@@ -843,9 +843,16 @@ fn group_call_ranges<'a, K: PartialEq>(
 /// server to resolve project-wide references for the symbol denoted by the given text document
 /// position." Returns `Location[]` or `null`. Source: <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_references>.
 ///
-/// Algorithm (per the M4 plan §6 + `docs/03 §7.1`):
+/// Algorithm (per the M4 plan §6 + `docs/03 §7.1`, updated for M6-E):
 ///   1. Resolve cursor → identifier name.
-///   2. Query `Index::name_referencers(name)` for candidate files (interface-pass filter).
+///   2. Choose candidate files:
+///      - **Method/signal targets** (M6-E): project-wide textual scan matching Godot's
+///        `gdscript_workspace.cpp:472` two-phase strategy — enumerate ALL project files from the
+///        index, read text (VFS/disk; no analysis), keep only files whose text contains `name` as a
+///        substring. This catches callers that reach the method through a body-local typed var
+///        (`var l: Lib = Lib.new(); l.helper()`) that wouldn't appear in `name_referencers`.
+///      - **Class/type/variable targets**: `Index::name_referencers(name)` fast-path (interface-pass
+///        filter); these can only be reached through interface-level type annotations.
 ///   3. For each candidate (plus the current buffer): lazy-parse, lazy-analyze, then collect
 ///      occurrences two ways and de-dupe: (a) the parser-level identifier scan
 ///      (`push_identifier_locations`) — every `Identifier` node named `name`, covering call-site
@@ -913,29 +920,96 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // current file, already scanned above). Collect URIs first so the index borrow doesn't conflict
     // with the lazy-analyze calls below.
     //
-    // M6-E: expand the candidate set beyond `name_referencers(name)`. For a method/signal `name`,
-    // callers reach it through a typed local (`var l: Lib; l.helper()`) — the interface pass
-    // records `Lib` (the type) but not `helper` (the callee) in the referencing set. Also include
-    // files that reference the current file's own class name, since any such file may call this
-    // method. The `push_identifier_locations` scan over the expanded set then picks up the callee
-    // identifier at its precise narrower range; de-dup collapses the overlap with the name scan.
-    let current_class_name: Option<String> = current_path
+    // M6-E: for method/signal targets, callers can reach the method through a body-local typed var
+    // (`var l: Lib = Lib.new(); l.helper()`) — the interface pass records `Lib` in the referencing
+    // set but not `helper`, so `name_referencers("helper")` misses those callers. This matches
+    // Godot's workspace.cpp:472 strategy: a project-wide textual name-scan first (two-phase), then
+    // per-hit re-resolve. For method/signal targets we therefore enumerate ALL project files, do a
+    // cheap substring pre-filter (`text.contains(name)` — only reads text, not analyze), and pass
+    // hits to the existing per-candidate analyze + `push_identifier_locations` loop. For non-method
+    // targets (class names, variables) the `name_referencers` fast-path is sufficient: they can
+    // only be reached via their interface-level type annotation, which the interface pass records.
+    //
+    // Cost: one VFS-or-disk read per project file per references request for method/signal targets.
+    // This matches Godot's behavior; a future identifier-occurrence index could optimize it. Do NOT
+    // full-analyze every file — text-prefilter first, analyze only textual hits.
+    let current_fid = current_path
         .as_deref()
-        .and_then(|p| state.workspace.index.file_id(p))
-        .and_then(|fid| state.workspace.index.interface(fid))
-        .and_then(|iface| iface.class_name.clone());
+        .and_then(|p| state.workspace.index.file_id(p));
 
-    let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
-    for fid in state.workspace.index.name_referencers(&name) {
-        candidate_fids.insert(fid);
-    }
-    if let Some(ref cn) = current_class_name {
-        for fid in state.workspace.index.name_referencers(cn) {
+    // Detect whether the cursor name is a method or signal in the current file's interface. If the
+    // file has no class_name (or the name isn't in the interface), it can still be a method — fall
+    // back to checking whether the cursor's Identifier node is the name child of a Function/Signal
+    // node via the interface members list (the interface always captures every func/signal).
+    let is_method_or_signal = current_fid
+        .and_then(|fid| state.workspace.index.interface(fid))
+        .is_some_and(|iface| {
+            iface.members.iter().any(|m| {
+                m.name == name
+                    && matches!(
+                        m.kind,
+                        gd_project::MemberKind::Func | gd_project::MemberKind::Signal
+                    )
+            })
+        });
+
+    // Collect (path, uri) pairs for candidate files. For method/signal targets, enumerate all
+    // project files and pre-filter by substring; for others, use the name_referencers fast-path.
+    // Either way, exclude the current file (already scanned above).
+    let candidates: Vec<(camino::Utf8PathBuf, Uri)> = if is_method_or_signal {
+        // Project-wide textual scan: collect all (FileId → path) from the index first (index
+        // borrow), then read text separately (VFS / disk borrow) so borrows don't overlap.
+        let all_paths: Vec<(gd_project::FileId, camino::Utf8PathBuf)> = state
+            .workspace
+            .index
+            .iter_interfaces()
+            .filter_map(|(fid, _)| {
+                state
+                    .workspace
+                    .index
+                    .path(fid)
+                    .map(|p| (fid, p.to_path_buf()))
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        for (fid, p) in all_paths {
+            // Exclude the current file (already scanned above).
+            if current_fid.is_some_and(|cfid| cfid == fid) {
+                continue;
+            }
+            let Some(cand_uri) = path_to_file_uri(&p) else {
+                log::warn!(
+                    "references: dropping candidate {p} — path_to_file_uri rejected the path"
+                );
+                continue;
+            };
+            // Pre-filter: only read text (VFS-first, no analysis). If the file's text doesn't
+            // contain `name` as a substring, it cannot have a reference — skip it cheaply.
+            let text_opt = state
+                .vfs
+                .get(cand_uri.as_str())
+                .map(|d| d.text())
+                .or_else(|| std::fs::read_to_string(p.as_std_path()).ok());
+            let Some(text) = text_opt else {
+                log::warn!(
+                    "references: skipping candidate {p} (unreadable); \
+                     cross-file results may be under-reported"
+                );
+                continue;
+            };
+            if text.contains(name.as_str()) {
+                out.push((p, cand_uri));
+            }
+        }
+        out
+    } else {
+        // Fast-path for class/type/variable names: only files whose interface mentions `name` can
+        // reference it; `name_referencers` already has that set.
+        let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
+        for fid in state.workspace.index.name_referencers(&name) {
             candidate_fids.insert(fid);
         }
-    }
-
-    let candidates: Vec<(camino::Utf8PathBuf, Uri)> = {
         let mut out = Vec::new();
         for fid in candidate_fids {
             let Some(p) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {

@@ -1,7 +1,8 @@
-//! M6-E gate: `textDocument/references` through cross-file `Binding::Call` edges.
+//! M6-E gate: `textDocument/references` finds callers through body-local typed vars.
 //!
-//! When `lib.gd` defines `func helper()` and `a.gd`/`b.gd` each call it through a typed local,
-//! find-references on `helper`'s declaration must include both cross-file call sites.
+//! When `lib.gd` defines `func helper()` and callers reach it through a body-local typed var
+//! (`var l: Lib = Lib.new(); l.helper()`), find-references on `helper`'s declaration must
+//! include all cross-file call sites — even files whose interface does not mention `Lib`.
 
 mod common;
 
@@ -51,7 +52,10 @@ fn init_and_open(project: &TempProject, client: &Connection, files: &[&str]) {
     while common::try_recv(client, std::time::Duration::from_millis(300)).is_some() {}
 }
 
-/// M6-E: references on `helper` in `lib.gd` must return the call sites in `a.gd` and `b.gd`.
+/// M6-E: references on `helper` in `lib.gd` must return the call sites in `a.gd` and `b.gd`,
+/// including when one caller reaches the method through a body-local typed var — not a typed
+/// parameter — so `Lib` does NOT appear in that caller's interface. This exercises the project-
+/// wide text-scan path that supersedes `name_referencers` for method/signal targets.
 #[test]
 fn references_finds_cross_file_method_calls() {
     let p = TempProject::new();
@@ -69,18 +73,24 @@ fn references_finds_cross_file_method_calls() {
         "class_name Lib\nextends Node\n\nfunc helper():\n\tpass\n",
     );
 
-    // a.gd calls helper() via a typed parameter (so `Lib` appears in its interface,
-    // making it a `name_referencers("Lib")` candidate).
+    // a.gd calls helper() via a typed parameter — `Lib` appears in its interface.
     // Line 0: `extends Node`
     // Line 2: `func test(l: Lib):`
     // Line 3: `\tl.helper()`  — `helper` at col 3..9
     p.write("a.gd", "extends Node\n\nfunc test(l: Lib):\n\tl.helper()\n");
 
-    // b.gd also calls helper() via a typed parameter.
+    // b.gd calls helper() through a BODY-LOCAL typed var — `Lib` does NOT appear in b.gd's
+    // interface (the interface pass only records types from parameters/return/annotations, not
+    // local variable declarations). This is the seam the M6-E fix must close: b.gd is NOT in
+    // `name_referencers("Lib")` or `name_referencers("helper")`, so it was previously missed.
     // Line 0: `extends Node`
-    // Line 2: `func run(x: Lib):`
-    // Line 3: `\tx.helper()`  — `helper` at col 3..9
-    p.write("b.gd", "extends Node\n\nfunc run(x: Lib):\n\tx.helper()\n");
+    // Line 2: `func run():`
+    // Line 3: `\tvar l: Lib = Lib.new()`
+    // Line 4: `\tl.helper()`  — `helper` at col 3..9
+    p.write(
+        "b.gd",
+        "extends Node\n\nfunc run():\n\tvar l: Lib = Lib.new()\n\tl.helper()\n",
+    );
 
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
@@ -115,18 +125,20 @@ fn references_finds_cross_file_method_calls() {
     let locs: Vec<Location> =
         serde_json::from_value(resp.result.expect("references result")).unwrap();
 
-    // Must include call sites from a.gd AND b.gd.
+    // Must include call sites from BOTH a.gd (typed-parameter caller) AND b.gd (body-local
+    // typed-var caller). The b.gd assertion is the critical M6-E seam.
     let a_uri = file_uri(&p.root.join("a.gd"));
     let b_uri = file_uri(&p.root.join("b.gd"));
     let has_a = locs.iter().any(|l| l.uri == a_uri);
     let has_b = locs.iter().any(|l| l.uri == b_uri);
     assert!(
         has_a,
-        "references must include call site in a.gd; got: {locs:?}"
+        "references must include call site in a.gd (typed-param caller); got: {locs:?}"
     );
     assert!(
         has_b,
-        "references must include call site in b.gd; got: {locs:?}"
+        "references must include call site in b.gd (body-local var caller — M6-E seam); \
+         got: {locs:?}"
     );
 
     // The call sites must be the `helper` identifier range (narrow), not the whole call expression.
