@@ -867,19 +867,23 @@ impl IndexMut<'_> {
         self.inner.on_file_removed(path);
     }
 
-    /// WP-RD10 test/fuzz seam: inject a guaranteed [`Index::verify`] violation **without
-    /// panicking**, so the fuzzer (and unit tests) can drive [`Index::txn`]'s post-verify +
-    /// quarantine recovery path directly. A *panicking* trigger cannot be fuzzed: libfuzzer's panic
-    /// hook reports any `panic!` as a crash *before* `txn`'s `catch_unwind` ever recovers, so the
-    /// panic-driven recovery path is covered by the release unit tests below
-    /// (`index_mutation_quarantines_the_offending_file_after_a_violating_panic` and siblings), not
-    /// by the fuzz target. This non-panicking trigger lets the quarantine path still be fuzzed:
-    /// it inserts a `DanglingClassName` (a `class_name` registered for a path the index never
-    /// interned), which `verify` flags and `txn` then quarantines, then re-verifies clean.
+    /// WP-RD10 release-test seam: inject a guaranteed [`Index::verify`] violation **without
+    /// panicking**, so the release unit tests can drive [`Index::txn`]'s post-verify + quarantine
+    /// recovery path directly. It inserts a `DanglingClassName` (a `class_name` registered for a
+    /// path the index never interned), which `verify` flags and `txn` then quarantines, then
+    /// re-verifies clean.
     ///
-    /// Gated on `cfg(any(test, fuzzing))` (cargo-fuzz passes `--cfg fuzzing` to every crate in its
-    /// build), so it never exists in a production `gdls` binary.
-    #[cfg(any(test, fuzzing))]
+    /// This path is **release-only and not fuzzable**. `txn` answers any post-state violation with
+    /// its debug-only `panic!` ("a mutator desynced the index"), so the quarantine branch runs only
+    /// when debug-assertions are OFF — i.e. `cargo test -p gd_project --release`, where the sibling
+    /// test [`Index::txn`]'s caller skips itself under `cfg!(debug_assertions)`. cargo-fuzz keeps
+    /// debug-assertions ON, so an injected violation there would hit the debug-`panic!` and
+    /// libfuzzer's hook would abort before quarantine ran — which is why the index-invariant fuzz
+    /// target drives only the change/remove mutators and leaves recovery to these release tests.
+    ///
+    /// Gated on `cfg(test)`, so it never exists in a production `gdls` binary (nor in the fuzz
+    /// build, which no longer references it).
+    #[cfg(test)]
     pub fn inject_verify_violation(&mut self) {
         self.inner.registry.insert(
             "FuzzGhost".to_string(),
@@ -1614,15 +1618,15 @@ mod tests {
 
     #[test]
     fn txn_quarantines_injected_verify_violation_without_panic() {
-        // WP-RD10: the NON-panicking failure trigger the fuzzer's op 2 now uses.
-        // `inject_verify_violation` registers a dangling `class_name` (a `DanglingClassName`) but
-        // does NOT panic, so `txn` runs verify → detects it → quarantines the offending entry →
-        // re-verifies clean. Because the closure didn't panic, `txn`'s debug-only invariant panic is
-        // bypassed only by the quarantine path here too: a `DanglingClassName` is a real violation,
-        // and in debug `txn` would panic on it UNLESS the mutation panicked. So this test pins that
-        // the seam-injected violation is the SAME shape the fuzzer drives, and quarantine remediates
-        // it — but it only runs the remediation path in RELEASE (debug `txn` panics on a non-panic
-        // violation by design). Mirror `index_mutation_release_handles_mutation_panic`'s guard.
+        // WP-RD10: the NON-panicking failure trigger. `inject_verify_violation` registers a dangling
+        // `class_name` (a `DanglingClassName`) but does NOT panic, so `txn` runs verify → detects it
+        // → quarantines the offending entry → re-verifies clean. Because the closure didn't panic,
+        // `txn`'s debug-only invariant panic is bypassed only by the quarantine path here too: a
+        // `DanglingClassName` is a real violation, and in debug `txn` would panic on it UNLESS the
+        // mutation panicked. So the remediation path only runs in RELEASE (debug `txn` panics on a
+        // non-panic violation by design) — which is also exactly why the index-invariant fuzz target
+        // (cargo-fuzz keeps debug-assertions ON) cannot exercise recovery and leaves it to this
+        // release test. Mirror `index_mutation_release_handles_mutation_panic`'s guard.
         if cfg!(debug_assertions) {
             return;
         }

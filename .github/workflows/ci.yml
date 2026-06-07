@@ -80,11 +80,12 @@ jobs:
           find crates/gd_syntax/tests/conformance/corpus -name '*.gd' -exec cp {} fuzz/corpus/parse/ \;
       - name: Fuzz parse (bounded)
         run: cargo +nightly fuzz run parse -- -max_total_time=60 -timeout=10
-      # WP-RD10: the index-invariant target's op set (change / remove / inject-violation).
-      # Op 2's `inject_verify_violation` drives `Index::txn`'s post-verify + quarantine recovery
-      # WITHOUT a `panic!`, so it runs under cargo-fuzz's debug-assertions-on build. The
-      # panic-driven `catch_unwind` recovery cannot be fuzzed here — libfuzzer's panic hook aborts
-      # on a deliberate `panic!` before `catch_unwind` runs — so it is covered by gd_project's
-      # release unit tests instead (the `Test (release · index recovery paths)` step above).
-      - name: "Fuzz index_invariants (recovery: non-panicking quarantine path)"
+      # The index-invariant target's op set is change / remove: it drives `Index`'s incremental
+      # mutators and asserts `verify()` holds after every mutation. `txn`'s quarantine RECOVERY path
+      # is intentionally NOT fuzzed — under cargo-fuzz's debug-assertions-on build `txn` answers any
+      # post-state violation with its debug-`panic!`, and libfuzzer's panic hook aborts before the
+      # quarantine branch runs (so a real desync surfaces as a crash; recovery is unreachable here).
+      # Quarantine recovery is covered by gd_project's release unit tests instead (the
+      # `Test (release · index recovery paths)` step above).
+      - name: "Fuzz index_invariants (mutator invariants)"
         run: cargo +nightly fuzz run index_invariants -- -max_total_time=60 -timeout=10

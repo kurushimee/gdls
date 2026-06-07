@@ -14,7 +14,7 @@ use gd_project::{extract_interface, Index};
 // directly and panic on Err so libfuzzer logs the trigger).
 //
 // Input bytes are split into a stream of operations:
-//   first byte = op kind (0=change, 1=remove, 2=panic-inside-mutation)
+//   first byte = op kind (0=change, 1=remove)
 //   next byte = file slot (0..16, modulo)
 //   remainder = source-text fragment chosen from a library of GDScript shapes selected to
 //   exercise the trickier invariants:
@@ -29,16 +29,20 @@ use gd_project::{extract_interface, Index};
 //   The point is mutation churn that hits invariants 3-7, not parse-error coverage — the parser
 //   is layer-1's job.
 //
-// WP-RD10 op 2 fuzzes the recovery path under the DEFAULT nightly build: the NON-panicking trigger
-// `IndexMut::inject_verify_violation` forces a `DanglingClassName` without `panic!`. cargo-fuzz
-// builds release-optimized but with debug-assertions ON, and libfuzzer-sys's panic hook treats ANY
-// `panic!` as a crash *before* `txn`'s `catch_unwind` can recover — so the recovery contract cannot
-// be fuzzed THROUGH a deliberate panic here at all. Op 2 sidesteps that: `txn` runs its post-verify,
-// detects the violation, quarantines it, and the loop's re-verify proves the index came back
-// consistent. The panic-driven `catch_unwind` path itself is exercised directly by gd_project's
-// release unit tests (`index_mutation_quarantines_the_offending_file_after_a_violating_panic` and
-// siblings, run by `cargo test -p gd_project --release`), which don't sit under libfuzzer's
-// abort-on-panic hook.
+// The op set is deliberately just change / remove. `Index::txn`'s post-verify + quarantine RECOVERY
+// path is NOT fuzzed here, and cannot be: cargo-fuzz builds release-optimized but with
+// debug-assertions ON, where `txn` answers ANY post-state violation — a real mutator desync OR a
+// deliberately-injected one — with its debug-only `panic!` ("this is a bug; verify caught an
+// inconsistency on_file_* should never produce"). libfuzzer-sys's panic hook treats that `panic!`
+// as a crash *before* `txn`'s `catch_unwind` can reach the quarantine branch, so the recovery
+// contract is unreachable through `txn` under fuzzing by every path (real desync → debug-panic;
+// injected violation → debug-panic; panicking mutation → hook aborts before `catch_unwind`). That
+// is by design and a feature for ops 0/1: a real invariant desync surfaces as an immediate
+// libfuzzer crash with a minimal repro. The quarantine recovery itself (which only runs in
+// debug-assertions-OFF builds) is covered directly by gd_project's RELEASE unit tests
+// (`txn_quarantines_injected_verify_violation_without_panic`,
+// `index_mutation_quarantines_the_offending_file_after_a_violating_panic` and siblings, run by
+// `cargo test -p gd_project --release`), which don't sit under libfuzzer's abort-on-panic hook.
 
 const TEMPLATES: &[&str] = &[
     // -- Baseline single-class shapes -----------------------------------------
@@ -86,10 +90,11 @@ fuzz_target!(|data: &[u8]| {
     let mut idx = Index::new(Utf8PathBuf::from("/proj"));
     let mut cursor = 0usize;
 
-    // WP-RD10: the op space is change / remove / inject-violation. The panic-driven `catch_unwind`
-    // recovery is unit-tested in gd_project, not fuzzed — libfuzzer's panic hook aborts on a
-    // deliberate `panic!` before `catch_unwind` can recover (see the module header).
-    const OP_COUNT: u8 = 3;
+    // The op space is change / remove. The quarantine recovery path (an injected or panicking
+    // violation) is unit-tested in gd_project, not fuzzed — under cargo-fuzz's debug-assertions-on
+    // build `txn` answers any violation with its debug-`panic!`, and libfuzzer's panic hook aborts
+    // before the quarantine branch runs (see the module header).
+    const OP_COUNT: u8 = 2;
 
     while cursor + 2 < data.len() {
         let op = data[cursor] % OP_COUNT;
@@ -108,21 +113,13 @@ fuzz_target!(|data: &[u8]| {
             1 => {
                 idx.txn(&path, |i| i.on_file_removed(&path));
             }
-            2 => {
-                // Op 2 (WP-RD10): the NON-panicking failure trigger. `inject_verify_violation`
-                // forces a `DanglingClassName` WITHOUT panicking, so `txn`'s post-verify +
-                // quarantine recovery path runs under cargo-fuzz's DEFAULT build (which keeps
-                // debug-assertions ON) — a path a `panic!`-based trigger could never reach here,
-                // since libfuzzer's panic hook reports any `panic!` as a crash before
-                // `catch_unwind` recovers. After the txn, the index must verify clean (quarantined).
-                idx.txn(&path, |i| i.inject_verify_violation());
-            }
-            // `op = data % OP_COUNT` is in 0..=2; the explicit arms above are exhaustive.
-            _ => unreachable!("op is data % OP_COUNT (3), so always 0, 1, or 2"),
+            // `op = data % OP_COUNT` is in 0..=1; the explicit arms above are exhaustive.
+            _ => unreachable!("op is data % OP_COUNT (2), so always 0 or 1"),
         }
-        // Explicit verify on top of `Index::txn` — panics on any violation libfuzzer can shrink
-        // down to a minimal repro. (After op 2's injected violation, `txn` has already quarantined
-        // it, so this re-verify is the proof the recovery left a consistent index.)
+        // Explicit verify on top of `Index::txn` — panics on any invariant violation libfuzzer can
+        // then shrink down to a minimal repro. (`txn`'s own post-verify already debug-panics on a
+        // desync under the debug-assertions-on fuzz build; this belt-and-suspenders re-verify pins
+        // the contract independent of that cfg.)
         if let Err(violations) = idx.verify() {
             panic!("index invariant violated: {violations:?}");
         }
