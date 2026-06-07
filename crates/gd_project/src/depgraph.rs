@@ -14,6 +14,7 @@
 use std::num::NonZeroU32;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 
 /// An opaque, `Copy` handle for a file within one [`crate::index::Index`].
 ///
@@ -22,7 +23,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// placeholder that orphan-file analysis used to invent (and which collided with whichever real
 /// script the index interned first). A file outside the project is now carried as
 /// `Option<FileId> = None` through [`gd_analyze::analyze`], not a colliding sentinel id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct FileId(NonZeroU32);
 
 impl FileId {
@@ -53,12 +54,68 @@ impl FileId {
 }
 
 /// Forward + reverse interface-dependency edges.
+///
+/// Serialization stores only the `forward` map; `reverse` is rebuilt from it on deserialization
+/// to avoid storing two copies that could drift.
 #[derive(Clone, Debug, Default)]
 pub struct DepGraph {
     /// `file → files it depends on`.
     forward: FxHashMap<FileId, FxHashSet<FileId>>,
     /// `file → files that depend on it` (the inverse of `forward`, maintained in lockstep).
     reverse: FxHashMap<FileId, FxHashSet<FileId>>,
+}
+
+impl Serialize for DepGraph {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize as a map of FileId → Vec<FileId> (forward edges only).
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.forward.len()))?;
+        for (from, tos) in &self.forward {
+            // Collect to a sorted Vec for deterministic output.
+            let mut tos_vec: Vec<FileId> = tos.iter().copied().collect();
+            tos_vec.sort_unstable();
+            map.serialize_entry(from, &tos_vec)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for DepGraph {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Deserialize as a map of FileId → Vec<FileId>, then rebuild reverse.
+        let raw: Vec<(FileId, Vec<FileId>)> = {
+            struct Visitor;
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = Vec<(FileId, Vec<FileId>)>;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(f, "a map of FileId to Vec<FileId>")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut access: A,
+                ) -> Result<Self::Value, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some((k, v)) = access.next_entry::<FileId, Vec<FileId>>()? {
+                        out.push((k, v));
+                    }
+                    Ok(out)
+                }
+            }
+            deserializer.deserialize_map(Visitor)?
+        };
+
+        let mut graph = DepGraph::default();
+        for (from, tos) in raw {
+            let set: FxHashSet<FileId> = tos.into_iter().collect();
+            for &to in &set {
+                graph.reverse.entry(to).or_default().insert(from);
+            }
+            if !set.is_empty() {
+                graph.forward.insert(from, set);
+            }
+        }
+        Ok(graph)
+    }
 }
 
 impl DepGraph {
@@ -115,6 +172,22 @@ impl DepGraph {
         }
         seen.remove(&file);
         seen
+    }
+
+    /// Iterate all `(from, deps)` forward edges. Used by `Index::cache_equivalent` to compare
+    /// two dep-graphs and by the custom `Serialize` impl.
+    pub(crate) fn iter_forward(&self) -> impl Iterator<Item = (FileId, &FxHashSet<FileId>)> + '_ {
+        self.forward.iter().map(|(&from, tos)| (from, tos))
+    }
+
+    /// The number of entries in the forward edge map. Used by `Index::cache_equivalent`.
+    pub(crate) fn forward_len(&self) -> usize {
+        self.forward.len()
+    }
+
+    /// Iterate the forward deps of a specific file, if any. Used by `Index::cache_equivalent`.
+    pub(crate) fn forward_deps(&self, file: FileId) -> Option<&FxHashSet<FileId>> {
+        self.forward.get(&file)
     }
 
     fn clear_forward(&mut self, file: FileId) {

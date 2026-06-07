@@ -6,7 +6,9 @@
 //!     only to reproduce Godot's diagnostic positions for `.out` conformance.
 
 /// A half-open byte range `[start, end)` into the source text.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct ByteSpan {
     pub start: usize,
     pub end: usize,
