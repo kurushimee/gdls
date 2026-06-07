@@ -406,8 +406,111 @@ fn definition_jumps_across_files_via_class_name() {
     let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
-/// M6-F: hover on a cross-file method call shows the function signature from the callee's
-/// interface (`func helper() -> void`). Hover on a preload string shows the target file basename.
+/// Fix 1: hover on a cross-file method call with parameters shows param NAMES in the signature.
+/// `func helper(amount: int, who: String) -> int` must render with `amount` and `who`, not just
+/// `int, String`.
+#[test]
+fn hover_cross_file_method_shows_param_names() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_param_names");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    // lib.gd: class_name Lib, func helper(amount: int, who: String) -> int
+    std::fs::write(
+        fixture_dir.join("lib.gd"),
+        "class_name Lib\nextends Node\n\nfunc helper(amount: int, who: String) -> int:\n\treturn amount\n",
+    )
+    .expect("write lib.gd");
+    // caller.gd: calls l.helper(5, \"Bob\")
+    // Line 0: `extends Node`
+    // Line 2: `func test(l: Lib):`
+    // Line 3: `\tvar x = l.helper(5, \"Bob\")`  — `helper` at col 12..18
+    let caller_src = "extends Node\n\nfunc test(l: Lib):\n\tvar x = l.helper(5, \"Bob\")\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover on `helper` at line 3, col 13.
+    let hover = hover_at(&client, &caller_uri, Position::new(3, 13))
+        .expect("hover on method call should return something");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("amount"),
+        "hover signature must include param name 'amount', got {md:?}"
+    );
+    assert!(
+        md.contains("who"),
+        "hover signature must include param name 'who', got {md:?}"
+    );
+    assert!(
+        md.contains("amount: int"),
+        "hover signature must render 'amount: int', got {md:?}"
+    );
+    assert!(
+        md.contains("who: String"),
+        "hover signature must render 'who: String', got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// Fix 2: hover on a `preload("res://foo.gd")` string literal shows the resolved script basename.
+#[test]
+fn hover_on_preload_string_shows_resolved_script() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_preload");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    std::fs::write(fixture_dir.join("lib.gd"), "extends Node\n").expect("write lib.gd");
+    // caller.gd has: const Lib = preload("res://lib.gd")
+    // The string literal starts at col 20.
+    let caller_src = "const Lib = preload(\"res://lib.gd\")\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover inside "res://lib.gd" at line 0, col 25.
+    let hover = hover_at(&client, &caller_uri, Position::new(0, 25))
+        .expect("hover on preload string must return something");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("lib.gd"),
+        "hover on preload string must show the resolved filename 'lib.gd', got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// M6-F: hover on a cross-file method call with no parameters shows the function signature from
+/// the callee's interface (`func helper() -> int`). Param-name rendering is tested in
+/// `hover_cross_file_method_shows_param_names`; preload-string hover in
+/// `hover_on_preload_string_shows_resolved_script`.
 #[test]
 fn hover_cross_file_method_shows_signature() {
     let fixture_dir = std::env::temp_dir().join("gdls_hover_m6f");

@@ -83,6 +83,11 @@ pub struct MemberDecl {
     pub ty: TypeExpr,
     /// Parameter types for `func`/`signal` members; empty otherwise.
     pub params: Vec<TypeExpr>,
+    /// Parameter identifier names for `func`/`signal` members, parallel to `params`. Empty for
+    /// non-func/signal members, and empty for parameters without identifiers (rare, defensive).
+    /// Not included in `signature_hash` — param renames don't change call compatibility in
+    /// GDScript's positional-call model, so they aren't interface-relevant for invalidation.
+    pub param_names: Vec<String>,
     pub flags: MemberFlags,
     /// Byte range of the declaration. **Excluded from [`Interface::signature_hash`]** so that a
     /// body-only edit (which shifts later members' spans) does not look like an interface change.
@@ -295,6 +300,7 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         kind,
         ty: type_expr(tree, v.datatype_specifier),
         params: Vec::new(),
+        param_names: Vec::new(),
         flags: MemberFlags {
             is_static: v.is_static,
             exported: has_annotation(tree, &node.annotations, |n| n.starts_with("@export")),
@@ -317,6 +323,7 @@ fn const_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         kind: MemberKind::Const,
         ty: type_expr(tree, c.datatype_specifier),
         params: Vec::new(),
+        param_names: Vec::new(),
         flags: MemberFlags::default(),
         span: node.span,
         line: node.loc.start.line,
@@ -329,19 +336,25 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         return None;
     };
     let name = ident_name(tree, f.identifier)?;
-    let params = f
+    let (params, param_names): (Vec<TypeExpr>, Vec<String>) = f
         .parameters
         .iter()
         .map(|&p| match &tree.get(p).kind {
-            NodeKind::Parameter(pn) => type_expr(tree, pn.datatype_specifier),
-            _ => TypeExpr::None,
+            NodeKind::Parameter(pn) => (
+                type_expr(tree, pn.datatype_specifier),
+                ident_name(tree, pn.identifier)
+                    .map(|n| n.to_owned())
+                    .unwrap_or_default(),
+            ),
+            _ => (TypeExpr::None, String::new()),
         })
-        .collect();
+        .unzip();
     Some(MemberDecl {
         name,
         kind: MemberKind::Func,
         ty: type_expr(tree, f.return_type),
         params,
+        param_names,
         flags: MemberFlags {
             is_static: f.is_static,
             is_abstract: has_annotation(tree, &node.annotations, |n| n == "@abstract"),
@@ -359,19 +372,25 @@ fn signal_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         return None;
     };
     let name = ident_name(tree, s.identifier)?;
-    let params = s
+    let (params, param_names): (Vec<TypeExpr>, Vec<String>) = s
         .parameters
         .iter()
         .map(|&p| match &tree.get(p).kind {
-            NodeKind::Parameter(pn) => type_expr(tree, pn.datatype_specifier),
-            _ => TypeExpr::None,
+            NodeKind::Parameter(pn) => (
+                type_expr(tree, pn.datatype_specifier),
+                ident_name(tree, pn.identifier)
+                    .map(|n| n.to_owned())
+                    .unwrap_or_default(),
+            ),
+            _ => (TypeExpr::None, String::new()),
         })
-        .collect();
+        .unzip();
     Some(MemberDecl {
         name,
         kind: MemberKind::Signal,
         ty: TypeExpr::None,
         params,
+        param_names,
         flags: MemberFlags::default(),
         span: node.span,
         line: node.loc.start.line,
@@ -391,6 +410,7 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         kind: MemberKind::Enum,
         ty: TypeExpr::None,
         params: Vec::new(),
+        param_names: Vec::new(),
         flags: MemberFlags::default(),
         span: node.span,
         line: node.loc.start.line,
@@ -424,6 +444,7 @@ fn enum_value_member(tree: &ParseTree, value: &EnumValue) -> Option<MemberDecl> 
         kind: MemberKind::Const,
         ty: TypeExpr::None,
         params: Vec::new(),
+        param_names: Vec::new(),
         flags: MemberFlags::default(),
         span: node.span,
         line: node.loc.start.line,
