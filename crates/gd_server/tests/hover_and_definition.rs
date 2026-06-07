@@ -604,6 +604,48 @@ fn definition_on_autoload_jumps_to_script() {
     let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
+/// M6-D negative: when project.godot declares an autoload pointing at `res://save.gd` but
+/// `save.gd` is NOT present on disk (not indexed), `go-to-definition` on the autoload name must
+/// return no Location — not crash, not emit a dangling URI. The existence-gate in
+/// `find_autoload_definition` (`resolve_res_path` returning None for unindexed files) covers this.
+#[test]
+fn definition_autoload_missing_script_returns_none() {
+    let fixture_dir = std::env::temp_dir().join("gdls_def_m6d_missing");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    // Declare `Save` autoload pointing at res://save.gd — but do NOT write save.gd to disk.
+    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
+    std::fs::write(fixture_dir.join("project.godot"), project_godot).expect("write project.godot");
+    // user.gd references Save in expression position.
+    // Line 0: `extends Node`
+    // Line 2: `func test():`
+    // Line 3: `\tSave.do_thing()`  — `Save` at col 1..5
+    let user_src = "extends Node\n\nfunc test():\n\tSave.do_thing()\n";
+    std::fs::write(fixture_dir.join("user.gd"), user_src).expect("write user.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let user_path = fixture_dir.join("user.gd");
+    let user_uri: Uri = format!("file:///{}", user_path.to_string_lossy().replace('\\', "/"))
+        .parse()
+        .unwrap();
+    did_open(&client, &user_uri, user_src);
+
+    // Click on `Save` at line 3, col 2 — autoload exists in project.godot but script is absent.
+    // Must return None (null wire response), not a dangling file:// URI.
+    let response = definition_at(&client, &user_uri, Position::new(3, 2));
+    assert!(
+        response.is_none(),
+        "definition on autoload with missing script must return None; got {response:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
 /// M6-D shadowing: a local var named `Save` takes priority over the autoload named `Save`.
 /// Definition on the local reference must stay in-file, not jump to the autoload script.
 #[test]

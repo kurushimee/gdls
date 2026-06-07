@@ -5,6 +5,7 @@ use gd_syntax::ast::{
     ClassNode, ConstantNode, FunctionNode, LiteralNode, NodeId, NodeKind, ParseTree, SignalNode,
     SubscriptAccess, VariableNode,
 };
+use gd_syntax::ByteSpan;
 use gd_syntax::Literal;
 use gd_types::native_db::NativeClass;
 use lsp_types::{
@@ -754,10 +755,19 @@ fn find_res_path_definition(
 /// autoload's script file. This is the **last** definition fallback — in-file member lookup and
 /// `class_name` registry checks (which honour local shadowing) run first, so `var Save := 1`
 /// in the current file correctly shadows an autoload named `Save`.
+///
+/// The existence gate uses `resolve_res_path` (which returns `Some` only for indexed, on-disk
+/// files) rather than `res_to_path` (a pure path-join with no existence check). This prevents
+/// emitting a dangling `file://` URI when the `project.godot` autoload entry points at a script
+/// that hasn't been written to disk — the same class of bug already fixed in `find_res_path_definition`
+/// and `document_link`.
 fn find_autoload_definition(state: &ServerState, name: &str) -> Option<Location> {
     let res_path = state.workspace.project.autoload_script_path(name)?;
-    let root = &state.workspace.project.root;
-    let abs = gd_project::paths::res_to_path(root, res_path)?;
+    // Gate on index membership — only emit a Location for paths that resolve to an actually
+    // existing, indexed project file. `resolve_res_path` returns Some only for indexed (on-disk)
+    // files; if save.gd is absent from disk, this returns None → no Location emitted.
+    let fid = state.workspace.index.resolve_res_path(res_path)?;
+    let abs = state.workspace.index.path(fid).map(|p| p.to_path_buf())?;
     let uri = path_to_file_uri(&abs)?;
     Some(Location {
         uri,
@@ -933,41 +943,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         }
     }
 
-    // Always scan the current file's bindings — name_referencers is the interface-level filter
-    // (cross-file dependents), not the self-references set. The body of the current file may
-    // contain many uses of `name` that name_referencers won't surface.
     let current_path = crate::uri::uri_to_path(&uri);
-    if let Some(p) = current_path
-        .as_ref()
-        .filter(|p| p.extension() == Some("gd"))
-    {
-        let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
-        push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
-        // Also scan parser-level identifier occurrences in the current file (`extends Foo`, type
-        // annotations, `class_name`) — the reducer doesn't record these as bindings. Cross-file
-        // candidates below already get this scan; without it here, an in-file `extends`/type/
-        // `class_name` reference to `name` was silently under-reported. The dedup pass at the end
-        // collapses any overlap with the binding scan.
-        push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
-    }
-
-    // Candidate cross-file referencing files via the interface-pass reverse index (excluding the
-    // current file, already scanned above). Collect URIs first so the index borrow doesn't conflict
-    // with the lazy-analyze calls below.
-    //
-    // M6-E: for method/signal targets, callers can reach the method through a body-local typed var
-    // (`var l: Lib = Lib.new(); l.helper()`) — the interface pass records `Lib` in the referencing
-    // set but not `helper`, so `name_referencers("helper")` misses those callers. This matches
-    // Godot's workspace.cpp:472 strategy: a project-wide textual name-scan first (two-phase), then
-    // per-hit re-resolve. For method/signal targets we therefore enumerate ALL project files, do a
-    // cheap substring pre-filter (`text.contains(name)` — only reads text, not analyze), and pass
-    // hits to the existing per-candidate analyze + `push_identifier_locations` loop. For non-method
-    // targets (class names, variables) the `name_referencers` fast-path is sufficient: they can
-    // only be reached via their interface-level type annotation, which the interface pass records.
-    //
-    // Cost: one VFS-or-disk read per project file per references request for method/signal targets.
-    // This matches Godot's behavior; a future identifier-occurrence index could optimize it. Do NOT
-    // full-analyze every file — text-prefilter first, analyze only textual hits.
     let current_fid = current_path
         .as_deref()
         .and_then(|p| state.workspace.index.file_id(p));
@@ -982,9 +958,112 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // (`l.helper()`) identically, so find-references is position-independent (matches Godot).
     let is_method_or_signal = is_method_or_signal_ident(&parsed.tree, node_id);
 
-    // Collect (path, uri) pairs for candidate files. For method/signal targets, enumerate all
-    // project files and pre-filter by substring; for others, use the name_referencers fast-path.
-    // Either way, exclude the current file (already scanned above).
+    // For method/signal targets, compute `target_file` — the FileId of the file that DECLARES
+    // the method. Used to filter `Binding::Call` records to genuine callers of this specific
+    // method, excluding identically-named methods in unrelated files (Fix 2 Part B, M6-E).
+    //
+    // Priority:
+    //   1. Call-site click: find a Binding::Call in the current file's analysis whose callee
+    //      identifier (derived from the parse tree) spans the cursor byte position. The
+    //      `callee_file` of that binding is the declaring file.
+    //   2. Declaration-site click: `current_fid` (the file where `func name():` lives is the
+    //      current file).
+    //   3. `None` — if the file isn't indexed or the callee is native/unresolved. When None,
+    //      fall back to raw identifier scan (no false-negative for unresolvable targets).
+    let target_file: Option<gd_project::FileId> = if is_method_or_signal {
+        // Analyze the current file to determine target_file.
+        let target_file_from_binding = if let Some(p) = current_path
+            .as_ref()
+            .filter(|p| p.extension() == Some("gd"))
+        {
+            let cur_result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+            // Look for a Binding::Call whose callee identifier span (in the parse tree)
+            // contains the cursor byte. If found (call-site click), target_file = callee_file.
+            cur_result
+                .bindings()
+                .iter()
+                .find_map(|b| {
+                    if let Binding::Call {
+                        callee_file,
+                        callee_name,
+                        call_site,
+                        ..
+                    } = b
+                    {
+                        if callee_name == name.as_str() {
+                            if let Some(ident_span) = callee_ident_span(&parsed.tree, *call_site) {
+                                if ident_span.start <= byte && byte < ident_span.end {
+                                    return Some(*callee_file);
+                                }
+                            }
+                        }
+                    }
+                    None
+                })
+                .flatten()
+        } else {
+            None
+        };
+        // If no call-binding at cursor (declaration click), use current_fid.
+        target_file_from_binding.or(current_fid)
+    } else {
+        None
+    };
+
+    // Always scan the current file's bindings — name_referencers is the interface-level filter
+    // (cross-file dependents), not the self-references set. The body of the current file may
+    // contain many uses of `name` that name_referencers won't surface.
+    if let Some(p) = current_path
+        .as_ref()
+        .filter(|p| p.extension() == Some("gd"))
+    {
+        let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+        push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
+        if is_method_or_signal {
+            // For method/signal targets: use callee-filtered call projection instead of raw
+            // identifier scan to avoid false positives from identically-named declarations.
+            // Only project when target_file is Some — if None (native/unresolved), fall back
+            // to identifier scan so we never under-report for unresolvable targets.
+            if let Some(tf) = target_file {
+                push_callee_ident_locations(
+                    &mut locations,
+                    &result,
+                    &parsed.tree,
+                    tf,
+                    &name,
+                    &uri,
+                    &mapper,
+                );
+            } else {
+                push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
+            }
+        } else {
+            // Non-method targets: raw identifier scan picks up `extends Foo`, type annotations,
+            // `class_name`, and other parser-level refs the reducer doesn't record. Cross-file
+            // candidates below already get this scan; without it here, in-file extends/type/
+            // class_name references to `name` would be silently under-reported. The dedup pass
+            // at the end collapses any overlap with the binding scan.
+            push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
+        }
+    }
+
+    // Candidate cross-file referencing files via the interface-pass reverse index (excluding the
+    // current file, already scanned above). Collect URIs first so the index borrow doesn't conflict
+    // with the lazy-analyze calls below.
+    //
+    // M6-E: for method/signal targets, callers can reach the method through a body-local typed var
+    // (`var l: Lib = Lib.new(); l.helper()`) — the interface pass records `Lib` in the referencing
+    // set but not `helper`, so `name_referencers("helper")` misses those callers. This matches
+    // Godot's workspace.cpp:472 strategy: a project-wide textual name-scan first (two-phase), then
+    // per-hit re-resolve. For method/signal targets we therefore enumerate ALL project files, do a
+    // cheap substring pre-filter (`text.contains(name)` — only reads text, not analyze), and pass
+    // hits to the existing per-candidate analyze + callee-filtered-binding loop. For non-method
+    // targets (class names, variables) the `name_referencers` fast-path is sufficient: they can
+    // only be reached via their interface-level type annotation, which the interface pass records.
+    //
+    // Cost: one VFS-or-disk read per project file per references request for method/signal targets.
+    // This matches Godot's behavior; a future identifier-occurrence index could optimize it. Do NOT
+    // full-analyze every file — text-prefilter first, analyze only textual hits.
     let candidates: Vec<(camino::Utf8PathBuf, Uri)> = if is_method_or_signal {
         // Project-wide textual scan: collect all (FileId → path) from the index first (index
         // borrow), then read text separately (VFS / disk borrow) so borrows don't overlap.
@@ -1066,9 +1145,35 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         let rope = Rope::from_str(&text);
         let cand_mapper = PositionMapper::new(&rope, enc);
         push_binding_locations(&mut locations, &cand_result, &name, &cand_uri, &cand_mapper);
-        // Also scan identifier-by-name — picks up `extends Foo` and other parser-level refs the
-        // reducer doesn't record. De-dupes happen below.
-        push_identifier_locations(&mut locations, &parsed.tree, &name, &cand_uri, &cand_mapper);
+        if is_method_or_signal {
+            // For method/signal targets: use callee-filtered call projection (accurate) rather
+            // than raw identifier scan (which would pick up unrelated same-named declarations
+            // like `func helper():` in other.gd). When target_file is None (native/unresolved),
+            // fall back to identifier scan to avoid under-reporting.
+            if let Some(tf) = target_file {
+                push_callee_ident_locations(
+                    &mut locations,
+                    &cand_result,
+                    &parsed.tree,
+                    tf,
+                    &name,
+                    &cand_uri,
+                    &cand_mapper,
+                );
+            } else {
+                push_identifier_locations(
+                    &mut locations,
+                    &parsed.tree,
+                    &name,
+                    &cand_uri,
+                    &cand_mapper,
+                );
+            }
+        } else {
+            // Non-method targets: identifier scan picks up `extends Foo` and other parser-level
+            // refs the reducer doesn't record. De-dupes happen below.
+            push_identifier_locations(&mut locations, &parsed.tree, &name, &cand_uri, &cand_mapper);
+        }
     }
 
     // De-duplicate (uri, range) pairs — binding scan + identifier scan can overlap on resolved
@@ -1145,6 +1250,78 @@ fn push_identifier_locations(
                     uri: uri.clone(),
                     range: mapper.span_to_range(node.span),
                 });
+            }
+        }
+    }
+}
+
+/// Walk the parse tree to find the callee attribute-identifier's span for a subscript call
+/// (e.g. `l.helper()` → span of the `helper` identifier, not the whole `l.helper()` expression).
+///
+/// Given the `call_site` ByteSpan from a `Binding::Call`, locates the corresponding `CallNode`
+/// in `tree` by span match, then follows `CallNode.callee → SubscriptNode → Attribute(ident_id)`.
+/// Returns `None` for non-subscript callees (bare function calls, `super()`, etc.) or when the
+/// tree doesn't contain a matching node.
+///
+/// Used by `push_callee_ident_locations` to emit the precise identifier sub-range for each
+/// resolved cross-file call, so the narrow range (e.g. col 3..9 for `helper` in `\tl.helper()`)
+/// matches what `push_identifier_locations` would have returned for that specific occurrence —
+/// but filtered to genuine callers of the target method, not all same-named identifiers.
+fn callee_ident_span(tree: &ParseTree, call_site: ByteSpan) -> Option<ByteSpan> {
+    for nid in tree.iter_ids() {
+        let node = tree.get(nid);
+        if node.span != call_site {
+            continue;
+        }
+        if let NodeKind::Call(call) = &node.kind {
+            let callee_id = call.callee?;
+            let callee_node = tree.get(callee_id);
+            if let NodeKind::Subscript(sub) = &callee_node.kind {
+                if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
+                    return Some(tree.get(attr_id).span);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Append a [`Location`] for every [`Binding::Call`] in `result.bindings` where
+/// `callee_file == target_file && callee_name == name`, emitting the **narrow callee-identifier
+/// span** derived from the parse tree (via [`callee_ident_span`]).
+///
+/// This replaces [`push_identifier_locations`] for method/signal targets in the M6-E references
+/// fix: raw textual identifier matching would include unrelated same-named declarations (e.g.
+/// `func helper():` in `other.gd`) whereas this filters to genuine callers of the specific method
+/// declared in `target_file`. Only subscript calls are emitted — bare/super calls without a
+/// resolved `callee_file` will have `None` for that field and won't match a `Some(target_file)`.
+///
+/// Caller must ensure `target_file` is `Some` before calling; the `None` guard lives in
+/// `references()` (fall back to `push_identifier_locations` when `target_file` is `None`).
+fn push_callee_ident_locations(
+    out: &mut Vec<Location>,
+    result: &AnalysisResult,
+    tree: &ParseTree,
+    target_file: gd_project::FileId,
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
+    for binding in result.bindings() {
+        if let Binding::Call {
+            callee_file: Some(cf),
+            callee_name,
+            call_site,
+            ..
+        } = binding
+        {
+            if *cf == target_file && callee_name == name {
+                if let Some(span) = callee_ident_span(tree, *call_site) {
+                    out.push(Location {
+                        uri: uri.clone(),
+                        range: mapper.span_to_range(span),
+                    });
+                }
             }
         }
     }

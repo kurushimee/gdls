@@ -151,3 +151,88 @@ fn references_finds_cross_file_method_calls() {
 
     shutdown(&client, server_thread);
 }
+
+/// M6-E false-positive gate: `textDocument/references` for `Lib::helper` must NOT include
+/// occurrences of an unrelated same-named method in `other.gd` (`class_name Other` with its own
+/// `func helper()`). The callee_file-filtered mechanism must distinguish between the two.
+#[test]
+fn references_excludes_unrelated_same_named_method() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+
+    // lib.gd defines `class_name Lib` and `func helper()`.
+    p.write(
+        "lib.gd",
+        "class_name Lib\nextends Node\n\nfunc helper():\n\tpass\n",
+    );
+
+    // other.gd is an unrelated class with its own `func helper()`.
+    // It does NOT extend Lib, does NOT call Lib.helper — it just happens to have the same name.
+    // Line 0: `class_name Other`
+    // Line 1: `extends Node`
+    // Line 3: `func helper():`  — `helper` at col 5..11
+    // Line 4: `\tpass`
+    p.write(
+        "other.gd",
+        "class_name Other\nextends Node\n\nfunc helper():\n\tpass\n",
+    );
+
+    // caller.gd calls Lib.helper() — it's a genuine reference.
+    // Line 0: `extends Node`
+    // Line 2: `func run():`
+    // Line 3: `\tvar l: Lib = Lib.new()`
+    // Line 4: `\tl.helper()`  — `helper` at col 3..9
+    p.write(
+        "caller.gd",
+        "extends Node\n\nfunc run():\n\tvar l: Lib = Lib.new()\n\tl.helper()\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["lib.gd", "other.gd", "caller.gd"]);
+
+    let lib_uri = file_uri(&p.root.join("lib.gd"));
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: lib_uri },
+            // Click on `helper` at line 3, col 7 (declaration site in lib.gd).
+            position: Position {
+                line: 3,
+                character: 7,
+            },
+        },
+        context: ReferenceContext {
+            include_declaration: false,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(20, "textDocument/references", params))
+        .unwrap();
+    let Message::Response(resp) = recv(&client) else {
+        panic!("expected references response");
+    };
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    let caller_uri = file_uri(&p.root.join("caller.gd"));
+    let other_uri = file_uri(&p.root.join("other.gd"));
+
+    // caller.gd's `l.helper()` call IS a genuine reference — must be included.
+    assert!(
+        locs.iter().any(|l| l.uri == caller_uri),
+        "references must include genuine call site in caller.gd; got: {locs:?}"
+    );
+
+    // other.gd's `func helper():` declaration is unrelated — must NOT appear.
+    assert!(
+        !locs.iter().any(|l| l.uri == other_uri),
+        "references must NOT include other.gd's unrelated helper (false positive); got: {locs:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
