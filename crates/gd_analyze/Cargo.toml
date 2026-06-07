@@ -21,7 +21,7 @@ gd_project.workspace = true
 rustc-hash.workspace = true
 
 [dev-dependencies]
-camino = "1.2.2"
+camino.workspace = true
 # `which`: M5 WP-D1 — PATH lookup for the local-only differential harness's `godot` discovery
 # (`tests/differential.rs`). Pinned in the workspace `[dependencies]` table per the workspace
 # policy in the root `Cargo.toml` (one version per shared external dep, lives in exactly one place).
