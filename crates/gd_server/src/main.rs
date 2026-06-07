@@ -118,6 +118,11 @@ fn diagnose(args: &[String]) -> Result<()> {
                 report.walk_errors, report.skipped_unreadable, report.skipped_non_utf8
             );
             failed = true;
+        } else {
+            // Reconcile succeeded — persist a fresh warm-start cache so the next launch
+            // (or a subsequent `gdls diagnose` after a wake-from-suspend) can avoid a full
+            // cold walk. Fire-and-forget (log-only on failure, matching server.rs's wiring).
+            workspace.save_cache();
         }
     }
 

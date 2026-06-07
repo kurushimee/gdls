@@ -271,6 +271,9 @@ fn serve_inner(
         report.removed,
         report.walked
     );
+    // Persist the settled index to the warm-start cache (fire-and-forget; never errors).
+    // Called AFTER build + reconcile so the cache reflects a consistent, post-reconcile state.
+    state.workspace.save_cache();
 
     // --- Event loop: select! over LSP receiver + the watcher receiver + a liveness ticker. The
     // watcher arm is disabled when `watcher_rx` is None: `unwrap_or(&dummy)` returns the
@@ -456,6 +459,10 @@ fn serve_inner(
         baseline_bytes = state.rss.baseline().get(),
         "session_peak_rss"
     );
+    // Persist the index cache on clean shutdown so the next launch can warm-start. Called
+    // at shutdown (not just at post-cold-reconcile) so a session that processed many edits
+    // leaves a fresh cache for the next launch. Fire-and-forget (log-only on failure).
+    state.workspace.save_cache();
 
     // WP-P3 flush: only fires when a recorder was injected (env var set or test-driven). A flush
     // failure is logged at warn (the LSP session is exiting anyway; killing the parent process
