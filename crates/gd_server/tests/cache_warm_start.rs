@@ -336,6 +336,218 @@ fn warm_load_produces_same_index_as_cold() {
     );
 }
 
+/// Issue 1 + Issue 2 seam test: disk edit → save → warm load skips re-parse on stat-match.
+///
+/// **This test is genuinely discriminating**: removing `update_stat_from_disk` from the
+/// production code causes this test to fail. Here's the forged-stat proof:
+///
+///   1. V1 on disk (size=S1). Cold load.
+///   2. Write V2 to disk (size=S2, S2≠S1). Capture V2's mtime (T2).
+///      Call `reindex` + `update_stat_from_disk`. Save cache → persisted stat = (S2, T2).
+///   3. Write V3 to disk (size=S2=V2 size, different class_name). Reset mtime to T2.
+///      Disk now shows stat (S2, T2) = **matches** the persisted (S2, T2).
+///   4. Warm load: stat matches → skip re-parse → serve persisted V2 index → "EditTargetV2".
+///
+/// Failure path (fix reverted):
+///   - Without `update_stat_from_disk`, the cache persists stat_V1 = (S1, T1).
+///   - Disk shows (S2, T2). MISMATCH → re-parse → reads V3 → "EditTargetV3" (**fail**).
+///
+/// The forged-stat trick (V3 same size as V2, mtime reset to T2) is what makes the
+/// skip observable without process restart — it makes disk appear unchanged relative
+/// to the persisted stat.
+#[test]
+fn warm_load_skips_reparse_when_stat_matches() {
+    use std::time::SystemTime;
+
+    let p = common::TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+
+    // V1: class_name EditTarget (size S1, different from V2/V3).
+    let v1_src = "class_name EditTarget\nextends Node\n";
+    p.write("src/edit_target.gd", v1_src);
+    p.write("src/bystander.gd", "class_name Bystander\nextends Node\n");
+
+    let options = InitializationOptions::parse(Some(&serde_json::json!({
+        "projectRoot": p.root.as_str(),
+    })));
+
+    // --- Session 1: cold build, write V2, reindex + update_stat, save cache. ---
+    let mut ws = Workspace::load(&p.root, &options);
+    assert_eq!(ws.index.file_count(), 2, "precondition");
+
+    let edit_path = p.root.join("src/edit_target.gd");
+    assert_eq!(
+        ws.index
+            .interface_of(&edit_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("EditTarget"),
+        "precondition: V1 class_name must be EditTarget"
+    );
+
+    // V2 content — must differ in size from V1 so stat_V1 ≠ stat_V2.
+    // "EditTargetV2" vs "EditTarget" = 2 extra chars → S2 = S1+2.
+    let v2_src = "class_name EditTargetV2\nextends Node\n";
+    p.write("src/edit_target.gd", v2_src);
+
+    // Capture V2's mtime before any further write (used to forge V3's stat below).
+    let v2_mtime: SystemTime = std::fs::metadata(edit_path.as_std_path())
+        .expect("stat V2")
+        .modified()
+        .expect("mtime V2");
+
+    // Simulate reindex_from_disk: parse, reindex, update stat → cache persists stat_V2.
+    let text = std::fs::read_to_string(edit_path.as_std_path()).unwrap();
+    ws.reindex(&edit_path, &gd_syntax::parse(&text).tree);
+    ws.update_stat_from_disk(&edit_path);
+
+    assert_eq!(
+        ws.index
+            .interface_of(&edit_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("EditTargetV2"),
+        "in-session: reindex must reflect V2"
+    );
+
+    ws.save_cache(); // persists index=V2, stat=(S2,T2)
+
+    // --- Forge V3: same size as V2, different class_name, mtime reset to T2. ---
+    // V3 is the same length as V2: "EditTargetV3" == "EditTargetV2" in byte count.
+    let v3_src = "class_name EditTargetV3\nextends Node\n";
+    assert_eq!(
+        v2_src.len(),
+        v3_src.len(),
+        "V2 and V3 must be the same byte length for the stat-forge to work"
+    );
+    p.write("src/edit_target.gd", v3_src);
+    // Reset mtime to T2 so disk stat = (S2, T2) = matches persisted stat_V2.
+    std::fs::File::open(edit_path.as_std_path())
+        .expect("open V3 for set_modified")
+        .set_modified(v2_mtime)
+        .expect("set_modified");
+
+    // --- Session 2: warm load — stat matches → skip re-parse → serve V2 index. ---
+    let warm_ws = Workspace::load(&p.root, &options);
+    assert_eq!(warm_ws.index.file_count(), 2, "warm load file count");
+
+    // The discriminating assertion: V2 interface must be served (skip proves fix works).
+    // If update_stat_from_disk was absent, persisted stat_V1 ≠ forged stat_V2 → re-parse
+    // → "EditTargetV3" → FAIL.
+    assert_eq!(
+        warm_ws
+            .index
+            .interface_of(&edit_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("EditTargetV2"),
+        "warm load must serve the persisted V2 interface (skipped re-parse) — \
+         fail means update_stat_from_disk did NOT persist stat_V2, so warm-load \
+         re-parsed V3 from disk instead"
+    );
+
+    // Bystander unchanged.
+    let bystander_path = p.root.join("src/bystander.gd");
+    assert_eq!(
+        warm_ws
+            .index
+            .interface_of(&bystander_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("Bystander"),
+        "bystander must retain its original class_name"
+    );
+}
+
+/// Issue 1 never-lie guard: unsaved buffer edit must NOT be served as disk truth after a warm load.
+///
+/// This is the "never lie" seam: the editor has a buffer whose interface differs from the on-disk
+/// file, the server shuts down (saves cache via `save_cache_excluding_open`), and the next launch
+/// warm-loads. The warm load must serve the ON-DISK interface (by re-parsing from disk because
+/// the file's stat entry was excluded from the saved cache), not the unsaved buffer interface.
+///
+/// The fix: `save_cache_excluding_open` omits open-buffer files from the persisted stat table
+/// so warm-load sees "unknown stat" for them and re-parses from disk.
+#[test]
+fn warm_load_after_unsaved_buffer_edit_serves_disk_interface() {
+    let p = common::TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    // Disk has V1 content with class_name DiskClass.
+    let disk_src = "class_name DiskClass\nextends Node\n";
+    let buffer_src = "class_name BufferClass\nextends Node\nvar unsaved: int = 0\n";
+    p.write("src/target.gd", disk_src);
+    p.write("src/other.gd", "class_name Other\nextends Node\n");
+
+    let options = InitializationOptions::parse(Some(&serde_json::json!({
+        "projectRoot": p.root.as_str(),
+    })));
+
+    // --- Session 1: cold build, buffer-only edit (disk unchanged), save excluding the open file. ---
+    let mut ws = Workspace::load(&p.root, &options);
+    assert_eq!(ws.index.file_count(), 2, "precondition: two files indexed");
+
+    let target_path = p.root.join("src/target.gd");
+    assert_eq!(
+        ws.index
+            .interface_of(&target_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("DiskClass"),
+        "precondition: original class_name must be DiskClass"
+    );
+
+    // Simulate a buffer-only edit: parse the buffer text (NOT on disk) and reindex.
+    // Do NOT write to disk and do NOT call update_stat_from_disk.
+    // This models what server.rs reindex_open_buffer does.
+    let parsed = gd_syntax::parse(buffer_src);
+    ws.reindex(&target_path, &parsed.tree);
+
+    // In-session the index reflects the buffer content.
+    assert_eq!(
+        ws.index
+            .interface_of(&target_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("BufferClass"),
+        "in-session buffer reindex must reflect BufferClass"
+    );
+
+    // The file is "open" in the editor (unsaved buffer). Simulate save_cache_excluding_open by
+    // building the open-paths set that the server's shutdown path would build.
+    // `gd_project::normalize_path` is the same normalization used by the server's
+    // `open_buffer_paths` helper (forward slashes, same as index keys).
+    let norm_target = gd_project::normalize_path(&target_path);
+    let open_paths = rustc_hash::FxHashSet::from_iter([norm_target]);
+
+    // Save cache excluding the open buffer: the target file's stat entry must NOT be persisted.
+    ws.save_cache_excluding_open(&open_paths);
+
+    // --- Session 2: warm load from cache. ---
+    // The target file's stat entry was NOT saved, so warm-load sees "unknown stat" → re-parses
+    // from disk → recovers the on-disk DiskClass interface, NOT the unsaved BufferClass.
+    let warm_ws = Workspace::load(&p.root, &options);
+    assert_eq!(
+        warm_ws.index.file_count(),
+        2,
+        "warm load must produce the same file count"
+    );
+
+    assert_eq!(
+        warm_ws
+            .index
+            .interface_of(&target_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("DiskClass"),
+        "warm load must serve the ON-DISK class_name (DiskClass), not the unsaved buffer \
+         interface (BufferClass) — never-lie guard"
+    );
+
+    // The non-open file must still be served from cache (its stat was persisted normally).
+    let other_path = p.root.join("src/other.gd");
+    assert_eq!(
+        warm_ws
+            .index
+            .interface_of(&other_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("Other"),
+        "the non-open file must be served from cache with its correct interface"
+    );
+}
+
 /// Timing breakdown: measure the individual phases of cold vs warm to diagnose ratio failures.
 /// This test is informational — it always passes, printing its findings to stderr.
 #[test]
