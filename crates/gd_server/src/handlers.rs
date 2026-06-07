@@ -3,7 +3,7 @@
 use gd_analyze::{find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, DtKind};
 use gd_syntax::ast::{
     ClassNode, ConstantNode, FunctionNode, LiteralNode, NodeId, NodeKind, ParseTree, SignalNode,
-    VariableNode,
+    SubscriptAccess, VariableNode,
 };
 use gd_syntax::Literal;
 use gd_types::native_db::NativeClass;
@@ -637,6 +637,41 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
     }
 }
 
+/// Returns `true` when `ident_id` is in a method-or-signal role in `tree`:
+/// - The `.identifier` child of a `Function` or `Signal` node (declaration-site click), OR
+/// - A `Subscript { access: Attribute(Some(ident_id)) }` operand (call-site attribute click, e.g.
+///   `l.helper()` — the cursor lands on `helper`'s Identifier, which is the attribute access node).
+///
+/// Used to decide whether `textDocument/references` should use the project-wide text scan (correct
+/// for method/signal targets that callers reach through body-local typed vars) or the faster
+/// `name_referencers` index (correct for class/type/variable targets reachable only via interface-
+/// level type annotations). The check is purely structural (O(#nodes), no analyzer involvement)
+/// and works identically whether the cursor is on the declaration or a call site.
+fn is_method_or_signal_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
+    for nid in tree.iter_ids() {
+        match &tree.get(nid).kind {
+            NodeKind::Function(f) => {
+                if f.identifier == Some(ident_id) {
+                    return true;
+                }
+            }
+            NodeKind::Signal(s) => {
+                if s.identifier == Some(ident_id) {
+                    return true;
+                }
+            }
+            NodeKind::Subscript(s) => {
+                if matches!(s.access, Some(SubscriptAccess::Attribute(Some(aid))) if aid == ident_id)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Resolve a `class_name` to the URI + identifier span of its declaring file's class header. The
 /// `class_name` registry tracks the path + identifier name; gdls locates the identifier span by
 /// parsing the target's text — but if the target is an *open* buffer, the workspace's parse cache
@@ -937,21 +972,15 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         .as_deref()
         .and_then(|p| state.workspace.index.file_id(p));
 
-    // Detect whether the cursor name is a method or signal in the current file's interface. If the
-    // file has no class_name (or the name isn't in the interface), it can still be a method — fall
-    // back to checking whether the cursor's Identifier node is the name child of a Function/Signal
-    // node via the interface members list (the interface always captures every func/signal).
-    let is_method_or_signal = current_fid
-        .and_then(|fid| state.workspace.index.interface(fid))
-        .is_some_and(|iface| {
-            iface.members.iter().any(|m| {
-                m.name == name
-                    && matches!(
-                        m.kind,
-                        gd_project::MemberKind::Func | gd_project::MemberKind::Signal
-                    )
-            })
-        });
+    // Detect whether the cursor identifier is in a method-or-signal role. We use a structural AST
+    // check (`is_method_or_signal_ident`) rather than an interface lookup because:
+    //   1. The interface only contains members of the *declaring* file — a click on a call site in
+    //      another file (e.g. `l.helper()` in `a.gd`) won't find `helper` in `a.gd`'s interface.
+    //   2. Private (`_`-prefixed) methods appear in the AST regardless of class_name visibility.
+    // The check is O(#nodes) on the current file's parse tree — already in cache — with no
+    // analyzer call. It handles declaration-click (`func helper():`) and call-site attribute-click
+    // (`l.helper()`) identically, so find-references is position-independent (matches Godot).
+    let is_method_or_signal = is_method_or_signal_ident(&parsed.tree, node_id);
 
     // Collect (path, uri) pairs for candidate files. For method/signal targets, enumerate all
     // project files and pre-filter by substring; for others, use the name_referencers fast-path.
