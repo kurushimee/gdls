@@ -133,4 +133,53 @@ impl ProjectModel {
             other => Some(other.clone()),
         }
     }
+
+    /// The `res://` script path a configured autoload `name` points at, or `None` if there is no such
+    /// autoload or its target is not a script (e.g. a scene). Consumed by go-to-definition on an
+    /// autoload identifier (M6-D).
+    #[must_use]
+    pub fn autoload_script_path(&self, name: &str) -> Option<&str> {
+        self.autoloads
+            .iter()
+            .find(|a| a.name == name)
+            .and_then(|a| match &a.target {
+                ResTarget::Script(path) => Some(path.as_str()),
+                _ => None,
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project_godot::{Autoload, ResTarget, WarningConfig};
+    use rustc_hash::FxHashMap;
+
+    #[test]
+    fn autoload_script_path_resolves_script_targets_only() {
+        let model = ProjectModel {
+            root: Utf8PathBuf::from("/tmp/project"),
+            config_version: 5,
+            main_scene: None,
+            autoloads: vec![
+                Autoload {
+                    name: "Save".into(),
+                    target: ResTarget::Script("res://save.gd".into()),
+                    is_singleton: true,
+                },
+                Autoload {
+                    name: "Music".into(),
+                    target: ResTarget::Scene("res://music.tscn".into()),
+                    is_singleton: true,
+                },
+            ],
+            warnings: WarningConfig::default(),
+            gdextensions: vec![],
+            uids: FxHashMap::default(),
+        };
+
+        assert_eq!(model.autoload_script_path("Save"), Some("res://save.gd"));
+        assert_eq!(model.autoload_script_path("Music"), None); // non-script (Scene) target
+        assert_eq!(model.autoload_script_path("Nope"), None); // unknown name
+    }
 }
