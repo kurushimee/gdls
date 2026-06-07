@@ -2038,5 +2038,33 @@ mod tests {
             0,
             "freshly-loaded index must have an empty dirty set"
         );
+
+        // Independent oracle: run real query operations on the restored index, exercising
+        // the rebuilt inverse maps (ids, name_referencers) rather than just the structural check.
+
+        // resolve_base on enemy.gd (extends Hero) must yield the hero FileId.
+        let db = native_db();
+        assert_eq!(
+            restored.resolve_base(enemy_id_before, &db),
+            Resolution::Script(hero_id_before),
+            "enemy.gd must resolve its base (Hero) to hero.gd's FileId after round-trip"
+        );
+
+        // name_referencers("Hero") on the restored index must yield the same FileIds.
+        let mut orig_refs: Vec<FileId> = idx.name_referencers("Hero").collect();
+        let mut restored_refs: Vec<FileId> = restored.name_referencers("Hero").collect();
+        orig_refs.sort();
+        restored_refs.sort();
+        assert_eq!(
+            orig_refs, restored_refs,
+            "name_referencers must match across round-trip"
+        );
+
+        // Class registry: restored index knows Hero is in hero.gd.
+        let hero_entry = restored
+            .registry()
+            .get("Hero")
+            .expect("Hero registered after round-trip");
+        assert_eq!(hero_entry.path, abs("hero.gd"));
     }
 }
