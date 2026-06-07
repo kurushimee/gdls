@@ -683,15 +683,27 @@ mod tests {
         }
 
         // Drain debounced batches until the stream goes quiet (no batch for a full 300 ms after the
-        // burst settles). Count how many surfaced events name the hammered file.
-        let mut events_for_target = 0usize;
+        // burst settles). Count only the events the watcher actually ACTS on — `classify_event`'s
+        // `Reaction::GdSource` (the index-affecting Create/Modify events whose per-save reindex
+        // budget WP-T1 depends on coalescing). Counting *raw* events instead is what made this test
+        // CI-flaky: notify-debouncer-full coalesces the burst's Create/Modify events for one path
+        // into ~1, but it does NOT coalesce the `Access(Open/Close)` events each write also emits
+        // (one open + one close per write). Those Access events are dropped by the production
+        // classifier (`SkipReason::AccessOnly`) and are irrelevant to the reindex budget, yet on a
+        // loaded CI runner ~2 Access events × 12 writes pushed the raw count to 24 — past `WRITES` —
+        // and failed a perfectly-healthy debouncer. Classifying first measures the real contract.
+        let mut index_events_for_target = 0usize;
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             match watcher.events().recv_timeout(Duration::from_millis(300)) {
                 Ok(Ok(batch)) => {
-                    for ev in batch {
-                        if ev.paths.iter().any(|p| p.ends_with("hammered.gd")) {
-                            events_for_target += 1;
+                    for ev in &batch {
+                        for reaction in classify_event(ev, &root) {
+                            if let Reaction::GdSource { path, .. } = reaction {
+                                if path.ends_with("hammered.gd") {
+                                    index_events_for_target += 1;
+                                }
+                            }
                         }
                     }
                 }
@@ -701,13 +713,13 @@ mod tests {
         }
 
         assert!(
-            events_for_target >= 1,
-            "the watcher must surface at least one event for the hammered file"
+            index_events_for_target >= 1,
+            "the watcher must surface at least one index-affecting event for the hammered file"
         );
         assert!(
-            events_for_target < WRITES,
-            "the quiet-time must COALESCE the {WRITES}-write burst into fewer debounced events; \
-             got {events_for_target} (no coalescing would yield ~{WRITES})"
+            index_events_for_target <= WRITES / 2,
+            "the quiet-time must COALESCE the {WRITES}-write burst into far fewer index-affecting \
+             events; got {index_events_for_target} (no coalescing would yield ~{WRITES})"
         );
     }
 }
