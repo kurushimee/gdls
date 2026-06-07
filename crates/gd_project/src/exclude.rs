@@ -20,7 +20,14 @@ use camino::Utf8Path;
 /// — all of which the index/watcher must surface so cross-file resolution stays correct. A stray
 /// `.gd` under an addon will get indexed; this is intentional behavior. Operators who genuinely
 /// don't want addon scripts in the index can omit them via project layout.
-pub const EXCLUDED_COMPONENTS: &[&str] = &[".godot", ".import", ".git", "target", "node_modules"];
+pub const EXCLUDED_COMPONENTS: &[&str] = &[
+    ".godot",
+    ".import",
+    ".git",
+    "target",
+    "node_modules",
+    ".gdls",
+];
 
 /// Suffixes matched on the *file name* part. Tmp/backup files from editors. (The cold index
 /// already filters to the `.gd` extension, so these mostly matter to the watcher — but sharing
