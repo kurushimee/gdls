@@ -191,6 +191,20 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     let byte = mapper.position_to_byte(tdp.position);
     let node_id = parsed.tree.innermost_node_at(byte)?;
 
+    // M6-Fix2: when the cursor is on a `res://` string literal (e.g. `preload("res://foo.gd")`),
+    // render the resolved script's basename. Return early so `render_hover` (which renders `String`
+    // for string literal nodes) doesn't shadow this more useful result.
+    if let Some(preload_md) = hover_preload_string(state, &parsed.tree, node_id) {
+        let leaf_node = parsed.tree.get(node_id);
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: preload_md,
+            }),
+            range: Some(mapper.span_to_range(leaf_node.span)),
+        });
+    }
+
     // The analyzer pins resolved types on whichever node it "owns" — usually the assignable
     // (`Variable`/`Constant`/`Parameter`) or the expression (`BinaryOp`, `Call`, …), not the inner
     // identifier slot. Hover should land on a node *with* a type when possible, so fall back from
@@ -460,9 +474,9 @@ fn render_hover(
 ///    checking whether the leaf's span is contained in any enclosing Call whose callee is a
 ///    subscript access with a known base type.
 ///
-/// The signature format is `func name(ParamType, …) -> ReturnType` using the unresolved syntactic
-/// type names from [`gd_project::TypeExpr`]; no parameter names are available at the interface
-/// level. This matches Godot's `hover` intent for cross-file method calls.
+/// The signature format is `func name(name: ParamType, …) -> ReturnType` using the parameter
+/// names and unresolved syntactic type names from [`gd_project::MemberDecl`]. When a name is
+/// unavailable (empty string), the type alone is rendered.
 fn hover_member_signature(
     state: &ServerState,
     tree: &ParseTree,
@@ -510,13 +524,23 @@ fn hover_member_signature(
     let iface = state.workspace.index.interface(callee_file)?;
     let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
 
-    // Format: `func name(ParamType, …) -> ReturnType`
+    // Format: `func name(param_name: ParamType, …) -> ReturnType`
+    // Zip param_names and params in lockstep; fall back to type-only when the name is empty.
     let params_str = decl
         .params
         .iter()
-        .map(|p| match p {
-            gd_project::TypeExpr::Named { path, .. } => path.join("."),
-            gd_project::TypeExpr::None => "Variant".to_string(),
+        .enumerate()
+        .map(|(i, p)| {
+            let type_str = match p {
+                gd_project::TypeExpr::Named { path, .. } => path.join("."),
+                gd_project::TypeExpr::None => "Variant".to_string(),
+            };
+            let name_str = decl.param_names.get(i).map(String::as_str).unwrap_or("");
+            if name_str.is_empty() {
+                type_str
+            } else {
+                format!("{name_str}: {type_str}")
+            }
         })
         .collect::<Vec<_>>()
         .join(", ");
@@ -544,6 +568,27 @@ fn append_class_docs(md: &mut String, class: &NativeClass) {
         md.push_str("\n\n");
         md.push_str(&class.description);
     }
+}
+
+/// M6-Fix2: when the cursor is on a `res://`-path string literal (e.g. inside
+/// `preload("res://foo.gd")`), render a hover showing the resolved script's basename.
+/// Returns `None` for non-res strings, unresolvable paths, or non-`String` literal nodes.
+fn hover_preload_string(state: &ServerState, tree: &ParseTree, node_id: NodeId) -> Option<String> {
+    let NodeKind::Literal(LiteralNode {
+        value: Literal::String(path),
+    }) = &tree.get(node_id).kind
+    else {
+        return None;
+    };
+    if !path.starts_with("res://") {
+        return None;
+    }
+    // Gate on index membership — only emit hover for paths that resolve to indexed files.
+    let fid = state.workspace.index.resolve_res_path(path)?;
+    let abs = state.workspace.index.path(fid).map(|p| p.to_path_buf())?;
+    let basename = abs.file_name().unwrap_or(abs.as_str());
+    let md = format!("```gdscript\n{basename}\n```\n\nGDScript: `{path}`");
+    Some(md)
 }
 
 /// Look for `name` as a member of the file's root class (Godot's `parser->head`). Returns the
@@ -638,17 +683,21 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
     }
 }
 
-/// Returns `true` when `ident_id` is in a method-or-signal role in `tree`:
+/// Returns `true` when `ident_id` is in a method, signal, or attribute-subscript role in `tree`:
 /// - The `.identifier` child of a `Function` or `Signal` node (declaration-site click), OR
-/// - A `Subscript { access: Attribute(Some(ident_id)) }` operand (call-site attribute click, e.g.
-///   `l.helper()` — the cursor lands on `helper`'s Identifier, which is the attribute access node).
+/// - A `Subscript { access: Attribute(Some(ident_id)) }` operand (call-site or property-read
+///   attribute click, e.g. `l.helper()` or `node.position` — the cursor lands on the attribute
+///   Identifier in the subscript).
 ///
 /// Used to decide whether `textDocument/references` should use the project-wide text scan (correct
 /// for method/signal targets that callers reach through body-local typed vars) or the faster
 /// `name_referencers` index (correct for class/type/variable targets reachable only via interface-
 /// level type annotations). The check is purely structural (O(#nodes), no analyzer involvement)
 /// and works identically whether the cursor is on the declaration or a call site.
-fn is_method_or_signal_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
+/// Note: attribute-subscript property reads (e.g. `node.position`) are structurally matched as
+/// well — this is an over-approximation for properties, but never produces false positives in
+/// practice since property reads appear in both text-scan and binding-scan paths.
+fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
     for nid in tree.iter_ids() {
         match &tree.get(nid).kind {
             NodeKind::Function(f) => {
@@ -935,28 +984,22 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
 
     let mut locations: Vec<Location> = Vec::new();
 
-    if params.context.include_declaration {
-        if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-            locations.push(loc);
-        } else if let Some(loc) = find_global_class_definition(state, &name) {
-            locations.push(loc);
-        }
-    }
-
     let current_path = crate::uri::uri_to_path(&uri);
     let current_fid = current_path
         .as_deref()
         .and_then(|p| state.workspace.index.file_id(p));
 
     // Detect whether the cursor identifier is in a method-or-signal role. We use a structural AST
-    // check (`is_method_or_signal_ident`) rather than an interface lookup because:
+    // check (`is_member_or_attribute_ident`) rather than an interface lookup because:
     //   1. The interface only contains members of the *declaring* file — a click on a call site in
     //      another file (e.g. `l.helper()` in `a.gd`) won't find `helper` in `a.gd`'s interface.
     //   2. Private (`_`-prefixed) methods appear in the AST regardless of class_name visibility.
     // The check is O(#nodes) on the current file's parse tree — already in cache — with no
     // analyzer call. It handles declaration-click (`func helper():`) and call-site attribute-click
-    // (`l.helper()`) identically, so find-references is position-independent (matches Godot).
-    let is_method_or_signal = is_method_or_signal_ident(&parsed.tree, node_id);
+    // (`l.helper()`) identically. Note: attribute-subscript property reads are also structurally
+    // matched (e.g. `node.position`) — these fire the method/signal code path, which is an
+    // over-approximation for properties but never produces false positives in practice.
+    let is_method_or_signal = is_member_or_attribute_ident(&parsed.tree, node_id);
 
     // For method/signal targets, compute `target_file` — the FileId of the file that DECLARES
     // the method. Used to filter `Binding::Call` records to genuine callers of this specific
@@ -1009,6 +1052,70 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     } else {
         None
     };
+
+    // include_declaration: prepend the declaration site when requested.
+    // For method/signal targets, the declaring file may be different from the current file
+    // (cross-file call-site click). When target_file is known and differs from the current file,
+    // read the declaring file and use find_in_file_definition on its tree to get the narrow
+    // identifier span (not MemberDecl.span, which is the whole func node).
+    if params.context.include_declaration {
+        let decl_found = if is_method_or_signal {
+            if let Some(tf) = target_file {
+                if current_fid.is_some_and(|cf| cf == tf) {
+                    // Declaration-site click: the current file IS the declaring file.
+                    if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
+                        locations.push(loc);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    // Cross-file call-site click: read the declaring file and locate the identifier.
+                    let decl_loc = state
+                        .workspace
+                        .index
+                        .path(tf)
+                        .map(|p| p.to_path_buf())
+                        .and_then(|decl_path| path_to_file_uri(&decl_path).map(|u| (decl_path, u)))
+                        .and_then(|(decl_path, decl_uri)| {
+                            let text = match state.vfs.get(decl_uri.as_str()).map(|d| d.text()) {
+                                Some(t) => t,
+                                None => std::fs::read_to_string(decl_path.as_std_path()).ok()?,
+                            };
+                            let decl_parsed = state
+                                .workspace
+                                .parse(&CanonicalKey::for_uri(&decl_uri), &text);
+                            let decl_rope = Rope::from_str(&text);
+                            let decl_mapper = PositionMapper::new(&decl_rope, enc);
+                            find_in_file_definition(
+                                &decl_parsed.tree,
+                                &name,
+                                &decl_uri,
+                                &decl_mapper,
+                            )
+                        });
+                    if let Some(loc) = decl_loc {
+                        locations.push(loc);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !decl_found {
+            // Non-method targets: use the existing class_name / in-file fallback.
+            if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
+                locations.push(loc);
+            } else if let Some(loc) = find_global_class_definition(state, &name) {
+                locations.push(loc);
+            }
+        }
+    }
 
     // Always scan the current file's bindings — name_referencers is the interface-level filter
     // (cross-file dependents), not the self-references set. The body of the current file may

@@ -237,6 +237,75 @@ fn references_excludes_unrelated_same_named_method() {
     shutdown(&client, server_thread);
 }
 
+/// Fix 3: `include_declaration: true` for a cross-file method must include the declaration site
+/// in the declaring file. The cursor is on a CALL SITE in caller.gd; with include_declaration=true,
+/// the response must include a Location in lib.gd at the `helper` declaration.
+#[test]
+fn references_include_declaration_returns_cross_file_decl() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+
+    // lib.gd: class_name Lib, func helper() at line 3, col 5..11.
+    p.write(
+        "lib.gd",
+        "class_name Lib\nextends Node\n\nfunc helper():\n\tpass\n",
+    );
+
+    // caller.gd: calls l.helper() at line 3, col 3..9.
+    p.write(
+        "caller.gd",
+        "extends Node\n\nfunc test(l: Lib):\n\tl.helper()\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["lib.gd", "caller.gd"]);
+
+    let caller_uri = file_uri(&p.root.join("caller.gd"));
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: caller_uri.clone(),
+            },
+            // Cursor on `helper` at line 3, col 5 (inside `l.helper()`).
+            position: Position {
+                line: 3,
+                character: 5,
+            },
+        },
+        context: ReferenceContext {
+            include_declaration: true,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(40, "textDocument/references", params))
+        .unwrap();
+    let Message::Response(resp) = recv(&client) else {
+        panic!("expected references response");
+    };
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    let lib_uri = file_uri(&p.root.join("lib.gd"));
+
+    // The declaration in lib.gd at line 3, col 5..11 must be included.
+    let has_decl = locs
+        .iter()
+        .any(|l| l.uri == lib_uri && l.range.start.line == 3 && l.range.start.character == 5);
+    assert!(
+        has_decl,
+        "include_declaration:true must include the method declaration in lib.gd at line 3, col 5; \
+         got: {locs:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 /// Bare same-file call: `func a(): helper()` calling a sibling `func helper()`.
 /// Find-references on `helper`'s declaration must include the same-file bare call site.
 ///
