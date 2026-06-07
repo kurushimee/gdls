@@ -236,3 +236,83 @@ fn references_excludes_unrelated_same_named_method() {
 
     shutdown(&client, server_thread);
 }
+
+/// Bare same-file call: `func a(): helper()` calling a sibling `func helper()`.
+/// Find-references on `helper`'s declaration must include the same-file bare call site.
+///
+/// Regression guard for the callee_ident_span bare-call path: bare calls have `CallNode::callee =
+/// None` so the SubscriptAccess arm can't produce the span; must fall back to
+/// `call_site.start..call_site.start + function_name.len()` for the narrow identifier span.
+#[test]
+fn references_finds_bare_same_file_call() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+
+    // lib.gd: `func a()` calls sibling `func helper()` with a bare (unqualified) call.
+    // Line 0: `extends Node`
+    // Line 2: `func a():`
+    // Line 3: `\thelper()`  — `helper` identifier at col 1..7 (after the tab)
+    // Line 5: `func helper():`
+    // Line 6: `\tpass`
+    // Click declaration at line 5, col 7 — must return call site at line 3, col 1.
+    p.write(
+        "lib.gd",
+        "extends Node\n\nfunc a():\n\thelper()\n\nfunc helper():\n\tpass\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["lib.gd"]);
+
+    let lib_uri = file_uri(&p.root.join("lib.gd"));
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: lib_uri.clone(),
+            },
+            // Click on `helper` at line 5, col 7 (declaration).
+            position: Position {
+                line: 5,
+                character: 7,
+            },
+        },
+        context: ReferenceContext {
+            include_declaration: false,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(30, "textDocument/references", params))
+        .unwrap();
+    let Message::Response(resp) = recv(&client) else {
+        panic!("expected references response");
+    };
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    // The bare call site at line 3 (func a body) must be in results.
+    let has_call = locs
+        .iter()
+        .any(|l| l.uri == lib_uri && l.range.start.line == 3);
+    assert!(
+        has_call,
+        "references must include bare same-file call site at line 3; got: {locs:?}"
+    );
+
+    // The narrow span: `helper` starts at col 1 (after the tab).
+    for loc in locs
+        .iter()
+        .filter(|l| l.uri == lib_uri && l.range.start.line == 3)
+    {
+        assert_eq!(
+            loc.range.start.character, 1,
+            "bare call site range should start at `helper` col 1 (after tab); got {loc:?}"
+        );
+    }
+
+    shutdown(&client, server_thread);
+}
