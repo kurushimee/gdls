@@ -281,6 +281,24 @@ fn stat_delta_detects_size_change() {
         saved_stat.size, new_stat.size,
         "mutating a.gd's content must change its size, flagging it for re-parse"
     );
+
+    // b.gd was NOT changed — its saved stat must match current disk stat exactly.
+    let b_path = root.join("b.gd");
+    let b_meta = fs::metadata(b_path.as_std_path()).expect("stat b.gd");
+    let b_current_stat = cache::stat_from_metadata(b_path.clone(), &b_meta);
+    let b_saved_stat = loaded
+        .files
+        .iter()
+        .find(|s| s.path == b_path)
+        .expect("b.gd in loaded stats");
+    assert_eq!(
+        b_saved_stat.size, b_current_stat.size,
+        "b.gd was not mutated — its size must be unchanged (only a.gd flagged for re-parse)"
+    );
+    assert_eq!(
+        b_saved_stat.mtime_ns, b_current_stat.mtime_ns,
+        "b.gd was not mutated — its mtime_ns must be unchanged"
+    );
 }
 
 // ---------------------------------------------------------------------------
