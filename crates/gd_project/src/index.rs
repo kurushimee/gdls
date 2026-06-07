@@ -1988,12 +1988,17 @@ mod tests {
                 "scene.gd",
                 "extends Node\nconst E = preload(\"res://enemy.gd\")\n",
             ),
+            // A path-based extends: exercises file_path_ref / path_referencers round-trip.
+            // Without this fixture those maps are empty and cache_equivalent compares
+            // empty-vs-empty vacuously, hiding any bug in `from_cache`'s inverse rebuild.
+            ("waiter.gd", "extends \"res://hero.gd\"\n"),
         ]);
 
         // Capture reference FileIds before serialization.
         let hero_id_before = idx.file_id(&abs("hero.gd")).expect("hero.gd interned");
         let enemy_id_before = idx.file_id(&abs("enemy.gd")).expect("enemy.gd interned");
         let scene_id_before = idx.file_id(&abs("scene.gd")).expect("scene.gd interned");
+        let waiter_id_before = idx.file_id(&abs("waiter.gd")).expect("waiter.gd interned");
 
         // Serialize the cache view.
         let cache = idx.to_cache();
@@ -2019,6 +2024,11 @@ mod tests {
             Some(scene_id_before),
             "scene.gd FileId must be stable across round-trip"
         );
+        assert_eq!(
+            restored.file_id(&abs("waiter.gd")),
+            Some(waiter_id_before),
+            "waiter.gd FileId must be stable across round-trip"
+        );
 
         // The restored Index must be structurally equivalent to the original.
         assert!(
@@ -2040,7 +2050,8 @@ mod tests {
         );
 
         // Independent oracle: run real query operations on the restored index, exercising
-        // the rebuilt inverse maps (ids, name_referencers) rather than just the structural check.
+        // the rebuilt inverse maps (ids, name_referencers, path_referencers) rather than
+        // just the structural check.
 
         // resolve_base on enemy.gd (extends Hero) must yield the hero FileId.
         let db = native_db();
@@ -2058,6 +2069,23 @@ mod tests {
         assert_eq!(
             orig_refs, restored_refs,
             "name_referencers must match across round-trip"
+        );
+
+        // path_referencers oracle: waiter.gd uses `extends "res://hero.gd"` (a path-based
+        // extends), so the restored index's path_referencers inverse map must link hero.gd's
+        // absolute path back to waiter's FileId. This directly tests that `from_cache` correctly
+        // rebuilds `path_referencers` from the serialized `file_path_ref` forward data — a bug
+        // there would silently break cross-file re-linking after a warm start, but `cache_equivalent`
+        // alone wouldn't catch it when the maps are empty (no fixture uses path extends). Direct field
+        // access is valid here: this test lives in the same module as Index.
+        let path_refs_for_hero = restored.path_referencers.get(&abs("hero.gd")).expect(
+            "path_referencers must have an entry for hero.gd after round-trip \
+                     (waiter.gd path-extends it)",
+        );
+        assert!(
+            path_refs_for_hero.contains(&waiter_id_before),
+            "path_referencers[hero.gd] must contain waiter.gd's FileId after round-trip; \
+             got: {path_refs_for_hero:?}"
         );
 
         // Class registry: restored index knows Hero is in hero.gd.
