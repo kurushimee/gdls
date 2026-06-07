@@ -11,11 +11,12 @@
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 
 use crate::interface::Extends;
 
 /// A class's immediate base, captured syntactically (resolved on demand by the [`crate::index::Index`]).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BaseRef {
     /// No `extends` clause.
     None,
@@ -36,7 +37,7 @@ impl BaseRef {
 }
 
 /// A registered global class: the file it lives in and its base.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassEntry {
     /// Absolute path of the declaring `.gd` file.
     pub path: Utf8PathBuf,
@@ -50,10 +51,31 @@ pub struct ClassEntry {
 /// A `path → name` reverse map (`by_path`) makes [`Self::remove_by_path`] O(1): a file declares at
 /// most one global `class_name`, so reconciling a file's registration on every (re)index never scans
 /// the whole table — without it, the cold index is O(N²).
+///
+/// Serialization stores only `by_name` (the source of truth); `by_path` is rebuilt on load.
 #[derive(Clone, Debug, Default)]
 pub struct ClassNameRegistry {
     by_name: FxHashMap<String, ClassEntry>,
     by_path: FxHashMap<Utf8PathBuf, String>,
+}
+
+impl Serialize for ClassNameRegistry {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize only the forward map (`by_name`). `by_path` is rebuilt on load.
+        self.by_name.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ClassNameRegistry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let by_name = FxHashMap::<String, ClassEntry>::deserialize(deserializer)?;
+        // Rebuild the reverse map from the forward data.
+        let mut by_path = FxHashMap::default();
+        for (name, entry) in &by_name {
+            by_path.insert(entry.path.clone(), name.clone());
+        }
+        Ok(ClassNameRegistry { by_name, by_path })
+    }
 }
 
 impl ClassNameRegistry {

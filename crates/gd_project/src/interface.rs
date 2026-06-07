@@ -14,9 +14,10 @@ use std::hash::{Hash, Hasher};
 use gd_syntax::ast::{ClassNode, EnumValue, Member, NodeId, NodeKind, PropertyStyle};
 use gd_syntax::{ByteSpan, ParseTree};
 use rustc_hash::FxHasher;
+use serde::{Deserialize, Serialize};
 
 /// What a class's `extends` clause names, captured syntactically.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Extends {
     /// No `extends` (Godot implies `RefCounted`; M2 leaves that to the analyzer).
     #[default]
@@ -28,7 +29,7 @@ pub enum Extends {
 }
 
 /// The kind of an exposed member. Inner classes are not members — they live in [`Interface::inner`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MemberKind {
     Const,
     Var,
@@ -42,7 +43,7 @@ pub enum MemberKind {
 
 /// A member's declared type, as written — an unresolved syntactic reference (decision 3). `Array[T]`
 /// / `Dictionary[K, V]` keep their container args; an attribute chain (`A.B`) keeps every segment.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TypeExpr {
     /// No annotation (untyped, inferred, or `void`).
     None,
@@ -65,7 +66,7 @@ impl TypeExpr {
 }
 
 /// Declaration flags that are part of a member's *interface* (they change how callers may use it).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemberFlags {
     pub is_static: bool,
     pub exported: bool,
@@ -75,7 +76,7 @@ pub struct MemberFlags {
 }
 
 /// One exposed member of a class.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberDecl {
     pub name: String,
     pub kind: MemberKind,
@@ -102,14 +103,14 @@ pub struct MemberDecl {
 /// chain — used by cross-file enum-value attribute walks (e.g. `P.Named.VALUE_A` where `P` is
 /// a preloaded script). Values without identifiers (computed at the parser, e.g. raw int
 /// expressions outside an enum declaration) are not collected — Godot ignores them too.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EnumDecl {
     pub name: String,
     pub values: Vec<String>,
 }
 
 /// The shallow interface of one class: what it exposes, with no types resolved.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interface {
     /// `class_name X` for the top-level class, or the declared name of an inner `class X:`.
     pub class_name: Option<String>,

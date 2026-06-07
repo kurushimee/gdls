@@ -10,11 +10,12 @@ use std::rc::Rc;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use gd_analyze::{code_from_name, AnalysisResult, StrictProfile, StrictSettings, WarnPolicy};
+use gd_project::cache::{self, FileStat};
 use gd_project::{Index, ProjectModel};
 use gd_syntax::{ParseResult, ParseTree};
 use gd_types::{DocXmlError, NativeDb};
 use lru::LruCache;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use walkdir::WalkDir;
 
 use crate::uri::CanonicalKey;
@@ -96,12 +97,19 @@ pub struct Workspace {
     /// session default the bare [`Self::analyze`] caller (which has no per-request context)
     /// picks up.
     analyzer_iter_limit: Option<u32>,
+    /// Per-file stat snapshot used for warm-start cache saves and stat-based reconcile. Keyed by
+    /// normalized path (`gd_project::normalize_path`). Populated during warm-load (stat-diff walk)
+    /// and after a cold `Index::build` (stat sweep of all interned files). Updated by
+    /// [`Self::reconcile`] as files are added/modified/removed so the table stays current
+    /// throughout the session. Consumed by [`Self::save_cache`] → `gd_project::cache::save`.
+    pub(crate) stat_table: FxHashMap<Utf8PathBuf, FileStat>,
 }
 
 impl Workspace {
     /// Build the workspace for a project rooted at `root`: load the native DB, parse `project.godot`,
-    /// then cold-index every `.gd`. Runs after the `initialize` response is sent, so a large scan
-    /// never stalls the handshake.
+    /// then either warm-start from the index cache (stat-diff only changed files) or cold-index
+    /// every `.gd`. Runs after the `initialize` response is sent, so a large scan never stalls the
+    /// handshake.
     pub fn load(root: &Utf8Path, options: &InitializationOptions) -> Self {
         // M5 WP-O1: cold_index span. Captures the full bootstrap — project model + native DB +
         // eager interface index + warn policy — so a hierarchical-profiler dump nests anything
@@ -117,7 +125,28 @@ impl Workspace {
         let _enter = _span.enter();
         let project = ProjectModel::load(root);
         let native = load_native(options, &project);
-        let index = Index::build(root);
+
+        // Build the cache key for warm-start attempt.
+        let key = build_cache_key(&native, root);
+
+        // Attempt warm-start: load the persisted cache and stat-diff it against disk.
+        // On any failure (missing file, key mismatch, verify failure) fall through to cold build.
+        let (index, stat_table) = match cache::load(root, &key) {
+            Some(loaded) => {
+                log::info!(
+                    "cache: warm-start candidate found; stat-diffing {} cached files",
+                    loaded.files.len()
+                );
+                warm_index_from_cache(loaded, root)
+            }
+            None => {
+                // Cold build — then sweep all interned files to populate the stat table.
+                let idx = Index::build(root);
+                let stats = build_stat_table_from_index(&idx);
+                (idx, stats)
+            }
+        };
+
         let policy = WarnPolicy::build(&project.warnings, &strict_settings(&options.strict));
         let file_count = index.file_count();
         log::info!(
@@ -140,7 +169,45 @@ impl Workspace {
             parse_cache: LruCache::new(cap),
             analysis_cache: LruCache::new(cap),
             analyzer_iter_limit: options.analyzer.iter_limit,
+            stat_table,
         }
+    }
+
+    /// Atomically persist the index + stat table to the `.gdls` cache directory.
+    /// Fire-and-forget: failures are logged at `warn` and never propagated (never crash).
+    /// Call AFTER build + reconcile have settled — not mid-reconcile.
+    ///
+    /// The persisted stat table contains only files that are NOT currently open in an editor
+    /// buffer. Files with open buffers may have a buffer-only interface in the index (never
+    /// written to disk), so persisting their disk-stat would cause warm-load to see
+    /// stored==disk-stat and skip re-parsing — serving the old on-disk interface as if it were
+    /// the buffer's unsaved content ("never lie" violation). By excluding them from the persisted
+    /// stat table, warm-load treats them as "unknown stat" and re-parses from disk, correctly
+    /// recovering the on-disk state. Use [`Self::save_cache`] when no buffers are open (startup,
+    /// diagnose CLI); use [`Self::save_cache_excluding_open`] at shutdown or any point where
+    /// unsaved editor buffers may exist.
+    pub fn save_cache(&self) {
+        self.save_cache_excluding_open(&FxHashSet::default());
+    }
+
+    /// Like [`Self::save_cache`] but excludes `open_paths` from the persisted stat table, so
+    /// warm-load re-parses those files from disk rather than trusting a buffer-only interface.
+    /// See [`Self::save_cache`] for the rationale.
+    pub fn save_cache_excluding_open(&self, open_paths: &FxHashSet<Utf8PathBuf>) {
+        let root = &self.project.root;
+        let key = build_cache_key(&self.native, root);
+        // Exclude files currently open in an editor buffer: their stat_table entry still reflects
+        // the pre-edit disk state (stat_table is only updated by disk-sourced reindexes), so if
+        // we persisted that entry, warm-load would see stored==current disk stat (unchanged since
+        // the buffer was opened) and skip re-parsing — serving the stale interface. Omitting the
+        // entry forces warm-load to re-parse the file from disk and get the correct interface.
+        let files: Vec<FileStat> = self
+            .stat_table
+            .iter()
+            .filter(|(path, _)| !open_paths.contains(*path))
+            .map(|(_, stat)| stat.clone())
+            .collect();
+        cache::save(root, &self.index, &files, key);
     }
 
     /// Parse `text`, reusing the cached result when the content fingerprint is unchanged. Both
@@ -437,11 +504,45 @@ impl Workspace {
     /// (2) it isn't needed for correctness, because cache validity is content-addressed
     /// ([`CacheEntry`]) and every reader passes current text, so a changed file misses the cache on
     /// its own. Eviction is reserved for [`Self::remove`], which is off the hot path.
+    ///
+    /// **Does NOT update `stat_table`** — call [`Self::update_stat_from_disk`] after this when the
+    /// source is a disk read (watcher, `didClose` reindex). On the buffer path the disk stat is
+    /// unchanged (the buffer text hasn't been written to disk), so `stat_table` must NOT be updated,
+    /// and the caller must ensure the file's stat_table entry is excluded from [`Self::save_cache`]
+    /// via `save_cache_excluding_open` so warm-load re-parses from disk rather than serving the
+    /// never-persisted buffer interface as disk truth.
     pub fn reindex(&mut self, path: &Utf8Path, tree: &ParseTree) {
         let iface = gd_project::extract_interface(tree);
         self.index.txn(path, |idx| {
             idx.on_file_changed(path, iface);
         });
+    }
+
+    /// Refresh `stat_table` for `path` from its current on-disk metadata. Call this after a
+    /// disk-sourced [`Self::reindex`] (watcher, `reindex_from_disk` on close). Keeps the stat
+    /// snapshot current so the next warm-load sees the updated stat and skips re-parsing the file
+    /// if it hasn't changed again. A stat failure is logged and the entry is removed so the next
+    /// reconcile retries defensively.
+    ///
+    /// **Must NOT be called after a buffer-only [`Self::reindex`]**: the buffer text hasn't hit
+    /// disk, so the disk stat is stale relative to the buffer interface now live in the index.
+    /// Calling this on a buffer reindex would mark the file "up to date" with disk when it isn't,
+    /// causing warm-load to serve the old disk interface — the "never lie" violation. The buffer
+    /// path uses [`Self::save_cache_excluding_open`] instead to ensure those files are re-parsed
+    /// fresh on the next launch.
+    pub fn update_stat_from_disk(&mut self, path: &Utf8Path) {
+        match std::fs::metadata(path.as_std_path()) {
+            Ok(meta) => {
+                let stat = cache::stat_from_metadata(path.to_path_buf(), &meta);
+                self.stat_table.insert(path.to_path_buf(), stat);
+            }
+            Err(e) => {
+                log::debug!(
+                    "update_stat_from_disk: could not stat {path}, removing from table: {e}"
+                );
+                self.stat_table.remove(path);
+            }
+        }
     }
 
     /// Drop a deleted file from the index. Wrapped in [`Index::txn`](gd_project::Index::txn) for invariant verification.
@@ -456,6 +557,9 @@ impl Workspace {
         if let Some(key) = CanonicalKey::for_path(path) {
             self.forget(&key);
         }
+        // Drop the stat entry: the file is gone, so the next warm-load must not see a stale entry
+        // that would skip re-parsing a file that has since been recreated with the same name.
+        self.stat_table.remove(path);
     }
 
     /// Re-read `project.godot` from disk (file changed via the M4 watcher) and rebuild the policy
@@ -602,6 +706,28 @@ impl Workspace {
                 continue;
             }
 
+            // Stat-based change detection: compare (size, mtime_ns) against the stored table.
+            // If stat fails (vanished mid-walk, permission), fall back to re-parsing so we don't
+            // silently drop an added file or leave a stale interface.
+            let meta = std::fs::metadata(path.as_std_path());
+            let new_stat = meta
+                .as_ref()
+                .ok()
+                .map(|m| cache::stat_from_metadata(path.clone(), m));
+
+            let in_table = self.stat_table.get(&path);
+            let stat_changed = match (in_table, &new_stat) {
+                (None, _) => true,       // added — not in table
+                (Some(_), None) => true, // stat failed — re-parse defensively
+                (Some(old), Some(new)) => old.size != new.size || old.mtime_ns != new.mtime_ns,
+            };
+
+            if !stat_changed {
+                // Stat unchanged — trust the cached interface, skip re-parse.
+                continue;
+            }
+
+            // Stat changed (or new file): re-read and re-parse.
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(e) => {
@@ -612,21 +738,21 @@ impl Workspace {
             };
             let tree = gd_syntax::parse(&text).tree;
             let new_iface = gd_project::extract_interface(&tree);
-            let new_hash = new_iface.signature_hash();
-            let action = match self.index.interface_of(&path) {
-                None => Some(true),                                           // added
-                Some(cur) if cur.signature_hash() != new_hash => Some(false), // modified
-                _ => None,
-            };
-            if let Some(is_added) = action {
-                self.index.txn(&path, |idx| {
-                    idx.on_file_changed(&path, new_iface);
-                });
-                if is_added {
-                    added += 1;
-                } else {
-                    modified += 1;
-                }
+            let is_added = self.index.interface_of(&path).is_none();
+            self.index.txn(&path, |idx| {
+                idx.on_file_changed(&path, new_iface);
+            });
+            // Update stat table with the fresh stat (or remove entry if stat failed so next
+            // reconcile retries).
+            if let Some(s) = new_stat {
+                self.stat_table.insert(path.clone(), s);
+            } else {
+                self.stat_table.remove(&path);
+            }
+            if is_added {
+                added += 1;
+            } else {
+                modified += 1;
             }
         }
 
@@ -653,6 +779,7 @@ impl Workspace {
             let n = removed_paths.len();
             for path in &removed_paths {
                 self.index.txn(path, |idx| idx.on_file_removed(path));
+                self.stat_table.remove(path);
             }
             n
         };
@@ -709,6 +836,177 @@ impl ReconciliationReport {
     pub fn had_errors(&self) -> bool {
         self.walk_errors > 0 || self.skipped_unreadable > 0 || self.skipped_non_utf8 > 0
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cache helpers (warm-start support).
+// ---------------------------------------------------------------------------
+
+/// Build the cache key from the live native DB and project root. Used by both `load` (warm-start
+/// attempt) and `save_cache` (persist after build/reconcile) so the key construction is
+/// identical — a divergent key is the silent always-cold failure mode.
+fn build_cache_key(native: &NativeDb, root: &Utf8Path) -> cache::CacheKey {
+    cache::CacheKey {
+        cache_format_version: cache::CACHE_FORMAT_VERSION,
+        gdls_version: env!("CARGO_PKG_VERSION").to_string(),
+        native_db_content_hash: native.content_hash(),
+        project_godot_fingerprint: cache::project_godot_fingerprint(root),
+    }
+}
+
+/// Walk the project root, stat-diff each `.gd` against the cached table, re-parse only changed
+/// files, and return the updated index + new stat table. This is the warm-start path — it avoids
+/// re-reading every file, only touching files whose `(size, mtime_ns)` changed.
+///
+/// Preserves `FileId` stability by reusing the deserialized index's path arena; new files append.
+/// Walk errors are logged but do not abort — the post-load reconcile is a backstop.
+fn warm_index_from_cache(
+    loaded: gd_project::cache::LoadedCache,
+    root: &Utf8Path,
+) -> (Index, FxHashMap<Utf8PathBuf, FileStat>) {
+    let gd_project::cache::LoadedCache { mut index, files } = loaded;
+
+    // Build a lookup table from the cached file stats.
+    let mut stat_table: FxHashMap<Utf8PathBuf, FileStat> =
+        files.into_iter().map(|s| (s.path.clone(), s)).collect();
+
+    // Walk current disk state — same walker reconcile uses.
+    let walker = WalkDir::new(root.as_std_path())
+        .into_iter()
+        .filter_entry(|e| {
+            if let Some(p) = camino::Utf8Path::from_path(e.path()) {
+                !is_excluded(p, root)
+            } else {
+                true
+            }
+        });
+
+    let mut walk_errors = 0usize;
+    let mut walked_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
+    let mut reparsed = 0usize;
+    let mut added = 0usize;
+
+    for entry_result in walker {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                let path_display = e
+                    .path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                log::warn!("warm_index: walk error at {path_display}: {e}");
+                walk_errors += 1;
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Some(p) = camino::Utf8Path::from_path(entry.path()) else {
+            log::warn!("warm_index: skipping non-UTF-8 path under {root}");
+            continue;
+        };
+        if p.extension() != Some("gd") {
+            continue;
+        }
+        let path = gd_project::normalize_path(p);
+        walked_paths.insert(path.clone());
+
+        // Stat the file and compare to the cached table entry.
+        let meta = std::fs::metadata(path.as_std_path());
+        let new_stat = meta
+            .as_ref()
+            .ok()
+            .map(|m| cache::stat_from_metadata(path.clone(), m));
+
+        let stat_changed = match (stat_table.get(&path), &new_stat) {
+            (None, _) => true,       // added — not in cache
+            (Some(_), None) => true, // stat failed — re-parse defensively
+            (Some(old), Some(new)) => old.size != new.size || old.mtime_ns != new.mtime_ns,
+        };
+
+        if stat_changed {
+            // Re-read and re-parse this file.
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let tree = gd_syntax::parse(&text).tree;
+                    let iface = gd_project::extract_interface(&tree);
+                    let is_added = index.interface_of(&path).is_none();
+                    index.txn(&path, |idx| {
+                        idx.on_file_changed(&path, iface);
+                    });
+                    if let Some(s) = new_stat {
+                        stat_table.insert(path.clone(), s);
+                    } else {
+                        stat_table.remove(&path);
+                    }
+                    if is_added {
+                        added += 1;
+                    } else {
+                        reparsed += 1;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("warm_index: skipping unreadable {path}: {e}");
+                }
+            }
+        } else {
+            // Stat unchanged — update the stat table entry with the fresh stat so it is
+            // current (the cached stat is the same; just keep it).
+            // No re-parse needed.
+        }
+    }
+
+    // Drop files that were in the cache but are no longer on disk (only when the walk was
+    // authoritative — same guard as reconcile).
+    if walk_errors == 0 {
+        let removed_paths: Vec<Utf8PathBuf> = index
+            .iter_interfaces()
+            .filter_map(|(fid, _)| index.path(fid).map(camino::Utf8Path::to_path_buf))
+            .filter(|p| !walked_paths.contains(p))
+            .collect();
+        for path in &removed_paths {
+            index.txn(path, |idx| idx.on_file_removed(path));
+            stat_table.remove(path);
+        }
+        log::info!(
+            "warm_index: stat-diff complete: {} unchanged, {} reparsed, {} added, {} removed",
+            walked_paths.len().saturating_sub(reparsed + added),
+            reparsed,
+            added,
+            removed_paths.len(),
+        );
+    } else {
+        log::info!(
+            "warm_index: stat-diff complete (walk had {walk_errors} error(s), skipping removal pass): \
+             {} reparsed, {} added",
+            reparsed, added,
+        );
+    }
+
+    (index, stat_table)
+}
+
+/// Build a stat table by iterating all interned files in the index after a cold build.
+/// Used so the cold path and the warm path both produce a populated stat table — the cold build
+/// doesn't stat files during `Index::build`, so we sweep them here.
+fn build_stat_table_from_index(index: &Index) -> FxHashMap<Utf8PathBuf, FileStat> {
+    let mut table = FxHashMap::default();
+    for (fid, _) in index.iter_interfaces() {
+        let Some(path) = index.path(fid) else {
+            continue;
+        };
+        match std::fs::metadata(path.as_std_path()) {
+            Ok(meta) => {
+                let stat = cache::stat_from_metadata(path.to_path_buf(), &meta);
+                table.insert(path.to_path_buf(), stat);
+            }
+            Err(e) => {
+                log::warn!("cold_index: could not stat {path} for cache table: {e}");
+            }
+        }
+    }
+    table
 }
 
 /// Project the server's `initializationOptions.strict` (its own enum, kept off the analyzer crate)

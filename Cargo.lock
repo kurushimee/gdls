@@ -40,6 +40,9 @@ name = "camino"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629a66d692cb9ff1a1c664e41771b3dcaf961985a9774c0eb0bd1b51cf60a48"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "cfg-if"
@@ -151,6 +154,9 @@ dependencies = [
  "gd_types",
  "log",
  "rustc-hash",
+ "serde",
+ "serde_json",
+ "tempfile",
  "walkdir",
 ]
 
@@ -190,6 +196,7 @@ dependencies = [
 name = "gd_syntax"
 version = "1.0.0"
 dependencies = [
+ "serde",
  "unicode-ident",
  "unicode-security",
 ]

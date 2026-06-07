@@ -13,7 +13,10 @@ rust-version.workspace = true
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [dependencies]
-camino = "1.2.2"
+camino.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 # WP-RD9: junction/8.3/symlink-resolving canonicalization for the `Index::file_id` slow path, so a
 # file reached through an NTFS junction or a differently-cased path interns to one `FileId`.
 dunce.workspace = true
@@ -23,5 +26,3 @@ log = "0.4.29"
 rustc-hash.workspace = true
 walkdir.workspace = true
 
-[dev-dependencies]
-camino = "1.2.2"
