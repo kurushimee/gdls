@@ -462,7 +462,11 @@ fn serve_inner(
     // Persist the index cache on clean shutdown so the next launch can warm-start. Called
     // at shutdown (not just at post-cold-reconcile) so a session that processed many edits
     // leaves a fresh cache for the next launch. Fire-and-forget (log-only on failure).
-    state.workspace.save_cache();
+    // Use save_cache_excluding_open so any unsaved buffer interfaces are NOT persisted as disk
+    // truth: warm-load will re-parse those files from disk and recover the correct on-disk state
+    // ("never lie" guarantee — Issue 1 never-lie fix).
+    let open_paths = open_buffer_paths(&state);
+    state.workspace.save_cache_excluding_open(&open_paths);
 
     // WP-P3 flush: only fires when a recorder was injected (env var set or test-driven). A flush
     // failure is logged at warn (the LSP session is exiting anyway; killing the parent process
@@ -800,9 +804,14 @@ fn apply_reaction_inner(
             match change {
                 FileChange::Created | FileChange::Modified => {
                     match std::fs::read_to_string(&path) {
-                        Ok(text) => state
-                            .workspace
-                            .reindex(&path, &gd_syntax::parse(&text).tree),
+                        Ok(text) => {
+                            state
+                                .workspace
+                                .reindex(&path, &gd_syntax::parse(&text).tree);
+                            // Disk-sourced: refresh stat_table so the next warm-load can skip this
+                            // file if it hasn't changed again (Issue 1 perf fix).
+                            state.workspace.update_stat_from_disk(&path);
+                        }
                         // A NotFound here is the partial-rename case: the watcher delivered
                         // Modify(Name(_)) for the source half of a cross-mountpoint rename
                         // that classify_event couldn't merge. The deleted half's interface
@@ -826,7 +835,11 @@ fn apply_reaction_inner(
                     // The source half was already removed above (independent of whether `to` is an
                     // open buffer). (Re)index the destination from disk.
                     match std::fs::read_to_string(&to) {
-                        Ok(text) => state.workspace.reindex(&to, &gd_syntax::parse(&text).tree),
+                        Ok(text) => {
+                            state.workspace.reindex(&to, &gd_syntax::parse(&text).tree);
+                            // Disk-sourced rename target: refresh stat_table (Issue 1 perf fix).
+                            state.workspace.update_stat_from_disk(&to);
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                             log::info!(
                                 "watcher: rename target {to} vanished before read; \
@@ -1325,6 +1338,8 @@ fn reindex_open_buffer(state: &mut ServerState, uri: &Uri) {
 }
 
 /// Re-index a `.gd` file from disk (on close), or drop it from the index if it no longer exists.
+/// After a successful reindex also refreshes `stat_table` so the next warm-start can skip
+/// re-parsing this file if it hasn't changed again (Issue 1 perf fix).
 fn reindex_from_disk(state: &mut ServerState, uri: &Uri) {
     let Some(path) = uri_to_path(uri) else {
         return;
@@ -1333,10 +1348,16 @@ fn reindex_from_disk(state: &mut ServerState, uri: &Uri) {
         return;
     }
     match std::fs::read_to_string(&path) {
-        Ok(text) => state
-            .workspace
-            .reindex(&path, &gd_syntax::parse(&text).tree),
-        // Genuinely gone ⇒ drop it from the index.
+        Ok(text) => {
+            state
+                .workspace
+                .reindex(&path, &gd_syntax::parse(&text).tree);
+            // Disk-sourced reindex: update stat_table so the next warm-load can skip this file
+            // if it hasn't changed again. Must NOT be called on the buffer path (see
+            // Workspace::update_stat_from_disk doc).
+            state.workspace.update_stat_from_disk(&path);
+        }
+        // Genuinely gone ⇒ drop it from the index (remove also drops the stat_table entry).
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => state.workspace.remove(&path),
         // Still on disk but unreadable (locked, perms, non-UTF-8): keep the last-known interface
         // rather than phantom-deleting a live class (which would silently break dependents). Surface

@@ -176,10 +176,37 @@ impl Workspace {
     /// Atomically persist the index + stat table to the `.gdls` cache directory.
     /// Fire-and-forget: failures are logged at `warn` and never propagated (never crash).
     /// Call AFTER build + reconcile have settled — not mid-reconcile.
+    ///
+    /// The persisted stat table contains only files that are NOT currently open in an editor
+    /// buffer. Files with open buffers may have a buffer-only interface in the index (never
+    /// written to disk), so persisting their disk-stat would cause warm-load to see
+    /// stored==disk-stat and skip re-parsing — serving the old on-disk interface as if it were
+    /// the buffer's unsaved content ("never lie" violation). By excluding them from the persisted
+    /// stat table, warm-load treats them as "unknown stat" and re-parses from disk, correctly
+    /// recovering the on-disk state. Use [`Self::save_cache`] when no buffers are open (startup,
+    /// diagnose CLI); use [`Self::save_cache_excluding_open`] at shutdown or any point where
+    /// unsaved editor buffers may exist.
     pub fn save_cache(&self) {
+        self.save_cache_excluding_open(&FxHashSet::default());
+    }
+
+    /// Like [`Self::save_cache`] but excludes `open_paths` from the persisted stat table, so
+    /// warm-load re-parses those files from disk rather than trusting a buffer-only interface.
+    /// See [`Self::save_cache`] for the rationale.
+    pub fn save_cache_excluding_open(&self, open_paths: &FxHashSet<Utf8PathBuf>) {
         let root = &self.project.root;
         let key = build_cache_key(&self.native, root);
-        let files: Vec<FileStat> = self.stat_table.values().cloned().collect();
+        // Exclude files currently open in an editor buffer: their stat_table entry still reflects
+        // the pre-edit disk state (stat_table is only updated by disk-sourced reindexes), so if
+        // we persisted that entry, warm-load would see stored==current disk stat (unchanged since
+        // the buffer was opened) and skip re-parsing — serving the stale interface. Omitting the
+        // entry forces warm-load to re-parse the file from disk and get the correct interface.
+        let files: Vec<FileStat> = self
+            .stat_table
+            .iter()
+            .filter(|(path, _)| !open_paths.contains(*path))
+            .map(|(_, stat)| stat.clone())
+            .collect();
         cache::save(root, &self.index, &files, key);
     }
 
@@ -477,11 +504,45 @@ impl Workspace {
     /// (2) it isn't needed for correctness, because cache validity is content-addressed
     /// ([`CacheEntry`]) and every reader passes current text, so a changed file misses the cache on
     /// its own. Eviction is reserved for [`Self::remove`], which is off the hot path.
+    ///
+    /// **Does NOT update `stat_table`** — call [`Self::update_stat_from_disk`] after this when the
+    /// source is a disk read (watcher, `didClose` reindex). On the buffer path the disk stat is
+    /// unchanged (the buffer text hasn't been written to disk), so `stat_table` must NOT be updated,
+    /// and the caller must ensure the file's stat_table entry is excluded from [`Self::save_cache`]
+    /// via `save_cache_excluding_open` so warm-load re-parses from disk rather than serving the
+    /// never-persisted buffer interface as disk truth.
     pub fn reindex(&mut self, path: &Utf8Path, tree: &ParseTree) {
         let iface = gd_project::extract_interface(tree);
         self.index.txn(path, |idx| {
             idx.on_file_changed(path, iface);
         });
+    }
+
+    /// Refresh `stat_table` for `path` from its current on-disk metadata. Call this after a
+    /// disk-sourced [`Self::reindex`] (watcher, `reindex_from_disk` on close). Keeps the stat
+    /// snapshot current so the next warm-load sees the updated stat and skips re-parsing the file
+    /// if it hasn't changed again. A stat failure is logged and the entry is removed so the next
+    /// reconcile retries defensively.
+    ///
+    /// **Must NOT be called after a buffer-only [`Self::reindex`]**: the buffer text hasn't hit
+    /// disk, so the disk stat is stale relative to the buffer interface now live in the index.
+    /// Calling this on a buffer reindex would mark the file "up to date" with disk when it isn't,
+    /// causing warm-load to serve the old disk interface — the "never lie" violation. The buffer
+    /// path uses [`Self::save_cache_excluding_open`] instead to ensure those files are re-parsed
+    /// fresh on the next launch.
+    pub fn update_stat_from_disk(&mut self, path: &Utf8Path) {
+        match std::fs::metadata(path.as_std_path()) {
+            Ok(meta) => {
+                let stat = cache::stat_from_metadata(path.to_path_buf(), &meta);
+                self.stat_table.insert(path.to_path_buf(), stat);
+            }
+            Err(e) => {
+                log::debug!(
+                    "update_stat_from_disk: could not stat {path}, removing from table: {e}"
+                );
+                self.stat_table.remove(path);
+            }
+        }
     }
 
     /// Drop a deleted file from the index. Wrapped in [`Index::txn`](gd_project::Index::txn) for invariant verification.
@@ -496,6 +557,9 @@ impl Workspace {
         if let Some(key) = CanonicalKey::for_path(path) {
             self.forget(&key);
         }
+        // Drop the stat entry: the file is gone, so the next warm-load must not see a stale entry
+        // that would skip re-parsing a file that has since been recreated with the same name.
+        self.stat_table.remove(path);
     }
 
     /// Re-read `project.godot` from disk (file changed via the M4 watcher) and rebuild the policy

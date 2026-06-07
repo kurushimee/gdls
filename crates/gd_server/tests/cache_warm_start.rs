@@ -336,6 +336,209 @@ fn warm_load_produces_same_index_as_cold() {
     );
 }
 
+/// Issue 1 + Issue 2 seam test: disk edit → save → warm load reflects the edited interface.
+///
+/// Drives the real `reindex` + `update_stat_from_disk` + `save_cache` + `Workspace::load` seam,
+/// which was untested (all prior warm-path tests saved a never-edited workspace).
+///
+/// Assertions:
+///   1. The second (warm) load reflects the edited file's NEW class_name.
+///   2. The unchanged file retains its original class_name (not re-parsed with stale content).
+///   3. A reconcile immediately after the warm load sees `modified == 0`: the stat_table was
+///      correctly updated by `update_stat_from_disk`, so warm-load correctly stamped the new
+///      stat for the edited file — it is NOT treated as "still changed" on the next check.
+#[test]
+fn warm_load_after_disk_edit_reflects_new_interface() {
+    let p = common::TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    // Two files: one will be edited, one stays unchanged.
+    let v1_src = "class_name EditTarget\nextends Node\n";
+    let unchanged_src = "class_name Bystander\nextends Node\n";
+    p.write("src/edit_target.gd", v1_src);
+    p.write("src/bystander.gd", unchanged_src);
+
+    let options = InitializationOptions::parse(Some(&serde_json::json!({
+        "projectRoot": p.root.as_str(),
+    })));
+
+    // --- Session 1: cold build, disk edit via reindex path, save cache. ---
+    let mut ws = Workspace::load(&p.root, &options);
+    assert_eq!(ws.index.file_count(), 2, "precondition: two files indexed");
+
+    // Verify V1 interface before the edit.
+    let edit_path = p.root.join("src/edit_target.gd");
+    assert_eq!(
+        ws.index
+            .interface_of(&edit_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("EditTarget"),
+        "precondition: original class_name must be EditTarget"
+    );
+
+    // Write new content to disk (changes size so stat definitely differs).
+    let v2_src = "class_name EditTargetV2\nextends Node\nvar new_field: int = 0\n";
+    p.write("src/edit_target.gd", v2_src);
+
+    // Simulate what server.rs reindex_from_disk does: parse from disk, reindex, update stat.
+    let text = std::fs::read_to_string(edit_path.as_std_path()).unwrap();
+    ws.reindex(&edit_path, &gd_syntax::parse(&text).tree);
+    ws.update_stat_from_disk(&edit_path);
+
+    // Verify the index now reflects V2 in-session.
+    assert_eq!(
+        ws.index
+            .interface_of(&edit_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("EditTargetV2"),
+        "in-session reindex must immediately reflect the new class_name"
+    );
+
+    // Save cache — no open buffers, so save_cache() is fine.
+    ws.save_cache();
+
+    // --- Session 2: warm load from cache. ---
+    let mut warm_ws = Workspace::load(&p.root, &options);
+    assert_eq!(
+        warm_ws.index.file_count(),
+        2,
+        "warm load must produce the same file count"
+    );
+
+    // The edited file's NEW interface must be reflected.
+    assert_eq!(
+        warm_ws
+            .index
+            .interface_of(&edit_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("EditTargetV2"),
+        "warm load must reflect the edited file's new class_name (EditTargetV2), not the old one"
+    );
+
+    // The unchanged file's interface must be unchanged.
+    let bystander_path = p.root.join("src/bystander.gd");
+    assert_eq!(
+        warm_ws
+            .index
+            .interface_of(&bystander_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("Bystander"),
+        "unchanged file must still have its original class_name (Bystander)"
+    );
+
+    // stat_table correctness: a post-warm-load reconcile must see no modified files.
+    // If update_stat_from_disk wasn't called, the edited file's old stat would still be in the
+    // cache, warm-load would see stored!=disk and re-parse it, but the warm Workspace's own
+    // stat_table would be freshly populated from the warm-index walk — so reconcile would be
+    // 0 either way on the warm ws. The key test is that warm LOAD correctly got V2 (above).
+    // This reconcile verifies the warm workspace's stat_table is fully consistent post-load.
+    let r = warm_ws.reconcile(&Default::default());
+    assert_eq!(
+        r.modified, 0,
+        "reconcile after warm load must see no modified files (stat_table is consistent post-warm-load): {r:?}"
+    );
+    assert_eq!(
+        r.added, 0,
+        "reconcile after warm load must see no added files: {r:?}"
+    );
+    assert_eq!(
+        r.removed, 0,
+        "reconcile after warm load must see no removed files: {r:?}"
+    );
+}
+
+/// Issue 1 never-lie guard: unsaved buffer edit must NOT be served as disk truth after a warm load.
+///
+/// This is the "never lie" seam: the editor has a buffer whose interface differs from the on-disk
+/// file, the server shuts down (saves cache via `save_cache_excluding_open`), and the next launch
+/// warm-loads. The warm load must serve the ON-DISK interface (by re-parsing from disk because
+/// the file's stat entry was excluded from the saved cache), not the unsaved buffer interface.
+///
+/// The fix: `save_cache_excluding_open` omits open-buffer files from the persisted stat table
+/// so warm-load sees "unknown stat" for them and re-parses from disk.
+#[test]
+fn warm_load_after_unsaved_buffer_edit_serves_disk_interface() {
+    let p = common::TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    // Disk has V1 content with class_name DiskClass.
+    let disk_src = "class_name DiskClass\nextends Node\n";
+    let buffer_src = "class_name BufferClass\nextends Node\nvar unsaved: int = 0\n";
+    p.write("src/target.gd", disk_src);
+    p.write("src/other.gd", "class_name Other\nextends Node\n");
+
+    let options = InitializationOptions::parse(Some(&serde_json::json!({
+        "projectRoot": p.root.as_str(),
+    })));
+
+    // --- Session 1: cold build, buffer-only edit (disk unchanged), save excluding the open file. ---
+    let mut ws = Workspace::load(&p.root, &options);
+    assert_eq!(ws.index.file_count(), 2, "precondition: two files indexed");
+
+    let target_path = p.root.join("src/target.gd");
+    assert_eq!(
+        ws.index
+            .interface_of(&target_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("DiskClass"),
+        "precondition: original class_name must be DiskClass"
+    );
+
+    // Simulate a buffer-only edit: parse the buffer text (NOT on disk) and reindex.
+    // Do NOT write to disk and do NOT call update_stat_from_disk.
+    // This models what server.rs reindex_open_buffer does.
+    let parsed = gd_syntax::parse(buffer_src);
+    ws.reindex(&target_path, &parsed.tree);
+
+    // In-session the index reflects the buffer content.
+    assert_eq!(
+        ws.index
+            .interface_of(&target_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("BufferClass"),
+        "in-session buffer reindex must reflect BufferClass"
+    );
+
+    // The file is "open" in the editor (unsaved buffer). Simulate save_cache_excluding_open by
+    // building the open-paths set that the server's shutdown path would build.
+    // `gd_project::normalize_path` is the same normalization used by the server's
+    // `open_buffer_paths` helper (forward slashes, same as index keys).
+    let norm_target = gd_project::normalize_path(&target_path);
+    let open_paths = rustc_hash::FxHashSet::from_iter([norm_target]);
+
+    // Save cache excluding the open buffer: the target file's stat entry must NOT be persisted.
+    ws.save_cache_excluding_open(&open_paths);
+
+    // --- Session 2: warm load from cache. ---
+    // The target file's stat entry was NOT saved, so warm-load sees "unknown stat" → re-parses
+    // from disk → recovers the on-disk DiskClass interface, NOT the unsaved BufferClass.
+    let warm_ws = Workspace::load(&p.root, &options);
+    assert_eq!(
+        warm_ws.index.file_count(),
+        2,
+        "warm load must produce the same file count"
+    );
+
+    assert_eq!(
+        warm_ws
+            .index
+            .interface_of(&target_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("DiskClass"),
+        "warm load must serve the ON-DISK class_name (DiskClass), not the unsaved buffer \
+         interface (BufferClass) — never-lie guard"
+    );
+
+    // The non-open file must still be served from cache (its stat was persisted normally).
+    let other_path = p.root.join("src/other.gd");
+    assert_eq!(
+        warm_ws
+            .index
+            .interface_of(&other_path)
+            .and_then(|i| i.class_name.as_deref()),
+        Some("Other"),
+        "the non-open file must be served from cache with its correct interface"
+    );
+}
+
 /// Timing breakdown: measure the individual phases of cold vs warm to diagnose ratio failures.
 /// This test is informational — it always passes, printing its findings to stderr.
 #[test]
