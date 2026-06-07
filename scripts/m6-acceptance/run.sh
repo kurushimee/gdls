@@ -155,6 +155,18 @@ sed \
     "${SESSION_JSON}" > "${CONCRETE_SESSION}"
 info "Concrete session: ${CONCRETE_SESSION}"
 
+# Guard: if the concrete session still contains unfilled file-role placeholders
+# (e.g. __CALLER_FILE__, __CALLEE_FILE__) the capability walk will crash with a
+# confusing FileNotFoundError.  Detect this early and give a clear message.
+if grep -q '__[A-Z_]*_FILE__' "${CONCRETE_SESSION}" 2>/dev/null; then
+    remaining="$(grep -o '__[A-Z_]*_FILE__' "${CONCRETE_SESSION}" | sort -u | tr '\n' ' ')"
+    die "Session still contains unfilled file-role placeholders: ${remaining}
+Copy walk.json into scripts/m6-acceptance/sessions/<project>.json, replace
+each __*_FILE__ token with the relative path (from project root) to a real
+project file, fill in real positions, then pass --session <your-session.json>.
+See scripts/m6-acceptance/README.md for step-by-step instructions."
+fi
+
 # ---------------------------------------------------------------------------
 # Step 4: Capability walk
 # ---------------------------------------------------------------------------
@@ -171,13 +183,15 @@ info "Capability report: ${CAPABILITY_REPORT}"
 # Step 5: Cold-vs-warm cache bench
 #
 # Strategy: lsp-poke.py writes elapsed_ms (wall time for the full session,
-# including server startup) to its JSON output. We run a minimal bench session
-# twice — once with cache cleared (cold) and once with it present (warm) —
-# and divide cold/warm to get the speedup ratio.
+# including server startup) to its JSON output. We run a minimal session
+# (initialize → shutdown, no opens, no requests) twice — cold then warm —
+# and compare elapsed_ms values.
 #
-# The bench session contains one documentSymbol request so the server must
-# fully index the project before it can answer, ensuring elapsed_ms captures
-# true startup-to-ready time rather than just process-spawn overhead.
+# Why initialize→shutdown is sufficient: server.rs runs workspace.reconcile()
+# synchronously BEFORE entering the event loop (lines ~261-276 of server.rs).
+# This means the cold walk (full .gd scan) blocks all replies, so even a bare
+# initialize + shutdown captures the full startup-to-ready cost.  We keep the
+# bench session dead-simple to avoid any file-open / URI confusion.
 # ---------------------------------------------------------------------------
 
 info "Building bench session ..."
@@ -185,62 +199,17 @@ BENCH_SESSION="${OUT_DIR}/bench-session.json"
 COLD_REPORT="${OUT_DIR}/bench-cold.json"
 WARM_REPORT="${OUT_DIR}/bench-warm.json"
 
-# Extract the second opens entry (callee file) from the concrete session, falling back
-# to the first entry.  We only need one well-indexed file for documentSymbol.
-BENCH_URI="$(python3 - <<PYEOF
-import json, os, sys
-
-with open("${CONCRETE_SESSION}") as f:
-    s = json.load(f)
-opens = s.get("opens", [])
-for entry in opens[1:2] + opens[0:1]:   # prefer index 1, fall back to 0
-    if isinstance(entry, str):
-        print(entry)
-        break
-    elif isinstance(entry, dict):
-        val = entry.get("path") or entry.get("uri", "")
-        if val:
-            print(val)
-            break
-PYEOF
-)"
-
-if [[ -z "${BENCH_URI}" ]]; then
-    info "WARNING: no opens in concrete session — bench will measure initialization only."
-fi
-
-# Normalise to file:// URI so lsp-poke accepts it as an inline-open entry.
-if [[ -n "${BENCH_URI}" && "${BENCH_URI}" != file://* ]]; then
-    BENCH_FILE_URI="file://$(python3 -c "import os; print(os.path.abspath('${BENCH_URI}'))")"
-else
-    BENCH_FILE_URI="${BENCH_URI}"
-fi
-
 python3 - <<PYEOF
 import json
 
-project_root = "${PROJECT_ROOT}"
-extension_api = "${EXTENSION_API}"
-bench_uri = "${BENCH_FILE_URI}"
-
-opens = [bench_uri] if bench_uri else []
-requests = []
-if bench_uri:
-    requests.append({
-        "label": "bench/documentSymbol",
-        "method": "textDocument/documentSymbol",
-        "params": {"textDocument": {"uri": bench_uri}},
-    })
-
 bench = {
     "initializationOptions": {
-        "projectRoot": project_root,
-        "extensionApiPath": extension_api,
+        "projectRoot": "${PROJECT_ROOT}",
+        "extensionApiPath": "${EXTENSION_API}",
     },
-    "opens": opens,
-    "requests": requests,
+    "opens": [],
+    "requests": [],
 }
-
 with open("${BENCH_SESSION}", "w") as f:
     json.dump(bench, f, indent=2)
 PYEOF
