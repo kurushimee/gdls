@@ -1,0 +1,96 @@
+{
+  "_comment_template": [
+    "This is a TEMPLATE. The token __PROJECT_ROOT__ must be substituted with the real",
+    "absolute path to the project root before passing to lsp-poke.py.",
+    "The token __EXTENSION_API__ must be substituted with the real path to extension_api.json.",
+    "File paths and line/column positions are project-specific: copy this file into",
+    "scripts/m6-acceptance/sessions/<project-name>.json, substitute __PROJECT_ROOT__ and",
+    "__EXTENSION_API__, then fill in real (line, character) positions for each request.",
+    "run.sh does this substitution automatically when given --project/--api/--session."
+  ],
+  "initializationOptions": {
+    "projectRoot": "__PROJECT_ROOT__",
+    "extensionApiPath": "__EXTENSION_API__"
+  },
+  "opens": [
+    "__PROJECT_ROOT__/__CALLER_FILE__",
+    "__PROJECT_ROOT__/__CALLEE_FILE__",
+    "__PROJECT_ROOT__/__AUTOLOAD_FILE__",
+    "__PROJECT_ROOT__/__BASE_CLASS_FILE__",
+    "__PROJECT_ROOT__/__SUBCLASS_FILE__",
+    "__PROJECT_ROOT__/__LINK_FILE__"
+  ],
+  "requests": [
+    {
+      "label": "hover/cross_file_method",
+      "_comment": "Hover over a cross-file method call site (in __CALLER_FILE__). Position must be on the method name token of a call like `obj.some_method()` where `some_method` is defined in __CALLEE_FILE__. Expected result: contents.value contains 'func' and '->'.",
+      "method": "textDocument/hover",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/__CALLER_FILE__" },
+        "position": { "line": 0, "character": 0 }
+      }
+    },
+    {
+      "label": "definition/class_name_expr",
+      "_comment": "Go-to-definition on a ClassName used in an expression (e.g. `ClassName.new()` or a type annotation `var x: ClassName`). Position must be on the identifier token. Expected result: non-empty locations array pointing to the class_name declaration file.",
+      "method": "textDocument/definition",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/__CALLER_FILE__" },
+        "position": { "line": 0, "character": 0 }
+      }
+    },
+    {
+      "label": "definition/preload_string",
+      "_comment": "Go-to-definition on the string argument of a preload() call, e.g. preload(\"res://path/to/File.gd\"). Position must be INSIDE the string literal. Expected result: non-empty locations array pointing to the preloaded file.",
+      "method": "textDocument/definition",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/__CALLER_FILE__" },
+        "position": { "line": 0, "character": 0 }
+      }
+    },
+    {
+      "label": "definition/autoload_name",
+      "_comment": "Go-to-definition on an autoload singleton name (e.g. `GameManager.some_method()`). Position must be on the autoload identifier token. Expected result: non-empty locations array pointing to the autoload script.",
+      "method": "textDocument/definition",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/__CALLER_FILE__" },
+        "position": { "line": 0, "character": 0 }
+      }
+    },
+    {
+      "label": "references/cross_file_method",
+      "_comment": "Find all references to a method defined in __CALLEE_FILE__. Position must be on the method name at its DEFINITION site. Expected result: non-empty locations array including at least one reference from __CALLER_FILE__.",
+      "method": "textDocument/references",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/__CALLEE_FILE__" },
+        "position": { "line": 0, "character": 0 },
+        "context": { "includeDeclaration": false }
+      }
+    },
+    {
+      "label": "documentSymbol/nested_members",
+      "_comment": "Request document symbols for __CALLEE_FILE__, which must be a class with nested members (functions, variables, inner classes). Expected result: non-empty array with at least one SymbolInformation/DocumentSymbol that has children or where the class symbol appears.",
+      "method": "textDocument/documentSymbol",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/__CALLEE_FILE__" }
+      }
+    },
+    {
+      "label": "implementation/func_with_overrides",
+      "_comment": "Find implementations of a virtual/overridable func defined in __BASE_CLASS_FILE__. Position must be on the func name at the base class definition. Expected result: non-empty locations array pointing to override definitions in __SUBCLASS_FILE__ (and possibly others).",
+      "method": "textDocument/implementation",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/__BASE_CLASS_FILE__" },
+        "position": { "line": 0, "character": 0 }
+      }
+    },
+    {
+      "label": "documentLink/res_literal",
+      "_comment": "Request document links for __LINK_FILE__, which must contain at least one res:// string literal (e.g. in a preload or load call, or a string constant). Expected result: non-empty DocumentLink array where each link target resolves to an existing project file.",
+      "method": "textDocument/documentLink",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/__LINK_FILE__" }
+      }
+    }
+  ]
+}
