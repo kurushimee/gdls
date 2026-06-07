@@ -2,16 +2,18 @@
 
 use gd_analyze::{find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, DtKind};
 use gd_syntax::ast::{
-    ClassNode, ConstantNode, FunctionNode, NodeId, NodeKind, ParseTree, SignalNode, VariableNode,
+    ClassNode, ConstantNode, FunctionNode, LiteralNode, NodeId, NodeKind, ParseTree, SignalNode,
+    VariableNode,
 };
+use gd_syntax::Literal;
 use gd_types::native_db::NativeClass;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, Location, MarkupContent, MarkupKind, Position, Range,
-    ReferenceParams, SymbolInformation, SymbolKind as LspSymbolKind, Uri, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    DocumentLink, DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location,
+    MarkupContent, MarkupKind, Position, Range, ReferenceParams, SymbolInformation,
+    SymbolKind as LspSymbolKind, Uri, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ropey::Rope;
@@ -38,10 +40,29 @@ pub fn document_symbol(
         return DocumentSymbolResponse::Nested(Vec::new());
     };
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
+
+    // A1 handoff: `document_symbols` now always returns a single root Class wrapping members.
+    // For an unnamed script the root's `name` is `""` (the parser has no path, so it can't fill
+    // it). Fill the empty name here with the file's basename from the document URI so editors
+    // render a useful symbol name (`"a.gd"`) instead of an empty string.
+    let basename = uri
+        .path()
+        .as_str()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
     let symbols = parsed
         .symbols
         .iter()
-        .map(|s| to_lsp_symbol(s, &mapper))
+        .map(|s| {
+            let mut lsp = to_lsp_symbol(s, &mapper);
+            if lsp.name.is_empty() && !basename.is_empty() {
+                lsp.name = basename.clone();
+            }
+            lsp
+        })
         .collect();
     DocumentSymbolResponse::Nested(symbols)
 }
@@ -88,6 +109,56 @@ fn to_lsp_symbol(
 }
 
 // =============================================================================================
+// M6-C2: textDocument/documentLink.
+// =============================================================================================
+
+/// `textDocument/documentLink`: walk the parse tree and emit a [`DocumentLink`] for every
+/// `res://`-path string literal (those produced by `preload("res://…")` / `load("res://…")`
+/// and any other expression containing a res-path string). The link's `target` is the
+/// `file://` URI of the resolved filesystem path; the `range` covers the string token including
+/// its surrounding quotes. Only string literals that start with `"res://"` produce links —
+/// `user://`, `uid://`, and plain strings are silently skipped.
+pub fn document_link(state: &mut ServerState, params: DocumentLinkParams) -> Vec<DocumentLink> {
+    let uri = params.text_document.uri;
+    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
+        return Vec::new();
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let Some(doc) = state.vfs.get(uri.as_str()) else {
+        return Vec::new();
+    };
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+    let root = state.workspace.project.root.clone();
+
+    let mut links = Vec::new();
+    for node_id in parsed.tree.iter_ids() {
+        let node = parsed.tree.get(node_id);
+        let NodeKind::Literal(LiteralNode {
+            value: Literal::String(path),
+        }) = &node.kind
+        else {
+            continue;
+        };
+        if !path.starts_with("res://") {
+            continue;
+        }
+        let Some(abs) = gd_project::paths::res_to_path(&root, path) else {
+            continue;
+        };
+        let Some(target) = path_to_file_uri(&abs) else {
+            continue;
+        };
+        links.push(DocumentLink {
+            range: mapper.span_to_range(node.span),
+            target: Some(target),
+            tooltip: None,
+            data: None,
+        });
+    }
+    links
+}
+
+// =============================================================================================
 // WP-H: hover + definition.
 // =============================================================================================
 
@@ -125,7 +196,19 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         .unwrap_or(node_id);
     let leaf_node = parsed.tree.get(node_id);
 
-    let markdown = render_hover(state, &parsed.tree, node_id, typed_id, analyzed.as_deref());
+    // M6-F: when the cursor is on an identifier that's the callee of a resolved cross-file call,
+    // render the callee's `MemberDecl` signature instead of (or in addition to) the type label.
+    // This supersedes the generic type-table hover for call-site identifiers and gives the user
+    // a `func helper(...) -> R` line rather than just the return type.
+    let member_sig = analyzed
+        .as_deref()
+        .and_then(|a| hover_member_signature(state, &parsed.tree, node_id, byte, a));
+
+    let markdown = if let Some(sig) = member_sig {
+        sig
+    } else {
+        render_hover(state, &parsed.tree, node_id, typed_id, analyzed.as_deref())
+    };
     if markdown.trim().is_empty() {
         return None;
     }
@@ -190,6 +273,12 @@ pub fn definition(
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
     let byte = mapper.position_to_byte(tdp.position);
     let node_id = parsed.tree.innermost_node_at(byte)?;
+
+    // (C1) String literal inside preload/load: cursor on `"res://foo.gd"` → jump to foo.gd.
+    if let Some(loc) = find_res_path_definition(state, &parsed.tree, node_id) {
+        return Some(GotoDefinitionResponse::Scalar(loc));
+    }
+
     let name = cursor_identifier(&parsed.tree, node_id)?;
 
     // (1) In-file member.
@@ -199,6 +288,12 @@ pub fn definition(
 
     // (2) Cross-file `class_name`.
     if let Some(loc) = find_global_class_definition(state, &name) {
+        return Some(GotoDefinitionResponse::Scalar(loc));
+    }
+
+    // (D) Autoload singleton — last fallback so in-file members and class_name declarations
+    // shadow autoload names (Godot's own resolution order: locals → members → class_name → autoload).
+    if let Some(loc) = find_autoload_definition(state, &name) {
         return Some(GotoDefinitionResponse::Scalar(loc));
     }
 
@@ -346,6 +441,88 @@ fn render_hover(
     }
 
     md
+}
+
+/// M6-F: when the cursor lands on a Call or Subscript node, resolve the callee's `MemberDecl`
+/// from the base expression's type and render its signature. Returns `None` on fall-through
+/// (e.g. the base type isn't a project script, or the method isn't in the interface).
+///
+/// Two cursor positions trigger this path:
+/// 1. Cursor at `(` → `innermost_node_at` returns the `Call` node.
+/// 2. Cursor inside the callee identifier itself (a child `Identifier`) — handled here by also
+///    checking whether the leaf's span is contained in any enclosing Call whose callee is a
+///    subscript access with a known base type.
+///
+/// The signature format is `func name(ParamType, …) -> ReturnType` using the unresolved syntactic
+/// type names from [`gd_project::TypeExpr`]; no parameter names are available at the interface
+/// level. This matches Godot's `hover` intent for cross-file method calls.
+fn hover_member_signature(
+    state: &ServerState,
+    tree: &ParseTree,
+    _leaf_id: NodeId,
+    cursor_byte: usize,
+    analyzed: &AnalysisResult,
+) -> Option<String> {
+    use gd_analyze::DtKind;
+
+    // Find a Call node whose span contains the cursor byte. The cursor may be directly on the
+    // Call node (at `(`/`)`) or on an inner Identifier child (the callee name) — both cases fall
+    // into the same "find the enclosing Call" logic.
+    let call_node = tree.iter_ids().find_map(|id| {
+        let node = tree.get(id);
+        if let NodeKind::Call(c) = &node.kind {
+            if node.span.start <= cursor_byte && cursor_byte < node.span.end {
+                return Some(c.clone());
+            }
+        }
+        None
+    })?;
+
+    // Only subscript calls (`l.helper()`) provide a base whose type we can look up.
+    // Bare calls (`helper()`) resolve via the in-class or inherited interface — handled
+    // by the existing `render_hover` type-label path; skip them here.
+    let callee_id = call_node.callee?;
+    let NodeKind::Subscript(sub) = &tree.get(callee_id).kind else {
+        return None;
+    };
+    let base_id = sub.base?;
+
+    // Get the base expression's resolved type — must be a project Script kind.
+    let base_dt = analyzed.types.get(base_id);
+    if base_dt.kind != DtKind::Script {
+        return None;
+    }
+    let script_ref = base_dt.script_type.as_ref()?;
+    let callee_file = script_ref.file;
+
+    // Look up the method name in the callee file's interface.
+    let fn_name = &call_node.function_name;
+    if fn_name.is_empty() {
+        return None;
+    }
+    let iface = state.workspace.index.interface(callee_file)?;
+    let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
+
+    // Format: `func name(ParamType, …) -> ReturnType`
+    let params_str = decl
+        .params
+        .iter()
+        .map(|p| match p {
+            gd_project::TypeExpr::Named { path, .. } => path.join("."),
+            gd_project::TypeExpr::None => "Variant".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ret_str = match &decl.ty {
+        gd_project::TypeExpr::Named { path, .. } => path.join("."),
+        gd_project::TypeExpr::None => "void".to_string(),
+    };
+    let sig = format!("func {}({}) -> {}", fn_name, params_str, ret_str);
+
+    let mut md = String::from("```gdscript\n");
+    md.push_str(&sig);
+    md.push_str("\n```");
+    Some(md)
 }
 
 fn append_class_docs(md: &mut String, class: &NativeClass) {
@@ -498,6 +675,49 @@ fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<L
     Some(Location {
         uri,
         range: mapper.span_to_range(ident_span),
+    })
+}
+
+/// M6-C1: resolve a `res://`-path string literal to a [`Location`] at the start of the target
+/// file. Called when the cursor's innermost node is a [`NodeKind::Literal`] whose value is a
+/// [`Literal::String`] starting with `"res://"`. Non-res strings (e.g. `"user://x"`,
+/// format strings, regular text) return `None` — the outer `definition` handler degrades to the
+/// normal identifier path.
+fn find_res_path_definition(
+    state: &ServerState,
+    tree: &ParseTree,
+    node_id: NodeId,
+) -> Option<Location> {
+    let NodeKind::Literal(LiteralNode {
+        value: Literal::String(path),
+    }) = &tree.get(node_id).kind
+    else {
+        return None;
+    };
+    if !path.starts_with("res://") {
+        return None;
+    }
+    let root = &state.workspace.project.root;
+    let abs = gd_project::paths::res_to_path(root, path)?;
+    let uri = path_to_file_uri(&abs)?;
+    Some(Location {
+        uri,
+        range: file_start_range(),
+    })
+}
+
+/// M6-D: resolve an autoload singleton name to a [`Location`] pointing at the head of the
+/// autoload's script file. This is the **last** definition fallback — in-file member lookup and
+/// `class_name` registry checks (which honour local shadowing) run first, so `var Save := 1`
+/// in the current file correctly shadows an autoload named `Save`.
+fn find_autoload_definition(state: &ServerState, name: &str) -> Option<Location> {
+    let res_path = state.workspace.project.autoload_script_path(name)?;
+    let root = &state.workspace.project.root;
+    let abs = gd_project::paths::res_to_path(root, res_path)?;
+    let uri = path_to_file_uri(&abs)?;
+    Some(Location {
+        uri,
+        range: file_start_range(),
     })
 }
 
@@ -683,12 +903,47 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // Candidate cross-file referencing files via the interface-pass reverse index (excluding the
     // current file, already scanned above). Collect URIs first so the index borrow doesn't conflict
     // with the lazy-analyze calls below.
-    let candidates = collect_name_referencer_uris(
-        &state.workspace.index,
-        &name,
-        current_path.as_deref(),
-        "references",
-    );
+    //
+    // M6-E: expand the candidate set beyond `name_referencers(name)`. For a method/signal `name`,
+    // callers reach it through a typed local (`var l: Lib; l.helper()`) — the interface pass
+    // records `Lib` (the type) but not `helper` (the callee) in the referencing set. Also include
+    // files that reference the current file's own class name, since any such file may call this
+    // method. The `push_identifier_locations` scan over the expanded set then picks up the callee
+    // identifier at its precise narrower range; de-dup collapses the overlap with the name scan.
+    let current_class_name: Option<String> = current_path
+        .as_deref()
+        .and_then(|p| state.workspace.index.file_id(p))
+        .and_then(|fid| state.workspace.index.interface(fid))
+        .and_then(|iface| iface.class_name.clone());
+
+    let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
+    for fid in state.workspace.index.name_referencers(&name) {
+        candidate_fids.insert(fid);
+    }
+    if let Some(ref cn) = current_class_name {
+        for fid in state.workspace.index.name_referencers(cn) {
+            candidate_fids.insert(fid);
+        }
+    }
+
+    let candidates: Vec<(camino::Utf8PathBuf, Uri)> = {
+        let mut out = Vec::new();
+        for fid in candidate_fids {
+            let Some(p) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            if current_path.as_deref().is_some_and(|e| normalize_eq(e, &p)) {
+                continue;
+            }
+            match path_to_file_uri(&p) {
+                Some(uri) => out.push((p, uri)),
+                None => log::warn!(
+                    "references: dropping candidate {p} — path_to_file_uri rejected the path"
+                ),
+            }
+        }
+        out
+    };
 
     for (path, cand_uri) in candidates {
         let Some((text, parsed, cand_result)) =
@@ -791,6 +1046,128 @@ fn normalize_eq(a: &camino::Utf8Path, b: &camino::Utf8Path) -> bool {
 // WP-N3: textDocument/implementation.
 // =============================================================================================
 
+/// M6-G: if `fn_name` is a `Func` member of the file identified by `uri`, BFS the inverse-extends
+/// graph to find subclasses and return `Location`s for each subclass that also declares a method
+/// named `fn_name`. Returns `None` to fall through to the existing class-identifier BFS when the
+/// cursor is NOT on a method of the current file's interface (e.g. on a class name or a variable).
+fn find_method_overrides(
+    state: &mut ServerState,
+    fn_name: &str,
+    uri: &Uri,
+    enc: crate::position::PositionEncoding,
+) -> Option<Vec<Location>> {
+    // Resolve the current file's FileId and interface.
+    let current_path = crate::uri::uri_to_path(uri)?;
+    let current_fid = state.workspace.index.file_id(&current_path)?;
+    let iface = state.workspace.index.interface(current_fid)?;
+
+    // The cursor must be on a `Func` member of this interface.
+    let is_func = iface
+        .members
+        .iter()
+        .any(|m| m.name == fn_name && m.kind == gd_project::MemberKind::Func);
+    if !is_func {
+        return None;
+    }
+
+    // Seed the BFS on the current file's own class_name.
+    let seed_name = iface.class_name.clone()?;
+
+    // BFS the inverse-extends graph — same algorithm as the class-identifier branch below.
+    let mut known_names: FxHashSet<String> = FxHashSet::default();
+    let mut known_files: FxHashSet<gd_project::FileId> = FxHashSet::default();
+    known_names.insert(seed_name);
+    loop {
+        let prev_names = known_names.len();
+        let prev_files = known_files.len();
+        for (fid, sub_iface) in state.workspace.index.iter_interfaces() {
+            if known_files.contains(&fid) {
+                continue;
+            }
+            let parent_name = match &sub_iface.extends {
+                gd_project::Extends::Names(parts) => parts.last().map(String::as_str),
+                _ => None,
+            };
+            if parent_name.is_some_and(|p| known_names.contains(p)) {
+                known_files.insert(fid);
+                if let Some(cn) = &sub_iface.class_name {
+                    known_names.insert(cn.clone());
+                }
+            }
+        }
+        if known_names.len() == prev_names && known_files.len() == prev_files {
+            break;
+        }
+    }
+
+    // For each known subclass (excluding the cursor's own file), emit a Location for the
+    // override's MemberDecl span. If the subclass doesn't override `fn_name`, skip it —
+    // method override search only reports files that actually declare the method.
+    let mut locations = Vec::new();
+    for fid in known_files {
+        if fid == current_fid {
+            continue;
+        }
+        let Some(sub_path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        let Some(cand_uri) = path_to_file_uri(&sub_path) else {
+            continue;
+        };
+
+        // Check the subclass interface for the override.
+        let has_override = state.workspace.index.interface(fid).is_some_and(|i| {
+            i.members
+                .iter()
+                .any(|m| m.name == fn_name && m.kind == gd_project::MemberKind::Func)
+        });
+        if !has_override {
+            continue;
+        }
+
+        // Point to the override's span in the subclass file: prefer the MemberDecl.span
+        // (the `func` keyword…body start), falling back to file start.
+        let override_span = state
+            .workspace
+            .index
+            .interface(fid)
+            .and_then(|i| {
+                i.members
+                    .iter()
+                    .find(|m| m.name == fn_name && m.kind == gd_project::MemberKind::Func)
+            })
+            .map(|m| m.span);
+
+        let range = if let Some(span) = override_span {
+            let cand_text = match state.vfs.get(cand_uri.as_str()).map(|d| d.text()) {
+                Some(t) => t,
+                None => match std::fs::read_to_string(sub_path.as_std_path()) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        locations.push(Location {
+                            uri: cand_uri,
+                            range: file_start_range(),
+                        });
+                        continue;
+                    }
+                },
+            };
+            let rope = Rope::from_str(&cand_text);
+            let cand_mapper = PositionMapper::new(&rope, enc);
+            cand_mapper.span_to_range(span)
+        } else {
+            file_start_range()
+        };
+
+        locations.push(Location {
+            uri: cand_uri,
+            range,
+        });
+    }
+
+    Some(locations)
+}
+
 /// `textDocument/implementation`: list the project classes that extend the class under the cursor
 /// (direct + transitive). Per LSP 3.17 §textDocument/implementation, returns
 /// `Location | Location[] | LocationLink[] | null`; this impl returns `Location[]`.
@@ -827,6 +1204,14 @@ pub fn implementation(
     let byte = mapper.position_to_byte(tdp.position);
     let node_id = parsed.tree.innermost_node_at(byte)?;
     let name = cursor_identifier(&parsed.tree, node_id)?;
+
+    // M6-G: method-override branch — runs BEFORE the class_name gate below so a cursor on a
+    // `func` identifier returns override locations rather than null. Detect whether `name` is a
+    // `Func` member of the current file's own interface; if so, BFS the subclass graph (seeded on
+    // the current file's class_name) and emit a Location for each subclass that overrides `name`.
+    if let Some(locs) = find_method_overrides(state, &name, &uri, enc) {
+        return Some(GotoDefinitionResponse::Array(locs));
+    }
 
     // Only project class_names participate; native classes have no project subclasses to list.
     state.workspace.index.registry().get(&name)?;

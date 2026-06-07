@@ -10,9 +10,9 @@ use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
     CallHierarchyServerCapability, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    OneOf, PublishDiagnosticsParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri,
+    DocumentLinkOptions, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, OneOf, PublishDiagnosticsParams, ServerCapabilities,
+    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent};
 use rustc_hash::FxHashSet;
@@ -966,6 +966,10 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+        document_link_provider: Some(DocumentLinkOptions {
+            resolve_provider: Some(false),
+            work_done_progress_options: Default::default(),
+        }),
         // `textDocument/publishDiagnostics` is a server→client push, not a capability field.
         ..Default::default()
     }
@@ -1120,6 +1124,7 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
     }
     let resp = match method.as_str() {
         "textDocument/documentSymbol" => handle!(handlers::document_symbol),
+        "textDocument/documentLink" => handle!(handlers::document_link),
         // LSP says hover returns `null` when there's nothing to say — `serde_json::to_value(None)`
         // serializes to `null`, which is what the wire wants.
         "textDocument/hover" => handle!(handlers::hover),
