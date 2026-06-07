@@ -3087,6 +3087,12 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     let mut found = false;
     let mut sig = CallSig::default();
     let mut in_file_function_id: Option<NodeId> = None;
+    // WP-N1b (xref metadata only): the FileId of the cross-file script that declares the callee,
+    // set when a subscript call resolves through a DtKind::Script base to a Func member in that
+    // script's interface. Kept separate from `in_file_function_id` so the arity-error gate
+    // (~3306: `if in_file_function_id.is_some()`) remains unchanged — cross-file Script calls
+    // still have no arity data, so we must not emit arity diagnostics for them.
+    let mut cross_file_callee: Option<gd_project::FileId> = None;
 
     if is_constructor {
         // `X.new()` returns an instance of X (analyzer.cpp's flow ends up there via
@@ -3170,6 +3176,12 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     };
                     return_type = Some(sig.return_dt.clone());
                     found = true;
+                    // WP-N1b (xref metadata only): record the cross-file callee for call-edge
+                    // bookkeeping. This is additive — no diagnostic or type changes. The
+                    // `cross_file_callee` local is used below at the Binding::Call recording site
+                    // to set `callee_file = Some(file)` for this cross-file Script call, enabling
+                    // accurate references filtering (Fix 2 Part B).
+                    cross_file_callee = Some(file);
                 }
             } else {
                 // Member not in the cross-file interface — silent degrade. The super-call /
@@ -3583,18 +3595,24 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     // super-callee shapes to avoid double-recording. `function_name` is the callee method name —
     // the attribute identifier after the dot for a subscript callee, or the post-`super.`
     // identifier (resp. the enclosing function for a bare `super()`), exactly as the parser fills
-    // `CallNode::function_name`. `callee_file` is `Some(ctx.file)` only when the method resolved
-    // to a function declared in *this* file (`in_file_function_id`, set by the in-file `Class`
-    // lookup which walks `ctx.bases`, all current-file node ids) — never a guessed file: for
-    // native / cross-file `Script` / builtin / enum / not-found callees we record `None`, and the
-    // nav handlers degrade through the same name-based matching they use for bare inherited calls
-    // (`binding.rs:55-69`). Recording is additive (WP-N1b): it sets no type and emits no
-    // diagnostic.
+    // `CallNode::function_name`. `callee_file` priority:
+    //   1. `cross_file_callee` — set when the call resolved through a DtKind::Script base to a
+    //      Func in that script's interface (the file that *declares* the method, e.g. lib.gd).
+    //   2. `ctx.file` — when `in_file_function_id` is set (the in-file `Class` lookup resolved
+    //      to a function declared in *this* file, walking `ctx.bases`).
+    //   3. `None` — for native / builtin / enum / not-found callees, and any callee gdls can't
+    //      pin to a project script. Nav handlers degrade through the same name-based matching
+    //      they use for bare inherited calls (`binding.rs:55-69`).
+    // Recording is additive (WP-N1b): it sets no type and emits no diagnostic.
     if is_subscript_callee || call.is_super {
         let caller = caller_function_name(ctx);
         let call_span = ctx.node(id).span;
         // WP-RD2: `ctx.file` is `Option`; an orphan records `None` rather than a placeholder id.
-        let callee_file = if in_file_function_id.is_some() {
+        let callee_file = if let Some(cf) = cross_file_callee {
+            // Cross-file Script call resolved to a declaring file — use it directly.
+            Some(cf)
+        } else if in_file_function_id.is_some() {
+            // In-file Class call resolved — attribute to the current file.
             ctx.file
         } else {
             None
