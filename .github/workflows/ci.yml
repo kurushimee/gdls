@@ -86,5 +86,5 @@ jobs:
       # panic-driven `catch_unwind` recovery cannot be fuzzed here — libfuzzer's panic hook aborts
       # on a deliberate `panic!` before `catch_unwind` runs — so it is covered by gd_project's
       # release unit tests instead (the `Test (release · index recovery paths)` step above).
-      - name: Fuzz index_invariants (recovery: non-panicking quarantine path)
+      - name: "Fuzz index_invariants (recovery: non-panicking quarantine path)"
         run: cargo +nightly fuzz run index_invariants -- -max_total_time=60 -timeout=10
