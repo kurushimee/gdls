@@ -5,3 +5,6 @@
 /crates/*/fuzz/artifacts
 # generated native-class API dumps used for local testing
 /api/extension_api*.json
+# local Claude Code / orchestration state (worktrees, plan artifacts, per-worktree settings,
+# agent-memory symlinks) — tool-local, never part of the shipped sources
+/.claude/
