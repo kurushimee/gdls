@@ -109,9 +109,15 @@ when a file's diagnostics or a query need them. Results are cached and invalidat
   bookkeeping; a hand-rolled invalidation map is the fallback. **Choice made**: hand-rolled (no `salsa`
   dependency). The trait-based [cross-file query seam](02-frontend-port.md#10-cross-file-query-seam-crossfilequery)
   is what carries dependency information across the `gd_analyze` ↔ `gd_project` boundary.
-- **Optional persistent cache (Phase 2).** Serialize the interface index keyed by file content hash for
-  instant warm starts on a 10k-file project. `NativeDb` already carries the `content_hash` field used
-  for change detection; the serializer + on-disk store is Phase 2 work.
+- **Persistent warm-start cache (M6, required for v1).** Serialize the eager-interface index so a second
+  launch skips the cold scan. Whole-cache key = `(cache_format_version, gdls_version,
+  NativeDb::content_hash, project.godot fingerprint)`; **per-file** validity is a read-free
+  `(size, mtime_ns)` stat check (content hash only as a fallback if mtime proves unreliable), so a warm
+  start is a stat sweep plus a handful of re-parses rather than a full re-scan. `NativeDb` already carries
+  the `content_hash` field. Stored project-local in `<root>/.gdls/` (which M6 adds to the §6 exclusion
+  set); writes are atomic (temp + rename, last-writer-wins) so two gdls processes on one project stay
+  safe, and any read/verify failure degrades to a cold index. Pulled forward from Phase 2 — it gates v1.
+  Full design: [`08-m6-v1-ship.md`](08-m6-v1-ship.md) §3.
 - **Cross-file member-initializer cycle detection (M4).** WP-R2 (M3) added
   `CrossFileQuery::member_initializer_xrefs`, inert in the production `SyntacticQuery` impl —
   cycle detection fires only in the conformance harness's `CorpusQuery`. M4 activates it in the

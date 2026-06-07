@@ -63,6 +63,9 @@ run. Tightening this in CI is the post-M5 step.
   (e.g. `.notest.gd`/`.textonly.gd`, the `completion/` and `lsp/` folders, and the runtime/debug
   lines filtered by the parse/analyze curation layer). The per-file `known_failures.txt` for the
   parser is intentionally empty after Phase E close-out.
+- **M6 holds both ratchets.** M6 (capability-parity + warm-start cache — `07-milestones-risks.md` /
+  `08-m6-v1-ship.md`) is glue/projection over existing structures; it adds no analyzer/parser fidelity
+  fixtures and keeps parse **1.0000** / analyze **1.0000** green as a gate on every step.
 
 ## 4. Per-component unit tests
 

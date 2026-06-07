@@ -76,13 +76,16 @@ in [`docs/05-lsp-cc-integration.md`](docs/05-lsp-cc-integration.md) §3.
 
 ## Status
 
-**Phase 1 (M0–M5) complete — v1.0.0.** Both fidelity ratchets at **1.0000** (parser 186/186,
-analyzer 300/300) against the vendored Godot 4.6.3-stable conformance corpus. See
-[`CHANGELOG.md`](CHANGELOG.md) for the full milestone history.
+**Phase 1 = M0–M6 = v1. M0–M5 are complete; M6 is the final milestone and is what ships v1 — not yet
+tagged.** Both fidelity ratchets are at **1.0000** (parser 186/186, analyzer 300/300) against the
+vendored Godot 4.6.3-stable conformance corpus. **M6** closes the remaining exposed-capability parity
+gaps vs Godot's own LSP and adds a persistent warm-start index cache; until it lands, `1.0.0` is set
+in-tree but deliberately **untagged**. See [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md) for the M6
+scope and [`CHANGELOG.md`](CHANGELOG.md) for the milestone history.
 
-Phase 2 (deferred): `.tscn` node typing for `$`/`%`, `signatureHelp`, `completion`, and an optional
-persistent on-disk index cache. Roadmap in
-[`docs/07-milestones-risks.md`](docs/07-milestones-risks.md) (the **Phase 2** row).
+Phase 2 (post-v1): `.tscn` node typing for `$`/`%`, `signatureHelp`, `completion`, and `rename` /
+`documentHighlight`. (The persistent warm-start index cache was pulled forward into **M6** — it now
+gates v1.) Roadmap in [`docs/07-milestones-risks.md`](docs/07-milestones-risks.md).
 
 ## Contributing
 

@@ -5,9 +5,12 @@ All notable changes to `gdls` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] — 2026-06-01
+## [Unreleased] — targeting v1.0.0
 
-First tagged release. Phase 1 complete (M0–M5).
+`1.0.0` is bumped in-tree but **deliberately untagged**: the ship bar was raised at the close of M5, so
+v1 now ships with **M6** (exposed-capability parity + a persistent warm-start cache). Everything below
+has landed (M0–M5); the **M6** section lists what remains before `1.0.0` is tagged. Full M6 scope:
+[`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md).
 
 ### Diagnostics
 - Parser fidelity 1.0000 (186/186) on the vendored Godot 4.6.3-stable corpus.
@@ -43,10 +46,23 @@ First tagged release. Phase 1 complete (M0–M5).
 - M2 environment + indexing (native DB, project.godot, class_name registry)
 - M3 analyzer + warning set + per-file diagnostics + hover + definition + strict mode
 - M4 freshness watcher + 4 nav handlers + cross-file cycle detection
-- M5 hardening, observability, parity gap closure, v1 release
+- M5 hardening, observability, parity gap closure
+
+### M6 — remaining for v1 (in progress)
+
+The raised ship bar pulls these into Phase 1 before `1.0.0` is tagged (full design:
+[`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md)):
+- Exposed-capability parity vs Godot's own LSP — `hover` member/call/`preload` signatures (M6-F);
+  `definition` for `class_name`-in-expression (M6-B), `preload`/`load` strings (M6-C), autoloads (M6-D);
+  project-wide `references` through typed vars (M6-E); hierarchical `documentSymbol` (M6-A);
+  `implementation` for method overrides (M6-G).
+- Persistent warm-start index cache — stat-validated `(size, mtime_ns)`, atomic multi-instance-safe
+  writes (M6-H / M6-I), plus a reconcile-by-stat path that stops re-parsing unchanged files.
+- Exit gate: every exposed capability ⊇ Godot's own LSP; warm start > 5× faster than cold scan; both
+  ratchets still 1.0000 / 1.0000; a clean re-run of the capability walk — then tag **v1.0.0**.
 
 ---
 
-**Tag conventions.** Subsequent Godot-tracked re-ports become `v1.x.0` minor releases
-(Godot 4.8, 4.9, …). `v2.0.0` is reserved for the persistent on-disk cache + Phase 2 features
-(`.tscn` node typing for `$`/`%`, `signatureHelp`, `completion`).
+**Tag conventions.** `1.0.0` is tagged once M6 lands (the persistent warm-start cache ships *in* v1, not
+later). Subsequent Godot-tracked re-ports become `v1.x.0` minor releases (Godot 4.8, 4.9, …). `v2.0.0`
+is reserved for Phase 2 features (`.tscn` node typing for `$`/`%`, `signatureHelp`, `completion`).

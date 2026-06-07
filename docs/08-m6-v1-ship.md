@@ -1,7 +1,7 @@
-# 08 — Phase 1 remaining scope (pre-ship punch list)
+# 08 — M6: exposed-capability parity + warm-start cache (the v1 ship milestone)
 
-**Status:** scoping spec · authored 2026-06-01 · supersedes the "ship now" recommendation reached at
-the close of M5 Phase H.
+**Status:** M6 milestone spec · authored 2026-06-01 · supersedes the "ship now" recommendation reached at
+the close of M5 Phase H. **M6 is the final milestone of Phase 1 — completing it is what ships and tags v1.0.0.**
 
 The M5 Phase H walk against a large real-world GDScript project returned GREEN **against the original bar** ("no crashes,
 no wrong answers, safe-but-sometimes-incomplete is acceptable"). The bar has since been raised:
@@ -9,10 +9,10 @@ no wrong answers, safe-but-sometimes-incomplete is acceptable"). The bar has sin
 > Every **currently-exposed** LSP capability must be **fully** correct — no inaccurate or
 > incomplete data for any input, with **no regressions against Godot's own GDScript LSP**. Any
 > previously-deferred follow-up whose absence yields incomplete/inaccurate output is pulled into
-> Phase 1. Plus: the per-startup reindex cost must be **cached** so a long startup happens once, not
+> M6. Plus: the per-startup reindex cost must be **cached** so a long startup happens once, not
 > every launch.
 
-This doc enumerates what that bar adds to Phase 1, grounded in (a) what Godot's own LSP actually
+This doc enumerates what that bar adds — the **M6** scope — grounded in (a) what Godot's own LSP actually
 does — inspected in Godot's `modules/gdscript/language_server/` — and
 (b) gdls's current code paths. `v1.0.0` stays untagged until these land and a re-run of the Phase H
 walk is clean.
@@ -26,13 +26,13 @@ This is the reference for "no regressions." Source: Godot's `modules/gdscript/la
 
 | Capability | Godot's own LSP | gdls today | Verdict |
 |---|---|---|---|
-| `hover` | signature + doc + "Defined in" link, **including member/method signatures** (`text_document.cpp:347`, `godot_lsp.h:1284`) | type-name only for native/class_name identifiers; **member/call/preload show the base placeholder** | **regression → P1** |
-| `definition` | `Location` at symbol; resolves `class_name` in expression position via `is_global_class` (`workspace.cpp:650`) | resolves in-file members + `class_name` in `extends`; **null for `class_name` in expression** | **regression → P1** |
-| preload `res://` nav | via **`documentLink`** on any file-resolving string literal (`extend_parser.cpp:186-215`), *not* `definition` | not implemented (no documentLink; definition returns null) | **gap → P1** (mechanism TBD) |
-| autoload nav | no dedicated autoload handling found *(unverified)* | null | exceeds-Godot completeness → P1 (cheap) |
-| `references` | **project-wide**, textual name-scan + per-hit re-resolve (`workspace.cpp:472`) — finds cross-file callsites through typed vars | in-file + cross-file *class* refs; **misses cross-file method/signal callsites through typed vars** | **regression → P1** |
-| `documentSymbol` | **hierarchical** (root Class → members, inner classes nested; `text_document.cpp:139`, `godot_lsp.h:1257`) | **flat** (drops the enclosing Class container) | **regression → P1** |
-| `implementation` | **NOT supported** (`implementationProvider=false`, `godot_lsp.h:1768`) | exposed; subtype-nav for classes, null for methods | bonus (no parity bar) → P1 *optional* |
+| `hover` | signature + doc + "Defined in" link, **including member/method signatures** (`text_document.cpp:347`, `godot_lsp.h:1284`) | type-name only for native/class_name identifiers; **member/call/preload show the base placeholder** | **regression → M6** |
+| `definition` | `Location` at symbol; resolves `class_name` in expression position via `is_global_class` (`workspace.cpp:650`) | resolves in-file members + `class_name` in `extends`; **null for `class_name` in expression** | **regression → M6** |
+| preload `res://` nav | via **`documentLink`** on any file-resolving string literal (`extend_parser.cpp:186-215`), *not* `definition` | not implemented (no documentLink; definition returns null) | **gap → M6** (mechanism TBD) |
+| autoload nav | no dedicated autoload handling found *(unverified)* | null | exceeds-Godot completeness → M6 (cheap) |
+| `references` | **project-wide**, textual name-scan + per-hit re-resolve (`workspace.cpp:472`) — finds cross-file callsites through typed vars | in-file + cross-file *class* refs; **misses cross-file method/signal callsites through typed vars** | **regression → M6** |
+| `documentSymbol` | **hierarchical** (root Class → members, inner classes nested; `text_document.cpp:139`, `godot_lsp.h:1257`) | **flat** (drops the enclosing Class container) | **regression → M6** |
+| `implementation` | **NOT supported** (`implementationProvider=false`, `godot_lsp.h:1768`) | exposed; subtype-nav for classes, null for methods | bonus (no parity bar) → M6 *optional* |
 | `callHierarchy` | **NOT supported** (no field/handler) | exposed, works | bonus, no gap |
 | `workspace/symbol` | **NOT supported** (`workspaceSymbolProvider=false`) | exposed, works | bonus, no gap |
 | `completion` / `signatureHelp` | supported | not exposed | **Phase 2** (per `docs/00 §3`) |
@@ -49,13 +49,13 @@ This is the reference for "no regressions." Source: Godot's `modules/gdscript/la
 
 ---
 
-## 2. Phase 1 capability-completeness work items
+## 2. M6 capability-completeness work items
 
 Each item: the gap, the parity rationale, current behavior (`file:line`), the fix shape, and a
 size/risk estimate. None touch the faithful-port analyzer/parser fidelity (all glue/projection),
 so the 300/300 + 186/186 ratchets are not at risk — but every item must keep the full gate green.
 
-### P1-A — `documentSymbol`: nest members under the enclosing Class  *(smallest, do first)*
+### M6-A — `documentSymbol`: nest members under the enclosing Class  *(smallest, do first)*
 - **Gap / parity:** Godot returns a hierarchical tree; gdls returns a flat member list with no Class
   container. A file with inner classes loses its nesting.
 - **Current:** the parser projection `document_symbols` (`crates/gd_syntax/src/parser.rs:4380-4385`)
@@ -71,7 +71,7 @@ so the 300/300 + 186/186 ratchets are not at risk — but every item must keep t
   does (`godot_lsp.h:1272`).
 - **Size/risk:** small / low. Localized to one function + a documentSymbol test update.
 
-### P1-B — `definition`: resolve `class_name` used in expression position
+### M6-B — `definition`: resolve `class_name` used in expression position
 - **Gap / parity:** Godot resolves `Foo.bar()` → `Foo`'s script (`workspace.cpp:650`); gdls returns
   null (works only in `extends`).
 - **Current:** `definition` (`handlers.rs:180-207`) takes `cursor_identifier(node)`; for `Utils` in
@@ -85,7 +85,7 @@ so the 300/300 + 186/186 ratchets are not at risk — but every item must keep t
   exact node shape during implementation.
 - **Size/risk:** small / low.
 
-### P1-C — `definition` (or `documentLink`) on `preload("res://…")` / `load("res://…")` strings
+### M6-C — `definition` (or `documentLink`) on `preload("res://…")` / `load("res://…")` strings
 - **Gap / parity:** Godot makes these clickable via **`documentLink`** (fires on *any* file-resolving
   string literal, `extend_parser.cpp:186-215`), not `definition`.
 - **Current:** `definition` requires a bare `Identifier` (`handlers.rs:193`); a string-literal path
@@ -102,7 +102,7 @@ so the 300/300 + 186/186 ratchets are not at risk — but every item must keep t
     capability + server-capability flag. Can follow C1 later.
 - **Size/risk:** C1 small / low; C2 medium / low.
 
-### P1-D — `definition` on an autoload reference  *(exceeds Godot; cheap)*
+### M6-D — `definition` on an autoload reference  *(exceeds Godot; cheap)*
 - **Gap / parity:** Godot's LSP has no dedicated autoload resolution *(unverified)*; this would
   exceed parity. Included because the data exists and autoload nav is a common, expected jump.
 - **Available:** `project.godot` is parsed into `ProjectGodot { autoloads: Vec<Autoload> }`, each
@@ -111,10 +111,10 @@ so the 300/300 + 186/186 ratchets are not at risk — but every item must keep t
   re-exposes a name→path accessor at the server layer — may need a small accessor.)*
 - **Fix:** add an autoload name→script-path lookup on `ProjectModel`/`Index`; in `definition`, map
   an identifier matching an autoload name → `resolve_res_path`/`file_id` → `Location`.
-- **Size/risk:** small-medium / low. (Optional within Phase 1 if time-boxed — flagged as
+- **Size/risk:** small-medium / low. (Optional within M6 if time-boxed — flagged as
   exceeds-parity.)
 
-### P1-E — `references`: include cross-file member/signal callsites through typed variables
+### M6-E — `references`: include cross-file member/signal callsites through typed variables
 - **Gap / parity:** Godot's references is project-wide and finds `c.get_current_value()` across
   files (textual scan + re-resolve, `workspace.cpp:472`). gdls misses them.
 - **Current:** `references` (`handlers.rs:634-721`) projects only `Binding::Use` via
@@ -133,7 +133,7 @@ so the 300/300 + 186/186 ratchets are not at risk — but every item must keep t
 - **Size/risk:** medium / medium. Touches the references candidate-gathering; needs careful de-dup
   + a cross-file fixture test. Parity target: ⊇ what Godot's textual scan would return.
 
-### P1-F — `hover`: render member/call/preload signatures
+### M6-F — `hover`: render member/call/preload signatures
 - **Gap / parity:** Godot's hover shows the member's full signature + doc (`godot_lsp.h:1284`); gdls
   shows the base type placeholder for member access / calls / preload.
 - **Current:** `render_hover` (`handlers.rs:268-349`) renders a type *name* only for bare native/
@@ -151,7 +151,7 @@ so the 300/300 + 186/186 ratchets are not at risk — but every item must keep t
   branch for declaration-anchor identifiers.
 - **Size/risk:** medium / low-medium. Pure projection; no analyzer change.
 
-### P1-G — `implementation` for method overrides  *(bonus capability; optional)*
+### M6-G — `implementation` for method overrides  *(bonus capability; optional)*
 - **Gap / parity:** Godot has **no** `implementation`, so there is no parity bar. gdls exposes it;
   on a method cursor it returns null (it does class-subtype nav only). `workspace/symbol` already
   surfaces every same-named method decl across files, so the information is reachable today.
@@ -176,7 +176,7 @@ a large real-world GDScript project. The event loop only arms after both (`serve
 reconcile before `loop {`), so the editor is unresponsive for ~12 s on **every** start. A one-time
 warm-up is fine; paying it every launch is not.
 
-**Goal (Phase 2 exit criterion, pulled forward):** warm start of a large project from on-disk cache
+**Goal (was a Phase 2 exit criterion, pulled forward into M6):** warm start of a large project from on-disk cache
 is **> 5× faster** than a cold scan (`docs/07 §1` Phase-2 row). On a large real-world GDScript project that means a
 ~stat-only warm start in well under ~2 s.
 
@@ -221,19 +221,19 @@ is **> 5× faster** than a cold scan (`docs/07 §1` Phase-2 row). On a large rea
      (`index.rs:181-192`, unconditional, not `debug_assert!`) — a corrupt cache degrades, it never
      poisons the session.
   6. **Still run a (cheap, mtime-based) reconcile** as the drift backstop for changes made while the
-     server was off — see P1-H.
+     server was off — see M6-H.
 - **Write timing:** write the cache after the initial index is built + reconciled (one-time
   ~few-ms serialize), guarded so a write failure only logs. Do not block the event loop; if needed,
   write on shutdown as well. Single-threaded loop means no locking concern (`docs/03 §6.1`).
 
-**Convergence with reconcile (P1-H):** the same per-file `(size, mtime_ns)` table lets
+**Convergence with reconcile (M6-H):** the same per-file `(size, mtime_ns)` table lets
 `reconcile` skip the full re-parse — it can classify added/modified/removed by **stat diff** and only
 re-parse the changed files, instead of re-parsing all 2338 (`workspace.rs:578-585`). This both
 removes the ~8.5 s startup block *and* makes the cache's drift-backstop cheap. (Note doc-rot:
 `docs/03 §6.1` already *claims* reconcile hashes `(path, mtime, size)` but the code does a full
 re-parse — this work makes the doc true.)
 
-### P1-I — Multi-instance / concurrent-process safety  *(load-bearing for the cache)*
+### M6-I — Multi-instance / concurrent-process safety  *(load-bearing for the cache)*
 
 **Today gdls is already safe for concurrent use, and the cache must not break that.** Verified by
 grep: every filesystem write in production code is inside `#[cfg(test)]`; the *only* non-test write
@@ -277,7 +277,7 @@ clobber each other's trace. That's an opt-in debug feature, not the LSP path; a 
 
 ---
 
-## 4. Out of scope / decisions for the user
+## 4. Out of scope / decisions (resolved)
 
 **Confirmed Phase 2 (per `docs/00 §3`; unchanged):** `.tscn` node typing for `$`/`%` precise types,
 `completion`, `signatureHelp`.
@@ -288,31 +288,29 @@ clobber each other's trace. That's an opt-in debug feature, not the LSP path; a 
   *latency* property, not a data-correctness one (no wrong/incomplete result — the request still
   returns a correct response), and Godot's LSP is no better here. Needs concurrent dispatch ⇒ Phase 2.
 
-**Godot capabilities gdls does not expose — your call (default: Phase 2):** Godot's LSP also offers
+**Godot capabilities gdls does not expose — decided for v1: all deferred to Phase 2.** Godot's LSP also offers
 `rename`/`prepareRename`, `documentHighlight`, `declaration` (definition + jump to native docs), and
-`onTypeFormatting`. None are "incomplete data on an exposed capability," so the new bar doesn't
-strictly require them — but if "no regressions against Godot's editor experience" is meant
-literally, `rename` and `documentHighlight` are the two a user would most notice. Flagging for an
-explicit decision:
-- **`rename`** — substantial (workspace-wide edits, must reuse the P1-E reference graph). Recommend
-  Phase 2 unless you want it in v1.
-- **`documentHighlight`** — in-file usages of the symbol under the cursor; cheap once P1-E's
-  reference machinery exists (in-file subset). Could be a low-cost Phase 1 add-on.
+`onTypeFormatting`. None are "incomplete data on an exposed capability," so the M6 bar doesn't
+require them. `rename` and `documentHighlight` are the two a user would most notice, so they are the
+first Phase-2 candidates:
+- **`rename`** — substantial (workspace-wide edits, must reuse the M6-E reference graph). **Phase 2.**
+- **`documentHighlight`** — in-file usages of the symbol under the cursor; cheap once M6-E's
+  reference machinery exists (in-file subset), so a **low-cost early Phase-2 add-on** — but out of v1 scope.
 - **`declaration`, onTypeFormatting** — low value for this tool; Phase 2 / never.
 
 ---
 
 ## 5. Suggested sequencing
 
-1. **P1-A** documentSymbol nesting (smallest, isolated, immediate parity win).
-2. **P1-B** definition on class_name-in-expression (small, high-frequency).
-3. **P1-C1** definition on preload strings; **P1-D** autoload definition (share the `resolve_res_path`
+1. **M6-A** documentSymbol nesting (smallest, isolated, immediate parity win).
+2. **M6-B** definition on class_name-in-expression (small, high-frequency).
+3. **M6-C1** definition on preload strings; **M6-D** autoload definition (share the `resolve_res_path`
    plumbing).
-4. **P1-E** references cross-file callsites (unlocks **P1-G** implementation overrides and a future
+4. **M6-E** references cross-file callsites (unlocks **M6-G** implementation overrides and a future
    `documentHighlight`/`rename`, which reuse the same reference/override machinery).
-5. **P1-F** hover member/preload signatures.
-6. **P1-G** implementation method overrides (optional; reuses P1-E + the existing BFS).
-7. **§3 cache + P1-H reconcile-by-stat + P1-I atomic/multi-instance-safe writes** (the largest; do as
+5. **M6-F** hover member/preload signatures.
+6. **M6-G** implementation method overrides (optional; reuses M6-E + the existing BFS).
+7. **§3 cache + M6-H reconcile-by-stat + M6-I atomic/multi-instance-safe writes** (the largest; do as
    a focused unit — serde derives, per-file `(size,mtime)` table, `.gdls/` exclusion,
    load+verify+reconcile path, atomic write-on-build via `tempfile` persist).
 
@@ -322,7 +320,7 @@ fidelity changes.
 
 ---
 
-## 6. Phase 1 ship exit criteria (revised)
+## 6. M6 exit criteria — the v1 ship gate
 
 `v1.0.0` ships when, in addition to the existing gate (ratchets 1.0/1.0, empty `known_failures`,
 green CI, observability/memory/governor wired):
@@ -330,7 +328,7 @@ green CI, observability/memory/governor wired):
 - **Exposed-capability parity:** hover (incl. member/call/preload signatures), definition
   (in-file + cross-file class + class_name-in-expression + preload-string + autoload), references
   (incl. cross-file member/signal callsites), documentSymbol (hierarchical) all return
-  complete/accurate output ⊇ Godot's own LSP on the same inputs. `implementation` (P1-G) returns
+  complete/accurate output ⊇ Godot's own LSP on the same inputs. `implementation` (M6-G) returns
   method overrides or is explicitly scoped as class-subtype-only.
 - **Warm-start cache:** a second launch of a large real-world GDScript project is **> 5× faster** than the cold scan
   (stat-only warm start), the cache validates against `NativeDb::content_hash` + per-file

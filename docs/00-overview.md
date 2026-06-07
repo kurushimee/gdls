@@ -6,7 +6,7 @@
 | | |
 |---|---|
 | **Spec date** | 2026-05-20 |
-| **Status** | Original design spec, retained for rationale. Phase 1 (M0–M5) is implemented (version **1.0.0**) — see [`../CHANGELOG.md`](../CHANGELOG.md) and [`../README.md`](../README.md) for current status. |
+| **Status** | Original design spec, retained for rationale. Phase 1 = **M0–M6** = v1: M0–M5 are implemented; **M6** (exposed-capability parity + warm-start cache) is the final milestone and is what ships v1. Version **1.0.0** is set in-tree but deliberately **untagged** until M6 lands — see [`08-m6-v1-ship.md`](08-m6-v1-ship.md), [`../CHANGELOG.md`](../CHANGELOG.md), and [`../README.md`](../README.md) for current status. |
 | **Target language** | GDScript 2.0 as shipped in **Godot 4.6.3-stable** |
 | **Engine** | Official Godot (`godotengine/godot`) at tag `4.6.3-stable` — the GDScript frontend is the port's source of truth (unchanged from upstream; only native C++ classes differ). Native classes are ingested from the `godot` binary's `extension_api.json`. |
 | **Consumer** | Claude Code's native LSP client (stdio) |
@@ -84,7 +84,7 @@ A standalone server, **gdls**, that:
 | `05-lsp-cc-integration.md` | LSP surface, Claude Code config & deployment |
 | `06-testing-fidelity.md` | Conformance corpus, differential testing, robustness |
 | `07-milestones-risks.md` | Phased milestones, effort, risks, maintenance |
-| `08-phase1-remaining.md` | Phase 1 pre-ship punch list: capability-parity gaps vs Godot's own LSP, the warm-start index cache, exit criteria |
+| `08-m6-v1-ship.md` | **M6** (the v1 ship milestone): exposed-capability parity gaps vs Godot's own LSP, the warm-start index cache, multi-instance safety, exit criteria |
 
 ## 7. References (sources)
 

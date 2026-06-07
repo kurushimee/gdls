@@ -2,7 +2,9 @@
 
 ## 1. Target LSP surface (driven by what Claude Code consumes)
 
-Per Claude Code's docs, its LSP client uses the following. v1 implements all of them; the rest are Phase 2.
+Per Claude Code's docs, its LSP client uses the following. v1 exposes all of them; the rest are Phase 2.
+(Several exposed handlers are wired but still have Godot-parity gaps that **M6** closes before v1 ships —
+see the parity note below the table.)
 
 | Capability | LSP method(s) | v1? | Notes |
 |---|---|---|---|
@@ -17,6 +19,13 @@ Per Claude Code's docs, its LSP client uses the following. v1 implements all of 
 | Signature help | `textDocument/signatureHelp` | ❌ Phase 2 | Not documented as consumed by CC. |
 | Completion | `textDocument/completion` | ❌ Phase 2 | Not documented as consumed by CC. |
 | Rename / formatting / code actions / semantic tokens | — | ❌ | Out of scope. |
+
+> **Parity note (M6).** A ✅ above means the capability is *exposed and wired*, not that it already
+> matches Godot's own LSP on every input. Five have parity gaps that **M6** closes before v1 is tagged:
+> hierarchical `documentSymbol` (M6-A); `definition` on `class_name`-in-expression / `preload` strings /
+> autoloads (M6-B/C/D); project-wide `references` through typed vars (M6-E); `hover` member/call/`preload`
+> signatures (M6-F); and `implementation` for method overrides (M6-G). Until then they are safe but
+> sometimes incomplete — never wrong. See [`08-m6-v1-ship.md`](08-m6-v1-ship.md).
 
 ### Hover doc-string source
 

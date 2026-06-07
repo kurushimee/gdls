@@ -122,17 +122,20 @@ output — filter it; skip `completion/`, `lsp/`, `*.notest.gd`, `*.textonly.gd`
 
 ## Milestone status
 
-Phase 1 = v1 = **M0–M5**: M0 LSP skeleton · M1 tokenizer + parser · M2 environment/indexing (native DB,
+Phase 1 = v1 = **M0–M6**: M0 LSP skeleton · M1 tokenizer + parser · M2 environment/indexing (native DB,
 `project.godot`, `class_name` registry) · M3 analyzer + warnings + per-file diagnostics + `hover`/
 `definition` + strict-mode · M4 freshness watcher + dep-graph invalidation + nav (`references`,
 `implementation`, `prepareCallHierarchy`/`callHierarchy`, `workspace/symbol`) · M5 10k-file hardening
-(memory pressure ladder, perf budgets), observability (`tracing`), differential-oracle harness. Phase 2
-(deferred): `.tscn` node typing for `$`/`%`, `completion`, `signatureHelp`, optional persistent on-disk
-index cache.
+(memory pressure ladder, perf budgets), observability (`tracing`), differential-oracle harness · **M6
+(the milestone that ships v1)** exposed-capability parity vs Godot's own LSP (`hover`/`definition`/
+`references`/`documentSymbol`/`implementation` gaps) + a persistent warm-start index cache, per
+[`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md). Phase 2 (post-v1): `.tscn` node typing for `$`/`%`,
+`completion`, `signatureHelp`, `rename`/`documentHighlight`.
 
-**Current:** M0–M5 complete on `m5-hardening`; workspace version-bumped to `1.0.0` but deliberately left
+**Current:** M0–M5 complete; workspace version-bumped to `1.0.0` but deliberately left
 **UNTAGGED** — the ship bar was raised (every exposed LSP capability fully Godot-parity-complete + a
-persistent warm-start index cache), so v1 work continues per **`docs/08-phase1-remaining.md`**. Both
+persistent warm-start index cache), so **M6** — the final Phase 1 milestone, which ships v1 — is the
+remaining work, specced in **[`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md)**. Both
 conformance ratchets hold at **1.0**: parser **186/186**, analyzer **300/300**. CI is green (`cargo fmt
 --check`, `cargo lint`, `cargo test --workspace`); three-layer fuzz gate (`parse` + `analyze` +
 `index_invariants`). Per-milestone exit criteria: `docs/07`; the full M5 phase-by-phase history:
