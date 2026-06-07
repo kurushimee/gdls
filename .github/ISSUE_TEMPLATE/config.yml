@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Roadmap & milestones
+    url: https://github.com/kurushimee/gdls/milestones
+    about: M6 (the v1-ship milestone) and Phase 2 are tracked here.
+  - name: Architecture & design docs
+    url: https://github.com/kurushimee/gdls/tree/main/docs
+    about: Problem, locked decisions, the crate DAG, and the M6 spec.
+  - name: Contributing & the faithful-port discipline
+    url: https://github.com/kurushimee/gdls/blob/main/CONTRIBUTING.md
+    about: Read this before opening a pull request.

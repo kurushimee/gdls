@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose a capability or improvement.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please skim the roadmap: **M6** (the v1-ship milestone) and **Phase 2** are tracked in
+        [Milestones](https://github.com/kurushimee/gdls/milestones) and in
+        [`docs/07-milestones-risks.md`](https://github.com/kurushimee/gdls/blob/main/docs/07-milestones-risks.md).
+        Some things — `.tscn` node typing for `$`/`%`, `completion`, `signatureHelp`, `rename` —
+        are already **deliberately Phase 2**.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: What are you trying to do that gdls doesn't support today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: parity
+    attributes:
+      label: Does Godot's own GDScript LSP do this?
+      description: gdls's first bar is parity with Godot, so "Godot already does it" is a strong signal.
+      options:
+        - "Yes — Godot's LSP already does this"
+        - "No — this would exceed Godot"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else (optional)

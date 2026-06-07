@@ -1,5 +1,10 @@
 # gdls — a standalone GDScript language server for Godot 4.6.3-stable
 
+[![CI](https://github.com/kurushimee/gdls/actions/workflows/ci.yml/badge.svg)](https://github.com/kurushimee/gdls/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-dea584.svg?logo=rust)](rust-toolchain.toml)
+[![Godot conformance](https://img.shields.io/badge/Godot%20conformance-1.0000-brightgreen.svg)](docs/06-testing-fidelity.md)
+
 A single self-contained language server providing **type-aware GDScript diagnostics and
 navigation** to Claude Code (and any LSP client) over stdio — **with no Godot engine or editor
 process running at runtime**.

@@ -1,0 +1,70 @@
+name: Bug report
+description: A crash, a wrong/missing diagnostic, or any behavior that diverges from Godot's own GDScript LSP.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. gdls is a **faithful port of Godot 4.6.3-stable's GDScript frontend** —
+        its diagnostics are meant to match Godot's exactly. If a diagnostic differs from what the Godot
+        editor / LSP reports, that divergence *is* the bug, so please tell us what Godot does.
+  - type: input
+    id: version
+    attributes:
+      label: gdls version
+      description: "Output of `gdls --version`, or the commit SHA you built."
+      placeholder: "e.g. 1.0.0 (abcdef1)"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Linux
+        - Windows
+        - macOS
+        - Other (note in the description)
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: LSP client
+      description: What spoke to gdls over stdio.
+      placeholder: "e.g. Claude Code, Neovim, VS Code, raw stdio"
+    validations:
+      required: true
+  - type: input
+    id: godot
+    attributes:
+      label: Godot version / extension_api.json source
+      description: Which Godot produced the extension_api.json you pointed gdls at, if relevant.
+      placeholder: "e.g. 4.6.3-stable, in-project --dump-extension-api-with-docs"
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest `.gd` snippet (or repo) plus the exact LSP request / cursor position that triggers it.
+      render: gdscript
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected — what Godot does
+      description: What Godot's own editor / LSP reports for the same input (the parity target). If you're not sure, say so.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual — what gdls does
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional)
+      description: "Re-run with `GDLS_LOG=debug` (or `trace`) and paste the relevant stderr. Never paste stdout — that's the LSP wire."
+      render: text
