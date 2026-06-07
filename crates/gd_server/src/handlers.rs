@@ -128,7 +128,6 @@ pub fn document_link(state: &mut ServerState, params: DocumentLinkParams) -> Vec
         return Vec::new();
     };
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
-    let root = state.workspace.project.root.clone();
 
     let mut links = Vec::new();
     for node_id in parsed.tree.iter_ids() {
@@ -142,7 +141,14 @@ pub fn document_link(state: &mut ServerState, params: DocumentLinkParams) -> Vec
         if !path.starts_with("res://") {
             continue;
         }
-        let Some(abs) = gd_project::paths::res_to_path(&root, path) else {
+        // Gate on index membership — only emit a link for paths that resolve to an actually
+        // existing project file. `res_to_path` is a pure path-join with no existence check;
+        // `resolve_res_path` returns Some only for files that are indexed (i.e. on disk at scan
+        // time). A link to a non-existent target is a bug (spec: documentLink scope, a3.md §3).
+        let Some(fid) = state.workspace.index.resolve_res_path(path) else {
+            continue;
+        };
+        let Some(abs) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
             continue;
         };
         let Some(target) = path_to_file_uri(&abs) else {
@@ -697,8 +703,11 @@ fn find_res_path_definition(
     if !path.starts_with("res://") {
         return None;
     }
-    let root = &state.workspace.project.root;
-    let abs = gd_project::paths::res_to_path(root, path)?;
+    // Gate on index membership — only emit a Location for paths that resolve to an actually
+    // existing, indexed project file. `res_to_path` is a pure path-join with no existence
+    // check; `resolve_res_path` returns Some only for indexed (on-disk) files.
+    let fid = state.workspace.index.resolve_res_path(path)?;
+    let abs = state.workspace.index.path(fid).map(|p| p.to_path_buf())?;
     let uri = path_to_file_uri(&abs)?;
     Some(Location {
         uri,

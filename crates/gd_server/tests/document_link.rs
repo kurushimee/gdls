@@ -156,6 +156,52 @@ fn document_link_returns_res_path_links() {
     shutdown(&client, handle);
 }
 
+/// A `res://` path pointing to a file that does NOT exist in the project yields no link.
+/// Guards Fix 1: `document_link` must check index membership, not just do a path-join.
+#[test]
+fn document_link_no_link_for_nonexistent_res_path() {
+    let p = TempProject::new();
+    p.write("project.godot", "");
+    // `nonexistent.gd` is NOT written — only the referencing script is.
+    let src = "const X = preload(\"res://nonexistent.gd\")\n";
+    p.write("caller.gd", src);
+
+    let (client, handle) = boot(&p);
+    let path = p.root.join("caller.gd");
+    did_open(&client, &path, src);
+
+    let uri = file_uri(&path);
+    client
+        .sender
+        .send(request(
+            10,
+            "textDocument/documentLink",
+            DocumentLinkParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        ))
+        .unwrap();
+
+    let Message::Response(resp) = recv(&client) else {
+        panic!("expected documentLink response");
+    };
+    assert!(
+        resp.error.is_none(),
+        "documentLink errored: {:?}",
+        resp.error
+    );
+    let links: Vec<lsp_types::DocumentLink> =
+        serde_json::from_value(resp.result.expect("documentLink result")).unwrap();
+    assert!(
+        links.is_empty(),
+        "must not emit a link for a res:// path that doesn't exist in the project, got {links:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
 /// A file with only `user://` paths or plain strings yields no document links
 /// (only `res://` paths that can be resolved to on-disk files produce links).
 #[test]
