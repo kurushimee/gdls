@@ -1,0 +1,54 @@
+# Layer 2 of the fuzz gate: a coverage-guided, libFuzzer-backed fuzz crate.
+#
+# This crate is DELIBERATELY OUTSIDE the gdls workspace (note the empty `[workspace]` table below,
+# which makes it its own workspace root, plus `exclude = ["fuzz"]` in the parent manifest). libFuzzer
+# needs the nightly toolchain (`-Z` sanitizer flags) and is unsupported on Windows by cargo-fuzz, so
+# keeping it out of the workspace means the stable `--workspace` CI never tries to compile `libfuzzer-sys`.
+# It runs only in the dedicated nightly-Linux CI job (see `.github/workflows/ci.yml`).
+#
+# Run locally (Linux/WSL, nightly):  cargo +nightly fuzz run parse -- -max_total_time=60
+
+[package]
+name = "gdls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+camino = "1.2"
+gd_syntax = { path = "../crates/gd_syntax" }
+gd_analyze = { path = "../crates/gd_analyze" }
+gd_project = { path = "../crates/gd_project" }
+gd_types = { path = "../crates/gd_types" }
+
+# Own workspace root → not absorbed by the parent gdls workspace.
+[workspace]
+
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "analyze"
+path = "fuzz_targets/analyze.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_invariants"
+path = "fuzz_targets/index_invariants.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+# Keep some debug info for readable crash backtraces without disabling optimizations.
+debug = 1

@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+# The cargo-fuzz crate is kept out of the workspace: libFuzzer needs nightly and is unsupported on
+# Windows by cargo-fuzz, so the stable `--workspace` CI (both the Linux and Windows matrix legs) must
+# never compile it. It also declares its own `[workspace]` in `fuzz/Cargo.toml`; this exclude is the
+# explicit belt-and-suspenders, guarded by `crates/gd_syntax/tests/fuzz_crate_isolation.rs`.
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.95"
+repository = "https://github.com/kurushimee/gdls"
+
+# Internal crates are referenced as `gd_xxx.workspace = true` by members.
+# Shared external dependencies are added here (with versions resolved by `cargo add`) as each
+# milestone introduces them, so versions are pinned in exactly one place.
+[workspace.dependencies]
+gd_syntax = { path = "crates/gd_syntax" }
+gd_types = { path = "crates/gd_types" }
+gd_analyze = { path = "crates/gd_analyze" }
+gd_project = { path = "crates/gd_project" }
+# M4 (freshness watcher + nav): notify drives the filesystem events on its own internal thread;
+# notify-debouncer-full coalesces atomic-write bursts and exposes rename/need_rescan signals; the
+# `crossbeam-channel` feature is *required* for the receiver to integrate with the LSP main loop's
+# `crossbeam_channel::select!`. nucleo-matcher powers fuzzy ranking for `workspace/symbol`.
+# walkdir is hoisted from gd_project — gd_server's `Workspace::reconcile()` walks the same tree.
+notify = "8"
+notify-debouncer-full = { version = "0.6", features = ["crossbeam-channel"] }
+nucleo-matcher = "0.3"
+walkdir = "2.5"
+tempfile = "3"
+# `which`: M5 WP-D1 — PATH lookup for the local-only differential harness's `godot` discovery.
+# Pinned here so a future Phase-H walk that needs the same lookup from `gd_server` (e.g. the
+# `gdls diagnose --godot-check` path) doesn't re-pick a different version.
+which = "8.0.2"
+# rustc-hash (FxHashMap/FxHashSet): used by gd_analyze, gd_project, gd_server, and gd_types.
+# Hoisted here so the shared version lives in exactly one place per the workspace
+# dependency policy — previously each of the four crates pinned `2.1.2` independently.
+rustc-hash = "2.1.2"
+# M5 Phase B (observability). Pinned at the de-facto tracing 0.1 / subscriber 0.3 / log-bridge 0.2
+# pair tokio + rust-analyzer ship with. `tracing-subscriber` enables only `env-filter` + `fmt` (the
+# default features add `tracing-log` re-export + chrono + the `ansi` heuristics — we install the
+# log bridge ourselves and skip the rest, keeping the transitive graph small per WP-O1's dep-audit
+# call-out). `sysinfo` drops every default feature and re-enables only `system` (its `disk` /
+# `component` / `network` collectors are all dead code for an RSS sampler).
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json", "registry", "std"] }
+tracing-log = { version = "0.2.0", default-features = false, features = ["log-tracer", "std"] }
+sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }
+# M5 Phase D (WP-H2). `lru` 0.18 — bounded `parse_cache` / `analysis_cache` with LRU eviction so a
+# long-running session can't accumulate unbounded entries from transient file opens. `pop_lru()` is
+# the bulk-eviction primitive WP-H1's Soft pressure ladder reaches for; `peek()` is the
+# non-recency-touching accessor used by `WorkspaceXFileQuery` so a cross-file member-xrefs lookup
+# (a recorded-fact read, not direct user activity) doesn't reorder the LRU.
+lru = "0.18.0"
+# M5 Phase E (WP-F4). `unicode-security` 0.1 — UTS #39 `skeleton()` for the tokenizer's
+# visually-similar-to-keyword identifier diagnostic (mirrors Godot's
+# `TextServer::is_confusable` path in `gdscript_tokenizer.cpp:585-602`). No default features —
+# the only optional one is `no_std`, which we don't want; the crate ships ~150 KB of generated
+# confusable-character tables at compile time and zero runtime allocation beyond the skeleton
+# string itself (cached keyword skeleton-set is built once via `OnceLock`).
+unicode-security = "0.1.2"
+# M5 Phase F. `dunce` (WP-RD9) — Windows junction- and UNC-aware path canonicalization: unlike
+# `std::fs::canonicalize`, it resolves NTFS junctions while preserving plain drive paths (never
+# emitting a `\\?\` verbatim prefix that downstream `camino`/`Utf8Path` comparisons would split
+# on). Used by `gd_server::uri::CanonicalKey` and `gd_project::index::normalize` so a file reached
+# through a junction interns to a single `FileId`. `same-file` (WP-RD11 item 5) — portable
+# file-identity comparison (Windows file index + volume serial; Linux dev/inode) so the watcher's
+# root-loss detection re-arms after a delete+recreate that lands a *different* directory at the
+# same path.
+dunce = "1.0.5"
+same-file = "1.0.6"
+
+[profile.release]
+lto = true
+# `panic` is intentionally left at the default `unwind` (not `abort`): the server must degrade a
+# stray panic to a logged error rather than dying mid-session, and cargo-fuzz relies on unwinding.

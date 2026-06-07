@@ -1,0 +1,17 @@
+{
+  "gdscript": {
+    "command": "gdls",
+    "extensionToLanguage": {
+      ".gd": "gdscript"
+    },
+    "initializationOptions": {
+      "projectRoot": "/home/me/MyGame",
+      "extensionApiPath": "/home/me/MyGame/api/extension_api.json",
+      "strict": {
+        "profile": "godot"
+      }
+    },
+    "restartOnCrash": true,
+    "maxRestarts": 5
+  }
+}

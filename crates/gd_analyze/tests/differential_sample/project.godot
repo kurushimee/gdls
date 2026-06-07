@@ -1,0 +1,14 @@
+; differential_sample stub project — anchors res:// to this directory so the godot binary's
+; --check-only --script path can resolve `preload("res://...")`, autoload lookups, and
+; class_name registration consistently with gdls. Mirrors the canonical Godot 4 project.godot
+; shape; only the `[autoload]` section matters for 02_autoload_reference.gd.
+
+config_version=5
+
+[application]
+
+config/name="gdls_differential_sample"
+
+[autoload]
+
+GameState="*res://_autoload.gd"

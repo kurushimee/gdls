@@ -1,0 +1,16 @@
+# Empty after Phase E (M5 close); all parse-phase corpus fixtures now match Godot.
+#
+# Historical context (kept so future drift is easy to read against): WP-C (M1 parser port) reached
+# 181/186 = 0.9731. The remaining five fixtures lived here until M5 Phase E ported the five
+# parser-side diagnostics Godot emits at parse time (`GDTEST_PARSER_ERROR`):
+#   * duplicate_icon / duplicate_tool — WP-F1/F2 ported the `icon_annotation` / `tool_annotation`
+#     duplicate check into the parser's SCRIPT-annotation branch.
+#   * warning_ignore_extra_start / warning_ignore_restore_without_start — WP-F3 added a parser
+#     post-pass mirroring `warning_ignore_region_annotations` (`gdscript_parser.cpp:5182-5219`).
+#   * identifier_similar_to_keyword — WP-F4 ported the tokenizer's UTS #39 confusable-skeleton
+#     check via the `unicode-security` crate (mirrors `gdscript_tokenizer.cpp:585-602`).
+#
+# Regenerate this file with:
+#   GDLS_BLESS_CONFORMANCE=1 cargo test -p gd_syntax --test conformance -- --nocapture
+# The conformance harness fails if a file fails that is NOT listed here (a regression) or PASSES
+# while still listed (delete the stale line).

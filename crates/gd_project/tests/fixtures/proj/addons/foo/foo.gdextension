@@ -1,0 +1,13 @@
+[configuration]
+
+entry_symbol = "foo_init"
+compatibility_minimum = 4.4
+
+[icons]
+
+FooNode = "res://addons/foo/icons/foo.svg"
+
+[libraries]
+
+windows.release.x86_64 = "res://addons/foo/bin/foo.windows.release.x86_64.dll"
+linux.release.x86_64 = "res://addons/foo/bin/libfoo.linux.release.x86_64.so"

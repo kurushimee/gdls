@@ -1,0 +1,90 @@
+{
+  "header": {
+    "version_major": 4,
+    "version_minor": 6,
+    "version_patch": 3,
+    "version_status": "stable",
+    "version_full_name": "Godot Engine v4.6.3.stable.mini"
+  },
+  "global_constants": [
+    { "name": "MINI_GLOBAL", "value": 7, "is_bitfield": false }
+  ],
+  "global_enums": [
+    { "name": "MiniError", "is_bitfield": false, "values": [
+      { "name": "OK", "value": 0 },
+      { "name": "FAILED", "value": 1 }
+    ] }
+  ],
+  "utility_functions": [
+    { "name": "mini_max", "return_type": "int", "category": "math", "is_vararg": true,
+      "arguments": [ { "name": "a", "type": "int" }, { "name": "b", "type": "int" } ] },
+    { "name": "mini_print", "category": "general", "is_vararg": true, "arguments": [] }
+  ],
+  "builtin_classes": [
+    { "name": "Vector2", "is_keyed": false, "indexing_return_type": "float",
+      "members": [ { "name": "x", "type": "float" }, { "name": "y", "type": "float" } ],
+      "constants": [ { "name": "ZERO", "type": "Vector2", "value": "Vector2(0, 0)" } ],
+      "constructors": [
+        { "index": 0, "arguments": [] },
+        { "index": 1, "arguments": [ { "name": "x", "type": "float" }, { "name": "y", "type": "float" } ] }
+      ],
+      "operators": [
+        { "name": "+", "right_type": "Vector2", "return_type": "Vector2" },
+        { "name": "unary-", "return_type": "Vector2" }
+      ],
+      "methods": [
+        { "name": "length", "is_const": true, "is_static": false, "is_vararg": false, "return_type": "float", "arguments": [] }
+      ]
+    }
+  ],
+  "classes": [
+    { "name": "MiniObject", "is_refcounted": false, "is_instantiable": true, "api_type": "core",
+      "constants": [ { "name": "VERSION", "value": 2 } ],
+      "enums": [
+        { "name": "Mode", "is_bitfield": false, "values": [ { "name": "MODE_A", "value": 0 }, { "name": "MODE_B", "value": 1 } ] },
+        { "name": "Flags", "is_bitfield": true, "values": [ { "name": "FLAG_X", "value": 1 }, { "name": "FLAG_Y", "value": 2 } ] }
+      ],
+      "properties": [ { "name": "mode", "type": "int", "setter": "set_mode", "getter": "get_mode", "index": -1 } ],
+      "signals": [ { "name": "changed", "arguments": [ { "name": "who", "type": "MiniObject" } ] } ],
+      "methods": [
+        { "name": "get_class", "is_const": true, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 1, "return_value": { "type": "String" }, "arguments": [] },
+        { "name": "create", "is_const": false, "is_static": true, "is_vararg": false, "is_virtual": false,
+          "hash": 2, "return_value": { "type": "MiniObject" }, "arguments": [] },
+        { "name": "_ready", "is_const": false, "is_static": false, "is_vararg": false, "is_virtual": true,
+          "is_required": false, "arguments": [] },
+        { "name": "call_va", "is_const": false, "is_static": false, "is_vararg": true, "is_virtual": false,
+          "hash": 3, "return_value": { "type": "Variant" },
+          "arguments": [ { "name": "method", "type": "StringName" } ] },
+        { "name": "get_children", "is_const": true, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 4, "return_value": { "type": "typedarray::MiniObject" }, "arguments": [] },
+        { "name": "get_table", "is_const": true, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 5, "return_value": { "type": "typeddictionary::int;String" }, "arguments": [] },
+        { "name": "get_mode_enum", "is_const": true, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 6, "return_value": { "type": "enum::MiniObject.Mode" }, "arguments": [] },
+        { "name": "get_flags", "is_const": true, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 7, "return_value": { "type": "bitfield::MiniObject.Flags" }, "arguments": [] },
+        { "name": "get_error", "is_const": true, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 8, "return_value": { "type": "enum::MiniError" }, "arguments": [] },
+        { "name": "get_buffer_ptr", "is_const": false, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 9, "return_value": { "type": "void*" }, "arguments": [] },
+        { "name": "notify", "is_const": false, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 10, "arguments": [ { "name": "what", "type": "int", "meta": "int32" } ] }
+      ]
+    },
+    { "name": "MiniNode", "is_refcounted": false, "is_instantiable": true, "api_type": "core",
+      "inherits": "MiniObject",
+      "methods": [
+        { "name": "add_child", "is_const": false, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 11,
+          "arguments": [
+            { "name": "node", "type": "MiniNode" },
+            { "name": "force", "type": "bool", "default_value": "false" }
+          ] }
+      ]
+    }
+  ],
+  "singletons": [
+    { "name": "MiniEngine", "type": "MiniObject" }
+  ]
+}

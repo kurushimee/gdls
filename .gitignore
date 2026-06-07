@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+# cargo-fuzz build artifacts (the corpus under fuzz/corpus is committed; artifacts are not)
+/crates/*/fuzz/target
+/crates/*/fuzz/artifacts
+# generated native-class API dumps used for local testing
+/api/extension_api*.json

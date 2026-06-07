@@ -1,0 +1,75 @@
+# bench/budget.toml -- measured against a large real-world GDScript project (reference only).
+#
+# These numbers are NOT enforced by CI. They are the operator-facing reference for what
+# "normal" perf looks like on a developer machine, and they back the WP-H1 memory pressure
+# ladder (which loads soft_cap_mb / hard_cap_mb at startup). Re-run the calibration walk
+# (the bench driver + scripts/summarize-spans.py) after any optimization and refresh.
+#
+# Hardware: AMD Ryzen 5 5600 6-Core / 32 GB DDR4 / SSD-backed working tree.
+# Workspace: a large real-world GDScript project -- 2338 .gd files, asset-heavy ~200 GB tree
+# (a representative large-project workload used for calibration).
+# Capture artefacts (gitignored):
+#   target/m5-p1-calib.jsonl        -- the WP-O1 JSONL trace.
+#   target/m5-p1-calib-stdin.bin    -- the LSP request stream replayed by the driver.
+#   target/m5-p1-calib-files.txt    -- the 2338-entry .gd inventory.
+#
+# Latencies are observed p50/p99 (interpolated) from the WP-O1 structured-span dump.
+
+[cold_index]
+# Workspace::load: project.godot parse + ProjectModel build + tree walk + eager-interface Index
+# build for 2338 .gd files. Wall-clock from the `cold_index` span on close.
+observed_ms = 3340
+
+[reconcile]
+# Post-cold-index Workspace::reconcile pass over the same 2338-file walk -- the M4 freshness
+# gate that catches any drift between the cold index and the on-disk state. One pass per cold
+# start; subsequent reconciles fire only on watcher overflow (need_rescan).
+observed_ms = 783
+
+[warm_analyze]
+# 702 samples across the calibration walk (45 didOpen events each fanning out to ~16 cross-file
+# analyses via member-initializer xrefs + dirty-deps walk). p50 is the dominant case (cache hit
+# on a small file); p99 is the analyzer running a full pass on a large or import-heavy file.
+p50_ms = 0.1
+p99_ms = 4.2
+
+[hover]
+# textDocument/hover -- 45 samples (one per opened file). p99 = 0.5 ms covers any v1 hover
+# request (position-resolution + binding lookup + prose render).
+p50_ms = 0.2
+p99_ms = 0.5
+
+[definition]
+# textDocument/definition -- 45 samples. The path is index-only after analyze settled.
+p99_ms = 0.1
+
+[references]
+# textDocument/references -- 45 samples. p99 is dominated by an in-workspace scan for a heavily
+# referenced symbol (e.g. an autoload type or a base-class method touched by many subclasses);
+# the p50 reflects narrower symbols. This is the slowest handler in the v1 capability set.
+p99_ms = 310.1
+
+[implementation]
+# textDocument/implementation -- 45 samples. Like definition, index-only.
+p99_ms = 0.1
+
+[prepare_call_hierarchy]
+# textDocument/prepareCallHierarchy -- 45 samples. Like hover/definition, fixed-cost.
+p99_ms = 0.2
+
+[workspace_symbol]
+# workspace/symbol via nucleo-matcher -- 5 queries ("get_", "_init", "Player", "set", "").
+# Empty query returns up to the workspaceSymbolMaxResults cap; the matcher cost dominates.
+p50_ms = 11.1
+p99_ms = 17.2
+
+[memory]
+# Peak resident-set observed during the calibration walk via the WP-O2 RssSampler. baseline is
+# the reading at server start; peak is the maximum since baseline (sysinfo RSS).
+# WP-H1 loads soft_cap_mb / hard_cap_mb at startup and uses them in the pressure ladder:
+#   soft = 2 * peak  -> shed entries from the LRU caches (parse + analysis)
+#   hard = 4 * peak  -> stop accepting new analyze requests, surface a memory-pressure event
+baseline_rss_mb = 9.6
+peak_rss_mb = 291
+soft_cap_mb = 582
+hard_cap_mb = 1164

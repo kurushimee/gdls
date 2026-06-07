@@ -1,0 +1,810 @@
+//! [`Workspace`] — the per-session project environment the server queries: the native-class DB, the
+//! parsed `project.godot` model, the eager-interface index, and a small parse cache shared between
+//! `documentSymbol` and `publishDiagnostics` (closing the M1 double-parse).
+//!
+//! All construction degrades rather than fails (`docs/00`: never crash): a missing/garbage
+//! `extension_api.json` yields an empty native DB (types go dynamic) plus one log notice, and an
+//! unreadable `.gd` is skipped during indexing.
+
+use std::rc::Rc;
+
+use camino::{Utf8Path, Utf8PathBuf};
+use gd_analyze::{code_from_name, AnalysisResult, StrictProfile, StrictSettings, WarnPolicy};
+use gd_project::{Index, ProjectModel};
+use gd_syntax::{ParseResult, ParseTree};
+use gd_types::{DocXmlError, NativeDb};
+use lru::LruCache;
+use rustc_hash::FxHashSet;
+use walkdir::WalkDir;
+
+use crate::uri::CanonicalKey;
+use crate::xfile::WorkspaceXFileQuery;
+use gd_project::is_excluded;
+
+use crate::config::{InitializationOptions, StrictConfig, StrictProfile as ServerStrictProfile};
+
+/// One parse/analysis cache slot. Validity is **content-addressed**: a hit requires `hash` to
+/// equal the [`fingerprint`] of the text the caller is asking about — not the LSP `version`
+/// counter the cache used to key on.
+///
+/// Why content, not version: the closed-file nav path (`references` / `callHierarchy/*` reading a
+/// cross-file candidate) has no editor version, so it read the file from disk and passed
+/// `version = 0`. A version-only check then returned a *stale* parse forever after an on-disk
+/// edit — the next disk read passed `0` again and hit the old entry, so navigation pointed at
+/// dead byte spans until the file was opened in an editor. Keying validity on a content
+/// fingerprint makes a hit correct regardless of how the text arrived: open buffer, disk read, or
+/// a change the watcher never observed (remote FS, wake-from-suspend — the drift `diagnose
+/// --reconcile` exists for). Because every nav handler re-reads the candidate from disk before
+/// asking the cache, the fingerprint always reflects current content, so it is also what makes
+/// eviction unnecessary on the (hot) open-buffer reindex path.
+pub(crate) struct CacheEntry<T> {
+    pub(crate) hash: u64,
+    /// WP-RD8: the [`gd_project::Index::epoch_of`] of this entry's file at analysis time — the
+    /// dependency-aware half of the composite cache key. A hit requires both `hash` (own content)
+    /// AND this `epoch` to still match the file's current epoch, so a dependency interface change
+    /// (which bumped the file's epoch through the reverse-dependency closure) self-invalidates the
+    /// entry with no dirty-bit override. The `parse_cache` is content-only (a parse depends on
+    /// nothing but its own bytes), so its entries carry `epoch: 0` and never consult this field.
+    pub(crate) epoch: u64,
+    pub(crate) value: Rc<T>,
+}
+
+/// Content fingerprint for cache validation: a fast non-cryptographic hash of the full text.
+/// FxHasher is a multiply-xor hash with weaker-than-ideal avalanche/distribution (no collision-
+/// resistance guarantee), so the true collision rate is worse than an idealized 1/2⁶⁴ — but it is
+/// still orders of magnitude below the false-hit rate of the previous version-only check, which was
+/// wrong for *every* closed-file disk read. (If a fingerprint collision ever proves to matter,
+/// swap in a stronger 64-bit hash here — the call sites only depend on equality, not the algorithm.)
+pub(crate) fn fingerprint(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Everything the server knows about the open project.
+pub struct Workspace {
+    /// Native classes (engine, from JSON; GDExtension classes merged from doc XML). Empty when
+    /// no dump is configured/loadable — callers treat unknown natives as dynamic.
+    pub native: NativeDb,
+    /// `project.godot`: root, autoloads, warning config, enumerated GDExtensions, UID map.
+    pub project: ProjectModel,
+    /// `class_name` registry + per-file interface tables + dependency graph.
+    pub index: Index,
+    /// Effective per-warning level, resolved from `project.godot` + the client's strict profile +
+    /// fine-grained overrides. The same policy is reused for every per-file analyze run in the
+    /// session; rebuilt only on `project.godot` change via [`Self::reload_project_and_native`].
+    pub policy: WarnPolicy,
+    /// `CanonicalKey → parse`. One parse per distinct content; reused across handlers. Content-
+    /// addressed (see [`CacheEntry`]), so an edit re-parses exactly once and a stale closed-file
+    /// entry is never served. M5 WP-H2: bounded LRU so a long-running session that opens
+    /// transient files for nav can't grow the cache without limit. Capacity comes from
+    /// `initializationOptions.memory.cacheCapacity` (default
+    /// [`crate::config::MemoryConfig::DEFAULT_CACHE_CAPACITY`]). Insert triggers eviction of the
+    /// least-recently-used entry once the cap is reached; the WP-H1 Soft-pressure ladder calls
+    /// [`Self::evict_half`] to bulk-drop the oldest half before that point if peak RSS climbs
+    /// past the soft cap.
+    pub(crate) parse_cache: LruCache<CanonicalKey, CacheEntry<ParseResult>>,
+    /// `CanonicalKey → analyze`, same content-addressed validity as `parse_cache`. Additionally
+    /// cleared wholesale on a `project.godot` / native-DB reload, since those entries were computed
+    /// against a policy / native lattice that just changed (a content fingerprint can't see that).
+    /// M5 WP-H2: bounded LRU (see [`Self::parse_cache`]).
+    pub(crate) analysis_cache: LruCache<CanonicalKey, CacheEntry<AnalysisResult>>,
+    /// M5 WP-O3 session-wide fixpoint cap, mirrored from `initializationOptions.analyzer.iterLimit`.
+    /// Default `None` ⇒ the analyzer falls back to [`gd_analyze::DEFAULT_ITER_LIMIT`]. Per-call
+    /// [`Self::analyze_with_options`] overrides win when present; this field is just the
+    /// session default the bare [`Self::analyze`] caller (which has no per-request context)
+    /// picks up.
+    analyzer_iter_limit: Option<u32>,
+}
+
+impl Workspace {
+    /// Build the workspace for a project rooted at `root`: load the native DB, parse `project.godot`,
+    /// then cold-index every `.gd`. Runs after the `initialize` response is sent, so a large scan
+    /// never stalls the handshake.
+    pub fn load(root: &Utf8Path, options: &InitializationOptions) -> Self {
+        // M5 WP-O1: cold_index span. Captures the full bootstrap — project model + native DB +
+        // eager interface index + warn policy — so a hierarchical-profiler dump nests anything
+        // that crosses the threshold under it. Fields are recorded with `Empty` and filled in
+        // before the span closes, so the on-close event carries the final elapsed + file_count.
+        let _start = std::time::Instant::now();
+        let _span = tracing::info_span!(
+            "cold_index",
+            root = %root,
+            elapsed_us = tracing::field::Empty,
+            file_count = tracing::field::Empty,
+        );
+        let _enter = _span.enter();
+        let project = ProjectModel::load(root);
+        let native = load_native(options, &project);
+        let index = Index::build(root);
+        let policy = WarnPolicy::build(&project.warnings, &strict_settings(&options.strict));
+        let file_count = index.file_count();
+        log::info!(
+            "indexed {} script(s); {} class_name(s); {} native class(es)",
+            file_count,
+            index.registry().len(),
+            native.class_count(),
+        );
+        _span.record("elapsed_us", _start.elapsed().as_micros() as u64);
+        _span.record("file_count", file_count as u64);
+        // `cache_capacity()` returns a `NonZeroUsize` (clamping a client `0`/absent up to the
+        // default), so the "never zero" invariant `lru::LruCache::new` requires is enforced by the
+        // type — no fallible unwrap at this call site.
+        let cap = options.memory.cache_capacity();
+        Workspace {
+            native,
+            project,
+            index,
+            policy,
+            parse_cache: LruCache::new(cap),
+            analysis_cache: LruCache::new(cap),
+            analyzer_iter_limit: options.analyzer.iter_limit,
+        }
+    }
+
+    /// Parse `text`, reusing the cached result when the content fingerprint is unchanged. Both
+    /// `documentSymbol` and `publishDiagnostics` go through here, so an edit parses exactly once;
+    /// and a closed-file nav candidate read fresh from disk re-parses iff its bytes changed (see
+    /// [`CacheEntry`] for why this is content-addressed rather than `(uri, version)`-keyed).
+    pub fn parse(&mut self, key: &CanonicalKey, text: &str) -> Rc<ParseResult> {
+        let hash = fingerprint(text);
+        if let Some(entry) = self.parse_cache.get(key) {
+            if entry.hash == hash {
+                return Rc::clone(&entry.value);
+            }
+        }
+        let parsed = Rc::new(gd_syntax::parse(text));
+        // `LruCache::put` overwrites any existing entry under `key` and, when at capacity,
+        // evicts the least-recently-used entry. The evicted slot is returned; we drop it
+        // immediately — the only state it carried was the `Rc<ParseResult>`, which the dropped
+        // `Rc` releases when no other handler is mid-use.
+        self.parse_cache.put(
+            key.clone(),
+            CacheEntry {
+                hash,
+                // Parse validity is content-only (WP-RD8): a parse depends on nothing but its own
+                // bytes, so the epoch field is unused on this cache and stamped 0.
+                epoch: 0,
+                value: Rc::clone(&parsed),
+            },
+        );
+        parsed
+    }
+
+    /// Analyze `tree`, reusing the cached result when the content fingerprint of `text` is
+    /// unchanged (and the cache hasn't been cleared by a policy/native reload). The cross-file
+    /// query is M2's [`SyntacticQuery`] — `extends`/`class_name`/`res://` lookups via the eager
+    /// interface index, no re-parse — and the warning policy is the workspace-level one. `path` is
+    /// the on-disk path (an open `.gd` will have been interned by [`Self::reindex`] before this
+    /// runs, so its [`gd_project::FileId`] is stable); when unknown (e.g. an `untitled:` buffer or
+    /// a `.gd` outside the project), the analyzer is run with `file = None` so per-file type
+    /// analysis still produces well-typed results.
+    ///
+    /// **WP-RD2 (FileId(0) placeholder retired).** The former design fell back to a `FileId(0)`
+    /// placeholder for orphan files; those bindings then recorded `target_file = Some(FileId(0))`,
+    /// colliding with whichever real script the index interned first and mis-attributing the
+    /// orphan's references. `FileId` is now `NonZeroU32` and the orphan case threads
+    /// `Option<FileId>::None` through [`gd_analyze::analyze`], so the reducer records `None`
+    /// ("don't know") for an orphan's bindings — cross-script nav for such a buffer correctly
+    /// returns empty instead of pointing at the wrong target.
+    pub fn analyze(
+        &mut self,
+        key: &CanonicalKey,
+        path: &Utf8Path,
+        tree: &ParseTree,
+        text: &str,
+    ) -> Rc<AnalysisResult> {
+        self.analyze_with_options(key, path, tree, text, gd_analyze::AnalyzeOptions::default())
+    }
+
+    /// Return a valid cached analysis for `text` without running the analyzer. Used by the Hard
+    /// memory-pressure diagnostic path: cached diagnostics may still serve, but a cache miss must
+    /// not allocate a fresh full-analysis working set while the server is shedding.
+    pub fn cached_analysis(
+        &mut self,
+        key: &CanonicalKey,
+        path: &Utf8Path,
+        text: &str,
+    ) -> Option<Rc<AnalysisResult>> {
+        let hash = fingerprint(text);
+        let file = self.index.file_id(path);
+        let current_epoch = file.map_or(0, |f| self.index.epoch_of(f));
+        self.analysis_cache
+            .get(key)
+            .filter(|entry| entry.hash == hash && entry.epoch == current_epoch)
+            .map(|entry| Rc::clone(&entry.value))
+    }
+
+    /// `analyze` with per-call knobs — M5 WP-O3 (fixpoint governor cap) and WP-O4 (cancellation
+    /// token). The token, when present, is checked every 256 nodes inside the analyzer's hot
+    /// reducer / resolver loops; on cancel the analyzer bails with a synthetic
+    /// `analyzer: request cancelled` diagnostic and returns the partial result. Production LSP
+    /// callers — the request handlers — go through here with a freshly-registered token; the
+    /// notification-driven `publish_diagnostics` path goes through bare [`Self::analyze`] (no
+    /// per-request id to cancel against). Span / cache / dirty-bit semantics are identical to
+    /// the wrapper.
+    pub fn analyze_with_options<'a>(
+        &mut self,
+        key: &CanonicalKey,
+        path: &Utf8Path,
+        tree: &'a ParseTree,
+        text: &str,
+        mut options: gd_analyze::AnalyzeOptions<'a>,
+    ) -> Rc<AnalysisResult> {
+        // Default iter_limit to the operator-configurable session-wide cap when the caller
+        // hasn't picked an explicit one. The analyzer crate's `DEFAULT_ITER_LIMIT` is the
+        // ultimate fallback when neither this nor `analyzer.iterLimit` is set.
+        if options.iter_limit.is_none() {
+            options.iter_limit = self.analyzer_iter_limit;
+        }
+        let hash = fingerprint(text);
+        // M5 WP-O1: analyze span. The plan's draft field-set is `file, version, ... elapsed_us,
+        // diagnostics_count`; the cache is content-addressed (no LSP version threads through
+        // here), so the field analogous to "version" is the content fingerprint that actually
+        // drives cache hits — record that as `text_hash`. The `cache_hit` boolean (recorded
+        // before close) lets a hierarchical-profiler dump distinguish a real reduction-path
+        // analyze from a cheap Rc-clone hit.
+        let _start = std::time::Instant::now();
+        let _span = tracing::info_span!(
+            "analyze",
+            file = %path,
+            text_hash = hash,
+            cache_hit = tracing::field::Empty,
+            elapsed_us = tracing::field::Empty,
+            diagnostics_count = tracing::field::Empty,
+        );
+        let _enter = _span.enter();
+        // WP-RD2: an `untitled:` buffer or a `.gd` outside the project isn't interned, so
+        // `file_id` is `None`. Thread that `Option` straight through to `analyze` — the reducer
+        // records `None`-attributed bindings for it (no colliding `FileId(0)`), so cross-script
+        // nav correctly answers "don't know" for the orphan.
+        let file = self.index.file_id(path);
+        // WP-RD8: the composite cache key is `(own content hash, dependency-aware epoch)`. A
+        // dependency's *interface* change bumps THIS file's epoch (`Index::on_file_changed` →
+        // reverse-dependency closure → `mark_dirty`), so a cached entry stamped with the old epoch
+        // no longer matches and self-invalidates — even though this file's own bytes (and so its
+        // content `hash`) are unchanged. That retires the M4 dirty-bit override + clear-after
+        // dance (no `is_dirty`, no `clear_dirty_one`, no ordering constraint). (`parse` stays
+        // content-only — a dependency's interface change never alters *this* file's bytes, only
+        // its analysis — so a future "consistency" refactor must NOT add the epoch to `parse`.)
+        let current_epoch = file.map_or(0, |f| self.index.epoch_of(f));
+        let cached = self
+            .analysis_cache
+            .get(key)
+            .filter(|entry| entry.hash == hash && entry.epoch == current_epoch)
+            .map(|entry| Rc::clone(&entry.value));
+        let cached_used = cached.is_some();
+        let result = match cached {
+            Some(hit) => hit,
+            None => {
+                // Godot threads `parser->script_path` into the head class's `fqcn` for
+                // `<file.gd>.<EnumName>` rendering (`gdscript_analyzer.cpp`; working-tree line
+                // numbers drift, so cite the symbol). We pass the file basename (e.g. `foo.gd`)
+                // rather than the absolute Windows path so the `Display for DataType` `get_file()`
+                // mirror (which strips at the last `/`) produces the same string Godot emits.
+                let script_path = path.file_name().unwrap_or_default();
+                let result = {
+                    // The borrow of `&self.analysis_cache` ends with this block, before the
+                    // `analysis_cache.insert(...)` below. WorkspaceXFileQuery overrides only
+                    // `member_initializer_xrefs` against the cache; every other CrossFileQuery
+                    // method delegates to SyntacticQuery.
+                    let xfile =
+                        WorkspaceXFileQuery::new(&self.index, &self.native, &self.analysis_cache);
+                    Rc::new(gd_analyze::analyze_with_options(
+                        tree,
+                        file,
+                        script_path,
+                        &self.native,
+                        &xfile,
+                        &self.policy,
+                        options,
+                    ))
+                };
+                // Like `parse_cache.put` above: overwrites under the key, evicts the LRU entry
+                // when at capacity. The entry is stamped with `current_epoch` so a later
+                // dependency change invalidates it.
+                //
+                // WP-O3/O4: a *bailed* result (fixpoint governor cap hit or request cancelled) has
+                // partial side tables, so caching it would silently re-serve a truncated analysis to
+                // the next hover/definition/references request on this unchanged content ("never
+                // lie"). Skip the cache so the next call re-attempts a full analysis — the governor
+                // self-heals once the file is re-analyzed (or a cancel doesn't recur).
+                if result.bailed {
+                    tracing::warn!(
+                        name = "analyze_bailed_uncached",
+                        file = %path,
+                        "analysis bailed (fixpoint governor / cancellation); not caching the partial result"
+                    );
+                } else {
+                    self.analysis_cache.put(
+                        key.clone(),
+                        CacheEntry {
+                            hash,
+                            epoch: current_epoch,
+                            value: Rc::clone(&result),
+                        },
+                    );
+                }
+                result
+            }
+        };
+        // WP-RD8 postcondition (the self-validating-key analog of the retired `!is_dirty`
+        // invariant): the cache entry now serving `path` is stamped with the current epoch, so the
+        // next caller hits it iff no dependency has since changed. A future change that let a
+        // stale-epoch entry reach a caller fails loudly here rather than silently shipping a wrong
+        // cross-file diagnostic (never lie).
+        debug_assert!(
+            result.bailed
+                || self
+                    .analysis_cache
+                    .peek(key)
+                    .is_some_and(|e| e.epoch == current_epoch),
+            "invariant: a completed analyze() must leave {path}'s cached entry stamped with the \
+             current epoch (a bailed result is intentionally not cached)"
+        );
+        _span.record("cache_hit", cached_used);
+        _span.record("elapsed_us", _start.elapsed().as_micros() as u64);
+        _span.record("diagnostics_count", result.diagnostics.len() as u64);
+        result
+    }
+
+    /// Drop a URI's cached parse and analysis (on `didClose`).
+    pub fn forget(&mut self, key: &CanonicalKey) {
+        // `LruCache::pop` is the spelling for "remove by key, return the removed value"; it
+        // matches `HashMap::remove`'s semantics. We ignore the return — both caches just drop
+        // the contained `Rc`s.
+        self.parse_cache.pop(key);
+        self.analysis_cache.pop(key);
+    }
+
+    /// M5 WP-H1 Soft-pressure action: drop the LRU-oldest half of both caches in one pass.
+    /// Returns the total number of entries evicted across both caches so the server can record
+    /// it as a structured-trace field on the `memory_soft_cap_evicted` event.
+    ///
+    /// "Half" is `len / 2`, taken before any eviction, so the evicted count is independent of
+    /// the post-eviction state and `evict_half()` on an empty cache is a no-op. Choosing
+    /// `len / 2` over a fixed fraction keeps the policy proportional to whatever has accumulated.
+    /// Note the shed fires once per *transition into* Soft, not once per held tick: the ticker is
+    /// transition-gated (`react_to_memory_pressure` early-returns when the level is unchanged), so
+    /// a session that simply sits at Soft does not re-shed every tick — between transitions the
+    /// LRU's own eviction-on-insert (at the configured cache capacity, default 512) bounds further
+    /// growth.
+    ///
+    /// `pop_lru` is `lru`'s direct primitive for "remove the least-recently-used entry". Iterating
+    /// via `iter()` would visit MRU-first (the documented order) and would require a side buffer
+    /// of keys to pop, since `iter()` holds a `&` borrow. The repeated `pop_lru()` is therefore
+    /// also the cheapest spelling.
+    pub fn evict_half(&mut self) -> usize {
+        let parse_drop = self.parse_cache.len() / 2;
+        let analysis_drop = self.analysis_cache.len() / 2;
+        for _ in 0..parse_drop {
+            self.parse_cache.pop_lru();
+        }
+        for _ in 0..analysis_drop {
+            self.analysis_cache.pop_lru();
+        }
+        parse_drop + analysis_drop
+    }
+
+    /// Observability hook for the WP-H1 ticker + the `memory_pressure` integration tests:
+    /// `(parse_len, analysis_len)`. Read-only — the consumer cannot mutate the caches through
+    /// this surface, so it's safe to expose at `pub` (the underlying fields stay `pub(crate)`).
+    pub fn cache_lens(&self) -> (usize, usize) {
+        (self.parse_cache.len(), self.analysis_cache.len())
+    }
+
+    /// Test hook: directly insert a synthetic entry into the parse cache. Used by the
+    /// `memory_pressure` integration test to stuff the cache without driving real parses. The
+    /// `#[cfg(any(test, debug_assertions))]` gate keeps this out of release builds (it is still
+    /// compiled into a debug `gdls` binary, but never into a release artifact).
+    #[cfg(any(test, debug_assertions))]
+    pub fn debug_insert_parse_entry(&mut self, key: CanonicalKey, hash: u64, value: ParseResult) {
+        self.parse_cache.put(
+            key,
+            CacheEntry {
+                hash,
+                epoch: 0,
+                value: Rc::new(value),
+            },
+        );
+    }
+
+    /// See [`Self::debug_insert_parse_entry`] — sibling for the analysis cache.
+    #[cfg(any(test, debug_assertions))]
+    pub fn debug_insert_analysis_entry(
+        &mut self,
+        key: CanonicalKey,
+        hash: u64,
+        value: AnalysisResult,
+    ) {
+        self.analysis_cache.put(
+            key,
+            CacheEntry {
+                hash,
+                epoch: 0,
+                value: Rc::new(value),
+            },
+        );
+    }
+
+    /// Re-index a file from a fresh parse tree (an open buffer's current contents, or disk).
+    /// Funnels through [`Index::txn`](gd_project::Index::txn) so every mutation is verified post-apply.
+    ///
+    /// Deliberately does **not** evict the parse/analysis cache. Two reasons: (1) on the hot
+    /// open-buffer edit path this is called between the `parse` that populated the cache and the
+    /// `publishDiagnostics` that consumes it — evicting here would reintroduce the M1 double-parse;
+    /// (2) it isn't needed for correctness, because cache validity is content-addressed
+    /// ([`CacheEntry`]) and every reader passes current text, so a changed file misses the cache on
+    /// its own. Eviction is reserved for [`Self::remove`], which is off the hot path.
+    pub fn reindex(&mut self, path: &Utf8Path, tree: &ParseTree) {
+        let iface = gd_project::extract_interface(tree);
+        self.index.txn(path, |idx| {
+            idx.on_file_changed(path, iface);
+        });
+    }
+
+    /// Drop a deleted file from the index. Wrapped in [`Index::txn`](gd_project::Index::txn) for invariant verification.
+    /// Also evicts any cached parse/analysis for the path: a deleted file can never be re-read to
+    /// produce fresh text, so its content-fingerprint check can't fire — without eviction the stale
+    /// entry would linger for the session. `remove` is only called off the hot edit path (watcher
+    /// delete, `didClose` of a vanished file), so eviction here can't trigger a double-parse.
+    pub fn remove(&mut self, path: &Utf8Path) {
+        self.index.txn(path, |idx| {
+            idx.on_file_removed(path);
+        });
+        if let Some(key) = CanonicalKey::for_path(path) {
+            self.forget(&key);
+        }
+    }
+
+    /// Re-read `project.godot` from disk (file changed via the M4 watcher) and rebuild the policy
+    /// + re-load the native DB (because the gdextensions list is in `ProjectModel` and the doc-XML
+    ///   merge step reads them). Cheaper than a full re-`load`: keeps the index and parse cache.
+    pub fn reload_project_and_native(&mut self, options: &InitializationOptions) {
+        let root = self.project.root.clone();
+        let (project, outcome) = ProjectModel::load_checked(&root);
+        // WP-RD13: a *present-but-unreadable* project.godot (locked mid-save, permission denied) OR
+        // a *corrupt-but-parseable* one (garbled content the tolerant parser accepts as a
+        // near-default "clean" parse) must NOT clobber the last good configuration on a transient
+        // glitch. Preserve the WHOLE prior state — project model, native DB, AND warning policy —
+        // rather than just the policy (the pre-RD13 behaviour rebuilt `self.project` + `self.native`
+        // from empty defaults even when it kept the policy, briefly wiping autoloads / gdextensions
+        // / UID map and republishing every buffer against an empty model). The watcher fires again
+        // once the file is readable/valid. A genuinely absent file is *not* a failure — it rebuilds
+        // normally (the legitimate standalone-`.gd` case).
+        if outcome.should_preserve_prior() {
+            log::warn!(
+                "project.godot reload {outcome:?}; keeping the previous project model, native DB, \
+                 and warning policy rather than resetting to defaults"
+            );
+            return;
+        }
+        self.project = project;
+        self.native = load_native(options, &self.project);
+        self.policy = WarnPolicy::build(&self.project.warnings, &strict_settings(&options.strict));
+        self.analysis_cache.clear();
+    }
+
+    /// Re-load only the native DB (extension_api.json + every installed gdextension's doc XML).
+    /// Drops the analysis cache so types pick up the new native lattice.
+    pub fn reload_native(&mut self, options: &InitializationOptions) {
+        self.native = load_native(options, &self.project);
+        self.analysis_cache.clear();
+    }
+
+    /// Walk the project root for every `.gd` and reconcile the live index against the disk: add
+    /// missing files, modify interface-changed files, drop deleted files. Idempotent — safe to
+    /// re-run (the M4 watcher fires it again on a `need_rescan`/overflow flag). Logged as
+    /// `cold_index_reconciled{added, modified, removed, walked, walk_errors, skipped_unreadable,
+    /// skipped_non_utf8}` via `log::info!` (M5 swaps to `tracing` spans; the marker line stays).
+    ///
+    /// `open_paths` is the set of files the editor currently has open (normalized like the index
+    /// keys). The open buffer is the source of truth over disk (docs/01, `vfs.rs`), so a file in
+    /// this set is skipped by **both** the disk-reindex pass (its in-index interface, set from the
+    /// buffer by `reindex_open_buffer`, is authoritative) and the removal pass (a transiently
+    /// deleted-on-disk open file — `git stash`, atomic save — must not be dropped). At startup and
+    /// in `gdls diagnose` the set is empty.
+    ///
+    /// Doesn't drop the parse or analysis caches: any open URI's cached analysis is still
+    /// authoritative for that buffer, and a watcher-driven reindex flowing through `Index::on_file_changed`
+    /// already marks dependents dirty in `Index.dirty`. Callers republish via `Index::take_dirty()`
+    /// after `reconcile()` to refresh diagnostics for any open URI whose interface dependents shifted.
+    ///
+    /// Safety against transient FS errors: `WalkDir` errors (permission denied, vanished
+    /// mid-walk, symlink loops, non-UTF-8 paths) are counted and logged but never abort the
+    /// walk. When any such error occurs, the "removed = anything in the index but not in the
+    /// walk" pass is **skipped** — a permission glitch on `.godot/` must not wipe every
+    /// indexed file from the index. Operators see the skip as a `walk_errors` count in the
+    /// summary line so they can investigate.
+    pub fn reconcile(&mut self, open_paths: &FxHashSet<Utf8PathBuf>) -> ReconciliationReport {
+        // M5 WP-O1: reconcile span. Both the cold-start post-load reconcile and the watcher's
+        // `need_rescan` overflow path flow through here. The 6 counters in the on-close fields
+        // mirror the `cold_index_reconciled` marker line below — the marker line stays for
+        // log-grep compatibility, the recorded fields give structured-trace consumers something
+        // to facet on without parsing the marker string.
+        let _start = std::time::Instant::now();
+        let _span = tracing::info_span!(
+            "reconcile",
+            open_paths_len = open_paths.len() as u64,
+            added = tracing::field::Empty,
+            modified = tracing::field::Empty,
+            removed = tracing::field::Empty,
+            walked = tracing::field::Empty,
+            walk_errors = tracing::field::Empty,
+            elapsed_us = tracing::field::Empty,
+        );
+        let _enter = _span.enter();
+        let root = self.project.root.clone();
+        let mut walked = 0usize;
+        let mut added = 0usize;
+        let mut modified = 0usize;
+        let mut walk_errors = 0usize;
+        let mut skipped_unreadable = 0usize;
+        let mut skipped_non_utf8 = 0usize;
+        let mut walked_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
+
+        let walker = WalkDir::new(root.as_std_path())
+            .into_iter()
+            .filter_entry(|e| {
+                // Skip excluded directories *before* descending — saves walking .godot/, etc.
+                if let Some(p) = camino::Utf8Path::from_path(e.path()) {
+                    !is_excluded(p, &root)
+                } else {
+                    true
+                }
+            });
+
+        // Inspect each WalkDir result explicitly — `.filter_map(Result::ok)` would silently
+        // drop permission-denied / I/O / symlink-loop errors, and the downstream "removed"
+        // pass would then delete every unreachable file from the index. Track errors so we
+        // can suppress that pass when the walk wasn't authoritative.
+        for entry_result in walker {
+            let entry = match entry_result {
+                Ok(e) => e,
+                Err(e) => {
+                    let path_display = e
+                        .path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    log::warn!("reconcile: walk error at {path_display}: {e}");
+                    walk_errors += 1;
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Some(p) = camino::Utf8Path::from_path(entry.path()) else {
+                // Non-UTF-8 path — surface a count so files don't silently vanish from the
+                // "removed" computation simply because the walk couldn't name them.
+                skipped_non_utf8 += 1;
+                log::warn!(
+                    "reconcile: skipping non-UTF-8 path under {root}; this file will not be \
+                     considered for the removed-files pass"
+                );
+                continue;
+            };
+            if p.extension() != Some("gd") {
+                continue;
+            }
+            // Normalize the way Index keys do (the shared `gd_project::normalize_path`) so the
+            // `walked_paths.contains(...)` check at the end against `Index::path(fid)` succeeds.
+            let path = gd_project::normalize_path(p);
+            walked += 1;
+            walked_paths.insert(path.clone());
+
+            // Open buffer wins over disk (docs/01, `vfs.rs`): skip the disk-driven reindex for a
+            // file the editor has open. It stays in `walked_paths` (above) so the removal pass
+            // won't drop it either, and its authoritative interface is already live in the index
+            // from `reindex_open_buffer`. Skipping before the read also avoids the wasted parse.
+            if open_paths.contains(&path) {
+                continue;
+            }
+
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    log::warn!("reconcile: skipping unreadable {path}: {e}");
+                    skipped_unreadable += 1;
+                    continue;
+                }
+            };
+            let tree = gd_syntax::parse(&text).tree;
+            let new_iface = gd_project::extract_interface(&tree);
+            let new_hash = new_iface.signature_hash();
+            let action = match self.index.interface_of(&path) {
+                None => Some(true),                                           // added
+                Some(cur) if cur.signature_hash() != new_hash => Some(false), // modified
+                _ => None,
+            };
+            if let Some(is_added) = action {
+                self.index.txn(&path, |idx| {
+                    idx.on_file_changed(&path, new_iface);
+                });
+                if is_added {
+                    added += 1;
+                } else {
+                    modified += 1;
+                }
+            }
+        }
+
+        // Removed = anything in the index whose path didn't show up in the walk.
+        // SAFETY: when the walk had errors (permission, I/O, non-UTF-8), `walked_paths` is
+        // incomplete by definition — files exist on disk that we just couldn't enumerate.
+        // Skip the removal pass entirely in that case rather than phantom-deleting live
+        // files. Operators see the skip in the summary line and can investigate.
+        let removed = if walk_errors > 0 || skipped_non_utf8 > 0 {
+            log::warn!(
+                "reconcile: skipping removal pass (walk_errors={walk_errors}, \
+                 skipped_non_utf8={skipped_non_utf8}); the walk was not authoritative"
+            );
+            0
+        } else {
+            let removed_paths: Vec<Utf8PathBuf> = self
+                .index
+                .iter_interfaces()
+                .filter_map(|(fid, _)| self.index.path(fid).map(camino::Utf8Path::to_path_buf))
+                // Never drop an open buffer: a file the editor has open whose on-disk copy vanished
+                // (git stash, atomic save mid-walk) is still authoritative from its buffer.
+                .filter(|p| !walked_paths.contains(p) && !open_paths.contains(p))
+                .collect();
+            let n = removed_paths.len();
+            for path in &removed_paths {
+                self.index.txn(path, |idx| idx.on_file_removed(path));
+            }
+            n
+        };
+
+        // M5 WP-O1 — preserved verbatim marker (operators & log-greppers depend on this exact
+        // label). Migrated from `log::info!` to `tracing::info!` so the event is attached to the
+        // surrounding `reconcile` span instead of arriving at root scope.
+        tracing::info!(
+            "cold_index_reconciled added={added} modified={modified} removed={removed} \
+             walked={walked} walk_errors={walk_errors} skipped_unreadable={skipped_unreadable} \
+             skipped_non_utf8={skipped_non_utf8}"
+        );
+        _span.record("added", added as u64);
+        _span.record("modified", modified as u64);
+        _span.record("removed", removed as u64);
+        _span.record("walked", walked as u64);
+        _span.record("walk_errors", walk_errors as u64);
+        _span.record("elapsed_us", _start.elapsed().as_micros() as u64);
+
+        ReconciliationReport {
+            added,
+            modified,
+            removed,
+            walked,
+            walk_errors,
+            skipped_unreadable,
+            skipped_non_utf8,
+        }
+    }
+}
+
+/// Outcome of a [`Workspace::reconcile`] pass. Used by `gdls diagnose --reconcile` (WP-T3) and by
+/// watcher event handling on the `need_rescan` overflow flag (WP-W3).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReconciliationReport {
+    pub added: usize,
+    pub modified: usize,
+    pub removed: usize,
+    pub walked: usize,
+    /// WalkDir per-entry errors (permission denied, vanished mid-walk, symlink loops, etc.).
+    /// When nonzero, [`ReconciliationReport::removed`] is forced to 0 — see [`Workspace::reconcile`].
+    pub walk_errors: usize,
+    /// Files the walk reached but couldn't `read_to_string` (locked, perms, non-UTF-8 content).
+    /// Their interfaces stay last-known in the index.
+    pub skipped_unreadable: usize,
+    /// Filesystem entries with non-UTF-8 paths. Disables the removal pass for the same reason
+    /// `walk_errors` does — the walk wasn't authoritative.
+    pub skipped_non_utf8: usize,
+}
+
+impl ReconciliationReport {
+    /// Whether the walk hit any error that should be surfaced to operators (driving the
+    /// nonzero-exit path of `gdls diagnose --reconcile`).
+    pub fn had_errors(&self) -> bool {
+        self.walk_errors > 0 || self.skipped_unreadable > 0 || self.skipped_non_utf8 > 0
+    }
+}
+
+/// Project the server's `initializationOptions.strict` (its own enum, kept off the analyzer crate)
+/// onto the analyzer's [`StrictSettings`]. The two profiles enumerate the same variants 1:1 by
+/// design (see `gd_analyze::warn_policy`'s module doc).
+///
+/// Side effect: warn-logs any name in the three override lists that doesn't resolve to a known
+/// `WarningCode`. This lenient "skip the unknown name and keep going" behavior is **gdls-specific,
+/// not Godot parity**: in Godot,
+/// `gdscript_warning.cpp`'s `get_code_from_name` is consulted only by the `@warning_ignore` /
+/// `@warning_ignore_region` annotation handlers (`gdscript_parser.cpp`), which
+/// `push_error("Invalid warning name")` on a miss — they do **not** silently continue. gdls's
+/// project-settings warning-level path never routes arbitrary names through that Godot code at all,
+/// so there is no Godot behavior to mirror here; we deliberately choose leniency for *config* (an
+/// unknown name in `initializationOptions` is a config typo, not GDScript source) and surface the
+/// unknown-name list to stderr at startup so the typo stays debuggable.
+fn strict_settings(strict: &StrictConfig) -> StrictSettings {
+    warn_on_unknown_codes(&strict.enable_warnings, "enableWarnings");
+    warn_on_unknown_codes(&strict.disable_warnings, "disableWarnings");
+    warn_on_unknown_codes(&strict.error_warnings, "errorWarnings");
+    StrictSettings {
+        profile: match strict.profile {
+            ServerStrictProfile::Godot => StrictProfile::Godot,
+            ServerStrictProfile::Strict => StrictProfile::Strict,
+            ServerStrictProfile::Off => StrictProfile::Off,
+        },
+        enable_warnings: strict.enable_warnings.clone(),
+        disable_warnings: strict.disable_warnings.clone(),
+        error_warnings: strict.error_warnings.clone(),
+    }
+}
+
+fn warn_on_unknown_codes(names: &[String], context: &str) {
+    for name in names {
+        if code_from_name(&name.to_ascii_uppercase()).is_none() {
+            log::warn!(
+                "unknown warning code in initializationOptions.strict.{context}: {name:?} (no such WarningCode; ignored per gdls config leniency)"
+            );
+        }
+    }
+}
+
+/// Load the native DB from `extensionApiPath` (degrading to empty on absence/error), then merge each
+/// installed GDExtension's `doc_classes` XML — those classes are absent from the stock dump.
+fn load_native(options: &InitializationOptions, project: &ProjectModel) -> NativeDb {
+    let mut db = match options.extension_api_path.as_deref() {
+        Some(path) => match NativeDb::load(path) {
+            Ok(db) => {
+                log::info!(
+                    "loaded native API: {} classes from {path}",
+                    db.class_count()
+                );
+                db
+            }
+            Err(e) => {
+                log::warn!("native API unavailable ({e}); native types degrade to dynamic");
+                NativeDb::empty()
+            }
+        },
+        None => {
+            log::info!("no extensionApiPath configured; native types degrade to dynamic");
+            NativeDb::empty()
+        }
+    };
+
+    let mut merged = 0usize;
+    for ext in &project.gdextensions {
+        let before = merged;
+        for xml in ext.doc_xml_files() {
+            match gd_types::doc_xml::parse_file(xml.as_str()) {
+                Ok(class) => {
+                    if db.merge_doc_class(class) {
+                        merged += 1;
+                    }
+                }
+                // Most `.xml` under an addon aren't class docs — expected, stay quiet.
+                Err(DocXmlError::NotAClass(_) | DocXmlError::MissingName) => {}
+                // A malformed `<class>` doc or an unreadable file IS actionable: that class
+                // silently goes dynamic. Warn so the operator sees the breadcrumb at default
+                // log level — `debug` would hide it where it matters.
+                Err(e) => log::warn!("skipping GDExtension doc XML {xml}: {e}"),
+            }
+        }
+        // `[icons]` named classes but no usable doc XML was found ⇒ those types degrade to dynamic.
+        // Surfacing this is the whole reason `class_hints` is captured (`gdextension.rs`).
+        if merged == before && !ext.class_hints.is_empty() {
+            log::info!(
+                "GDExtension {} declares {} class hint(s) but shipped no usable doc XML; \
+                 its types degrade to dynamic",
+                ext.config,
+                ext.class_hints.len()
+            );
+        }
+    }
+    if merged > 0 {
+        log::info!("merged {merged} GDExtension class(es) from doc XML");
+    }
+    db
+}

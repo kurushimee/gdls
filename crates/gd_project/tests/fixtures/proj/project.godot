@@ -1,0 +1,18 @@
+config_version=5
+
+[application]
+
+config/name="Proj Fixture"
+run/main_scene="uid://mainmainmain"
+
+[autoload]
+
+StaticSignals="*res://src/static_signals.gd"
+Panku="*uid://cyftuo4syatlv"
+PlainNode="res://src/static_signals.gd"
+
+[debug]
+
+gdscript/warnings/enable=true
+gdscript/warnings/untyped_declaration=2
+gdscript/warnings/unassigned_variable=0

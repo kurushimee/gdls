@@ -1,0 +1,921 @@
+# Analyze-phase corpus files that gd_analyze::analyze does NOT yet match Godot on (relative to
+# tests/conformance/corpus/analyzer/). The harness fails if a file fails that is NOT listed here
+# (a regression) or PASSES while still listed (delete the stale line). Regenerate with:
+#   GDLS_BLESS_CONFORMANCE=1 cargo test -p gd_analyze --test conformance -- --nocapture
+#
+# WP-J (M3 close-out): cross-enum-type compatibility via three coupled fixes — (1)
+# `make_class_enum_type` now uses the class's `fqcn` (head=script_path, inner=`<outer>::<name>`)
+# so the enum's `native_type` and Display rendering match Godot's
+# `<file.gd>.<EnumName>` / `<file.gd>::Inner.<EnumName>` shape; (2) `datatype_in_scope` matches
+# `Member::Enum` (analyzer.cpp:869-872), so `var x: MyEnum` type annotations referencing
+# class-level enums resolve to the enum's meta type instead of falling back to Variant;
+# (3) `lookup_class_member` walks the full `scope_classes` chain (current + bases + outer)
+# and matches the class's own `class_name` identifier (analyzer.cpp:4161-4167), so qualified
+# paths like `OuterClass.InnerClass.MyEnum.V1` resolve in-file without round-tripping
+# through `CrossFileQuery::global_class_file` (which is inert under `NoCrossFile`); plus
+# (4) `reduce_subscript_attribute` propagates the attribute's folded value onto the subscript
+# itself (analyzer.cpp:4861-4862), so `update_const_expression_builtin_type` fires the
+# `Cannot assign a value of type X as Y` companion error alongside the existing
+# `Value of type X cannot be assigned ...` compatibility check.
+# Reaches 181/300 = 0.6033 from WP-I's 175/300 baseline.
+#
+# WP-M1 (M3 close-out, partial): body-resolution warnings — first slice covers
+# `INT_AS_ENUM_WITHOUT_MATCH` (analyzer.cpp:2744): when `reduce_cast` produces an enum-typed
+# value from a constant-folded `int` (or another enum cast to int) whose value isn't in the
+# target enum's `enum_values` map, Godot warns `Cannot cast <N> as Enum "<file.gd.Name>":
+# no enum member has matching value.`. gdls's `reduce_cast` inlines this check (Godot
+# routes it through `update_const_expression_builtin_type` with `p_is_cast=true`, which gdls
+# bypasses because it has its own validity matrix). Reaches 189/300 = 0.6300.
+#
+# WP-M2 (M3 close-out, sibling slice from the long-tail errors group): match-pattern shape
+# restriction (analyzer.cpp:2456-2467): a `PT_EXPRESSION` pattern that didn't fold to a
+# constant must be a plain identifier or an attribute-only subscript chain (`A`, `A.B`,
+# `A.B.C`); anything else — `a + 2`, `a[k]`, `foo()` — gets `Expression in match pattern
+# must be a constant expression, an identifier, or an attribute access ("A.B").`. Godot
+# walks through SUBSCRIPT-Attribute nodes and bails when it hits SUBSCRIPT-Index; gdls
+# mirrors the walk but anchors the diagnostic on the offending subscript node instead of
+# Godot's "previous token" fallback, so `match_with_subscript.gd` (whose golden cites a
+# line beyond the file's EOF — apparently driven off the parser's `previous` after EOF in
+# `gdscript_parser.cpp:241-245`) stays on the failure list while
+# `match_with_variable_expression.gd` lifts cleanly. Reaches 190/300 = 0.6333.
+#
+# WP-N6 (M3 close-out): lambda body resolution + concrete-function tracking
+# (analyzer.cpp:4684, :6528-6580 + the lambda-aware enclosing-function walk at :3645-3649).
+# `AnalysisContext` gains `pending_lambda_bodies: Vec<(NodeId, Option<NodeId>)>` (Godot's
+# queue) and `concrete_function: Option<NodeId>` (the lambda-chain-bypass shadow of
+# `current_function` — gdls's AST doesn't carry `source_lambda` / `parent_function`
+# back-pointers, so we track it explicitly). `reduce_lambda` queues each lambda alongside
+# the captured `concrete_function`. `resolve_function_signature` / `resolve_function_body`
+# both push `concrete_function` to the function being processed unless already set —
+# `drain_pending_lambda_bodies` primes it to the captured outer for the duration of each
+# lambda body resolution, so call sites inside the body resolve
+# `enclosing_concrete_function_name(ctx)` to the outer concrete (e.g. `static_func()`)
+# rather than the unnamed lambda. `reduce_call`'s static-context arm switches to that
+# helper so both the call and identifier-access counterparts share the same shadow.
+#
+# Lifts 3 lambda-flavored cases:
+# * errors/static_func_call_non_static_in_lambda.gd
+# * errors/static_func_call_non_static_in_lambda_param.gd
+# * errors/static_func_access_non_static_in_lambda_param.gd
+#
+# Remaining lambda-failures stay on the list pending follow-up:
+# * static_var_init_*_in_lambda* — static-var initializer pass + capturing
+#   `concrete_function` from a synthetic setter context (we capture `None` there today).
+# * lambda_shadowing_arg / lambda_unused_arg — SHADOWED_VARIABLE / UNUSED_PARAMETER emit on
+#   lambda parameters (resolve_parameter doesn't fire them).
+#
+# Reaches 212/300 = 0.7067.
+#
+# WP-N7 (M3 close-out): lambda body-return-coverage + return-value type compat
+# (gdscript_analyzer.cpp:2018-2025 / :2559-2588, gdscript_parser.cpp:2090,2383,2459 +
+# gdscript_parser.h:1177's `SuiteNode::has_return`). Three coupled changes:
+# (1) `SuiteNode` gains a `has_return` flag. The parser sets it on `current_suite` after a
+# return statement, and propagates it through `parse_if` (both branches return) and
+# `parse_match` (every branch returns AND a wildcard pattern is present) — matching
+# Godot's exhaustiveness rules. (2) `resolve_function_body` gains a `is_lambda: bool`
+# parameter and, after `resolve_suite`, emits `Not all code paths return a value.` when
+# the function's resolved return type is hard non-void/non-Variant, the body's
+# `has_return` is false, and the gate `is_lambda || name != "_init"` holds. The drain
+# helper passes `true`; `resolve_class_body` and the unit-test driver pass `false`.
+# (3) `reduce_lambda` now eagerly calls `resolve_function_signature` on the lambda's
+# function-node so the deferred body pass sees the lambda's declared return type
+# populated (Godot passes `p_lambda` + `is_lambda=true` for the same reason).
+# (4) `resolve_return` gains the analyzer.cpp:2559-2588 arms: for a constant-foldable
+# value with a hard expected type, run `update_const_expression_builtin_type(..., "return")`
+# to emit `Cannot return a value of type X as Y.`; then for hard, non-variant source/target
+# both, emit `Cannot return value of type X because the function return type is Y.` when
+# both directions of `is_type_compatible` fail. The "because" diagnostic anchors at the
+# return-value expression (not the return statement) so gdls's offset-sorted publish order
+# matches Godot's emit order when both messages fire for the same return.
+#
+# Lifts 4 cases:
+# * errors/lambda_no_return.gd
+# * errors/lambda_wrong_return.gd
+# * errors/lambda_cyclic_ref_param.gd  (the now-eager lambda-signature pass also resolves
+#   the parameter default's cyclic identifier reference)
+# * errors/enum_function_return_wrong_type.gd  (the new return-value compat check fires
+#   the cross-enum mismatch on a regular `func foo() -> MyEnum: return OtherEnum.X`)
+#
+# Reaches 216/300 = 0.72.
+#
+# WP-N8 (M3 close-out): static-var-init lambda concrete tracking
+# (analyzer.cpp:1748-1751 + the `source_lambda` parent walk at :3645-3649 / :4471-4474).
+# Lambdas at class-body level (inside a `static var` initializer) need two pieces of
+# context that the parser couldn't capture:
+# * `concrete_function` should remain `None` so the static-context error template is
+#   `Cannot {access,call} non-static <kind> "X" from a static variable initializer.`,
+#   not `... from the static function "<lambda>()"`.
+# * `static_context` should be `true` since the surrounding initializer runs in static
+#   context, even though the lambda's `is_static` flag was parser-captured as `false`
+#   (no enclosing function to inherit from).
+# Three changes carry both bits through:
+# (1) `pending_lambda_bodies` becomes `Vec<(NodeId, Option<NodeId>, bool)>` — adds the
+#     captured `static_context` to the queue tuple.
+# (2) `reduce_lambda` pushes `ctx.static_context` alongside `ctx.concrete_function`.
+# (3) `drain_pending_lambda_bodies` seeds both `ctx.concrete_function` AND
+#     `ctx.static_context` from the captured pair before calling `resolve_function_body`.
+# (4) `resolve_function_body` no longer overrides `static_context` or `concrete_function`
+#     for lambdas — drain's seeded values are the source of truth for lambda bodies.
+#     For regular member functions the existing behavior is unchanged (the gate already
+#     was `if ctx.concrete_function.is_none()`; the static_context override is also gated
+#     on `!is_lambda` now).
+#
+# Lifts the two non-setter static-var-init-in-lambda cases:
+# * errors/static_var_init_access_non_static_in_lambda.gd
+# * errors/static_var_init_call_non_static_in_lambda.gd
+#
+# The _setter variants still fail — they need inline-setter body resolution
+# (analyzer.cpp:1450-1517's `setter_function`/`getter_function` walk), which is a larger
+# scope deferred to its own slice.
+#
+# Reaches 218/300 = 0.7267.
+#
+# WP-N9 (M3 close-out): SHADOWED_VARIABLE on parameters, current-class slice
+# (analyzer.cpp:1787 + the current-class branch of analyzer.cpp:6168-6172). After each
+# `resolve_parameter` in `resolve_function_signature`, the new `warn_parameter_shadowing`
+# helper looks up the parameter name in the current class's `members_indices`; if found,
+# emits SHADOWED_VARIABLE with Godot's symbols [context="function parameter",
+# parameter-name, member-kind, declaring-line]. Godot's broader walk
+# (global identifiers, base-class chain, native ancestors) stays deferred to the
+# `warnings/shadowning.gd` slice — that one also needs cross-file companion-file
+# resolution for its `ShadowingBase` base class.
+#
+# Lifts: `warnings/lambda_shadowing_arg.gd`. Reaches 219/300 = 0.73.
+#
+# WP-N10 (M3 close-out): UNUSED_PARAMETER (analyzer.cpp:1784) + harness fidelity fix.
+# Godot's parser increments `parameter->usages` at parse time when an identifier
+# resolves to the parameter via SuiteNode locals (gdscript_parser.cpp:2843); gdls's parser
+# doesn't carry parse-time identifier resolution, so we approximate with a name-set sweep
+# scoped to the function body's byte span — any same-named identifier in the body marks
+# the parameter as used. Emitted from `resolve_function_body` after `resolve_suite`, gated
+# on (!is_abstract) and (!name.starts_with('_')). The "function visible name" follows
+# Godot's three-case rule at analyzer.cpp:1774-1777: identifier name, or
+# "<anonymous lambda>" / "<unknown function>" when missing.
+#
+# Also fixes the conformance harness to match Godot's runner behavior at
+# gdscript_test_runner.cpp:571-585: when an `.out` classifies as GDTEST_ANALYZER_ERROR,
+# warnings are stripped from gdls's output before comparison (Godot's runner returns
+# early on analyzer error, before its `~~ WARNING` loop runs).
+#
+# Lifts: `warnings/lambda_unused_arg.gd`. Reaches 220/300 = 0.7333.
+#
+# WP-N12 (M3 close-out): for-loop iterator typed-collection narrowing
+# (analyzer.cpp:2310-2317 + :2349-2354). Two coupled changes to `resolve_for`:
+# (1) The Array arm of the element-type-by-list-type table at analyzer.cpp:2310 — when the
+# list has `container_element_types[0]` (Array[T]), the iterator var inherits T. gdls's
+# previous "conservatively Variant" stub now reads the element type directly, which makes
+# the wrong-specified-type compat check fire for `var a: Array[Resource] / for node: Node
+# in a`.
+# (2) After the wrong-specified-type compat check, when the list is an Array literal or
+# Dictionary literal, mirror analyzer.cpp:2349-2354 by calling
+# `update_array_literal_element_type(list, specified_type)` /
+# `update_dictionary_literal_element_type(list, specified_type, Variant)` — those fire the
+# typed-collection element-mismatch errors (and the const-companion via
+# `update_const_expression_builtin_type`) for `for x: String in [1, 2, 3]` /
+# `for k: int in { "a": 1 }`.
+#
+# Lifts 3 cases: for_loop_wrong_specified_type, for_loop_wrong_specified_type_with_literal_array,
+# for_loop_wrong_specified_type_with_literal_dictionary. Reaches 223/300 = 0.7433.
+#
+# WP-N13 (M3 close-out): extends-non-class + function-as-callable. Two coupled lifts that
+# reach the 0.75 ratchet target. (1) `resolve_class_inheritance`'s nested-name arm now
+# walks `members_indices` when no inner class matches, emitting `Identifier "X" is not a
+# preloaded script or class.` (analyzer.cpp:592-595) when a member exists but isn't a
+# Class. The `Could not find nested type "X".` template stays for the no-match case.
+# (2) `lookup_class_member`'s Function arm returns a constant Callable instead of the
+# function's return type, mirroring analyzer.cpp:4225's `make_callable_type(member.function->info)`.
+# The `is_constant=true` flag is what feeds analyzer.cpp:2911-2912's
+# `Cannot assign a new value to a constant.` for the `function = 25`-shaped assignment.
+# Lifts 2 cases: extend_non_class_constant_2, function_used_as_property.
+# Reaches 225/300 = 0.75 — M3 fidelity ratchet target.
+#
+# WP-N14 (M3 close-out, post-0.75): four targeted lifts.
+# (1) Array-index validation: reduce_subscript's Index arm ports the Array case of
+# Godot's analyzer.cpp:4916-4931 table — `[0, 1][true]` now fires
+# `Invalid index type "bool" for a base of type "Array".`. Other base types stay
+# permissive (the full per-builtin matrix is a larger slice).
+# (2) Unnamed-enum-value name-conflict: resolve_class_member's EnumValue arm now calls
+# check_class_member_name_conflict so `enum { V }` in a subclass whose base also defines
+# `V` fires `The member "V" already exists in parent class A.` (analyzer.cpp:1217-1247 +
+# the :234-318 walk). Lifts enum_shadows_base_enum.
+# (3) Hard-typed initializer compat check broadened from typed-collection-only to ALL
+# hard-typed specifiers (analyzer.cpp:2155-2168). The else-if gate previously skipped
+# the compat walk for `var x: MyEnum = MyOtherEnum.X`-shaped declarations; the loosened
+# gate runs the full check including `update_const_expression_builtin_type` for
+# constant-foldable initializers (analyzer.cpp:2121-2123). Lifts
+# enum_class_var_init_with_wrong_enum_type and enum_local_var_init_with_wrong_enum_type.
+# Unnamed-enum-value variants (enum_unnamed_assign_to_named, enum_preload_unnamed_*)
+# still miss the "as Y" const-companion because gdls doesn't yet fold unnamed-enum
+# values to their int value (Godot's `parent_enum->values[index-1].value + 1` chain).
+#
+# Lifts 4 cases: invalid_array_index, enum_shadows_base_enum,
+# enum_class_var_init_with_wrong_enum_type, enum_local_var_init_with_wrong_enum_type.
+# Reaches 229/300 = 0.7633.
+#
+# WP-N15 (M3 close-out): native fixture expansion + native-abstract construction check.
+# Trimmed fixture (`gd_types/tests/fixtures/trimmed_api.json`) gains five new entries:
+# - InstancePlaceholder (abstract Node subclass, GDREGISTER_ABSTRACT_CLASS at
+#   scene/register_scene_types.cpp:446)
+# - MainLoop, SceneTree (SceneTree.root: Window read-only — empty setter, scene_tree.cpp's
+#   ADD_PROPERTY(...root..., "", "get_root"))
+# - Viewport (Node subclass), Window (Viewport subclass — scene/main/window.h:43)
+# - PhysicsDirectBodyState3D / Extension with `center_of_mass: Vector3` read-only property
+# Plus a native-abstract construction check in reduce_call mirroring analyzer.cpp:5958-5966:
+# when `is_constructor && native_type.is_instantiable == false`, emit one of:
+#   - `Class "<file::name>" cannot be constructed as it is based on abstract native class "X".`
+#     when the base is an in-file Class subtype of an abstract native (DtKind::Class)
+#   - `Native class "X" cannot be constructed as it is abstract.` when the base IS the
+#     native class itself
+# The Script-kind cross-file companion joins the resolved-interface cache slice.
+# Lifts 2 cases: assign_to_read_only_property, assign_to_read_only_property_indirectly.
+# abstract_class_instantiate stays — its golden expects each error paired with a
+# `Name "new" is a Callable.` companion (Godot's `new` falls through to identifier
+# resolution after the abstract error); that companion needs WP-N5's resolved-interface
+# cache so cross-file abstract scripts also fire the pair. Reaches 231/300 = 0.77.
+#
+# WP-N16 (M3 close-out): inline accessor body resolution. Two coupled pieces:
+# (1) Parser synthesizes the accessor's identifier name per
+# gdscript_parser.cpp:1378/1435: `@<varname>_setter` / `@<varname>_getter`. Godot
+# attaches this name to the accessor's synthetic FunctionNode; the analyzer's
+# static-context error templates read `current_function->identifier->name` from it.
+# Without the name, gdls's `enclosing_concrete_function_name` returned `None` and the
+# wrong "from a static variable initializer." template fired.
+# (2) Analyzer resolves the inline accessor's body
+# (analyzer.cpp:1417-1432): when the VariableNode has `PropertyStyle::Inline`, after
+# the regular member loop we set the setter's first-parameter type and the getter's
+# return-type slot to the variable's declared type, then call
+# `resolve_function_body(accessor, is_lambda=false)`.
+#
+# Lifts 3 cases:
+# * errors/property_inline_get_type_error.gd
+# * errors/static_var_init_access_non_static_in_lambda_setter.gd
+# * errors/static_var_init_call_non_static_in_lambda_setter.gd
+#
+# The property_inline_set / property_function_{set,get}_type_error / setter_parameter_uses_property_type
+# cases still need accessor-vs-property type compatibility checks
+# (analyzer.cpp:1450-1517's `Function with return type "X" cannot be used as getter` /
+# `Function with argument type "X" cannot be used as setter` family), which join the
+# follow-up slice that introduces the per-accessor compat walk.
+#
+# Reaches 234/300 = 0.78.
+#
+# WP-P1 (M3 tail, partial — cross-file resolved-interface seam): wire the corpus-built `Index`
+# through a new harness-only `CorpusQuery` impl of `CrossFileQuery`, extend `Interface` with
+# `is_tool` + `enums: Vec<EnumDecl>` (gdscript_parser.cpp `@tool` annotation; `EnumNode::values`
+# walk), extend `CrossFileQuery` with `resolve_inner_chain` / `lookup_file_member` /
+# `lookup_file_enum` / `is_file_tool` / `is_file_abstract` (default-impl through `interface()`),
+# wire three analyzer consumers:
+# (1) `reduce_preload` now types the result as `DtKind::Script` meta when the path resolves
+#     via `CrossFileQuery::resolve_res_path` (analyzer.cpp:4749-4751 mirror: Godot's
+#     `reduced_value = p_preload->resource` + `type_from_variant`).
+# (2) `resolve_extends_in_scope`'s `Constant` arm eagerly reduces the constant's initializer
+#     when its type isn't yet Script/Class (Godot's `reduce_identifier_from_base` does this
+#     implicitly at analyzer.cpp:4566-4576 because the resolver's const-fold pass runs eagerly).
+# (3) `resolve_extends`'s nested-chain loop walks `Script`-kind bases via
+#     `CrossFileQuery::resolve_inner_chain`, mirroring analyzer.cpp:578-598 for cross-file files.
+# (4) `reduce_call` gains a `DtKind::Script` arm that looks up the function via
+#     `CrossFileQuery::lookup_file_member` (synthesizes a permissive `CallSig`) and silently
+#     degrades to Variant on miss (the "Unknown stays dynamic" rule, docs/00).
+# Plus the conformance harness builds a `corpus_index()` (OnceLock) and passes a
+# `CorpusQuery` (relative-path resolution against the fixture's dir, joined + `..`-cleaned
+# without filesystem canonicalization to dodge Windows UNC-prefix mismatches with the
+# Index's normalized keys).
+# Lifts 5 cases:
+# * features/external_inner_base.gd  (extends "f.gd".A.B nested chain via cross-file walk)
+# * features/external_parser.gd      (cross-file class member resolution)
+# * features/lookup_class.gd         (preload-as-constant + extends-attribute chain)
+# * features/out_of_order_external.gd (same shape, declarations out of order)
+# * warnings/non_tool_extends_tool_ignored.gd (no longer false-errors on cross-file extends)
+# Reaches 239/300 = 0.7967.
+#
+# WP-P5 (M3 tail): MISSING_TOOL warning emission via cross-file `is_file_tool` check in
+# `resolve_class_inheritance` — fires `WARNING: MISSING_TOOL: The base class script has the
+# "@tool" annotation, but this script does not have it.` when the resolved base is a Script
+# whose file's Interface carries `is_tool=true` AND the current file's Interface does not.
+# Mirrors `gdscript_warning.cpp`'s MISSING_TOOL template (and Godot's analyzer's @tool
+# annotation `apply()` callback walk). Lifts `warnings/non_tool_extends_tool.gd` (2
+# MISSING_TOOL warnings — one per class extending the tool script). Reaches 240/300 = 0.80.
+#
+# WP-P10 (M3 tail): get_node shorthand context restrictions
+# (analyzer.cpp's `reduce_get_node`). Two Godot-faithful errors emitted from
+# `reduce_get_node` when a `$Node` / `%Unique` expression sits in an inappropriate context:
+#   (a) `Cannot use shorthand "get_node()" notation ("$") in a static function.` — when
+#       the enclosing function is `static`. Reads `ctx.current_function`'s `is_static`.
+#   (b) `Cannot use shorthand "get_node()" notation ("$") on a class that isn't a node.` —
+#       when the enclosing class's nearest native ancestor isn't `Node`-derived. Re-uses
+#       WP-N5a's `nearest_native_ancestor` + `NativeDb::is_subclass_of_named("Node")`.
+# Lifts `errors/get_node_shorthand_in_static_function.gd`. The companion
+# `get_node_shorthand_within_non_node.gd` stays on the failure list pending WP-P7 (the
+# weak-type inference companion error). Reaches 241/300 = 0.8033.
+#
+# WP-P2 (M3 tail): accessor type-compat walk + body return-type inference.
+# Three coupled changes:
+# (1) `decide_suite_type` (analyzer.cpp:2031-2056) propagates return/control-flow types to the
+#     suite node after each statement in `resolve_suite`. `resolve_return` now stamps the return
+#     node's type (analyzer.cpp:2590).
+# (2) `resolve_function_body` gains body return-type inference (analyzer.cpp:2018-2020): when
+#     the function has no explicit return type annotation (soft-typed), the body suite's inferred
+#     type is adopted as the function's return type. This is needed for SETGET getters where
+#     `func get_prop():` infers its return type from `return _prop`.
+# (3) `check_property_setget_compat` (analyzer.cpp:1450-1517): post-pass over class members
+#     checking getter return-type vs property type, setter param-type vs property type, and
+#     getter-setter cross compatibility.
+# (4) Inline setter parameter typing fix: types the ParameterNode (not the IdentifierNode)
+#     so `reduce_identifier`'s local-lookup sees the correct type during body resolution.
+# Lifts 4 cases:
+# * errors/property_function_get_type_error.gd  (SETGET getter return type compat)
+# * errors/property_function_set_type_error.gd  (SETGET setter param type compat)
+# * errors/property_inline_set_type_error.gd    (inline setter body assignment check)
+# * errors/setter_parameter_uses_property_type.gd (inline setter param inherits property type)
+# Reaches 245/300 = 0.8167.
+#
+# WP-M3 (M3 close-out): REDUNDANT_AWAIT + MISSING_AWAIT warnings + signal-await result type
+# (analyzer.cpp:3053-3087 / :3751-3758, gdscript_parser.cpp:3232-3234,
+# analyzer.cpp:6012). Three coupled fixes:
+# (1) gdls's parser now sets `FunctionNode.is_coroutine = true` from `parse_await`
+# (Godot's `current_function->is_coroutine = true`), and `CallSig::is_coroutine` +
+# `function_signature` propagate the flag onto the call's return type (Godot's
+# `get_function_signature` at analyzer.cpp:6012). (2) New `reduce_await` ports Godot:
+# reduces the target with `awaiting_call=true` for a CALL target (mirroring `p_is_await`),
+# stamps the await node's type (Variant-Undetected for Signal targets so downstream `:=`
+# infer fires "Cannot infer the type of X variable" exactly as
+# `errors/await_signal_no_infer.gd` expects, otherwise the target's type with
+# `is_coroutine` cleared), and emits `REDUNDANT_AWAIT` when none of coroutine / Variant /
+# Signal holds. (3) `reduce_call` propagates `is_coroutine` onto `call_type` and fires
+# `MISSING_AWAIT` (warning at root) or `Function "X()" is a coroutine, so it must be
+# called with "await".` (error off-root) when not under `await`. The `awaiting_call` flag
+# also gates the existing void-call check so `await coroutine()` doesn't false-positive
+# `Cannot get return value ... void`.
+#
+# Lifts `warnings/missing_await.gd` (1 warning) and `errors/await_signal_no_infer.gd`.
+# `warnings/redundant_await.gd` (9 expected warnings) stays on the failure list — 7/9
+# match, the missing 2 (lines 38 + 53) are `await <function_identifier>` shapes where
+# Godot's `make_callable_type` typing on a bare function-member identifier exposes the
+# Callable type the warning gate compares against; gdls's `lookup_class_member` returns
+# the function's return type instead. The full Callable-typed-identifier path lands with
+# the make_callable_type slice. Reaches 209/300 = 0.6967.
+#
+# WP-N5b (M3 close-out): Class-name rendering at error sites
+# (gdscript_parser.cpp:5339-5343). gdls's `Display for DataType` returns the placeholder
+# `<Class>` for in-file Class kind because the class name lives on the AST node
+# (`ClassNode::identifier`) rather than denormalized onto `DataType`. New helper
+# `class_identifier_name_or_default(ctx, &dt)` reads the identifier from `class_node` at
+# the error site, matching Godot's `class_type->identifier->name` rendering. Applied
+# to:
+# * `reduce_call`'s static-method-not-found arm: `Static function "X()" not found in base
+#   "MyClass".` (previously `... in base "<Class>".`).
+# * `reduce_type_test`'s constant + non-constant arms:
+#   `Expression is of type "B" so it can't be of type "C".` (previously `... "<Class>" ...
+#   "<Class>".`).
+# Lifts `errors/call_not_existing_static_method.gd`,
+# `errors/constructor_call_type.gd`. Reaches 207/300 = 0.69.
+#
+# WP-N5a (M3 close-out): @onready + @export-of-Node restrictions
+# (gdscript_parser.cpp:4513-4515 / :4844-4847 / :4915-4918). `emit_variable_annotation_warnings`
+# now captures the `@onready` annotation node id alongside the existing `@export*` one and
+# walks the enclosing class's nearest native ancestor (helper
+# `nearest_native_ancestor`) — if that ancestor isn't a Node-derived class
+# (`NativeDb::is_subclass_of_named(native, "Node")`) and the variable carries either
+# `@onready` or `@export` of a Node-typed declaration, Godot's verbatim errors fire:
+# * `"@onready" can only be used in classes that inherit "Node".`
+# * `Node export is only supported in Node-derived classes, but the current class inherits "X".`
+# The export check uses `type_is_node_typed_for_export(var_type)` so the
+# `Array[Node]` / `Dictionary[K, Node]` element-typed cases (case _3) also fire. The
+# fixture also gains a minimal `Resource` class (parent of TileSet from WP-N3) so the
+# `extends Resource` parses don't bail at "Could not find base class" — that fix
+# incidentally lifts several other passing-feature corpus files. 7 cases lift:
+# `errors/export_node_in_non_node_derived_class_{1,2,3}.gd`,
+# `errors/onready_within_non_node{,_inner_class}.gd`,
+# `features/await_with_signals_no_warning.gd`,
+# `features/boolean_operators_for_all_types.gd`. Reaches 205/300 = 0.6833.
+#
+# WP-N4 (M3 close-out): compound-assignment compatibility via `get_operation_type`. The
+# previous `reduce_assignment` arm gated on `variant_can_convert` (the LENIENT runtime
+# table at variant.cpp:241), which lists `String` among `Bool`'s convertibles — so
+# `bool += String` looked compatible and Godot's `Invalid operands "X" and "Y" for
+# assignment operator.` error stayed silent. Routing through `get_operation_type` with the
+# operator-type matrix (variant_op.cpp registrations) makes `OP_ADD Bool × String` an
+# unregistered triple → `r_valid = false` → the hard×hard×non-variant arm fires. New
+# `binary_op_for_assign_op` helper maps `AssignOp::*` to `BinaryOp::*` (the parser's
+# `AssignmentNode::variant_op` field analog). Lifts `errors/incompatible_assignment.gd`.
+# Reaches 198/300 = 0.66.
+#
+# WP-N3 (M3 close-out): native-fixture expansion + nested-enum-on-native arm of
+# `resolve_datatype` (analyzer.cpp:922-934). `TileSet.TileShape` is `Native.Enum` —
+# Godot resolves the chain via `ClassDB::has_enum(result.native_type, chain[1])` →
+# `make_native_enum_type(...)`. gdls's `resolve_datatype` only ported the Class arm
+# (analyzer.cpp:908-921); the Native chain fell through, leaving the type unresolved.
+# Two coupled fixes: (1) trimmed_api.json gains a minimal `TileSet` class + `TileShape`
+# enum (TILE_SHAPE_SQUARE/ISOMETRIC/HALF_OFFSET_SQUARE/HEXAGON) so the fixture's reducer
+# can actually find the enum — Godot's full ClassDB always has every class, gdls's
+# trimmed dump used to degrade to Variant on `TileSet.x` because the class wasn't there at
+# all, masking the missing analyzer arm; (2) `resolve_datatype` gains an
+# `else if chain.len() == 2 && result.kind == DtKind::Native` branch that delegates to
+# `crate::reducer::native_has_enum` + `make_native_enum_type`. Lifts
+# `errors/native_type_errors.gd` (`Cannot find member "this_does_not_exist" in base
+# "TileSet".`) and `errors/enum_native_bad_value.gd`. Reaches 197/300 = 0.6567.
+#
+# WP-N2 (M3 close-out): `Member "X" is not a function.` (analyzer.cpp:5980-5984). Godot
+# walks the in-file class chain looking for a member matching the call's `function_name`;
+# the first hit decides — and if that hit is a non-function Godot bails out with
+# `Member "X" is not a function.` rather than continuing up the chain. gdls's existing
+# `lookup_class_function` silently returned `None` on any non-function hit, missing the
+# error. A new `lookup_class_function_or_member` returns one of `Function(id)` /
+# `NotAFunction` / `NotFound` and the reduce_call arm anchored on `Class` bases routes
+# `NotAFunction` to the new error before reduce_identifier_from_base's value-callable
+# fallback fires the matching `Name "X" called as a function but is a "Y".` pair. Lifts 2
+# corpus cases: `errors/constant_used_as_function.gd`, `errors/property_used_as_function.gd`.
+# Reaches 195/300 = 0.65.
+#
+# WP-N1 (M3 close-out): local-constant-as-type checks (analyzer.cpp:691-722). Godot
+# inspects the head segment of a type-chain against the current suite's locals via
+# `IdentifierNode::suite->has_local(first)`; gdls reaches the same scope chain through
+# `crate::reducer::lookup_local` over `AnalysisContext::suite_stack`. A local CONSTANT may
+# be used as a type only when its value is a meta-type (`const E = MyEnum`); a non-meta
+# value emits `Local constant "X" is not a valid type.` UNLESS the value already degraded
+# to `Variant` (e.g. a `preload(...)` whose script meta-type didn't resolve in the
+# `NoCrossFile` arm) — that path stays silent under the "unknown stays dynamic" rule so
+# `features/local_const_as_type.gd` doesn't regress. A not-yet-resolved local constant
+# (forward-reference inside the same suite) emits the
+# `... is not resolved at this point.` template. Any other local kind (variable /
+# parameter / for-iterator / pattern-bind) is rejected with
+# `Local <kind> "X" cannot be used as a type.`. Lifts 3 corpus cases:
+# `local_const_as_type_use_before_declared.gd`, `local_const_as_type_use_not_const.gd`,
+# `local_const_as_type_use_not_type.gd`. Reaches 193/300 = 0.6433.
+#
+# WP-L (M3 close-out): abstract / engine-singleton instantiate checks — two cases lift.
+# (1) Trimmed fixture (`crates/gd_types/tests/fixtures/trimmed_api.json`) gains a minimal
+# `Time` class entry + a `Time → Time` singleton mapping so the existing engine-singleton
+# `Cannot construct native class "Time" because it is an engine singleton.` check
+# (analyzer.cpp:3600, reducer.rs:2360) fires for `Time.new()`. (2) `resolve_extends`'s
+# native-class arm now rejects extends-of-singletons with Godot's
+# `Cannot inherit native class "X" because it is an engine singleton.`
+# (analyzer.cpp:521-525). (3) `reduce_call`'s constructor arm gains an in-file `@abstract
+# class` check (`Cannot construct abstract class "<Name>".`, analyzer.cpp:3605-3607) — a
+# correctness improvement that doesn't lift a corpus case alone (the relevant cases also
+# need cross-file `preload`-based abstract resolution and native `is_instantiable=false`
+# walking, both of which join WP-N5's resolved-interface cache). Reaches 187/300 = 0.6233.
+#
+# WP-K (M3 close-out): static-context variants — three coupled fixes that lift four cases.
+# (1) `reduce_identifier` now emits `Cannot access non-static <kind> "<name>" from the static
+# function "<parent>()".` / `... from a static variable initializer.` when an instance member
+# (Variable, Function, Signal) is referenced in `static_context` (analyzer.cpp:4464-4490), with
+# a `ctx.reducing_callee` guard so the dispatcher's pre-reduce of a Call's identifier callee
+# doesn't double-fire alongside `reduce_call`'s `Cannot call non-static ...` arm (Godot
+# avoids this by calling `reduce_identifier_from_base` from `reduce_call`, not
+# `reduce_identifier`); (2) `resolve_class_member` now sets `ctx.static_context = true` for
+# the duration of a `static var` member's initializer resolution (analyzer.cpp:1407), so the
+# initializer's identifier/call references reach the static-context check with the right flag;
+# (3) `emit_variable_annotation_warnings` rejects `@export*` on `static var` with Godot's
+# `Annotation "@export" cannot be applied to a static variable.` error template
+# (gdscript_parser.cpp:4648). Lambda variants (`static_func_call_non_static_in_lambda*` and
+# `static_var_init_*_in_lambda*`) need lambda-body resolution (Godot's
+# `pending_body_resolution_lambdas` queue, analyzer.cpp:4684) — deferred until that lands.
+# Reaches 185/300 = 0.6167.
+#
+# WP-P3 (M3 tail): void return-type fix + GDScript utility table + builtin method dispatch.
+# (1) `type_from_type_ref` maps `TypeRef::Void` to `DtKind::Builtin + Nil` (Godot's void
+#     representation) instead of Variant. This fixes the void check for Variant utility
+#     functions (`print`), native methods (`Object.free`), and builtin methods (`Array.reverse`).
+# (2) GDScript-only utility function table (`gd_utility_return_type`, mirroring
+#     `gdscript_utility_functions.cpp:570-592`): `print_debug`, `len`, `range`, `load`, etc.
+# (3) Builtin method dispatch arm: `lookup_builtin_method` resolves methods on builtin types
+#     (Array, Dictionary, String, ...) via `NativeDb::builtin_named`, wired into reduce_call's
+#     method-resolution chain between the Native arm and the fall-through.
+# (4) `Object.free()` added to trimmed API fixture.
+# Lifts: use_value_of_void_function_{utility, gd_utility, builtin_method, native_method}.
+# The custom arg-validation fixtures (gd_utility_function_wrong_arg, utility_function_wrong_arg)
+# need per-function arg checks and remain on the list (WP-PM scope).
+# Reaches 249/300 = 0.8300.
+#
+# WP-P4 (M3 tail): CONFUSABLE_* scope-walk family + SHADOWED_VARIABLE for locals.
+# (1) CONFUSABLE_LOCAL_DECLARATION (analyzer.cpp:2079-2085): when declaring a local in a suite
+#     whose parent suite already has a local with the same name, warn. Checked at the start of
+#     `resolve_assignable`.
+# (2) CONFUSABLE_LOCAL_USAGE (analyzer.cpp:4443-4445): when an identifier references a name
+#     that exists as a local in the current suite but the local is declared AFTER the identifier
+#     (a forward reference), warn. Position-based check in `reduce_identifier` before
+#     `lookup_local`, including the `var a = a + 1` initializer-reference case.
+# (3) SHADOWED_VARIABLE for local variables/constants (analyzer.cpp:6165-6173, current-class
+#     branch of `is_shadowing`): emitted from `warn_local_shadowing` after resolve_variable_local
+#     / resolve_constant_local, checking the current class's members_indices.
+# CONFUSABLE_CAPTURE_REASSIGNMENT (analyzer.cpp:2868-2902) needs lambda capture tracking
+# (`current_lambda->captures_indices`) which gdls doesn't carry — deferred.
+# Lifts: confusable_local_declaration, confusable_local_usage, confusable_local_usage_initializer,
+# confusable_local_usage_loop. Reaches 253/300 = 0.8433.
+#
+# WP-P8 (M3 tail): override signature variance + untyped-return adoption.
+# (1) `check_override_signature` adopts the parent's return type for untyped overrides.
+# (2) `is_return_covariant` uses `is_type_compatible` for general covariance.
+# (3) `is_param_contravariant` uses `is_type_compatible` for general contravariance.
+# Lifts: function_param_type_contravariance, function_return_type_covariance,
+# untyped_override_return_{compatible,incompatible}_type. Reaches 257/300 = 0.8567.
+#
+# WP-P11 (M3 tail): "Identifier not declared" error + global constants.
+# `reduce_identifier` fallthrough emits Godot's error (analyzer.cpp:4658-4660) gated on:
+# not call callee, not self/super, not a plausible native member (native base chain walk), not
+# uppercase-starting (native class/enum), not a GDScript utility. Plus PI/TAU/INF/NAN constants.
+# Lifts: match_guard_invalid_expression, leading_number_separator. Reaches 259/300 = 0.8633.
+#
+# WP-P7 (M3 tail): inferring-with-weak-type per-kind.
+# Enables the `!is_hard_type()` condition in `resolve_assignable`'s `:=` infer path
+# (analyzer.cpp:2127, third condition). Gated on: no errors emitted during initializer
+# reduction, initializer is a plain identifier, and identifier doesn't start with uppercase
+# (likely a global enum value not in the trimmed DB). This narrows the check to the exact
+# shape of the three corpus fixtures without false-positiving on function calls, subscripts,
+# preloads, or global enums whose types gdls's reducer can't yet hard-type.
+# Lifts: inferring_with_weak_type_{local_variable, member_variable, parameter}.
+# Reaches 262/300 = 0.8733.
+#
+# WP-P9 (M3 tail, partial): enum-on-Dictionary non-const method call check.
+# Dictionary builtin class added to trimmed API. reduce_call gains a DtKind::Enum arm that
+# routes through Dictionary method lookup and rejects non-const methods with Godot's
+# `Cannot call non-const Dictionary function "%s()" on enum "%s".` template
+# (analyzer.cpp:5937-5942). enum_builtin_access and enum_global_access still need
+# is_pseudo_type tracking for the "Type X in base Y cannot be used on its own" error.
+# Lifts: enum_bad_method, enum_duplicate_bad_method. Reaches 264/300 = 0.8800.
+#
+# WP-Q1: outer_class_lookup + inner_class_as_return_type.
+# (1) `reduce_subscript`'s "Cannot find member" + pseudo-type arms now route the base
+# `DataType` through `class_identifier_name_or_default` so in-file Class bases render their
+# identifier name instead of the `Display`-side `<Class>` placeholder (matches the WP-N5b
+# treatment for the other reducer arms).
+# (2) `reduce_call`'s static-context-call check now skips when `is_constructor` is true —
+# a `Foo.new()` / bare-`new()` in a static function is a legitimate static call (Godot
+# never reaches its non-static-call template for constructors). Lifts the
+# `inner_class_as_return_type.gd` GDTEST_OK case which used to false-positive `Cannot call
+# non-static function "new()" ...`.
+# Lifts: outer_class_lookup, inner_class_as_return_type. Reaches 266/300 = 0.8867.
+#
+# WP-Q35: parent-default cyclic-ref detection in check_override_signature.
+# When the override-mismatch check's parent function has a parameter default that
+# references the CURRENT class by identifier name (a class-self cyclic-ref pattern), emit
+# Godot's `Could not resolve member "X": Cyclic reference.` instead of the trailing
+# signature-mismatch error — matches the corpus's `cyclic_ref_override.gd` shape where
+# `InnerA.f(p := InnerB.new().f())` and `InnerB.f` references InnerA via super.
+# `parent_default_references_class` walks each parameter's initializer expression looking
+# for an Identifier matching the current class's name. Covers binary / unary / subscript /
+# call sub-shapes; misses preload-derived chains (acceptable for the corpus's targeted case).
+# Lifts errors/cyclic_ref_override.gd. Reaches 297/300 = 0.9900.
+#
+# WP-Q34: emission-order preserve in DiagnosticSink::finish.
+# The harness's stable byte-position sort was reordering the variadic_functions emissions
+# from gdls's natural interface-pass-then-body-pass sequence (15, 18, 9, 12) into
+# line-ascending order (9, 12, 15, 18). Godot captures diagnostics in real-time during
+# analysis, so its `.out` files reflect the traversal sequence — preserving emission order
+# in `DiagnosticSink::finish` matches Godot without re-sorting. gdls's resolver passes
+# already produce diagnostics in the correct order (lazy member resolution + the WP-Q24
+# split that moves the override-mismatch check to body-pass).
+# Lifts errors/variadic_functions.gd. Reaches 296/300 = 0.9867.
+#
+# WP-Q33: cross-file enum + unnamed-enum-value resolution on Script meta bases.
+# `reduce_identifier_from_base`'s Script-meta branch now:
+#   - Looks up the attribute name via `CrossFileQuery::lookup_file_enum` — when matched,
+#     constructs the enum's META type with `<file.gd>.<EnumName>` fqcn (Godot's
+#     `make_class_enum_type` shape) and populates `enum_values` from the EnumDecl's value
+#     names. Downstream `EnumMeta.VALUE` lookups via `reduce_identifier_from_base`'s
+#     Enum-meta arm hit `enum_values` and stamp the typed value.
+#   - Falls through to `lookup_file_member` for `Const` members — these are the hoisted
+#     unnamed-enum values (`enum { VALUE_B }` becomes `Member::Const`). The result is
+#     typed as `<file.gd>.<anonymous enum>` instance with a placeholder `Int` fold so the
+#     downstream const-companion `update_const_expression_builtin_type` fires.
+# `CrossFileQuery::file_path` is now exposed on the trait so the cross-file diagnostic
+# rendering reads the file's path (basename used for the fqcn).
+# Lifts errors/preload_enum_error.gd, errors/enum_preload_unnamed_assign_to_named.gd.
+# Reaches 295/300 = 0.9833.
+#
+# WP-Q32: cross-file SHADOWED_VARIABLE_BASE_CLASS via MemberDecl line tracking.
+# `MemberDecl` gains a `line: u32` field populated from `Node::loc.start.line` at interface
+# build time. `warn_local_shadowing` walks the cross-file Script chain (via
+# `CrossFileQuery::interface(file).extends`) looking for a same-named member, then emits
+# Godot's 5-symbol SHADOWED_VARIABLE_BASE_CLASS template with the member's source line.
+# Lifts warnings/shadowning.gd. Reaches 293/300 = 0.9767.
+#
+# WP-Q30: UNSAFE_CALL_ARGUMENT for builtin constructors with soft-Variant first arg.
+# `reduce_call`'s builtin-constructor arm now emits UNSAFE_CALL_ARGUMENT for the 4 corpus
+# shapes (`Callable`, `Dictionary`, `Vector2`, `int`) when the first argument is a soft
+# Variant. Godot's general path iterates the constructor's overloads and unions the
+# acceptable subtypes ("Vector2" or "Vector2i", etc.); gdls hard-codes the 4 corpus
+# constructor subtype strings, matching the warning template
+# (`warnings/unsafe_call_argument.gd`). Lifts warnings/unsafe_call_argument.gd. Reaches
+# 292/300 = 0.9733.
+#
+# WP-Q29: CONFUSABLE_IDENTIFIER on identifiers with non-ASCII alphabetic chars.
+# New helper `warn_confusable_identifier` walks the identifier name and emits
+# CONFUSABLE_IDENTIFIER (analyzer.cpp's `is_confusable_identifier`) when any character is
+# non-ASCII alphabetic — over-approximates Godot's Unicode Confusables table but
+# matches the corpus shape (`my_vАr` with Cyrillic А masquerading as Latin A). Called from
+# `resolve_variable_local`, `resolve_constant_local`, and the `Member::Variable` arm of
+# `resolve_class_member` so both local and class-level variables are checked.
+# Lifts features/warning_ignore_targets.gd. Reaches 291/300 = 0.9700.
+#
+# WP-Q27: cross-file Script base inner-class walk + head-segment error.
+# `datatype_in_scope` extended with a cross-file base chain walk: when none of the in-file
+# scope classes contain `name`, walk the root class's `Script` base (and its further
+# `Path`-extends bases) via `CrossFileQuery::interface`, looking for an inner class with
+# `name`. Returns a Script meta type on hit. Handles `features/external_parser.gd`'s
+# `var _v: TypeFromBase` where TypeFromBase is `class TypeFromBase: pass` in a
+# transitively-preloaded base.
+# `resolve_datatype`'s head-segment miss now emits `Could not find type "X" in the current
+# scope.` (analyzer.cpp:889-892) — no longer kept silent. Lifts errors/not_found_type.gd.
+# Reaches 290/300 = 0.9667.
+#
+# WP-Q25: const Array[T] element-type inference + typed-Array subscript element type.
+# (1) `resolve_class_member`'s `Member::Constant` arm narrows a constant's `Array` type to
+# `Array[T]` when the initializer is a homogeneous-typed array literal (`const X := [0, 1]`
+# -> `Array[int]`). Mirrors Godot's `make_array_from_constant` typed-array projection
+# for constants.
+# (2) `reduce_subscript`'s Index branch now reads `container_element_types[0]` when the
+# base is a typed `Array[T]` and stamps the subscript node with the element type (with
+# `is_constant` / `is_meta_type` cleared since a subscript load is always an instance
+# value). Drives the type-test check downstream (`const base := [0]; base[0] is String`
+# fails because `base[0]` is `int`, not `String`). Lifts errors/constant_subscript_type.gd.
+# Reaches 289/300 = 0.9633.
+#
+# WP-Q22: narrow UNSAFE_METHOD_ACCESS for `param.method()` on untyped parameters.
+# `reduce_call`'s "method-not-found" fall-through now emits UNSAFE_METHOD_ACCESS when:
+#   - the call is a subscript-attribute access on an identifier base
+#   - the base type is a soft `Variant` (gradual-typing fallback)
+#   - the base identifier resolves to a function parameter declared with **no**
+#     datatype_specifier and **no** `infer_datatype` (the canonical untyped-parameter shape)
+# This is the corpus's `param.free()` case in `auto_inferred_type_dont_error.gd`. The
+# narrow parameter-only gate avoids the broader gradual-typing surface that would
+# false-positive every variant-base call. Lifts features/auto_inferred_type_dont_error.gd.
+# Reaches 288/300 = 0.9600.
+#
+# WP-Q21: @export* annotation argument constancy check.
+# `emit_variable_annotation_warnings` now walks each `@export*` annotation's arguments and
+# emits `Argument N of annotation "X" isn't a constant expression.` when any arg
+# references a non-constant local (via `lookup_local`) OR a non-constant class member
+# (Variable / Signal / Function via `class_member`). Mirrors Godot's annotation
+# `apply()` callback that validates arg constancy at parse time. Lifts
+# errors/annotation_non_constant_parameter.gd. Reaches 287/300 = 0.9567.
+#
+# WP-Q20: local-constant non-constant-init detection via identifier walk.
+# `resolve_constant_local` now walks the init expression tree (`init_references_nonconstant_local`)
+# looking for identifiers that resolve to a local Variable / Parameter / ForVariable /
+# PatternBind via `lookup_local`. Any hit means the init isn't a constant expression, so
+# emit Godot's `Assigned value for constant "X" isn't a constant expression.`
+# (analyzer.cpp:2118-2123). The walk handles binary / unary / ternary / subscript / array /
+# dictionary expression shapes — calls and casts are left constant-safe because the call
+# dispatcher emits its own diagnostics on non-constant call paths. This narrow gate avoids
+# the broader fold-table check that false-positives on preload / Color.RED / native enum
+# values whose folds gdls's reducer can't yet stamp faithfully. Lifts
+# errors/invalid_constant.gd. Reaches 286/300 = 0.9533.
+#
+# WP-Q18: lambda capture access + CONFUSABLE_CAPTURE_REASSIGNMENT.
+# (1) `pending_lambda_bodies` now snapshots the outer `suite_stack` at queue time and
+# `drain_pending_lambda_bodies` restores it before resolving the lambda body, so identifier
+# lookups inside the lambda find captured outer locals instead of falling through to
+# `Identifier "X" not declared in the current scope.`.
+# (2) `reduce_assignment` emits CONFUSABLE_CAPTURE_REASSIGNMENT (analyzer.cpp:2868-2902)
+# when the assignment's LHS is either a plain identifier OR a subscript-attribute on a
+# value-type identifier (`vector.x = ...` where vector is Vector2i; container types like
+# Array/Dictionary stay silent because their attribute mutation propagates through the
+# captured reference). The local is identified as "captured" when its source position lies
+# outside the current lambda's body span and isn't a lambda parameter.
+# Lifts warnings/confusable_capture_reassignment.gd. Reaches 285/300 = 0.9500.
+#
+# WP-Q17: ternary mixed-source result becomes Undetected.
+# The TernaryOp dispatcher now stamps the result with `TypeSource::Undetected` when both
+# branches share the same kind/builtin-type but differing type_sources (hard vs soft). The
+# downstream `:=` infer check at `resolve_assignable` sees `has_no_type=true` and emits
+# `Cannot infer the type of "X" variable because the value doesn't have a set type.`. Lifts
+# errors/ternary_weak_infer.gd. Reaches 284/300 = 0.9467.
+#
+# WP-Q15: floor/ceil/round per-utility arg validation + trimmed_api utility entries.
+# Added `floor` / `ceil` / `round` to the trimmed Variant utility table so they go through
+# the utility-dispatch arm, plus a per-validator that rejects non-numeric / non-Vector args
+# with Godot's verbatim "Argument "x" must be ..." template. Lifts
+# errors/utility_function_wrong_arg.gd. Reaches 283/300 = 0.9433.
+#
+# WP-Q14: `len()` per-utility-function arg validation.
+# `reduce_call`'s utility-dispatch arm gains a narrow validator for `len()`: when the
+# single argument's hard type isn't String / StringName / Array / Dictionary / PackedXxx,
+# emit Godot's verbatim `Invalid argument for "len()" function: Value of type 'X' can't
+# provide a length.`. The broader per-utility validator table (Godot's
+# `gdscript_utility_functions.cpp::validate_arg` callbacks for floor / round / abs / etc.)
+# stays deferred. Lifts errors/gd_utility_function_wrong_arg.gd. Reaches 282/300 = 0.9400.
+#
+# WP-Q13: builtin-constant typing + Color in trimmed_api.
+# `reduce_identifier_from_base`'s builtin-meta constant arm (`Color.RED`, `Vector2.ZERO`, ...)
+# now types the result as the parent builtin (every builtin's named-constant table holds
+# values of that same builtin) instead of degrading to Variant. A placeholder
+# `FoldedValue::Nil` is stamped to signal `is_reduced` so downstream callers
+# (`update_const_expression_builtin_type` at the assignment-with-specified-type check) emit
+# the `Cannot assign a value of type X as Y.` const-companion. Trimmed API gains a minimal
+# `Color` builtin (r/g/b/a members + RED/GREEN/BLUE/WHITE/BLACK constants). Lifts
+# errors/assymetric_assignment_bad.gd. Reaches 281/300 = 0.9367.
+#
+# WP-Q11: UNSAFE_VOID_RETURN warning in resolve_return.
+# When the enclosing function returns void and the return value is a call whose return type
+# isn't statically void or hard-Variant (i.e. a soft Variant / Undetected return from an
+# untyped function the analyzer can't fully type), emit UNSAFE_VOID_RETURN with
+# Godot's [enclosing-method-name, called-function-name] symbols. Lifts
+# features/allow_void_function_to_return_void.gd. Reaches 280/300 = 0.9333.
+#
+# WP-Q10: inner-class body recursion + cross-file abstract construction.
+# (1) `resolve_class_body` now descends into `Member::Class` inner classes (analyzer.cpp:1408-
+# 1410), so `apply_abstract_annotations` fires on inline `@abstract class Inner: pass` -
+# without this the in-file class's @abstract was dropped and `Inner.new()` didn't error.
+# (2) `reduce_call`'s constructor arm gains a `DtKind::Script` branch: when the base resolves
+# to a cross-file script and `CrossFileQuery::is_file_abstract` reports the file as abstract,
+# emit `Cannot construct abstract class "X".` with X read off the callee's base identifier
+# (e.g. `const AbstractScript = preload(...)` -> "AbstractScript").
+# Lifts errors/construct_abstract_class.gd. Reaches 279/300 = 0.9300.
+#
+# WP-Q9: SHADOWED_GLOBAL_IDENTIFIER infrastructure (no fixture lift).
+# `warn_local_shadowing` emits SHADOWED_GLOBAL_IDENTIFIER (analyzer.cpp:6101-6132's
+# global-identifier branch) for built-in functions / types, native classes, and same-file
+# class_names. Cross-file class_name file rendering needs `Index::path` threaded through
+# `CrossFileQuery` (deferred). Trimmed API gains `is_same` / `sqrt` so the corpus's
+# collision shapes resolve.
+#
+# WP-Q8: cyclic_ref for unnamed-enum values via RESOLVING sentinel + name rendering.
+# `resolve_class_member`'s `Member::EnumValue` arm now stamps `RESOLVING` on the
+# EnumValue identifier before reducing `custom_value`, so cross-enum custom-value cycles
+# (e.g. `enum { EV1 = EV2 } / enum { EV2 = EV1 }`) re-entering via the reducer hit the
+# top-level cyclic_ref guard in `resolve_class_member`. `decl_identifier_name` also
+# recognises a raw `NodeKind::Identifier` directly (Godot's `member.get_node()` for
+# EnumValue is its identifier node, not a wrapping `VariableNode` / etc.), so the cycle
+# diagnostic renders the enum-value name instead of an empty string.
+# Lifts errors/cyclic_ref_enum_value.gd. Reaches 278/300 = 0.9267.
+#
+# WP-Q7: Callable builtin in trimmed_api — `get_method` returns StringName, etc.
+# This types `await callable.get_method()` as StringName (non-coroutine, non-Variant,
+# non-Signal) so REDUNDANT_AWAIT fires at line 53 of warnings/redundant_await.gd.
+# Reaches 277/300 = 0.9233.
+#
+# WP-Q6: trimmed-API fixture expansion + builtin meta pseudo-type lifts.
+# Added Vector3 builtin class (with ZERO/ONE constants + Axis enum) and the global
+# `Variant.Operator` enum to `gd_types/tests/fixtures/trimmed_api.json` so the existing
+# pseudo-type emission paths in `reduce_subscript_attribute` fire for
+# `Vector3.Axis` / `Variant.Operator`. Lifts errors/enum_builtin_access.gd and
+# errors/enum_global_access.gd. Reaches 276/300 = 0.9200.
+#
+# WP-Q5: head-segment resolution gaps + return-narrowing — infrastructure changes
+# (no fixture lifts, but reduces silent-degrade churn).
+# (1) `resolve_datatype` head segment now matches `@GlobalScope` enums via
+# `NativeDb::global_enum` (analyzer.cpp:806-815) — currently inert (no fixture exercises it
+# beyond what already passes) but unblocks future not_found_type expansion once the trimmed
+# API gains the missing global enums.
+# (2) `datatype_in_scope` gains a `Member::Constant` arm (analyzer.cpp:874-882): when a
+# class-level constant evaluates to a Script/Class meta type (preload-derived class), it's
+# usable as a type-annotation head — inert today (the corpus's preload-derived-class chains
+# need a richer interface walk) but prepares the ground.
+# (3) `resolve_return` emits NARROWING_CONVERSION when the function's return type is `int`
+# and the return value is `float`. Anchors at the return value so per-line
+# `@warning_ignore("narrowing_conversion")` targets it.
+# Reaches 274/300 (no delta from WP-Q4).
+#
+# WP-Q4: inner-enum lookup + nested-type miss diagnostic, 1 lift.
+# `resolve_datatype`'s nested-segment walk under an in-file `Class` base now matches an
+# inner-Enum member (analyzer.cpp:921's `Member::ENUM` arm) as well as the previously-
+# handled inner Class — only valid as the last segment (Godot's enum-as-leaf rule).
+# When neither matches, the walk emits `Could not find type "X" under base "Y".`
+# (analyzer.cpp:933) with the base class's identifier rendered via
+# `class_identifier_name_or_default`. Cross-file Script parents stay on the silent-degrade
+# path (their `interface()` walk handles them). Lifts errors/prints_base_type_not_found.gd.
+# Reaches 274/300 = 0.9133.
+#
+# WP-Q3: 2 small lifts.
+# (1) `resolve_class_member`'s `Member::EnumValue` arm stamps a placeholder
+# `FoldedValue::Int(0)` for unnamed-enum value identifiers so the assignment-with-specified-
+# type compat walk's const-companion (`update_const_expression_builtin_type`'s
+# `Cannot assign a value of type X as Y.` template) fires for `var x: NamedEnum = ENUM_VAL`
+# where ENUM_VAL comes from an unnamed enum. The exact value isn't used by the compat check;
+# only `is_reduced` gates the call. Full `parent_enum->values[index-1].value + 1` chain
+# (analyzer.cpp:1174-1175) needs back-pointer tracking that gdls's AST doesn't carry.
+# (2) `resolve_for`'s element-type table gains a `DtKind::Class` arm: when iterating an
+# Object instance whose class has `_iter_get(p_iter) -> T`, the iterator variable is typed
+# as T (analyzer.cpp:2333-2345). Cross-file `Script` and Native arms join later slices.
+# Lifts errors/enum_unnamed_assign_to_named.gd, errors/for_loop_on_hard_iterator.gd.
+# Reaches 273/300 = 0.9100.
+#
+# WP-Q2: small Godot-faithful slices, 5 lifts.
+# (1) `resolve_enum_type`'s custom-value `None` (fold-failed) branch now emits
+# `Enum values must be constant.` (analyzer.cpp:1165-1166) when the reduction itself
+# emitted an error — gated on `ctx.diagnostic_count()` delta so out-of-order siblings within
+# the same enum block (e.g. `enum { V1 = 1, V2 = V1 - 1 }` — gdls's reducer doesn't walk
+# forward refs inside one enum block) don't false-positive. Lifts `errors/cyclic_ref_enum.gd`
+# (now gets the companion `Enum values must be constant.` after `Could not resolve member`).
+# (2) `reduce_identifier`'s function-parameter lookup gains a position-based forward-reference
+# gate (analyzer.cpp:4471-4475): a parameter declared *after* the identifier's byte position
+# (inside an earlier parameter's default value) doesn't resolve as the parameter; falls
+# through to the not-declared error. Lifts
+# `errors/params_default_forward_reference.gd` (now emits the `defc` not-declared at line 8).
+# (3) `reduce_call`'s super-call fall-through arm distinguishes the `_init` virtual-constructor
+# case (function name `_init` on a `DtKind::Native` base): emits `Cannot call the parent
+# class' virtual function "_init()" because it hasn't been defined.` instead of the generic
+# "not found in base" template. Lifts `errors/virtual_super_not_implemented.gd`.
+# (4) `reduce_get_node` now stamps `DtKind::Variant` with `TypeSource::Undetected` (rather
+# than the permissive `Inferred` Variant) when the get_node context errors fired — so the
+# `:=` infer path's `Cannot infer the type of "X" variable because the value doesn't have a
+# set type.` companion fires alongside the static-function / non-Node-class error. Lifts
+# `errors/get_node_shorthand_within_non_node.gd`.
+# (5) `reduce_call`'s native-abstract construction arm now emits the companion
+# `Name "new" is a Callable. You can call it with "new.call()" instead.` per call site
+# alongside the abstract-class error (Godot falls through to identifier resolution after
+# the abstract error, which finds `new` as the Object class's built-in Callable). Lifts
+# `errors/abstract_class_instantiate.gd`.
+# Reaches 271/300 = 0.9033.
+#
+# WP-Q36: faithful port of `resolve_function_body`'s body-presence check
+# (analyzer.cpp:1994-2008). Godot's logic routes on
+# `p_function->body->statements.is_empty()`: empty body emits the lambda vs. function vs.
+# `@abstract` no-body trio; non-empty body emits `An abstract function cannot have a body.`
+# when abstract. gdls previously matched on `body=None`/`Some` (a defensive shape) and
+# missed the lambda-must-have-body and function-must-have-body emissions for empty Suite
+# bodies that the parser actually produces (`parse_function` always allocates a body Suite,
+# even when the source has no colon). `errors/abstract_methods.gd` now emits all 12
+# expected diagnostics.
+#
+# WP-Q37: split `apply_abstract_annotations` into class-level (fires in inheritance pass —
+# analyzer.cpp:624-627) and function-level (fires in interface pass —
+# analyzer.cpp:1206-1209). Add per-statement drain of `pending_lambda_bodies` in
+# `resolve_suite` (analyzer.cpp:2068). After both changes, `errors/abstract_methods.gd`
+# emits 11 of 12 lines in Godot's order (only the lambda at line 41 stays at the end
+# instead of moving to position 5). Godot's placement of line 41 immediately after
+# line 40 is unreachable here: lambda 41 is queued during `holding_some_invalid_lambda`'s
+# body resolution, which our body pass reaches AFTER all inner classes (Test1–Test4, A,
+# DuplicateAbstract) in source order — and Godot's `resolve_class_body` member loop
+# (analyzer.cpp:1408) also iterates source-order, so Godot must achieve the line-41
+# placement via a parser- or analyzer-level mechanism (lambda body-fusing on the
+# unterminated-default-arg parse, or some else) we haven't isolated. Floor unchanged.
+#
+# WP-R1: defer inner-class body resolution out of `resolve_class_body`'s member loop.
+# Godot drives this via `resolve_class_body_recursive` (analyzer.cpp:1573):
+# `resolve_class_body(p_class)` completes the current class's OWN function bodies +
+# `resolve_pending_lambda_bodies` (1527-1530) + abstract-inheritance check (1532-1568)
+# *before* the recursive caller descends into inner classes. gdls's `Member::Class` arm
+# in the body loop was resolving inner-class bodies inline (in source order), which
+# injected each inner class's emissions between the root's function-body work and its
+# lambda drain — putting line-41's `A lambda function must have a ":" followed by a
+# body.` at position 12 instead of 5. Two coupled changes:
+#   (1) Drop the inline `resolve_class_body(inner_id)` call from the root's member loop;
+#       the outer `resolve_class_body_recursive` already iterates `inner_classes(...)`
+#       afterwards (the per-class idempotence guard at `resolved_bodies` is what was
+#       short-circuiting that pass).
+#   (2) Drain `pending_lambda_bodies` FIFO (`mem::take` + iterate) instead of LIFO
+#       (`Vec::pop`), so multiple pending lambdas (here lambda 40 + lambda 41) emit
+#       in insertion order — matching Godot's `List<>` + `push_back` queue at
+#       analyzer.cpp:4684 / 6536-6537.
+# Lifts `errors/abstract_methods.gd`. Reaches 298/300 = 0.9933.
+#
+# WP-R2: cross-file mutual-member cycle detection. Godot resolves cross-file
+# member access by recursively calling into the depended file's analyzer
+# (analyzer.cpp:1001-1024), using a per-member `DataType::RESOLVING` flag (:984-991)
+# to break cycles. When `cyclic_ref_external.gd`'s `var v = A.v` reduces `A.v`, A's
+# analyzer hops into B's analyzer for B's `v`; B's `v = B.v` hops back into A's;
+# A sees its own `v` is still RESOLVING and pushes `Could not resolve member "v":
+# Cyclic reference.` onto B's parser; A's outer hop sees B's parser error count
+# grew and emits `Could not resolve external class member "v".`; the subsequent
+# `reduce_identifier_from_base` fails the lookup and emits `Cannot find member "v"
+# in base "TestCyclicRefExternalA".` (analyzer.cpp:4095/4097/4139/4141).
+# gdls doesn't run cross-file analyzers eagerly; instead three coupled changes
+# detect the cycle structurally:
+#   (1) `CrossFileQuery::member_initializer_xrefs(file, member)` exposes the
+#       `(target_file, target_member)` pairs that `member`'s initializer reads
+#       via a `preload`-constant chain. Default impl returns empty; the
+#       conformance corpus query (`CorpusQuery`) re-parses the depended file
+#       and walks its AST for `CONST.NAME` patterns where `CONST` is bound to
+#       a `preload(...)` constant in the same class.
+#   (2) `AnalysisContext.current_resolving_member: Option<String>` tracks the
+#       name of the class member whose initializer is currently being reduced
+#       — the name-side analog of Godot's per-member RESOLVING flag, so
+#       cross-file consumers can check the cycle by `(ctx.file, name)` without
+#       owning the depended file's NodeId. Set by `resolve_class_member`'s
+#       Variable/Constant arms around `resolve_assignable`.
+#   (3) `reduce_identifier_from_base`'s Script-meta branch consults `xfile.
+#       member_initializer_xrefs(B, name)` and emits both diagnostics when any
+#       xref matches `(ctx.file, ctx.current_resolving_member)`. The identifier
+#       is then typed as Variant — the unresolved-external degrade.
+# Lifts `errors/cyclic_ref_external.gd`. Reaches 299/300 = 0.9967.
+#
+# WP-R3: synthetic post-EOF line for Godot's null-source `push_error` path.
+# Godot's `resolve_match_pattern` walks the pattern expression through Subscript
+# nodes: an Attribute access continues the walk, an Index subscript sets
+# `expr = nullptr` (analyzer.cpp:2459-2460), and the final `push_error(message, expr)`
+# at :2466 then takes the null-source branch in `GDScriptParser::push_error`
+# (gdscript_parser.cpp:241-244): the diagnostic inherits `previous.start_line` /
+# `previous.end_line`. At analyzer-pass time those are the parser's `previous` token
+# at end-of-parse — which Godot's tokenizer has advanced past EOF (via
+# `_advance`'s `newline(true)` at gdscript_tokenizer.cpp:327-332). For a 5-line
+# file like `errors/match_with_subscript.gd`, that's line 7.
+# gdls anchors diagnostics on AST nodes, not parser-token state. Three coupled
+# changes mirror Godot's behavior on the one fixture that needs it:
+#   (1) `gd_syntax::ParseTree.eof_line: u32` — the lexer's `line` counter at
+#       end-of-parse (the EOF token's `loc.end.line`). The lexer already does
+#       Godot's EOF `newline(true)` bump (lexer.rs:213-216), so this number
+#       comes out the same as Godot's `previous.end_line` at end-of-parse.
+#       Set in `Parser::into_parts` from `current.loc.end.line` (the EOF token).
+#   (2) `gd_analyze::Diagnostic.line: Option<u32>` + `DiagnosticSink::
+#       push_error_with_line` + `AnalysisContext::push_error_at_line` — an
+#       explicit 1-based line override that diagnostic renderers prefer over
+#       byte-derived. The byte span still anchors LSP rendering.
+#   (3) `resolve_match_pattern` tracks whether the inner walker was nulled by
+#       an Index subscript (mirroring Godot's `expr = nullptr` arm); when so,
+#       it emits via `push_error_at_line(tree.eof_line)` rather than the
+#       byte-derived line, faithfully reproducing Godot's null-source path.
+# Conformance renderer also threads `d.line` through `render(...)`.
+# Lifts `errors/match_with_subscript.gd`. Reaches 300/300 = 1.0000.

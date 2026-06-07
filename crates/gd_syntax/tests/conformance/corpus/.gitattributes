@@ -1,0 +1,6 @@
+# Vendored Godot conformance corpus — must stay byte-identical to the vendored Godot source.
+# The corpus is LF-only. On a Windows checkout with core.autocrlf=true, Git would
+# rewrite these to CRLF, which shifts every byte offset and breaks the conformance
+# harness's span/message matching. Pin LF so that can never happen.
+*.gd  text eol=lf
+*.out text eol=lf

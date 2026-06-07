@@ -1,0 +1,6 @@
+# cargo-fuzz build + run artifacts (the corpus is seeded fresh from the conformance .gd at job time).
+/target
+/corpus
+/artifacts
+/coverage
+Cargo.lock

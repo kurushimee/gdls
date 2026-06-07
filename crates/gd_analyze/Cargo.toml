@@ -1,0 +1,28 @@
+[package]
+name = "gd_analyze"
+description = "The GDScript analyzer: staged name resolution, type checking, the warning set, and strict mode."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+# WP-RD1: exposes `AnalysisResult::new_for_test` across the crate boundary so dependent crates'
+# integration tests (e.g. `gd_server::xfile`, `gd_server::tests::memory_pressure`) can build
+# `AnalysisResult` literals after its `bindings` / `member_xrefs` fields went private. A bare
+# `#[cfg(test)]` would only be visible to `gd_analyze`'s own unit tests. Carries no runtime code
+# in production builds (the constructor is the only thing it gates).
+test-support = []
+
+[dependencies]
+gd_syntax.workspace = true
+gd_types.workspace = true
+gd_project.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+camino = "1.2.2"
+# `which`: M5 WP-D1 — PATH lookup for the local-only differential harness's `godot` discovery
+# (`tests/differential.rs`). Pinned in the workspace `[dependencies]` table per the workspace
+# policy in the root `Cargo.toml` (one version per shared external dep, lives in exactly one place).
+which.workspace = true

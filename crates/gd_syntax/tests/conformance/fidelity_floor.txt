@@ -1,0 +1,8 @@
+# Minimum parse-phase fidelity (matched / eligible) the conformance harness will accept.
+# Ratchets UP only — raise it in the same PR that improves the parser. The per-file
+# known_failures.txt is the primary regression net; this is the milestone-facing number.
+#
+# Trajectory:
+#   WP-C (M1 parser port)            181/186 = 0.9731   floor = 0.972
+#   M5 Phase E (WP-F1..F5 close-out) 186/186 = 1.0000   floor = 1.0   ← ratchet now floored to full parity
+1.0

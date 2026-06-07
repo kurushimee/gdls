@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<class name="GDExtNode" inherits="Node2D" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="../class.xsd">
+	<brief_description>
+		A synthetic GDExtension node, for exercising the doc-XML reader.
+	</brief_description>
+	<description>
+	</description>
+	<tutorials>
+	</tutorials>
+	<methods>
+		<method name="get_peers" qualifiers="const">
+			<return type="GDExtNode[]" />
+			<description>
+				Returns the connected peers as a typed array.
+			</description>
+		</method>
+		<method name="set_mode">
+			<param index="0" name="mode" type="int" enum="GDExtNode.Mode" />
+			<description>
+			</description>
+		</method>
+		<method name="flush" qualifiers="const vararg">
+			<return type="void" />
+			<description>
+			</description>
+		</method>
+	</methods>
+	<members>
+		<member name="mode" type="int" setter="set_mode" getter="get_mode" enum="GDExtNode.Mode" default="0">
+			The current mode.
+		</member>
+		<member name="layers" type="int" setter="set_layers" getter="get_layers" enum="GDExtNode.Layers" is_bitfield="true" default="0">
+			A layer bitmask.
+		</member>
+	</members>
+	<signals>
+		<signal name="updated">
+			<param index="0" name="who" type="GDExtNode" />
+			<description>
+			</description>
+		</signal>
+	</signals>
+	<constants>
+		<constant name="MODE_IDLE" value="0" enum="Mode">
+			Idle.
+		</constant>
+		<constant name="MODE_BUSY" value="1" enum="Mode">
+			Busy.
+		</constant>
+		<constant name="MAX_PEERS" value="32">
+			Maximum number of peers.
+		</constant>
+	</constants>
+</class>

@@ -1,0 +1,11 @@
+[package]
+name = "gd_syntax"
+description = "GDScript 4.6.3 tokenizer, parser, and AST — a faithful port of Godot's frontend (no engine knowledge)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+unicode-ident = "1.0.24"
+unicode-security.workspace = true

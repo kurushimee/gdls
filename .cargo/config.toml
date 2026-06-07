@@ -1,0 +1,6 @@
+# Workspace-local cargo configuration.
+# Build profiles live in the root Cargo.toml ([profile.*]); this file holds command aliases only.
+
+[alias]
+# `cargo lint` — the CI lint gate, runnable locally.
+lint = "clippy --workspace --all-targets -- -D warnings"

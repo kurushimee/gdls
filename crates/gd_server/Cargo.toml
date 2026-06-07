@@ -1,0 +1,65 @@
+[package]
+name = "gd_server"
+description = "The gdls LSP server: lifecycle, VFS, position mapping, query services, and the diagnostics engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gdls"
+path = "src/main.rs"
+
+[dependencies]
+gd_syntax.workspace = true
+gd_types.workspace = true
+gd_analyze.workspace = true
+gd_project.workspace = true
+lsp-server = "0.7.9"
+lsp-types = "0.97.0"
+ropey = "1.6.1"
+camino = "1.2.2"
+serde_json = "1.0.149"
+crossbeam-channel = "0.5.15"
+anyhow = "1.0.102"
+log = "0.4.29"
+serde = { version = "1.0.228", features = ["derive"] }
+# M4: freshness watcher + nav handlers.
+notify.workspace = true
+notify-debouncer-full.workspace = true
+nucleo-matcher.workspace = true
+walkdir.workspace = true
+rustc-hash.workspace = true
+# M5 Phase B (WP-O1 / WP-O2 / WP-O5). `tracing` is the structured-span + event API replacing the
+# log/env_logger stack on stderr; `tracing-subscriber` is the stderr sink + `EnvFilter` (`GDLS_LOG`)
+# + the hierarchical-profiler Layer slot for WP-O5's `GDLS_TRACE`; `tracing-log` is the bridge that
+# keeps the rest of the workspace's `log::*` callsites emitting through the tracing pipeline (zero
+# touches in non-server crates); `sysinfo` powers the peak-RSS sampler at WP-O2 (Windows reads
+# `WorkingSetSize`, Linux `/proc/self/statm`, macOS Mach VM API — all uniform behind sysinfo).
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-log.workspace = true
+sysinfo.workspace = true
+# M5 Phase D (WP-H2). Bounded `parse_cache` / `analysis_cache`. WP-H1's soft-pressure ladder
+# reaches for `pop_lru()` to bulk-evict the oldest half.
+lru.workspace = true
+# M5 Phase F. `dunce` (WP-RD9) — junction/8.3/symlink-resolving canonicalization at `CanonicalKey`
+# construction so a file reached through a junction or a differently-cased path keys to one cache
+# entry. `same-file` (WP-RD11) — portable file-identity comparison for the watcher's root-loss
+# re-arming after a delete+recreate lands a different directory at the same path.
+dunce.workspace = true
+same-file.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# WP-RD1: `test-support` exposes `gd_analyze::AnalysisResult::new_for_test` so the integration
+# tests here (xfile, memory_pressure) can construct `AnalysisResult` literals now that its
+# `bindings` / `member_xrefs` fields are private. Dev-dep-only: the feature is never enabled in a
+# production `gdls` build.
+gd_analyze = { workspace = true, features = ["test-support"] }
+# WP-RD3: `tests/watcher_event_loop.rs` constructs synthetic `DebounceEventResult`s (debounced
+# events, `need_rescan` flags, fatal `notify` errors) and the injected event channel to drive the
+# watcher dark branches through `serve_with_injected_watcher` without real OS events.
+notify.workspace = true
+notify-debouncer-full.workspace = true
+crossbeam-channel = "0.5.15"

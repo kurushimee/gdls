@@ -1,0 +1,413 @@
+# Minimum analyze-phase fidelity (matched / eligible) the conformance harness will accept.
+# Ratchets UP only — raise it in the same PR that advances the analyzer. The per-file
+# analyze_known_failures.txt is the primary regression net; this is the milestone-facing number.
+#
+# === Differential-oracle witness (docs/06 §2 manual milestone pass) ===
+# Differential oracle: PASS against a large real-world GDScript project (manual run), godot
+#   binary on PATH, date 2026-05-27.
+# Re-run on each milestone close via:
+#   GDLS_GODOT_BINARY=<path> GDLS_SAMPLE_CORPUS=<dir> cargo test -p gd_analyze --test differential
+# Update this header in the same PR that closes the milestone. Until the CI job described in
+# docs/06 §2 lands (planned with M5 hardening), this header is the M3 exit-criterion witness
+# for "differential oracle agrees on a project sample" (docs/07 row M3).
+#
+# === Ratchet trajectory ===
+# WP-C reached 0.34; WP-D (interface + conflict checks) reaches 108/300 = 0.36;
+# WP-E1 (reducer + leaf reducers + enum-custom-value wire-up) reaches 110/300 = 0.3667;
+# WP-E3a (Bool-widening fix + constant-fold error emission) reaches 113/300 = 0.3767;
+# WP-E3b (dict duplicate-key detection) reaches 117/300 = 0.39;
+# WP-E3c (reduce_identifier local/param/member lookup + is_type_compatible + variant_can_convert
+# + reduce_cast validity check) reaches 119/300 = 0.3967;
+# WP-E3d (cycle detection via member-resolution trigger + Could-not-resolve-type / Cannot-infer
+# errors in resolve_assignable) reaches 123/300 = 0.41;
+# WP-E3e (reduce_subscript attribute path + reduce_identifier_from_base CLASS/SCRIPT/NATIVE/BUILTIN/
+# ENUM branches + reduce_type_test + resolve_for list-type matrix + EnumValue identifier typing
+# + UNSAFE_PROPERTY_ACCESS dynamic-access permissive path) reaches 132/300 = 0.44;
+# WP-E3f (reduce_call: builtin constructors / utilities / super / subscript-method dispatch with
+# `Function not found` / `Static function not found` / `Name X called as function but is Y` /
+# `Cannot get return value ... void` errors + arg-count validation for in-file functions +
+# resolve_suite is_root=true default for if/else/while/for/match-branch blocks) reaches 138/300 = 0.46;
+# WP-E3g (reduce_assignment with `Cannot assign a new value to a constant.` /
+# `Cannot assign a new value to a read-only property.` / `Value of type X cannot be assigned to
+# variable of type Y.` / `Invalid operands X and Y for assignment operator.` errors +
+# update_const_expression_builtin_type emitting `Cannot assign a value of type X as Y` +
+# native-property is_read_only from setter=None) reaches 145/300 = 0.48;
+# WP-E3h (get_operation_type for hard-typed binary ops, with a verbatim port of variant_op.cpp's
+# OP_ADD / SUBTRACT / MULTIPLY / DIVIDE / MODULE / POWER / bitwise / comparison / IN registration
+# table emitting `Invalid operands "X" and "Y" for "OP" operator.` on unknown pairs) reaches
+# 147/300 = 0.49;
+# WP-E3i (typed-collection element-type narrowing — update_array_literal_element_type /
+# update_dictionary_literal_element_type emitting `Cannot have an element of type "X" in an array
+# of type "Array[Y]".` / `Cannot have a key of type "X" in a dictionary of type "Dictionary[K,V]".`
+# + resolve_datatype now parses `Array[T]` / `Dictionary[K, V]` containers + Display renders them
+# in error messages + variant_can_convert_strict for the analyzer's strict compat path) reaches
+# 153/300 = 0.51;
+# WP-E3j (reduce_call typed-arg narrowing — update_array/dict_literal_element_type called when an
+# array/dict literal is passed to a typed-collection parameter — plus validate_call_arg's per-arg
+# compatibility check emitting `Invalid argument for "X()" function: argument N should be "T" but
+# is "U".` on hard-type mismatches, with the const-arg `Cannot pass a value of type X as Y.`
+# companion via update_const_expression_builtin_type usage="pass") reaches 155/300 = 0.5166;
+# WP-F1+F2 (push_warning plumbing + per-node `@warning_ignore` filter on AnalysisContext, plus the
+# UNUSED_PRIVATE_CLASS_VARIABLE / UNUSED_SIGNAL warnings emitted from resolve_class_body via a
+# name-set sweep — referenced-names collected from identifier refs + Godot's implicit-use call
+# sites at analyzer.cpp:3411-3425 (`Signal(self, "name")`) and analyzer.cpp:3680-3692
+# (`emit_signal` / `connect` / `disconnect`)) reaches 157/300 = 0.5233;
+# WP-F3 (INFERENCE_ON_VARIANT error-by-default warning emitted from resolve_assignable when `:=`
+# resolves to a hard Variant initializer, with an error-count gate to suppress on cyclic paths,
+# a parameter→function ignore-context routing for `@warning_ignore` on the enclosing func, and
+# the region-based `@warning_ignore_start("CODE") … @warning_ignore_restore("CODE")` filter
+# wired through AnalysisContext — plus the conformance harness's warning policy now demotes
+# every code to Warn except UNTYPED_DECLARATION/INFERRED_DECLARATION to mirror Godot's
+# test-runner config at gdscript_test_runner.cpp:150-159) reaches 158/300 = 0.5267;
+# WP-F4 (UNSAFE_CAST warning emitted from reduce_cast when the operand is Variant/soft and the
+# target is non-Variant, with a docs/02 §11 suppression for `$Node`/`%Unique`/`get_node()`
+# operands that gdls's permissive deferred-node policy types as Variant — Godot sees them as
+# Node and doesn't fire — plus a per-line @warning_ignore("CODE") filter populated from every
+# node's annotations so the corpus's `@warning_ignore("unsafe_cast")` on a print statement
+# whose nested expression is the cast suppresses correctly) reaches 159/300 = 0.5300;
+# WP-F5 (UNSAFE_CALL_ARGUMENT in validate_call_arg's two arms — Variant/soft arg vs hard
+# non-Variant param, and supertype-acceptable-but-unsafe — with Godot's to_string_strict()
+# mirror so soft types render as "Variant"; 10/14 corpus lines match, constructor 4 deferred)
+# reaches 159/300 = 0.5300;
+# WP-F6 (ONREADY_WITH_EXPORT + GET_NODE_DEFAULT_WITHOUT_ONREADY per-variable annotation sweep
+# in resolve_class_body, with the offending-syntax classifier `$`/`%`/`get_node()` matching
+# Godot's expression-shape walk at analyzer.cpp:1073-1102 incl. Cast unwrap and self.get_node
+# attribute callee) reaches 161/300 = 0.5366;
+# WP-F7 (NATIVE_METHOD_OVERRIDE error-by-default warning emitted from resolve_function_signature
+# — walks the enclosing class's native-ancestor chain, then walks each native class's inherits
+# chain looking for the **defining** class of the same-named method, matching Godot's
+# `native_base` semantics where the reported class is where the method actually exists,
+# e.g. `Object.get()` rather than `RefCounted`) reaches 162/300 = 0.54;
+# WP-I (M3 close-out): differential oracle infrastructure (env-gated, see
+# `crates/gd_analyze/tests/differential.rs`) plus four targeted analyzer slices for the final
+# ratchet — void-return validation (`A void function cannot return a value.`), extends-target
+# resolution (Constant/Variable/etc. with Godot's per-kind error messages), in-file function-
+# override signature compat (return-type covariance + parameter contravariance + min/max arg
+# count overlap), and the self-call static-context check
+# (`Cannot call non-static function X from the static function Y.`) — reaches 175/300 = 0.5833.
+# WP-J (M3 close-out): cross-enum-type compatibility via four
+# coupled fixes — (1) `make_class_enum_type` uses the class's `fqcn` (head=script_path,
+# inner=`<outer>::<name>`) so the enum's `native_type` and Display rendering match Godot's
+# `<file.gd>.<EnumName>` / `<file.gd>::Inner.<EnumName>` shape (analyzer.cpp:147, :153);
+# (2) `datatype_in_scope` matches `Member::Enum` (analyzer.cpp:869-872) so `var x: MyEnum`
+# annotations resolve to the enum's meta type instead of Variant; (3) `lookup_class_member`
+# walks the full `scope_classes` chain (current + bases + outer) and matches the class's own
+# `class_name` identifier (analyzer.cpp:4161-4167), so qualified `OuterClass.Inner.MyEnum.V1`
+# paths resolve in-file without `CrossFileQuery::global_class_file` (inert under
+# `NoCrossFile`); (4) `reduce_subscript_attribute` propagates the attribute's folded value onto
+# the subscript itself (analyzer.cpp:4861-4862) so `update_const_expression_builtin_type`
+# fires the `Cannot assign a value of type X as Y` companion error alongside the
+# `Value of type X cannot be assigned ...` compatibility check. Reaches 181/300 = 0.6033.
+# WP-K (M3 close-out): static-context variants — three coupled
+# fixes that lift four cases. (1) `reduce_identifier` emits the access counterpart to WP-I's
+# call check — `Cannot access non-static <kind> "<name>" from the static function "<parent>()".`
+# / `... from a static variable initializer.` (analyzer.cpp:4464-4490) — with a
+# `ctx.reducing_callee` guard so the dispatcher's pre-reduce of a Call's identifier callee
+# doesn't double-fire alongside `reduce_call`'s `Cannot call non-static ...` arm (Godot
+# avoids this by calling `reduce_identifier_from_base` from `reduce_call`, not
+# `reduce_identifier`); (2) `resolve_class_member` now sets `ctx.static_context = true` for
+# the duration of a `static var` member's initializer resolution (analyzer.cpp:1407);
+# (3) `emit_variable_annotation_warnings` rejects `@export*` on `static var` with Godot's
+# `Annotation "@export" cannot be applied to a static variable.` error
+# (gdscript_parser.cpp:4648). Lambda variants (`*_in_lambda*` family) need lambda-body
+# resolution (Godot's `pending_body_resolution_lambdas` queue, analyzer.cpp:4684) — deferred
+# until that lands. Reaches 185/300 = 0.6167.
+# WP-L (M3 close-out): engine-singleton checks — two cases lift,
+# plus an in-file `@abstract class` construction error as a correctness improvement that
+# doesn't yet lift cases (cross-file `preload`-of-abstract + native `is_instantiable=false`
+# walking are still missing). (1) `trimmed_api.json` fixture gains a minimal `Time` class +
+# singleton entry so the existing engine-singleton constructor check
+# (`Cannot construct native class "Time" because it is an engine singleton.`,
+# analyzer.cpp:3600) fires for `Time.new()`. (2) `resolve_extends` rejects extends-of-
+# singletons in the native arm with Godot's
+# `Cannot inherit native class "X" because it is an engine singleton.`
+# (analyzer.cpp:521-525). (3) `reduce_call`'s constructor arm checks the in-file
+# `ClassNode::is_abstract` flag for `<InFileClass>.new()` and emits
+# `Cannot construct abstract class "<Name>".` (analyzer.cpp:3605-3607); the cross-file
+# preload arm and the native `is_instantiable=false`/base-walking variants need WP-N5's
+# resolved-interface cache. Reaches 187/300 = 0.6233.
+# WP-M1 (M3 close-out, partial slice of the 25-warning gap): `INT_AS_ENUM_WITHOUT_MATCH`
+# (analyzer.cpp:2744) in `reduce_cast` — when a constant `int` (or `Enum` folded to int) is
+# cast to an `Enum` target whose `enum_values` don't include that value, emit
+# `Cannot cast <N> as Enum "<file.gd.Name>": no enum member has matching value.`.
+# Reaches 189/300 = 0.6300. Larger warning families (REDUNDANT_AWAIT, MISSING_AWAIT,
+# CONFUSABLE_*, UNREACHABLE_CODE, UNUSED_LOCAL_CONSTANT, ASSERT_ALWAYS_*, etc.) and the
+# parser-deferred annotation-apply errors (duplicate_icon/tool, warning_ignore_*) each need
+# their own focused slice and join later in WP-M.
+# WP-M2 (M3 close-out, sibling slice — long-tail errors): match-pattern shape restriction
+# (analyzer.cpp:2456-2467). When `PT_EXPRESSION` patterns don't fold, the only legal shape
+# is `A`, `A.B`, `A.B.C`, …; anything else — `a + 2`, `dict[k]`, `foo()` — fires the
+# `Expression in match pattern must be a constant expression, an identifier, or an
+# attribute access ("A.B").` error. `resolve_match_pattern`'s `PT_EXPRESSION` arm now walks
+# through SUBSCRIPT-Attribute nodes and bails on SUBSCRIPT-Index, mirroring Godot's
+# `expr` re-pointing loop. Reaches 190/300 = 0.6333.
+# WP-N1 (M3 close-out): local-constant-as-type checks (analyzer.cpp:691-722). The head
+# segment of a type-chain may name a local constant — accepted iff its type is a hard
+# meta-type, rejected with Godot's three error templates otherwise
+# (`is not resolved at this point.` / `is not a valid type.` / `Local <kind> "X" cannot be
+# used as a type.`). Variant-degraded constants (e.g. unresolved cross-file preloads) stay
+# silent per the project's "unknown stays dynamic" rule, so the
+# `features/local_const_as_type.gd` heavyweight smoke case keeps passing. Reaches
+# 193/300 = 0.6433.
+# WP-N2 (M3 close-out): `Member "X" is not a function.` (analyzer.cpp:5980-5984). The
+# in-file class lookup in reduce_call now distinguishes "matched a non-function member"
+# from "matched nothing" (new `ClassCallLookup` enum + `lookup_class_function_or_member`)
+# and emits the missing template before the existing `Name "X" called as a function but
+# is a "Y".` pair. Reaches 195/300 = 0.65.
+# WP-N3 (M3 close-out): native-fixture expansion (TileSet + TileShape) + the
+# `Native.Enum` chain arm of `resolve_datatype` (analyzer.cpp:922-934). Two cases lift:
+# `native_type_errors.gd`, `enum_native_bad_value.gd`. Reaches 197/300 = 0.6567.
+# WP-N4 (M3 close-out): compound-assignment compatibility via `get_operation_type` instead
+# of the lenient `variant_can_convert` (LENIENT table at variant.cpp:241 incorrectly
+# allowed `bool += String`). New `binary_op_for_assign_op` helper maps `AssignOp::*` to
+# `BinaryOp::*` (Godot's `AssignmentNode::variant_op` analog). Lifts
+# `errors/incompatible_assignment.gd`. Reaches 198/300 = 0.66.
+# WP-N5a (M3 close-out): @onready / @export-of-Node restrictions
+# (gdscript_parser.cpp:4513-4515 / :4844-4847 / :4915-4918). `emit_variable_annotation_warnings`
+# walks the enclosing class's nearest native ancestor and emits Godot's verbatim
+# errors when @onready or @export-of-Node-derived appears in a non-Node-derived class. The
+# trimmed fixture also gains a minimal `Resource` class so `extends Resource` parses; the
+# combined slice lifts 7 cases. Reaches 205/300 = 0.6833.
+# WP-N5b (M3 close-out): Class-name rendering. `Display for DataType` returns `<Class>`
+# for in-file Class kind; new `class_identifier_name_or_default(ctx, &dt)` reads
+# `class_node->identifier` at the error site instead. Applied to two reducer arms; lifts
+# `call_not_existing_static_method.gd`, `constructor_call_type.gd`. Reaches
+# 207/300 = 0.69.
+# WP-M3 (M3 close-out): REDUNDANT_AWAIT + MISSING_AWAIT warnings. Parser sets
+# `FunctionNode.is_coroutine`, CallSig+function_signature propagate it, new `reduce_await`
+# stamps result type (Variant-Undetected for Signal so `var _a := await sig` fires "Cannot
+# infer"), and reduce_call emits MISSING_AWAIT / `Function ... must be called with "await"`
+# under the `awaiting_call` flag. The flag also gates the existing void-call check.
+# Lifts `warnings/missing_await.gd`, `errors/await_signal_no_infer.gd`. Reaches
+# 209/300 = 0.6967.
+# WP-N6 (M3 close-out): lambda body resolution. `AnalysisContext` gains
+# `pending_lambda_bodies` + `concrete_function`. `reduce_lambda` queues each lambda
+# (capturing the outer concrete function), drained after the enclosing class body finishes.
+# `reduce_call`'s static-context arm reads `enclosing_concrete_function_name` so lambda-body
+# call sites name the outer concrete. Lifts 3 static-context-in-lambda cases. Reaches
+# 212/300 = 0.7067.
+# WP-N7 (M3 close-out): lambda body-return-coverage + return-value type compat
+# (analyzer.cpp:2018-2025 / :2559-2588). `SuiteNode.has_return` flows in the parser
+# (return / if-both-branches / match-all+wildcard, gdscript_parser.cpp:2090,2383,2459).
+# `resolve_function_body` takes `is_lambda` and emits `Not all code paths return a value.`
+# under Godot's gate. `reduce_lambda` now eagerly calls `resolve_function_signature` on
+# the lambda's function-node so the deferred body pass sees the declared return type.
+# `resolve_return` runs `update_const_expression_builtin_type` for constant-foldable
+# returns and emits the "Cannot return value of type X because ..." compat check, anchoring
+# at the return value so gdls's offset-sort matches Godot's emit order. Lifts 4 cases
+# (lambda_no_return, lambda_wrong_return, lambda_cyclic_ref_param, enum_function_return_wrong_type).
+# Reaches 216/300 = 0.72.
+# WP-N8 (M3 close-out): static-var-init lambda concrete tracking. The
+# `pending_lambda_bodies` queue gains a captured `static_context` slot and the body
+# resolution skips its own `static_context` / `concrete_function` overrides for lambdas,
+# letting drain's seeded pair be the source of truth. Lifts the two non-setter
+# static-var-init-in-lambda cases. Reaches 218/300 = 0.7267.
+# WP-N9 (M3 close-out): SHADOWED_VARIABLE on parameters, current-class slice
+# (analyzer.cpp:1787). `warn_parameter_shadowing` checks each parameter against the
+# current class's `members_indices` and emits SHADOWED_VARIABLE with Godot's symbols.
+# Broader global/base-class/native-ancestor branches deferred. Lifts
+# `warnings/lambda_shadowing_arg.gd`. Reaches 219/300 = 0.73.
+# WP-N10 (M3 close-out): UNUSED_PARAMETER warning (analyzer.cpp:1784) via a name-set
+# sweep over identifier nodes inside the function body's byte span (since gdls's parser
+# doesn't carry Godot's parse-time identifier resolution). Plus a harness fidelity fix
+# that strips warnings from gdls's output for GDTEST_ANALYZER_ERROR cases — matching the
+# Godot's test runner's early-return-on-analyzer-error behavior at
+# gdscript_test_runner.cpp:571-585. Lifts `warnings/lambda_unused_arg.gd`. Reaches
+# 220/300 = 0.7333.
+# WP-N12 (M3 close-out): for-loop iterator typed-collection narrowing
+# (analyzer.cpp:2310-2317 / :2349-2354). Array[T] iterator now extracts T as the variable
+# type (was conservatively Variant); for-loop with array/dict literal as source now calls
+# update_array_literal_element_type / update_dictionary_literal_element_type against the
+# iterator's specified type, firing the typed-collection element-mismatch errors with the
+# const companion. Lifts 3 for_loop_wrong_specified_type* cases. Reaches 223/300 = 0.7433.
+# WP-N13 (M3 close-out): extends-non-class + function-as-callable.
+# `resolve_class_inheritance`'s nested-name arm walks members_indices and emits
+# `Identifier "X" is not a preloaded script or class.` for non-Class members
+# (analyzer.cpp:592-595). `lookup_class_member` returns a constant Callable for
+# in-file member functions (analyzer.cpp:4225 make_callable_type), feeding the
+# `Cannot assign a new value to a constant.` check at assignee. Lifts 2 cases
+# (extend_non_class_constant_2, function_used_as_property). Reaches 225/300 = 0.75.
+# WP-N14 (M3 close-out, past 0.75): four targeted lifts — array-index Bool check
+# (analyzer.cpp:4916-4931 Array case), unnamed-enum-value name conflict
+# (analyzer.cpp:1217-1247 + :234-318), broadened initializer compat check from
+# typed-collection-only to ALL hard-typed specifiers (analyzer.cpp:2121-2123 +
+# :2155-2168) including update_const_expression_builtin_type for constant
+# initializers. Lifts invalid_array_index, enum_shadows_base_enum,
+# enum_class_var_init_with_wrong_enum_type, enum_local_var_init_with_wrong_enum_type.
+# Reaches 229/300 = 0.7633.
+# WP-N15 (M3 close-out): native fixture expansion (InstancePlaceholder, MainLoop,
+# SceneTree, Viewport, Window, PhysicsDirectBodyState3D{,Extension}) + native-abstract
+# construction check in reduce_call (analyzer.cpp:5958-5966). Lifts 2 read-only-property
+# cases. Reaches 231/300 = 0.77.
+# WP-N16 (M3 close-out): inline accessor body resolution. Parser synthesizes the
+# accessor's identifier name (`@<var>_setter` / `@<var>_getter`,
+# gdscript_parser.cpp:1378/1435); analyzer resolves the inline accessor's body after
+# the member loop (analyzer.cpp:1417-1432), stamping the setter's first-parameter type
+# and getter's return-type from the variable's declared type. Lifts 3 cases. Reaches
+# 234/300 = 0.78.
+# WP-P1 (M3 tail — cross-file resolved-interface seam): wire the corpus-built `Index` +
+# `CorpusQuery` in the conformance harness; extend `Interface` with `is_tool` + `enums`;
+# extend `CrossFileQuery` with `resolve_inner_chain` / `lookup_file_member` /
+# `lookup_file_enum` / `is_file_tool` / `is_file_abstract`; wire `reduce_preload`
+# (Script meta on resolved paths), `resolve_extends_in_scope` (eager-resolve constant
+# initializers), `resolve_extends`'s nested chain walk over Script bases, and
+# `reduce_call`'s `DtKind::Script` arm (permissive cross-file function lookup + silent
+# degrade on miss). Lifts 5 cases (external_inner_base, external_parser, lookup_class,
+# out_of_order_external, non_tool_extends_tool_ignored). Reaches 239/300 = 0.7967.
+# WP-P5 (M3 tail): MISSING_TOOL warning emission via cross-file `is_file_tool` check in
+# `resolve_class_inheritance` — fires `WARNING: MISSING_TOOL: The base class script has the
+# "@tool" annotation, but this script does not have it.` when the resolved base is a Script
+# with @tool but the current file isn't @tool. Mirrors `gdscript_warning.cpp`'s MISSING_TOOL
+# template (and the analyzer's @tool annotation `apply()` walk). Lifts 1 case
+# (warnings/non_tool_extends_tool.gd, 2 warnings). Reaches 240/300 = 0.80.
+# WP-P10 (M3 tail): get_node shorthand context restrictions in `reduce_get_node`
+# (analyzer.cpp ~4870-4895) — emits `Cannot use shorthand "get_node()" notation ("$") in a
+# static function.` when the enclosing function is static, and `... on a class that isn't a
+# node.` when the enclosing class's nearest native ancestor isn't Node-derived. Reuses WP-N5a's
+# `nearest_native_ancestor` helper. Lifts 1 case
+# (errors/get_node_shorthand_in_static_function.gd). Reaches 241/300 = 0.8033.
+# WP-P2 (M3 tail): accessor type-compat walk + body return-type inference.
+# `decide_suite_type` (analyzer.cpp:2031-2056) propagates return/control-flow types to the suite
+# node; `resolve_function_body` adopts the body's inferred type for untyped functions
+# (analyzer.cpp:2018-2020); `check_property_setget_compat` (analyzer.cpp:1450-1517) checks
+# getter return/setter param types against the variable type; inline setter parameter typing
+# fixed to stamp the ParameterNode (not just the IdentifierNode). Lifts 4 cases
+# (property_function_{get,set}_type_error, property_inline_set_type_error,
+# setter_parameter_uses_property_type). Reaches 245/300 = 0.8167.
+# WP-P3 (M3 tail): void return-type fix + GDScript utility table + builtin method dispatch.
+# `type_from_type_ref` maps `TypeRef::Void` → `Builtin(Nil)` (was Variant). GDScript-only
+# utilities (`print_debug`, `len`, `range`, etc.) table. Builtin method dispatch via
+# `lookup_builtin_method`. `Object.free()` added to trimmed API. Lifts 4 void-function
+# cases. Reaches 249/300 = 0.8300.
+# WP-P4 (M3 tail): CONFUSABLE_LOCAL_DECLARATION + CONFUSABLE_LOCAL_USAGE + SHADOWED_VARIABLE
+# for locals. Position-based forward-reference detection in reduce_identifier, parent-suite
+# check in resolve_assignable, current-class member shadowing from resolve_variable_local.
+# Lifts 4 cases (confusable_local_{declaration,usage,usage_initializer,usage_loop}).
+# Reaches 253/300 = 0.8433.
+# WP-P8 (M3 tail): override signature variance + untyped-return adoption.
+# check_override_signature adopts parent return type for untyped overrides
+# (analyzer.cpp:1878-1879). is_return_covariant / is_param_contravariant now use
+# is_type_compatible for proper subtype checks. Lifts 4 cases. Reaches 257/300 = 0.8567.
+# WP-P11 (M3 tail): "Identifier not declared" error with native-member + global guards.
+# Plus PI/TAU/INF/NAN math constants. Lifts 2 cases. Reaches 259/300 = 0.8633.
+# WP-P7 (M3 tail): enable `!is_hard_type()` in resolve_assignable's `:=` infer path,
+# gated on plain-identifier initializer + non-uppercase. Lifts 3 cases. Reaches 262/300 = 0.8733.
+# WP-P6 (M3 tail): @abstract annotation processing + abstract-method-implementation walk +
+# super-call-on-abstract. Produces correct errors but fixture stays on known_failures. No delta.
+# WP-P9 (M3 tail, partial): enum-on-Dictionary non-const method call check
+# (analyzer.cpp:5937-5942). Dictionary builtin class added to trimmed API. Lifts 2 cases
+# (enum_bad_method, enum_duplicate_bad_method). Reaches 264/300 = 0.8800.
+# WP-Q1: outer_class_lookup + inner_class_as_return_type. Class-name rendering at the
+# `Cannot find member`/pseudo-type arms of reduce_subscript via
+# `class_identifier_name_or_default`; constructor exemption in the static-context call check.
+# Lifts 2 cases. Reaches 266/300 = 0.8867.
+# WP-Q2: 5 small Godot-faithful lifts —
+#   (1) enum custom-value `Enum values must be constant.` companion (gated on
+#       diagnostic-count delta during the value reduction)
+#   (2) reduce_identifier parameter-lookup forward-reference gate (analyzer.cpp:4471-4475)
+#       so `defb=defc` references a forward parameter as not-declared
+#   (3) reduce_call super-call `_init` virtual-constructor template on Native bases
+#   (4) reduce_get_node stamps Undetected-Variant on context errors so `:=` infer fires
+#   (5) reduce_call native-abstract `Name "new" is a Callable` companion alongside the
+#       abstract-class error
+# Lifts cyclic_ref_enum, params_default_forward_reference, virtual_super_not_implemented,
+# get_node_shorthand_within_non_node, abstract_class_instantiate. Reaches 271/300 = 0.9033.
+# WP-Q3: 2 small lifts —
+#   (1) unnamed-enum-value placeholder `Int(0)` fold so the assign-with-specified-type
+#       const-companion fires for `var x: NamedEnum = UNNAMED_VAL`
+#   (2) resolve_for `_iter_get` walk on Class instances (analyzer.cpp:2333-2345) so the
+#       iterator variable is typed by the method's return type
+# Lifts enum_unnamed_assign_to_named, for_loop_on_hard_iterator. Reaches 273/300 = 0.9100.
+# WP-Q4: `resolve_datatype` nested walk now matches inner-Enum members
+# (analyzer.cpp:921's `Member::ENUM` arm) + emits `Could not find type "X" under base
+# "Y".` (analyzer.cpp:933) when neither inner Class nor inner Enum matches. Lifts 1 case.
+# Reaches 274/300 = 0.9133.
+# WP-Q6: trimmed_api.json expansion — Vector3 builtin class (constants + Axis enum) and
+# Variant.Operator global enum. Lifts enum_builtin_access + enum_global_access.
+# Reaches 276/300 = 0.9200.
+# WP-Q7: trimmed_api.json gains Callable builtin (`get_method` -> StringName etc.) so
+# `await callable.get_method()` is recognised as a non-Variant non-Signal non-coroutine
+# value and the REDUNDANT_AWAIT warning fires for it. Lifts warnings/redundant_await.gd.
+# Reaches 277/300 = 0.9233.
+# WP-Q8: cyclic_ref detection for unnamed-enum values via RESOLVING sentinel stamping in
+# `Member::EnumValue` + `decl_identifier_name` handling raw Identifier nodes. Lifts
+# errors/cyclic_ref_enum_value.gd. Reaches 278/300 = 0.9267.
+# WP-Q10: inner-class body recursion in `resolve_class_body` (analyzer.cpp:1408-1410) +
+# Script-kind branch of reduce_call's abstract construction check (via
+# `CrossFileQuery::is_file_abstract`). Lifts construct_abstract_class.gd. Reaches
+# 279/300 = 0.9300.
+# WP-Q11: UNSAFE_VOID_RETURN warning when a void function returns a call whose return
+# type isn't statically void or hard-Variant. Lifts allow_void_function_to_return_void.
+# Reaches 280/300 = 0.9333.
+# WP-Q13: builtin-constant typing — `reduce_identifier_from_base`'s builtin-meta constant
+# arm now types the result as the parent builtin (Color.RED -> Color, Vector2.ZERO ->
+# Vector2) instead of Variant; placeholder Nil fold so `is_reduced` gates downstream
+# checks. Plus minimal Color in trimmed_api. Lifts assymetric_assignment_bad. Reaches
+# 281/300 = 0.9367.
+# WP-Q14: `len()` per-utility-function arg validation (narrow port of
+# gdscript_utility_functions.cpp's validate_arg callback for `len_func`). Lifts
+# gd_utility_function_wrong_arg. Reaches 282/300 = 0.9400.
+# WP-Q15: trimmed_api gains `floor` / `ceil` / `round` Variant utilities + per-utility
+# arg validator rejecting non-numeric / non-Vector args. Lifts utility_function_wrong_arg.
+# Reaches 283/300 = 0.9433.
+# WP-Q17: TernaryOp result becomes Undetected when branches have mixed type_sources
+# (same kind, hard vs soft). Lifts ternary_weak_infer. Reaches 284/300 = 0.9467.
+# WP-Q18: lambda capture access + CONFUSABLE_CAPTURE_REASSIGNMENT (suite_stack snapshot
+# in pending_lambda_bodies + reduce_assignment emits the warning for plain-identifier or
+# subscript-attribute-on-value-type captured locals). Lifts
+# warnings/confusable_capture_reassignment. Reaches 285/300 = 0.9500.
+# WP-Q20: local-constant non-constant-init detection via identifier walk in
+# `init_references_nonconstant_local`. Lifts errors/invalid_constant.gd. Reaches
+# 286/300 = 0.9533.
+# WP-Q21: @export* annotation argument constancy check via
+# `expression_references_nonconstant_member`. Lifts annotation_non_constant_parameter.
+# Reaches 287/300 = 0.9567.
+# WP-Q22: narrow UNSAFE_METHOD_ACCESS for `param.method()` on untyped parameters (no
+# datatype_specifier, no infer_datatype). Lifts auto_inferred_type_dont_error. Reaches
+# 288/300 = 0.9600.
+# WP-Q25: const Array[T] element-type inference for homogeneous array literals + typed
+# subscript element type. Lifts constant_subscript_type. Reaches 289/300 = 0.9633.
+# WP-Q27: cross-file Script base inner-class walk + head-segment `Could not find type`
+# error emission. Lifts not_found_type. Reaches 290/300 = 0.9667.
+# WP-Q29: CONFUSABLE_IDENTIFIER for non-ASCII alphabetic identifiers (Cyrillic А, etc.).
+# Lifts features/warning_ignore_targets. Reaches 291/300 = 0.9700.
+# WP-Q30: UNSAFE_CALL_ARGUMENT for builtin constructors (Callable / Dictionary / Vector2
+# / int) when first arg is a soft Variant. Hard-coded per-constructor subtype strings
+# matching Godot's union-of-overloads message. Lifts unsafe_call_argument. Reaches
+# 292/300 = 0.9733.
+# WP-Q32: cross-file SHADOWED_VARIABLE_BASE_CLASS — MemberDecl::line tracking +
+# Script-chain walk in warn_local_shadowing. Lifts shadowning. Reaches 293/300 = 0.9767.
+# WP-Q33: cross-file enum + unnamed-enum-value resolution on Script meta bases
+# (`P.Named` -> EnumMeta with cross-file fqcn, `P.UNNAMED_VAL` -> anonymous-enum instance
+# with placeholder Int fold). Lifts preload_enum_error +
+# enum_preload_unnamed_assign_to_named. Reaches 295/300 = 0.9833.
+# WP-Q34: emission-order preserve — DiagnosticSink::finish no longer sorts. Lifts
+# variadic_functions (15, 18, 9, 12 emission order matches Godot). Reaches
+# 296/300 = 0.9867.
+# WP-Q35: parent-default cyclic-ref detection in check_override_signature. When the
+# parent function has a parameter default that references the current class by name,
+# emit `Could not resolve member "X": Cyclic reference.` instead of the trailing
+# signature-mismatch error. Lifts cyclic_ref_override. Reaches 297/300 = 0.9900.
+# WP-R1: defer inner-class body resolution out of `resolve_class_body`'s member loop +
+# drain `pending_lambda_bodies` FIFO (analyzer.cpp:1573 / :4684 / :6536-6537). The root
+# class's own function bodies + lambda drain + abstract-inheritance check now complete
+# before any inner-class body work — placing `holding_some_invalid_lambda`'s line-41
+# lambda at Godot's position 5 instead of the tail. Lifts abstract_methods. Reaches
+# 298/300 = 0.9933.
+# WP-R2: cross-file mutual-member cycle detection.
+# `CrossFileQuery::member_initializer_xrefs` (default empty; `CorpusQuery` re-parses the
+# depended file and walks for `CONST.NAME` patterns where `CONST` is a `preload(...)`
+# constant) + `AnalysisContext.current_resolving_member` (name-side analog of Godot's
+# per-member RESOLVING flag at analyzer.cpp:984) + cycle emit in
+# `reduce_identifier_from_base`'s Script-meta branch (the gdls analog of
+# analyzer.cpp:1019 + :4095/4097/4139/4141). Lifts cyclic_ref_external. Reaches
+# 299/300 = 0.9966.
+# WP-R3: synthetic post-EOF line for Godot's null-source `push_error` path.
+# `gd_syntax::ParseTree.eof_line` (the lexer's `line` counter at end-of-parse) +
+# `gd_analyze::Diagnostic.line` (explicit override) + match-pattern subscript-Index
+# arm emits via the override when the inner walker was nulled. Mirrors Godot's
+# analyzer.cpp:2466 with `expr = nullptr` -> gdscript_parser.cpp:241-244's
+# `previous.{start,end}_line` (which is past EOF after `_advance`'s
+# `newline(true)` at gdscript_tokenizer.cpp:327-332). Lifts match_with_subscript.
+# Reaches 300/300 = 1.0000 — M3 conformance ceiling.
+1.0

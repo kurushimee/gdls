@@ -1,0 +1,770 @@
+//! The parse tree — a faithful port of the `GDScriptParser::Node` hierarchy
+//! (`modules/gdscript/gdscript_parser.h`).
+//!
+//! Godot allocates `Node*` subclasses and links them through a `next` pointer so the parser can free
+//! them all in one pass. We mirror that with a flat **arena**: every node lives in [`ParseTree::nodes`]
+//! and is referenced by a [`NodeId`] index. Children, and Godot's cyclic back-references
+//! (`suite -> parent_block`, `identifier -> declaration`), are all just a `NodeId` — no `Rc<RefCell>`,
+//! no borrow-checker fight — and the analyzer (M3) can reach any node by id and mutate its
+//! [`Node::datatype`] in place. Cleanup is `Vec::drop`.
+//!
+//! This is a **parser-level** AST: only fields the parser itself populates are present. Engine- and
+//! analyzer-typed state (`Variant` reduced values, `MethodInfo`, `PropertyInfo`, resolution flags,
+//! identifier source links, the real type lattice) is intentionally absent so `gd_syntax` keeps zero
+//! engine knowledge and stays fuzzable in isolation; M3 adds it via side tables / later fields.
+//!
+//! Every Godot `union` keyed by an adjacent tag becomes a Rust `enum`, so the wrong arm can never be
+//! read. The `NodeKind` variants are kept in Godot's declaration order (`gdscript_parser.h:299`).
+
+use std::collections::HashMap;
+
+use crate::span::{ByteSpan, LineColRange};
+use crate::token::Literal;
+
+/// Index of a [`Node`] within [`ParseTree::nodes`]. Godot's `Node *`. The inner index is
+/// `pub(crate)` so ids can only be minted in-crate (via [`ParseTree::push`]); other crates hold them
+/// opaquely and read them through [`NodeId::index`], which keeps a forged id from reaching `get`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(pub(crate) u32);
+
+impl NodeId {
+    #[inline]
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Placeholder for the analyzer's type lattice (M3, ported into `gd_types`). The parser leaves every
+/// node's datatype at this default; `gd_analyze` fills it in during the reduce/resolve passes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DataType {}
+
+// ---------------------------------------------------------------------------------------------------
+// Operator enums (ported verbatim, in Godot's declaration order).
+// ---------------------------------------------------------------------------------------------------
+
+/// `AssignmentNode::Operation` (`gdscript_parser.h:425`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssignOp {
+    None,
+    Addition,
+    Subtraction,
+    Multiplication,
+    Division,
+    Modulo,
+    Power,
+    BitShiftLeft,
+    BitShiftRight,
+    BitAnd,
+    BitOr,
+    BitXor,
+}
+
+/// `BinaryOpNode::OpType` (`gdscript_parser.h:460`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryOp {
+    Addition,
+    Subtraction,
+    Multiplication,
+    Division,
+    Modulo,
+    Power,
+    BitLeftShift,
+    BitRightShift,
+    BitAnd,
+    BitOr,
+    BitXor,
+    LogicAnd,
+    LogicOr,
+    ContentTest,
+    CompEqual,
+    CompNotEqual,
+    CompLess,
+    CompLessEqual,
+    CompGreater,
+    CompGreaterEqual,
+}
+
+/// `UnaryOpNode::OpType` (`gdscript_parser.h:1234`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnaryOp {
+    Positive,
+    Negative,
+    Complement,
+    LogicNot,
+}
+
+/// `DictionaryNode::Style` (`gdscript_parser.h:832`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictStyle {
+    LuaTable,
+    PythonDict,
+}
+
+/// `VariableNode::PropertyStyle` (`gdscript_parser.h:1251`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PropertyStyle {
+    #[default]
+    None,
+    Inline,
+    SetGet,
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Tagged unions (Godot `union` + adjacent tag → Rust enum).
+// ---------------------------------------------------------------------------------------------------
+
+/// `SubscriptNode`'s `index | attribute` union + `is_attribute` flag (`gdscript_parser.h:1082`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptAccess {
+    /// `base[index]`.
+    Index(Option<NodeId>),
+    /// `base.attribute`.
+    Attribute(Option<NodeId>),
+}
+
+/// A `VariableNode` accessor (`gdscript_parser.h:1258`): inline `get:`/`set:` body, or a method-name
+/// pointer (`get = m`, `set = m`), or none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PropertyAccessor {
+    #[default]
+    None,
+    /// Inline `FunctionNode`.
+    Inline(NodeId),
+    /// Method-name `IdentifierNode` pointer.
+    Pointer(NodeId),
+}
+
+/// A `ClassNode::Member` (`gdscript_parser.h:563`); each variant holds the member's node id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Member {
+    Class(NodeId),
+    Constant(NodeId),
+    Function(NodeId),
+    Signal(NodeId),
+    Variable(NodeId),
+    Enum(NodeId),
+    /// Value of an unnamed enum.
+    EnumValue(EnumValue),
+    /// `@export_group`/`@export_category`/`@export_subgroup` annotation node.
+    Group(NodeId),
+}
+
+/// A `SuiteNode::Local` (`gdscript_parser.h:1097`): a name bound in a block, for redefinition checks
+/// and resolution. Extents come from the source node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Local {
+    pub kind: LocalKind,
+    pub name: String,
+    /// The declaring node (`ConstantNode`/`VariableNode`/`ParameterNode`/`IdentifierNode`).
+    pub source: NodeId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalKind {
+    Constant,
+    Variable,
+    Parameter,
+    ForVariable,
+    PatternBind,
+}
+
+/// An `EnumNode::Value` (`gdscript_parser.h:535`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumValue {
+    pub identifier: Option<NodeId>,
+    pub custom_value: Option<NodeId>,
+}
+
+/// A `DictionaryNode`/`PatternNode` key→value pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyValue {
+    pub key: Option<NodeId>,
+    pub value: Option<NodeId>,
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Node payloads, alphabetical within Godot's grouping. Pointers → `NodeId`; optional pointers →
+// `Option<NodeId>`; `Vector<T*>` → `Vec<NodeId>`.
+// ---------------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnnotationNode {
+    pub name: String,
+    pub arguments: Vec<NodeId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArrayNode {
+    pub elements: Vec<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AssertNode {
+    pub condition: Option<NodeId>,
+    pub message: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AssignmentNode {
+    pub operation: AssignOp,
+    pub assignee: Option<NodeId>,
+    pub assigned_value: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AwaitNode {
+    pub to_await: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BinaryOpNode {
+    pub operation: BinaryOp,
+    pub left_operand: Option<NodeId>,
+    pub right_operand: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CallNode {
+    pub callee: Option<NodeId>,
+    pub arguments: Vec<NodeId>,
+    pub function_name: String,
+    pub is_super: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CastNode {
+    pub operand: Option<NodeId>,
+    pub cast_type: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClassNode {
+    pub identifier: Option<NodeId>,
+    pub icon_path: Option<String>,
+    pub members: Vec<Member>,
+    /// Name → index into `members`; the two are maintained in lockstep — do not mutate independently.
+    pub members_indices: HashMap<String, usize>,
+    pub outer: Option<NodeId>,
+    pub extends_used: bool,
+    pub is_abstract: bool,
+    pub extends_path: Option<String>,
+    /// `extends A.B.C` as an identifier chain.
+    pub extends: Vec<NodeId>,
+}
+
+/// `ConstantNode` — an `AssignableNode` (`gdscript_parser.h:409`, `:809`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConstantNode {
+    pub identifier: Option<NodeId>,
+    pub initializer: Option<NodeId>,
+    pub datatype_specifier: Option<NodeId>,
+    pub infer_datatype: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DictionaryNode {
+    pub elements: Vec<KeyValue>,
+    pub style: Option<DictStyle>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnumNode {
+    pub identifier: Option<NodeId>,
+    pub values: Vec<EnumValue>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ForNode {
+    pub variable: Option<NodeId>,
+    pub datatype_specifier: Option<NodeId>,
+    pub list: Option<NodeId>,
+    pub loop_body: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FunctionNode {
+    pub identifier: Option<NodeId>,
+    pub parameters: Vec<NodeId>,
+    /// Name → index into `parameters`; the two are maintained in lockstep.
+    pub parameters_indices: HashMap<String, usize>,
+    pub rest_parameter: Option<NodeId>,
+    pub return_type: Option<NodeId>,
+    pub body: Option<NodeId>,
+    pub is_abstract: bool,
+    pub is_static: bool,
+    pub is_coroutine: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetNodeNode {
+    pub full_path: String,
+    pub use_dollar: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdentifierNode {
+    pub name: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IfNode {
+    pub condition: Option<NodeId>,
+    pub true_block: Option<NodeId>,
+    pub false_block: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LambdaNode {
+    pub function: Option<NodeId>,
+    pub captures: Vec<NodeId>,
+    pub use_self: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiteralNode {
+    pub value: Literal,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MatchNode {
+    pub test: Option<NodeId>,
+    pub branches: Vec<NodeId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MatchBranchNode {
+    pub patterns: Vec<NodeId>,
+    pub block: Option<NodeId>,
+    pub has_wildcard: bool,
+    pub guard_body: Option<NodeId>,
+}
+
+/// `ParameterNode` — an `AssignableNode` (`gdscript_parser.h:990`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParameterNode {
+    pub identifier: Option<NodeId>,
+    pub initializer: Option<NodeId>,
+    pub datatype_specifier: Option<NodeId>,
+    pub infer_datatype: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PatternNode {
+    pub pattern_type: PatternKind,
+    /// `array` sub-patterns (`PT_ARRAY`).
+    pub array: Vec<NodeId>,
+    /// `dictionary` key→value-pattern pairs (`PT_DICTIONARY`).
+    pub dictionary: Vec<KeyValue>,
+    /// Bind names declared across the whole branch, accumulated on the *root* pattern
+    /// (`gdscript_parser.h:1028`): name → the binding `IdentifierNode`.
+    pub binds: HashMap<String, NodeId>,
+    pub rest_used: bool,
+}
+
+/// `PatternNode`'s `literal | bind | expression` union + its `Type` tag (`gdscript_parser.h:1003`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PatternKind {
+    Literal(Option<NodeId>),
+    Expression(Option<NodeId>),
+    Bind(Option<NodeId>),
+    Array,
+    Dictionary,
+    Rest,
+    #[default]
+    Wildcard,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreloadNode {
+    pub path: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReturnNode {
+    pub return_value: Option<NodeId>,
+    pub void_return: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignalNode {
+    pub identifier: Option<NodeId>,
+    pub parameters: Vec<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptNode {
+    pub base: Option<NodeId>,
+    pub access: Option<SubscriptAccess>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SuiteNode {
+    pub parent_block: Option<NodeId>,
+    pub statements: Vec<NodeId>,
+    pub locals: Vec<Local>,
+    /// Name → index into `locals`; the two are maintained in lockstep.
+    pub locals_indices: HashMap<String, usize>,
+    /// Mirrors Godot's `SuiteNode::has_return` (gdscript_parser.h:1177). Set by the parser when this
+    /// suite contains a `return` statement, or when every conditional path inside it has return
+    /// coverage (if/else with both arms returning, match with all branches returning and a wildcard
+    /// branch present). The analyzer consults this to emit `Not all code paths return a value.`
+    /// at `gdscript_analyzer.cpp:2022-2024`.
+    pub has_return: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TernaryOpNode {
+    pub condition: Option<NodeId>,
+    pub true_expr: Option<NodeId>,
+    pub false_expr: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TypeNode {
+    pub type_chain: Vec<NodeId>,
+    pub container_types: Vec<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TypeTestNode {
+    pub operand: Option<NodeId>,
+    pub test_type: Option<NodeId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnaryOpNode {
+    pub operation: UnaryOp,
+    pub operand: Option<NodeId>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VariableNode {
+    pub identifier: Option<NodeId>,
+    pub initializer: Option<NodeId>,
+    pub datatype_specifier: Option<NodeId>,
+    pub infer_datatype: bool,
+    pub property: PropertyStyle,
+    pub setter: PropertyAccessor,
+    pub getter: PropertyAccessor,
+    pub setter_parameter: Option<NodeId>,
+    pub exported: bool,
+    pub onready: bool,
+    pub is_static: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WhileNode {
+    pub condition: Option<NodeId>,
+    pub loop_body: Option<NodeId>,
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The 40-variant node tag, in Godot's declaration order (`gdscript_parser.h:299-340`).
+// ---------------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeKind {
+    /// `NONE` — the empty/recovery node.
+    None,
+    Annotation(AnnotationNode),
+    Array(ArrayNode),
+    Assert(AssertNode),
+    Assignment(AssignmentNode),
+    Await(AwaitNode),
+    BinaryOp(BinaryOpNode),
+    Break,
+    Breakpoint,
+    Call(CallNode),
+    Cast(CastNode),
+    Class(ClassNode),
+    Constant(ConstantNode),
+    Continue,
+    Dictionary(DictionaryNode),
+    Enum(EnumNode),
+    For(ForNode),
+    Function(FunctionNode),
+    GetNode(GetNodeNode),
+    Identifier(IdentifierNode),
+    If(IfNode),
+    Lambda(LambdaNode),
+    Literal(LiteralNode),
+    Match(MatchNode),
+    MatchBranch(MatchBranchNode),
+    Parameter(ParameterNode),
+    Pass,
+    Pattern(PatternNode),
+    Preload(PreloadNode),
+    Return(ReturnNode),
+    SelfExpr,
+    Signal(SignalNode),
+    Subscript(SubscriptNode),
+    Suite(SuiteNode),
+    TernaryOp(TernaryOpNode),
+    Type(TypeNode),
+    TypeTest(TypeTestNode),
+    UnaryOp(UnaryOpNode),
+    Variable(VariableNode),
+    While(WhileNode),
+}
+
+impl NodeKind {
+    /// Whether this node is an expression (Godot's `Node::is_expression()`).
+    pub fn is_expression(&self) -> bool {
+        use NodeKind::*;
+        matches!(
+            self,
+            Array(_)
+                | Assignment(_)
+                | Await(_)
+                | BinaryOp(_)
+                | Call(_)
+                | Cast(_)
+                | Dictionary(_)
+                | GetNode(_)
+                | Identifier(_)
+                | Lambda(_)
+                | Literal(_)
+                | Preload(_)
+                | SelfExpr
+                | Subscript(_)
+                | TernaryOp(_)
+                | TypeTest(_)
+                | UnaryOp(_)
+        )
+    }
+}
+
+/// One node: the kind-tagged payload plus the shared extents Godot's base `Node` carries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Node {
+    pub kind: NodeKind,
+    /// Byte range into the source (for LSP ranges).
+    pub span: ByteSpan,
+    /// Godot-faithful tab-expanded 1-based extents (for `.out` fidelity).
+    pub loc: LineColRange,
+    /// Annotations attached to this node (`@onready`, `@export`, …). Empty for most nodes.
+    pub annotations: Vec<NodeId>,
+    /// Filled by the analyzer (M3); left default by the parser.
+    pub datatype: DataType,
+}
+
+impl Node {
+    pub fn new(kind: NodeKind) -> Self {
+        Node {
+            kind,
+            span: ByteSpan::default(),
+            loc: LineColRange::default(),
+            annotations: Vec::new(),
+            datatype: DataType::default(),
+        }
+    }
+}
+
+/// The owned arena of nodes for one parsed source. The root is the head [`ClassNode`]
+/// (Godot's implicit top-level class).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ParseTree {
+    nodes: Vec<Node>,
+    /// The head class node. Meaningful only when [`ParseTree::is_empty`] is false; `pub(crate)` so
+    /// external callers go through the bounds-checked [`ParseTree::root`] accessor instead of feeding
+    /// the empty-tree sentinel `NodeId(0)` to the panicking [`ParseTree::get`].
+    pub(crate) root: NodeId,
+    /// The lexer's `line` counter at end-of-parse (the EOF token's `loc.end.line`). For sources
+    /// that end with a `\n`, Godot's tokenizer increments `line` once more inside
+    /// `_advance()`'s EOF check (gdscript_tokenizer.cpp:327-332: `newline(true)`) — so a 5-line
+    /// `.gd` file gets `eof_line = 7` (5 newlines → line 6, plus the synthetic EOF newline → 7).
+    /// Diagnostics anchored on the parser's `previous` token at end-of-parse (Godot's null-
+    /// source `push_error` path at gdscript_parser.cpp:241-244) inherit this line — used by
+    /// `resolve_match_pattern`'s subscript-Index arm to mirror Godot's line 7 on
+    /// `match_with_subscript.gd`.
+    pub eof_line: u32,
+}
+
+impl ParseTree {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Append a node and return its id.
+    pub fn push(&mut self, node: Node) -> NodeId {
+        let id = NodeId(self.nodes.len() as u32);
+        self.nodes.push(node);
+        id
+    }
+
+    /// Iterate every `NodeId` allocated in this tree, in declaration order. Used by `gd_analyze`'s
+    /// whole-tree warning sweeps (name-set construction for `UNUSED_*` warnings) and any other
+    /// pass that needs to visit every node without keeping a parent-side child list.
+    pub fn iter_ids(&self) -> impl Iterator<Item = NodeId> + '_ {
+        (0..self.nodes.len() as u32).map(NodeId)
+    }
+
+    pub fn get(&self, id: NodeId) -> &Node {
+        &self.nodes[id.index()]
+    }
+
+    pub fn get_mut(&mut self, id: NodeId) -> &mut Node {
+        &mut self.nodes[id.index()]
+    }
+
+    /// The root class node, or `None` if nothing was parsed.
+    pub fn root(&self) -> Option<&Node> {
+        self.nodes.get(self.root.index())
+    }
+
+    /// The id of the root class node, or `None` if nothing was parsed. The analyzer needs the root
+    /// `NodeId` (not just the node) to seed its `NodeId`-keyed side tables and to walk members; the
+    /// `root` field is `pub(crate)`, so this is the sanctioned external accessor.
+    pub fn root_id(&self) -> Option<NodeId> {
+        (!self.nodes.is_empty()).then_some(self.root)
+    }
+
+    /// The id of the **innermost** node whose [`Node::span`] contains `byte`, or `None` if no node
+    /// covers that offset. Linear over the arena — adequate for per-keystroke LSP queries (a 3k-line
+    /// file is on the order of 10k nodes); a smarter pick (e.g. binary search by span) would only
+    /// matter for `hover`/`definition` on enormous files, which is well outside v1's target scale.
+    ///
+    /// "Innermost" = smallest span containing the byte. Ties (zero-width spans, identical extents)
+    /// resolve to the **latest-emitted** node, which mirrors the parser's emission order:
+    /// children are pushed after their parents into the arena, so the deepest child wins. This is
+    /// the seam `gd_server`'s [hover](`textDocument/hover`) and
+    /// [definition](`textDocument/definition`) handlers need to map an LSP `Position` (converted
+    /// to a byte through [`crate::ByteSpan`]) onto a specific node and read its analyzer side
+    /// tables.
+    pub fn innermost_node_at(&self, byte: usize) -> Option<NodeId> {
+        let mut best: Option<(NodeId, u32)> = None;
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.span.start <= byte && byte < n.span.end {
+                let width = (n.span.end - n.span.start) as u32;
+                match best {
+                    Some((_, best_width)) if width > best_width => {}
+                    _ => best = Some((NodeId(i as u32), width)),
+                }
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+}
+
+impl std::ops::Index<NodeId> for ParseTree {
+    type Output = Node;
+    fn index(&self, id: NodeId) -> &Node {
+        self.get(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn innermost_node_picks_smallest_containing_span() {
+        // Hand-built tree: an outer node spanning bytes 0..10, an inner identifier spanning 3..7.
+        // A byte inside the inner identifier must resolve to the inner node, not the outer one.
+        let mut tree = ParseTree::new();
+        let outer = tree.push(Node {
+            kind: NodeKind::None,
+            span: ByteSpan { start: 0, end: 10 },
+            loc: LineColRange::default(),
+            annotations: Vec::new(),
+            datatype: DataType::default(),
+        });
+        let inner = tree.push(Node {
+            kind: NodeKind::Identifier(IdentifierNode {
+                name: "x".to_string(),
+            }),
+            span: ByteSpan { start: 3, end: 7 },
+            loc: LineColRange::default(),
+            annotations: Vec::new(),
+            datatype: DataType::default(),
+        });
+
+        assert_eq!(tree.innermost_node_at(0), Some(outer));
+        assert_eq!(tree.innermost_node_at(5), Some(inner));
+        assert_eq!(tree.innermost_node_at(6), Some(inner));
+        // The end byte is exclusive: byte 7 is in the outer, not the inner.
+        assert_eq!(tree.innermost_node_at(7), Some(outer));
+        // Past the outer's end ⇒ no hit.
+        assert_eq!(tree.innermost_node_at(10), None);
+        assert_eq!(tree.innermost_node_at(11), None);
+    }
+
+    #[test]
+    fn arena_push_and_index() {
+        let mut tree = ParseTree::new();
+        assert!(tree.is_empty());
+        let id = tree.push(Node::new(NodeKind::Identifier(IdentifierNode {
+            name: "x".to_string(),
+        })));
+        assert_eq!(id, NodeId(0));
+        assert_eq!(tree.len(), 1);
+        match &tree[id].kind {
+            NodeKind::Identifier(ident) => assert_eq!(ident.name, "x"),
+            _ => panic!("wrong kind"),
+        }
+        assert!(tree[id].kind.is_expression());
+    }
+
+    #[test]
+    fn none_is_not_an_expression() {
+        assert!(!NodeKind::None.is_expression());
+        assert!(!NodeKind::Pass.is_expression());
+    }
+
+    // ===============================================================================
+    // WP-R3 regression: ParseTree.eof_line follows the lexer's end-of-parse `line`
+    // counter (including the synthetic EOF `newline(true)` bump for sources ending
+    // in `\n`). Pinning this so a future refactor that drops the bump or stops
+    // populating `eof_line` from `current.loc.end.line` fails CI rather than the
+    // `match_with_subscript.gd` corpus fixture.
+    // ===============================================================================
+
+    #[test]
+    fn eof_line_is_populated_by_parse() {
+        // An empty source: the lexer's `line` starts at 1; the EOF newline bump takes it to 2.
+        let tree = crate::parse("").tree;
+        assert!(
+            tree.eof_line >= 1,
+            "eof_line must be set to >= 1, got {}",
+            tree.eof_line
+        );
+    }
+
+    #[test]
+    fn eof_line_advances_past_newlines() {
+        // A 3-line source must end with eof_line strictly greater than a 1-line source's.
+        let one_line = crate::parse("var x = 0\n").tree;
+        let three_line = crate::parse("var x = 0\nvar y = 1\nvar z = 2\n").tree;
+        assert!(
+            three_line.eof_line > one_line.eof_line,
+            "longer source ⇒ larger eof_line; got one={} three={}",
+            one_line.eof_line,
+            three_line.eof_line
+        );
+    }
+
+    #[test]
+    fn eof_line_survives_trailing_newline_bump() {
+        // Godot's tokenizer (gdscript_tokenizer.cpp:327-332, `newline(true)`) increments
+        // `line` one more time at EOF for sources that end with `\n`. So a source ending in `\n`
+        // has eof_line one HIGHER than the same source without the final newline.
+        // Pinning this guards the `match_with_subscript.gd` post-EOF synthetic-line invariant.
+        let with_nl = crate::parse("var x = 0\n").tree;
+        let no_nl = crate::parse("var x = 0").tree;
+        assert!(
+            with_nl.eof_line >= no_nl.eof_line,
+            "trailing-newline source has eof_line >= no-newline source; got with={} no={}",
+            with_nl.eof_line,
+            no_nl.eof_line
+        );
+    }
+}
