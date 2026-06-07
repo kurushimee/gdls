@@ -336,85 +336,114 @@ fn warm_load_produces_same_index_as_cold() {
     );
 }
 
-/// Issue 1 + Issue 2 seam test: disk edit → save → warm load reflects the edited interface.
+/// Issue 1 + Issue 2 seam test: disk edit → save → warm load skips re-parse on stat-match.
 ///
-/// Drives the real `reindex` + `update_stat_from_disk` + `save_cache` + `Workspace::load` seam,
-/// which was untested (all prior warm-path tests saved a never-edited workspace).
+/// **This test is genuinely discriminating**: removing `update_stat_from_disk` from the
+/// production code causes this test to fail. Here's the forged-stat proof:
 ///
-/// Assertions:
-///   1. The second (warm) load reflects the edited file's NEW class_name.
-///   2. The unchanged file retains its original class_name (not re-parsed with stale content).
-///   3. A reconcile immediately after the warm load sees `modified == 0`: the stat_table was
-///      correctly updated by `update_stat_from_disk`, so warm-load correctly stamped the new
-///      stat for the edited file — it is NOT treated as "still changed" on the next check.
+///   1. V1 on disk (size=S1). Cold load.
+///   2. Write V2 to disk (size=S2, S2≠S1). Capture V2's mtime (T2).
+///      Call `reindex` + `update_stat_from_disk`. Save cache → persisted stat = (S2, T2).
+///   3. Write V3 to disk (size=S2=V2 size, different class_name). Reset mtime to T2.
+///      Disk now shows stat (S2, T2) = **matches** the persisted (S2, T2).
+///   4. Warm load: stat matches → skip re-parse → serve persisted V2 index → "EditTargetV2".
+///
+/// Failure path (fix reverted):
+///   - Without `update_stat_from_disk`, the cache persists stat_V1 = (S1, T1).
+///   - Disk shows (S2, T2). MISMATCH → re-parse → reads V3 → "EditTargetV3" (**fail**).
+///
+/// The forged-stat trick (V3 same size as V2, mtime reset to T2) is what makes the
+/// skip observable without process restart — it makes disk appear unchanged relative
+/// to the persisted stat.
 #[test]
-fn warm_load_after_disk_edit_reflects_new_interface() {
+fn warm_load_skips_reparse_when_stat_matches() {
+    use std::time::SystemTime;
+
     let p = common::TempProject::new();
     p.write("project.godot", "config_version=5\n");
-    // Two files: one will be edited, one stays unchanged.
+
+    // V1: class_name EditTarget (size S1, different from V2/V3).
     let v1_src = "class_name EditTarget\nextends Node\n";
-    let unchanged_src = "class_name Bystander\nextends Node\n";
     p.write("src/edit_target.gd", v1_src);
-    p.write("src/bystander.gd", unchanged_src);
+    p.write("src/bystander.gd", "class_name Bystander\nextends Node\n");
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
     })));
 
-    // --- Session 1: cold build, disk edit via reindex path, save cache. ---
+    // --- Session 1: cold build, write V2, reindex + update_stat, save cache. ---
     let mut ws = Workspace::load(&p.root, &options);
-    assert_eq!(ws.index.file_count(), 2, "precondition: two files indexed");
+    assert_eq!(ws.index.file_count(), 2, "precondition");
 
-    // Verify V1 interface before the edit.
     let edit_path = p.root.join("src/edit_target.gd");
     assert_eq!(
         ws.index
             .interface_of(&edit_path)
             .and_then(|i| i.class_name.as_deref()),
         Some("EditTarget"),
-        "precondition: original class_name must be EditTarget"
+        "precondition: V1 class_name must be EditTarget"
     );
 
-    // Write new content to disk (changes size so stat definitely differs).
-    let v2_src = "class_name EditTargetV2\nextends Node\nvar new_field: int = 0\n";
+    // V2 content — must differ in size from V1 so stat_V1 ≠ stat_V2.
+    // "EditTargetV2" vs "EditTarget" = 2 extra chars → S2 = S1+2.
+    let v2_src = "class_name EditTargetV2\nextends Node\n";
     p.write("src/edit_target.gd", v2_src);
 
-    // Simulate what server.rs reindex_from_disk does: parse from disk, reindex, update stat.
+    // Capture V2's mtime before any further write (used to forge V3's stat below).
+    let v2_mtime: SystemTime = std::fs::metadata(edit_path.as_std_path())
+        .expect("stat V2")
+        .modified()
+        .expect("mtime V2");
+
+    // Simulate reindex_from_disk: parse, reindex, update stat → cache persists stat_V2.
     let text = std::fs::read_to_string(edit_path.as_std_path()).unwrap();
     ws.reindex(&edit_path, &gd_syntax::parse(&text).tree);
     ws.update_stat_from_disk(&edit_path);
 
-    // Verify the index now reflects V2 in-session.
     assert_eq!(
         ws.index
             .interface_of(&edit_path)
             .and_then(|i| i.class_name.as_deref()),
         Some("EditTargetV2"),
-        "in-session reindex must immediately reflect the new class_name"
+        "in-session: reindex must reflect V2"
     );
 
-    // Save cache — no open buffers, so save_cache() is fine.
-    ws.save_cache();
+    ws.save_cache(); // persists index=V2, stat=(S2,T2)
 
-    // --- Session 2: warm load from cache. ---
-    let mut warm_ws = Workspace::load(&p.root, &options);
+    // --- Forge V3: same size as V2, different class_name, mtime reset to T2. ---
+    // V3 is the same length as V2: "EditTargetV3" == "EditTargetV2" in byte count.
+    let v3_src = "class_name EditTargetV3\nextends Node\n";
     assert_eq!(
-        warm_ws.index.file_count(),
-        2,
-        "warm load must produce the same file count"
+        v2_src.len(),
+        v3_src.len(),
+        "V2 and V3 must be the same byte length for the stat-forge to work"
     );
+    p.write("src/edit_target.gd", v3_src);
+    // Reset mtime to T2 so disk stat = (S2, T2) = matches persisted stat_V2.
+    std::fs::File::open(edit_path.as_std_path())
+        .expect("open V3 for set_modified")
+        .set_modified(v2_mtime)
+        .expect("set_modified");
 
-    // The edited file's NEW interface must be reflected.
+    // --- Session 2: warm load — stat matches → skip re-parse → serve V2 index. ---
+    let warm_ws = Workspace::load(&p.root, &options);
+    assert_eq!(warm_ws.index.file_count(), 2, "warm load file count");
+
+    // The discriminating assertion: V2 interface must be served (skip proves fix works).
+    // If update_stat_from_disk was absent, persisted stat_V1 ≠ forged stat_V2 → re-parse
+    // → "EditTargetV3" → FAIL.
     assert_eq!(
         warm_ws
             .index
             .interface_of(&edit_path)
             .and_then(|i| i.class_name.as_deref()),
         Some("EditTargetV2"),
-        "warm load must reflect the edited file's new class_name (EditTargetV2), not the old one"
+        "warm load must serve the persisted V2 interface (skipped re-parse) — \
+         fail means update_stat_from_disk did NOT persist stat_V2, so warm-load \
+         re-parsed V3 from disk instead"
     );
 
-    // The unchanged file's interface must be unchanged.
+    // Bystander unchanged.
     let bystander_path = p.root.join("src/bystander.gd");
     assert_eq!(
         warm_ws
@@ -422,27 +451,7 @@ fn warm_load_after_disk_edit_reflects_new_interface() {
             .interface_of(&bystander_path)
             .and_then(|i| i.class_name.as_deref()),
         Some("Bystander"),
-        "unchanged file must still have its original class_name (Bystander)"
-    );
-
-    // stat_table correctness: a post-warm-load reconcile must see no modified files.
-    // If update_stat_from_disk wasn't called, the edited file's old stat would still be in the
-    // cache, warm-load would see stored!=disk and re-parse it, but the warm Workspace's own
-    // stat_table would be freshly populated from the warm-index walk — so reconcile would be
-    // 0 either way on the warm ws. The key test is that warm LOAD correctly got V2 (above).
-    // This reconcile verifies the warm workspace's stat_table is fully consistent post-load.
-    let r = warm_ws.reconcile(&Default::default());
-    assert_eq!(
-        r.modified, 0,
-        "reconcile after warm load must see no modified files (stat_table is consistent post-warm-load): {r:?}"
-    );
-    assert_eq!(
-        r.added, 0,
-        "reconcile after warm load must see no added files: {r:?}"
-    );
-    assert_eq!(
-        r.removed, 0,
-        "reconcile after warm load must see no removed files: {r:?}"
+        "bystander must retain its original class_name"
     );
 }
 
