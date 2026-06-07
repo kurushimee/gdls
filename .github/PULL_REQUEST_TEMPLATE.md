@@ -25,8 +25,7 @@ diagnostics byte-for-byte. See
 
 ## Fidelity ratchets
 
-- [ ] Parser **186/186** and analyzer **300/300** still hold (or I intentionally raised a ratchet and
-      updated the floor file).
+- [ ] Both fidelity ratchets still hold (or I intentionally raised a ratchet and updated the floor file).
 
 ## Verification
 
