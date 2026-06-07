@@ -64,11 +64,12 @@ so the 300/300 + 186/186 ratchets are not at risk — but every item must keep t
   (inner classes/enums are nested at `parser.rs:4419-4458`); the server handler
   (`crates/gd_server/src/handlers.rs` `document_symbol` → `to_lsp_symbol`) preserves children
   faithfully. **The flattening is purely in the parser projection.**
-- **Fix:** when the root class has an identifier (named top-level class), wrap its members in a
-  single `Class` `DocumentSymbol` (range = whole script, selectionRange = the `class_name`/file)
-  instead of returning them at top level. Match Godot's SymbolKinds (Class 5, Method 6/Function 12,
-  Variable 13/Property 7, Constant 14, Enum 10, Signal/Event 24) and drop `local` symbols as Godot
-  does (`godot_lsp.h:1272`).
+- **Fix:** always wrap the script's members in a single root `Class` `DocumentSymbol` (range = whole
+  script) — unconditionally, matching Godot's `parse_class_symbol` (`gdscript_extend_parser.cpp:240-252`).
+  Named by `class_name` if present (selectionRange = identifier span); otherwise empty name + zero-width
+  selectionRange at file start, with the server handler filling the file basename for unnamed scripts.
+  Match Godot's SymbolKinds (Class 5, Method 6/Function 12, Variable 13/Property 7, Constant 14,
+  Enum 10, Signal/Event 24) and drop `local` symbols as Godot does (`godot_lsp.h:1272`).
 - **Size/risk:** small / low. Localized to one function + a documentSymbol test update.
 
 ### M6-B — `definition`: resolve `class_name` used in expression position

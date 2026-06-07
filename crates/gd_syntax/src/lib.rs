@@ -87,15 +87,26 @@ mod tests {
     fn empty_extends_is_clean() {
         let r = parse("extends Node\n");
         assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
-        assert!(r.symbols.is_empty());
+        // Unconditional root Class wrapper (Godot parse_class_symbol parity): one symbol,
+        // unnamed (no class_name), no children (no members).
+        assert_eq!(r.symbols.len(), 1, "expected one root Class symbol");
+        let root = &r.symbols[0];
+        assert_eq!(root.kind, SymbolKind::Class);
+        assert_eq!(root.name, "");
+        assert!(root.children.is_empty());
     }
 
     #[test]
     fn projects_top_level_symbols() {
         let r = parse("extends Node\n\nvar speed := 1.0\n\nfunc move():\n\tpass\n");
         assert!(r.diagnostics.is_empty(), "diagnostics: {:?}", r.diagnostics);
-        let names: Vec<_> = r
-            .symbols
+        // Root Class wraps the members (Godot parse_class_symbol parity).
+        assert_eq!(r.symbols.len(), 1, "expected one root Class symbol");
+        let root = &r.symbols[0];
+        assert_eq!(root.kind, SymbolKind::Class);
+        assert_eq!(root.name, "");
+        let names: Vec<_> = root
+            .children
             .iter()
             .map(|s| (s.name.as_str(), s.kind))
             .collect();
