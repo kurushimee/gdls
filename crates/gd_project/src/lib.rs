@@ -8,6 +8,7 @@
 //! and the dependency graph + `on_file_changed` invalidation (WP-E). The `notify` watcher that drives
 //! that invalidation lands in M4 (`docs/03-indexing-freshness.md`).
 
+pub mod cache;
 pub mod depgraph;
 pub mod exclude;
 pub mod gdextension;
@@ -18,6 +19,10 @@ pub mod paths;
 pub mod project_godot;
 pub mod registry;
 
+pub use cache::{
+    load as cache_load, project_godot_fingerprint, save as cache_save, stat_from_metadata,
+    CacheKey, FileStat, LoadedCache, CACHE_FORMAT_VERSION,
+};
 pub use depgraph::{DepGraph, FileId};
 pub use exclude::{is_excluded, ProjectRoot, EXCLUDED_COMPONENTS};
 pub use gdextension::GdExtension;
