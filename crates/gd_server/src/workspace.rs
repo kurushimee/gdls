@@ -902,6 +902,7 @@ fn warm_index_from_cache(
         });
 
     let mut walk_errors = 0usize;
+    let mut skipped_non_utf8 = 0usize;
     let mut walked_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
     let mut reparsed = 0usize;
     let mut added = 0usize;
@@ -923,6 +924,9 @@ fn warm_index_from_cache(
             continue;
         }
         let Some(p) = camino::Utf8Path::from_path(entry.path()) else {
+            // Non-UTF-8 path — count it so the removal pass below stays off (same authority
+            // rule as reconcile): a walk that couldn't name a file isn't authoritative.
+            skipped_non_utf8 += 1;
             log::warn!("warm_index: skipping non-UTF-8 path under {root}");
             continue;
         };
@@ -978,8 +982,9 @@ fn warm_index_from_cache(
     }
 
     // Drop files that were in the cache but are no longer on disk (only when the walk was
-    // authoritative — same guard as reconcile).
-    if walk_errors == 0 {
+    // authoritative — same guard as reconcile: any unnamed/errored entry means the walked set
+    // is incomplete, so a missing-from-walk file might still exist).
+    if walk_errors == 0 && skipped_non_utf8 == 0 {
         let removed_paths: Vec<Utf8PathBuf> = index
             .iter_interfaces()
             .filter_map(|(fid, _)| index.path(fid).map(camino::Utf8Path::to_path_buf))
@@ -998,9 +1003,10 @@ fn warm_index_from_cache(
         );
     } else {
         log::info!(
-            "warm_index: stat-diff complete (walk had {walk_errors} error(s), skipping removal pass): \
-             {} reparsed, {} added",
-            reparsed, added,
+            "warm_index: stat-diff complete (walk not authoritative — walk_errors={walk_errors}, \
+             skipped_non_utf8={skipped_non_utf8} — skipping removal pass): {} reparsed, {} added",
+            reparsed,
+            added,
         );
     }
 

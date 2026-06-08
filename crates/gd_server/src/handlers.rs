@@ -1540,8 +1540,14 @@ fn find_method_overrides(
         return None;
     }
 
-    // Seed the BFS on the current file's own class_name.
-    let seed_name = iface.class_name.clone()?;
+    // Seed the BFS on the current file's own class_name. The cursor is confirmed to be on a
+    // method of THIS file, so an unnamed script simply has no named subclasses to find — return
+    // an empty result, not `None`. `None` would fall through to the class-identifier BFS in
+    // `implementation`, which would then look up the function name in the class_name registry; a
+    // class whose name happens to equal the function name would wrongly surface its subclasses.
+    let Some(seed_name) = iface.class_name.clone() else {
+        return Some(Vec::new());
+    };
 
     // BFS the inverse-extends graph — same algorithm as the class-identifier branch below.
     let mut known_names: FxHashSet<String> = FxHashSet::default();
