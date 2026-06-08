@@ -467,7 +467,7 @@ fn hover_cross_file_method_shows_param_names() {
     let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
-/// Fix 2: hover on a `preload("res://foo.gd")` string literal shows the resolved script basename.
+/// Hover on a `preload("res://foo.gd")` string literal shows the resolved script's basename.
 #[test]
 fn hover_on_preload_string_shows_resolved_script() {
     let fixture_dir = std::env::temp_dir().join("gdls_hover_preload");
@@ -501,6 +501,52 @@ fn hover_on_preload_string_shows_resolved_script() {
     assert!(
         md.contains("lib.gd"),
         "hover on preload string must show the resolved filename 'lib.gd', got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// Hover on a `preload("res://…")` whose target is a real **non-GDScript** resource (`.tscn`/
+/// `.tres`/asset) shows that file's basename, labelled "Resource" (not "GDScript"). The index holds
+/// only `.gd`, so this resolves via the on-disk fallback — matching what `document_link` links.
+#[test]
+fn hover_on_preload_non_gd_resource_shows_basename() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_preload_tscn");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(fixture_dir.join("scenes")).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    // A real scene file on disk — NOT a `.gd`, so it never enters the index.
+    std::fs::write(fixture_dir.join("scenes/main.tscn"), "[gd_scene]\n").expect("write main.tscn");
+    // caller.gd has: const Main = preload("res://scenes/main.tscn")
+    let caller_src = "const Main = preload(\"res://scenes/main.tscn\")\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover inside the `"res://scenes/main.tscn"` literal (col 30 lands in the path).
+    let hover = hover_at(&client, &caller_uri, Position::new(0, 30))
+        .expect("hover on a preload of an on-disk .tscn must return something");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("main.tscn"),
+        "hover must show the resolved resource basename 'main.tscn', got {md:?}"
+    );
+    assert!(
+        md.contains("Resource") && !md.contains("GDScript"),
+        "a non-.gd resource hover must be labelled 'Resource', not 'GDScript', got {md:?}"
     );
 
     shutdown(&client, handle);

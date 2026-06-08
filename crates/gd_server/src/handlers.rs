@@ -623,8 +623,9 @@ fn append_class_docs(md: &mut String, class: &NativeClass) {
 }
 
 /// M6-Fix2: when the cursor is on a `res://`-path string literal (e.g. inside
-/// `preload("res://foo.gd")`), render a hover showing the resolved script's basename.
-/// Returns `None` for non-res strings, unresolvable paths, or non-`String` literal nodes.
+/// `preload("res://foo.gd")`), render a hover showing the resolved file's basename — a `.gd`
+/// script or any other on-disk project resource (`.tscn`/`.tres`/asset). Returns `None` for
+/// non-res strings, paths with no on-disk target, or non-`String` literal nodes.
 fn hover_preload_string(state: &ServerState, tree: &ParseTree, node_id: NodeId) -> Option<String> {
     let NodeKind::Literal(LiteralNode {
         value: Literal::String(path),
@@ -635,11 +636,27 @@ fn hover_preload_string(state: &ServerState, tree: &ParseTree, node_id: NodeId) 
     if !path.starts_with("res://") {
         return None;
     }
-    // Gate on index membership — only emit hover for paths that resolve to indexed files.
-    let fid = state.workspace.index.resolve_res_path(path)?;
-    let abs = state.workspace.index.path(fid).map(|p| p.to_path_buf())?;
+    // Resolve to an on-disk project file with the same logic as `document_link`, so hover and
+    // links agree on what a `res://` literal points to: a `.gd` script is in the index → use its
+    // canonical interned path; any other resource isn't indexed (the index holds only `.gd`), so
+    // join it against the project root and confirm it's a real file.
+    let abs = match state.workspace.index.resolve_res_path(path) {
+        Some(fid) => state.workspace.index.path(fid).map(|p| p.to_path_buf()),
+        None => state
+            .workspace
+            .index
+            .res_to_path(path)
+            .filter(|p| p.is_file()),
+    }?;
     let basename = abs.file_name().unwrap_or(abs.as_str());
-    let md = format!("```gdscript\n{basename}\n```\n\nGDScript: `{path}`");
+    // A GDScript script gets a `gdscript`-fenced basename and a "GDScript:" label; any other
+    // resource gets a plain-fenced basename and a "Resource:" label, so the hover never claims a
+    // scene or asset is GDScript.
+    let md = if abs.extension() == Some("gd") {
+        format!("```gdscript\n{basename}\n```\n\nGDScript: `{path}`")
+    } else {
+        format!("```\n{basename}\n```\n\nResource: `{path}`")
+    };
     Some(md)
 }
 
