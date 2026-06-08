@@ -123,10 +123,10 @@ mod tests {
         assert!(is_excluded(&p("/proj/target/debug/x"), &root));
         assert!(is_excluded(&p("/proj/node_modules/dep/x.gd"), &root));
         // M6 cache dir: the warm-start cache must never re-enter the index/watcher. A `.gd` placed
-        // under `.gdls/` (or a watcher event for the `.bin`) is excluded only because `.gdls` is in
-        // EXCLUDED_COMPONENTS — this fails if that entry is removed (the `.gd`-extension filter alone
-        // would not catch a `.gd` sibling there).
-        assert!(is_excluded(&p("/proj/.gdls/index.1.bin"), &root));
+        // under `.gdls/` (or a watcher event for the `.json` cache) is excluded only because `.gdls`
+        // is in EXCLUDED_COMPONENTS — this fails if that entry is removed (the `.gd`-extension filter
+        // alone would not catch a `.gd` sibling there).
+        assert!(is_excluded(&p("/proj/.gdls/index.1.json"), &root));
         assert!(is_excluded(&p("/proj/.gdls/stray.gd"), &root));
     }
 

@@ -377,3 +377,73 @@ fn references_finds_bare_same_file_call() {
 
     shutdown(&client, server_thread);
 }
+
+/// Property-read recall guard: find-references on a field clicked at an **attribute read-site**
+/// (`self.hp`) must still report the field's other read occurrences. A property attribute is not a
+/// method call, so it must take the raw-identifier scan — not the callee-filtered method path,
+/// which emits `Binding::Call` records only and would drop every property read (the analyzer
+/// records no binding for an attribute read).
+///
+/// Discriminating: with the cursor on `self.hp` in `func a`, the response must include the *other*
+/// read (`self.hp` in `func b`). Routing the click through the method path (the pre-fix behavior)
+/// returns neither read — `assert has_b` fails. The raw-scan path finds both.
+#[test]
+fn references_on_property_at_attribute_site_finds_other_reads() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+
+    // One file: field `hp` declared, then read through `self.hp` in two methods.
+    // Line 0: `extends Node`
+    // Line 1: `var hp: int = 0`
+    // Line 2: `func a() -> void:`
+    // Line 3: `\tself.hp = 1`   — `hp` attribute at col 6..8 (`\tself.` = 6 bytes)
+    // Line 4: `func b() -> void:`
+    // Line 5: `\tself.hp = 2`   — `hp` attribute at col 6..8
+    p.write(
+        "obj.gd",
+        "extends Node\nvar hp: int = 0\nfunc a() -> void:\n\tself.hp = 1\nfunc b() -> void:\n\tself.hp = 2\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["obj.gd"]);
+
+    let obj_uri = file_uri(&p.root.join("obj.gd"));
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: obj_uri.clone(),
+            },
+            // Click `hp` in `self.hp` at the func-a read site (line 3, col 6 — on `h`).
+            position: Position {
+                line: 3,
+                character: 6,
+            },
+        },
+        context: ReferenceContext {
+            include_declaration: false,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(60, "textDocument/references", params))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    // The other read site (`self.hp` in func b, line 5) must be reported — proving the raw scan ran
+    // instead of the callee-only method path (which drops property reads entirely).
+    assert!(
+        locs.iter()
+            .any(|l| l.uri == obj_uri && l.range.start.line == 5),
+        "references on a property at a read-site must include the other read in func b (line 5); \
+         got: {locs:?}"
+    );
+
+    shutdown(&client, server_thread);
+}

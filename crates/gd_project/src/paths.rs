@@ -10,8 +10,24 @@ use rustc_hash::FxHashMap;
 use walkdir::WalkDir;
 
 /// `"res://a/b.gd"` → `<root>/a/b.gd`.
+///
+/// Godot's `res://` is strictly project-rooted: the relative part is always a plain forward-slash
+/// path with no traversal. We reject any `..`, absolute (`/x`), or drive-prefix (`C:`) component so
+/// a crafted literal like `preload("res://../../etc/passwd")` can never join to an out-of-tree path
+/// — which a consumer (`documentLink`/hover/`definition`) would otherwise surface as a `file://`
+/// target outside the project root. Such literals are invalid in Godot anyway, so returning `None`
+/// (unresolved) is faithful, not a regression.
 pub fn res_to_path(root: &Utf8Path, res: &str) -> Option<Utf8PathBuf> {
     let rel = res.strip_prefix("res://")?;
+    let all_normal = Utf8Path::new(rel).components().all(|c| {
+        matches!(
+            c,
+            camino::Utf8Component::Normal(_) | camino::Utf8Component::CurDir
+        )
+    });
+    if !all_normal {
+        return None;
+    }
     Some(root.join(rel))
 }
 
@@ -69,5 +85,20 @@ mod tests {
     #[test]
     fn non_res_uri_is_none() {
         assert!(res_to_path(Utf8Path::new("/proj"), "user://x").is_none());
+    }
+
+    #[test]
+    fn rejects_traversal_and_absolute_components() {
+        let root = Utf8Path::new("/proj");
+        // `..` traversal must not escape the project root.
+        assert!(res_to_path(root, "res://../../etc/passwd").is_none());
+        assert!(res_to_path(root, "res://a/../../b.gd").is_none());
+        // A leading slash (absolute relative part) must not replace the root on join.
+        assert!(res_to_path(root, "res:///etc/passwd").is_none());
+        // `.` segments are harmless and stay rooted.
+        assert_eq!(
+            res_to_path(root, "res://./src/a.gd"),
+            Some(Utf8PathBuf::from("/proj/src/a.gd"))
+        );
     }
 }

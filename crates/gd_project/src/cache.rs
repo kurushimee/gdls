@@ -1,6 +1,6 @@
 //! Persistent warm-start index cache for `gdls`.
 //!
-//! Writes the [`Index`] + a per-file stat table to `<project-root>/.gdls/index.<fmtver>.bin`
+//! Writes the [`Index`] + a per-file stat table to `<project-root>/.gdls/index.<fmtver>.json`
 //! (JSON-encoded, atomically via `tempfile` → same-fs rename so a concurrent reader never sees a
 //! torn write). On next startup, [`load`] deserializes the cache, checks the [`CacheKey`] (binary
 //! version, native-DB hash, project.godot fingerprint), runs [`Index::verify`] on the deserialized
@@ -19,7 +19,7 @@
 //! ever opens a complete old or complete new file.
 //!
 //! **`.gdls` exclusion:** `exclude.rs` already lists `.gdls` in `EXCLUDED_COMPONENTS`, so the cold
-//! indexer and watcher never try to parse `index.<fmtver>.bin` as a GDScript source.
+//! indexer and watcher never try to parse `index.<fmtver>.json` as a GDScript source.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,15 @@ use crate::index::{Index, IndexCache};
 /// old files unreadable. The cache filename embeds this version so old files are silently ignored,
 /// not quarantined (a format bump is not corruption).
 pub const CACHE_FORMAT_VERSION: u32 = 1;
+
+/// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
+/// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
+/// sees an inspectable JSON file, not an opaque blob. Single source of truth so `save` and `load`
+/// can never disagree on the name (a divergence would be the silent always-cold failure mode).
+#[must_use]
+pub fn cache_file_name() -> String {
+    format!("index.{CACHE_FORMAT_VERSION}.json")
+}
 
 /// All inputs that determine whether a cached index is still valid. A mismatch on any field means
 /// the cached index may not reflect current project state; `load` returns `None` and lets the
@@ -148,7 +157,7 @@ pub fn project_godot_fingerprint(root: &Utf8Path) -> u64 {
 // save() — atomic write.
 // ---------------------------------------------------------------------------
 
-/// Serialize the index + stat table to `<root>/.gdls/index.<CACHE_FORMAT_VERSION>.bin` atomically.
+/// Serialize the index + stat table to `<root>/.gdls/index.<CACHE_FORMAT_VERSION>.json` atomically.
 ///
 /// Serializes to a `NamedTempFile` in the **same directory** as the target (so `persist` is a
 /// same-filesystem rename — never a cross-device copy). Two concurrent writers race to a
@@ -174,7 +183,7 @@ pub fn save(root: &Utf8Path, index: &Index, files: &[FileStat], key: CacheKey) {
             return;
         }
     };
-    let target = dir.join(format!("index.{CACHE_FORMAT_VERSION}.bin"));
+    let target = dir.join(cache_file_name());
     // Write to a temp in the SAME dir so persist() is an atomic same-fs rename.
     let result = tempfile::NamedTempFile::new_in(dir.as_std_path()).and_then(|mut f| {
         f.write_all(&bytes)?;
@@ -200,9 +209,7 @@ pub fn save(root: &Utf8Path, index: &Index, files: &[FileStat], key: CacheKey) {
 /// is NOT quarantined — the file is valid but stale and will be overwritten by the next `save`.
 #[must_use]
 pub fn load(root: &Utf8Path, expected_key: &CacheKey) -> Option<LoadedCache> {
-    let path = root
-        .join(".gdls")
-        .join(format!("index.{CACHE_FORMAT_VERSION}.bin"));
+    let path = root.join(".gdls").join(cache_file_name());
 
     let bytes = std::fs::read(path.as_std_path()).ok()?;
 

@@ -88,9 +88,7 @@ fn round_trip_warm_equivalent_to_cold() {
     cache::save(&root, &cold, &files, key.clone());
 
     // The .gdls dir should exist, the cache file should be there.
-    let cache_path = root
-        .join(".gdls")
-        .join(format!("index.{CACHE_FORMAT_VERSION}.bin"));
+    let cache_path = root.join(".gdls").join(cache::cache_file_name());
     assert!(cache_path.exists(), "cache file written");
 
     // Load it back.
@@ -102,7 +100,7 @@ fn round_trip_warm_equivalent_to_cold() {
         "warm-started index must equal the cold-built index"
     );
 
-    // Bonus: rebuild cold again, confirm file_count unchanged (the .bin didn't re-enter the index).
+    // Bonus: rebuild cold again, confirm file_count unchanged (the cache file didn't re-enter the index).
     let cold2 = Index::build(&root);
     assert_eq!(
         cold2.file_count(),
@@ -125,9 +123,7 @@ fn corrupt_file_yields_none_and_quarantines() {
     let files = stat_gd_files(&root);
     cache::save(&root, &cold, &files, key.clone());
 
-    let cache_path = root
-        .join(".gdls")
-        .join(format!("index.{CACHE_FORMAT_VERSION}.bin"));
+    let cache_path = root.join(".gdls").join(cache::cache_file_name());
     assert!(cache_path.exists());
 
     // Garble the file (write garbage bytes).
@@ -147,7 +143,7 @@ fn corrupt_file_yields_none_and_quarantines() {
     );
     let corrupt_path = root
         .join(".gdls")
-        .join(format!("index.{CACHE_FORMAT_VERSION}.bin.corrupt"));
+        .join(format!("{}.corrupt", cache::cache_file_name()));
     assert!(
         corrupt_path.exists(),
         "corrupt file must be quarantined alongside the original path"
@@ -183,16 +179,14 @@ fn key_mismatch_yields_none_without_quarantine() {
     assert!(result.is_none(), "key mismatch must yield None");
 
     // The cache file must still be present (not quarantined — it's valid, just stale).
-    let cache_path = root
-        .join(".gdls")
-        .join(format!("index.{CACHE_FORMAT_VERSION}.bin"));
+    let cache_path = root.join(".gdls").join(cache::cache_file_name());
     assert!(
         cache_path.exists(),
         "stale-but-valid file must not be quarantined on key mismatch"
     );
     let corrupt_path = root
         .join(".gdls")
-        .join(format!("index.{CACHE_FORMAT_VERSION}.bin.corrupt"));
+        .join(format!("{}.corrupt", cache::cache_file_name()));
     assert!(!corrupt_path.exists(), "no quarantine for a key mismatch");
 }
 
@@ -390,7 +384,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
                     // But if a .corrupt file appeared, that's a torn-read indicator.
                     let corrupt_path = root_r
                         .join(".gdls")
-                        .join(format!("index.{CACHE_FORMAT_VERSION}.bin.corrupt"));
+                        .join(format!("{}.corrupt", cache::cache_file_name()));
                     if corrupt_path.exists() {
                         corrupt_count_r.fetch_add(1, Ordering::Relaxed);
                     }
@@ -423,7 +417,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
     );
     let corrupt_path = root
         .join(".gdls")
-        .join(format!("index.{CACHE_FORMAT_VERSION}.bin.corrupt"));
+        .join(format!("{}.corrupt", cache::cache_file_name()));
     assert!(
         !corrupt_path.exists(),
         "no .corrupt quarantine file after concurrent writes (atomic rename guards against torn reads)"

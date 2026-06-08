@@ -598,6 +598,11 @@ fn hover_member_signature(
         .join(", ");
     let ret_str = match &decl.ty {
         gd_project::TypeExpr::Named { path, .. } => path.join("."),
+        // `interface::type_expr` collapses BOTH an explicit `-> void` (empty type node) and an
+        // absent return annotation to `TypeExpr::None`, so they're indistinguishable here. Render
+        // `void`: explicit-void functions vastly outnumber truly-untyped ones in typed GDScript, so
+        // this is correct far more often than `Variant` would be. (A precise split would need
+        // interface extraction to carry "explicit void" vs "no annotation" — out of scope.)
         gd_project::TypeExpr::None => "void".to_string(),
     };
     let sig = format!("func {}({}) -> {}", fn_name, params_str, ret_str);
@@ -752,21 +757,28 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
     }
 }
 
-/// Returns `true` when `ident_id` is in a method, signal, or attribute-subscript role in `tree`:
+/// Returns `true` when `ident_id` is in a method or signal role in `tree`:
 /// - The `.identifier` child of a `Function` or `Signal` node (declaration-site click), OR
-/// - A `Subscript { access: Attribute(Some(ident_id)) }` operand (call-site or property-read
-///   attribute click, e.g. `l.helper()` or `node.position` — the cursor lands on the attribute
-///   Identifier in the subscript).
+/// - The attribute of a `Subscript` that is itself the **callee of a `Call`** (`l.helper()` — a
+///   method call site; the cursor lands on the `helper` attribute Identifier).
 ///
-/// Used to decide whether `textDocument/references` should use the project-wide text scan (correct
-/// for method/signal targets that callers reach through body-local typed vars) or the faster
-/// `name_referencers` index (correct for class/type/variable targets reachable only via interface-
-/// level type annotations). The check is purely structural (O(#nodes), no analyzer involvement)
-/// and works identically whether the cursor is on the declaration or a call site.
-/// Note: attribute-subscript property reads (e.g. `node.position`) are structurally matched as
-/// well — this is an over-approximation for properties, but never produces false positives in
-/// practice since property reads appear in both text-scan and binding-scan paths.
+/// A bare attribute **property read** (`node.position`, `self.hp`) is *not* a call callee and
+/// returns `false` so it falls through to the raw-identifier scan in `references`. This matters for
+/// recall: the method/signal code path filters to `Binding::Call` records (via
+/// [`push_callee_ident_locations`]), and the analyzer records no binding for a property attribute
+/// read — so routing property reads through it would silently drop every read occurrence. Letting
+/// them use the raw scan restores correct (over-approximating, never under-reporting) recall, which
+/// is the v1 stance for property/field references.
+///
+/// Used to decide whether `textDocument/references` uses the project-wide text scan (correct for
+/// method/signal targets reached through body-local typed vars) or the faster `name_referencers`
+/// index (correct for class/type/variable/property targets). Purely structural (O(#nodes), no
+/// analyzer involvement); works identically whether the cursor is on the declaration or a call site.
 fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
+    // Single pass: short-circuit on a func/signal declaration; otherwise remember the subscript
+    // that owns this attribute identifier and collect every `Call` callee node, then decide.
+    let mut owning_subscript: Option<NodeId> = None;
+    let mut call_callees: FxHashSet<NodeId> = FxHashSet::default();
     for nid in tree.iter_ids() {
         match &tree.get(nid).kind {
             NodeKind::Function(f) if f.identifier == Some(ident_id) => {
@@ -778,13 +790,20 @@ fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
             NodeKind::Subscript(s) => {
                 if matches!(s.access, Some(SubscriptAccess::Attribute(Some(aid))) if aid == ident_id)
                 {
-                    return true;
+                    owning_subscript = Some(nid);
+                }
+            }
+            NodeKind::Call(c) => {
+                if let Some(callee) = c.callee {
+                    call_callees.insert(callee);
                 }
             }
             _ => {}
         }
     }
-    false
+    // The attribute identifier belongs to a subscript: a method target only if that subscript is a
+    // `Call`'s callee (`l.helper()`), not a standalone property read (`node.position`).
+    owning_subscript.is_some_and(|sub_id| call_callees.contains(&sub_id))
 }
 
 /// Resolve a `class_name` to the URI + identifier span of its declaring file's class header. The
@@ -1061,9 +1080,9 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     //   2. Private (`_`-prefixed) methods appear in the AST regardless of class_name visibility.
     // The check is O(#nodes) on the current file's parse tree — already in cache — with no
     // analyzer call. It handles declaration-click (`func helper():`) and call-site attribute-click
-    // (`l.helper()`) identically. Note: attribute-subscript property reads are also structurally
-    // matched (e.g. `node.position`) — these fire the method/signal code path, which is an
-    // over-approximation for properties but never produces false positives in practice.
+    // (`l.helper()`) identically. A bare property read (`node.position`) is deliberately NOT matched
+    // (it isn't a call callee) so it falls through to the raw-identifier scan — the method path emits
+    // `Binding::Call` records only and would otherwise drop every property-read occurrence.
     let is_method_or_signal = is_member_or_attribute_ident(&parsed.tree, node_id);
 
     // For method/signal targets, compute `target_file` — the FileId of the file that DECLARES
@@ -1591,28 +1610,21 @@ fn find_method_overrides(
             continue;
         };
 
-        // Check the subclass interface for the override.
-        let has_override = state.workspace.index.interface(fid).is_some_and(|i| {
-            i.members
-                .iter()
-                .any(|m| m.name == fn_name && m.kind == gd_project::MemberKind::Func)
-        });
-        if !has_override {
+        // Check the subclass interface for the override and capture its span in one pass.
+        let Some(sub_iface) = state.workspace.index.interface(fid) else {
             continue;
-        }
+        };
+        let Some(override_decl) = sub_iface
+            .members
+            .iter()
+            .find(|m| m.name == fn_name && m.kind == gd_project::MemberKind::Func)
+        else {
+            continue;
+        };
 
         // Point to the override's span in the subclass file: prefer the MemberDecl.span
         // (the `func` keyword…body start), falling back to file start.
-        let override_span = state
-            .workspace
-            .index
-            .interface(fid)
-            .and_then(|i| {
-                i.members
-                    .iter()
-                    .find(|m| m.name == fn_name && m.kind == gd_project::MemberKind::Func)
-            })
-            .map(|m| m.span);
+        let override_span = Some(override_decl.span);
 
         let range = if let Some(span) = override_span {
             let cand_text = match state.vfs.get(cand_uri.as_str()).map(|d| d.text()) {
