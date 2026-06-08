@@ -29,12 +29,14 @@ use gd_analyze::{AnalysisResult, CrossFileQuery, MemberXref, SyntacticQuery};
 use gd_project::{FileId, Index, Interface};
 use gd_types::NativeDb;
 use lru::LruCache;
+use rustc_hash::FxHashMap;
 
 use crate::uri::CanonicalKey;
 use crate::workspace::CacheEntry;
 
-/// Wraps [`SyntacticQuery`] and overrides [`CrossFileQuery::member_initializer_xrefs`] with a
-/// cache-backed lookup. Every other method delegates to the inner query.
+/// Wraps [`SyntacticQuery`] and overrides [`CrossFileQuery::member_initializer_xrefs`] and
+/// [`CrossFileQuery::autoload_file`] with project-backed lookups. Every other method delegates
+/// to the inner query.
 pub struct WorkspaceXFileQuery<'a> {
     inner: SyntacticQuery<'a>,
     /// Held alongside `inner` (which also wraps it) so the WP-RD8 freshness gate in
@@ -47,6 +49,12 @@ pub struct WorkspaceXFileQuery<'a> {
     /// actively editing, so re-promoting its recency to MRU would distort the eviction order and
     /// shield seldom-touched files from the WP-H1 Soft-pressure shed.
     analysis_cache: &'a LruCache<CanonicalKey, CacheEntry<AnalysisResult>>,
+    /// Autoload name → FileId map, built once per analysis context from the project's autoload
+    /// table. Built per-call (a small `filter_map` over the autoload list) rather than cached on
+    /// `Workspace` so there is no stale-cache class: the map is always consistent with the
+    /// current index snapshot. Non-script autoloads and autoloads whose script has not been
+    /// indexed yet are silently skipped — the resolver degrades gracefully to Variant for those.
+    autoloads: FxHashMap<String, FileId>,
 }
 
 impl<'a> WorkspaceXFileQuery<'a> {
@@ -54,11 +62,13 @@ impl<'a> WorkspaceXFileQuery<'a> {
         index: &'a Index,
         native: &'a NativeDb,
         analysis_cache: &'a LruCache<CanonicalKey, CacheEntry<AnalysisResult>>,
+        autoloads: FxHashMap<String, FileId>,
     ) -> Self {
         WorkspaceXFileQuery {
             inner: SyntacticQuery::new(index, native),
             index,
             analysis_cache,
+            autoloads,
         }
     }
 }
@@ -78,6 +88,10 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
 
     fn file_path(&self, file: FileId) -> Option<&str> {
         self.inner.file_path(file)
+    }
+
+    fn autoload_file(&self, name: &str) -> Option<FileId> {
+        self.autoloads.get(name).copied()
     }
 
     fn member_initializer_xrefs(&self, file: FileId, member: &str) -> Vec<MemberXref> {
@@ -194,7 +208,8 @@ mod tests {
         let mut cache = test_cache();
         cache.put(wire_key("file:///proj/b.gd"), entry(Rc::clone(&cached)));
 
-        let xfile = WorkspaceXFileQuery::new(&idx, &native, &cache);
+        let xfile =
+            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
         let got = xfile.member_initializer_xrefs(b_fid, "V");
         assert_eq!(
             got,
@@ -217,7 +232,8 @@ mod tests {
         let native = NativeDb::empty();
         let cache = test_cache();
 
-        let xfile = WorkspaceXFileQuery::new(&idx, &native, &cache);
+        let xfile =
+            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
         assert!(xfile.member_initializer_xrefs(fid, "anything").is_empty());
     }
 
@@ -257,7 +273,8 @@ mod tests {
         );
 
         let native = NativeDb::empty();
-        let xfile = WorkspaceXFileQuery::new(&idx, &native, &cache);
+        let xfile =
+            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
         assert!(
             xfile.member_initializer_xrefs(b_fid, "V").is_empty(),
             "a dirty (stale) dependency must degrade to no-xrefs, not serve the cached entry"
@@ -287,7 +304,8 @@ mod tests {
             entry(Rc::clone(&cached)),
         );
 
-        let xfile = WorkspaceXFileQuery::new(&idx, &native, &cache);
+        let xfile =
+            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
         let got = xfile.member_initializer_xrefs(b_fid, "V");
         assert_eq!(
             got,
@@ -310,7 +328,8 @@ mod tests {
         let native = NativeDb::empty();
         let cache = test_cache();
 
-        let xfile = WorkspaceXFileQuery::new(&idx, &native, &cache);
+        let xfile =
+            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
         assert!(xfile.global_class_file("Hero").is_some());
         assert!(xfile.global_class_file("Nonexistent").is_none());
     }
@@ -347,7 +366,8 @@ mod tests {
 
         // Look up the oldest via the xfile reader → its xrefs come back, and recency must NOT
         // shift (otherwise the next pop_lru would target the wrong entry).
-        let xfile = WorkspaceXFileQuery::new(&idx, &native, &cache);
+        let xfile =
+            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
         let got = xfile.member_initializer_xrefs(oldest_fid, "V");
         assert_eq!(
             got,

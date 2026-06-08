@@ -1434,7 +1434,38 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
-    // 9. analyzer.cpp:4658-4660 — `Identifier "X" not declared in the current scope.` fires as
+    // 9. Autoload singleton → Script INSTANCE type (Godot `ScriptServer` singleton). Truly last
+    //    fallback: only fires when every higher-priority lookup (local, param, class member,
+    //    native, class_name, builtin, @GlobalScope enum, global constant) has missed. An autoload
+    //    named like a builtin (`Color`) or a global enum therefore never shadows the language-level
+    //    meaning; a member or local named the same as an autoload shadows the autoload (Godot's own
+    //    precedence order: `ScriptServer::get_global_class` is checked before autoloads, but both
+    //    are below in-scope identifiers — mirrored faithfully by placing this after step 5+6+7+8).
+    //    This is ADDITIVE: it only resolves where nothing else resolved. It cannot affect the
+    //    300/300 conformance corpus (which has no project.godot autoloads — `autoload_file` returns
+    //    `None` there via the default impl).
+    if let Some(fid) = ctx.xfile.autoload_file(&name) {
+        let site = ctx.node(id).span;
+        // Record a Use binding so `textDocument/references` and `textDocument/definition` on
+        // the autoload name work. Class kind mirrors the `class_name` branch at step 5, since
+        // an autoload is conceptually a class instance.
+        ctx.record_binding(Binding::use_(
+            Some(fid),
+            BindingSymbolKind::Class,
+            name.clone(),
+            site,
+        ));
+        // Script INSTANCE type — unlike `script_meta_type` (the class_name metatype). The singleton
+        // IS the instance; callers do `Global.method()`, not `Global.new()`. Reuse the existing
+        // metatype→instance lowering (`type_from_metatype`) the class_name branch uses, so this stays
+        // field-identical if those helpers change. This makes `reduce_identifier_from_base` /
+        // `reduce_subscript` walk the script's interface members — the same path that resolves
+        // `var l: Lib; l.helper()` (M6-E), which already works.
+        ctx.set_type(id, type_from_metatype(script_meta_type(fid)));
+        return;
+    }
+
+    // 10. analyzer.cpp:4658-4660 — `Identifier "X" not declared in the current scope.` fires as
     //    the last fallthrough after all lookup paths are exhausted. gdls hasn't ported global
     //    enums, autoloads, or native properties fully, so we gate on: identifier has no type
     //    set, not a call callee, not self/super, not a plausible native member (walked via the

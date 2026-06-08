@@ -353,11 +353,31 @@ impl Workspace {
                 let script_path = path.file_name().unwrap_or_default();
                 let result = {
                     // The borrow of `&self.analysis_cache` ends with this block, before the
-                    // `analysis_cache.insert(...)` below. WorkspaceXFileQuery overrides only
-                    // `member_initializer_xrefs` against the cache; every other CrossFileQuery
-                    // method delegates to SyntacticQuery.
-                    let xfile =
-                        WorkspaceXFileQuery::new(&self.index, &self.native, &self.analysis_cache);
+                    // `analysis_cache.insert(...)` below. WorkspaceXFileQuery overrides
+                    // `member_initializer_xrefs` and `autoload_file` against the cache/project;
+                    // every other CrossFileQuery method delegates to SyntacticQuery.
+                    //
+                    // Build autoload name→FileId map per-call: a filter_map over the project's
+                    // autoload list. Cost is negligible against a full analyze, and building it
+                    // per-call avoids any stale-map risk (e.g. autoload script indexed after
+                    // project load). Non-script autoloads and unindexed scripts are silently
+                    // skipped — the resolver degrades to Variant for those.
+                    let autoload_map: rustc_hash::FxHashMap<String, gd_project::FileId> = self
+                        .project
+                        .autoloads
+                        .iter()
+                        .filter_map(|a| {
+                            let path = self.project.autoload_script_path(&a.name)?;
+                            let fid = self.index.resolve_res_path(path)?;
+                            Some((a.name.clone(), fid))
+                        })
+                        .collect();
+                    let xfile = WorkspaceXFileQuery::new(
+                        &self.index,
+                        &self.native,
+                        &self.analysis_cache,
+                        autoload_map,
+                    );
                     Rc::new(gd_analyze::analyze_with_options(
                         tree,
                         file,
