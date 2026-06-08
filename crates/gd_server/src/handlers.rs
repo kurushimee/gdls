@@ -18,7 +18,7 @@ use lsp_types::{
 };
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ropey::Rope;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::position::PositionMapper;
 use crate::server::ServerState;
@@ -142,14 +142,22 @@ pub fn document_link(state: &mut ServerState, params: DocumentLinkParams) -> Vec
         if !path.starts_with("res://") {
             continue;
         }
-        // Gate on index membership — only emit a link for paths that resolve to an actually
-        // existing project file. `res_to_path` is a pure path-join with no existence check;
-        // `resolve_res_path` returns Some only for files that are indexed (i.e. on disk at scan
-        // time). A link to a non-existent target is a bug (spec: documentLink scope, a3.md §3).
-        let Some(fid) = state.workspace.index.resolve_res_path(path) else {
-            continue;
+        // Resolve the literal to an on-disk project file, then link it. Two cases, both keeping
+        // the "no link to a non-existent target" guarantee (spec: documentLink scope, a3.md §3):
+        //   * a `.gd` script is in the index → use its canonical interned path;
+        //   * any other resource (`.tscn`/`.tres`/asset) is NOT indexed — the index holds only
+        //     `.gd` (see `gd_files`) — so join it against the project root and confirm it's a real
+        //     file on disk. `preload`/`load` routinely target these, so gating purely on index
+        //     membership would silently drop every non-GDScript link.
+        let abs = match state.workspace.index.resolve_res_path(path) {
+            Some(fid) => state.workspace.index.path(fid).map(|p| p.to_path_buf()),
+            None => state
+                .workspace
+                .index
+                .res_to_path(path)
+                .filter(|p| p.is_file()),
         };
-        let Some(abs) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+        let Some(abs) = abs else {
             continue;
         };
         let Some(target) = path_to_file_uri(&abs) else {
@@ -1062,6 +1070,9 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             let cur_result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
             // Look for a Binding::Call whose callee identifier span (in the parse tree)
             // contains the cursor byte. If found (call-site click), target_file = callee_file.
+            // The callee-span map (same one `push_callee_ident_locations` uses) is built once on
+            // the first matching binding rather than re-scanned per binding.
+            let mut callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
             cur_result
                 .bindings()
                 .iter()
@@ -1074,7 +1085,9 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                     } = b
                     {
                         if callee_name == name.as_str() {
-                            if let Some(ident_span) = callee_ident_span(&parsed.tree, *call_site) {
+                            let spans = callee_spans
+                                .get_or_insert_with(|| callee_ident_spans(&parsed.tree));
+                            if let Some(ident_span) = spans.get(call_site).copied() {
                                 if ident_span.start <= byte && byte < ident_span.end {
                                     return Some(*callee_file);
                                 }
@@ -1402,35 +1415,35 @@ fn push_identifier_locations(
     }
 }
 
-/// Walk the parse tree to find the callee attribute-identifier's span for a subscript call
-/// (e.g. `l.helper()` → span of the `helper` identifier, not the whole `l.helper()` expression).
+/// Build, in one pass over `tree`, a map from each subscript-call's full [`ByteSpan`] to the span
+/// of its callee attribute-identifier (e.g. `l.helper()` → span of the `helper` identifier, not
+/// the whole `l.helper()` expression), following `CallNode.callee → SubscriptNode →
+/// Attribute(ident_id)`. Callees that aren't a subscript-attribute (bare function calls,
+/// `super()`, …) are simply absent from the map.
 ///
-/// Given the `call_site` ByteSpan from a `Binding::Call`, locates the corresponding `CallNode`
-/// in `tree` by span match, then follows `CallNode.callee → SubscriptNode → Attribute(ident_id)`.
-/// Returns `None` for non-subscript callees (bare function calls, `super()`, etc.) or when the
-/// tree doesn't contain a matching node.
-///
-/// Used by `push_callee_ident_locations` to emit the precise identifier sub-range for each
-/// resolved cross-file call, so the narrow range (e.g. col 3..9 for `helper` in `\tl.helper()`)
-/// matches what `push_identifier_locations` would have returned for that specific occurrence —
-/// but filtered to genuine callers of the target method, not all same-named identifiers.
-fn callee_ident_span(tree: &ParseTree, call_site: ByteSpan) -> Option<ByteSpan> {
+/// [`push_callee_ident_locations`] consults this instead of re-scanning the whole arena once per
+/// matched `Binding::Call` — that was O(nodes × matching_bindings) per file, slow on a large
+/// project with a frequently-named method (`update`, `ready`). Call spans are unique (distinct
+/// calls occupy distinct source extents), so there's no key collision and a lookup reproduces the
+/// old first-match result. The caller builds this lazily, so a file whose textual pre-filter
+/// matched but has no matching call pays nothing.
+fn callee_ident_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
+    let mut map = FxHashMap::default();
     for nid in tree.iter_ids() {
         let node = tree.get(nid);
-        if node.span != call_site {
+        let NodeKind::Call(call) = &node.kind else {
             continue;
-        }
-        if let NodeKind::Call(call) = &node.kind {
-            let callee_id = call.callee?;
-            let callee_node = tree.get(callee_id);
-            if let NodeKind::Subscript(sub) = &callee_node.kind {
-                if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
-                    return Some(tree.get(attr_id).span);
-                }
+        };
+        let Some(callee_id) = call.callee else {
+            continue;
+        };
+        if let NodeKind::Subscript(sub) = &tree.get(callee_id).kind {
+            if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
+                map.insert(node.span, tree.get(attr_id).span);
             }
         }
     }
-    None
+    map
 }
 
 /// Append a [`Location`] for every [`Binding::Call`] in `result.bindings` where
@@ -1454,6 +1467,9 @@ fn push_callee_ident_locations(
     uri: &Uri,
     mapper: &PositionMapper,
 ) {
+    // Built on the first matching binding so a textually-pre-filtered file with no matching call
+    // pays nothing: O(nodes) once + O(1) per match, vs the old O(nodes × matching_bindings).
+    let mut callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
     for binding in result.bindings() {
         if let Binding::Call {
             callee_file: Some(cf),
@@ -1463,7 +1479,8 @@ fn push_callee_ident_locations(
         } = binding
         {
             if *cf == target_file && callee_name == name {
-                if let Some(span) = callee_ident_span(tree, *call_site) {
+                let spans = callee_spans.get_or_insert_with(|| callee_ident_spans(tree));
+                if let Some(span) = spans.get(call_site).copied() {
                     out.push(Location {
                         uri: uri.clone(),
                         range: mapper.span_to_range(span),

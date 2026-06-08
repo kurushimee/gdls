@@ -156,8 +156,9 @@ fn document_link_returns_res_path_links() {
     shutdown(&client, handle);
 }
 
-/// A `res://` path pointing to a file that does NOT exist in the project yields no link.
-/// Guards Fix 1: `document_link` must check index membership, not just do a path-join.
+/// A `res://` path pointing to a `.gd` file that does NOT exist in the project yields no link:
+/// the existence gate (index membership for `.gd`, an `is_file` check for other resources) blocks
+/// links to targets that aren't on disk.
 #[test]
 fn document_link_no_link_for_nonexistent_res_path() {
     let p = TempProject::new();
@@ -243,6 +244,110 @@ fn document_link_ignores_non_res_strings() {
     assert!(
         links.is_empty(),
         "no links expected for non-res strings, got {links:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// A `res://` literal that resolves to a real **non-GDScript** on-disk resource (`.tscn`/`.tres`/
+/// asset) still produces a link. The index holds only `.gd`, so this drives the fallback path
+/// (`Index::res_to_path` + `is_file`), not index membership — `preload`/`load` of scenes and assets
+/// must link, not silently produce nothing.
+#[test]
+fn document_link_links_non_gd_resource() {
+    let p = TempProject::new();
+    p.write("project.godot", "");
+    // A real scene file on disk — NOT a `.gd`, so it never enters the index.
+    p.write("scenes/main.tscn", "[gd_scene]\n");
+    let src = "const S = preload(\"res://scenes/main.tscn\")\n";
+    p.write("caller.gd", src);
+
+    let (client, handle) = boot(&p);
+    let caller_path = p.root.join("caller.gd");
+    did_open(&client, &caller_path, src);
+
+    let caller_uri = file_uri(&caller_path);
+    client
+        .sender
+        .send(request(
+            10,
+            "textDocument/documentLink",
+            DocumentLinkParams {
+                text_document: TextDocumentIdentifier { uri: caller_uri },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        ))
+        .unwrap();
+
+    let Message::Response(resp) = recv(&client) else {
+        panic!("expected documentLink response");
+    };
+    assert!(
+        resp.error.is_none(),
+        "documentLink errored: {:?}",
+        resp.error
+    );
+    let links: Vec<lsp_types::DocumentLink> =
+        serde_json::from_value(resp.result.expect("documentLink result")).unwrap();
+
+    assert_eq!(
+        links.len(),
+        1,
+        "a preload of an on-disk .tscn must produce one link, got {links:?}"
+    );
+    let target = links[0].target.as_ref().expect("link must have a target");
+    assert!(
+        target.as_str().ends_with("/scenes/main.tscn"),
+        "link target should be the .tscn, got {}",
+        target.as_str()
+    );
+
+    shutdown(&client, handle);
+}
+
+/// The fallback (non-`.gd`) path still gates on existence: a `res://` literal for a resource that
+/// is not on disk produces no link — proving the `is_file` check, not index membership, blocks
+/// dangling links.
+#[test]
+fn document_link_no_link_for_nonexistent_non_gd_resource() {
+    let p = TempProject::new();
+    p.write("project.godot", "");
+    // `missing.tscn` is never written.
+    let src = "const S = preload(\"res://missing.tscn\")\n";
+    p.write("caller.gd", src);
+
+    let (client, handle) = boot(&p);
+    let caller_path = p.root.join("caller.gd");
+    did_open(&client, &caller_path, src);
+
+    let caller_uri = file_uri(&caller_path);
+    client
+        .sender
+        .send(request(
+            10,
+            "textDocument/documentLink",
+            DocumentLinkParams {
+                text_document: TextDocumentIdentifier { uri: caller_uri },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        ))
+        .unwrap();
+
+    let Message::Response(resp) = recv(&client) else {
+        panic!("expected documentLink response");
+    };
+    assert!(
+        resp.error.is_none(),
+        "documentLink errored: {:?}",
+        resp.error
+    );
+    let links: Vec<lsp_types::DocumentLink> =
+        serde_json::from_value(resp.result.expect("documentLink result")).unwrap();
+    assert!(
+        links.is_empty(),
+        "no link for a non-existent .tscn, got {links:?}"
     );
 
     shutdown(&client, handle);

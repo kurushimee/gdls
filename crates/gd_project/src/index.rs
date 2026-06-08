@@ -318,6 +318,15 @@ impl Index {
         self.resolve_path(res)
     }
 
+    /// `res://…` → its absolute path under the project root — a pure path-join with **no existence
+    /// check** (mirrors [`ProjectModel::res_to_path`](crate::ProjectModel::res_to_path)). Unlike
+    /// [`Self::resolve_res_path`], this does not require the target to be an indexed `.gd` file, so
+    /// callers can resolve references to non-GDScript resources (`.tscn`/`.tres`/assets — the index
+    /// holds only `.gd`; see `gd_files`). The caller is responsible for confirming the path exists.
+    pub fn res_to_path(&self, res: &str) -> Option<Utf8PathBuf> {
+        crate::paths::res_to_path(&self.root, res)
+    }
+
     // --- Read accessors -------------------------------------------------------------------------
 
     pub fn file_id(&self, path: &Utf8Path) -> Option<FileId> {
