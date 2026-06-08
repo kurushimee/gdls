@@ -1024,11 +1024,13 @@ fn group_call_ranges<'a, K: PartialEq>(
 /// Algorithm (per the M4 plan §6 + `docs/03 §7.1`, updated for M6-E):
 ///   1. Resolve cursor → identifier name.
 ///   2. Choose candidate files:
-///      - **Method/signal targets** (M6-E): project-wide textual scan matching Godot's
-///        `gdscript_workspace.cpp:472` two-phase strategy — enumerate ALL project files from the
-///        index, read text (VFS/disk; no analysis), keep only files whose text contains `name` as a
-///        substring. This catches callers that reach the method through a body-local typed var
-///        (`var l: Lib = Lib.new(); l.helper()`) that wouldn't appear in `name_referencers`.
+///      - **Method/signal targets** (M6-E) and **autoload singleton names** (M6-D): project-wide
+///        textual scan matching Godot's `gdscript_workspace.cpp:472` two-phase strategy — enumerate
+///        ALL project files from the index, read text (VFS/disk; no analysis), keep only files whose
+///        text contains `name` as a substring. This catches callers that reach the method through a
+///        body-local typed var (`var l: Lib = Lib.new(); l.helper()`) that wouldn't appear in
+///        `name_referencers`, and autoload names (`Global`) which appear only in function bodies,
+///        never in interface-level annotations.
 ///      - **Class/type/variable targets**: `Index::name_referencers(name)` fast-path (interface-pass
 ///        filter); these can only be reached through interface-level type annotations.
 ///   3. For each candidate (plus the current buffer): lazy-parse, lazy-analyze, then collect
@@ -1084,6 +1086,19 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // (it isn't a call callee) so it falls through to the raw-identifier scan — the method path emits
     // `Binding::Call` records only and would otherwise drop every property-read occurrence.
     let is_method_or_signal = is_member_or_attribute_ident(&parsed.tree, node_id);
+
+    // M6-D: an autoload singleton name (e.g. `Global` in `Global.popup_error()`) is the base of a
+    // subscript, not a call callee, so `is_member_or_attribute_ident` returns false and it would
+    // otherwise take the `name_referencers` fast-path below. But autoload names never appear in
+    // interface-level class-name annotations, so that referencer set is always empty — a cursor on
+    // the singleton name itself would then scan only the current file and silently miss every other
+    // file that uses `Global` in a function body. Detect the autoload here and route it through the
+    // same project-wide textual scan used for method/signal targets so cross-file uses are found.
+    let is_autoload = state
+        .workspace
+        .project
+        .autoload_script_path(&name)
+        .is_some();
 
     // For method/signal targets, compute `target_file` — the FileId of the file that DECLARES
     // the method. Used to filter `Binding::Call` records to genuine callers of this specific
@@ -1253,14 +1268,18 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // Godot's workspace.cpp:472 strategy: a project-wide textual name-scan first (two-phase), then
     // per-hit re-resolve. For method/signal targets we therefore enumerate ALL project files, do a
     // cheap substring pre-filter (`text.contains(name)` — only reads text, not analyze), and pass
-    // hits to the existing per-candidate analyze + callee-filtered-binding loop. For non-method
-    // targets (class names, variables) the `name_referencers` fast-path is sufficient: they can
-    // only be reached via their interface-level type annotation, which the interface pass records.
+    // hits to the existing per-candidate analyze + callee-filtered-binding loop. Autoload singleton
+    // names need the same project-wide scan: an autoload name appears in other files' function
+    // bodies (`Global.popup_error()`) but never in their interface-level annotations, so
+    // `name_referencers` would return an empty set and miss every cross-file use. For the remaining
+    // non-method targets (class names, variables) the `name_referencers` fast-path is sufficient:
+    // they can only be reached via their interface-level type annotation, which the interface pass
+    // records.
     //
     // Cost: one VFS-or-disk read per project file per references request for method/signal targets.
     // This matches Godot's behavior; a future identifier-occurrence index could optimize it. Do NOT
     // full-analyze every file — text-prefilter first, analyze only textual hits.
-    let candidates: Vec<(camino::Utf8PathBuf, Uri)> = if is_method_or_signal {
+    let candidates: Vec<(camino::Utf8PathBuf, Uri)> = if is_method_or_signal || is_autoload {
         // Project-wide textual scan: collect all (FileId → path) from the index first (index
         // borrow), then read text separately (VFS / disk borrow) so borrows don't overlap.
         let all_paths: Vec<(gd_project::FileId, camino::Utf8PathBuf)> = state
@@ -1309,7 +1328,8 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         out
     } else {
         // Fast-path for class/type/variable names: only files whose interface mentions `name` can
-        // reference it; `name_referencers` already has that set.
+        // reference it; `name_referencers` already has that set. (Autoloads are excluded — they
+        // take the project-wide textual scan above since they never appear in interface sets.)
         let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
         for fid in state.workspace.index.name_referencers(&name) {
             candidate_fids.insert(fid);

@@ -975,8 +975,7 @@ fn warm_index_from_cache(
                 }
             }
         } else {
-            // Stat unchanged — update the stat table entry with the fresh stat so it is
-            // current (the cached stat is the same; just keep it).
+            // Stat unchanged — the cached stat is still current, so keep it as-is.
             // No re-parse needed.
         }
     }

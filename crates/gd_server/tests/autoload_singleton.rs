@@ -316,6 +316,58 @@ fn references_on_autoload_method_finds_caller() {
     shutdown(&client, handle);
 }
 
+/// `textDocument/references` on the autoload NAME itself (`Global` in `Global.popup_error("x")`)
+/// must find uses of the singleton across ALL files, not just the current one. Autoload names
+/// never appear in interface-level class-name annotations, so the `name_referencers` fast-path
+/// returns an empty set; without routing autoloads through the project-wide textual scan, a click
+/// on `Global` in `a.gd` would silently miss the `Global` use in `b.gd`. Regression guard for the
+/// "cross-file references on an autoload name silently falls back to current-file-only" bug.
+#[test]
+fn references_on_autoload_name_finds_cross_file_uses() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+    );
+    p.write(
+        "global.gd",
+        "extends Node\n\nfunc popup_error(msg: String) -> void:\n\tpass\n",
+    );
+    // a.gd and b.gd each use the autoload name `Global` in a function body. Both `Global` tokens
+    // sit at line 3, col 1..7.
+    p.write(
+        "a.gd",
+        "extends Node\n\nfunc test():\n\tGlobal.popup_error(\"x\")\n",
+    );
+    p.write(
+        "b.gd",
+        "extends Node\n\nfunc other():\n\tGlobal.popup_error(\"y\")\n",
+    );
+
+    let (client, handle) = boot(&p);
+    did_open(&client, &p, "global.gd");
+    did_open(&client, &p, "a.gd");
+    did_open(&client, &p, "b.gd");
+
+    let a_uri = file_uri(&p.root.join("a.gd"));
+    let b_uri = file_uri(&p.root.join("b.gd"));
+
+    // Click on `Global` (the singleton name) in a.gd at line 3, col 2 (inside the identifier).
+    let locs = references_at(&client, &a_uri, Position::new(3, 2), false);
+
+    assert!(
+        locs.iter().any(|l| l.uri == a_uri),
+        "references on `Global` must include the current-file use in a.gd; got: {locs:?}"
+    );
+    assert!(
+        locs.iter().any(|l| l.uri == b_uri),
+        "references on autoload name `Global` must include the cross-file use in b.gd \
+         (project-wide scan, not current-file-only); got: {locs:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
 /// Shadowing gate: a local `var Global = 1` inside a function shadows the autoload singleton.
 /// Hover on the local `Global` reference must NOT show a Script type — it's an int local.
 #[test]
