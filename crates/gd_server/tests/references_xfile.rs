@@ -7,7 +7,7 @@
 mod common;
 
 use common::{file_uri, notification, recv, request, shutdown, TempProject};
-use lsp_server::{Connection, Message};
+use lsp_server::Connection;
 use lsp_types::{
     DidOpenTextDocumentParams, InitializeParams, InitializedParams, Location, Position,
     ReferenceContext, ReferenceParams, TextDocumentIdentifier, TextDocumentItem,
@@ -118,9 +118,7 @@ fn references_finds_cross_file_method_calls() {
         .sender
         .send(request(10, "textDocument/references", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected references response");
-    };
+    let resp = common::recv_response(&client);
     assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
     let locs: Vec<Location> =
         serde_json::from_value(resp.result.expect("references result")).unwrap();
@@ -212,9 +210,7 @@ fn references_excludes_unrelated_same_named_method() {
         .sender
         .send(request(20, "textDocument/references", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected references response");
-    };
+    let resp = common::recv_response(&client);
     assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
     let locs: Vec<Location> =
         serde_json::from_value(resp.result.expect("references result")).unwrap();
@@ -284,9 +280,7 @@ fn references_include_declaration_returns_cross_file_decl() {
         .sender
         .send(request(40, "textDocument/references", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected references response");
-    };
+    let resp = common::recv_response(&client);
     assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
     let locs: Vec<Location> =
         serde_json::from_value(resp.result.expect("references result")).unwrap();
@@ -356,9 +350,7 @@ fn references_finds_bare_same_file_call() {
         .sender
         .send(request(30, "textDocument/references", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected references response");
-    };
+    let resp = common::recv_response(&client);
     assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
     let locs: Vec<Location> =
         serde_json::from_value(resp.result.expect("references result")).unwrap();
