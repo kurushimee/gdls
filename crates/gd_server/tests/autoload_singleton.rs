@@ -15,8 +15,8 @@ use lsp_server::{Connection, Message};
 use lsp_types::{
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
     HoverParams, InitializeParams, InitializedParams, Location, MarkupKind, PartialResultParams,
-    Position, ReferenceContext, ReferenceParams, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, WorkDoneProgressParams,
+    Position, PublishDiagnosticsParams, ReferenceContext, ReferenceParams, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, WorkDoneProgressParams,
 };
 
 /// Boot a server over a TempProject with UTF-8 position encoding negotiated.
@@ -66,6 +66,45 @@ fn did_open(client: &Connection, project: &TempProject, rel: &str) {
         .unwrap();
     // Drain the publishDiagnostics push.
     let _ = recv(client);
+}
+
+/// Open a file and assert the resulting `publishDiagnostics` carries zero diagnostics.
+/// Guards the "never false-positive" rule: autoload typing must not introduce spurious errors.
+fn did_open_assert_clean(client: &Connection, project: &TempProject, rel: &str) {
+    let abs = project.root.join(rel);
+    let text = std::fs::read_to_string(abs.as_std_path()).expect("read file");
+    let uri = file_uri(&abs);
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 1,
+                    text,
+                },
+            },
+        ))
+        .unwrap();
+    // Parse the publishDiagnostics push and assert empty.
+    let msg = recv(client);
+    let Message::Notification(notif) = msg else {
+        panic!("expected publishDiagnostics notification after didOpen, got {msg:?}");
+    };
+    assert_eq!(
+        notif.method, "textDocument/publishDiagnostics",
+        "expected publishDiagnostics, got {}",
+        notif.method
+    );
+    let params: PublishDiagnosticsParams =
+        serde_json::from_value(notif.params).expect("valid PublishDiagnosticsParams");
+    assert!(
+        params.diagnostics.is_empty(),
+        "autoload typing must produce zero diagnostics for {rel}; got: {:?}",
+        params.diagnostics
+    );
 }
 
 fn hover_at(client: &Connection, uri: &lsp_types::Uri, position: Position) -> Option<Hover> {
@@ -183,12 +222,14 @@ fn setup_autoload_project() -> TempProject {
 
 /// Hover on `popup_error` in `Global.popup_error("x")` must show the function signature,
 /// not a degraded Variant type. This is the primary M6 autoload-typing acceptance test.
+/// Also asserts zero diagnostics on `caller.gd` — autoload typing must not false-positive on a
+/// valid call like `Global.popup_error("x")` where the arg type matches the param.
 #[test]
 fn hover_on_autoload_member_shows_signature() {
     let p = setup_autoload_project();
     let (client, handle) = boot(&p);
     did_open(&client, &p, "global.gd");
-    did_open(&client, &p, "caller.gd");
+    did_open_assert_clean(&client, &p, "caller.gd");
 
     let caller_uri = file_uri(&p.root.join("caller.gd"));
 
