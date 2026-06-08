@@ -524,15 +524,24 @@ fn hover_member_signature(
     // Find a Call node whose span contains the cursor byte. The cursor may be directly on the
     // Call node (at `(`/`)`) or on an inner Identifier child (the callee name) — both cases fall
     // into the same "find the enclosing Call" logic.
-    let call_node = tree.iter_ids().find_map(|id| {
-        let node = tree.get(id);
-        if let NodeKind::Call(c) = &node.kind {
-            if node.span.start <= cursor_byte && cursor_byte < node.span.end {
-                return Some(c.clone());
+    //
+    // Pick the *innermost* (smallest-span) enclosing Call: DFS pre-order visits an outer call
+    // before its inner ones, so for a nested callee — e.g. the cursor on `bar` in
+    // `a.foo(b.bar(x))` — a plain first-match would wrongly select `a.foo` and render its
+    // signature instead of `b.bar`'s.
+    let call_node = tree
+        .iter_ids()
+        .filter_map(|id| {
+            let node = tree.get(id);
+            if let NodeKind::Call(c) = &node.kind {
+                if node.span.start <= cursor_byte && cursor_byte < node.span.end {
+                    return Some((node.span.end - node.span.start, c.clone()));
+                }
             }
-        }
-        None
-    })?;
+            None
+        })
+        .min_by_key(|(span_len, _)| *span_len)
+        .map(|(_, c)| c)?;
 
     // Only subscript calls (`l.helper()`) provide a base whose type we can look up.
     // Bare calls (`helper()`) resolve via the in-class or inherited interface — handled
@@ -735,15 +744,11 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
     for nid in tree.iter_ids() {
         match &tree.get(nid).kind {
-            NodeKind::Function(f) => {
-                if f.identifier == Some(ident_id) {
-                    return true;
-                }
+            NodeKind::Function(f) if f.identifier == Some(ident_id) => {
+                return true;
             }
-            NodeKind::Signal(s) => {
-                if s.identifier == Some(ident_id) {
-                    return true;
-                }
+            NodeKind::Signal(s) if s.identifier == Some(ident_id) => {
+                return true;
             }
             NodeKind::Subscript(s) => {
                 if matches!(s.access, Some(SubscriptAccess::Attribute(Some(aid))) if aid == ident_id)

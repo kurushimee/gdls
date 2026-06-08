@@ -561,6 +561,56 @@ fn hover_cross_file_method_shows_signature() {
     let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
+/// M6-F regression (greptile r3372647839): with a nested call `a.outer(b.inner())`, hovering the
+/// *inner* callee `inner` must render `inner`'s signature, not the enclosing `outer`'s. DFS
+/// pre-order visits the outer Call first, so the handler must pick the smallest-span (innermost)
+/// enclosing Call, not the first match.
+#[test]
+fn hover_nested_call_picks_innermost_callee() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_m6f_nested");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    std::fs::write(
+        fixture_dir.join("lib.gd"),
+        "class_name Lib\nextends Node\n\nfunc outer(n: int) -> int:\n\treturn n\n\nfunc inner() -> int:\n\treturn 1\n",
+    )
+    .expect("write lib.gd");
+    // Line 3: `\tvar x = a.outer(b.inner())` — `inner` at cols 19..24, nested inside `a.outer(…)`.
+    let caller_src = "extends Node\n\nfunc test(a: Lib, b: Lib):\n\tvar x = a.outer(b.inner())\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover on `inner` at line 3, col 21 (inside the inner callee identifier).
+    let hover = hover_at(&client, &caller_uri, Position::new(3, 21))
+        .expect("hover on nested inner call should return something");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("inner"),
+        "hover on the inner callee must show 'inner', got {md:?}"
+    );
+    assert!(
+        !md.contains("outer"),
+        "hover on the inner callee must NOT show the enclosing 'outer' signature, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
 /// M6-B: definition on a `class_name`-registered identifier used in expression position
 /// (`Foo.bar()` or `Foo.CONST`). When the cursor is on `Foo` (the base of an attribute-access
 /// subscript), go-to-definition must jump to `foo.gd`'s `class_name Foo` declaration.
