@@ -107,6 +107,7 @@ if [[ -z "${EXTENSION_API:-}" ]]; then
 
     info "Dumping extension_api.json via ${GODOT_BIN} ..."
     API_TMPDIR="$(mktemp -d)"
+    trap 'rm -rf "${API_TMPDIR:-}"' EXIT
     # --dump-extension-api-with-docs writes extension_api.json to cwd; --headless suppresses GPU init.
     (
         cd "${API_TMPDIR}"
@@ -199,18 +200,20 @@ BENCH_SESSION="${OUT_DIR}/bench-session.json"
 COLD_REPORT="${OUT_DIR}/bench-cold.json"
 WARM_REPORT="${OUT_DIR}/bench-warm.json"
 
-python3 - <<PYEOF
-import json
+python3 - "${PROJECT_ROOT}" "${EXTENSION_API}" "${BENCH_SESSION}" <<'PYEOF'
+import json, sys
+
+project_root, extension_api, bench_session = sys.argv[1:]
 
 bench = {
     "initializationOptions": {
-        "projectRoot": "${PROJECT_ROOT}",
-        "extensionApiPath": "${EXTENSION_API}",
+        "projectRoot": project_root,
+        "extensionApiPath": extension_api,
     },
     "opens": [],
     "requests": [],
 }
-with open("${BENCH_SESSION}", "w") as f:
+with open(bench_session, "w") as f:
     json.dump(bench, f, indent=2)
 PYEOF
 
