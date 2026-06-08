@@ -137,8 +137,10 @@ pub fn stat_from_metadata(path: Utf8PathBuf, meta: &std::fs::Metadata) -> FileSt
 /// cheap (one `stat` syscall) and catches any write to the file (autoloads, warning config, etc.)
 /// without reading its content on every startup.
 ///
-/// Returns `0` if the file does not exist or cannot be stat'd — so a missing `project.godot` is
-/// treated as "everything changed" (key will not match any saved cache).
+/// Returns `0` if the file does not exist or cannot be stat'd. A project that has never had
+/// `project.godot` (or always lacks it) will consistently produce `0`, which correctly matches
+/// a cache saved under the same condition. A project that previously *had* the file and
+/// subsequently lost it will produce `0 ≠ <old fingerprint>`, triggering a cold rebuild.
 pub fn project_godot_fingerprint(root: &Utf8Path) -> u64 {
     let path = root.join("project.godot");
     match std::fs::metadata(path.as_std_path()) {

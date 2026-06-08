@@ -529,9 +529,9 @@ fn hover_member_signature(
 ) -> Option<String> {
     use gd_analyze::DtKind;
 
-    // Find a Call node whose span contains the cursor byte. The cursor may be directly on the
-    // Call node (at `(`/`)`) or on an inner Identifier child (the callee name) — both cases fall
-    // into the same "find the enclosing Call" logic.
+    // Find the innermost Call node whose span contains the cursor byte. The cursor is gated below
+    // to the callee member-name identifier; this only recovers the enclosing Call so we can reach
+    // the callee subscript and its base type.
     //
     // Pick the *innermost* (smallest-span) enclosing Call: DFS pre-order visits an outer call
     // before its inner ones, so for a nested callee — e.g. the cursor on `bar` in
@@ -559,6 +559,18 @@ fn hover_member_signature(
         return None;
     };
     let base_id = sub.base?;
+
+    // Gate: the cursor must land on the callee member name itself (the `.helper` identifier), not
+    // on the base receiver or an argument. Both of those live inside the enclosing Call span but
+    // carry their own types that `render_hover` must report; without this gate, hovering `l` or an
+    // argument in `l.helper(arg)` would wrongly surface `helper`'s signature.
+    let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access else {
+        return None;
+    };
+    let attr_span = tree.get(attr_id).span;
+    if !(attr_span.start <= cursor_byte && cursor_byte < attr_span.end) {
+        return None;
+    }
 
     // Get the base expression's resolved type — must be a project Script kind.
     let base_dt = analyzed.types.get(base_id);

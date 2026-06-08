@@ -46,7 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 usage() {
-    cat >&2 <<'USAGE'
+   cat >&2 <<'USAGE'
 Usage: run.sh --project PROJECT_ROOT [--godot GODOT_BIN]
               [--api EXTENSION_API] [--session SESSION_JSON]
 
@@ -64,10 +64,13 @@ Optional:
 Example:
   run.sh --project ~/projects/pixelorama --godot /usr/local/bin/godot4
 USAGE
-    exit 1
+   exit 1
 }
 
-die()  { echo "ERROR: $*" >&2; exit 1; }
+die() {
+   echo "ERROR: $*" >&2
+   exit 1
+}
 info() { echo "[m6-acceptance] $*"; }
 
 # ---------------------------------------------------------------------------
@@ -77,21 +80,33 @@ info() { echo "[m6-acceptance] $*"; }
 SESSION_JSON=""
 
 while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --project)  PROJECT_ROOT="${2:?'--project requires a path'}"; shift 2 ;;
-        --godot)    GODOT_BIN="${2:?'--godot requires a path'}";      shift 2 ;;
-        --api)      EXTENSION_API="${2:?'--api requires a path'}";    shift 2 ;;
-        --session)  SESSION_JSON="${2:?'--session requires a path'}"; shift 2 ;;
-        --help|-h)  usage ;;
-        *)          die "Unknown argument: '$1' (use --help for usage)" ;;
-    esac
+   case "$1" in
+   --project)
+      PROJECT_ROOT="${2:?'--project requires a path'}"
+      shift 2
+      ;;
+   --godot)
+      GODOT_BIN="${2:?'--godot requires a path'}"
+      shift 2
+      ;;
+   --api)
+      EXTENSION_API="${2:?'--api requires a path'}"
+      shift 2
+      ;;
+   --session)
+      SESSION_JSON="${2:?'--session requires a path'}"
+      shift 2
+      ;;
+   --help | -h) usage ;;
+   *) die "Unknown argument: '$1' (use --help for usage)" ;;
+   esac
 done
 
 # Validate required inputs
 : "${PROJECT_ROOT:?'PROJECT_ROOT is not set. Pass --project or export the environment variable.'}"
-[[ -d "${PROJECT_ROOT}" ]] \
-    || die "PROJECT_ROOT '${PROJECT_ROOT}' is not a directory."
-PROJECT_ROOT="$(cd "${PROJECT_ROOT}" && pwd)"   # canonicalize
+[[ -d "${PROJECT_ROOT}" ]] ||
+   die "PROJECT_ROOT '${PROJECT_ROOT}' is not a directory."
+PROJECT_ROOT="$(cd "${PROJECT_ROOT}" && pwd)" # canonicalize
 
 [[ -z "${SESSION_JSON}" ]] && SESSION_JSON="${SCRIPT_DIR}/walk.json"
 [[ -f "${SESSION_JSON}" ]] || die "Session template '${SESSION_JSON}' not found."
@@ -101,25 +116,25 @@ PROJECT_ROOT="$(cd "${PROJECT_ROOT}" && pwd)"   # canonicalize
 # ---------------------------------------------------------------------------
 
 if [[ -z "${EXTENSION_API:-}" ]]; then
-    : "${GODOT_BIN:?'GODOT_BIN is not set and --api was not supplied. Pass --godot or export GODOT_BIN.'}"
-    [[ -x "${GODOT_BIN}" ]] \
-        || die "GODOT_BIN '${GODOT_BIN}' is not an executable file."
+   : "${GODOT_BIN:?'GODOT_BIN is not set and --api was not supplied. Pass --godot or export GODOT_BIN.'}"
+   [[ -x "${GODOT_BIN}" ]] ||
+      die "GODOT_BIN '${GODOT_BIN}' is not an executable file."
 
-    info "Dumping extension_api.json via ${GODOT_BIN} ..."
-    API_TMPDIR="$(mktemp -d)"
-    trap 'rm -rf "${API_TMPDIR:-}"' EXIT
-    # --dump-extension-api-with-docs writes extension_api.json to cwd; --headless suppresses GPU init.
-    (
-        cd "${API_TMPDIR}"
-        "${GODOT_BIN}" --dump-extension-api-with-docs --headless 2>/dev/null || true
-    )
-    [[ -f "${API_TMPDIR}/extension_api.json" ]] \
-        || die "Godot did not produce extension_api.json in '${API_TMPDIR}'. Verify GODOT_BIN is a Godot 4.x build."
-    EXTENSION_API="${API_TMPDIR}/extension_api.json"
-    info "extension_api.json dumped to ${EXTENSION_API}"
+   info "Dumping extension_api.json via ${GODOT_BIN} ..."
+   API_TMPDIR="$(mktemp -d)"
+   trap 'rm -rf "${API_TMPDIR:-}"' EXIT
+   # --dump-extension-api-with-docs writes extension_api.json to cwd; --headless suppresses GPU init.
+   (
+      cd "${API_TMPDIR}"
+      "${GODOT_BIN}" --dump-extension-api-with-docs --headless 2>/dev/null || true
+   )
+   [[ -f "${API_TMPDIR}/extension_api.json" ]] ||
+      die "Godot did not produce extension_api.json in '${API_TMPDIR}'. Verify GODOT_BIN is a Godot 4.x build."
+   EXTENSION_API="${API_TMPDIR}/extension_api.json"
+   info "extension_api.json dumped to ${EXTENSION_API}"
 else
-    [[ -f "${EXTENSION_API}" ]] || die "EXTENSION_API '${EXTENSION_API}' does not exist."
-    info "Using extension_api.json: ${EXTENSION_API}"
+   [[ -f "${EXTENSION_API}" ]] || die "EXTENSION_API '${EXTENSION_API}' does not exist."
+   info "Using extension_api.json: ${EXTENSION_API}"
 fi
 # Canonicalize
 EXTENSION_API="$(cd "$(dirname "${EXTENSION_API}")" && pwd)/$(basename "${EXTENSION_API}")"
@@ -150,18 +165,44 @@ mkdir -p "${OUT_DIR}"
 
 CONCRETE_SESSION="${OUT_DIR}/concrete-session.json"
 info "Substituting template tokens ..."
-sed \
-    -e "s|__PROJECT_ROOT__|${PROJECT_ROOT}|g" \
-    -e "s|__EXTENSION_API__|${EXTENSION_API}|g" \
-    "${SESSION_JSON}" > "${CONCRETE_SESSION}"
+python3 - "${SESSION_JSON}" "${CONCRETE_SESSION}" "${PROJECT_ROOT}" "${EXTENSION_API}" <<'PYEOF'
+import json, sys
+
+# Substitute template tokens *inside JSON string values*, then re-serialize. Going through
+# json.load/json.dump (rather than a raw sed/text replace) means a path containing JSON
+# metacharacters — a literal `"` or `\` — is escaped correctly instead of producing invalid
+# JSON, and shell/sed metacharacters (`&`, `|`) in the path are never interpreted.
+session_path, out_path, project_root, extension_api = sys.argv[1:]
+
+subs = {
+    "__PROJECT_ROOT__": project_root,
+    "__EXTENSION_API__": extension_api,
+}
+
+def subst(node):
+    if isinstance(node, str):
+        for tok, val in subs.items():
+            node = node.replace(tok, val)
+        return node
+    if isinstance(node, list):
+        return [subst(x) for x in node]
+    if isinstance(node, dict):
+        return {k: subst(v) for k, v in node.items()}
+    return node
+
+with open(session_path) as f:
+    data = json.load(f)
+with open(out_path, "w") as f:
+    json.dump(subst(data), f, indent=2)
+PYEOF
 info "Concrete session: ${CONCRETE_SESSION}"
 
 # Guard: if the concrete session still contains unfilled file-role placeholders
 # (e.g. __CALLER_FILE__, __CALLEE_FILE__) the capability walk will crash with a
 # confusing FileNotFoundError.  Detect this early and give a clear message.
 if grep -q '__[A-Z_]*_FILE__' "${CONCRETE_SESSION}" 2>/dev/null; then
-    remaining="$(grep -o '__[A-Z_]*_FILE__' "${CONCRETE_SESSION}" | sort -u | tr '\n' ' ')"
-    die "Session still contains unfilled file-role placeholders: ${remaining}
+   remaining="$(grep -o '__[A-Z_]*_FILE__' "${CONCRETE_SESSION}" | sort -u | tr '\n' ' ')"
+   die "Session still contains unfilled file-role placeholders: ${remaining}
 Copy walk.json into scripts/m6-acceptance/sessions/<project>.json, replace
 each __*_FILE__ token with the relative path (from project root) to a real
 project file, fill in real positions, then pass --session <your-session.json>.
@@ -175,9 +216,9 @@ fi
 CAPABILITY_REPORT="${OUT_DIR}/capability-report.json"
 info "Running capability walk ..."
 python3 "${REPO_ROOT}/scripts/lsp-poke.py" \
-    --session "${CONCRETE_SESSION}" \
-    --gdls "${GDLS}" \
-    --out "${CAPABILITY_REPORT}"
+   --session "${CONCRETE_SESSION}" \
+   --gdls "${GDLS}" \
+   --out "${CAPABILITY_REPORT}"
 info "Capability report: ${CAPABILITY_REPORT}"
 
 # ---------------------------------------------------------------------------
@@ -221,16 +262,16 @@ PYEOF
 info "Cold bench run (clearing .gdls/) ..."
 rm -rf "${PROJECT_ROOT}/.gdls"
 python3 "${REPO_ROOT}/scripts/lsp-poke.py" \
-    --session "${BENCH_SESSION}" \
-    --gdls "${GDLS}" \
-    --out "${COLD_REPORT}"
+   --session "${BENCH_SESSION}" \
+   --gdls "${GDLS}" \
+   --out "${COLD_REPORT}"
 
 # Warm run — cache written by cold run.
 info "Warm bench run ..."
 python3 "${REPO_ROOT}/scripts/lsp-poke.py" \
-    --session "${BENCH_SESSION}" \
-    --gdls "${GDLS}" \
-    --out "${WARM_REPORT}"
+   --session "${BENCH_SESSION}" \
+   --gdls "${GDLS}" \
+   --out "${WARM_REPORT}"
 
 # ---------------------------------------------------------------------------
 # Step 6: Validate — write oss-report.json, exit non-zero on any failure
@@ -239,11 +280,11 @@ python3 "${REPO_ROOT}/scripts/lsp-poke.py" \
 info "Validating results ..."
 
 python3 - \
-    "${CAPABILITY_REPORT}" \
-    "${COLD_REPORT}" \
-    "${WARM_REPORT}" \
-    "${OUT_DIR}/oss-report.json" \
-<<'PYEOF'
+   "${CAPABILITY_REPORT}" \
+   "${COLD_REPORT}" \
+   "${WARM_REPORT}" \
+   "${OUT_DIR}/oss-report.json" \
+   <<'PYEOF'
 import json, sys, os
 
 cap_report_path, cold_path, warm_path, report_path = sys.argv[1:]

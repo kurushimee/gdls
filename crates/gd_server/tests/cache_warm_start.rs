@@ -565,6 +565,8 @@ fn warm_load_after_unsaved_buffer_edit_serves_disk_interface() {
 
 /// Timing breakdown: measure the individual phases of cold vs warm to diagnose ratio failures.
 /// This test is informational — it always passes, printing its findings to stderr.
+#[ignore = "informational only: re-runs the full 3k-file corpus with no assertions; the real gate \
+            is warm_start_is_five_times_faster_than_cold"]
 #[test]
 fn timing_breakdown() {
     let p = generate_corpus();

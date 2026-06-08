@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{file_uri, notification, recv, request, shutdown, TempProject};
+use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};
 use lsp_types::{
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
@@ -119,9 +119,7 @@ fn hover_at(client: &Connection, uri: &lsp_types::Uri, position: Position) -> Op
         .sender
         .send(request(10, "textDocument/hover", params))
         .unwrap();
-    let Message::Response(resp) = recv(client) else {
-        panic!("expected hover response");
-    };
+    let resp = recv_response(client);
     let value = resp.result.expect("hover result always present");
     serde_json::from_value(value).expect("valid Option<Hover>")
 }
@@ -143,9 +141,7 @@ fn definition_at(
         .sender
         .send(request(11, "textDocument/definition", params))
         .unwrap();
-    let Message::Response(resp) = recv(client) else {
-        panic!("expected definition response");
-    };
+    let resp = recv_response(client);
     let value = resp.result.expect("definition result always present");
     serde_json::from_value(value).expect("valid Option<GotoDefinitionResponse>")
 }
@@ -171,9 +167,7 @@ fn references_at(
         .sender
         .send(request(12, "textDocument/references", params))
         .unwrap();
-    let Message::Response(resp) = recv(client) else {
-        panic!("expected references response");
-    };
+    let resp = recv_response(client);
     assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
     serde_json::from_value(resp.result.expect("references result")).unwrap()
 }

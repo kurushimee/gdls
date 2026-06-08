@@ -462,6 +462,70 @@ fn hover_cross_file_method_shows_param_names() {
         md.contains("who: String"),
         "hover signature must render 'who: String', got {md:?}"
     );
+    assert!(
+        md.contains("func helper("),
+        "hover signature must render the `func helper(` prefix, got {md:?}"
+    );
+    assert!(
+        md.contains("-> int"),
+        "hover signature must render the `-> int` return type, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// Regression for the M6-F hover-scope gate: in `l.helper(5, "Bob")`, hovering the *base receiver*
+/// `l` must fall through to the ordinary type-label hover, NOT surface `helper`'s signature. Before
+/// the gate, `hover_member_signature` matched the whole enclosing Call span, so the base (and any
+/// argument) wrongly rendered `func helper(...)` instead of its own type.
+#[test]
+fn hover_on_call_base_does_not_show_callee_signature() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_base_not_sig");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    std::fs::write(
+        fixture_dir.join("lib.gd"),
+        "class_name Lib\nextends Node\n\nfunc helper(amount: int, who: String) -> int:\n\treturn amount\n",
+    )
+    .expect("write lib.gd");
+    // Line 3: `\tvar x = l.helper(5, "Bob")` — base `l` at col 9, `helper` at col 11..17.
+    let caller_src = "extends Node\n\nfunc test(l: Lib):\n\tvar x = l.helper(5, \"Bob\")\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover on the base receiver `l` at line 3, col 9 — must show its own type, never the callee sig.
+    let base_hover = hover_at(&client, &caller_uri, Position::new(3, 9))
+        .expect("hover on the typed base receiver should return its type label");
+    assert!(
+        !hover_markdown(&base_hover).contains("func helper("),
+        "hover on base receiver `l` must not surface the callee signature, got {:?}",
+        hover_markdown(&base_hover)
+    );
+
+    // Sanity: hovering the callee `helper` (col 13) DOES still render the signature, proving the
+    // gate narrowed scope rather than disabling the M6-F feature.
+    let callee_hover = hover_at(&client, &caller_uri, Position::new(3, 13))
+        .expect("hover on the callee must still return the signature");
+    assert!(
+        hover_markdown(&callee_hover).contains("func helper("),
+        "hover on callee `helper` must still render the signature, got {:?}",
+        hover_markdown(&callee_hover)
+    );
 
     shutdown(&client, handle);
     let _ = std::fs::remove_dir_all(&fixture_dir);

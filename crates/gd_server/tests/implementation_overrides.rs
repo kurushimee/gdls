@@ -4,8 +4,8 @@
 
 mod common;
 
-use common::{file_uri, notification, recv, request, shutdown, TempProject};
-use lsp_server::{Connection, Message};
+use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
+use lsp_server::Connection;
 use lsp_types::{
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
     InitializedParams, Position, TextDocumentIdentifier, TextDocumentItem,
@@ -101,9 +101,7 @@ fn implementation_on_method_returns_overrides() {
         .sender
         .send(request(10, "textDocument/implementation", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected implementation response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "implementation errored: {:?}",
@@ -185,9 +183,7 @@ fn implementation_on_unnamed_script_func_does_not_leak_class_subclasses() {
         .sender
         .send(request(11, "textDocument/implementation", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected implementation response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "implementation errored: {:?}",
