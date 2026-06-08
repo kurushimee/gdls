@@ -420,7 +420,12 @@ fn warm_load_skips_reparse_when_stat_matches() {
     );
     p.write("src/edit_target.gd", v3_src);
     // Reset mtime to T2 so disk stat = (S2, T2) = matches persisted stat_V2.
-    std::fs::File::open(edit_path.as_std_path())
+    // Open with write access: on Windows `set_modified` (SetFileTime) needs a handle with
+    // FILE_WRITE_ATTRIBUTES — a read-only `File::open` handle errors there (Linux's futimes
+    // accepts a read-only fd, which is why this only failed on windows-latest CI).
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(edit_path.as_std_path())
         .expect("open V3 for set_modified")
         .set_modified(v2_mtime)
         .expect("set_modified");
