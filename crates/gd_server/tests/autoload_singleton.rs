@@ -362,3 +362,66 @@ fn local_var_shadows_autoload_no_script_hover() {
 
     shutdown(&client, handle);
 }
+
+/// Shadow + definition gate: a body-local `var Global = 1` shadows the autoload singleton.
+/// `textDocument/definition` on the local `Global` reference must NOT jump to `global.gd`
+/// (the autoload script). It must return either `None` (no location for an inferred local) or
+/// a location in `shadow.gd` (pointing at the local declaration). This is the regression guard
+/// for the "never lie" fix that gates `find_autoload_definition` on the analyzer's binding.
+///
+/// Without the fix: the definition handler falls through to `find_autoload_definition` and
+/// returns `global.gd` — violating Godot's resolution order (locals shadow autoloads).
+/// With the fix: the autoload step checks that the analyzer recorded a `Binding::Use` whose
+/// `target_file` is the autoload's FileId at the cursor's span; for a shadowed local the
+/// analyzer resolves it at step 1 (suite-local) and records no autoload binding → no jump.
+#[test]
+fn local_var_shadows_autoload_no_definition_jump() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+    );
+    p.write(
+        "global.gd",
+        "extends Node\n\nfunc popup_error(msg: String) -> void:\n\tpass\n",
+    );
+    // shadow.gd: declares `var Global = 1` as a local, then references it.
+    // Line 0: `extends Node`
+    // Line 2: `func test():`
+    // Line 3: `\tvar Global = 1`   — `Global` (decl) at col 5..11
+    // Line 4: `\tprint(Global)`    — `Global` at col 7..13
+    p.write(
+        "shadow.gd",
+        "extends Node\n\nfunc test():\n\tvar Global = 1\n\tprint(Global)\n",
+    );
+
+    let (client, handle) = boot(&p);
+    did_open(&client, &p, "global.gd");
+    did_open(&client, &p, "shadow.gd");
+
+    let shadow_uri = file_uri(&p.root.join("shadow.gd"));
+    let global_uri = file_uri(&p.root.join("global.gd"));
+
+    // Go-to-definition on `Global` in `print(Global)` at line 4, col 8 (inside the identifier).
+    // The result must NOT be a location in global.gd — the autoload script.
+    // It may be None (no location for a body-local) or a location in shadow.gd.
+    let response = definition_at(&client, &shadow_uri, Position::new(4, 8));
+    if let Some(ref resp) = response {
+        let loc = match resp {
+            GotoDefinitionResponse::Scalar(loc) => loc.clone(),
+            GotoDefinitionResponse::Array(locs) if !locs.is_empty() => locs[0].clone(),
+            _ => {
+                shutdown(&client, handle);
+                return;
+            }
+        };
+        assert_ne!(
+            loc.uri, global_uri,
+            "definition on a shadowed local `Global` must NOT jump to the autoload global.gd; \
+             it resolved to {loc:?}"
+        );
+    }
+    // None is also correct — a body-local without an indexed declaration has no jump target.
+
+    shutdown(&client, handle);
+}

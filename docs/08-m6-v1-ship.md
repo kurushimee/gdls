@@ -1,6 +1,6 @@
 # 08 — M6: exposed-capability parity + warm-start cache (the v1 ship milestone)
 
-**Status: SHIPPED (2026-06-08).** M6 is complete — every exposed-capability parity item (A–G) plus
+**Status: READY TO SHIP (2026-06-08) — `v1.0.0` is tagged on merge.** M6 is complete — every exposed-capability parity item (A–G) plus
 autoload-singleton typing landed, the persistent warm-start cache is in (14.7× on a 3,000-file synthetic
 project; multi-instance-safe), and an OSS capability walk against a real Godot 4.6.3 project
 (Pixelorama) returns complete data on every row. Both ratchets hold (parser 186/186, analyzer 300/300).
