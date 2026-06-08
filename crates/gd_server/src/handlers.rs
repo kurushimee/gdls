@@ -1455,7 +1455,9 @@ fn push_identifier_locations(
 /// of its callee attribute-identifier (e.g. `l.helper()` → span of the `helper` identifier, not
 /// the whole `l.helper()` expression), following `CallNode.callee → SubscriptNode →
 /// Attribute(ident_id)`. Callees that aren't a subscript-attribute (bare function calls,
-/// `super()`, …) are simply absent from the map.
+/// `super()`, …) are absent from the map by design — their callee identifier is pre-reduced into a
+/// `Binding::Use` (reducer Call arm) and reported via [`push_binding_locations`], so projecting them
+/// here too would only double-report the same narrow span (which the de-dupe would then collapse).
 ///
 /// [`push_callee_ident_locations`] consults this instead of re-scanning the whole arena once per
 /// matched `Binding::Call` — that was O(nodes × matching_bindings) per file, slow on a large
@@ -1489,8 +1491,13 @@ fn callee_ident_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
 /// This replaces [`push_identifier_locations`] for method/signal targets in the M6-E references
 /// fix: raw textual identifier matching would include unrelated same-named declarations (e.g.
 /// `func helper():` in `other.gd`) whereas this filters to genuine callers of the specific method
-/// declared in `target_file`. Only subscript calls are emitted — bare/super calls without a
-/// resolved `callee_file` will have `None` for that field and won't match a `Some(target_file)`.
+/// declared in `target_file`. Only subscript-attribute call sites are emitted here; bare and
+/// `super` call sites are intentionally absent — but NOT dropped from references. The dispatcher
+/// pre-reduces a bare callee (and a subscript callee's base) as an identifier, recording a
+/// `Binding::Use` at that narrow span which [`push_binding_locations`] reports. (Bare calls DO carry
+/// `callee_file == Some(declaring_file)` via `resolve_callee_file`/WP-RD6 — recall for them rides
+/// that `Use` binding, not this call projection; see `references_finds_bare_same_file_call` and
+/// `references_finds_signal_emit_and_connect_sites`.)
 ///
 /// Caller must ensure `target_file` is `Some` before calling; the `None` guard lives in
 /// `references()` (fall back to `push_identifier_locations` when `target_file` is `None`).
@@ -1622,11 +1629,10 @@ fn find_method_overrides(
             continue;
         };
 
-        // Point to the override's span in the subclass file: prefer the MemberDecl.span
-        // (the `func` keyword…body start), falling back to file start.
-        let override_span = Some(override_decl.span);
+        // Point to the override's span (the `func` keyword…body start) in the subclass file.
+        let span = override_decl.span;
 
-        let range = if let Some(span) = override_span {
+        let range = {
             let cand_text = match state.vfs.get(cand_uri.as_str()).map(|d| d.text()) {
                 Some(t) => t,
                 None => match std::fs::read_to_string(sub_path.as_std_path()) {
@@ -1643,8 +1649,6 @@ fn find_method_overrides(
             let rope = Rope::from_str(&cand_text);
             let cand_mapper = PositionMapper::new(&rope, enc);
             cand_mapper.span_to_range(span)
-        } else {
-            file_start_range()
         };
 
         locations.push(Location {

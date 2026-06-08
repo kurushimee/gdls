@@ -447,3 +447,81 @@ fn references_on_property_at_attribute_site_finds_other_reads() {
 
     shutdown(&client, server_thread);
 }
+
+/// Signal-reference recall: find-references on a `signal hit` declaration must include the signal's
+/// use sites (`hit.emit()`, `hit.connect(...)`). These reach the signal through the **base** of a
+/// subscript call, not its callee — the `Binding::Call` for `hit.emit()` records `callee_name =
+/// "emit"`, never `"hit"`, so the callee-filtered method projection (`push_callee_ident_locations`)
+/// can never match. Recall instead rides the base identifier `hit`, which the dispatcher pre-reduces
+/// as an identifier (`reducer.rs` Call arm) into a `Binding::Use{target_name: "hit"}` that
+/// `push_binding_locations` reports. This is a distinct path from the bare-call case above, so it
+/// gets its own guard.
+#[test]
+fn references_finds_signal_emit_and_connect_sites() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+
+    // Line 0: `extends Node`
+    // Line 2: `signal hit`        — `hit` declaration at col 7..10
+    // Line 4: `func a():`
+    // Line 5: `\thit.emit()`      — `hit` base at col 1..4 (after the tab)
+    // Line 7: `func b():`
+    // Line 8: `\thit.connect(a)`  — `hit` base at col 1..4
+    p.write(
+        "sig.gd",
+        "extends Node\n\nsignal hit\n\nfunc a():\n\thit.emit()\n\nfunc b():\n\thit.connect(a)\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["sig.gd"]);
+
+    let sig_uri = file_uri(&p.root.join("sig.gd"));
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: sig_uri.clone(),
+            },
+            // Click on `hit` at line 2, col 7 (the `signal hit` declaration).
+            position: Position {
+                line: 2,
+                character: 7,
+            },
+        },
+        context: ReferenceContext {
+            include_declaration: false,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(90, "textDocument/references", params))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    // Both signal-use sites must be reported: the `emit` site (line 5) and the `connect` site
+    // (line 8), each on the `hit` base identifier at col 1 (after the tab).
+    for line in [5, 8] {
+        assert!(
+            locs.iter()
+                .any(|l| l.uri == sig_uri && l.range.start.line == line),
+            "references on `signal hit` must include the use site at line {line}; got: {locs:?}"
+        );
+        for loc in locs
+            .iter()
+            .filter(|l| l.uri == sig_uri && l.range.start.line == line)
+        {
+            assert_eq!(
+                loc.range.start.character, 1,
+                "signal use site range should start at `hit` col 1 (after tab); got {loc:?}"
+            );
+        }
+    }
+
+    shutdown(&client, server_thread);
+}
