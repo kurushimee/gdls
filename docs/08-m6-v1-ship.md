@@ -1,7 +1,11 @@
 # 08 — M6: exposed-capability parity + warm-start cache (the v1 ship milestone)
 
-**Status:** M6 milestone spec · authored 2026-06-01 · supersedes the "ship now" recommendation reached at
-the close of M5 Phase H. **M6 is the final milestone of Phase 1 — completing it is what ships and tags v1.0.0.**
+**Status: SHIPPED (2026-06-08).** M6 is complete — every exposed-capability parity item (A–G) plus
+autoload-singleton typing landed, the persistent warm-start cache is in (14.7× on a 3,000-file synthetic
+project; multi-instance-safe), and an OSS capability walk against a real Godot 4.6.3 project
+(Pixelorama) returns complete data on every row. Both ratchets hold (parser 186/186, analyzer 300/300).
+`v1.0.0` is tagged from the integration branch on merge. The spec below is preserved as authored
+(2026-06-01); see [`CHANGELOG.md`](../CHANGELOG.md) for what landed and the Phase-2 deferrals.
 
 The M5 Phase H walk against a large real-world GDScript project returned GREEN **against the original bar** ("no crashes,
 no wrong answers, safe-but-sometimes-incomplete is acceptable"). The bar has since been raised:

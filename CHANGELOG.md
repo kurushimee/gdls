@@ -7,9 +7,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased] — targeting v1.0.0
 
-`1.0.0` is bumped in-tree but **deliberately untagged**: the ship bar was raised at the close of M5, so
-v1 now ships with **M6** (exposed-capability parity + a persistent warm-start cache). Everything below
-has landed (M0–M5); the **M6** section lists what remains before `1.0.0` is tagged. Full M6 scope:
+`1.0.0` is bumped in-tree and **M6 has landed** — the ship bar raised at the close of M5
+(exposed-capability parity vs Godot's own LSP + a persistent warm-start cache) is met. Everything below
+has landed (M0–M6); `1.0.0` is tagged from this branch once merged. Full M6 scope:
 [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md).
 
 ### Diagnostics
@@ -48,18 +48,30 @@ has landed (M0–M5); the **M6** section lists what remains before `1.0.0` is ta
 - M4 freshness watcher + 4 nav handlers + cross-file cycle detection
 - M5 hardening, observability, parity gap closure
 
-### M6 — remaining for v1 (in progress)
+### M6 — landed (ships v1.0.0)
 
-The raised ship bar pulls these into Phase 1 before `1.0.0` is tagged (full design:
-[`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md)):
-- Exposed-capability parity vs Godot's own LSP — `hover` member/call/`preload` signatures (M6-F);
-  `definition` for `class_name`-in-expression (M6-B), `preload`/`load` strings (M6-C), autoloads (M6-D);
-  project-wide `references` through typed vars (M6-E); hierarchical `documentSymbol` (M6-A);
-  `implementation` for method overrides (M6-G).
-- Persistent warm-start index cache — stat-validated `(size, mtime_ns)`, atomic multi-instance-safe
-  writes (M6-H / M6-I), plus a reconcile-by-stat path that stops re-parsing unchanged files.
-- Exit gate: every exposed capability ⊇ Godot's own LSP; warm start > 5× faster than cold scan; both
-  ratchets still 1.0000 / 1.0000; a clean re-run of the capability walk — then tag **v1.0.0**.
+The raised ship bar is met (full design: [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md)):
+- **Exposed-capability parity vs Godot's own LSP** — `hover` renders member/call/`preload` signatures
+  with parameter names (M6-F); `definition` resolves `class_name`-in-expression (M6-B), `preload`/`load`
+  `res://` strings (M6-C1), and autoload names (M6-D); `documentLink` on resolving `res://` literals
+  (M6-C2); project-wide `references` through typed vars (M6-E); hierarchical `documentSymbol` with a root
+  `Class` (M6-A); `implementation` for method overrides across direct + transitive subclasses (M6-G).
+  All res://-resolving navigation gates on index membership — never a link/Location to a file that isn't
+  on disk ("never lie").
+- **Autoload-singleton typing** — autoload names resolve to their script's instance type, so member
+  access through a singleton (`Global.popup_error()`) gives the full hover signature and project-wide
+  references, matching Godot (closes a parity gap the OSS acceptance walk surfaced; analyzer-level,
+  ratchets unaffected).
+- **Persistent warm-start index cache** — serde-serialized `Index` keyed by
+  `(format_version, gdls_version, NativeDb::content_hash, project.godot fingerprint)` + a per-file
+  `(size, mtime_ns)` table; atomic, multi-instance-safe (temp + rename, last-writer-wins, tolerant
+  reads → cold fallback, never crashes) (M6-H / M6-I); `reconcile` re-parses only stat-changed files.
+- **Verified:** a clean capability walk on a real Godot 4.6.3 OSS project (every exposed capability
+  returns complete data); warm start **14.7×** faster than cold on a 3,000-file synthetic project
+  (>5× exit gate); ratchets hold **1.0000 / 1.0000** (parser 186/186, analyzer 300/300).
+- **Deferred to Phase 2** (documented, not regressions): go-to-`definition` on a cross-file method
+  *member* (hover/references on members work); precise typing of `$`/`%` nodes; `completion`,
+  `signatureHelp`, `rename`, `documentHighlight`.
 
 ---
 
