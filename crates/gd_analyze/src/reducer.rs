@@ -1455,26 +1455,13 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             name.clone(),
             site,
         ));
-        // Script INSTANCE type (is_meta_type=false, is_constant=false) — unlike `script_meta_type`
-        // (the class_name metatype). The singleton IS the instance; callers do `Global.method()`,
-        // not `Global.new()`. This makes `reduce_identifier_from_base` / `reduce_subscript` walk
-        // the script's interface members correctly — exactly the same path that resolves
+        // Script INSTANCE type — unlike `script_meta_type` (the class_name metatype). The singleton
+        // IS the instance; callers do `Global.method()`, not `Global.new()`. Reuse the existing
+        // metatype→instance lowering (`type_from_metatype`) the class_name branch uses, so this stays
+        // field-identical if those helpers change. This makes `reduce_identifier_from_base` /
+        // `reduce_subscript` walk the script's interface members — the same path that resolves
         // `var l: Lib; l.helper()` (M6-E), which already works.
-        ctx.set_type(
-            id,
-            DataType {
-                type_source: TypeSource::AnnotatedExplicit,
-                kind: DtKind::Script,
-                builtin_type: VariantType::Object,
-                is_meta_type: false,
-                is_constant: false,
-                script_type: Some(crate::data_type::ScriptRef {
-                    file: fid,
-                    inner: Vec::new(),
-                }),
-                ..Default::default()
-            },
-        );
+        ctx.set_type(id, type_from_metatype(script_meta_type(fid)));
         return;
     }
 
