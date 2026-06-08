@@ -312,10 +312,45 @@ pub fn definition(
         return Some(GotoDefinitionResponse::Scalar(loc));
     }
 
-    // (D) Autoload singleton — last fallback so in-file members and class_name declarations
-    // shadow autoload names (Godot's own resolution order: locals → members → class_name → autoload).
-    if let Some(loc) = find_autoload_definition(state, &name) {
-        return Some(GotoDefinitionResponse::Scalar(loc));
+    // (D) Autoload singleton — last fallback so in-file members, class_name declarations, AND
+    // body-local vars/parameters shadow autoload names.
+    //
+    // The "never lie" gate: only jump to the autoload script when the analyzer's `reduce_identifier`
+    // actually resolved THIS occurrence to the autoload (step 9 — the last fallback in the
+    // analyzer's priority chain: local → param → class member → native → class_name → builtin →
+    // global-const → autoload). The analyzer records a `Binding::Use { target_file: Some(fid) }`
+    // at the cursor's span when and only when steps 1–8 all missed — i.e. exactly when nothing
+    // shadows the autoload. Gating here rather than re-implementing scope lookup means the
+    // definition handler inherits the analyzer's precedence by construction.
+    //
+    // Implementation: resolve the autoload name → FileId first (cheap, no analysis), then run
+    // the analyzer (cached — same call as hover) and check for the sentinel Use binding at the
+    // cursor span. If the binding is absent the identifier was shadowed by a local/param/member
+    // and we must NOT jump (return None, not the autoload Location).
+    {
+        let autoload_fid = state
+            .workspace
+            .project
+            .autoload_script_path(&name)
+            .map(str::to_owned)
+            .and_then(|p| state.workspace.index.resolve_res_path(&p));
+        if let Some(fid) = autoload_fid {
+            let node_span = parsed.tree.get(node_id).span;
+            let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+            let resolved_to_autoload = analyzed.as_deref().is_some_and(|a| {
+                a.bindings().iter().any(|b| {
+                    matches!(b,
+                        Binding::Use { site, target_file: Some(f), .. }
+                            if *site == node_span && *f == fid
+                    )
+                })
+            });
+            if resolved_to_autoload {
+                if let Some(loc) = find_autoload_definition(state, &name) {
+                    return Some(GotoDefinitionResponse::Scalar(loc));
+                }
+            }
+        }
     }
 
     // (3) Native / unknown: no location.
