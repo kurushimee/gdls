@@ -525,3 +525,74 @@ fn references_finds_signal_emit_and_connect_sites() {
 
     shutdown(&client, server_thread);
 }
+
+/// Native subscript-call recall: a cursor on `_ready` in `self._ready()` (a NATIVE `Node` method,
+/// so the reducer records `Binding::Call { callee_file: None }`) must still report the cross-file
+/// `self._ready()` occurrence in another file. Regression guard for the `target_file` conflation
+/// where `find_map(..).flatten().or(current_fid)` collapsed the native `Some(None)` case into the
+/// current file: `push_callee_ident_locations` then filtered on `callee_file == Some(current_fid)`
+/// — which no native call carries — and silently dropped every cross-file reference. The fix keeps
+/// `target_file = None` for native callees so the scan falls back to `push_identifier_locations`
+/// (raw text scan), the pre-M6 behaviour.
+#[test]
+fn references_on_native_subscript_call_finds_cross_file_uses() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+
+    // a.gd calls the native `_ready` through `self`. `_ready` identifier at line 3:
+    // `\tself._ready()` → tab=col0, `self`=1..5, `.`=col5, `_ready`=col6..12.
+    p.write("a.gd", "extends Node\n\nfunc setup():\n\tself._ready()\n");
+    // b.gd makes the same native call — the cross-file occurrence the bug dropped.
+    p.write("b.gd", "extends Node\n\nfunc run():\n\tself._ready()\n");
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["a.gd", "b.gd"]);
+
+    let a_uri = file_uri(&p.root.join("a.gd"));
+    let b_uri = file_uri(&p.root.join("b.gd"));
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: a_uri.clone() },
+            // Click inside `_ready` at line 3, col 8.
+            position: Position {
+                line: 3,
+                character: 8,
+            },
+        },
+        context: ReferenceContext {
+            include_declaration: false,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(11, "textDocument/references", params))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    assert!(
+        locs.iter().any(|l| l.uri == a_uri),
+        "references on native `_ready` must include the current-file call site in a.gd; \
+         got: {locs:?}"
+    );
+    assert!(
+        locs.iter().any(|l| l.uri == b_uri),
+        "references on native `_ready` must include the cross-file call site in b.gd \
+         (native callee → raw text scan, not callee_file-filtered); got: {locs:?}"
+    );
+    // The reported occurrences must be the narrow `_ready` identifier (col 6), not the whole call.
+    for loc in locs.iter().filter(|l| l.uri == a_uri || l.uri == b_uri) {
+        assert_eq!(
+            loc.range.start.character, 6,
+            "native call site range should start at `_ready` identifier col 6; got {loc:?}"
+        );
+    }
+
+    shutdown(&client, server_thread);
+}

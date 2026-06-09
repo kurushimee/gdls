@@ -1160,35 +1160,42 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             // contains the cursor byte. If found (call-site click), target_file = callee_file.
             // The shared callee-span map (`callee_spans`, hoisted above) is built lazily on the
             // first matching binding and reused by push_callee_ident_locations below.
-            cur_result
-                .bindings()
-                .iter()
-                .find_map(|b| {
-                    if let Binding::Call {
-                        callee_file,
-                        callee_name,
-                        call_site,
-                        ..
-                    } = b
-                    {
-                        if callee_name == name.as_str() {
-                            let spans = callee_spans
-                                .get_or_insert_with(|| callee_ident_spans(&parsed.tree));
-                            if let Some(ident_span) = spans.get(call_site).copied() {
-                                if ident_span.start <= byte && byte < ident_span.end {
-                                    return Some(*callee_file);
-                                }
+            cur_result.bindings().iter().find_map(|b| {
+                if let Binding::Call {
+                    callee_file,
+                    callee_name,
+                    call_site,
+                    ..
+                } = b
+                {
+                    if callee_name == name.as_str() {
+                        let spans =
+                            callee_spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
+                        if let Some(ident_span) = spans.get(call_site).copied() {
+                            if ident_span.start <= byte && byte < ident_span.end {
+                                return Some(*callee_file);
                             }
                         }
                     }
-                    None
-                })
-                .flatten()
+                }
+                None
+            })
         } else {
             None
         };
-        // If no call-binding at cursor (declaration click), use current_fid.
-        target_file_from_binding.or(current_fid)
+        // Distinguish the two None origins that the old `.flatten().or(current_fid)` conflated —
+        // collapsing them dropped every cross-file reference for native subscript calls
+        // (e.g. `node.queue_free()`, whose Binding::Call carries callee_file: None):
+        //   Some(Some(f)) — call-site click on a resolved callee: the declaring file is `f`.
+        //   Some(None)    — call-site click on a NATIVE/unresolved callee: keep target_file None so
+        //                   the scan falls back to push_identifier_locations (raw text scan) rather
+        //                   than filtering on a callee_file that no Binding::Call carries.
+        //   None          — no Binding::Call at the cursor (declaration-site click): the current
+        //                   file declares the method, so target_file = current_fid.
+        match target_file_from_binding {
+            Some(cf) => cf,
+            None => current_fid,
+        }
     } else {
         None
     };

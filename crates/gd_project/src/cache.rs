@@ -149,7 +149,15 @@ pub fn project_godot_fingerprint(root: &Utf8Path) -> u64 {
             // Mix size + mtime into a single u64 with a cheap multiply-xor hash.
             let a = stat.size;
             let b = stat.mtime_ns as u64; // truncate to 64 bits — lower bits carry the change
-            a.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(b)
+            let h = a.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(b);
+            // Reserve 0 exclusively for the "absent/unstat-able" sentinel (Err branch). A real
+            // file whose size+mtime mix lands on 0 would otherwise be indistinguishable from a
+            // deleted project.godot and could match a stale cache; bump it to 1.
+            if h == 0 {
+                1
+            } else {
+                h
+            }
         }
         Err(_) => 0,
     }
