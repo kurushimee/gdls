@@ -558,3 +558,87 @@ fn local_var_shadows_autoload_no_definition_jump() {
 
     shutdown(&client, handle);
 }
+
+/// Hover on the SIGNAL member in `Global.game_over.emit(7)` must render the signal's declared
+/// signature (`signal game_over(score: int)`), not the degraded `Variant` expression type. The
+/// signal identifier here is the attribute of the callee's BASE subscript — the enclosing Call's
+/// callee attribute is `emit`, never `game_over` — so this rides the attribute-fallback hover
+/// path (`hover_attribute_member_signature`), not the Call-gated one.
+#[test]
+fn hover_on_autoload_signal_member_shows_signal_signature() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+    );
+    // Line 2: `signal game_over(score: int)`
+    p.write(
+        "global.gd",
+        "extends Node\n\nsignal game_over(score: int)\n",
+    );
+    // Line 3: `\tGlobal.game_over.emit(7)` — `\tGlobal.` is 8 bytes, so `game_over` spans cols 8-16.
+    p.write(
+        "caller.gd",
+        "extends Node\n\nfunc test():\n\tGlobal.game_over.emit(7)\n",
+    );
+    let (client, handle) = boot(&p);
+    did_open(&client, &p, "global.gd");
+    did_open(&client, &p, "caller.gd");
+
+    let caller_uri = file_uri(&p.root.join("caller.gd"));
+    let hover = hover_at(&client, &caller_uri, Position::new(3, 10))
+        .expect("hover on game_over should return content");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("signal game_over"),
+        "hover must render the signal declaration, got: {md:?}"
+    );
+    assert!(
+        md.contains("score") && md.contains("int"),
+        "hover must include the signal param `score: int`, got: {md:?}"
+    );
+    assert!(
+        !md.contains("Variant"),
+        "hover must NOT show the degraded 'Variant' type for a resolved signal member, got: {md:?}"
+    );
+    shutdown(&client, handle);
+}
+
+/// Hover on an UNCALLED func member reference (`var _f = Global.popup_error`) must render the
+/// function signature. There is no enclosing Call node for the Call-gated hover to find, so this
+/// is the Func arm of the attribute-fallback path.
+#[test]
+fn hover_on_uncalled_autoload_func_member_shows_signature() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+    );
+    p.write(
+        "global.gd",
+        "extends Node\n\nfunc popup_error(msg: String) -> void:\n\tpass\n",
+    );
+    // Line 3: `\tvar _f = Global.popup_error` — `\tvar _f = Global.` is 17 bytes, so
+    // `popup_error` spans cols 17-27.
+    p.write(
+        "caller.gd",
+        "extends Node\n\nfunc test():\n\tvar _f = Global.popup_error\n",
+    );
+    let (client, handle) = boot(&p);
+    did_open(&client, &p, "global.gd");
+    did_open(&client, &p, "caller.gd");
+
+    let caller_uri = file_uri(&p.root.join("caller.gd"));
+    let hover = hover_at(&client, &caller_uri, Position::new(3, 19))
+        .expect("hover on uncalled popup_error reference should return content");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("func popup_error"),
+        "hover must render the function signature, got: {md:?}"
+    );
+    assert!(
+        md.contains("msg") && md.contains("String"),
+        "hover must include param `msg: String`, got: {md:?}"
+    );
+    shutdown(&client, handle);
+}

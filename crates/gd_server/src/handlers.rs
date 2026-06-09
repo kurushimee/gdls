@@ -230,10 +230,17 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     // M6-F: when the cursor is on an identifier that's the callee of a resolved cross-file call,
     // render the callee's `MemberDecl` signature instead of (or in addition to) the type label.
     // This supersedes the generic type-table hover for call-site identifiers and gives the user
-    // a `func helper(...) -> R` line rather than just the return type.
+    // a `func helper(...) -> R` line rather than just the return type. The attribute fallback
+    // covers member identifiers in non-callee position: the signal in `obj.sig.emit()` or an
+    // uncalled `obj.method` reference.
     let member_sig = analyzed
         .as_deref()
-        .and_then(|a| hover_member_signature(state, &parsed.tree, byte, a));
+        .and_then(|a| hover_member_signature(state, &parsed.tree, byte, a))
+        .or_else(|| {
+            analyzed
+                .as_deref()
+                .and_then(|a| hover_attribute_member_signature(state, &parsed.tree, byte, a))
+        });
 
     let markdown = if let Some(sig) = member_sig {
         sig
@@ -589,10 +596,17 @@ fn hover_member_signature(
     let iface = state.workspace.index.interface(callee_file)?;
     let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
 
-    // Format: `func name(param_name: ParamType, …) -> ReturnType`
-    // Zip param_names and params in lockstep; fall back to type-only when the name is empty.
-    let params_str = decl
-        .params
+    let sig = format_func_signature(fn_name, decl);
+    let mut md = String::from("```gdscript\n");
+    md.push_str(&sig);
+    md.push_str("\n```");
+    Some(md)
+}
+
+/// Render a `MemberDecl`'s params as `name: Type, …` — zip `param_names` and `params` in lockstep;
+/// fall back to type-only when the name is empty.
+fn format_member_params(decl: &gd_project::MemberDecl) -> String {
+    decl.params
         .iter()
         .enumerate()
         .map(|(i, p)| {
@@ -608,7 +622,12 @@ fn hover_member_signature(
             }
         })
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(", ")
+}
+
+/// Format a `Func` member as `func name(param_name: ParamType, …) -> ReturnType`.
+fn format_func_signature(fn_name: &str, decl: &gd_project::MemberDecl) -> String {
+    let params_str = format_member_params(decl);
     let ret_str = match &decl.ty {
         gd_project::TypeExpr::Named { path, .. } => path.join("."),
         // `interface::type_expr` collapses BOTH an explicit `-> void` (empty type node) and an
@@ -618,12 +637,61 @@ fn hover_member_signature(
         // interface extraction to carry "explicit void" vs "no annotation" — out of scope.)
         gd_project::TypeExpr::None => "void".to_string(),
     };
-    let sig = format!("func {}({}) -> {}", fn_name, params_str, ret_str);
+    format!("func {fn_name}({params_str}) -> {ret_str}")
+}
 
-    let mut md = String::from("```gdscript\n");
-    md.push_str(&sig);
-    md.push_str("\n```");
-    Some(md)
+/// Member-signature hover for a subscript ATTRIBUTE identifier outside a callee position — the
+/// signal in `obj.sig.emit()` / `Singleton.sig.connect(…)`, or an uncalled method reference like
+/// `var f = obj.method` — where the base expression resolves to a project script. The Call-gated
+/// [`hover_member_signature`] can't reach these: for `obj.sig.emit()` the enclosing Call's callee
+/// attribute is `emit`, never `sig`. Renders `func`/`signal` member signatures from the base
+/// script's interface; every other member kind returns `None` so the expression-type label keeps
+/// reporting the analyzer's resolved type (the honest answer until the cross-file instance-member
+/// typing slice lands — see the Script-instance deferral note in `reducer.rs`).
+fn hover_attribute_member_signature(
+    state: &ServerState,
+    tree: &ParseTree,
+    cursor_byte: usize,
+    analyzed: &AnalysisResult,
+) -> Option<String> {
+    use gd_analyze::DtKind;
+
+    // The subscript whose attribute identifier spans the cursor. Attribute identifier spans are
+    // disjoint across nesting (each is a distinct source token), so the first hit is the only hit.
+    let (sub_base, attr_id) = tree.iter_ids().find_map(|id| {
+        let node = tree.get(id);
+        if let NodeKind::Subscript(sub) = &node.kind {
+            if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
+                let s = tree.get(attr_id).span;
+                if s.start <= cursor_byte && cursor_byte < s.end {
+                    return Some((sub.base, attr_id));
+                }
+            }
+        }
+        None
+    })?;
+    let base_id = sub_base?;
+
+    let base_dt = analyzed.types.get(base_id);
+    if base_dt.kind != DtKind::Script {
+        return None;
+    }
+    let script_ref = base_dt.script_type.as_ref()?;
+    let iface = state.workspace.index.interface(script_ref.file)?;
+    let name = ident_name(tree, attr_id);
+    if name.is_empty() {
+        return None;
+    }
+    let decl = iface.members.iter().find(|m| m.name.as_str() == name)?;
+
+    let sig = match decl.kind {
+        gd_project::MemberKind::Func => format_func_signature(name, decl),
+        gd_project::MemberKind::Signal => {
+            format!("signal {}({})", name, format_member_params(decl))
+        }
+        _ => return None,
+    };
+    Some(format!("```gdscript\n{sig}\n```"))
 }
 
 fn append_class_docs(md: &mut String, class: &NativeClass) {
