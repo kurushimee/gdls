@@ -258,6 +258,9 @@ fn serve_inner(
     // each file clears its own bit on first `analyze`, so there is no
     // startup-time republish to perform here.
     let open_paths = open_buffer_paths(&state);
+    // On a warm start this is the second full walk (`warm_index_from_cache` already stat-diffed
+    // the tree) — deliberate: reconcile is the single authoritative settle pass for cold and warm
+    // alike. Rationale and bench witness in `warm_index_from_cache`'s doc.
     let report = state.workspace.reconcile(&open_paths);
     // M5 WP-O1 — preserved verbatim marker (operators & log-greppers depend on this exact label).
     // The reconcile span has already closed at this point (it lives inside Workspace::reconcile),

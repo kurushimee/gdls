@@ -783,6 +783,16 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 /// them use the raw scan restores correct (over-approximating, never under-reporting) recall, which
 /// is the v1 stance for property/field references.
 ///
+/// The declaration arm deliberately matches a `Function`/`Signal` identifier at *any* class depth —
+/// inner-class methods (`class Foo:` … `func helper():`) included. `Binding::Call` records carry a
+/// `callee_file` but no owning-class path, so a root-class and an inner-class method sharing one
+/// name in one file are indistinguishable at call-site granularity: both declaration clicks take
+/// the project-wide scan and their result sets may mix the two methods' call sites. That is the
+/// same over-approximating, never under-reporting stance as above — routing inner declarations to
+/// the raw-identifier scan instead would *drop* their cross-file call sites (the `name_referencers`
+/// index only sees interface-level names) while still mixing in-file textual matches. Splitting
+/// them cleanly needs the owning class recorded on `Binding::Call` — a post-v1 refinement.
+///
 /// Used to decide whether `textDocument/references` uses the project-wide text scan (correct for
 /// method/signal targets reached through body-local typed vars) or the faster `name_referencers`
 /// index (correct for class/type/variable/property targets). Purely structural (O(#nodes), no

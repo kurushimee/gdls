@@ -880,6 +880,15 @@ fn build_cache_key(native: &NativeDb, root: &Utf8Path) -> cache::CacheKey {
 ///
 /// Preserves `FileId` stability by reusing the deserialized index's path arena; new files append.
 /// Walk errors are logged but do not abort — the post-load reconcile is a backstop.
+///
+/// That backstop means a warm startup stats every `.gd` twice — this walk plus `reconcile`'s — a
+/// deliberate cost, not an oversight. Reconcile stays unconditional so cold and warm startups
+/// converge on the same authoritative settle pass: it has final authority on removals, produces
+/// the dirty set and the `post_cold_reconcile` marker line, and settles the state the cache save
+/// then persists. The warm-start gate (>5×; 14.7× measured on the 3 000-file synthetic project)
+/// holds with the double walk in place, so folding the two passes (teaching reconcile to trust
+/// this walk's fresh stat table) is deferred to the first project that actually flags startup
+/// stat cost, per the plan's "lands OR documented bench witness" rule.
 fn warm_index_from_cache(
     loaded: gd_project::cache::LoadedCache,
     root: &Utf8Path,
