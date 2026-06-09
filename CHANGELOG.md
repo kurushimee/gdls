@@ -5,11 +5,16 @@ All notable changes to `gdls` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — targeting v1.0.0
+## [Unreleased]
 
-`1.0.0` is bumped in-tree and **M6 has landed** — the ship bar raised at the close of M5
-(exposed-capability parity vs Godot's own LSP + a persistent warm-start cache) is met. Everything below
-has landed (M0–M6); `1.0.0` is tagged from this branch once merged. Full M6 scope:
+(nothing yet)
+
+## [1.0.0] — 2026-06-10
+
+The first release. **M6 has landed** — the ship bar raised at the close of M5 (exposed-capability
+parity vs Godot's own LSP + a persistent warm-start cache) is met, and both final acceptance walks
+(an OSS Godot 4.6.3 project and a Windows-native walk on a 2,338-script production project) came
+back clean. Everything below is what v1.0.0 contains (M0–M6). Full M6 scope:
 [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md).
 
 ### Diagnostics
@@ -66,15 +71,27 @@ The raised ship bar is met (full design: [`docs/08-m6-v1-ship.md`](docs/08-m6-v1
   `(format_version, gdls_version, NativeDb::content_hash, project.godot fingerprint)` + a per-file
   `(size, mtime_ns)` table; atomic, multi-instance-safe (temp + rename, last-writer-wins, tolerant
   reads → cold fallback, never crashes) (M6-H / M6-I); `reconcile` re-parses only stat-changed files.
-- **Verified:** a clean capability walk on a real Godot 4.6.3 OSS project (every exposed capability
-  returns complete data); warm start **14.7×** faster than cold on a 3,000-file synthetic project
-  (>5× exit gate); ratchets hold **1.0000 / 1.0000** (parser 186/186, analyzer 300/300).
-- **Deferred to Phase 2** (documented, not regressions): go-to-`definition` on a cross-file method
-  *member* (hover/references on members work); precise typing of `$`/`%` nodes; `completion`,
-  `signatureHelp`, `rename`, `documentHighlight`.
+- **Attribute-fallback hover** — `func`/`signal` member signatures also render when the member
+  identifier is *not* a call's callee: the signal in `Singleton.sig.emit(…)`/`obj.sig.connect(…)`
+  and uncalled references like `var f = obj.method` (caught by the final acceptance walks; the
+  Call-gated path alone left these on the degraded type label).
+- **Verified (final acceptance):** the parameterized runner (`scripts/m6-acceptance/`) passes every
+  capability row on a real Godot 4.6.3 OSS project (Pixelorama, committed session — including
+  autoload-singleton member hover/references); a Windows-native walk on a 2,338-script production
+  project returns correct data on every row with graceful degradation of doc-less GDExtensions and
+  the cache stat-diffing `2338 unchanged, 0 reparsed` over NTFS; warm start **14.7×** faster than
+  cold on the 3,000-file synthetic gate (>5× exit criterion); ratchets hold **1.0000 / 1.0000**
+  (parser 186/186, analyzer 300/300).
+- **Deferred to Phase 2** (documented, not regressions): cross-file instance-member typing for
+  signal/var members through typed bases — references/definition on those *member-access* sites
+  (#13; method calls and in-file signal uses work, and hover covers func/signal members via the
+  attribute fallback); go-to-`definition` on a cross-file method *member* (#13); Windows/NTFS
+  startup wall-clock dominated by the reconcile backstop walk, masking the warm-cache win there
+  (#14); precise typing of `$`/`%` nodes; `completion`, `signatureHelp`, `rename`,
+  `documentHighlight`.
 
 ---
 
-**Tag conventions.** `1.0.0` is tagged once M6 lands (the persistent warm-start cache ships *in* v1, not
-later). Subsequent Godot-tracked re-ports become `v1.x.0` minor releases (Godot 4.8, 4.9, …). `v2.0.0`
+**Tag conventions.** `v1.0.0` is tagged with M6 landed (the persistent warm-start cache ships *in* v1,
+not later). Subsequent Godot-tracked re-ports become `v1.x.0` minor releases (Godot 4.8, 4.9, …). `v2.0.0`
 is reserved for Phase 2 features (`.tscn` node typing for `$`/`%`, `signatureHelp`, `completion`).

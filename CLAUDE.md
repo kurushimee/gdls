@@ -132,11 +132,11 @@ Phase 1 = v1 = **M0–M6**: M0 LSP skeleton · M1 tokenizer + parser · M2 envir
 [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md). Phase 2 (post-v1): `.tscn` node typing for `$`/`%`,
 `completion`, `signatureHelp`, `rename`/`documentHighlight`.
 
-**Current:** M0–M5 complete; workspace version-bumped to `1.0.0` but deliberately left
-**UNTAGGED** — the ship bar was raised (every exposed LSP capability fully Godot-parity-complete + a
-persistent warm-start index cache), so **M6** — the final Phase 1 milestone, which ships v1 — is the
-remaining work, specced in **[`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md)**. Both
-conformance ratchets hold at **1.0**: parser **186/186**, analyzer **300/300**. CI is green (`cargo fmt
---check`, `cargo lint`, `cargo test --workspace`); three-layer fuzz gate (`parse` + `analyze` +
-`index_invariants`). Per-milestone exit criteria: `docs/07`; the full M5 phase-by-phase history:
-`CHANGELOG.md`.
+**Current:** Phase 1 complete — **v1.0.0 shipped** (M0–M6, tagged from `main`; release notes in
+`CHANGELOG.md`). Both conformance ratchets hold at **1.0**: parser **186/186**, analyzer **300/300**.
+CI is green (`cargo fmt --check`, `cargo lint`, `cargo test --workspace`); three-layer fuzz gate
+(`parse` + `analyze` + `index_invariants`). Final acceptance: the `scripts/m6-acceptance/` walk passes
+on a real OSS Godot 4.6.3 project, plus a Windows-native walk on a 2,338-script production project.
+Open follow-ups: #13 (cross-file signal/var instance-member typing slice — references/definition on
+member-access sites), #14 (Windows/NTFS startup wall-clock dominated by the reconcile backstop walk).
+Per-milestone exit criteria: `docs/07`; the full history: `CHANGELOG.md`.

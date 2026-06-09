@@ -16,7 +16,10 @@ of scope (diagnostics only).
 
 ## Install
 
-`gdls` is not shipped by Claude Code; you build the binary and put it on `PATH`.
+`gdls` is not shipped by Claude Code; you grab a release binary (or build one) and put it on `PATH`.
+
+- **Prebuilt binaries** — download `gdls` (Linux x86_64) or `gdls.exe` (Windows x86_64) from
+  [GitHub Releases](https://github.com/kurushimee/gdls/releases).
 
 - **From source (cargo)** — installs the `gdls` binary into `~/.cargo/bin`:
 
@@ -86,8 +89,9 @@ in [`docs/05-lsp-cc-integration.md`](docs/05-lsp-cc-integration.md) §3.
 parity gaps vs Godot's own LSP (hover member signatures, `definition`/`documentLink` on
 `class_name`/`preload`/autoloads, project-wide `references`, hierarchical `documentSymbol`,
 `implementation` overrides, autoload-singleton typing) and added a persistent, multi-instance-safe
-warm-start index cache (a warm relaunch is **>5×** faster than a cold scan). Verified by a capability
-walk against a real Godot 4.6.3 OSS project. `1.0.0` is tagged from the integration branch on merge.
+warm-start index cache (a warm relaunch is **>5×** faster than a cold scan). Verified by capability
+walks against a real Godot 4.6.3 OSS project and a Windows-native 2,338-script production project.
+**v1.0.0** is the first tagged release.
 See [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md) for the M6 scope and
 [`CHANGELOG.md`](CHANGELOG.md) for the milestone history.
 
