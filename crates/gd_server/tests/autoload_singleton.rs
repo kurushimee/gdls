@@ -15,8 +15,8 @@ use lsp_server::{Connection, Message};
 use lsp_types::{
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
     HoverParams, InitializeParams, InitializedParams, Location, MarkupKind, PartialResultParams,
-    Position, PublishDiagnosticsParams, ReferenceContext, ReferenceParams, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, WorkDoneProgressParams,
+    Position, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, WorkDoneProgressParams,
 };
 
 /// Boot a server over a TempProject with UTF-8 position encoding negotiated.
@@ -357,6 +357,48 @@ fn references_on_autoload_name_finds_cross_file_uses() {
         locs.iter().any(|l| l.uri == b_uri),
         "references on autoload name `Global` must include the cross-file use in b.gd \
          (project-wide scan, not current-file-only); got: {locs:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// `textDocument/references` on an autoload NAME with `include_declaration: true` must include the
+/// autoload script's start-of-file location (the same location `textDocument/definition` returns,
+/// via `find_autoload_definition`). Autoload names have no `class_name` declaration and no in-file
+/// `func`/`var` declaration, so without routing the `include_declaration` branch through the
+/// autoload path the declaration location is silently dropped. Regression guard for the
+/// "include_declaration omits the autoload script location" gap. Also asserts the location is
+/// absent when `include_declaration: false`, proving the flag — not the cross-file scan — drives it.
+#[test]
+fn references_on_autoload_name_include_declaration_adds_script_location() {
+    let p = setup_autoload_project();
+    let (client, handle) = boot(&p);
+    did_open(&client, &p, "global.gd");
+    did_open(&client, &p, "caller.gd");
+
+    let caller_uri = file_uri(&p.root.join("caller.gd"));
+    let global_uri = file_uri(&p.root.join("global.gd"));
+
+    // The autoload script's declaration location is start-of-file in global.gd (0:0-0:0),
+    // matching `textDocument/definition` on the same `Global` name.
+    let decl = Location {
+        uri: global_uri,
+        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+    };
+
+    // Click on `Global` in caller.gd at line 3, col 2 (inside the identifier).
+    let with_decl = references_at(&client, &caller_uri, Position::new(3, 2), true);
+    assert!(
+        with_decl.contains(&decl),
+        "references on autoload `Global` with include_declaration:true must include the \
+         script's start-of-file location {decl:?}; got: {with_decl:?}"
+    );
+
+    let without_decl = references_at(&client, &caller_uri, Position::new(3, 2), false);
+    assert!(
+        !without_decl.contains(&decl),
+        "references on autoload `Global` with include_declaration:false must NOT include the \
+         script's declaration location {decl:?}; got: {without_decl:?}"
     );
 
     shutdown(&client, handle);

@@ -1145,6 +1145,10 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     //      current file).
     //   3. `None` — if the file isn't indexed or the callee is native/unresolved. When None,
     //      fall back to raw identifier scan (no false-negative for unresolvable targets).
+    // Shared lazy callee-identifier span map for the current file's parse tree, built at most once
+    // and reused by both the call-site probe below and push_callee_ident_locations in the
+    // current-file scan — eliminates a duplicate O(nodes) tree walk per references request.
+    let mut callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
     let target_file: Option<gd_project::FileId> = if is_method_or_signal {
         // Analyze the current file to determine target_file.
         let target_file_from_binding = if let Some(p) = current_path
@@ -1154,9 +1158,8 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             let cur_result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
             // Look for a Binding::Call whose callee identifier span (in the parse tree)
             // contains the cursor byte. If found (call-site click), target_file = callee_file.
-            // The callee-span map (same one `push_callee_ident_locations` uses) is built once on
-            // the first matching binding rather than re-scanned per binding.
-            let mut callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+            // The shared callee-span map (`callee_spans`, hoisted above) is built lazily on the
+            // first matching binding and reused by push_callee_ident_locations below.
             cur_result
                 .bindings()
                 .iter()
@@ -1245,8 +1248,14 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             false
         };
         if !decl_found {
-            // Non-method targets: use the existing class_name / in-file fallback.
-            if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
+            // Non-method targets: use the existing class_name / in-file fallback. Also handle the
+            // autoload case — when the cursor was confirmed to be an autoload name, include the
+            // autoload script's start-of-file location (mirrors the M6-D definition handler).
+            if is_autoload {
+                if let Some(loc) = find_autoload_definition(state, &name) {
+                    locations.push(loc);
+                }
+            } else if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
                 locations.push(loc);
             } else if let Some(loc) = find_global_class_definition(state, &name) {
                 locations.push(loc);
@@ -1277,6 +1286,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                     &name,
                     &uri,
                     &mapper,
+                    &mut callee_spans,
                 );
             } else {
                 push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
@@ -1400,6 +1410,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             // like `func helper():` in other.gd). When target_file is None (native/unresolved),
             // fall back to identifier scan to avoid under-reporting.
             if let Some(tf) = target_file {
+                let mut cand_callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
                 push_callee_ident_locations(
                     &mut locations,
                     &cand_result,
@@ -1408,6 +1419,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                     &name,
                     &cand_uri,
                     &cand_mapper,
+                    &mut cand_callee_spans,
                 );
             } else {
                 push_identifier_locations(
@@ -1554,6 +1566,11 @@ fn callee_ident_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
 ///
 /// Caller must ensure `target_file` is `Some` before calling; the `None` guard lives in
 /// `references()` (fall back to `push_identifier_locations` when `target_file` is `None`).
+// The 8th parameter is a shared lazy span-memo cache (`callee_spans`): it lets the current-file
+// scan reuse the map already built by the target_file probe in `references`, eliminating a
+// duplicate O(nodes) `callee_ident_spans` walk, while staying lazy for cross-file candidates.
+// Bundling args into a struct or inlining the projection loop would be worse than this localized allow.
+#[allow(clippy::too_many_arguments)]
 fn push_callee_ident_locations(
     out: &mut Vec<Location>,
     result: &AnalysisResult,
@@ -1562,10 +1579,10 @@ fn push_callee_ident_locations(
     name: &str,
     uri: &Uri,
     mapper: &PositionMapper,
+    // Lazy callee-identifier span map for `tree`, built at most once and shared with the
+    // target_file probe in `references` to avoid a duplicate O(nodes) tree walk per request.
+    callee_spans: &mut Option<FxHashMap<ByteSpan, ByteSpan>>,
 ) {
-    // Built on the first matching binding so a textually-pre-filtered file with no matching call
-    // pays nothing: O(nodes) once + O(1) per match, vs the old O(nodes × matching_bindings).
-    let mut callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
     for binding in result.bindings() {
         if let Binding::Call {
             callee_file: Some(cf),
