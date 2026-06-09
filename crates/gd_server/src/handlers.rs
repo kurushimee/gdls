@@ -233,7 +233,7 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     // a `func helper(...) -> R` line rather than just the return type.
     let member_sig = analyzed
         .as_deref()
-        .and_then(|a| hover_member_signature(state, &parsed.tree, node_id, byte, a));
+        .and_then(|a| hover_member_signature(state, &parsed.tree, byte, a));
 
     let markdown = if let Some(sig) = member_sig {
         sig
@@ -525,7 +525,6 @@ fn render_hover(
 fn hover_member_signature(
     state: &ServerState,
     tree: &ParseTree,
-    _leaf_id: NodeId,
     cursor_byte: usize,
     analyzed: &AnalysisResult,
 ) -> Option<String> {
