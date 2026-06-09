@@ -2,20 +2,23 @@
 
 use gd_analyze::{find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, DtKind};
 use gd_syntax::ast::{
-    ClassNode, ConstantNode, FunctionNode, NodeId, NodeKind, ParseTree, SignalNode, VariableNode,
+    ClassNode, ConstantNode, FunctionNode, LiteralNode, NodeId, NodeKind, ParseTree, SignalNode,
+    SubscriptAccess, VariableNode,
 };
+use gd_syntax::ByteSpan;
+use gd_syntax::Literal;
 use gd_types::native_db::NativeClass;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, Location, MarkupContent, MarkupKind, Position, Range,
-    ReferenceParams, SymbolInformation, SymbolKind as LspSymbolKind, Uri, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    DocumentLink, DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location,
+    MarkupContent, MarkupKind, Position, Range, ReferenceParams, SymbolInformation,
+    SymbolKind as LspSymbolKind, Uri, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ropey::Rope;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::position::PositionMapper;
 use crate::server::ServerState;
@@ -30,18 +33,38 @@ pub fn document_symbol(
     params: DocumentSymbolParams,
 ) -> DocumentSymbolResponse {
     let uri = params.text_document.uri;
-    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
-        return DocumentSymbolResponse::Nested(Vec::new());
-    };
-    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    // Single VFS lookup: hold `doc` across the parse and reuse its already-built rope for the
+    // mapper (disjoint `&state.vfs` / `&mut state.workspace` borrows compose). Avoids both the
+    // redundant hash lookup and re-allocating a rope we already hold.
     let Some(doc) = state.vfs.get(uri.as_str()) else {
         return DocumentSymbolResponse::Nested(Vec::new());
     };
+    let text = doc.text();
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
+
+    // A1 handoff: `document_symbols` now always returns a single root Class wrapping members.
+    // For an unnamed script the root's `name` is `""` (the parser has no path, so it can't fill
+    // it). Fill the empty name here with the file's basename from the document URI so editors
+    // render a useful symbol name (`"a.gd"`) instead of an empty string.
+    let basename = uri
+        .path()
+        .as_str()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+
     let symbols = parsed
         .symbols
         .iter()
-        .map(|s| to_lsp_symbol(s, &mapper))
+        .map(|s| {
+            let mut lsp = to_lsp_symbol(s, &mapper);
+            if lsp.name.is_empty() && !basename.is_empty() {
+                lsp.name = basename.clone();
+            }
+            lsp
+        })
         .collect();
     DocumentSymbolResponse::Nested(symbols)
 }
@@ -88,6 +111,71 @@ fn to_lsp_symbol(
 }
 
 // =============================================================================================
+// M6-C2: textDocument/documentLink.
+// =============================================================================================
+
+/// `textDocument/documentLink`: walk the parse tree and emit a [`DocumentLink`] for every
+/// `res://`-path string literal (those produced by `preload("res://…")` / `load("res://…")`
+/// and any other expression containing a res-path string). The link's `target` is the
+/// `file://` URI of the resolved filesystem path; the `range` covers the string token including
+/// its surrounding quotes. Only string literals that start with `"res://"` produce links —
+/// `user://`, `uid://`, and plain strings are silently skipped.
+pub fn document_link(state: &mut ServerState, params: DocumentLinkParams) -> Vec<DocumentLink> {
+    let uri = params.text_document.uri;
+    // Single VFS lookup: hold `doc` across the parse and reuse its already-built rope for the
+    // mapper. `&state.vfs` and `&mut state.workspace` are disjoint fields, so the borrow composes;
+    // building a fresh `Rope::from_str(&text)` would needlessly re-allocate the rope we already own.
+    let Some(doc) = state.vfs.get(uri.as_str()) else {
+        return Vec::new();
+    };
+    let text = doc.text();
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+
+    let mut links = Vec::new();
+    for node_id in parsed.tree.iter_ids() {
+        let node = parsed.tree.get(node_id);
+        let NodeKind::Literal(LiteralNode {
+            value: Literal::String(path),
+        }) = &node.kind
+        else {
+            continue;
+        };
+        if !path.starts_with("res://") {
+            continue;
+        }
+        // Resolve the literal to an on-disk project file, then link it. Two cases, both keeping
+        // the "no link to a non-existent target" guarantee (spec: documentLink scope, a3.md §3):
+        //   * a `.gd` script is in the index → use its canonical interned path;
+        //   * any other resource (`.tscn`/`.tres`/asset) is NOT indexed — the index holds only
+        //     `.gd` (see `gd_files`) — so join it against the project root and confirm it's a real
+        //     file on disk. `preload`/`load` routinely target these, so gating purely on index
+        //     membership would silently drop every non-GDScript link.
+        let abs = match state.workspace.index.resolve_res_path(path) {
+            Some(fid) => state.workspace.index.path(fid).map(|p| p.to_path_buf()),
+            None => state
+                .workspace
+                .index
+                .res_to_path(path)
+                .filter(|p| p.is_file()),
+        };
+        let Some(abs) = abs else {
+            continue;
+        };
+        let Some(target) = path_to_file_uri(&abs) else {
+            continue;
+        };
+        links.push(DocumentLink {
+            range: mapper.span_to_range(node.span),
+            target: Some(target),
+            tooltip: None,
+            data: None,
+        });
+    }
+    links
+}
+
+// =============================================================================================
 // WP-H: hover + definition.
 // =============================================================================================
 
@@ -113,6 +201,20 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     let byte = mapper.position_to_byte(tdp.position);
     let node_id = parsed.tree.innermost_node_at(byte)?;
 
+    // M6-Fix2: when the cursor is on a `res://` string literal (e.g. `preload("res://foo.gd")`),
+    // render the resolved script's basename. Return early so `render_hover` (which renders `String`
+    // for string literal nodes) doesn't shadow this more useful result.
+    if let Some(preload_md) = hover_preload_string(state, &parsed.tree, node_id) {
+        let leaf_node = parsed.tree.get(node_id);
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: preload_md,
+            }),
+            range: Some(mapper.span_to_range(leaf_node.span)),
+        });
+    }
+
     // The analyzer pins resolved types on whichever node it "owns" — usually the assignable
     // (`Variable`/`Constant`/`Parameter`) or the expression (`BinaryOp`, `Call`, …), not the inner
     // identifier slot. Hover should land on a node *with* a type when possible, so fall back from
@@ -125,7 +227,19 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         .unwrap_or(node_id);
     let leaf_node = parsed.tree.get(node_id);
 
-    let markdown = render_hover(state, &parsed.tree, node_id, typed_id, analyzed.as_deref());
+    // M6-F: when the cursor is on an identifier that's the callee of a resolved cross-file call,
+    // render the callee's `MemberDecl` signature instead of (or in addition to) the type label.
+    // This supersedes the generic type-table hover for call-site identifiers and gives the user
+    // a `func helper(...) -> R` line rather than just the return type.
+    let member_sig = analyzed
+        .as_deref()
+        .and_then(|a| hover_member_signature(state, &parsed.tree, byte, a));
+
+    let markdown = if let Some(sig) = member_sig {
+        sig
+    } else {
+        render_hover(state, &parsed.tree, node_id, typed_id, analyzed.as_deref())
+    };
     if markdown.trim().is_empty() {
         return None;
     }
@@ -190,6 +304,12 @@ pub fn definition(
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
     let byte = mapper.position_to_byte(tdp.position);
     let node_id = parsed.tree.innermost_node_at(byte)?;
+
+    // (C1) String literal inside preload/load: cursor on `"res://foo.gd"` → jump to foo.gd.
+    if let Some(loc) = find_res_path_definition(state, &parsed.tree, node_id) {
+        return Some(GotoDefinitionResponse::Scalar(loc));
+    }
+
     let name = cursor_identifier(&parsed.tree, node_id)?;
 
     // (1) In-file member.
@@ -200,6 +320,47 @@ pub fn definition(
     // (2) Cross-file `class_name`.
     if let Some(loc) = find_global_class_definition(state, &name) {
         return Some(GotoDefinitionResponse::Scalar(loc));
+    }
+
+    // (D) Autoload singleton — last fallback so in-file members, class_name declarations, AND
+    // body-local vars/parameters shadow autoload names.
+    //
+    // The "never lie" gate: only jump to the autoload script when the analyzer's `reduce_identifier`
+    // actually resolved THIS occurrence to the autoload (step 9 — the last fallback in the
+    // analyzer's priority chain: local → param → class member → native → class_name → builtin →
+    // global-const → autoload). The analyzer records a `Binding::Use { target_file: Some(fid) }`
+    // at the cursor's span when and only when steps 1–8 all missed — i.e. exactly when nothing
+    // shadows the autoload. Gating here rather than re-implementing scope lookup means the
+    // definition handler inherits the analyzer's precedence by construction.
+    //
+    // Implementation: resolve the autoload name → FileId first (cheap, no analysis), then run
+    // the analyzer (cached — same call as hover) and check for the sentinel Use binding at the
+    // cursor span. If the binding is absent the identifier was shadowed by a local/param/member
+    // and we must NOT jump (return None, not the autoload Location).
+    {
+        let autoload_fid = state
+            .workspace
+            .project
+            .autoload_script_path(&name)
+            .map(str::to_owned)
+            .and_then(|p| state.workspace.index.resolve_res_path(&p));
+        if let Some(fid) = autoload_fid {
+            let node_span = parsed.tree.get(node_id).span;
+            let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+            let resolved_to_autoload = analyzed.as_deref().is_some_and(|a| {
+                a.bindings().iter().any(|b| {
+                    matches!(b,
+                        Binding::Use { site, target_file: Some(f), .. }
+                            if *site == node_span && *f == fid
+                    )
+                })
+            });
+            if resolved_to_autoload {
+                if let Some(loc) = find_autoload_definition(state, &name) {
+                    return Some(GotoDefinitionResponse::Scalar(loc));
+                }
+            }
+        }
     }
 
     // (3) Native / unknown: no location.
@@ -348,6 +509,123 @@ fn render_hover(
     md
 }
 
+/// M6-F: when the cursor lands on a Call or Subscript node, resolve the callee's `MemberDecl`
+/// from the base expression's type and render its signature. Returns `None` on fall-through
+/// (e.g. the base type isn't a project script, or the method isn't in the interface).
+///
+/// Two cursor positions trigger this path:
+/// 1. Cursor at `(` → `innermost_node_at` returns the `Call` node.
+/// 2. Cursor inside the callee identifier itself (a child `Identifier`) — handled here by also
+///    checking whether the leaf's span is contained in any enclosing Call whose callee is a
+///    subscript access with a known base type.
+///
+/// The signature format is `func name(name: ParamType, …) -> ReturnType` using the parameter
+/// names and unresolved syntactic type names from [`gd_project::MemberDecl`]. When a name is
+/// unavailable (empty string), the type alone is rendered.
+fn hover_member_signature(
+    state: &ServerState,
+    tree: &ParseTree,
+    cursor_byte: usize,
+    analyzed: &AnalysisResult,
+) -> Option<String> {
+    use gd_analyze::DtKind;
+
+    // Find the innermost Call node whose span contains the cursor byte. The cursor is gated below
+    // to the callee member-name identifier; this only recovers the enclosing Call so we can reach
+    // the callee subscript and its base type.
+    //
+    // Pick the *innermost* (smallest-span) enclosing Call: DFS pre-order visits an outer call
+    // before its inner ones, so for a nested callee — e.g. the cursor on `bar` in
+    // `a.foo(b.bar(x))` — a plain first-match would wrongly select `a.foo` and render its
+    // signature instead of `b.bar`'s.
+    let call_node = tree
+        .iter_ids()
+        .filter_map(|id| {
+            let node = tree.get(id);
+            if let NodeKind::Call(c) = &node.kind {
+                if node.span.start <= cursor_byte && cursor_byte < node.span.end {
+                    return Some((node.span.end - node.span.start, c.clone()));
+                }
+            }
+            None
+        })
+        .min_by_key(|(span_len, _)| *span_len)
+        .map(|(_, c)| c)?;
+
+    // Only subscript calls (`l.helper()`) provide a base whose type we can look up.
+    // Bare calls (`helper()`) resolve via the in-class or inherited interface — handled
+    // by the existing `render_hover` type-label path; skip them here.
+    let callee_id = call_node.callee?;
+    let NodeKind::Subscript(sub) = &tree.get(callee_id).kind else {
+        return None;
+    };
+    let base_id = sub.base?;
+
+    // Gate: the cursor must land on the callee member name itself (the `.helper` identifier), not
+    // on the base receiver or an argument. Both of those live inside the enclosing Call span but
+    // carry their own types that `render_hover` must report; without this gate, hovering `l` or an
+    // argument in `l.helper(arg)` would wrongly surface `helper`'s signature.
+    let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access else {
+        return None;
+    };
+    let attr_span = tree.get(attr_id).span;
+    if !(attr_span.start <= cursor_byte && cursor_byte < attr_span.end) {
+        return None;
+    }
+
+    // Get the base expression's resolved type — must be a project Script kind.
+    let base_dt = analyzed.types.get(base_id);
+    if base_dt.kind != DtKind::Script {
+        return None;
+    }
+    let script_ref = base_dt.script_type.as_ref()?;
+    let callee_file = script_ref.file;
+
+    // Look up the method name in the callee file's interface.
+    let fn_name = &call_node.function_name;
+    if fn_name.is_empty() {
+        return None;
+    }
+    let iface = state.workspace.index.interface(callee_file)?;
+    let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
+
+    // Format: `func name(param_name: ParamType, …) -> ReturnType`
+    // Zip param_names and params in lockstep; fall back to type-only when the name is empty.
+    let params_str = decl
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let type_str = match p {
+                gd_project::TypeExpr::Named { path, .. } => path.join("."),
+                gd_project::TypeExpr::None => "Variant".to_string(),
+            };
+            let name_str = decl.param_names.get(i).map(String::as_str).unwrap_or("");
+            if name_str.is_empty() {
+                type_str
+            } else {
+                format!("{name_str}: {type_str}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ret_str = match &decl.ty {
+        gd_project::TypeExpr::Named { path, .. } => path.join("."),
+        // `interface::type_expr` collapses BOTH an explicit `-> void` (empty type node) and an
+        // absent return annotation to `TypeExpr::None`, so they're indistinguishable here. Render
+        // `void`: explicit-void functions vastly outnumber truly-untyped ones in typed GDScript, so
+        // this is correct far more often than `Variant` would be. (A precise split would need
+        // interface extraction to carry "explicit void" vs "no annotation" — out of scope.)
+        gd_project::TypeExpr::None => "void".to_string(),
+    };
+    let sig = format!("func {}({}) -> {}", fn_name, params_str, ret_str);
+
+    let mut md = String::from("```gdscript\n");
+    md.push_str(&sig);
+    md.push_str("\n```");
+    Some(md)
+}
+
 fn append_class_docs(md: &mut String, class: &NativeClass) {
     if !class.brief_description.is_empty() {
         md.push_str("\n\n");
@@ -360,6 +638,44 @@ fn append_class_docs(md: &mut String, class: &NativeClass) {
         md.push_str("\n\n");
         md.push_str(&class.description);
     }
+}
+
+/// M6-Fix2: when the cursor is on a `res://`-path string literal (e.g. inside
+/// `preload("res://foo.gd")`), render a hover showing the resolved file's basename — a `.gd`
+/// script or any other on-disk project resource (`.tscn`/`.tres`/asset). Returns `None` for
+/// non-res strings, paths with no on-disk target, or non-`String` literal nodes.
+fn hover_preload_string(state: &ServerState, tree: &ParseTree, node_id: NodeId) -> Option<String> {
+    let NodeKind::Literal(LiteralNode {
+        value: Literal::String(path),
+    }) = &tree.get(node_id).kind
+    else {
+        return None;
+    };
+    if !path.starts_with("res://") {
+        return None;
+    }
+    // Resolve to an on-disk project file with the same logic as `document_link`, so hover and
+    // links agree on what a `res://` literal points to: a `.gd` script is in the index → use its
+    // canonical interned path; any other resource isn't indexed (the index holds only `.gd`), so
+    // join it against the project root and confirm it's a real file.
+    let abs = match state.workspace.index.resolve_res_path(path) {
+        Some(fid) => state.workspace.index.path(fid).map(|p| p.to_path_buf()),
+        None => state
+            .workspace
+            .index
+            .res_to_path(path)
+            .filter(|p| p.is_file()),
+    }?;
+    let basename = abs.file_name().unwrap_or(abs.as_str());
+    // A GDScript script gets a `gdscript`-fenced basename and a "GDScript:" label; any other
+    // resource gets a plain-fenced basename and a "Resource:" label, so the hover never claims a
+    // scene or asset is GDScript.
+    let md = if abs.extension() == Some("gd") {
+        format!("```gdscript\n{basename}\n```\n\nGDScript: `{path}`")
+    } else {
+        format!("```\n{basename}\n```\n\nResource: `{path}`")
+    };
+    Some(md)
 }
 
 /// Look for `name` as a member of the file's root class (Godot's `parser->head`). Returns the
@@ -454,6 +770,65 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
     }
 }
 
+/// Returns `true` when `ident_id` is in a method or signal role in `tree`:
+/// - The `.identifier` child of a `Function` or `Signal` node (declaration-site click), OR
+/// - The attribute of a `Subscript` that is itself the **callee of a `Call`** (`l.helper()` — a
+///   method call site; the cursor lands on the `helper` attribute Identifier).
+///
+/// A bare attribute **property read** (`node.position`, `self.hp`) is *not* a call callee and
+/// returns `false` so it falls through to the raw-identifier scan in `references`. This matters for
+/// recall: the method/signal code path filters to `Binding::Call` records (via
+/// [`push_callee_ident_locations`]), and the analyzer records no binding for a property attribute
+/// read — so routing property reads through it would silently drop every read occurrence. Letting
+/// them use the raw scan restores correct (over-approximating, never under-reporting) recall, which
+/// is the v1 stance for property/field references.
+///
+/// The declaration arm deliberately matches a `Function`/`Signal` identifier at *any* class depth —
+/// inner-class methods (`class Foo:` … `func helper():`) included. `Binding::Call` records carry a
+/// `callee_file` but no owning-class path, so a root-class and an inner-class method sharing one
+/// name in one file are indistinguishable at call-site granularity: both declaration clicks take
+/// the project-wide scan and their result sets may mix the two methods' call sites. That is the
+/// same over-approximating, never under-reporting stance as above — routing inner declarations to
+/// the raw-identifier scan instead would *drop* their cross-file call sites (the `name_referencers`
+/// index only sees interface-level names) while still mixing in-file textual matches. Splitting
+/// them cleanly needs the owning class recorded on `Binding::Call` — a post-v1 refinement.
+///
+/// Used to decide whether `textDocument/references` uses the project-wide text scan (correct for
+/// method/signal targets reached through body-local typed vars) or the faster `name_referencers`
+/// index (correct for class/type/variable/property targets). Purely structural (O(#nodes), no
+/// analyzer involvement); works identically whether the cursor is on the declaration or a call site.
+fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
+    // Single pass: short-circuit on a func/signal declaration; otherwise remember the subscript
+    // that owns this attribute identifier and collect every `Call` callee node, then decide.
+    let mut owning_subscript: Option<NodeId> = None;
+    let mut call_callees: FxHashSet<NodeId> = FxHashSet::default();
+    for nid in tree.iter_ids() {
+        match &tree.get(nid).kind {
+            NodeKind::Function(f) if f.identifier == Some(ident_id) => {
+                return true;
+            }
+            NodeKind::Signal(s) if s.identifier == Some(ident_id) => {
+                return true;
+            }
+            NodeKind::Subscript(s) => {
+                if matches!(s.access, Some(SubscriptAccess::Attribute(Some(aid))) if aid == ident_id)
+                {
+                    owning_subscript = Some(nid);
+                }
+            }
+            NodeKind::Call(c) => {
+                if let Some(callee) = c.callee {
+                    call_callees.insert(callee);
+                }
+            }
+            _ => {}
+        }
+    }
+    // The attribute identifier belongs to a subscript: a method target only if that subscript is a
+    // `Call`'s callee (`l.helper()`), not a standalone property read (`node.position`).
+    owning_subscript.is_some_and(|sub_id| call_callees.contains(&sub_id))
+}
+
 /// Resolve a `class_name` to the URI + identifier span of its declaring file's class header. The
 /// `class_name` registry tracks the path + identifier name; gdls locates the identifier span by
 /// parsing the target's text — but if the target is an *open* buffer, the workspace's parse cache
@@ -498,6 +873,61 @@ fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<L
     Some(Location {
         uri,
         range: mapper.span_to_range(ident_span),
+    })
+}
+
+/// M6-C1: resolve a `res://`-path string literal to a [`Location`] at the start of the target
+/// file. Called when the cursor's innermost node is a [`NodeKind::Literal`] whose value is a
+/// [`Literal::String`] starting with `"res://"`. Non-res strings (e.g. `"user://x"`,
+/// format strings, regular text) return `None` — the outer `definition` handler degrades to the
+/// normal identifier path.
+fn find_res_path_definition(
+    state: &ServerState,
+    tree: &ParseTree,
+    node_id: NodeId,
+) -> Option<Location> {
+    let NodeKind::Literal(LiteralNode {
+        value: Literal::String(path),
+    }) = &tree.get(node_id).kind
+    else {
+        return None;
+    };
+    if !path.starts_with("res://") {
+        return None;
+    }
+    // Gate on index membership — only emit a Location for paths that resolve to an actually
+    // existing, indexed project file. `res_to_path` is a pure path-join with no existence
+    // check; `resolve_res_path` returns Some only for indexed (on-disk) files.
+    let fid = state.workspace.index.resolve_res_path(path)?;
+    let abs = state.workspace.index.path(fid).map(|p| p.to_path_buf())?;
+    let uri = path_to_file_uri(&abs)?;
+    Some(Location {
+        uri,
+        range: file_start_range(),
+    })
+}
+
+/// M6-D: resolve an autoload singleton name to a [`Location`] pointing at the head of the
+/// autoload's script file. This is the **last** definition fallback — in-file member lookup and
+/// `class_name` registry checks (which honour local shadowing) run first, so `var Save := 1`
+/// in the current file correctly shadows an autoload named `Save`.
+///
+/// The existence gate uses `resolve_res_path` (which returns `Some` only for indexed, on-disk
+/// files) rather than `res_to_path` (a pure path-join with no existence check). This prevents
+/// emitting a dangling `file://` URI when the `project.godot` autoload entry points at a script
+/// that hasn't been written to disk — the same class of bug already fixed in `find_res_path_definition`
+/// and `document_link`.
+fn find_autoload_definition(state: &ServerState, name: &str) -> Option<Location> {
+    let res_path = state.workspace.project.autoload_script_path(name)?;
+    // Gate on index membership — only emit a Location for paths that resolve to an actually
+    // existing, indexed project file. `resolve_res_path` returns Some only for indexed (on-disk)
+    // files; if save.gd is absent from disk, this returns None → no Location emitted.
+    let fid = state.workspace.index.resolve_res_path(res_path)?;
+    let abs = state.workspace.index.path(fid).map(|p| p.to_path_buf())?;
+    let uri = path_to_file_uri(&abs)?;
+    Some(Location {
+        uri,
+        range: file_start_range(),
     })
 }
 
@@ -614,9 +1044,18 @@ fn group_call_ranges<'a, K: PartialEq>(
 /// server to resolve project-wide references for the symbol denoted by the given text document
 /// position." Returns `Location[]` or `null`. Source: <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_references>.
 ///
-/// Algorithm (per the M4 plan §6 + `docs/03 §7.1`):
+/// Algorithm (per the M4 plan §6 + `docs/03 §7.1`, updated for M6-E):
 ///   1. Resolve cursor → identifier name.
-///   2. Query `Index::name_referencers(name)` for candidate files (interface-pass filter).
+///   2. Choose candidate files:
+///      - **Method/signal targets** (M6-E) and **autoload singleton names** (M6-D): project-wide
+///        textual scan matching Godot's `gdscript_workspace.cpp:472` two-phase strategy — enumerate
+///        ALL project files from the index, read text (VFS/disk; no analysis), keep only files whose
+///        text contains `name` as a substring. This catches callers that reach the method through a
+///        body-local typed var (`var l: Lib = Lib.new(); l.helper()`) that wouldn't appear in
+///        `name_referencers`, and autoload names (`Global`) which appear only in function bodies,
+///        never in interface-level annotations.
+///      - **Class/type/variable targets**: `Index::name_referencers(name)` fast-path (interface-pass
+///        filter); these can only be reached through interface-level type annotations.
 ///   3. For each candidate (plus the current buffer): lazy-parse, lazy-analyze, then collect
 ///      occurrences two ways and de-dupe: (a) the parser-level identifier scan
 ///      (`push_identifier_locations`) — every `Identifier` node named `name`, covering call-site
@@ -654,41 +1093,325 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
 
     let mut locations: Vec<Location> = Vec::new();
 
+    let current_path = crate::uri::uri_to_path(&uri);
+    let current_fid = current_path
+        .as_deref()
+        .and_then(|p| state.workspace.index.file_id(p));
+
+    // Detect whether the cursor identifier is in a method-or-signal role. We use a structural AST
+    // check (`is_member_or_attribute_ident`) rather than an interface lookup because:
+    //   1. The interface only contains members of the *declaring* file — a click on a call site in
+    //      another file (e.g. `l.helper()` in `a.gd`) won't find `helper` in `a.gd`'s interface.
+    //   2. Private (`_`-prefixed) methods appear in the AST regardless of class_name visibility.
+    // The check is O(#nodes) on the current file's parse tree — already in cache — with no
+    // analyzer call. It handles declaration-click (`func helper():`) and call-site attribute-click
+    // (`l.helper()`) identically. A bare property read (`node.position`) is deliberately NOT matched
+    // (it isn't a call callee) so it falls through to the raw-identifier scan — the method path emits
+    // `Binding::Call` records only and would otherwise drop every property-read occurrence.
+    let is_method_or_signal = is_member_or_attribute_ident(&parsed.tree, node_id);
+
+    // M6-D: an autoload singleton name (e.g. `Global` in `Global.popup_error()`) is the base of a
+    // subscript, not a call callee, so `is_member_or_attribute_ident` returns false and it would
+    // otherwise take the `name_referencers` fast-path below. But autoload names never appear in
+    // interface-level class-name annotations, so that referencer set is always empty — a cursor on
+    // the singleton name itself would then scan only the current file and silently miss every other
+    // file that uses `Global` in a function body.
+    //
+    // Match the definition handler's "never lie" gate: only treat this occurrence as an autoload
+    // when the analyzer resolved THIS cursor span to the autoload script's FileId. A local variable,
+    // parameter, or member named `Global` shadows the singleton and must stay on the cheap
+    // `name_referencers` path instead of triggering a project-wide textual scan.
+    let autoload_fid = state
+        .workspace
+        .project
+        .autoload_script_path(&name)
+        .map(str::to_owned)
+        .and_then(|p| state.workspace.index.resolve_res_path(&p));
+    let is_autoload = autoload_fid.is_some_and(|fid| {
+        let node_span = parsed.tree.get(node_id).span;
+        let Some(p) = current_path
+            .as_ref()
+            .filter(|p| p.extension() == Some("gd"))
+        else {
+            return false;
+        };
+        let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+        result.bindings().iter().any(|b| {
+            matches!(b,
+                Binding::Use { site, target_file: Some(f), .. }
+                    if *site == node_span && *f == fid
+            )
+        })
+    });
+
+    // For method/signal targets, compute `target_file` — the FileId of the file that DECLARES
+    // the method. Used to filter `Binding::Call` records to genuine callers of this specific
+    // method, excluding identically-named methods in unrelated files (Fix 2 Part B, M6-E).
+    //
+    // Priority:
+    //   1. Call-site click: find a Binding::Call in the current file's analysis whose callee
+    //      identifier (derived from the parse tree) spans the cursor byte position. The
+    //      `callee_file` of that binding is the declaring file.
+    //   2. Declaration-site click: `current_fid` (the file where `func name():` lives is the
+    //      current file).
+    //   3. `None` — if the file isn't indexed or the callee is native/unresolved. When None,
+    //      fall back to raw identifier scan (no false-negative for unresolvable targets).
+    // Shared lazy callee-identifier span map for the current file's parse tree, built at most once
+    // and reused by both the call-site probe below and push_callee_ident_locations in the
+    // current-file scan — eliminates a duplicate O(nodes) tree walk per references request.
+    let mut callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+    let target_file: Option<gd_project::FileId> = if is_method_or_signal {
+        // Analyze the current file to determine target_file.
+        let target_file_from_binding = if let Some(p) = current_path
+            .as_ref()
+            .filter(|p| p.extension() == Some("gd"))
+        {
+            let cur_result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+            // Look for a Binding::Call whose callee identifier span (in the parse tree)
+            // contains the cursor byte. If found (call-site click), target_file = callee_file.
+            // The shared callee-span map (`callee_spans`, hoisted above) is built lazily on the
+            // first matching binding and reused by push_callee_ident_locations below.
+            cur_result.bindings().iter().find_map(|b| {
+                if let Binding::Call {
+                    callee_file,
+                    callee_name,
+                    call_site,
+                    ..
+                } = b
+                {
+                    if callee_name == name.as_str() {
+                        let spans =
+                            callee_spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
+                        if let Some(ident_span) = spans.get(call_site).copied() {
+                            if ident_span.start <= byte && byte < ident_span.end {
+                                return Some(*callee_file);
+                            }
+                        }
+                    }
+                }
+                None
+            })
+        } else {
+            None
+        };
+        // Distinguish the two None origins that the old `.flatten().or(current_fid)` conflated —
+        // collapsing them dropped every cross-file reference for native subscript calls
+        // (e.g. `node.queue_free()`, whose Binding::Call carries callee_file: None):
+        //   Some(Some(f)) — call-site click on a resolved callee: the declaring file is `f`.
+        //   Some(None)    — call-site click on a NATIVE/unresolved callee: keep target_file None so
+        //                   the scan falls back to push_identifier_locations (raw text scan) rather
+        //                   than filtering on a callee_file that no Binding::Call carries.
+        //   None          — no Binding::Call at the cursor (declaration-site click): the current
+        //                   file declares the method, so target_file = current_fid.
+        match target_file_from_binding {
+            Some(cf) => cf,
+            None => current_fid,
+        }
+    } else {
+        None
+    };
+
+    // include_declaration: prepend the declaration site when requested.
+    // For method/signal targets, the declaring file may be different from the current file
+    // (cross-file call-site click). When target_file is known and differs from the current file,
+    // read the declaring file and use find_in_file_definition on its tree to get the narrow
+    // identifier span (not MemberDecl.span, which is the whole func node).
     if params.context.include_declaration {
-        if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-            locations.push(loc);
-        } else if let Some(loc) = find_global_class_definition(state, &name) {
-            locations.push(loc);
+        let decl_found = if is_method_or_signal {
+            if let Some(tf) = target_file {
+                if current_fid.is_some_and(|cf| cf == tf) {
+                    // Declaration-site click: the current file IS the declaring file.
+                    if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
+                        locations.push(loc);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    // Cross-file call-site click: read the declaring file and locate the identifier.
+                    let decl_loc = state
+                        .workspace
+                        .index
+                        .path(tf)
+                        .map(|p| p.to_path_buf())
+                        .and_then(|decl_path| path_to_file_uri(&decl_path).map(|u| (decl_path, u)))
+                        .and_then(|(decl_path, decl_uri)| {
+                            let text = match state.vfs.get(decl_uri.as_str()).map(|d| d.text()) {
+                                Some(t) => t,
+                                None => std::fs::read_to_string(decl_path.as_std_path()).ok()?,
+                            };
+                            let decl_parsed = state
+                                .workspace
+                                .parse(&CanonicalKey::for_uri(&decl_uri), &text);
+                            let decl_rope = Rope::from_str(&text);
+                            let decl_mapper = PositionMapper::new(&decl_rope, enc);
+                            find_in_file_definition(
+                                &decl_parsed.tree,
+                                &name,
+                                &decl_uri,
+                                &decl_mapper,
+                            )
+                        });
+                    if let Some(loc) = decl_loc {
+                        locations.push(loc);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !decl_found {
+            // Non-method targets: use the existing class_name / in-file fallback. Also handle the
+            // autoload case — when the cursor was confirmed to be an autoload name, include the
+            // autoload script's start-of-file location (mirrors the M6-D definition handler).
+            if is_autoload {
+                if let Some(loc) = find_autoload_definition(state, &name) {
+                    locations.push(loc);
+                }
+            } else if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
+                locations.push(loc);
+            } else if let Some(loc) = find_global_class_definition(state, &name) {
+                locations.push(loc);
+            }
         }
     }
 
     // Always scan the current file's bindings — name_referencers is the interface-level filter
     // (cross-file dependents), not the self-references set. The body of the current file may
     // contain many uses of `name` that name_referencers won't surface.
-    let current_path = crate::uri::uri_to_path(&uri);
     if let Some(p) = current_path
         .as_ref()
         .filter(|p| p.extension() == Some("gd"))
     {
         let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
         push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
-        // Also scan parser-level identifier occurrences in the current file (`extends Foo`, type
-        // annotations, `class_name`) — the reducer doesn't record these as bindings. Cross-file
-        // candidates below already get this scan; without it here, an in-file `extends`/type/
-        // `class_name` reference to `name` was silently under-reported. The dedup pass at the end
-        // collapses any overlap with the binding scan.
-        push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
+        if is_method_or_signal {
+            // For method/signal targets: use callee-filtered call projection instead of raw
+            // identifier scan to avoid false positives from identically-named declarations.
+            // Only project when target_file is Some — if None (native/unresolved), fall back
+            // to identifier scan so we never under-report for unresolvable targets.
+            if let Some(tf) = target_file {
+                push_callee_ident_locations(
+                    &mut locations,
+                    &result,
+                    &parsed.tree,
+                    tf,
+                    &name,
+                    &uri,
+                    &mapper,
+                    &mut callee_spans,
+                );
+            } else {
+                push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
+            }
+        } else {
+            // Non-method targets: raw identifier scan picks up `extends Foo`, type annotations,
+            // `class_name`, and other parser-level refs the reducer doesn't record. Cross-file
+            // candidates below already get this scan; without it here, in-file extends/type/
+            // class_name references to `name` would be silently under-reported. The dedup pass
+            // at the end collapses any overlap with the binding scan.
+            push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
+        }
     }
 
     // Candidate cross-file referencing files via the interface-pass reverse index (excluding the
     // current file, already scanned above). Collect URIs first so the index borrow doesn't conflict
     // with the lazy-analyze calls below.
-    let candidates = collect_name_referencer_uris(
-        &state.workspace.index,
-        &name,
-        current_path.as_deref(),
-        "references",
-    );
+    //
+    // M6-E: for method/signal targets, callers can reach the method through a body-local typed var
+    // (`var l: Lib = Lib.new(); l.helper()`) — the interface pass records `Lib` in the referencing
+    // set but not `helper`, so `name_referencers("helper")` misses those callers. This matches
+    // Godot's workspace.cpp:472 strategy: a project-wide textual name-scan first (two-phase), then
+    // per-hit re-resolve. For method/signal targets we therefore enumerate ALL project files, do a
+    // cheap substring pre-filter (`text.contains(name)` — only reads text, not analyze), and pass
+    // hits to the existing per-candidate analyze + callee-filtered-binding loop. Autoload singleton
+    // names need the same project-wide scan: an autoload name appears in other files' function
+    // bodies (`Global.popup_error()`) but never in their interface-level annotations, so
+    // `name_referencers` would return an empty set and miss every cross-file use. For the remaining
+    // non-method targets (class names, variables) the `name_referencers` fast-path is sufficient:
+    // they can only be reached via their interface-level type annotation, which the interface pass
+    // records.
+    //
+    // Cost: one VFS-or-disk read per project file per references request for method/signal targets.
+    // This matches Godot's behavior; a future identifier-occurrence index could optimize it. Do NOT
+    // full-analyze every file — text-prefilter first, analyze only textual hits.
+    let candidates: Vec<(camino::Utf8PathBuf, Uri)> = if is_method_or_signal || is_autoload {
+        // Project-wide textual scan: collect all (FileId → path) from the index first (index
+        // borrow), then read text separately (VFS / disk borrow) so borrows don't overlap.
+        let all_paths: Vec<(gd_project::FileId, camino::Utf8PathBuf)> = state
+            .workspace
+            .index
+            .iter_interfaces()
+            .filter_map(|(fid, _)| {
+                state
+                    .workspace
+                    .index
+                    .path(fid)
+                    .map(|p| (fid, p.to_path_buf()))
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        for (fid, p) in all_paths {
+            // Exclude the current file (already scanned above).
+            if current_fid.is_some_and(|cfid| cfid == fid) {
+                continue;
+            }
+            let Some(cand_uri) = path_to_file_uri(&p) else {
+                log::warn!(
+                    "references: dropping candidate {p} — path_to_file_uri rejected the path"
+                );
+                continue;
+            };
+            // Pre-filter: only read text (VFS-first, no analysis). If the file's text doesn't
+            // contain `name` as a substring, it cannot have a reference — skip it cheaply.
+            let text_opt = state
+                .vfs
+                .get(cand_uri.as_str())
+                .map(|d| d.text())
+                .or_else(|| std::fs::read_to_string(p.as_std_path()).ok());
+            let Some(text) = text_opt else {
+                log::warn!(
+                    "references: skipping candidate {p} (unreadable); \
+                     cross-file results may be under-reported"
+                );
+                continue;
+            };
+            if text.contains(name.as_str()) {
+                out.push((p, cand_uri));
+            }
+        }
+        out
+    } else {
+        // Fast-path for class/type/variable names: only files whose interface mentions `name` can
+        // reference it; `name_referencers` already has that set. (Autoloads are excluded — they
+        // take the project-wide textual scan above since they never appear in interface sets.)
+        let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
+        for fid in state.workspace.index.name_referencers(&name) {
+            candidate_fids.insert(fid);
+        }
+        let mut out = Vec::new();
+        for fid in candidate_fids {
+            let Some(p) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            if current_path.as_deref().is_some_and(|e| normalize_eq(e, &p)) {
+                continue;
+            }
+            match path_to_file_uri(&p) {
+                Some(uri) => out.push((p, uri)),
+                None => log::warn!(
+                    "references: dropping candidate {p} — path_to_file_uri rejected the path"
+                ),
+            }
+        }
+        out
+    };
 
     for (path, cand_uri) in candidates {
         let Some((text, parsed, cand_result)) =
@@ -699,9 +1422,37 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         let rope = Rope::from_str(&text);
         let cand_mapper = PositionMapper::new(&rope, enc);
         push_binding_locations(&mut locations, &cand_result, &name, &cand_uri, &cand_mapper);
-        // Also scan identifier-by-name — picks up `extends Foo` and other parser-level refs the
-        // reducer doesn't record. De-dupes happen below.
-        push_identifier_locations(&mut locations, &parsed.tree, &name, &cand_uri, &cand_mapper);
+        if is_method_or_signal {
+            // For method/signal targets: use callee-filtered call projection (accurate) rather
+            // than raw identifier scan (which would pick up unrelated same-named declarations
+            // like `func helper():` in other.gd). When target_file is None (native/unresolved),
+            // fall back to identifier scan to avoid under-reporting.
+            if let Some(tf) = target_file {
+                let mut cand_callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+                push_callee_ident_locations(
+                    &mut locations,
+                    &cand_result,
+                    &parsed.tree,
+                    tf,
+                    &name,
+                    &cand_uri,
+                    &cand_mapper,
+                    &mut cand_callee_spans,
+                );
+            } else {
+                push_identifier_locations(
+                    &mut locations,
+                    &parsed.tree,
+                    &name,
+                    &cand_uri,
+                    &cand_mapper,
+                );
+            }
+        } else {
+            // Non-method targets: identifier scan picks up `extends Foo` and other parser-level
+            // refs the reducer doesn't record. De-dupes happen below.
+            push_identifier_locations(&mut locations, &parsed.tree, &name, &cand_uri, &cand_mapper);
+        }
     }
 
     // De-duplicate (uri, range) pairs — binding scan + identifier scan can overlap on resolved
@@ -783,13 +1534,278 @@ fn push_identifier_locations(
     }
 }
 
+/// Build, in one pass over `tree`, a map from each subscript-call's full [`ByteSpan`] to the span
+/// of its callee attribute-identifier (e.g. `l.helper()` → span of the `helper` identifier, not
+/// the whole `l.helper()` expression), following `CallNode.callee → SubscriptNode →
+/// Attribute(ident_id)`. Callees that aren't a subscript-attribute (bare function calls,
+/// `super()`, …) are absent from the map by design — their callee identifier is pre-reduced into a
+/// `Binding::Use` (reducer Call arm) and reported via [`push_binding_locations`], so projecting them
+/// here too would only double-report the same narrow span (which the de-dupe would then collapse).
+///
+/// [`push_callee_ident_locations`] consults this instead of re-scanning the whole arena once per
+/// matched `Binding::Call` — that was O(nodes × matching_bindings) per file, slow on a large
+/// project with a frequently-named method (`update`, `ready`). Call spans are unique (distinct
+/// calls occupy distinct source extents), so there's no key collision and a lookup reproduces the
+/// old first-match result. The caller builds this lazily, so a file whose textual pre-filter
+/// matched but has no matching call pays nothing.
+fn callee_ident_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
+    let mut map = FxHashMap::default();
+    for nid in tree.iter_ids() {
+        let node = tree.get(nid);
+        let NodeKind::Call(call) = &node.kind else {
+            continue;
+        };
+        let Some(callee_id) = call.callee else {
+            continue;
+        };
+        if let NodeKind::Subscript(sub) = &tree.get(callee_id).kind {
+            if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
+                map.insert(node.span, tree.get(attr_id).span);
+            }
+        }
+    }
+    map
+}
+
+/// Append a [`Location`] for every [`Binding::Call`] in `result.bindings` where
+/// `callee_file == target_file && callee_name == name`, emitting the **narrow callee-identifier
+/// span** derived from the parse tree (via [`callee_ident_span`]).
+///
+/// This replaces [`push_identifier_locations`] for method/signal targets in the M6-E references
+/// fix: raw textual identifier matching would include unrelated same-named declarations (e.g.
+/// `func helper():` in `other.gd`) whereas this filters to genuine callers of the specific method
+/// declared in `target_file`. Only subscript-attribute call sites are emitted here; bare and
+/// `super` call sites are intentionally absent — but NOT dropped from references. The dispatcher
+/// pre-reduces a bare callee (and a subscript callee's base) as an identifier, recording a
+/// `Binding::Use` at that narrow span which [`push_binding_locations`] reports. (Bare calls DO carry
+/// `callee_file == Some(declaring_file)` via `resolve_callee_file`/WP-RD6 — recall for them rides
+/// that `Use` binding, not this call projection; see `references_finds_bare_same_file_call` and
+/// `references_finds_signal_emit_and_connect_sites`.)
+///
+/// Caller must ensure `target_file` is `Some` before calling; the `None` guard lives in
+/// `references()` (fall back to `push_identifier_locations` when `target_file` is `None`).
+// The 8th parameter is a shared lazy span-memo cache (`callee_spans`): it lets the current-file
+// scan reuse the map already built by the target_file probe in `references`, eliminating a
+// duplicate O(nodes) `callee_ident_spans` walk, while staying lazy for cross-file candidates.
+// Bundling args into a struct or inlining the projection loop would be worse than this localized allow.
+#[allow(clippy::too_many_arguments)]
+fn push_callee_ident_locations(
+    out: &mut Vec<Location>,
+    result: &AnalysisResult,
+    tree: &ParseTree,
+    target_file: gd_project::FileId,
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+    // Lazy callee-identifier span map for `tree`, built at most once and shared with the
+    // target_file probe in `references` to avoid a duplicate O(nodes) tree walk per request.
+    callee_spans: &mut Option<FxHashMap<ByteSpan, ByteSpan>>,
+) {
+    for binding in result.bindings() {
+        if let Binding::Call {
+            callee_file: Some(cf),
+            callee_name,
+            call_site,
+            ..
+        } = binding
+        {
+            if *cf == target_file && callee_name == name {
+                let spans = callee_spans.get_or_insert_with(|| callee_ident_spans(tree));
+                if let Some(span) = spans.get(call_site).copied() {
+                    out.push(Location {
+                        uri: uri.clone(),
+                        range: mapper.span_to_range(span),
+                    });
+                }
+            }
+        }
+    }
+}
+
 fn normalize_eq(a: &camino::Utf8Path, b: &camino::Utf8Path) -> bool {
     gd_project::normalize_path(a) == gd_project::normalize_path(b)
+}
+
+fn function_node_span_for_identifier(
+    tree: &ParseTree,
+    ident_id: NodeId,
+    name: &str,
+) -> Option<gd_syntax::ByteSpan> {
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if let NodeKind::Function(f) = &node.kind {
+            if f.identifier == Some(ident_id) && ident_name(tree, ident_id) == name {
+                return Some(node.span);
+            }
+        }
+    }
+    None
+}
+
+fn function_identifier_span_for_decl(
+    tree: &ParseTree,
+    name: &str,
+    decl_span: gd_syntax::ByteSpan,
+) -> Option<gd_syntax::ByteSpan> {
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if node.span == decl_span {
+            if let NodeKind::Function(f) = &node.kind {
+                if let Some(ident) = f.identifier {
+                    if ident_name(tree, ident) == name {
+                        return Some(tree.get(ident).span);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 // =============================================================================================
 // WP-N3: textDocument/implementation.
 // =============================================================================================
+
+/// M6-G: if the cursor is on a root `Func` member of the file identified by `uri`, BFS the
+/// inverse-extends graph to find subclasses and return `Location`s for each subclass that also
+/// declares a method named `fn_name`. Returns `None` to fall through to the existing class-identifier
+/// BFS when the cursor is NOT on that method declaration (e.g. on a class name, a variable, a local
+/// with the same name, or an inner-class method).
+fn find_method_overrides(
+    state: &mut ServerState,
+    fn_name: &str,
+    uri: &Uri,
+    tree: &ParseTree,
+    node_id: NodeId,
+    enc: crate::position::PositionEncoding,
+) -> Option<Vec<Location>> {
+    // Resolve the current file's FileId and interface.
+    let current_path = crate::uri::uri_to_path(uri)?;
+    let current_fid = state.workspace.index.file_id(&current_path)?;
+    let iface = state.workspace.index.interface(current_fid)?;
+
+    // The cursor must be on this file's root method declaration, not merely an identifier whose
+    // text matches a method name. This keeps locals/params/call sites named like a method on the
+    // class-level implementation path, and excludes inner-class methods that are not interface
+    // members of this script's root class.
+    let cursor_fn_span = function_node_span_for_identifier(tree, node_id, fn_name)?;
+    let is_root_func = iface.members.iter().any(|m| {
+        m.name == fn_name && m.kind == gd_project::MemberKind::Func && m.span == cursor_fn_span
+    });
+    if !is_root_func {
+        return None;
+    }
+
+    // Seed the BFS on the current file's own class_name. The cursor is confirmed to be on a
+    // method of THIS file, so an unnamed script simply has no named subclasses to find — return
+    // an empty result, not `None`. `None` would fall through to the class-identifier BFS in
+    // `implementation`, which would then look up the function name in the class_name registry; a
+    // class whose name happens to equal the function name would wrongly surface its subclasses.
+    let Some(seed_name) = iface.class_name.clone() else {
+        return Some(Vec::new());
+    };
+
+    // BFS the inverse-extends graph — same algorithm as the class-identifier branch below.
+    let mut known_names: FxHashSet<String> = FxHashSet::default();
+    let mut known_files: FxHashSet<gd_project::FileId> = FxHashSet::default();
+    known_names.insert(seed_name);
+    loop {
+        let prev_names = known_names.len();
+        let prev_files = known_files.len();
+        for (fid, sub_iface) in state.workspace.index.iter_interfaces() {
+            if known_files.contains(&fid) {
+                continue;
+            }
+            // A name-extends parent matches the known class_name set; a path-extends parent
+            // (`extends "res://base.gd"`) resolves through the index and matches the declaring
+            // file or any already-known subclass file. `current_fid` is checked explicitly
+            // because `known_files` only ever holds discovered subclasses, never the BFS seed.
+            let parent_known = match &sub_iface.extends {
+                gd_project::Extends::Names(parts) => {
+                    parts.last().is_some_and(|p| known_names.contains(p))
+                }
+                gd_project::Extends::Path(res_path) => state
+                    .workspace
+                    .index
+                    .resolve_res_path(res_path)
+                    .is_some_and(|f| f == current_fid || known_files.contains(&f)),
+                gd_project::Extends::None => false,
+            };
+            if parent_known {
+                known_files.insert(fid);
+                if let Some(cn) = &sub_iface.class_name {
+                    known_names.insert(cn.clone());
+                }
+            }
+        }
+        if known_names.len() == prev_names && known_files.len() == prev_files {
+            break;
+        }
+    }
+
+    // For each known subclass (excluding the cursor's own file), emit a Location for the
+    // override's MemberDecl span. If the subclass doesn't override `fn_name`, skip it —
+    // method override search only reports files that actually declare the method.
+    let mut locations = Vec::new();
+    for fid in known_files {
+        if fid == current_fid {
+            continue;
+        }
+        let Some(sub_path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        let Some(cand_uri) = path_to_file_uri(&sub_path) else {
+            continue;
+        };
+
+        // Check the subclass interface for the override and capture its span in one pass.
+        let Some(sub_iface) = state.workspace.index.interface(fid) else {
+            continue;
+        };
+        let Some(override_decl) = sub_iface
+            .members
+            .iter()
+            .find(|m| m.name == fn_name && m.kind == gd_project::MemberKind::Func)
+        else {
+            continue;
+        };
+
+        // Point to the override's identifier span, not the whole `func ...:` signature. The
+        // interface stores FunctionNode spans for members, so parse the candidate text below and
+        // locate the matching FunctionNode identifier just like class-level implementation narrows
+        // subclass locations to `class_name`'s identifier.
+        let fallback_span = override_decl.span;
+
+        let range = {
+            let cand_text = match state.vfs.get(cand_uri.as_str()).map(|d| d.text()) {
+                Some(t) => t,
+                None => match std::fs::read_to_string(sub_path.as_std_path()) {
+                    Ok(t) => t,
+                    Err(_) => {
+                        locations.push(Location {
+                            uri: cand_uri,
+                            range: file_start_range(),
+                        });
+                        continue;
+                    }
+                },
+            };
+            let cand_parsed = gd_syntax::parse(&cand_text);
+            let span = function_identifier_span_for_decl(&cand_parsed.tree, fn_name, fallback_span)
+                .unwrap_or(fallback_span);
+            let rope = Rope::from_str(&cand_text);
+            let cand_mapper = PositionMapper::new(&rope, enc);
+            cand_mapper.span_to_range(span)
+        };
+
+        locations.push(Location {
+            uri: cand_uri,
+            range,
+        });
+    }
+
+    Some(locations)
+}
 
 /// `textDocument/implementation`: list the project classes that extend the class under the cursor
 /// (direct + transitive). Per LSP 3.17 §textDocument/implementation, returns
@@ -828,8 +1844,22 @@ pub fn implementation(
     let node_id = parsed.tree.innermost_node_at(byte)?;
     let name = cursor_identifier(&parsed.tree, node_id)?;
 
+    // M6-G: method-override branch — runs BEFORE the class_name gate below so a cursor on a
+    // root `func` identifier returns override locations rather than null. The helper verifies the
+    // cursor is on that root method declaration, then BFSes the subclass graph (seeded on the
+    // current file's class_name) and emits a Location for each subclass override.
+    if let Some(locs) = find_method_overrides(state, &name, &uri, &parsed.tree, node_id, enc) {
+        return Some(GotoDefinitionResponse::Array(locs));
+    }
+
     // Only project class_names participate; native classes have no project subclasses to list.
-    state.workspace.index.registry().get(&name)?;
+    // Resolve the seed class's file up front: the BFS below matches path-extends subclasses
+    // against it (`known_files` only ever holds discovered subclasses, never the seed), and the
+    // emission loop excludes it from the results.
+    let cursor_fid = {
+        let entry = state.workspace.index.registry().get(&name)?;
+        state.workspace.index.file_id(&entry.path)
+    };
 
     // BFS the inverse-extends closure over EVERY interface (not just registry entries — a file
     // can extend `Hero` without declaring its own `class_name`). Track known-extender FileIds in
@@ -853,12 +1883,21 @@ pub fn implementation(
                 continue;
             }
             // The parent's name is the last identifier in the extends chain (e.g.
-            // `extends Outer.Inner` ⇒ parent name = "Inner"; `extends Hero` ⇒ "Hero").
-            let parent_name = match &iface.extends {
-                gd_project::Extends::Names(parts) => parts.last().map(String::as_str),
-                _ => None,
+            // `extends Outer.Inner` ⇒ parent name = "Inner"; `extends Hero` ⇒ "Hero"). A
+            // path-extends parent (`extends "res://hero.gd"`) resolves through the index and
+            // matches the seed class's file or any already-known subclass file.
+            let parent_known = match &iface.extends {
+                gd_project::Extends::Names(parts) => {
+                    parts.last().is_some_and(|p| known_names.contains(p))
+                }
+                gd_project::Extends::Path(res_path) => state
+                    .workspace
+                    .index
+                    .resolve_res_path(res_path)
+                    .is_some_and(|f| Some(f) == cursor_fid || known_files.contains(&f)),
+                gd_project::Extends::None => false,
             };
-            if parent_name.is_some_and(|p| known_names.contains(p)) {
+            if parent_known {
                 known_files.insert(fid);
                 if let Some(cn) = &iface.class_name {
                     known_names.insert(cn.clone());
@@ -871,12 +1910,6 @@ pub fn implementation(
     }
 
     // Emit a Location per known subclass file (excluding the cursor's own class file).
-    let cursor_fid = state
-        .workspace
-        .index
-        .registry()
-        .get(&name)
-        .and_then(|e| state.workspace.index.file_id(&e.path));
     let mut locations: Vec<Location> = Vec::new();
     let subclass_paths: Vec<camino::Utf8PathBuf> = known_files
         .iter()

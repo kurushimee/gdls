@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use camino::{Utf8Path, Utf8PathBuf};
 use gd_server::config::InitializationOptions;
-use lsp_server::{Connection, Message, Notification, Request, RequestId};
+use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::Uri;
 
 /// A throwaway project directory, removed on drop.
@@ -108,6 +108,19 @@ pub fn recv(conn: &Connection) -> Message {
 /// Used by watcher tests that drain published diagnostics across an indeterminate event count.
 pub fn try_recv(conn: &Connection, timeout: Duration) -> Option<Message> {
     conn.receiver.recv_timeout(timeout).ok()
+}
+
+/// Receive messages until a [`Response`] arrives, skipping any server-initiated notifications
+/// (e.g. a late `publishDiagnostics` push) or requests in between. A bare [`recv`] returns the
+/// *next* message, which races on slower hosts (windows CI) where a diagnostic can slip past a
+/// timeout-based drain and land where the awaited response was expected. Use this whenever a test
+/// sends a request and needs its response.
+pub fn recv_response(conn: &Connection) -> Response {
+    loop {
+        if let Message::Response(r) = recv(conn) {
+            return r;
+        }
+    }
 }
 
 /// Build an LSP request `Message` with the given id, method, and serializable params.

@@ -32,6 +32,9 @@ notify-debouncer-full = { version = "0.6", features = ["crossbeam-channel"] }
 nucleo-matcher = "0.3"
 walkdir = "2.5"
 tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+camino = { version = "1", features = ["serde1"] }
 # `which`: M5 WP-D1 — PATH lookup for the local-only differential harness's `godot` discovery.
 # Pinned here so a future Phase-H walk that needs the same lookup from `gd_server` (e.g. the
 # `gdls diagnose --godot-check` path) doesn't re-pick a different version.

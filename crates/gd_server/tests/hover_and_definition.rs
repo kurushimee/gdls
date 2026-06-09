@@ -406,6 +406,559 @@ fn definition_jumps_across_files_via_class_name() {
     let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
+/// Fix 1: hover on a cross-file method call with parameters shows param NAMES in the signature.
+/// `func helper(amount: int, who: String) -> int` must render with `amount` and `who`, not just
+/// `int, String`.
+#[test]
+fn hover_cross_file_method_shows_param_names() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_param_names");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    // lib.gd: class_name Lib, func helper(amount: int, who: String) -> int
+    std::fs::write(
+        fixture_dir.join("lib.gd"),
+        "class_name Lib\nextends Node\n\nfunc helper(amount: int, who: String) -> int:\n\treturn amount\n",
+    )
+    .expect("write lib.gd");
+    // caller.gd: calls l.helper(5, \"Bob\")
+    // Line 0: `extends Node`
+    // Line 2: `func test(l: Lib):`
+    // Line 3: `\tvar x = l.helper(5, \"Bob\")`  — `helper` at col 12..18
+    let caller_src = "extends Node\n\nfunc test(l: Lib):\n\tvar x = l.helper(5, \"Bob\")\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover on `helper` at line 3, col 13.
+    let hover = hover_at(&client, &caller_uri, Position::new(3, 13))
+        .expect("hover on method call should return something");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("amount"),
+        "hover signature must include param name 'amount', got {md:?}"
+    );
+    assert!(
+        md.contains("who"),
+        "hover signature must include param name 'who', got {md:?}"
+    );
+    assert!(
+        md.contains("amount: int"),
+        "hover signature must render 'amount: int', got {md:?}"
+    );
+    assert!(
+        md.contains("who: String"),
+        "hover signature must render 'who: String', got {md:?}"
+    );
+    assert!(
+        md.contains("func helper("),
+        "hover signature must render the `func helper(` prefix, got {md:?}"
+    );
+    assert!(
+        md.contains("-> int"),
+        "hover signature must render the `-> int` return type, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// Regression for the M6-F hover-scope gate: in `l.helper(5, "Bob")`, hovering the *base receiver*
+/// `l` must fall through to the ordinary type-label hover, NOT surface `helper`'s signature. Before
+/// the gate, `hover_member_signature` matched the whole enclosing Call span, so the base (and any
+/// argument) wrongly rendered `func helper(...)` instead of its own type.
+#[test]
+fn hover_on_call_base_does_not_show_callee_signature() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_base_not_sig");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    std::fs::write(
+        fixture_dir.join("lib.gd"),
+        "class_name Lib\nextends Node\n\nfunc helper(amount: int, who: String) -> int:\n\treturn amount\n",
+    )
+    .expect("write lib.gd");
+    // Line 3: `\tvar x = l.helper(5, "Bob")` — base `l` at col 9, `helper` at col 11..17.
+    let caller_src = "extends Node\n\nfunc test(l: Lib):\n\tvar x = l.helper(5, \"Bob\")\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover on the base receiver `l` at line 3, col 9 — must show its own type, never the callee sig.
+    let base_hover = hover_at(&client, &caller_uri, Position::new(3, 9))
+        .expect("hover on the typed base receiver should return its type label");
+    assert!(
+        !hover_markdown(&base_hover).contains("func helper("),
+        "hover on base receiver `l` must not surface the callee signature, got {:?}",
+        hover_markdown(&base_hover)
+    );
+
+    // Sanity: hovering the callee `helper` (col 13) DOES still render the signature, proving the
+    // gate narrowed scope rather than disabling the M6-F feature.
+    let callee_hover = hover_at(&client, &caller_uri, Position::new(3, 13))
+        .expect("hover on the callee must still return the signature");
+    assert!(
+        hover_markdown(&callee_hover).contains("func helper("),
+        "hover on callee `helper` must still render the signature, got {:?}",
+        hover_markdown(&callee_hover)
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// Hover on a `preload("res://foo.gd")` string literal shows the resolved script's basename.
+#[test]
+fn hover_on_preload_string_shows_resolved_script() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_preload");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    std::fs::write(fixture_dir.join("lib.gd"), "extends Node\n").expect("write lib.gd");
+    // caller.gd has: const Lib = preload("res://lib.gd")
+    // The string literal starts at col 20.
+    let caller_src = "const Lib = preload(\"res://lib.gd\")\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover inside "res://lib.gd" at line 0, col 25.
+    let hover = hover_at(&client, &caller_uri, Position::new(0, 25))
+        .expect("hover on preload string must return something");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("lib.gd"),
+        "hover on preload string must show the resolved filename 'lib.gd', got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// Hover on a `preload("res://…")` whose target is a real **non-GDScript** resource (`.tscn`/
+/// `.tres`/asset) shows that file's basename, labelled "Resource" (not "GDScript"). The index holds
+/// only `.gd`, so this resolves via the on-disk fallback — matching what `document_link` links.
+#[test]
+fn hover_on_preload_non_gd_resource_shows_basename() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_preload_tscn");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(fixture_dir.join("scenes")).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    // A real scene file on disk — NOT a `.gd`, so it never enters the index.
+    std::fs::write(fixture_dir.join("scenes/main.tscn"), "[gd_scene]\n").expect("write main.tscn");
+    // caller.gd has: const Main = preload("res://scenes/main.tscn")
+    let caller_src = "const Main = preload(\"res://scenes/main.tscn\")\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover inside the `"res://scenes/main.tscn"` literal (col 30 lands in the path).
+    let hover = hover_at(&client, &caller_uri, Position::new(0, 30))
+        .expect("hover on a preload of an on-disk .tscn must return something");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("main.tscn"),
+        "hover must show the resolved resource basename 'main.tscn', got {md:?}"
+    );
+    assert!(
+        md.contains("Resource") && !md.contains("GDScript"),
+        "a non-.gd resource hover must be labelled 'Resource', not 'GDScript', got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// M6-F: hover on a cross-file method call with no parameters shows the function signature from
+/// the callee's interface (`func helper() -> int`). Param-name rendering is tested in
+/// `hover_cross_file_method_shows_param_names`; preload-string hover in
+/// `hover_on_preload_string_shows_resolved_script`.
+#[test]
+fn hover_cross_file_method_shows_signature() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_m6f");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    // lib.gd: class_name Lib, func helper() -> int
+    std::fs::write(
+        fixture_dir.join("lib.gd"),
+        "class_name Lib\nextends Node\n\nfunc helper() -> int:\n\treturn 1\n",
+    )
+    .expect("write lib.gd");
+    // caller.gd: calls l.helper()
+    // Line 0: `extends Node`
+    // Line 2: `func test(l: Lib):`
+    // Line 3: `\tvar x = l.helper()`  — `helper` at col 12..18
+    let caller_src = "extends Node\n\nfunc test(l: Lib):\n\tvar x = l.helper()\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover on `helper` at line 3, col 13 (inside the identifier).
+    let hover = hover_at(&client, &caller_uri, Position::new(3, 13))
+        .expect("hover on method call should return something");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("helper"),
+        "hover on cross-file method call must show 'helper' in the signature, got {md:?}"
+    );
+    assert!(
+        md.contains("func"),
+        "hover on cross-file method call must show 'func' keyword, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// M6-F regression (greptile r3372647839): with a nested call `a.outer(b.inner())`, hovering the
+/// *inner* callee `inner` must render `inner`'s signature, not the enclosing `outer`'s. DFS
+/// pre-order visits the outer Call first, so the handler must pick the smallest-span (innermost)
+/// enclosing Call, not the first match.
+#[test]
+fn hover_nested_call_picks_innermost_callee() {
+    let fixture_dir = std::env::temp_dir().join("gdls_hover_m6f_nested");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    std::fs::write(
+        fixture_dir.join("lib.gd"),
+        "class_name Lib\nextends Node\n\nfunc outer(n: int) -> int:\n\treturn n\n\nfunc inner() -> int:\n\treturn 1\n",
+    )
+    .expect("write lib.gd");
+    // Line 3: `\tvar x = a.outer(b.inner())` — `inner` at cols 19..24, nested inside `a.outer(…)`.
+    let caller_src = "extends Node\n\nfunc test(a: Lib, b: Lib):\n\tvar x = a.outer(b.inner())\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Hover on `inner` at line 3, col 21 (inside the inner callee identifier).
+    let hover = hover_at(&client, &caller_uri, Position::new(3, 21))
+        .expect("hover on nested inner call should return something");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("inner"),
+        "hover on the inner callee must show 'inner', got {md:?}"
+    );
+    assert!(
+        !md.contains("outer"),
+        "hover on the inner callee must NOT show the enclosing 'outer' signature, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// M6-B: definition on a `class_name`-registered identifier used in expression position
+/// (`Foo.bar()` or `Foo.CONST`). When the cursor is on `Foo` (the base of an attribute-access
+/// subscript), go-to-definition must jump to `foo.gd`'s `class_name Foo` declaration.
+#[test]
+fn definition_on_class_name_in_expression_position() {
+    let fixture_dir = std::env::temp_dir().join("gdls_def_m6b");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    // foo.gd declares the class; `class_name Foo` at line 0, cols 11..14.
+    std::fs::write(fixture_dir.join("foo.gd"), "class_name Foo\n").expect("write foo.gd");
+    // caller.gd references Foo in expression position: `Foo.new()`.
+    // Line 0: `extends Node`
+    // Line 2: `func test():`
+    // Line 3: `\tvar x = Foo.new()` — `Foo` at col 9..12
+    let caller_src = "extends Node\n\nfunc test():\n\tvar x = Foo.new()\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Click on `Foo` at line 3, col 10 (inside `Foo.new()`).
+    let response = definition_at(&client, &caller_uri, Position::new(3, 10))
+        .expect("class_name in expression position must resolve");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    let loc_str = location.uri.as_str();
+    assert!(
+        loc_str.ends_with("/foo.gd"),
+        "definition should jump to foo.gd, got {loc_str}"
+    );
+    // `class_name Foo` — identifier `Foo` at cols 11..14.
+    assert_eq!(location.range.start, Position::new(0, 11));
+    assert_eq!(location.range.end, Position::new(0, 14));
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// M6-C1: definition on a preload/load path string literal jumps to the target file.
+#[test]
+fn definition_on_preload_path_string_jumps_to_file() {
+    let fixture_dir = std::env::temp_dir().join("gdls_def_m6c1");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    std::fs::write(fixture_dir.join("foo.gd"), "extends Node\n").expect("write foo.gd");
+    // caller.gd has: const Foo = preload("res://foo.gd")
+    // line 0: `const Foo = preload("res://foo.gd")`
+    // The string literal `"res://foo.gd"` starts at col 20.
+    let caller_src = "const Foo = preload(\"res://foo.gd\")\n";
+    std::fs::write(fixture_dir.join("caller.gd"), caller_src).expect("write caller.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let caller_path = fixture_dir.join("caller.gd");
+    let caller_uri: Uri = format!(
+        "file:///{}",
+        caller_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &caller_uri, caller_src);
+
+    // Click inside the string literal "res://foo.gd" at line 0, col 25.
+    let response = definition_at(&client, &caller_uri, Position::new(0, 25))
+        .expect("preload string must resolve to the target file");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    let loc_str = location.uri.as_str();
+    assert!(
+        loc_str.ends_with("/foo.gd"),
+        "definition on preload path should jump to foo.gd, got {loc_str}"
+    );
+    // Location points at the beginning of foo.gd (line 0, col 0).
+    assert_eq!(location.range.start, Position::new(0, 0));
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// M6-D: definition on an autoload name jumps to the autoload script (last-fallback branch).
+/// Also tests shadowing: a local var `Save` shadows the autoload named `Save`; definition on
+/// the local ref must resolve to the in-file declaration, not the autoload.
+#[test]
+fn definition_on_autoload_jumps_to_script() {
+    let fixture_dir = std::env::temp_dir().join("gdls_def_m6d");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("save.gd"), "extends Node\n").expect("write save.gd");
+    // project.godot declares `Save` as an autoload pointing at res://save.gd.
+    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
+    std::fs::write(fixture_dir.join("project.godot"), project_godot).expect("write project.godot");
+    // user.gd references the autoload `Save` in expression position.
+    // Line 0: `extends Node`
+    // Line 2: `func test():`
+    // Line 3: `\tSave.do_thing()`  — `Save` at col 1..5
+    let user_src = "extends Node\n\nfunc test():\n\tSave.do_thing()\n";
+    std::fs::write(fixture_dir.join("user.gd"), user_src).expect("write user.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let user_path = fixture_dir.join("user.gd");
+    let user_uri: Uri = format!("file:///{}", user_path.to_string_lossy().replace('\\', "/"))
+        .parse()
+        .unwrap();
+    did_open(&client, &user_uri, user_src);
+
+    // Click on `Save` at line 3, col 2 — should jump to save.gd.
+    let response = definition_at(&client, &user_uri, Position::new(3, 2))
+        .expect("autoload name must resolve to its script");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    let loc_str = location.uri.as_str();
+    assert!(
+        loc_str.ends_with("/save.gd"),
+        "definition on autoload should jump to save.gd, got {loc_str}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// M6-D negative: when project.godot declares an autoload pointing at `res://save.gd` but
+/// `save.gd` is NOT present on disk (not indexed), `go-to-definition` on the autoload name must
+/// return no Location — not crash, not emit a dangling URI. The existence-gate in
+/// `find_autoload_definition` (`resolve_res_path` returning None for unindexed files) covers this.
+#[test]
+fn definition_autoload_missing_script_returns_none() {
+    let fixture_dir = std::env::temp_dir().join("gdls_def_m6d_missing");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    // Declare `Save` autoload pointing at res://save.gd — but do NOT write save.gd to disk.
+    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
+    std::fs::write(fixture_dir.join("project.godot"), project_godot).expect("write project.godot");
+    // user.gd references Save in expression position.
+    // Line 0: `extends Node`
+    // Line 2: `func test():`
+    // Line 3: `\tSave.do_thing()`  — `Save` at col 1..5
+    let user_src = "extends Node\n\nfunc test():\n\tSave.do_thing()\n";
+    std::fs::write(fixture_dir.join("user.gd"), user_src).expect("write user.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let user_path = fixture_dir.join("user.gd");
+    let user_uri: Uri = format!("file:///{}", user_path.to_string_lossy().replace('\\', "/"))
+        .parse()
+        .unwrap();
+    did_open(&client, &user_uri, user_src);
+
+    // Click on `Save` at line 3, col 2 — autoload exists in project.godot but script is absent.
+    // Must return None (null wire response), not a dangling file:// URI.
+    let response = definition_at(&client, &user_uri, Position::new(3, 2));
+    assert!(
+        response.is_none(),
+        "definition on autoload with missing script must return None; got {response:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+/// M6-D shadowing: a local var named `Save` takes priority over the autoload named `Save`.
+/// Definition on the local reference must stay in-file, not jump to the autoload script.
+#[test]
+fn definition_autoload_shadowed_by_local_stays_in_file() {
+    let fixture_dir = std::env::temp_dir().join("gdls_def_m6d_shadow");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("save.gd"), "extends Node\n").expect("write save.gd");
+    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
+    std::fs::write(fixture_dir.join("project.godot"), project_godot).expect("write project.godot");
+    // shadow.gd has a member `var Save := 1` and a func that references it.
+    // Line 0: `extends Node`
+    // Line 1: `var Save := 1`   — `Save` (decl) at col 4..8
+    // Line 3: `func test():`
+    // Line 4: `\tprint(Save)`   — `Save` at col 8..12
+    let shadow_src = "extends Node\nvar Save := 1\n\nfunc test():\n\tprint(Save)\n";
+    std::fs::write(fixture_dir.join("shadow.gd"), shadow_src).expect("write shadow.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+
+    let shadow_path = fixture_dir.join("shadow.gd");
+    let shadow_uri: Uri = format!(
+        "file:///{}",
+        shadow_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &shadow_uri, shadow_src);
+
+    // Click on `Save` at line 4 col 9 — the `print(Save)` reference.
+    let response = definition_at(&client, &shadow_uri, Position::new(4, 9))
+        .expect("shadowed name resolves to in-file decl");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    // Must stay in shadow.gd, pointing at the `var Save` declaration (col 4..8 on line 1).
+    assert_eq!(
+        location.uri, shadow_uri,
+        "shadowed name must resolve in-file"
+    );
+    assert_eq!(location.range.start, Position::new(1, 4));
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
 #[test]
 fn did_save_triggers_a_diagnostic_republish() {
     // `didSave` should re-publish diagnostics for the open buffer (same content, idempotent),

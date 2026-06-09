@@ -19,6 +19,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use gd_syntax::ParseTree;
 use gd_types::NativeDb;
 use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
 use crate::depgraph::{DepGraph, FileId};
@@ -315,6 +316,15 @@ impl Index {
     /// build the base's `DataType` itself.
     pub fn resolve_res_path(&self, res: &str) -> Option<FileId> {
         self.resolve_path(res)
+    }
+
+    /// `res://…` → its absolute path under the project root — a pure path-join with **no existence
+    /// check** (mirrors [`ProjectModel::res_to_path`](crate::ProjectModel::res_to_path)). Unlike
+    /// [`Self::resolve_res_path`], this does not require the target to be an indexed `.gd` file, so
+    /// callers can resolve references to non-GDScript resources (`.tscn`/`.tres`/assets — the index
+    /// holds only `.gd`; see `gd_files`). The caller is responsible for confirming the path exists.
+    pub fn res_to_path(&self, res: &str) -> Option<Utf8PathBuf> {
+        crate::paths::res_to_path(&self.root, res)
     }
 
     // --- Read accessors -------------------------------------------------------------------------
@@ -796,6 +806,201 @@ fn fold_windows_drive(s: String) -> String {
         out
     } else {
         s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Index cache integration — B2: to_cache / from_cache / cache_equivalent.
+// ---------------------------------------------------------------------------
+
+/// A serializable snapshot of an [`Index`].
+///
+/// This is the "plain-data view" of the index that gets written to the warm-start cache (B3).
+/// Runtime-only fields (`dirty`, `epochs`) are excluded — a freshly-loaded index has an empty
+/// dirty set and epoch 0 for every file, which is correct for a warm-start.
+///
+/// Inverse maps (`ids`, `name_referencers`, `path_referencers`) are rebuilt from their sources
+/// of truth on [`Index::from_cache`] to avoid storing two copies that could drift.
+#[derive(Serialize, Deserialize)]
+pub struct IndexCache {
+    /// `res://` root of the project.
+    root: Utf8PathBuf,
+    /// FileId arena — `paths[i]` is the path for `FileId::new(i as u32 + 1)`.
+    /// **Stored in insertion order** so FileId stability is preserved after round-trip.
+    paths: Vec<Utf8PathBuf>,
+    /// Per-file shallow interfaces (keyed by FileId).
+    interfaces: Vec<(FileId, Interface)>,
+    /// The `class_name` registry (forward data only; reverse rebuilt on load).
+    registry: ClassNameRegistry,
+    /// The dependency graph (forward edges only; reverse rebuilt on load).
+    deps: DepGraph,
+    /// `file → set of class names it references` — the forward half of the name-reference index.
+    /// `name_referencers` (the inverse) is rebuilt from this on load.
+    file_refs: Vec<(FileId, Vec<String>)>,
+    /// `file → path it `extends "res://…"`to` — the forward half of the path-reference index.
+    /// `path_referencers` (the inverse) is rebuilt from this on load.
+    file_path_ref: Vec<(FileId, Utf8PathBuf)>,
+}
+
+impl Index {
+    /// Produce a serializable snapshot of this index. Runtime-only state (`dirty`, `epochs`) is
+    /// excluded; inverse maps are omitted (they are rebuilt from sources of truth on
+    /// [`Self::from_cache`]).
+    pub fn to_cache(&self) -> IndexCache {
+        IndexCache {
+            root: self.root.clone(),
+            paths: self.paths.clone(),
+            interfaces: self
+                .interfaces
+                .iter()
+                .map(|(&fid, iface)| (fid, iface.clone()))
+                .collect(),
+            registry: self.registry.clone(),
+            deps: self.deps.clone(),
+            file_refs: self
+                .file_refs
+                .iter()
+                .map(|(&fid, names)| {
+                    let mut names_vec: Vec<String> = names.iter().cloned().collect();
+                    names_vec.sort_unstable();
+                    (fid, names_vec)
+                })
+                .collect(),
+            file_path_ref: self
+                .file_path_ref
+                .iter()
+                .map(|(&fid, path)| (fid, path.clone()))
+                .collect(),
+        }
+    }
+
+    /// Reconstruct an [`Index`] from a serialized snapshot. Inverse maps (`ids`,
+    /// `name_referencers`, `path_referencers`) are rebuilt from the stored forward data.
+    /// Runtime-only fields (`dirty`, `epochs`) start empty/zeroed — correct for a freshly-loaded
+    /// warm-start index.
+    pub fn from_cache(cache: IndexCache) -> Self {
+        // Rebuild the `ids` reverse map from `paths` in stored order so FileId stability holds.
+        let mut ids = FxHashMap::default();
+        for (i, path) in cache.paths.iter().enumerate() {
+            let fid = FileId::new(i as u32 + 1);
+            ids.insert(path.clone(), fid);
+        }
+
+        // Rebuild `interfaces` map from the stored vec.
+        let interfaces: FxHashMap<FileId, Interface> = cache.interfaces.into_iter().collect();
+
+        // Rebuild `file_refs` map and the `name_referencers` inverse from the stored forward data.
+        let mut file_refs: FxHashMap<FileId, FxHashSet<String>> = FxHashMap::default();
+        let mut name_referencers: FxHashMap<String, FxHashSet<FileId>> = FxHashMap::default();
+        for (fid, names) in cache.file_refs {
+            let set: FxHashSet<String> = names.into_iter().collect();
+            for name in &set {
+                name_referencers
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(fid);
+            }
+            if !set.is_empty() {
+                file_refs.insert(fid, set);
+            }
+        }
+
+        // Rebuild `file_path_ref` map and the `path_referencers` inverse.
+        let mut file_path_ref: FxHashMap<FileId, Utf8PathBuf> = FxHashMap::default();
+        let mut path_referencers: FxHashMap<Utf8PathBuf, FxHashSet<FileId>> = FxHashMap::default();
+        for (fid, path) in cache.file_path_ref {
+            path_referencers
+                .entry(path.clone())
+                .or_default()
+                .insert(fid);
+            file_path_ref.insert(fid, path);
+        }
+
+        Index {
+            root: cache.root,
+            paths: cache.paths,
+            ids,
+            interfaces,
+            registry: cache.registry,
+            deps: cache.deps,
+            file_refs,
+            name_referencers,
+            file_path_ref,
+            path_referencers,
+            // Runtime-only fields start empty/zeroed — correct for a fresh warm-start.
+            dirty: FxHashSet::default(),
+            epochs: FxHashMap::default(),
+        }
+    }
+
+    /// Assert that a warm-started (loaded) index is structurally equivalent to a cold-built one
+    /// for the same project state. Compares the sources of truth (interfaces, registry forward
+    /// data, depgraph forward edges, path arena) — inverse maps are not compared as they are
+    /// always derived from these.
+    ///
+    /// Returns `true` when `self` and `other` carry the same project state. Used by the B3 load
+    /// path to validate a cache hit before trusting it, and by the round-trip spike test.
+    ///
+    /// **Distinct from [`Self::verify`]**, which checks internal consistency of a single index
+    /// (cross-table invariants). This method checks structural equality *between* two indexes.
+    pub fn cache_equivalent(&self, other: &Index) -> bool {
+        // Roots must match.
+        if self.root != other.root {
+            return false;
+        }
+        // Path arenas must be identical (same order, same paths — FileId stability depends on it).
+        if self.paths != other.paths {
+            return false;
+        }
+        // Interface maps must match.
+        if self.interfaces.len() != other.interfaces.len() {
+            return false;
+        }
+        for (fid, iface) in &self.interfaces {
+            if other.interfaces.get(fid) != Some(iface) {
+                return false;
+            }
+        }
+        // Registry forward data must match. Use the public `entries()` API.
+        if self.registry.len() != other.registry.len() {
+            return false;
+        }
+        for (name, entry) in self.registry.entries() {
+            if other.registry.get(name) != Some(entry) {
+                return false;
+            }
+        }
+        // DepGraph forward edges must match. Use the crate-internal `iter_forward` API.
+        if self.deps.forward_len() != other.deps.forward_len() {
+            return false;
+        }
+        for (fid, targets) in self.deps.iter_forward() {
+            let Some(other_targets) = other.deps.forward_deps(fid) else {
+                return false;
+            };
+            if targets != other_targets {
+                return false;
+            }
+        }
+        // File-refs forward data must match.
+        if self.file_refs.len() != other.file_refs.len() {
+            return false;
+        }
+        for (fid, names) in &self.file_refs {
+            if other.file_refs.get(fid) != Some(names) {
+                return false;
+            }
+        }
+        // File-path-ref forward data must match.
+        if self.file_path_ref.len() != other.file_path_ref.len() {
+            return false;
+        }
+        for (fid, path) in &self.file_path_ref {
+            if other.file_path_ref.get(fid) != Some(path) {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1759,5 +1964,144 @@ mod tests {
         assert!(idx.interface_of(&abs("b.gd")).is_none());
         assert!(idx.registry().get("MyBase").is_none());
         assert!(epoch(&idx, "a.gd") > a_epoch0);
+    }
+
+    /// Spike: serde round-trip on a populated Index.
+    ///
+    /// Validates:
+    /// - Every serialized field type can actually derive Serialize+Deserialize.
+    /// - FileId stability: same path → same FileId after round-trip.
+    /// - Structural equivalence: warm == cold for same on-disk state.
+    #[test]
+    fn index_serde_roundtrip() {
+        // Build a small Index with several interned files, an interface with members/inner/enums,
+        // a registered class_name, and a depgraph edge — exercises every serialized field shape.
+        let idx = cold_index(&[
+            (
+                "hero.gd",
+                "class_name Hero\nextends Node2D\n\
+                 @export var speed: float = 10.0\n\
+                 @onready var label: Label\n\
+                 func move(dir: Vector2, speed: float) -> void:\n\tpass\n\
+                 signal hit(amount: int)\n\
+                 enum State { IDLE, RUN, JUMP }\n",
+            ),
+            (
+                "enemy.gd",
+                "class_name Enemy\nextends Hero\n\
+                 var hp: int\n\
+                 class Inner extends Resource:\n\
+                     var x: Array[int]\n",
+            ),
+            (
+                "scene.gd",
+                "extends Node\nconst E = preload(\"res://enemy.gd\")\n",
+            ),
+            // A path-based extends: exercises file_path_ref / path_referencers round-trip.
+            // Without this fixture those maps are empty and cache_equivalent compares
+            // empty-vs-empty vacuously, hiding any bug in `from_cache`'s inverse rebuild.
+            ("waiter.gd", "extends \"res://hero.gd\"\n"),
+        ]);
+
+        // Capture reference FileIds before serialization.
+        let hero_id_before = idx.file_id(&abs("hero.gd")).expect("hero.gd interned");
+        let enemy_id_before = idx.file_id(&abs("enemy.gd")).expect("enemy.gd interned");
+        let scene_id_before = idx.file_id(&abs("scene.gd")).expect("scene.gd interned");
+        let waiter_id_before = idx.file_id(&abs("waiter.gd")).expect("waiter.gd interned");
+
+        // Serialize the cache view.
+        let cache = idx.to_cache();
+        let bytes = serde_json::to_vec(&cache).expect("Index cache must serialize to JSON");
+
+        // Deserialize back.
+        let cache2: IndexCache = serde_json::from_slice(&bytes).expect("JSON must deserialize");
+        let restored = Index::from_cache(cache2);
+
+        // FileId stability: same paths → same FileIds after round-trip.
+        assert_eq!(
+            restored.file_id(&abs("hero.gd")),
+            Some(hero_id_before),
+            "hero.gd FileId must be stable across round-trip"
+        );
+        assert_eq!(
+            restored.file_id(&abs("enemy.gd")),
+            Some(enemy_id_before),
+            "enemy.gd FileId must be stable across round-trip"
+        );
+        assert_eq!(
+            restored.file_id(&abs("scene.gd")),
+            Some(scene_id_before),
+            "scene.gd FileId must be stable across round-trip"
+        );
+        assert_eq!(
+            restored.file_id(&abs("waiter.gd")),
+            Some(waiter_id_before),
+            "waiter.gd FileId must be stable across round-trip"
+        );
+
+        // The restored Index must be structurally equivalent to the original.
+        assert!(
+            idx.cache_equivalent(&restored),
+            "restored Index must be structurally equivalent to the original"
+        );
+
+        // verify() should still pass on the restored index.
+        assert!(
+            restored.verify().is_ok(),
+            "restored Index must satisfy all invariants"
+        );
+
+        // Runtime-only fields are zeroed on load (dirty set is empty, epochs all 0).
+        assert_eq!(
+            restored.dirty_count(),
+            0,
+            "freshly-loaded index must have an empty dirty set"
+        );
+
+        // Independent oracle: run real query operations on the restored index, exercising
+        // the rebuilt inverse maps (ids, name_referencers, path_referencers) rather than
+        // just the structural check.
+
+        // resolve_base on enemy.gd (extends Hero) must yield the hero FileId.
+        let db = native_db();
+        assert_eq!(
+            restored.resolve_base(enemy_id_before, &db),
+            Resolution::Script(hero_id_before),
+            "enemy.gd must resolve its base (Hero) to hero.gd's FileId after round-trip"
+        );
+
+        // name_referencers("Hero") on the restored index must yield the same FileIds.
+        let mut orig_refs: Vec<FileId> = idx.name_referencers("Hero").collect();
+        let mut restored_refs: Vec<FileId> = restored.name_referencers("Hero").collect();
+        orig_refs.sort();
+        restored_refs.sort();
+        assert_eq!(
+            orig_refs, restored_refs,
+            "name_referencers must match across round-trip"
+        );
+
+        // path_referencers oracle: waiter.gd uses `extends "res://hero.gd"` (a path-based
+        // extends), so the restored index's path_referencers inverse map must link hero.gd's
+        // absolute path back to waiter's FileId. This directly tests that `from_cache` correctly
+        // rebuilds `path_referencers` from the serialized `file_path_ref` forward data — a bug
+        // there would silently break cross-file re-linking after a warm start, but `cache_equivalent`
+        // alone wouldn't catch it when the maps are empty (no fixture uses path extends). Direct field
+        // access is valid here: this test lives in the same module as Index.
+        let path_refs_for_hero = restored.path_referencers.get(&abs("hero.gd")).expect(
+            "path_referencers must have an entry for hero.gd after round-trip \
+                     (waiter.gd path-extends it)",
+        );
+        assert!(
+            path_refs_for_hero.contains(&waiter_id_before),
+            "path_referencers[hero.gd] must contain waiter.gd's FileId after round-trip; \
+             got: {path_refs_for_hero:?}"
+        );
+
+        // Class registry: restored index knows Hero is in hero.gd.
+        let hero_entry = restored
+            .registry()
+            .get("Hero")
+            .expect("Hero registered after round-trip");
+        assert_eq!(hero_entry.path, abs("hero.gd"));
     }
 }

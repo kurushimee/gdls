@@ -20,7 +20,14 @@ use camino::Utf8Path;
 /// — all of which the index/watcher must surface so cross-file resolution stays correct. A stray
 /// `.gd` under an addon will get indexed; this is intentional behavior. Operators who genuinely
 /// don't want addon scripts in the index can omit them via project layout.
-pub const EXCLUDED_COMPONENTS: &[&str] = &[".godot", ".import", ".git", "target", "node_modules"];
+pub const EXCLUDED_COMPONENTS: &[&str] = &[
+    ".godot",
+    ".import",
+    ".git",
+    "target",
+    "node_modules",
+    ".gdls",
+];
 
 /// Suffixes matched on the *file name* part. Tmp/backup files from editors. (The cold index
 /// already filters to the `.gd` extension, so these mostly matter to the watcher — but sharing
@@ -115,6 +122,12 @@ mod tests {
         assert!(is_excluded(&p("/proj/.git/HEAD"), &root));
         assert!(is_excluded(&p("/proj/target/debug/x"), &root));
         assert!(is_excluded(&p("/proj/node_modules/dep/x.gd"), &root));
+        // M6 cache dir: the warm-start cache must never re-enter the index/watcher. A `.gd` placed
+        // under `.gdls/` (or a watcher event for the `.json` cache) is excluded only because `.gdls`
+        // is in EXCLUDED_COMPONENTS — this fails if that entry is removed (the `.gd`-extension filter
+        // alone would not catch a `.gd` sibling there).
+        assert!(is_excluded(&p("/proj/.gdls/index.1.json"), &root));
+        assert!(is_excluded(&p("/proj/.gdls/stray.gd"), &root));
     }
 
     #[test]

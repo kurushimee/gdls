@@ -95,6 +95,17 @@ pub trait CrossFileQuery {
         None
     }
 
+    /// Resolve a configured autoload singleton NAME to the project file of its script, if any.
+    ///
+    /// Godot's `ProjectSettings` autoload table → `ScriptServer` singleton. Returning `Some(fid)`
+    /// makes `reduce_identifier` type the bare name as a Script INSTANCE (not meta type) pointing
+    /// at `fid`, so member access through the singleton (`Global.popup_error(...)`) resolves via
+    /// the existing Script-member path. `None` = not an autoload (default; overridden only by
+    /// `WorkspaceXFileQuery` in `gd_server`, which has access to the `ProjectModel`).
+    fn autoload_file(&self, _name: &str) -> Option<FileId> {
+        None
+    }
+
     /// Cross-file references in `member`'s initializer expression on `file`.
     ///
     /// Each returned `(target_file, target_member)` pair names another file's top-level member

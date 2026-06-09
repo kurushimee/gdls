@@ -1,7 +1,11 @@
 # 08 — M6: exposed-capability parity + warm-start cache (the v1 ship milestone)
 
-**Status:** M6 milestone spec · authored 2026-06-01 · supersedes the "ship now" recommendation reached at
-the close of M5 Phase H. **M6 is the final milestone of Phase 1 — completing it is what ships and tags v1.0.0.**
+**Status: READY TO SHIP (2026-06-08) — `v1.0.0` is tagged on merge.** M6 is complete — every exposed-capability parity item (A–G) plus
+autoload-singleton typing landed, the persistent warm-start cache is in (14.7× on a 3,000-file synthetic
+project; multi-instance-safe), and an OSS capability walk against a real Godot 4.6.3 project
+(Pixelorama) returns complete data on every row. Both ratchets hold (parser 186/186, analyzer 300/300).
+`v1.0.0` is tagged from the integration branch on merge. The spec below is preserved as authored
+(2026-06-01); see [`CHANGELOG.md`](../CHANGELOG.md) for what landed and the Phase-2 deferrals.
 
 The M5 Phase H walk against a large real-world GDScript project returned GREEN **against the original bar** ("no crashes,
 no wrong answers, safe-but-sometimes-incomplete is acceptable"). The bar has since been raised:
@@ -64,11 +68,12 @@ so the 300/300 + 186/186 ratchets are not at risk — but every item must keep t
   (inner classes/enums are nested at `parser.rs:4419-4458`); the server handler
   (`crates/gd_server/src/handlers.rs` `document_symbol` → `to_lsp_symbol`) preserves children
   faithfully. **The flattening is purely in the parser projection.**
-- **Fix:** when the root class has an identifier (named top-level class), wrap its members in a
-  single `Class` `DocumentSymbol` (range = whole script, selectionRange = the `class_name`/file)
-  instead of returning them at top level. Match Godot's SymbolKinds (Class 5, Method 6/Function 12,
-  Variable 13/Property 7, Constant 14, Enum 10, Signal/Event 24) and drop `local` symbols as Godot
-  does (`godot_lsp.h:1272`).
+- **Fix:** always wrap the script's members in a single root `Class` `DocumentSymbol` (range = whole
+  script) — unconditionally, matching Godot's `parse_class_symbol` (`gdscript_extend_parser.cpp:240-252`).
+  Named by `class_name` if present (selectionRange = identifier span); otherwise empty name + zero-width
+  selectionRange at file start, with the server handler filling the file basename for unnamed scripts.
+  Match Godot's SymbolKinds (Class 5, Method 6/Function 12, Variable 13/Property 7, Constant 14,
+  Enum 10, Signal/Event 24) and drop `local` symbols as Godot does (`godot_lsp.h:1272`).
 - **Size/risk:** small / low. Localized to one function + a documentSymbol test update.
 
 ### M6-B — `definition`: resolve `class_name` used in expression position

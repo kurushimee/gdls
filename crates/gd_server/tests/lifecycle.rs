@@ -121,7 +121,8 @@ fn m0_lifecycle_diagnostics_and_symbols() {
         "a valid `extends Node` file has no syntax diagnostics"
     );
 
-    // 4) documentSymbol → a valid response (this file declares no members, so it is empty).
+    // 4) documentSymbol → a root Class named by the file basename (A1: unnamed scripts get a
+    //    root Class wrapper; the handler fills the empty name with the URI basename "a.gd").
     client
         .sender
         .send(request(
@@ -141,7 +142,19 @@ fn m0_lifecycle_diagnostics_and_symbols() {
     };
     assert_eq!(resp.id, RequestId::from(2));
     assert!(resp.error.is_none());
-    assert_eq!(resp.result, Some(serde_json::json!([])));
+    // A1 changed documentSymbol: now returns a single root Class wrapping members. For an unnamed
+    // script ("extends Node" with no class_name), the root name is the file basename "a.gd"
+    // (filled by the handler) and children is absent (no members declared). The selectionRange is
+    // zero-width at (0,0) since there's no class_name declaration to point at.
+    assert_eq!(
+        resp.result,
+        Some(serde_json::json!([{
+            "name": "a.gd",
+            "kind": 5,
+            "range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
+            "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}
+        }]))
+    );
 
     // 5) shutdown + exit → server replies to shutdown, then exits cleanly.
     client

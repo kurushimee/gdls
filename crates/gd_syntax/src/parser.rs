@@ -24,6 +24,7 @@ use std::collections::HashMap;
 
 use crate::ast::*;
 use crate::lexer::Lexer;
+use crate::span::ByteSpan;
 use crate::token::{Literal, Token, TokenKind};
 use crate::{Diagnostic, DocumentSymbol, SymbolKind};
 
@@ -425,7 +426,7 @@ pub struct Parser {
 fn empty_token() -> Token {
     Token {
         kind: TokenKind::Empty,
-        span: crate::span::ByteSpan::default(),
+        span: ByteSpan::default(),
         loc: crate::span::LineColRange::default(),
         literal: None,
         source: Box::from(""),
@@ -4549,13 +4550,38 @@ impl Parser {
 
 // ===== documentSymbol projection (walks the parsed head class) =====
 
-/// Project the parse tree's top-level class into a nested [`DocumentSymbol`] outline. Inner classes
-/// recurse; unnamed members (e.g. a malformed declaration with no identifier) are skipped.
+/// Project the parse tree's top-level class into a nested [`DocumentSymbol`] outline, mirroring
+/// Godot's `parse_class_symbol` (`gdscript_extend_parser.cpp:240-252`). Always wraps the script in
+/// one root `Class` symbol (named by `class_name` if present, else empty name — the server handler
+/// fills the file basename for unnamed scripts). Inner classes recurse; unnamed members (e.g. a
+/// malformed declaration with no identifier) are skipped.
 pub fn document_symbols(tree: &ParseTree) -> Vec<DocumentSymbol> {
     if tree.is_empty() {
         return Vec::new();
     }
-    class_member_symbols(tree, tree.root)
+    let NodeKind::Class(class) = &tree.get(tree.root).kind else {
+        return Vec::new();
+    };
+
+    let children = class_member_symbols(tree, tree.root);
+
+    // name + selectionRange from the class_name identifier if present, else empty/zero-width
+    // (the handler fills the file basename for an unnamed script — the parser has no path).
+    let (name, selection_span) = match class.identifier {
+        Some(id) => match &tree.get(id).kind {
+            NodeKind::Identifier(ident) => (ident.name.clone(), tree.get(id).span),
+            _ => (String::new(), ByteSpan { start: 0, end: 0 }),
+        },
+        None => (String::new(), ByteSpan { start: 0, end: 0 }),
+    };
+
+    vec![DocumentSymbol {
+        name,
+        kind: SymbolKind::Class,
+        span: tree.get(tree.root).span, // whole-script range of the root class node
+        selection_span,
+        children,
+    }]
 }
 
 fn class_member_symbols(tree: &ParseTree, class_id: NodeId) -> Vec<DocumentSymbol> {
@@ -4950,5 +4976,42 @@ mod tests {
             let mut p = Parser::new(src);
             let _ = p.parse_expression(true, false);
         }
+    }
+
+    // --- documentSymbol projection tests ---
+
+    #[test]
+    fn document_symbols_wraps_named_script_in_root_class() {
+        let src = "class_name Foo\nvar x := 1\nfunc bar() -> void:\n\tpass\n";
+        let tree = crate::parse(src).tree;
+        let syms = document_symbols(&tree);
+        assert_eq!(syms.len(), 1, "expected a single root Class symbol");
+        let root = &syms[0];
+        assert_eq!(root.kind, SymbolKind::Class);
+        assert_eq!(root.name, "Foo");
+        // members live UNDER the root, not at top level
+        let names: Vec<_> = root.children.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"x") && names.contains(&"bar"));
+        // selection_span points at the class_name identifier (non-zero width)
+        assert_ne!(root.selection_span.start, root.selection_span.end);
+    }
+
+    #[test]
+    fn document_symbols_wraps_unnamed_script_with_empty_name_and_zero_width_span() {
+        let src = "var x := 1\nclass Inner:\n\tvar y := 2\n";
+        let tree = crate::parse(src).tree;
+        let syms = document_symbols(&tree);
+        assert_eq!(syms.len(), 1);
+        let root = &syms[0];
+        assert_eq!(root.kind, SymbolKind::Class);
+        // unnamed -> parser leaves name empty; the HANDLER (A3) fills the file basename.
+        assert_eq!(root.name, "");
+        // zero-width span at file start
+        assert_eq!(root.selection_span, ByteSpan { start: 0, end: 0 });
+        // inner class nests under the root
+        assert!(root
+            .children
+            .iter()
+            .any(|c| c.kind == SymbolKind::Class && c.name == "Inner"));
     }
 }

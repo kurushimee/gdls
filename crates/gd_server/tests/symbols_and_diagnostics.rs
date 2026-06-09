@@ -170,11 +170,27 @@ fn document_symbol_projects_nested_outline_with_kinds() {
         panic!("expected a documentSymbol response");
     };
     assert!(resp.error.is_none());
+    // A1: documentSymbol now returns a single root Class wrapping all members as children.
+    // The root is named by the file basename ("syms.gd") since no `class_name` is declared.
     let symbols: Vec<DocumentSymbol> =
         serde_json::from_value(resp.result.expect("documentSymbol result")).unwrap();
 
+    assert_eq!(
+        symbols.len(),
+        1,
+        "A1: single root Class wrapper; got: {symbols:?}"
+    );
+    let root = &symbols[0];
+    assert_eq!(root.kind, SymbolKind::CLASS);
+    assert_eq!(
+        root.name, "syms.gd",
+        "unnamed script root name = file basename"
+    );
+
+    // All members are children of the root Class.
+    let members = root.children.as_deref().unwrap_or_default();
     let outline: Vec<(&str, SymbolKind)> =
-        symbols.iter().map(|s| (s.name.as_str(), s.kind)).collect();
+        members.iter().map(|s| (s.name.as_str(), s.kind)).collect();
     assert_eq!(
         outline,
         vec![
@@ -189,7 +205,7 @@ fn document_symbol_projects_nested_outline_with_kinds() {
     );
 
     // The named enum carries its values as children.
-    let state = &symbols[1];
+    let state = &members[1];
     let enum_children: Vec<&str> = state
         .children
         .as_deref()
@@ -206,7 +222,7 @@ fn document_symbol_projects_nested_outline_with_kinds() {
         .all(|c| c.kind == SymbolKind::ENUM_MEMBER));
 
     // The inner class nests its own member.
-    let inner = symbols.last().unwrap();
+    let inner = members.last().unwrap();
     let inner_children = inner.children.as_deref().unwrap_or_default();
     assert_eq!(inner_children.len(), 1);
     assert_eq!(inner_children[0].name, "x");
@@ -214,7 +230,7 @@ fn document_symbol_projects_nested_outline_with_kinds() {
 
     // `selection_range` is the identifier; `range` encloses it. `signal hit` → name at col 7 on the
     // line that follows the `@warning_ignore` annotation (line 3 of the source, 0-indexed).
-    assert_eq!(symbols[0].selection_range.start, Position::new(3, 7));
+    assert_eq!(members[0].selection_range.start, Position::new(3, 7));
 
     shutdown(&client, handle);
 }
@@ -362,9 +378,12 @@ fn document_symbol_on_malformed_buffer_still_returns_recoverable_symbols() {
         "documentSymbol must still answer on a parse-error tree: {:?}",
         resp.error
     );
+    // A1: documentSymbol now returns a single root Class; members are its children.
     let symbols: Vec<DocumentSymbol> =
         serde_json::from_value(resp.result.expect("documentSymbol result")).unwrap();
-    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(symbols.len(), 1, "A1: single root Class wrapper");
+    let members = symbols[0].children.as_deref().unwrap_or_default();
+    let names: Vec<&str> = members.iter().map(|s| s.name.as_str()).collect();
     assert!(
         names.contains(&"before") && names.contains(&"after"),
         "symbols on both sides of the error should survive recovery, got {names:?}"
