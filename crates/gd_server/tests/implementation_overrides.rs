@@ -278,6 +278,87 @@ fn implementation_on_local_named_like_method_does_not_return_overrides() {
     shutdown(&client, server_thread);
 }
 
+/// Path-extends subclasses participate in both subclass walks: `extends "res://base.gd"`
+/// (direct — matched against the seed file itself) and `extends "res://pmid.gd"` (transitive —
+/// matched against an already-discovered subclass file). One fixture covers the method-override
+/// branch and the class-identifier branch.
+#[test]
+fn implementation_follows_path_extends_subclasses() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+
+    p.write(
+        "base.gd",
+        "class_name Base\nextends Node\n\nfunc act():\n\tpass\n",
+    );
+    // Direct path-extends subclass; named, so the class-identifier branch emits its root
+    // class identifier.
+    p.write(
+        "pmid.gd",
+        "class_name PMid\nextends \"res://base.gd\"\n\nfunc act():\n\tpass\n",
+    );
+    // Transitive path-extends subclass through pmid.gd; deliberately unnamed so the walk can
+    // only reach it through the known-files set, never through a class_name.
+    p.write(
+        "pleaf.gd",
+        "extends \"res://pmid.gd\"\n\nfunc act():\n\tpass\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["base.gd", "pmid.gd", "pleaf.gd"]);
+
+    let base_uri = file_uri(&p.root.join("base.gd"));
+    let pmid_uri = file_uri(&p.root.join("pmid.gd"));
+    let pleaf_uri = file_uri(&p.root.join("pleaf.gd"));
+
+    // Method-override branch: cursor on `act` in base.gd (line 3, cols 5..8).
+    // Class-identifier branch: cursor on `Base` in `class_name Base` (line 0, cols 11..15).
+    for (req_id, position, branch) in [
+        (14, Position::new(3, 6), "method-override"),
+        (15, Position::new(0, 12), "class-identifier"),
+    ] {
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: base_uri.clone(),
+                },
+                position,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+        };
+        client
+            .sender
+            .send(request(req_id, "textDocument/implementation", params))
+            .unwrap();
+        let resp = recv_response(&client);
+        assert!(
+            resp.error.is_none(),
+            "implementation ({branch}) errored: {:?}",
+            resp.error
+        );
+        let response: GotoDefinitionResponse =
+            serde_json::from_value(resp.result.expect("implementation result"))
+                .expect("valid GotoDefinitionResponse");
+        let locs = match response {
+            GotoDefinitionResponse::Array(v) => v,
+            other => panic!("expected Array response ({branch}), got {other:?}"),
+        };
+        assert!(
+            locs.iter().any(|l| l.uri == pmid_uri),
+            "{branch} walk must include the direct path-extends subclass pmid.gd; got: {locs:?}"
+        );
+        assert!(
+            locs.iter().any(|l| l.uri == pleaf_uri),
+            "{branch} walk must include the transitive path-extends subclass pleaf.gd; got: {locs:?}"
+        );
+    }
+
+    shutdown(&client, server_thread);
+}
+
 #[test]
 fn implementation_override_span_uses_matching_root_decl_not_inner_function() {
     let p = TempProject::new();

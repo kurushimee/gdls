@@ -1706,11 +1706,22 @@ fn find_method_overrides(
             if known_files.contains(&fid) {
                 continue;
             }
-            let parent_name = match &sub_iface.extends {
-                gd_project::Extends::Names(parts) => parts.last().map(String::as_str),
-                _ => None,
+            // A name-extends parent matches the known class_name set; a path-extends parent
+            // (`extends "res://base.gd"`) resolves through the index and matches the declaring
+            // file or any already-known subclass file. `current_fid` is checked explicitly
+            // because `known_files` only ever holds discovered subclasses, never the BFS seed.
+            let parent_known = match &sub_iface.extends {
+                gd_project::Extends::Names(parts) => {
+                    parts.last().is_some_and(|p| known_names.contains(p))
+                }
+                gd_project::Extends::Path(res_path) => state
+                    .workspace
+                    .index
+                    .resolve_res_path(res_path)
+                    .is_some_and(|f| f == current_fid || known_files.contains(&f)),
+                gd_project::Extends::None => false,
             };
-            if parent_name.is_some_and(|p| known_names.contains(p)) {
+            if parent_known {
                 known_files.insert(fid);
                 if let Some(cn) = &sub_iface.class_name {
                     known_names.insert(cn.clone());
@@ -1832,7 +1843,13 @@ pub fn implementation(
     }
 
     // Only project class_names participate; native classes have no project subclasses to list.
-    state.workspace.index.registry().get(&name)?;
+    // Resolve the seed class's file up front: the BFS below matches path-extends subclasses
+    // against it (`known_files` only ever holds discovered subclasses, never the seed), and the
+    // emission loop excludes it from the results.
+    let cursor_fid = {
+        let entry = state.workspace.index.registry().get(&name)?;
+        state.workspace.index.file_id(&entry.path)
+    };
 
     // BFS the inverse-extends closure over EVERY interface (not just registry entries — a file
     // can extend `Hero` without declaring its own `class_name`). Track known-extender FileIds in
@@ -1856,12 +1873,21 @@ pub fn implementation(
                 continue;
             }
             // The parent's name is the last identifier in the extends chain (e.g.
-            // `extends Outer.Inner` ⇒ parent name = "Inner"; `extends Hero` ⇒ "Hero").
-            let parent_name = match &iface.extends {
-                gd_project::Extends::Names(parts) => parts.last().map(String::as_str),
-                _ => None,
+            // `extends Outer.Inner` ⇒ parent name = "Inner"; `extends Hero` ⇒ "Hero"). A
+            // path-extends parent (`extends "res://hero.gd"`) resolves through the index and
+            // matches the seed class's file or any already-known subclass file.
+            let parent_known = match &iface.extends {
+                gd_project::Extends::Names(parts) => {
+                    parts.last().is_some_and(|p| known_names.contains(p))
+                }
+                gd_project::Extends::Path(res_path) => state
+                    .workspace
+                    .index
+                    .resolve_res_path(res_path)
+                    .is_some_and(|f| Some(f) == cursor_fid || known_files.contains(&f)),
+                gd_project::Extends::None => false,
             };
-            if parent_name.is_some_and(|p| known_names.contains(p)) {
+            if parent_known {
                 known_files.insert(fid);
                 if let Some(cn) = &iface.class_name {
                     known_names.insert(cn.clone());
@@ -1874,12 +1900,6 @@ pub fn implementation(
     }
 
     // Emit a Location per known subclass file (excluding the cursor's own class file).
-    let cursor_fid = state
-        .workspace
-        .index
-        .registry()
-        .get(&name)
-        .and_then(|e| state.workspace.index.file_id(&e.path));
     let mut locations: Vec<Location> = Vec::new();
     let subclass_paths: Vec<camino::Utf8PathBuf> = known_files
         .iter()
