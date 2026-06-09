@@ -1104,13 +1104,34 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // otherwise take the `name_referencers` fast-path below. But autoload names never appear in
     // interface-level class-name annotations, so that referencer set is always empty — a cursor on
     // the singleton name itself would then scan only the current file and silently miss every other
-    // file that uses `Global` in a function body. Detect the autoload here and route it through the
-    // same project-wide textual scan used for method/signal targets so cross-file uses are found.
-    let is_autoload = state
+    // file that uses `Global` in a function body.
+    //
+    // Match the definition handler's "never lie" gate: only treat this occurrence as an autoload
+    // when the analyzer resolved THIS cursor span to the autoload script's FileId. A local variable,
+    // parameter, or member named `Global` shadows the singleton and must stay on the cheap
+    // `name_referencers` path instead of triggering a project-wide textual scan.
+    let autoload_fid = state
         .workspace
         .project
         .autoload_script_path(&name)
-        .is_some();
+        .map(str::to_owned)
+        .and_then(|p| state.workspace.index.resolve_res_path(&p));
+    let is_autoload = autoload_fid.is_some_and(|fid| {
+        let node_span = parsed.tree.get(node_id).span;
+        let Some(p) = current_path
+            .as_ref()
+            .filter(|p| p.extension() == Some("gd"))
+        else {
+            return false;
+        };
+        let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+        result.bindings().iter().any(|b| {
+            matches!(b,
+                Binding::Use { site, target_file: Some(f), .. }
+                    if *site == node_span && *f == fid
+            )
+        })
+    });
 
     // For method/signal targets, compute `target_file` — the FileId of the file that DECLARES
     // the method. Used to filter `Binding::Call` records to genuine callers of this specific
@@ -1570,18 +1591,57 @@ fn normalize_eq(a: &camino::Utf8Path, b: &camino::Utf8Path) -> bool {
     gd_project::normalize_path(a) == gd_project::normalize_path(b)
 }
 
+fn function_node_span_for_identifier(
+    tree: &ParseTree,
+    ident_id: NodeId,
+    name: &str,
+) -> Option<gd_syntax::ByteSpan> {
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if let NodeKind::Function(f) = &node.kind {
+            if f.identifier == Some(ident_id) && ident_name(tree, ident_id) == name {
+                return Some(node.span);
+            }
+        }
+    }
+    None
+}
+
+fn function_identifier_span_for_decl(
+    tree: &ParseTree,
+    name: &str,
+    decl_span: gd_syntax::ByteSpan,
+) -> Option<gd_syntax::ByteSpan> {
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if node.span == decl_span {
+            if let NodeKind::Function(f) = &node.kind {
+                if let Some(ident) = f.identifier {
+                    if ident_name(tree, ident) == name {
+                        return Some(tree.get(ident).span);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 // =============================================================================================
 // WP-N3: textDocument/implementation.
 // =============================================================================================
 
-/// M6-G: if `fn_name` is a `Func` member of the file identified by `uri`, BFS the inverse-extends
-/// graph to find subclasses and return `Location`s for each subclass that also declares a method
-/// named `fn_name`. Returns `None` to fall through to the existing class-identifier BFS when the
-/// cursor is NOT on a method of the current file's interface (e.g. on a class name or a variable).
+/// M6-G: if the cursor is on a root `Func` member of the file identified by `uri`, BFS the
+/// inverse-extends graph to find subclasses and return `Location`s for each subclass that also
+/// declares a method named `fn_name`. Returns `None` to fall through to the existing class-identifier
+/// BFS when the cursor is NOT on that method declaration (e.g. on a class name, a variable, a local
+/// with the same name, or an inner-class method).
 fn find_method_overrides(
     state: &mut ServerState,
     fn_name: &str,
     uri: &Uri,
+    tree: &ParseTree,
+    node_id: NodeId,
     enc: crate::position::PositionEncoding,
 ) -> Option<Vec<Location>> {
     // Resolve the current file's FileId and interface.
@@ -1589,12 +1649,15 @@ fn find_method_overrides(
     let current_fid = state.workspace.index.file_id(&current_path)?;
     let iface = state.workspace.index.interface(current_fid)?;
 
-    // The cursor must be on a `Func` member of this interface.
-    let is_func = iface
-        .members
-        .iter()
-        .any(|m| m.name == fn_name && m.kind == gd_project::MemberKind::Func);
-    if !is_func {
+    // The cursor must be on this file's root method declaration, not merely an identifier whose
+    // text matches a method name. This keeps locals/params/call sites named like a method on the
+    // class-level implementation path, and excludes inner-class methods that are not interface
+    // members of this script's root class.
+    let cursor_fn_span = function_node_span_for_identifier(tree, node_id, fn_name)?;
+    let is_root_func = iface.members.iter().any(|m| {
+        m.name == fn_name && m.kind == gd_project::MemberKind::Func && m.span == cursor_fn_span
+    });
+    if !is_root_func {
         return None;
     }
 
@@ -1661,8 +1724,11 @@ fn find_method_overrides(
             continue;
         };
 
-        // Point to the override's span (the `func` keyword…body start) in the subclass file.
-        let span = override_decl.span;
+        // Point to the override's identifier span, not the whole `func ...:` signature. The
+        // interface stores FunctionNode spans for members, so parse the candidate text below and
+        // locate the matching FunctionNode identifier just like class-level implementation narrows
+        // subclass locations to `class_name`'s identifier.
+        let fallback_span = override_decl.span;
 
         let range = {
             let cand_text = match state.vfs.get(cand_uri.as_str()).map(|d| d.text()) {
@@ -1678,6 +1744,9 @@ fn find_method_overrides(
                     }
                 },
             };
+            let cand_parsed = gd_syntax::parse(&cand_text);
+            let span = function_identifier_span_for_decl(&cand_parsed.tree, fn_name, fallback_span)
+                .unwrap_or(fallback_span);
             let rope = Rope::from_str(&cand_text);
             let cand_mapper = PositionMapper::new(&rope, enc);
             cand_mapper.span_to_range(span)
@@ -1730,10 +1799,10 @@ pub fn implementation(
     let name = cursor_identifier(&parsed.tree, node_id)?;
 
     // M6-G: method-override branch — runs BEFORE the class_name gate below so a cursor on a
-    // `func` identifier returns override locations rather than null. Detect whether `name` is a
-    // `Func` member of the current file's own interface; if so, BFS the subclass graph (seeded on
-    // the current file's class_name) and emit a Location for each subclass that overrides `name`.
-    if let Some(locs) = find_method_overrides(state, &name, &uri, enc) {
+    // root `func` identifier returns override locations rather than null. The helper verifies the
+    // cursor is on that root method declaration, then BFSes the subclass graph (seeded on the
+    // current file's class_name) and emits a Location for each subclass override.
+    if let Some(locs) = find_method_overrides(state, &name, &uri, &parsed.tree, node_id, enc) {
         return Some(GotoDefinitionResponse::Array(locs));
     }
 

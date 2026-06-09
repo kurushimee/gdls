@@ -362,6 +362,51 @@ fn references_on_autoload_name_finds_cross_file_uses() {
     shutdown(&client, handle);
 }
 
+/// Shadowing gate for references: a body-local `var Global = 1` is not the autoload singleton, so
+/// references on that occurrence must not take the autoload project-wide scan and report unrelated
+/// singleton uses from other files.
+#[test]
+fn references_on_shadowed_autoload_name_stays_local() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+    );
+    p.write(
+        "global.gd",
+        "extends Node\n\nfunc popup_error(msg: String) -> void:\n\tpass\n",
+    );
+    p.write(
+        "shadow.gd",
+        "extends Node\n\nfunc test():\n\tvar Global = 1\n\tprint(Global)\n",
+    );
+    p.write(
+        "caller.gd",
+        "extends Node\n\nfunc other():\n\tGlobal.popup_error(\"y\")\n",
+    );
+
+    let (client, handle) = boot(&p);
+    did_open(&client, &p, "global.gd");
+    did_open(&client, &p, "shadow.gd");
+    did_open(&client, &p, "caller.gd");
+
+    let shadow_uri = file_uri(&p.root.join("shadow.gd"));
+    let caller_uri = file_uri(&p.root.join("caller.gd"));
+
+    let locs = references_at(&client, &shadow_uri, Position::new(4, 8), false);
+
+    assert!(
+        locs.iter().any(|l| l.uri == shadow_uri),
+        "references on a shadowed local `Global` must include the current-file occurrence; got: {locs:?}"
+    );
+    assert!(
+        !locs.iter().any(|l| l.uri == caller_uri),
+        "references on a shadowed local `Global` must not report unrelated autoload uses from caller.gd; got: {locs:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
 /// Shadowing gate: a local `var Global = 1` inside a function shadows the autoload singleton.
 /// Hover on the local `Global` reference must NOT show a Script type — it's an int local.
 #[test]

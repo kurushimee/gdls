@@ -134,6 +134,23 @@ fn implementation_on_method_returns_overrides() {
         "implementation must include leaf.gd (transitive override); got: {locs:?}"
     );
 
+    for uri in [&mid_uri, &leaf_uri] {
+        let loc = locs
+            .iter()
+            .find(|l| l.uri == *uri)
+            .unwrap_or_else(|| panic!("missing override location for {uri:?}; got: {locs:?}"));
+        assert_eq!(
+            loc.range.start,
+            Position::new(3, 5),
+            "method implementation must land on the override identifier, not the `func` keyword; got: {loc:?}"
+        );
+        assert_eq!(
+            loc.range.end,
+            Position::new(3, 8),
+            "method implementation must select only the override identifier; got: {loc:?}"
+        );
+    }
+
     shutdown(&client, server_thread);
 }
 
@@ -208,6 +225,120 @@ fn implementation_on_unnamed_script_func_does_not_leak_class_subclasses() {
              class_name with the same name; got: {locs:?}"
         );
     }
+
+    shutdown(&client, server_thread);
+}
+
+#[test]
+fn implementation_on_local_named_like_method_does_not_return_overrides() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    p.write(
+        "base.gd",
+        "class_name Base\nextends Node\n\nfunc act():\n\tvar act = 1\n\tprint(act)\n",
+    );
+    p.write(
+        "sub.gd",
+        "class_name Sub\nextends Base\n\nfunc act():\n\tpass\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["base.gd", "sub.gd"]);
+
+    let base_uri = file_uri(&p.root.join("base.gd"));
+    let params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: base_uri.clone(),
+            },
+            // Click on the local `act` use in `print(act)`, not the method declaration.
+            position: Position::new(5, 8),
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(12, "textDocument/implementation", params))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "implementation errored: {:?}",
+        resp.error
+    );
+    assert!(
+        resp.result.as_ref().is_none_or(|v| v.is_null()),
+        "implementation on a local named like a method must not return method overrides; got: {:?}",
+        resp.result
+    );
+
+    shutdown(&client, server_thread);
+}
+
+#[test]
+fn implementation_override_span_uses_matching_root_decl_not_inner_function() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    p.write(
+        "base.gd",
+        "class_name Base\nextends Node\n\nfunc act():\n\tpass\n",
+    );
+    p.write(
+        "sub.gd",
+        "class_name Sub\nextends Base\n\nclass Inner:\n\tfunc act():\n\t\tpass\n\nfunc act():\n\tpass\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["base.gd", "sub.gd"]);
+
+    let base_uri = file_uri(&p.root.join("base.gd"));
+    let params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: base_uri.clone(),
+            },
+            position: Position::new(3, 6),
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(13, "textDocument/implementation", params))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "implementation errored: {:?}",
+        resp.error
+    );
+    let response: GotoDefinitionResponse =
+        serde_json::from_value(resp.result.expect("implementation result"))
+            .expect("valid GotoDefinitionResponse");
+    let locs = match response {
+        GotoDefinitionResponse::Array(v) => v,
+        other => panic!("expected Array response, got {other:?}"),
+    };
+    let sub_uri = file_uri(&p.root.join("sub.gd"));
+    let loc = locs
+        .iter()
+        .find(|l| l.uri == sub_uri)
+        .unwrap_or_else(|| panic!("missing sub.gd override location; got: {locs:?}"));
+    assert_eq!(
+        loc.range.start,
+        Position::new(7, 5),
+        "implementation must choose the root override identifier, not Inner.act; got: {loc:?}"
+    );
+    assert_eq!(
+        loc.range.end,
+        Position::new(7, 8),
+        "implementation must select only the root override identifier; got: {loc:?}"
+    );
 
     shutdown(&client, server_thread);
 }
