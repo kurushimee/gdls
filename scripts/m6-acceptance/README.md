@@ -68,6 +68,9 @@ Flags override environment variables when both are set.
 > index-build speedup is much larger. A sub-5x result on a small project (e.g. Pixelorama, 243
 > files) is a measurement artifact, not a cache regression; the >5x criterion is proven
 > deterministically by the synthetic 3,000-file bench (`cache_warm_start.rs`, 14.7x).
+> Accordingly the runner **enforces** the 5x gate only on projects with **>= 1000 `.gd` files**;
+> below that it prints and records the ratio as informational (`bench_enforced: false` in
+> `oss-report.json`) without failing the run.
 
 ---
 

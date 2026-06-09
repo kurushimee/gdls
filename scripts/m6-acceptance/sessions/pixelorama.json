@@ -1,0 +1,116 @@
+{
+  "_comment": [
+    "Filled M6 acceptance session for Pixelorama (https://github.com/Orama-Interactive/Pixelorama),",
+    "a 243-file GDScript-only Godot 4.x project compatible with 4.6.3. Built per",
+    "scripts/m6-acceptance/README.md from walk.json; positions verified against the M6 OSS",
+    "acceptance walk. __PROJECT_ROOT__ / __EXTENSION_API__ are substituted by run.sh.",
+    "Targets: hover/references on `cel.on_remove()` (cel: BaseCel, cross-file via typed var),",
+    "definition on `AnimationTag` in expression position, on a preload(\"res://….gd\") string,",
+    "and on the `Global` autoload name; documentSymbol on Project.gd (root Class + nesting);",
+    "implementation on BaseCel.get_image (4 subclass overrides); documentLink on a res:// literal.",
+    "The two extra/ rows probe autoload-singleton member typing (Global.popup_error) — landed",
+    "after M6-A..G; not validated by run.sh's required-label set but recorded in the report."
+  ],
+  "initializationOptions": {
+    "projectRoot": "__PROJECT_ROOT__",
+    "extensionApiPath": "__EXTENSION_API__"
+  },
+  "opens": [
+    "__PROJECT_ROOT__/src/HandleExtensions.gd",
+    "__PROJECT_ROOT__/src/UI/Timeline/LayerEffects/LayerEffectsSettings.gd",
+    "__PROJECT_ROOT__/src/Classes/Project.gd",
+    "__PROJECT_ROOT__/src/Classes/Cels/BaseCel.gd"
+  ],
+  "requests": [
+    {
+      "label": "hover/cross_file_method",
+      "_comment": "cel.on_remove() in Project.gd; cel is typed BaseCel, on_remove defined in BaseCel.gd",
+      "method": "textDocument/hover",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/Classes/Project.gd" },
+        "position": { "line": 182, "character": 7 }
+      }
+    },
+    {
+      "label": "definition/class_name_expr",
+      "_comment": "AnimationTag used in expression position in Project.gd",
+      "method": "textDocument/definition",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/Classes/Project.gd" },
+        "position": { "line": 519, "character": 22 }
+      }
+    },
+    {
+      "label": "definition/preload_string",
+      "_comment": "inside the string of preload(\"res://…/LayerEffectButton.gd\")",
+      "method": "textDocument/definition",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/UI/Timeline/LayerEffects/LayerEffectsSettings.gd" },
+        "position": { "line": 2, "character": 60 }
+      }
+    },
+    {
+      "label": "definition/autoload_name",
+      "_comment": "the `Global` autoload name in HandleExtensions.gd",
+      "method": "textDocument/definition",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/HandleExtensions.gd" },
+        "position": { "line": 60, "character": 5 }
+      }
+    },
+    {
+      "label": "references/cross_file_method",
+      "_comment": "references from the cel.on_remove() callsite (typed-var dispatch)",
+      "method": "textDocument/references",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/Classes/Project.gd" },
+        "position": { "line": 182, "character": 7 },
+        "context": { "includeDeclaration": false }
+      }
+    },
+    {
+      "label": "documentSymbol/nested_members",
+      "_comment": "Project.gd — root Class `Project` with ~111 nested members",
+      "method": "textDocument/documentSymbol",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/Classes/Project.gd" }
+      }
+    },
+    {
+      "label": "implementation/func_with_overrides",
+      "_comment": "BaseCel.get_image — overridden by GroupCel, Cel3D, PixelCel, AudioCel",
+      "method": "textDocument/implementation",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/Classes/Cels/BaseCel.gd" },
+        "position": { "line": 81, "character": 6 }
+      }
+    },
+    {
+      "label": "documentLink/res_literal",
+      "_comment": "LayerEffectsSettings.gd has res:// .gd preload literals",
+      "method": "textDocument/documentLink",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/UI/Timeline/LayerEffects/LayerEffectsSettings.gd" }
+      }
+    },
+    {
+      "label": "extra/hover_autoload_member",
+      "_comment": "Global.popup_error — autoload-singleton member hover (post-M6-A..G fix)",
+      "method": "textDocument/hover",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/HandleExtensions.gd" },
+        "position": { "line": 60, "character": 13 }
+      }
+    },
+    {
+      "label": "extra/references_autoload_member",
+      "_comment": "Global.popup_error — autoload-singleton member references (post-M6-A..G fix)",
+      "method": "textDocument/references",
+      "params": {
+        "textDocument": { "uri": "file://__PROJECT_ROOT__/src/HandleExtensions.gd" },
+        "position": { "line": 60, "character": 13 },
+        "context": { "includeDeclaration": false }
+      }
+    }
+  ]
+}
