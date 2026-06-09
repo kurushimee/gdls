@@ -906,6 +906,10 @@ fn warm_index_from_cache(
     let mut walked_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
     let mut reparsed = 0usize;
     let mut added = 0usize;
+    // Stat-changed files that could not be re-read. They sit in `walked_paths` but were neither
+    // reparsed nor added, so they must be excluded from the "unchanged" count below (otherwise a
+    // locked/permission-denied file is mis-reported as unchanged).
+    let mut skipped_unreadable = 0usize;
 
     for entry_result in walker {
         let entry = match entry_result {
@@ -971,6 +975,7 @@ fn warm_index_from_cache(
                     }
                 }
                 Err(e) => {
+                    skipped_unreadable += 1;
                     log::warn!("warm_index: skipping unreadable {path}: {e}");
                 }
             }
@@ -994,18 +999,24 @@ fn warm_index_from_cache(
             stat_table.remove(path);
         }
         log::info!(
-            "warm_index: stat-diff complete: {} unchanged, {} reparsed, {} added, {} removed",
-            walked_paths.len().saturating_sub(reparsed + added),
+            "warm_index: stat-diff complete: {} unchanged, {} reparsed, {} added, {} removed, \
+             {} skipped (unreadable)",
+            walked_paths
+                .len()
+                .saturating_sub(reparsed + added + skipped_unreadable),
             reparsed,
             added,
             removed_paths.len(),
+            skipped_unreadable,
         );
     } else {
         log::info!(
             "warm_index: stat-diff complete (walk not authoritative — walk_errors={walk_errors}, \
-             skipped_non_utf8={skipped_non_utf8} — skipping removal pass): {} reparsed, {} added",
+             skipped_non_utf8={skipped_non_utf8} — skipping removal pass): {} reparsed, {} added, \
+             {} skipped (unreadable)",
             reparsed,
             added,
+            skipped_unreadable,
         );
     }
 

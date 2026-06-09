@@ -33,13 +33,14 @@ pub fn document_symbol(
     params: DocumentSymbolParams,
 ) -> DocumentSymbolResponse {
     let uri = params.text_document.uri;
-    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
-        return DocumentSymbolResponse::Nested(Vec::new());
-    };
-    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    // Single VFS lookup: hold `doc` across the parse and reuse its already-built rope for the
+    // mapper (disjoint `&state.vfs` / `&mut state.workspace` borrows compose). Avoids both the
+    // redundant hash lookup and re-allocating a rope we already hold.
     let Some(doc) = state.vfs.get(uri.as_str()) else {
         return DocumentSymbolResponse::Nested(Vec::new());
     };
+    let text = doc.text();
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
 
     // A1 handoff: `document_symbols` now always returns a single root Class wrapping members.
@@ -121,13 +122,14 @@ fn to_lsp_symbol(
 /// `user://`, `uid://`, and plain strings are silently skipped.
 pub fn document_link(state: &mut ServerState, params: DocumentLinkParams) -> Vec<DocumentLink> {
     let uri = params.text_document.uri;
-    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
-        return Vec::new();
-    };
-    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    // Single VFS lookup: hold `doc` across the parse and reuse its already-built rope for the
+    // mapper. `&state.vfs` and `&mut state.workspace` are disjoint fields, so the borrow composes;
+    // building a fresh `Rope::from_str(&text)` would needlessly re-allocate the rope we already own.
     let Some(doc) = state.vfs.get(uri.as_str()) else {
         return Vec::new();
     };
+    let text = doc.text();
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
 
     let mut links = Vec::new();
