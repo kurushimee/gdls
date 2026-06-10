@@ -247,9 +247,10 @@ fn malformed_cancel_params_does_not_panic_or_block() {
         .unwrap();
 
     // No response should arrive from a notification ever.
+    let stray = try_recv(&client, Duration::from_millis(100));
     assert!(
-        try_recv(&client, Duration::from_millis(100)).is_none(),
-        "no response should arrive for any `$/cancelRequest` notification"
+        stray.is_none(),
+        "no response should arrive for any `$/cancelRequest` notification; got {stray:?}"
     );
 
     // Verify the loop is still healthy by issuing a normal request.

@@ -23,6 +23,7 @@ use rustc_hash::FxHashMap;
 fn options_with_cache_capacity(p: &TempProject, capacity: usize) -> InitializationOptions {
     InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+        "autoDumpExtensionApi": false,
         "memory": {
             "cacheCapacity": capacity,
         },
@@ -131,6 +132,7 @@ fn default_cache_capacity_matches_documented_default() {
     p.write("project.godot", "config_version=5\n");
     let opts = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
     let mut ws = Workspace::load(&p.root, &opts);
 

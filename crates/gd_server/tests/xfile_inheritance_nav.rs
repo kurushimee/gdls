@@ -58,6 +58,7 @@ fn boot_with_api(p: &TempProject) -> (Connection, std::thread::JoinHandle<anyhow
     let init = InitializeParams {
         initialization_options: Some(serde_json::json!({
             "projectRoot": p.root.as_str(),
+            "autoDumpExtensionApi": false,
             "extensionApiPath": p.root.join("extension_api.json").as_str(),
         })),
         capabilities: lsp_types::ClientCapabilities {

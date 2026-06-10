@@ -74,6 +74,7 @@ fn lsp_responds_under_space_containing_project_path() {
     let init = InitializeParams {
         initialization_options: Some(serde_json::json!({
             "projectRoot": root.as_str(),
+            "autoDumpExtensionApi": false,
             "extensionApiPath": root.join("extension_api.json").as_str(),
         })),
         ..Default::default()

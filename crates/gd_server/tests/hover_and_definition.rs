@@ -377,6 +377,7 @@ fn definition_jumps_across_files_via_class_name() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -430,6 +431,7 @@ fn hover_cross_file_method_shows_param_names() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -496,6 +498,7 @@ fn hover_on_call_base_does_not_show_callee_signature() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -546,6 +549,7 @@ fn hover_on_preload_string_shows_resolved_script() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -588,6 +592,7 @@ fn hover_on_preload_non_gd_resource_shows_basename() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -642,6 +647,7 @@ fn hover_cross_file_method_shows_signature() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -692,6 +698,7 @@ fn hover_nested_call_picks_innermost_callee() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -741,6 +748,7 @@ fn definition_on_class_name_in_expression_position() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -789,6 +797,7 @@ fn definition_on_preload_path_string_jumps_to_file() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -841,6 +850,7 @@ fn definition_on_autoload_jumps_to_script() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -888,6 +898,7 @@ fn definition_autoload_missing_script_returns_none() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 
@@ -929,6 +940,7 @@ fn definition_autoload_shadowed_by_local_stays_in_file() {
 
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+    "autoDumpExtensionApi": false,
     });
     let (client, handle) = boot_with_options(Some(init_options));
 

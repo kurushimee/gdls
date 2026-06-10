@@ -26,6 +26,7 @@ fn boot(project: &TempProject) -> (Connection, std::thread::JoinHandle<anyhow::R
     let init = InitializeParams {
         initialization_options: Some(serde_json::json!({
             "projectRoot": project.root.as_str(),
+        "autoDumpExtensionApi": false,
         })),
         capabilities: lsp_types::ClientCapabilities {
             general: Some(lsp_types::GeneralClientCapabilities {

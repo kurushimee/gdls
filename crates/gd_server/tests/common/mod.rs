@@ -92,6 +92,7 @@ pub fn sample_project() -> TempProject {
 pub fn options_for(p: &TempProject) -> InitializationOptions {
     InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+        "autoDumpExtensionApi": false,
         "extensionApiPath": p.root.join("extension_api.json").as_str(),
     })))
 }

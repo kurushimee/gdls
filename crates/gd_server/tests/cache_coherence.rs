@@ -17,6 +17,7 @@ use gd_server::Workspace;
 fn options(p: &TempProject) -> InitializationOptions {
     InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+    "autoDumpExtensionApi": false,
     })))
 }
 

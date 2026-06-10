@@ -237,8 +237,14 @@ fn serve_inner(
     };
 
     // Build the workspace (native DB + project model + cold index) only after the `initialize`
-    // response is sent, so a large scan never stalls the handshake (WP-F: start inline).
-    let workspace = Workspace::load(&root, &options);
+    // response is sent, so a large scan never stalls the handshake (WP-F: start inline). The
+    // SOLE SpawnIfStale caller: session startup is the one place the extension_api auto-dump
+    // may run (a blocking Godot boot is acceptable before the event loop arms, never after).
+    let workspace = Workspace::load_with_api_policy(
+        &root,
+        &options,
+        crate::api_dump::ApiDumpPolicy::SpawnIfStale,
+    );
     let post_cold_index_rss = rss.sample_now("post_cold_index");
     // M5 WP-H1: a one-shot startup check so an operator gets an immediate, actionable signal when
     // the resolved cap is already below this project's steady-state working set — rather than

@@ -18,6 +18,7 @@ fn init_and_open(project: &TempProject, client: &Connection, files: &[&str]) {
     let init = InitializeParams {
         initialization_options: Some(serde_json::json!({
             "projectRoot": project.root.as_str(),
+            "autoDumpExtensionApi": false,
             "extensionApiPath": project.root.join("extension_api.json").as_str(),
         })),
         ..Default::default()

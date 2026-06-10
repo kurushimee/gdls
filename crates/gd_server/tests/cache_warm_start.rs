@@ -93,6 +93,7 @@ fn gen_script(i: usize) -> String {
 fn timed_load(root: &camino::Utf8Path) -> (Workspace, std::time::Duration) {
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
     let t0 = Instant::now();
     let ws = Workspace::load(root, &options);
@@ -192,6 +193,7 @@ fn reconcile_reparsed_only_touched_file() {
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
     let mut ws = Workspace::load(&p.root, &options);
     assert_eq!(
@@ -264,6 +266,7 @@ fn discover_only_finds_added_and_removed_without_stating_known_files() {
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
     let mut ws = Workspace::load(&p.root, &options);
     assert_eq!(ws.index.file_count(), SMALL_SIZE);
@@ -304,6 +307,7 @@ fn reconcile_detects_added_file() {
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
     let mut ws = Workspace::load(&p.root, &options);
     assert_eq!(ws.index.file_count(), 1, "precondition: one file indexed");
@@ -334,6 +338,7 @@ fn reconcile_detects_removed_file() {
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
     let mut ws = Workspace::load(&p.root, &options);
     assert_eq!(ws.index.file_count(), 2, "precondition: two files indexed");
@@ -362,6 +367,7 @@ fn warm_load_produces_same_index_as_cold() {
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
 
     // Cold build + save.
@@ -426,6 +432,7 @@ fn warm_load_skips_reparse_when_stat_matches() {
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
 
     // --- Session 1: cold build, write V2, reindex + update_stat, save cache. ---
@@ -538,6 +545,7 @@ fn warm_load_after_unsaved_buffer_edit_serves_disk_interface() {
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
 
     // --- Session 1: cold build, buffer-only edit (disk unchanged), save excluding the open file. ---
@@ -620,6 +628,7 @@ fn timing_breakdown() {
     let root = &p.root;
     let options = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": root.as_str(),
+    "autoDumpExtensionApi": false,
     })));
 
     // Cold build.

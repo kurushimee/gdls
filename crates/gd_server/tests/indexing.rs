@@ -48,9 +48,13 @@ fn workspace_resolves_cross_file_and_native_chain() {
 #[test]
 fn missing_dump_degrades_but_still_resolves_scripts() {
     let project = sample_project();
-    // No extensionApiPath ⇒ empty native DB, but script-to-script resolution still works.
+    // Remove the sample's root-level dump: since v1.0.1 an unmanaged `<root>/extension_api.json`
+    // is a legitimate fallback source (the auto-dump resolution ladder), so "missing dump" must
+    // mean genuinely missing — no extensionApiPath, no `.gdls` dump, no root file, dump disabled.
+    project.remove("extension_api.json");
     let opts = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": project.root.as_str(),
+        "autoDumpExtensionApi": false,
     })));
     let ws = Workspace::load(&project.root, &opts);
 
@@ -80,6 +84,7 @@ fn server_indexes_at_startup_and_serves_symbols() {
     let init = InitializeParams {
         initialization_options: Some(serde_json::json!({
             "projectRoot": project.root.as_str(),
+            "autoDumpExtensionApi": false,
             "extensionApiPath": project.root.join("extension_api.json").as_str(),
         })),
         ..Default::default()
