@@ -4,8 +4,8 @@ use gd_analyze::{
     find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, BindingTargetKind, DtKind,
 };
 use gd_syntax::ast::{
-    ClassNode, ConstantNode, FunctionNode, LiteralNode, NodeId, NodeKind, ParseTree, SignalNode,
-    SubscriptAccess, VariableNode,
+    ClassNode, ConstantNode, FunctionNode, LiteralNode, Member, NodeId, NodeKind, ParseTree,
+    SignalNode, SubscriptAccess, VariableNode,
 };
 use gd_syntax::ByteSpan;
 use gd_syntax::Literal;
@@ -212,6 +212,22 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
             contents: HoverContents::Markup(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value: preload_md,
+            }),
+            range: Some(mapper.span_to_range(leaf_node.span)),
+        });
+    }
+
+    // v1.0.2 (issue #26): the cursor is on the NAME of a class-level declaration — render its
+    // signature (the analyzer pins no type on the name identifier, so the typed-ancestor
+    // fallback below would walk up to the class node and surface its `<Script #N>` meta).
+    if let Some(decl_md) =
+        hover_declaration_signature(state, &parsed.tree, node_id, &uri, analyzed.as_deref())
+    {
+        let leaf_node = parsed.tree.get(node_id);
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: decl_md,
             }),
             range: Some(mapper.span_to_range(leaf_node.span)),
         });
@@ -511,7 +527,9 @@ fn render_hover(
     } else if let Some(dt) = analyzed.map(|a| a.types.get(typed_id)) {
         if dt.is_set() {
             md.push_str("```gdscript\n");
-            md.push_str(&dt.to_string());
+            // Through the human label, never the raw `Display` — a script-typed value must
+            // read `ReproEntity`, not the `<Script #N>` diagnostic placeholder (issue #26).
+            md.push_str(&human_type_label(state, tree, dt));
             md.push('\n');
             md.push_str("```");
             if dt.kind == DtKind::Native && !dt.native_type.is_empty() {
@@ -740,8 +758,24 @@ fn hover_attribute_member_signature(
         .flatten()
         .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))?;
 
+    let sig = format_member_signature(name, decl)?;
+    Some(format!("```gdscript\n{sig}\n```"))
+}
+
+/// Render a [`gd_project::MemberDecl`]'s declaration shape — the one formatter behind both the
+/// attribute-reference hover and the declaration-site hover (issue #26), so `obj.member` and the
+/// member's own declaration line read byte-for-byte the same. `None` for named enums (the
+/// analyzer's enum-meta type label is the better hover there).
+fn format_member_signature(name: &str, decl: &gd_project::MemberDecl) -> Option<String> {
     let sig = match decl.kind {
-        gd_project::MemberKind::Func => format_func_signature(name, decl),
+        gd_project::MemberKind::Func => {
+            let bare = format_func_signature(name, decl);
+            if decl.flags.is_static {
+                format!("static {bare}")
+            } else {
+                bare
+            }
+        }
         gd_project::MemberKind::Signal => {
             format!("signal {}({})", name, format_member_params(decl))
         }
@@ -767,7 +801,176 @@ fn hover_attribute_member_signature(
         // Named enums keep the analyzer's enum-meta type label (no signature to render).
         gd_project::MemberKind::Enum => return None,
     };
+    Some(sig)
+}
+
+/// Declaration-site hover (issue #26): when the cursor is on the NAME identifier of a class-level
+/// declaration (`func`/`var`/`const`/`signal`/inner `class`), render that member's signature —
+/// previously the typed-ancestor fallback walked up to the enclosing class node and surfaced its
+/// `<Script #N>` meta placeholder. Routed through [`format_member_signature`], the same formatter
+/// the call-site/attribute hovers use, so declaration and reference hovers agree byte-for-byte.
+///
+/// Locals and parameters deliberately fall through (`None`): membership is checked against the
+/// owning `ClassNode.members` list, so a body-level `var x` — even one shadowing a class member —
+/// keeps the analyzer's resolved-type hover.
+fn hover_declaration_signature(
+    state: &ServerState,
+    tree: &ParseTree,
+    leaf_id: NodeId,
+    uri: &Uri,
+    analyzed: Option<&AnalysisResult>,
+) -> Option<String> {
+    if !matches!(&tree.get(leaf_id).kind, NodeKind::Identifier(_)) {
+        return None;
+    }
+    let name = ident_name(tree, leaf_id).to_owned();
+    if name.is_empty() {
+        return None;
+    }
+
+    // The declaration whose name slot is exactly this identifier node, plus its OWNING class:
+    // scan every ClassNode's member list so locals (not class members) never match.
+    let mut decl: Option<(NodeId, &Member, NodeId)> = None; // (decl node, member tag, owner class)
+    for class_id in tree.iter_ids() {
+        let NodeKind::Class(class) = &tree.get(class_id).kind else {
+            continue;
+        };
+        for member in &class.members {
+            let (mid, named_by_leaf) = match member {
+                Member::Class(id) => match &tree.get(*id).kind {
+                    NodeKind::Class(c) => (*id, c.identifier == Some(leaf_id)),
+                    _ => continue,
+                },
+                Member::Constant(id) => match &tree.get(*id).kind {
+                    NodeKind::Constant(c) => (*id, c.identifier == Some(leaf_id)),
+                    _ => continue,
+                },
+                Member::Function(id) => match &tree.get(*id).kind {
+                    NodeKind::Function(f) => (*id, f.identifier == Some(leaf_id)),
+                    _ => continue,
+                },
+                Member::Signal(id) => match &tree.get(*id).kind {
+                    NodeKind::Signal(s) => (*id, s.identifier == Some(leaf_id)),
+                    _ => continue,
+                },
+                Member::Variable(id) => match &tree.get(*id).kind {
+                    NodeKind::Variable(v) => (*id, v.identifier == Some(leaf_id)),
+                    _ => continue,
+                },
+                Member::Enum(_) | Member::EnumValue(_) | Member::Group(_) => continue,
+            };
+            if named_by_leaf {
+                decl = Some((mid, member, class_id));
+                break;
+            }
+        }
+        if decl.is_some() {
+            break;
+        }
+    }
+    let (decl_id, member, owner_class) = decl?;
+
+    // An inner `class X:` declaration renders directly from the AST (inner classes aren't in
+    // the `class_name` registry the leaf-type-label branch serves).
+    if let Member::Class(_) = member {
+        let mut sig = format!("class {name}");
+        if let NodeKind::Class(c) = &tree.get(decl_id).kind {
+            let extends: Vec<&str> = c.extends.iter().map(|&e| ident_name(tree, e)).collect();
+            if !extends.is_empty() {
+                sig = format!("{sig} extends {}", extends.join("."));
+            } else if let Some(p) = &c.extends_path {
+                sig = format!("{sig} extends \"{p}\"");
+            }
+        }
+        return Some(format!("```gdscript\n{sig}\n```"));
+    }
+
+    // Locate this file's interface scope: the root Interface, descended through `inner` by the
+    // owning class's chain of names (built via `ClassNode.outer`, innermost → outermost).
+    let path = uri_to_path(uri)?;
+    let fid = state.workspace.index.file_id(&path)?;
+    let mut chain: Vec<String> = Vec::new();
+    let mut cursor = Some(owner_class);
+    while let Some(cid) = cursor {
+        let NodeKind::Class(c) = &tree.get(cid).kind else {
+            break;
+        };
+        if c.outer.is_some() {
+            // Non-root classes contribute their name; the root scope is the interface itself.
+            chain.push(c.identifier.map(|i| ident_name(tree, i).to_owned())?);
+        }
+        cursor = c.outer;
+    }
+    let mut iface = state.workspace.index.interface(fid)?;
+    for class_name in chain.iter().rev() {
+        iface = iface
+            .inner
+            .iter()
+            .find(|i| i.class_name.as_deref() == Some(class_name))?;
+    }
+    let member_decl = iface.members.iter().find(|m| m.name == name)?;
+    let mut sig = format_member_signature(&name, member_decl)?;
+
+    // An untyped `var`/`const` whose initializer the analyzer typed reads better with the
+    // resolved type appended (`var made: ReproEntity` for `var made := ent.spawn(...)`).
+    if matches!(member_decl.ty, gd_project::TypeExpr::None)
+        && matches!(
+            member_decl.kind,
+            gd_project::MemberKind::Var
+                | gd_project::MemberKind::Property
+                | gd_project::MemberKind::Const
+        )
+    {
+        if let Some(a) = analyzed {
+            let dt = a.types.get(decl_id);
+            if dt.is_set() && !dt.is_variant() {
+                sig = format!("{sig}: {}", human_type_label(state, tree, dt));
+            }
+        }
+    }
     Some(format!("```gdscript\n{sig}\n```"))
+}
+
+/// A human-readable label for a resolved [`DataType`] — hover must never surface the
+/// `Display` impl's `<Script #N>` / `<Class>` diagnostic placeholders (issue #26). Script types
+/// render their global `class_name` (or file basename) plus any inner-class path; in-file Class
+/// types render their declared identifier. Everything else keeps the faithful `Display` text.
+fn human_type_label(state: &ServerState, tree: &ParseTree, dt: &gd_analyze::DataType) -> String {
+    use gd_analyze::DtKind;
+    match dt.kind {
+        DtKind::Script => {
+            let Some(sr) = &dt.script_type else {
+                return dt.to_string();
+            };
+            let head = state
+                .workspace
+                .index
+                .interface(sr.file)
+                .and_then(|i| i.class_name.clone())
+                .or_else(|| {
+                    state
+                        .workspace
+                        .index
+                        .path(sr.file)
+                        .and_then(|p| p.file_name())
+                        .map(str::to_owned)
+                });
+            match head {
+                Some(h) if sr.inner.is_empty() => h,
+                Some(h) => format!("{h}.{}", sr.inner.join(".")),
+                None => dt.to_string(),
+            }
+        }
+        DtKind::Class => dt
+            .class_node
+            .and_then(|cid| match &tree.get(cid).kind {
+                NodeKind::Class(c) => c.identifier.map(|i| ident_name(tree, i).to_owned()),
+                _ => None,
+            })
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| dt.to_string()),
+        _ => dt.to_string(),
+    }
 }
 
 fn append_class_docs(md: &mut String, class: &NativeClass) {
