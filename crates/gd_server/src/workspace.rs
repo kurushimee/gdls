@@ -368,7 +368,7 @@ impl Workspace {
                         .iter()
                         .filter_map(|a| {
                             let path = self.project.autoload_script_path(&a.name)?;
-                            let fid = self.index.resolve_res_path(path)?;
+                            let fid = self.index.resolve_res_path(&path)?;
                             Some((a.name.clone(), fid))
                         })
                         .collect();

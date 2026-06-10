@@ -642,3 +642,60 @@ fn hover_on_uncalled_autoload_func_member_shows_signature() {
     );
     shutdown(&client, handle);
 }
+
+/// An autoload declared as `Name="*uid://…"` whose sidecar maps to a `.gd` gets the full
+/// singleton treatment: clean diagnostics on a caller, and definition on the name jumps to the
+/// script. `ProjectModel::resolve_target` dereferences the uid exactly like Godot's
+/// `ResourceLoader` does for autoload paths.
+#[test]
+fn uid_autoload_resolves_like_res_path() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*uid://c1testuidauto\"\n",
+    );
+    p.write(
+        "global.gd",
+        "extends Node\n\nfunc popup_error(msg: String) -> void:\n\tpass\n",
+    );
+    p.write("global.gd.uid", "uid://c1testuidauto\n");
+    p.write(
+        "caller.gd",
+        "extends Node\n\nfunc test():\n\tGlobal.popup_error(\"x\")\n",
+    );
+    let (client, handle) = boot(&p);
+    did_open(&client, &p, "global.gd");
+    did_open_assert_clean(&client, &p, "caller.gd");
+
+    let caller_uri = file_uri(&p.root.join("caller.gd"));
+    client
+        .sender
+        .send(request(
+            7,
+            "textDocument/definition",
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: caller_uri.clone(),
+                    },
+                    // Line 3 `\tGlobal.popup_error("x")` — col 2 is inside `Global`.
+                    position: Position::new(3, 2),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            },
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    let result: Option<GotoDefinitionResponse> =
+        serde_json::from_value(resp.result.expect("definition result")).unwrap();
+    let Some(GotoDefinitionResponse::Scalar(loc)) = result else {
+        panic!("expected a definition for a uid:// autoload, got {result:?}");
+    };
+    assert!(
+        loc.uri.as_str().ends_with("global.gd"),
+        "uid autoload definition must land in global.gd, got {}",
+        loc.uri.as_str()
+    );
+    shutdown(&client, handle);
+}

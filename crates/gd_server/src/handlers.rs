@@ -383,7 +383,6 @@ pub fn definition(
             .workspace
             .project
             .autoload_script_path(&name)
-            .map(str::to_owned)
             .and_then(|p| state.workspace.index.resolve_res_path(&p));
         if let Some(fid) = autoload_fid {
             let node_span = parsed.tree.get(node_id).span;
@@ -1110,7 +1109,7 @@ fn find_autoload_definition(state: &ServerState, name: &str) -> Option<Location>
     // Gate on index membership — only emit a Location for paths that resolve to an actually
     // existing, indexed project file. `resolve_res_path` returns Some only for indexed (on-disk)
     // files; if save.gd is absent from disk, this returns None → no Location emitted.
-    let fid = state.workspace.index.resolve_res_path(res_path)?;
+    let fid = state.workspace.index.resolve_res_path(&res_path)?;
     let abs = state.workspace.index.path(fid).map(|p| p.to_path_buf())?;
     let uri = path_to_file_uri(&abs)?;
     Some(Location {
@@ -1313,7 +1312,6 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         .workspace
         .project
         .autoload_script_path(&name)
-        .map(str::to_owned)
         .and_then(|p| state.workspace.index.resolve_res_path(&p));
     let is_autoload = autoload_fid.is_some_and(|fid| {
         let node_span = parsed.tree.get(node_id).span;
