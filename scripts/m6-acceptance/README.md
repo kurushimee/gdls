@@ -180,3 +180,27 @@ cp target/m6-acceptance/oss-report.json /out/of/repo/reports/proprietary-report.
 ```
 
 The session file for the proprietary project lives entirely outside the repo. Nothing is committed.
+
+---
+
+## Diagnostics sweep — the release gate (`scan_diags.py`)
+
+A nav-row walk is NOT a diagnostics gate: the v1.0.0 walks opened only files that extended a
+native class directly and looked clean, while a full sweep then found error-level false positives
+in 133/243 Pixelorama files (the v1.0.1 cross-file families). `scan_diags.py` didOpens **every**
+`.gd` in a project and tallies every `publishDiagnostics`:
+
+```bash
+scripts/m6-acceptance/scan_diags.py \
+  --project ~/dev/m6-oss-acceptance/Pixelorama \
+  --gdls target/release/gdls \
+  --api ~/dev/m6-oss-acceptance/extension_api.json \
+  --out target/m6-acceptance/scan-report.json
+```
+
+**Gate rule: run this on both acceptance projects before any release.** `files_with_errors`
+must be ~0; every remaining error file must be individually justified against
+`godot --check-only --script <file>` (run from inside an imported project — an unimported one
+lacks the class cache and false-fails). The report's `error_message_histogram` is the fastest
+way to spot a systematic family vs. genuine project errors. Delete the project's `.gdls/`
+afterwards if you don't want the sweep's warm cache left behind.
