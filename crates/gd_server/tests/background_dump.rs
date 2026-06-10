@@ -45,12 +45,17 @@ fn background_dump_adoption_republishes_open_buffers() {
         "a.gd",
         "extends Node\n\nvar t: Timer = null\nvar c: FakeCustomClass = null\n",
     );
-    // The fake binary sleeps long enough for the didOpen round-trip to complete first, so the
-    // initial publish deterministically reflects the embedded fallback, then dumps and exits.
+    // The fake binary blocks on a sentinel file the test writes only after publish #1 lands, so
+    // the initial publish reflects the embedded fallback on any scheduler — a sync point, not a
+    // timed sleep. The poll cap (~30 s) keeps an orphaned fake from outliving the test; the dump
+    // thread's own deadline kill covers it regardless.
     let bin = project.root.join("fake-godot.sh");
     std::fs::write(
         bin.as_std_path(),
-        format!("#!/bin/sh\nsleep 2\ncat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 0\n"),
+        format!(
+            "#!/bin/sh\ni=0\nwhile [ ! -f go.flag ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done\n\
+             cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 0\n"
+        ),
     )
     .unwrap();
     std::fs::set_permissions(bin.as_std_path(), std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -100,6 +105,9 @@ fn background_dump_adoption_republishes_open_buffers() {
         first.is_empty(),
         "embedded-fallback session must not false-positive, got: {first:?}"
     );
+
+    // Publish #1 observed — release the fake binary to produce its dump.
+    project.write("go.flag", "");
 
     // The adoption republish — wait for the publish whose content reflects the Exact fake dump:
     // `Timer` is now a trustworthy unknown (error), `FakeCustomClass` resolves. Intermediate
