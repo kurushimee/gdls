@@ -18,7 +18,6 @@ use lru::LruCache;
 use rustc_hash::{FxHashMap, FxHashSet};
 use walkdir::WalkDir;
 
-use crate::api_dump::ApiDumpPolicy;
 use crate::uri::CanonicalKey;
 use crate::xfile::WorkspaceXFileQuery;
 use gd_project::is_excluded;
@@ -112,19 +111,11 @@ impl Workspace {
     /// every `.gd`. Runs after the `initialize` response is sent, so a large scan never stalls the
     /// handshake.
     ///
-    /// Never spawns Godot — the auto-dump only runs through [`Self::load_with_api_policy`] with
-    /// [`ApiDumpPolicy::SpawnIfStale`], which `serve_inner` alone passes. Direct callers
-    /// (`gdls diagnose`, every test) stay process-free with zero changes.
+    /// Never spawns Godot — since v1.0.2 (issue #25) NO resolution path does. The auto-dump runs
+    /// on a background thread (`api_dump::spawn_background_dump`, started by `serve_inner` after
+    /// this load) and is adopted mid-session via [`Self::reload_native`], so direct callers
+    /// (`gdls diagnose`, every test) and the session startup are equally process-free.
     pub fn load(root: &Utf8Path, options: &InitializationOptions) -> Self {
-        Self::load_with_api_policy(root, options, ApiDumpPolicy::NeverSpawn)
-    }
-
-    /// [`Self::load`] with an explicit [`ApiDumpPolicy`] for the `extension_api.json` auto-dump.
-    pub fn load_with_api_policy(
-        root: &Utf8Path,
-        options: &InitializationOptions,
-        api_policy: ApiDumpPolicy,
-    ) -> Self {
         // M5 WP-O1: cold_index span. Captures the full bootstrap — project model + native DB +
         // eager interface index + warn policy — so a hierarchical-profiler dump nests anything
         // that crosses the threshold under it. Fields are recorded with `Empty` and filled in
@@ -138,7 +129,7 @@ impl Workspace {
         );
         let _enter = _span.enter();
         let project = ProjectModel::load(root);
-        let native = load_native(options, &project, root, api_policy);
+        let native = load_native(options, &project, root);
 
         // Build the cache key for warm-start attempt.
         let key = build_cache_key(&native, root);
@@ -619,21 +610,65 @@ impl Workspace {
             return;
         }
         self.project = project;
-        // NeverSpawn: a mid-session reload must not block the single-threaded event loop on a
-        // Godot boot. A `.gdextension` change marks the auto-dump meta stale; the next startup
-        // re-dumps.
-        self.native = load_native(options, &self.project, &root, ApiDumpPolicy::NeverSpawn);
+        // Mid-session reloads never spawn Godot (no resolution path does since v1.0.2); a
+        // `.gdextension` change marks the auto-dump meta stale and the next startup's background
+        // dump refreshes it.
+        let native = load_native(options, &self.project, &root);
+        // No content-hash dedupe here: a doc-XML merge changes the DB without changing the dump
+        // text the hash covers, and this path IS the doc-XML/gdextension reaction.
+        self.adopt_native(native, false);
         self.policy = WarnPolicy::build(&self.project.warnings, &strict_settings(&options.strict));
         self.analysis_cache.clear();
     }
 
     /// Re-load only the native DB (extension_api.json + every installed gdextension's doc XML).
-    /// Drops the analysis cache so types pick up the new native lattice. NeverSpawn — see
-    /// [`Self::reload_project_and_native`].
-    pub fn reload_native(&mut self, options: &InitializationOptions) {
+    /// Returns whether the live DB actually changed — callers republish + re-save the warm cache
+    /// only on `true`. Never spawns Godot — see [`Self::reload_project_and_native`].
+    pub fn reload_native(&mut self, options: &InitializationOptions) -> bool {
         let root = self.project.root.clone();
-        self.native = load_native(options, &self.project, &root, ApiDumpPolicy::NeverSpawn);
+        let native = load_native(options, &self.project, &root);
+        self.adopt_native(native, true)
+    }
+
+    /// Install a freshly-resolved native DB, with two session-stability rules (issue #25):
+    ///
+    /// 1. **Never downgrade.** A mid-session resolution that comes back strictly worse — empty
+    ///    where the live DB is populated, or non-`Exact` where the live DB is `Exact` — is a
+    ///    transient artifact (a torn read of a mid-write dump, a momentarily-missing file), not
+    ///    a real change. Keep the live DB; a genuine source change re-fires the watcher once the
+    ///    file is whole, and a restart re-resolves from disk anyway.
+    /// 2. **Dedupe by content** (only when `dedupe_by_hash` — the extension_api-triggered path,
+    ///    where the doc-XML merge inputs are unchanged): the post-adoption watcher echo of the
+    ///    dump file re-resolves to byte-identical content; skip the cache flush + republish.
+    ///
+    /// Returns whether `self.native` changed (callers gate republish on it). Clears the
+    /// analysis cache on adoption so types pick up the new native lattice.
+    fn adopt_native(&mut self, new: NativeDb, dedupe_by_hash: bool) -> bool {
+        use gd_types::ApiProvenance;
+        let downgrade = (new.is_empty() && !self.native.is_empty())
+            || (self.native.provenance() == ApiProvenance::Exact
+                && new.provenance() != ApiProvenance::Exact);
+        if downgrade {
+            log::warn!(
+                "native API: reload resolved a strictly worse source ({} classes, {:?} \
+                 provenance); keeping the live DB ({} classes, {:?})",
+                new.class_count(),
+                new.provenance(),
+                self.native.class_count(),
+                self.native.provenance(),
+            );
+            return false;
+        }
+        if dedupe_by_hash
+            && new.content_hash() == self.native.content_hash()
+            && new.provenance() == self.native.provenance()
+        {
+            log::debug!("native API: reload resolved identical content; nothing to do");
+            return false;
+        }
+        self.native = new;
         self.analysis_cache.clear();
+        true
     }
 
     /// Walk the project root for every `.gd` and reconcile the live index against the disk: add
@@ -1162,7 +1197,6 @@ fn load_native(
     options: &InitializationOptions,
     project: &ProjectModel,
     root: &Utf8Path,
-    api_policy: ApiDumpPolicy,
 ) -> NativeDb {
     let mut db = match options.extension_api_path.as_deref() {
         Some(path) => match NativeDb::load(path) {
@@ -1195,9 +1229,10 @@ fn load_native(
                 }
             }
         },
-        // No explicit path: the v1.0.1 managed resolution — fresh .gdls dump → auto-dump →
-        // stale dump → project-root file → empty (crate::api_dump has the full ladder + logs).
-        None => crate::api_dump::resolve_native_db(options, project, root, api_policy),
+        // No explicit path: the managed resolution — fresh .gdls dump → stale dump →
+        // project-root file → embedded stock → empty (crate::api_dump has the full ladder +
+        // logs). Never spawns; the auto-dump is `spawn_background_dump`'s job.
+        None => crate::api_dump::resolve_native_db(options, project, root),
     };
 
     let mut merged = 0usize;

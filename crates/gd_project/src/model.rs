@@ -9,8 +9,9 @@ use crate::paths;
 use crate::project_godot::{self, Autoload, ResTarget, WarningConfig};
 
 /// Everything gdls knows about a project's environment, short of the per-script interface index
-/// (which the indexer owns).
-#[derive(Debug)]
+/// (which the indexer owns). `Clone` because the background auto-dump thread
+/// (`gd_server::api_dump`) snapshots the model it was started against.
+#[derive(Clone, Debug)]
 pub struct ProjectModel {
     pub root: Utf8PathBuf,
     pub config_version: u32,

@@ -238,13 +238,15 @@ fn serve_inner(
 
     // Build the workspace (native DB + project model + cold index) only after the `initialize`
     // response is sent, so a large scan never stalls the handshake (WP-F: start inline). The
-    // SOLE SpawnIfStale caller: session startup is the one place the extension_api auto-dump
-    // may run (a blocking Godot boot is acceptable before the event loop arms, never after).
-    let workspace = Workspace::load_with_api_policy(
-        &root,
-        &options,
-        crate::api_dump::ApiDumpPolicy::SpawnIfStale,
-    );
+    // load itself never spawns Godot (issue #25): it resolves the best CURRENTLY-available
+    // native source (cached dump → root file → embedded stock → empty) and serves on that.
+    let workspace = Workspace::load(&root, &options);
+    // Kick the auto-dump off on a background thread when the cache is stale/missing — the dump
+    // (a full Godot boot; up to a 60 s timeout when the binary wedges) must never sit between
+    // `initialize` and the first served request. Its completion is a select! arm below: adopt,
+    // reload, republish — the first run converges to the same state as every later run,
+    // mid-session.
+    let mut dump_rx = crate::api_dump::spawn_background_dump(&options, &workspace.project, &root);
     let post_cold_index_rss = rss.sample_now("post_cold_index");
     // M5 WP-H1: a one-shot startup check so an operator gets an immediate, actionable signal when
     // the resolved cap is already below this project's steady-state working set — rather than
@@ -314,6 +316,8 @@ fn serve_inner(
     // WP-RD3: `watcher_rx` and `ticker` are produced by the watcher-source match above (real or
     // injected); only the never-channel `dummy` is local to the loop.
     let dummy = crossbeam_channel::never::<DebounceEventResult>();
+    // One-shot arm for the background auto-dump (issue #25); `never` once it has fired/closed.
+    let dump_dummy = crossbeam_channel::never::<crate::api_dump::DumpOutcome>();
     // WP-RD11 (4): liveness ticks elapsed since the watcher arm was disabled. Once the watcher is
     // down (MaxFilesWatch / root-loss), the index would otherwise freeze until restart; this counts
     // 3-second ticks so a low-frequency reconcile fallback can re-sync on-disk drift.
@@ -321,7 +325,32 @@ fn serve_inner(
 
     loop {
         let watcher_arm = watcher_rx.as_ref().unwrap_or(&dummy);
+        let dump_arm = dump_rx.as_ref().unwrap_or(&dump_dummy);
         select! {
+            recv(dump_arm) -> outcome => {
+                // One-shot: whether it reported or the thread died, retire the arm.
+                dump_rx = None;
+                match outcome {
+                    Ok(crate::api_dump::DumpOutcome::Adopted { classes, version }) => {
+                        log::info!(
+                            "native API: background dump adopted ({classes} classes, {version}); \
+                             reloading + republishing open buffers"
+                        );
+                        if state.workspace.reload_native(&state.options) {
+                            republish_all_open_buffers(&mut state);
+                            // The warm-start cache key includes the native DB; re-save so the
+                            // NEXT session warm-loads instead of cold-indexing on key mismatch.
+                            state.workspace.save_cache();
+                        }
+                    }
+                    Ok(crate::api_dump::DumpOutcome::Failed(e)) => {
+                        log::warn!("native API: background auto-dump failed ({e}); keeping the current source");
+                    }
+                    Err(_) => {
+                        log::warn!("native API: background dump thread ended without reporting");
+                    }
+                }
+            },
             recv(connection.receiver) -> msg => match msg {
                 Ok(Message::Request(req)) => {
                     // WP-P3: record before dispatch so a panicking handler still leaves the
@@ -711,8 +740,16 @@ fn handle_watcher(state: &mut ServerState, events: Vec<DebouncedEvent>) {
         log::info!(
             "watcher: extension_api.json changed; reloading native DB (coalesced for the batch)"
         );
-        state.workspace.reload_native(&state.options);
-        republish_all_open_buffers(state);
+        // `reload_native` reports whether the live DB actually changed: a torn read of a
+        // mid-write dump (kept prior) or the post-adoption echo (identical content) must not
+        // re-analyze every open buffer for nothing.
+        if state.workspace.reload_native(&state.options) {
+            republish_all_open_buffers(state);
+            // The warm-start cache key includes the native DB — re-save so the next session
+            // warm-loads against the new key. (The background-dump completion arm does the
+            // same; whichever path adopts first wins, the other dedupes by content hash.)
+            state.workspace.save_cache();
+        }
     }
     // M5 WP-O2: post-watcher-batch sample. A mass reindex driven by a `git checkout` or branch
     // switch can balloon the parse + analysis caches in one go; this catches that burst without
@@ -965,6 +1002,16 @@ fn classify_open_buffer_disk_change(state: &ServerState, path: &Utf8Path) {
 /// non-draining `dirty_paths` + `clear_dirty_one` dance, whose only reason for being was that
 /// `analyze` keyed its cache-miss override on `is_dirty` and had to clear the bit itself.
 fn republish_dirty_open_buffers(state: &mut ServerState) {
+    republish_dirty_open_buffers_except(state, None);
+}
+
+/// [`republish_dirty_open_buffers`] minus one URI: the didOpen/didChange handlers drain the
+/// dirty set their own reindex populated (the edited file + its open dependents) right after
+/// their direct, version-tagged publish — `skip` keeps that file from being published twice in
+/// the same turn. Draining at the edit chokepoint (v1.0.2) does two jobs: open DEPENDENTS get
+/// fresh diagnostics immediately (previously they waited for the next unrelated watcher batch
+/// to drain the set), and that later batch no longer "republishes" untouched buffers.
+fn republish_dirty_open_buffers_except(state: &mut ServerState, skip: Option<&Uri>) {
     let dirty = state.workspace.index.take_dirty();
     if dirty.is_empty() {
         return;
@@ -975,6 +1022,7 @@ fn republish_dirty_open_buffers(state: &mut ServerState) {
         .collect();
     let stale_uris: Vec<Uri> = open_buffer_uris(state)
         .into_iter()
+        .filter(|u| skip != Some(u))
         .filter(|u| {
             uri_to_path(u)
                 .map(|p| gd_project::normalize_path(&p))
@@ -1225,7 +1273,9 @@ fn dispatch_notification(state: &mut ServerState, note: Notification) {
                         .vfs
                         .open(td.uri.as_str().to_string(), td.text, td.version);
                     reindex_open_buffer(state, &td.uri);
-                    publish_diagnostics(state, td.uri, Some(td.version));
+                    let uri = td.uri;
+                    publish_diagnostics(state, uri.clone(), Some(td.version));
+                    republish_dirty_open_buffers_except(state, Some(&uri));
                 }
                 Err(()) => {
                     // The client thinks the file is open; gdls did not register it. Every
@@ -1249,7 +1299,8 @@ fn dispatch_notification(state: &mut ServerState, note: Notification) {
                         .vfs
                         .apply_changes(uri.as_str(), p.content_changes, version, enc);
                     reindex_open_buffer(state, &uri);
-                    publish_diagnostics(state, uri, Some(version));
+                    publish_diagnostics(state, uri.clone(), Some(version));
+                    republish_dirty_open_buffers_except(state, Some(&uri));
                 }
                 Err(()) => {
                     // `parse_params` already log::warn'd the deserialize error. Re-flag at error
@@ -1288,7 +1339,8 @@ fn dispatch_notification(state: &mut ServerState, note: Notification) {
                     // The buffer is gone — re-index from disk so the index reflects the on-disk file (an
                     // unsaved buffer's edits are discarded), then push an empty set to clear diagnostics.
                     reindex_from_disk(state, &uri);
-                    publish_diagnostics(state, uri, None);
+                    publish_diagnostics(state, uri.clone(), None);
+                    republish_dirty_open_buffers_except(state, Some(&uri));
                 }
                 Err(()) => {
                     // The VFS entry leaks (the client moved on; we still think the buffer is
