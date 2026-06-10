@@ -7,7 +7,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-(nothing yet)
+### Fixed
+- **No background auto-dump when `extensionApiPath` is pinned**: `load_native` never consults
+  the managed `.gdls/` dump while an explicit path is set, so the background Godot boot was
+  pure waste (its result deduped to a no-op on adoption). `spawn_background_dump` now declines
+  up front, like the other no-dump configurations.
 
 ## [1.0.2] — 2026-06-11
 

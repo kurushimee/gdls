@@ -178,8 +178,8 @@ pub(crate) fn resolve_native_db(
 /// Decide whether this session should auto-dump, and if so run it on a BACKGROUND thread:
 /// the dump (a full Godot boot, seconds — or a 60 s timeout when the binary wedges) must never
 /// sit between `initialize` and the first served request (issue #25). Returns the receiver the
-/// event loop selects on, or `None` when no dump is warranted (fresh cache, kill switch, no
-/// binary, no project, or a user-managed root file).
+/// event loop selects on, or `None` when no dump is warranted (fresh cache, kill switch, a
+/// pinned `extensionApiPath`, no binary, no project, or a user-managed root file).
 ///
 /// The thread does the whole job — spawn, drain, parse, move into `.gdls/`, write meta — and
 /// reports a [`DumpOutcome`]; the loop's only duty on `Adopted` is `reload_native` +
@@ -193,6 +193,13 @@ pub(crate) fn spawn_background_dump(
 ) -> Option<crossbeam_channel::Receiver<DumpOutcome>> {
     if !options.auto_dump_extension_api {
         log::debug!("native API: auto-dump disabled by autoDumpExtensionApi=false");
+        return None;
+    }
+    // A pinned explicit path makes the managed dump unservable — `load_native` resolves the
+    // `Some(extensionApiPath)` arm without ever consulting the `.gdls/` ladder — so the boot
+    // would be pure waste (adoption re-resolves the pinned path and dedupes to a no-op).
+    if options.extension_api_path.is_some() {
+        log::debug!("native API: extensionApiPath is pinned; auto-dump skipped");
         return None;
     }
     // Only for a real Godot project. A bare-`.gd` session whose root fell back to some cwd has
@@ -793,6 +800,23 @@ mod tests {
             let db = resolve_native_db(&options, &project, &root);
             assert_eq!(db.provenance(), gd_types::ApiProvenance::Exact);
             assert_eq!(db.class_count(), 2);
+            assert!(spawn_background_dump(&options, &project, &root).is_none());
+        }
+
+        /// A pinned extensionApiPath makes the managed dump unservable (`load_native` never
+        /// consults the `.gdls/` ladder when the explicit path is set), so no background boot
+        /// fires even when everything else — binary, project, missing cache — warrants one.
+        #[test]
+        fn pinned_extension_api_path_skips_dump() {
+            let (_dir, root, bin) = fixture(&format!(
+                "cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 0"
+            ));
+            let options = InitializationOptions {
+                godot_binary_path: Some(bin.to_string()),
+                extension_api_path: Some(root.join("pinned.json").to_string()),
+                ..Default::default()
+            };
+            let project = ProjectModel::load(&root);
             assert!(spawn_background_dump(&options, &project, &root).is_none());
         }
     }
