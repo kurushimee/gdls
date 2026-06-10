@@ -100,7 +100,7 @@ fn walk(ctx: &AnalysisContext, start: &ScriptRef) -> ResolvedChain {
                     native_root: Some("RefCounted".to_owned()),
                 };
             }
-            gd_project::Extends::Path(p) => match ctx.xfile.resolve_res_path(p) {
+            gd_project::Extends::Path(p) => match ctx.xfile.resolve_path_from(cur.file, p) {
                 Some(f) => ScriptRef {
                     file: f,
                     inner: Vec::new(),

@@ -89,6 +89,10 @@ pub struct MemberDecl {
     /// Not included in `signature_hash` — param renames don't change call compatibility in
     /// GDScript's positional-call model, so they aren't interface-relevant for invalidation.
     pub param_names: Vec<String>,
+    /// `func` members: how many parameters have NO default value (the call-site arity minimum;
+    /// `mirror_array(arr, callable := …)` requires 1). Equals `params.len()` for everything
+    /// else. Hashed — a default added/removed changes call compatibility.
+    pub required_params: usize,
     pub flags: MemberFlags,
     /// Byte range of the declaration. **Excluded from [`Interface::signature_hash`]** so that a
     /// body-only edit (which shifts later members' spans) does not look like an interface change.
@@ -185,6 +189,7 @@ impl Interface {
             m.kind.hash(h);
             m.ty.hash(h);
             m.params.hash(h);
+            m.required_params.hash(h);
             m.flags.hash(h);
             // m.span is intentionally NOT hashed.
         }
@@ -328,12 +333,20 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     } else {
         MemberKind::Var
     };
+    let mut ty = type_expr(tree, v.datatype_specifier);
+    if matches!(ty, TypeExpr::None) {
+        // `var x := <literal/constructor/builtin-constant>` — capture the syntactically-obvious
+        // type so cross-file consumers see `int`/`Color`/… instead of soft Variant (Godot's
+        // full analysis infers these; the shallow interface can read the simple shapes).
+        ty = initializer_type_expr(tree, v.initializer);
+    }
     Some(MemberDecl {
         name,
         kind,
-        ty: type_expr(tree, v.datatype_specifier),
+        ty,
         params: Vec::new(),
         param_names: Vec::new(),
+        required_params: 0,
         flags: MemberFlags {
             is_static: v.is_static,
             exported: has_annotation(tree, &node.annotations, |n| n.starts_with("@export")),
@@ -351,12 +364,17 @@ fn const_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         return None;
     };
     let name = ident_name(tree, c.identifier)?;
+    let mut ty = type_expr(tree, c.datatype_specifier);
+    if matches!(ty, TypeExpr::None) {
+        ty = initializer_type_expr(tree, c.initializer);
+    }
     Some(MemberDecl {
         name,
         kind: MemberKind::Const,
-        ty: type_expr(tree, c.datatype_specifier),
+        ty,
         params: Vec::new(),
         param_names: Vec::new(),
+        required_params: 0,
         flags: MemberFlags::default(),
         span: node.span,
         line: node.loc.start.line,
@@ -382,12 +400,22 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
             _ => (TypeExpr::None, String::new()),
         })
         .unzip();
+    let defaulted = f
+        .parameters
+        .iter()
+        .filter(|&&p| match &tree.get(p).kind {
+            NodeKind::Parameter(pn) => pn.initializer.is_some(),
+            _ => false,
+        })
+        .count();
+    let required_params = params.len().saturating_sub(defaulted);
     Some(MemberDecl {
         name,
         kind: MemberKind::Func,
         ty: type_expr(tree, f.return_type),
         params,
         param_names,
+        required_params,
         flags: MemberFlags {
             is_static: f.is_static,
             is_abstract: has_annotation(tree, &node.annotations, |n| n == "@abstract"),
@@ -418,12 +446,14 @@ fn signal_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
             _ => (TypeExpr::None, String::new()),
         })
         .unzip();
+    let required_params = params.len();
     Some(MemberDecl {
         name,
         kind: MemberKind::Signal,
         ty: TypeExpr::None,
         params,
         param_names,
+        required_params,
         flags: MemberFlags::default(),
         span: node.span,
         line: node.loc.start.line,
@@ -444,6 +474,7 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         ty: TypeExpr::None,
         params: Vec::new(),
         param_names: Vec::new(),
+        required_params: 0,
         flags: MemberFlags::default(),
         span: node.span,
         line: node.loc.start.line,
@@ -512,6 +543,7 @@ fn enum_value_member(tree: &ParseTree, value: &EnumValue) -> Option<MemberDecl> 
         ty: TypeExpr::None,
         params: Vec::new(),
         param_names: Vec::new(),
+        required_params: 0,
         flags: MemberFlags::default(),
         span: node.span,
         line: node.loc.start.line,
@@ -542,6 +574,128 @@ fn type_expr(tree: &ParseTree, opt: Option<NodeId>) -> TypeExpr {
     } else {
         TypeExpr::Named { path, args }
     }
+}
+
+/// The syntactically-obvious type of a `:=` initializer, for members with no annotation: a
+/// literal, an Array/Dictionary literal, a builtin constructor call (`Color(…)`), or a
+/// builtin-class constant (`Color.PURPLE` — captured as the two-segment path so the analyzer can
+/// consult the dump for the constant's REAL declared type; `Vector3.AXIS_X` is `int`). Anything
+/// needing evaluation stays `TypeExpr::None` (soft Variant downstream). Godot's full analysis
+/// infers all of these; the shallow interface reads only the unambiguous shapes.
+fn initializer_type_expr(tree: &ParseTree, init: Option<NodeId>) -> TypeExpr {
+    use gd_syntax::token::Literal;
+    let named = |s: &str| TypeExpr::Named {
+        path: vec![s.to_owned()],
+        args: Vec::new(),
+    };
+    let Some(id) = init else {
+        return TypeExpr::None;
+    };
+    match &tree.get(id).kind {
+        NodeKind::Literal(l) => match l.value {
+            Literal::Int(_) => named("int"),
+            Literal::Float(_) => named("float"),
+            Literal::Bool(_) => named("bool"),
+            Literal::String(_) => named("String"),
+            Literal::StringName(_) => named("StringName"),
+            Literal::NodePath(_) => named("NodePath"),
+            Literal::Null => TypeExpr::None,
+        },
+        NodeKind::Array(_) => named("Array"),
+        NodeKind::Dictionary(_) => named("Dictionary"),
+        NodeKind::Call(c) => {
+            if is_builtin_type_name(&c.function_name) {
+                named(&c.function_name)
+            } else if c.function_name == "new" {
+                // `X.new()` constructs an X — the everyday `var map := SelectionMap.new()`
+                // member idiom. The callee is `X.new` (a Subscript over an identifier base).
+                let base_name = c.callee.and_then(|cid| match &tree.get(cid).kind {
+                    NodeKind::Subscript(sub) => sub.base.and_then(|b| match &tree.get(b).kind {
+                        NodeKind::Identifier(i) => Some(i.name.clone()),
+                        _ => None,
+                    }),
+                    _ => None,
+                });
+                match base_name {
+                    Some(b) => named(&b),
+                    None => TypeExpr::None,
+                }
+            } else {
+                TypeExpr::None
+            }
+        }
+        NodeKind::Subscript(sub) => {
+            // `Builtin.CONSTANT` — record both segments; the analyzer resolves the constant's
+            // declared type from the dump.
+            let base_name = sub.base.and_then(|b| match &tree.get(b).kind {
+                NodeKind::Identifier(i) => Some(i.name.clone()),
+                _ => None,
+            });
+            let attr_name = match sub.access {
+                Some(gd_syntax::ast::SubscriptAccess::Attribute(Some(a))) => {
+                    match &tree.get(a).kind {
+                        NodeKind::Identifier(i) => Some(i.name.clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            match (base_name, attr_name) {
+                (Some(b), Some(a)) if is_builtin_type_name(&b) => TypeExpr::Named {
+                    path: vec![b, a],
+                    args: Vec::new(),
+                },
+                _ => TypeExpr::None,
+            }
+        }
+        _ => TypeExpr::None,
+    }
+}
+
+/// GDScript's builtin type-name set (`GDScriptParser::get_builtin_type`, minus `Nil`/`Object`).
+/// Duplicated from the analyzer's table because gd_project must stay engine-free; the list is
+/// frozen by the language.
+fn is_builtin_type_name(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "int"
+            | "float"
+            | "String"
+            | "Vector2"
+            | "Vector2i"
+            | "Rect2"
+            | "Rect2i"
+            | "Vector3"
+            | "Vector3i"
+            | "Transform2D"
+            | "Vector4"
+            | "Vector4i"
+            | "Plane"
+            | "Quaternion"
+            | "AABB"
+            | "Basis"
+            | "Transform3D"
+            | "Projection"
+            | "Color"
+            | "StringName"
+            | "NodePath"
+            | "RID"
+            | "Callable"
+            | "Signal"
+            | "Dictionary"
+            | "Array"
+            | "PackedByteArray"
+            | "PackedInt32Array"
+            | "PackedInt64Array"
+            | "PackedFloat32Array"
+            | "PackedFloat64Array"
+            | "PackedStringArray"
+            | "PackedVector2Array"
+            | "PackedVector3Array"
+            | "PackedColorArray"
+            | "PackedVector4Array"
+    )
 }
 
 fn ident_name(tree: &ParseTree, opt: Option<NodeId>) -> Option<String> {

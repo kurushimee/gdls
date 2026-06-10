@@ -377,3 +377,90 @@ func go() -> void:
         "Mode.B must follow the previous+1 chain to 6, got {folds:?}"
     );
 }
+
+/// The sweep-driven v1.0.1 batch, pinned as one zero-diagnostics fixture: every shape here
+/// errored on a real OSS project (Pixelorama @ stock 4.6.3) after the first fix wave. Kitchen
+/// sink by design — the gate that proved them is the full-project sweep
+/// (`scripts/m6-acceptance/scan_diags.py`), and this is its in-repo distillation.
+#[test]
+fn sweep_batch_shapes_publish_no_errors() {
+    let base = "\
+class_name SweepBase
+extends Node
+enum Modes { PASS = 5, NORM }
+var map := SweepMap.new()
+var tint := Color.BLUE
+var flag := false
+func mirror_array(arr: Array[Vector2i], cb := 1) -> Array[Vector2i]:
+\treturn arr
+";
+    let map_gd = "\
+class_name SweepMap
+extends RefCounted
+func get_nearest(pos: Vector2i) -> Vector2i:
+\treturn pos
+";
+    let sub = "class_name SweepSub\nextends SweepBase\n";
+    let consumer = "\
+extends SweepBase
+
+const Sibling := preload(\"sib.gd\")
+
+
+func modes(d: Dictionary) -> SweepBase.Modes:
+\tvar _t := d[\"type\"] as Variant.Type
+\treturn SweepBase.Modes.PASS
+
+
+func go(pos: Vector2i, others: Array[SweepBase]) -> void:
+\tvar left := pos.x
+\tvar start_x := left
+\tvar near := map.get_nearest(pos)
+\tvar _offset := near
+\tvar _color := tint if flag else Color.WHITE
+\tfor point in mirror_array([pos]):
+\t\tvar _draw_point := point
+\tfor o in others:
+\t\tif is_ancestor_of(o):
+\t\t\tpass
+\tvar _sib = Sibling
+\tmatch pos:
+\t\tVector2i(-1, -1):
+\t\t\tpass
+\t\tVector2i.ZERO:
+\t\t\tpass
+\tprint(start_x)
+";
+    let sib = "extends RefCounted\n";
+    let project = Project::new(&[
+        ("res://base.gd", base),
+        ("res://map.gd", map_gd),
+        ("res://sub.gd", sub),
+        ("res://sib.gd", sib),
+        ("res://use.gd", ""),
+    ]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}
+
+/// `self is OwnSubclassInAnotherFile` — tested from the BASE file's own analysis (Pixelorama's
+/// `Guide.gd: if self is SymmetryGuide`): the subclass's chain passes through THIS file, which
+/// the Class-target bridge resolves; the reverse direction (sibling vs sibling) must keep
+/// erroring — Godot rejects provably-disjoint `is` tests.
+#[test]
+fn self_is_own_subclass_through_chain() {
+    let base_src = "\
+class_name BridgeBase
+extends Node
+func check() -> void:
+\tif self is BridgeSub:
+\t\tpass
+";
+    let sub = "class_name BridgeSub\nextends BridgeBase\n";
+    let project = Project::new(&[
+        ("res://bridge_base.gd", base_src),
+        ("res://bridge_sub.gd", sub),
+    ]);
+    let result = analyze_file(&project, "res://bridge_base.gd", base_src);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}

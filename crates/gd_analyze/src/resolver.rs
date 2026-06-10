@@ -194,9 +194,13 @@ fn resolve_class_inheritance(
 fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option<DataType>, ()> {
     // `extends "res://path.gd"` (analyzer.cpp:437-459).
     if let Some(path) = class_extends_path(ctx, class_id) {
-        // Relative paths (resolved against the script's dir in Godot) are deferred; M2 indexes by
-        // `res://`. An unresolved path is Godot's "Could not resolve super class path".
-        return match ctx.xfile.resolve_res_path(&path) {
+        // Relative paths resolve against the script's own directory (analyzer.cpp:437); an
+        // unresolved path is Godot's "Could not resolve super class path".
+        let resolved = match ctx.file {
+            Some(from) => ctx.xfile.resolve_path_from(from, &path),
+            None => ctx.xfile.resolve_res_path(&path),
+        };
+        return match resolved {
             Some(fid) => Ok(Some(script_base_datatype(ctx, fid))),
             None => {
                 ctx.push_error(
@@ -623,7 +627,16 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
             }
         }
     } else if first == "Variant" {
-        // Nested `Variant.Enum` needs the global-enum table (WP-D); the bare case is `Variant`.
+        // `Variant.Type` / `Variant.Operator` annotations resolve through the dump's global
+        // enums (registered under the dotted name); the bare case is `Variant`.
+        if chain.len() == 2 {
+            let seg = ident_name(ctx, chain[1]).unwrap_or_default();
+            let dotted = format!("Variant.{seg}");
+            if ctx.native.global_enum(&dotted).is_some() {
+                ctx.set_type(type_id, make_global_enum_type(ctx, &dotted, "", true));
+                return ctx.get_type(type_id).clone();
+            }
+        }
         result.kind = DtKind::Variant;
     } else if let Some(builtin) = builtin_type_from_name(&first) {
         // Builtin scalar/container. Element typing for Array/Dictionary and nested builtin enums are
@@ -649,8 +662,13 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         // analyzer.cpp:806-815 — `@GlobalScope` enum (e.g. `Side`, `ClockDirection`). Resolves
         // to the enum's meta type.
         result = make_global_enum_type(ctx, &first, "", true);
+    } else if let Some(fid) = ctx.xfile.autoload_file(&first) {
+        // analyzer.cpp:830-845 — an autoload singleton used as a type annotation
+        // (`func get_global() -> Global:`). Resolves to the autoload script's class meta, same
+        // shape as the global-class arm; nested segments (`Keychain.InputAction`) continue
+        // through the Script-segment walk below.
+        result = script_base_datatype(ctx, fid);
     }
-    // Autoload-singleton case (analyzer.cpp:830-845) deferred to a later slice.
 
     if !result.is_set() {
         // analyzer.cpp:889-892 — `Could not find type "X" in the current scope.` The
@@ -725,6 +743,50 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
                     }
                 }
             }
+        }
+    } else if chain.len() > 1 && result.kind == DtKind::Script {
+        // Cross-file nested types under a global-class / autoload head: an enum leaf
+        // (`-> BaseLayer.BlendModes`) or inner-class hops (`Keychain.InputAction`). Godot
+        // resolves these through the depended parser's members (analyzer.cpp:908-939); gdls
+        // walks the interface. A miss degrades to a SILENT Variant — interfaces are shallow
+        // extracts and a gap in them must never become a `Could not find type` error (the same
+        // rule as the cross-file hop in `resolve_extends`).
+        for (i, &id) in chain[1..].iter().enumerate() {
+            let seg = ident_name(ctx, id).unwrap_or_default();
+            let is_last = i + 1 == chain.len() - 1;
+            let Some(sr) = result.script_type.clone() else {
+                return bad_type;
+            };
+            // Named enum as the LEAF (enums cannot contain nested types) — head-class enums
+            // only; inner-class enum leaves degrade below.
+            if is_last && sr.inner.is_empty() {
+                if let Some(dt) = crate::reducer::cross_file_named_enum(ctx, sr.file, &seg, true) {
+                    result = dt;
+                    continue;
+                }
+            }
+            // Inner-class hop.
+            let mut inner: Vec<&str> = sr.inner.iter().map(String::as_str).collect();
+            inner.push(&seg);
+            if ctx.xfile.resolve_inner_chain(sr.file, &inner).is_some() {
+                let inner_owned: Vec<String> = inner.into_iter().map(String::from).collect();
+                let next = ScriptRef {
+                    file: sr.file,
+                    inner: inner_owned,
+                };
+                result = DataType {
+                    kind: DtKind::Script,
+                    type_source: TypeSource::AnnotatedExplicit,
+                    is_meta_type: true,
+                    builtin_type: VariantType::Object,
+                    native_type: crate::script_chain::chain_native_root(ctx, &next)
+                        .unwrap_or_default(),
+                    script_type: Some(next),
+                    ..Default::default()
+                };
+                continue;
+            }
+            return bad_type;
         }
     } else if chain.len() == 2 && result.kind == DtKind::Native {
         // analyzer.cpp:922-934 — `TileSet.TileShape` style: a native class followed by exactly one
@@ -910,7 +972,11 @@ fn inner_classes(ctx: &AnalysisContext, class_id: NodeId) -> Vec<NodeId> {
 }
 
 /// An inner `class` named `name` directly inside `class_id`, if any.
-fn inner_class_named(ctx: &AnalysisContext, class_id: NodeId, name: &str) -> Option<NodeId> {
+pub(crate) fn inner_class_named(
+    ctx: &AnalysisContext,
+    class_id: NodeId,
+    name: &str,
+) -> Option<NodeId> {
     match class_member(ctx, class_id, name) {
         Some(Member::Class(id)) => Some(id),
         _ => None,

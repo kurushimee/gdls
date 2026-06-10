@@ -187,12 +187,13 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
             if let Some(e) = t.false_expr {
                 reduce_expression(ctx, e, false);
             }
-            // analyzer.cpp ternary reduce: when both branches have the same builtin type but
-            // differing type_sources (hard vs soft), the result's source is the weaker of the
-            // two (Undetected). The corpus's `ternary_weak_infer.gd` exercises exactly this
-            // shape — mixing a hard int and a weak int in a ternary, then trying `:=` infer
-            // on the result; Godot's "Cannot infer" fires because the result reads as
-            // has_no_type at the resolve_assignable check.
+            // analyzer.cpp:5172-5186 ternary result typing for same-shaped branches. Both
+            // branches HARD ⇒ the common type at ANNOTATED_INFERRED (Godot's
+            // `true_type.is_hard_type() && false_type.is_hard_type() ? ANNOTATED_INFERRED :
+            // INFERRED` tail) — `x := a if c else Color.WHITE` with two hard Colors must infer
+            // Color, not degrade. Mixed hard/soft keeps the Undetected result the corpus's
+            // `ternary_weak_infer.gd` pins (gdls's resolve_assignable "Cannot infer" contract).
+            // Differing shapes fall to the dispatcher tail-guard's soft Variant.
             if let (Some(te), Some(fe)) = (t.true_expr, t.false_expr) {
                 let tt = ctx.get_type(te).clone();
                 let ft = ctx.get_type(fe).clone();
@@ -200,17 +201,23 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
                     && ft.is_set()
                     && tt.kind == ft.kind
                     && tt.builtin_type == ft.builtin_type
-                    && tt.type_source != ft.type_source
                 {
-                    ctx.set_type(
-                        id,
-                        DataType {
-                            type_source: TypeSource::Undetected,
-                            kind: tt.kind,
-                            builtin_type: tt.builtin_type,
-                            ..Default::default()
-                        },
-                    );
+                    if tt.is_hard_type() && ft.is_hard_type() {
+                        let mut result = tt.clone();
+                        result.type_source = TypeSource::AnnotatedInferred;
+                        result.is_constant = false;
+                        ctx.set_type(id, result);
+                    } else if tt.type_source != ft.type_source {
+                        ctx.set_type(
+                            id,
+                            DataType {
+                                type_source: TypeSource::Undetected,
+                                kind: tt.kind,
+                                builtin_type: tt.builtin_type,
+                                ..Default::default()
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -791,8 +798,24 @@ fn arith_mul(a: VariantType, b: VariantType) -> Option<VariantType> {
         | (Quaternion, Float)
         | (Int, Quaternion)
         | (Float, Quaternion) => Quaternion,
-        // Matrix multiplies (Transform2D, Transform3D, Basis, Projection) — registered but
-        // omitted from this slice; an unknown pair returns None.
+        // Quaternion rotates a Vector3 (variant_op.cpp:301-303, XForm/XFormInv pair).
+        (Quaternion, Vector3) | (Vector3, Quaternion) => Vector3,
+        // Matrix multiplies + xform/xform_inv pairs (variant_op.cpp:306-335). The xform result
+        // is the OPERAND type (Transform2D * Vector2 → Vector2); matrix × matrix / scalar keeps
+        // the matrix.
+        (Transform2d, Transform2d) | (Transform2d, Int) | (Transform2d, Float) => Transform2d,
+        (Transform2d, Vector2) | (Vector2, Transform2d) => Vector2,
+        (Transform2d, Rect2) | (Rect2, Transform2d) => Rect2,
+        (Transform2d, PackedVector2Array) | (PackedVector2Array, Transform2d) => PackedVector2Array,
+        (Transform3d, Transform3d) | (Transform3d, Int) | (Transform3d, Float) => Transform3d,
+        (Transform3d, Vector3) | (Vector3, Transform3d) => Vector3,
+        (Transform3d, Aabb) | (Aabb, Transform3d) => Aabb,
+        (Transform3d, Plane) | (Plane, Transform3d) => Plane,
+        (Transform3d, PackedVector3Array) | (PackedVector3Array, Transform3d) => PackedVector3Array,
+        (Projection, Projection) => Projection,
+        (Projection, Vector4) | (Vector4, Projection) => Vector4,
+        (Basis, Basis) | (Basis, Int) | (Basis, Float) => Basis,
+        (Basis, Vector3) | (Vector3, Basis) => Vector3,
         _ => return None,
     })
 }
@@ -1414,6 +1437,17 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
                 return;
             }
         }
+        // Bare native members of the current class's root — `position`, `changed.connect(…)`,
+        // an uncalled method reference — Godot reaches the native arms (analyzer.cpp:4308-4360)
+        // through the implicit `current_class` base. Skipped in callee position (reduce_call's
+        // native-method path owns those).
+        if let Some(class_id) = ctx.current_class {
+            if let Some(root) = crate::resolver::nearest_native_ancestor(ctx, class_id) {
+                if try_native_member(ctx, &root, &name, false, id) {
+                    return;
+                }
+            }
+        }
     }
 
     // 4. Native class name → metatype (analyzer.cpp:4541-4545).
@@ -1621,8 +1655,10 @@ fn is_plausible_native_member(ctx: &AnalysisContext, name: &str) -> bool {
     }
 }
 
-/// Whether `name` is a method or property anywhere up `native`'s inherits chain — the native
-/// tail of [`is_plausible_native_member`], shared by the in-file and cross-file base arms.
+/// Whether `name` is a method, property, or signal anywhere up `native`'s inherits chain — the
+/// native tail of [`is_plausible_native_member`], shared by the in-file and cross-file base
+/// arms. Signals matter: bare `changed.connect(...)` / `ready` against an inherited native
+/// signal is everyday GDScript and must never read as undeclared.
 fn native_member_plausible(ctx: &AnalysisContext, native: &str, name: &str) -> bool {
     let mut native = Some(native.to_owned());
     while let Some(c) = native {
@@ -1640,6 +1676,13 @@ fn native_member_plausible(ctx: &AnalysisContext, native: &str, name: &str) -> b
             .properties
             .iter()
             .any(|p| ctx.native.name_of(p.name) == name)
+        {
+            return true;
+        }
+        if nc
+            .signals
+            .iter()
+            .any(|s| ctx.native.name_of(s.name) == name)
         {
             return true;
         }
@@ -2066,8 +2109,11 @@ pub(crate) fn is_type_compatible(
         let mut valid =
             source.kind == DtKind::Builtin && target.builtin_type == source.builtin_type;
         if !valid && allow_implicit_conversion {
-            valid = source.kind == DtKind::Builtin
-                && data_type::variant_can_convert_strict(source.builtin_type, target.builtin_type);
+            // Godot's check has NO kind gate (analyzer.cpp:6328): it reads `builtin_type`
+            // directly, which is OBJECT for Native/Script/Class sources — that is what lets an
+            // Object-derived argument satisfy an RID parameter (`can_convert_strict(OBJECT, RID)`
+            // is registered, variant.cpp:850's table).
+            valid = data_type::variant_can_convert_strict(source.builtin_type, target.builtin_type);
         }
         // analyzer.cpp:6330-6333 — Enum value compatible with Int.
         if !valid
@@ -2125,6 +2171,28 @@ pub(crate) fn is_type_compatible(
     if source.kind == DtKind::Builtin && source.builtin_type == VariantType::Nil {
         return true;
     }
+
+    // Same-file identity bridge: a Script type whose ref points at THIS file is the in-file
+    // class by another name (annotations resolved through interfaces — e.g. an `Array[Own]`
+    // element on another file's member — produce ScriptRefs even for this file's own classes;
+    // `self` is Class-kind). Normalize to Class-kind so the node-identity arms below compare
+    // them as the same class instead of erroring `"<Class>" vs "<Script #N>"`.
+    let target_bridge;
+    let target = match script_ref_as_in_file_class(ctx, target) {
+        Some(t) => {
+            target_bridge = t;
+            &target_bridge
+        }
+        None => target,
+    };
+    let source_bridge;
+    let source = match script_ref_as_in_file_class(ctx, source) {
+        Some(s) => {
+            source_bridge = s;
+            &source_bridge
+        }
+        None => source,
+    };
 
     // Polymorphism for object types — Godot's source decomposition + target switch
     // (`check_type_compatibility`'s object half, analyzer.cpp:6210-6296). The SOURCE decomposes
@@ -2231,8 +2299,11 @@ pub(crate) fn is_type_compatible(
             chain.native_root.is_none()
         }
         DtKind::Class => {
-            // analyzer.cpp:6285-6295 — in-file node-identity walk. Script/Native sources never
-            // satisfy an in-file Class target (Godot 6226/6233).
+            // analyzer.cpp:6285-6295 — node-identity walk, then the cross-file bridge: a Script
+            // source whose extends CHAIN passes through THIS file's class satisfies the in-file
+            // Class target (Godot compares fqcn through get_base_script(), 6291) — `self is
+            // SubClassInOtherFile` / `node = node.parent` where parent's annotation resolved
+            // cross-file back into this file's hierarchy.
             let target_node = match target.class_node {
                 Some(n) => n,
                 None => return false,
@@ -2244,10 +2315,87 @@ pub(crate) fn is_type_compatible(
                 }
                 cur = ctx.bases.get(&n).and_then(|b| b.class_node);
             }
+            if let Some(start) = src_script {
+                if let Some(target_sr) = in_file_script_ref_of_class(ctx, target_node) {
+                    let chain = crate::script_chain::resolve_script_chain(ctx, &start);
+                    if chain.links.contains(&target_sr) {
+                        return true;
+                    }
+                    return chain.native_root.is_none(); // incomplete ⇒ permissive
+                }
+            }
             false
         }
         _ => false,
     }
+}
+
+/// The this-file [`ScriptRef`] identity of an in-file class NODE — root has an empty inner
+/// path; inner classes get their name chain (depth-first search from the root). The inverse of
+/// [`script_ref_as_in_file_class`].
+fn in_file_script_ref_of_class(
+    ctx: &AnalysisContext,
+    node: NodeId,
+) -> Option<crate::data_type::ScriptRef> {
+    let file = ctx.file?;
+    let root = ctx.tree.root_id()?;
+    fn search(ctx: &AnalysisContext, cur: NodeId, target: NodeId, path: &mut Vec<String>) -> bool {
+        if cur == target {
+            return true;
+        }
+        let members = match &ctx.node(cur).kind {
+            NodeKind::Class(c) => c.members.clone(),
+            _ => return false,
+        };
+        for m in members {
+            if let gd_syntax::ast::Member::Class(inner_id) = m {
+                let name = match &ctx.node(inner_id).kind {
+                    NodeKind::Class(c) => c
+                        .identifier
+                        .and_then(|i| match &ctx.node(i).kind {
+                            NodeKind::Identifier(ident) => Some(ident.name.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                path.push(name);
+                if search(ctx, inner_id, target, path) {
+                    return true;
+                }
+                path.pop();
+            }
+        }
+        false
+    }
+    let mut path = Vec::new();
+    if search(ctx, root, node, &mut path) {
+        Some(crate::data_type::ScriptRef { file, inner: path })
+    } else {
+        None
+    }
+}
+
+/// The in-file `Class` form of a Script-typed INSTANCE whose ref points at the CURRENT file —
+/// `None` when it's another file's script (or a meta type). The bridge that makes `self` and a
+/// same-class annotation resolved through interfaces compare equal.
+fn script_ref_as_in_file_class(ctx: &AnalysisContext, dt: &DataType) -> Option<DataType> {
+    if dt.kind != DtKind::Script || dt.is_meta_type {
+        return None;
+    }
+    let sr = dt.script_type.as_ref()?;
+    if Some(sr.file) != ctx.file {
+        return None;
+    }
+    let mut node = ctx.tree.root_id()?;
+    for seg in &sr.inner {
+        node = crate::resolver::inner_class_named(ctx, node, seg)?;
+    }
+    let mut out = dt.clone();
+    out.kind = DtKind::Class;
+    out.class_node = Some(node);
+    out.script_type = None;
+    Some(out)
 }
 
 /// `GDScriptAnalyzer::is_type_compatible_strict_collections(target, source)` (analyzer.cpp:6296-
@@ -2455,13 +2603,17 @@ fn reduce_assignment(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
-    // analyzer.cpp:2914-2919 — `arr[0] = 1` where `arr` is a constant. Special-cased: only when
-    // the subscript base resolves to a non-Class / non-Script constant (Script/Class statics use
-    // a different path).
+    // analyzer.cpp:2912-2918 — `arr[0] = 1` where `arr` is a constant. Godot gates on the base
+    // EXPRESSION's reduced-constant flag (`base->is_constant`): a const collection is reduced,
+    // while a native-class META like `Engine` is a type reference with no reduced value — so
+    // `Engine.max_fps = x` is legal. gdls has no Array/Dictionary folds yet, so the DataType's
+    // `is_constant` stands in for "reduced" with `!is_meta_type` carrying the type-reference
+    // exclusion (metas are constant-typed but never reduced values).
     if let NodeKind::Subscript(s) = ctx.node(assignee_id).kind.clone() {
         if let Some(base) = s.base {
             let base_type = ctx.get_type(base).clone();
             if base_type.is_constant
+                && !base_type.is_meta_type
                 && base_type.kind != DtKind::Class
                 && base_type.kind != DtKind::Script
             {
@@ -2986,6 +3138,13 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     }
                 }
             }
+            // Godot evaluates constructor calls over constant args into a reduced value
+            // (analyzer.cpp:3327-3357); gdls can't materialize non-scalar values — an Opaque
+            // fold keeps the constancy, so `match v:\n\tVector2(-1, -1):` stays a legal
+            // constant pattern and `const X = Color(1, 1, 1)` stays a constant initializer.
+            if call.arguments.iter().all(|&a| ctx.folds.is_reduced(a)) {
+                ctx.folds.set(id, FoldedValue::Opaque(bt));
+            }
             ctx.set_type(id, call_type);
             return;
         }
@@ -3355,7 +3514,28 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         id,
                     );
                 }
-                ClassCallLookup::NotFound => {}
+                ClassCallLookup::NotFound => {
+                    // The in-file walk missed; bare inherited calls (`mirror_array(...)` with
+                    // the method declared in a cross-file base) continue through the chain —
+                    // analyzer.cpp's get_function_signature walks base scripts the same way.
+                    if let Some(sr) = script_base_of_class(ctx, class_id) {
+                        match script_chain_call(ctx, &sr, &function_name) {
+                            ChainCall::Sig(chain_sig, file) => {
+                                sig = *chain_sig;
+                                return_type = Some(sig.return_dt.clone());
+                                found = true;
+                                cross_file_callee = Some(file);
+                            }
+                            ChainCall::Other => {}
+                            ChainCall::Missing => {
+                                // A script base means the interface view may be incomplete —
+                                // degrade silently rather than risk a phantom not-found.
+                                return_type = Some(DataType::variant());
+                                found = true;
+                            }
+                        }
+                    }
+                }
             }
         }
     } else if base_type.kind == DtKind::Native && !base_type.native_type.is_empty() {
@@ -3376,39 +3556,25 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // when the cross-file interface may simply be incomplete (chain segments, inherited
         // members from a base script not yet walked, etc.).
         if let Some(script_ref) = base_type.script_type.as_ref() {
-            let file = script_ref.file;
-            if let Some(member) = ctx.xfile.lookup_file_member(file, &function_name) {
-                if member.kind == gd_project::MemberKind::Func {
-                    // Synthesize a permissive CallSig — Variant return + Variant params keeps
-                    // arity-check + UNSAFE_CALL_ARGUMENT silent on missing-detail cases. A future
-                    // slice can project the MemberDecl's TypeExprs into the lattice for tighter
-                    // checks.
-                    let par_n = member.params.len();
-                    sig = CallSig {
-                        return_dt: DataType::variant(),
-                        par_types: vec![DataType::variant(); par_n],
-                        min_params: par_n,
-                        max_params: par_n,
-                        is_vararg: false,
-                        is_static: member.flags.is_static,
-                        is_coroutine: member.flags.is_coroutine,
-                    };
+            match script_chain_call(ctx, script_ref, &function_name) {
+                ChainCall::Sig(chain_sig, file) => {
+                    sig = *chain_sig;
                     return_type = Some(sig.return_dt.clone());
                     found = true;
-                    // WP-N1b (xref metadata only): record the cross-file callee for call-edge
-                    // bookkeeping. This is additive — no diagnostic or type changes. The
-                    // `cross_file_callee` local is used below at the Binding::Call recording site
-                    // to set `callee_file = Some(file)` for this cross-file Script call, enabling
-                    // accurate references filtering (Fix 2 Part B).
+                    // WP-N1b: record the DECLARING file for call-edge bookkeeping — consumed at
+                    // the Binding::Call recording site below (accurate references filtering).
                     cross_file_callee = Some(file);
                 }
-            } else {
-                // Member not in the cross-file interface — silent degrade. The super-call /
-                // non-found arms in the `else` block below also gate on base kind so they won't
-                // fire a phantom error for cross-file scripts whose interface may not capture
-                // every member (inner-class methods, inherited members from a base script, etc.).
-                return_type = Some(DataType::variant());
-                found = true;
+                ChainCall::Other => {
+                    // Exists as a non-Func — fall through; the value-callable path fires.
+                }
+                ChainCall::Missing => {
+                    // Not in any chain interface — silent degrade ("Unknown stays dynamic"):
+                    // shallow interfaces may miss inner-class methods etc., so a phantom
+                    // "Function not found" is never acceptable here.
+                    return_type = Some(DataType::variant());
+                    found = true;
+                }
             }
         }
     }
@@ -4347,6 +4513,61 @@ fn reduce_subscript_attribute(
     ctx.set_type(sub_id, result_type);
 }
 
+/// Outcome of a cross-file call-signature walk over a script chain.
+enum ChainCall {
+    /// A Func member resolved: its synthesized [`CallSig`] + the DECLARING file. Boxed — the
+    /// signature dwarfs the unit variants and this enum moves through match arms by value.
+    Sig(Box<CallSig>, gd_project::FileId),
+    /// The name exists as a non-Func member — the value-callable path owns it.
+    Other,
+    /// Not in any chain interface.
+    Missing,
+}
+
+/// Look up `function_name` as a Func through `start`'s full extends chain, synthesizing a
+/// permissive [`CallSig`]: the return type projects through the declared annotation (what kills
+/// the `x := obj.method()` INFERENCE_ON_VARIANT false positives) while params stay Variant —
+/// arity is exact (`required_params` carries defaults), argument-type errors against a shallow
+/// interface are not worth the false-positive risk.
+fn script_chain_call(
+    ctx: &mut AnalysisContext,
+    start: &crate::data_type::ScriptRef,
+    function_name: &str,
+) -> ChainCall {
+    let chain = crate::script_chain::resolve_script_chain(ctx, start);
+    let xf = ctx.xfile;
+    let mut hit: Option<(gd_project::FileId, &gd_project::MemberDecl)> = None;
+    for link in chain.links.iter() {
+        let Some(iface) = crate::script_chain::link_interface(xf, link) else {
+            continue;
+        };
+        if let Some(m) = iface.members.iter().find(|m| m.name == function_name) {
+            if m.kind != gd_project::MemberKind::Func {
+                return ChainCall::Other;
+            }
+            hit = Some((link.file, m));
+            break;
+        }
+    }
+    let Some((file, member)) = hit else {
+        return ChainCall::Missing;
+    };
+    let par_n = member.params.len();
+    let return_dt = resolve_interface_type_expr(ctx, file, &member.ty);
+    ChainCall::Sig(
+        Box::new(CallSig {
+            return_dt,
+            par_types: vec![DataType::variant(); par_n],
+            min_params: member.required_params,
+            max_params: par_n,
+            is_vararg: false,
+            is_static: member.flags.is_static,
+            is_coroutine: member.flags.is_coroutine,
+        }),
+        file,
+    )
+}
+
 // ===================================================================================================
 // resolve_interface_type_expr — the cross-file analog of resolve_datatype (analyzer.cpp:654-900)
 // ===================================================================================================
@@ -4381,6 +4602,36 @@ pub(crate) fn resolve_interface_type_expr(
     if first == "Variant" {
         result.kind = DtKind::Variant;
     } else if let Some(builtin) = crate::resolver::builtin_type_from_name(first) {
+        // Two segments under a builtin head: an interface-captured `Color.PURPLE`-style
+        // initializer (the constant's DECLARED type from the dump — `Vector3.AXIS_X` is int)
+        // or a builtin enum (`Vector3.Axis`).
+        if path.len() == 2 {
+            let builtin_name = crate::data_type::variant_type_name(builtin);
+            if let Some(bt) = ctx.native.builtin_named(builtin_name) {
+                if let Some(c) = bt
+                    .constants
+                    .iter()
+                    .find(|c| ctx.native.name_of(c.name) == path[1])
+                {
+                    let const_bt =
+                        c.ty.and_then(|sym| {
+                            crate::resolver::builtin_type_from_name(ctx.native.name_of(sym))
+                        })
+                        .unwrap_or(builtin);
+                    result.kind = DtKind::Builtin;
+                    result.builtin_type = const_bt;
+                    return result;
+                }
+                if bt
+                    .enums
+                    .iter()
+                    .any(|e| ctx.native.name_of(e.name) == path[1])
+                {
+                    return crate::resolver::make_builtin_enum_type(ctx, &path[1], builtin, false);
+                }
+            }
+            return DataType::variant();
+        }
         result.kind = DtKind::Builtin;
         result.builtin_type = builtin;
         // `Array[T]` / `Dictionary[K, V]` element types recurse through the same resolver
@@ -4612,13 +4863,15 @@ fn link_basename(ctx: &AnalysisContext, link: &crate::data_type::ScriptRef) -> S
         .unwrap_or_default()
 }
 
-/// A cross-file named enum as an INSTANCE type (a value of `file`'s enum `name`), values
-/// populated from the interface — the non-meta sibling of the Script-meta enum arm in
-/// `reduce_identifier_from_base`. `None` when `file` has no such named enum.
-fn cross_file_enum_instance(
+/// A cross-file named enum of `file`'s HEAD class, meta or instance, values populated from the
+/// interface (real declared integers where syntactically known; placeholders mark the map
+/// inexact). `None` when `file` has no such named enum. Shared by the reducer's Script-branch
+/// enum arm, the const-annotation resolver, and `resolve_datatype`'s Script-segment walk.
+pub(crate) fn cross_file_named_enum(
     ctx: &AnalysisContext,
     file: gd_project::FileId,
     name: &str,
+    meta: bool,
 ) -> Option<DataType> {
     let enum_decl = ctx.xfile.lookup_file_enum(file, name)?;
     let base_path = ctx
@@ -4626,11 +4879,12 @@ fn cross_file_enum_instance(
         .file_path(file)
         .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_owned())
         .unwrap_or_default();
-    let mut dt = crate::resolver::make_enum_type(name, &base_path, false);
+    let mut dt = crate::resolver::make_enum_type(name, &base_path, meta);
     dt.script_type = Some(crate::data_type::ScriptRef {
         file,
         inner: Vec::new(),
     });
+    dt.is_constant = true;
     for (i, v) in enum_decl.values.iter().enumerate() {
         match v.value {
             Some(val) => {
@@ -4643,6 +4897,15 @@ fn cross_file_enum_instance(
         }
     }
     Some(dt)
+}
+
+/// Instance-typed wrapper (a VALUE of the enum) — the const/annotation consumer shape.
+fn cross_file_enum_instance(
+    ctx: &AnalysisContext,
+    file: gd_project::FileId,
+    name: &str,
+) -> Option<DataType> {
+    cross_file_named_enum(ctx, file, name, false)
 }
 
 // ===================================================================================================
@@ -4782,8 +5045,37 @@ fn reduce_identifier_from_base(
             //    definitive "not found" verdict.
             return;
         }
-        // Non-meta builtin base (instance) — properties / methods. Deferred to the call/subscript
-        // typed-collection slice; conservatively degrade to Variant (no phantom error).
+        // Non-meta builtin base (instance): members (`pos.x` → int, analyzer.cpp:4118-4124 via
+        // Variant introspection) and methods (constant Callable). Unknown names stay a silent
+        // Variant — the trimmed-DB / dynamic-member rule.
+        let builtin_name = data_type::variant_type_name(base.builtin_type);
+        if let Some(bt) = ctx.native.builtin_named(builtin_name) {
+            if let Some(member) = bt
+                .members
+                .iter()
+                .find(|m| ctx.native.name_of(m.name) == name)
+            {
+                let dt = type_from_type_ref(ctx, &member.ty);
+                ctx.set_type(identifier_id, dt);
+                return;
+            }
+            if bt
+                .methods
+                .iter()
+                .any(|m| ctx.native.name_of(m.name) == name)
+            {
+                let mut t = DataType {
+                    type_source: TypeSource::AnnotatedExplicit,
+                    kind: DtKind::Builtin,
+                    builtin_type: VariantType::Callable,
+                    is_constant: true,
+                    ..Default::default()
+                };
+                t.is_meta_type = false;
+                ctx.set_type(identifier_id, t);
+                return;
+            }
+        }
         ctx.set_type(identifier_id, DataType::variant());
         return;
     }
@@ -5225,7 +5517,11 @@ fn builtin_variant_from_name(name: &str) -> Option<VariantType> {
         "StringName" => StringName,
         "NodePath" => NodePath,
         "RID" => Rid,
-        "Object" => Object,
+        // "Object" deliberately ABSENT: in dumps it names the native root class, not a builtin
+        // (gdscript_parser's get_builtin_type excludes it too). Mapping it here typed
+        // `instance_from_id()` & friends as kind-Builtin Object, which the object-polymorphism
+        // arms reject — `obj is Node3D` false-positived. The caller's class_named fallback
+        // produces the proper kind-Native Object.
         "Callable" => Callable,
         "Signal" => Signal,
         "Dictionary" => Dictionary,
@@ -5453,8 +5749,16 @@ fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
     // Script meta. This drains `lookup_class.gd`, `out_of_order_external.gd`, and the
     // `inner_class_as_return_type` family — each names a preloaded constant whose use as a
     // type / base / extends-head needs the constant to carry a Script-kind type.
+    let mut path_for_resource_typing: Option<String> = None;
     if let Some(path_str) = folded_path {
-        if let Some(file) = ctx.xfile.resolve_res_path(&path_str) {
+        let resolved = match ctx.file {
+            // Relative paths resolve against the referring script's directory
+            // (analyzer.cpp:437's relativization).
+            Some(from) => ctx.xfile.resolve_path_from(from, &path_str),
+            None => ctx.xfile.resolve_res_path(&path_str),
+        };
+        path_for_resource_typing = Some(path_str);
+        if let Some(file) = resolved {
             let preload_type = DataType {
                 type_source: TypeSource::AnnotatedInferred,
                 kind: DtKind::Script,
@@ -5469,6 +5773,34 @@ fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
             };
             ctx.set_type(id, preload_type);
             return;
+        }
+    }
+
+    // Non-script resources: Godot types the preload by the loaded resource's class
+    // (analyzer.cpp:4749-4751 via type_from_variant over the Resource). A shallow extension map
+    // covers the unambiguous ones; everything else stays a soft Variant.
+    if let Some(path_str) = path_for_resource_typing {
+        let native_name = match path_str.rsplit('.').next() {
+            Some("tscn") | Some("scn") => Some("PackedScene"),
+            Some("gdshader") => Some("Shader"),
+            Some("tres") | Some("res") => Some("Resource"),
+            _ => None,
+        };
+        if let Some(n) = native_name {
+            if ctx.native.class_named(n).is_some() {
+                ctx.set_type(
+                    id,
+                    DataType {
+                        type_source: TypeSource::AnnotatedInferred,
+                        kind: DtKind::Native,
+                        builtin_type: VariantType::Object,
+                        native_type: n.to_owned(),
+                        is_constant: true,
+                        ..Default::default()
+                    },
+                );
+                return;
+            }
         }
     }
 
