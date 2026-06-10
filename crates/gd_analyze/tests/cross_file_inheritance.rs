@@ -8,7 +8,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use gd_analyze::{
-    analyze, AnalysisResult, CrossFileQuery, FoldedValue, Severity, StrictSettings, WarnPolicy,
+    analyze, AnalysisResult, Binding, BindingTargetKind, CrossFileQuery, FoldedValue, Severity,
+    StrictSettings, WarnPolicy,
 };
 use gd_project::{FileId, Interface};
 use gd_syntax::parse;
@@ -189,6 +190,76 @@ fn extends_cycle_terminates_permissively() {
     let project = Project::new(&[("res://a.gd", a), ("res://b.gd", b), ("res://child.gd", "")]);
     let result = analyze_file(&project, "res://child.gd", child);
     assert_eq!(error_messages(&result), Vec::<String>::new());
+}
+
+/// #13: member access through a typed cross-file base records `Binding::Use` against the
+/// DECLARING file — what references/definition project for member-access sites.
+#[test]
+fn member_access_records_use_bindings_against_declaring_file() {
+    let consumer = "\
+extends RefCounted
+func go(b: BaseThing) -> void:
+\tb.ping.emit(1)
+\tvar _h = b.hp
+\tvar _f = b.boost
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+
+    let base_fid = project.fid("res://base.gd");
+    let uses: Vec<(String, BindingTargetKind)> = result
+        .bindings()
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Use {
+                target_file: Some(f),
+                target_kind,
+                target_name,
+                ..
+            } if *f == base_fid => Some((target_name.clone(), *target_kind)),
+            _ => None,
+        })
+        .collect();
+    for expected in [
+        ("ping", BindingTargetKind::Signal),
+        ("hp", BindingTargetKind::Variable),
+        ("boost", BindingTargetKind::Function),
+    ] {
+        assert!(
+            uses.iter()
+                .any(|(n, k)| n == expected.0 && *k == expected.1),
+            "missing Use binding {expected:?}; got {uses:?}"
+        );
+    }
+}
+
+/// Inherited members carry their declared types, not Variant: `hp: int` through the chain.
+#[test]
+fn inherited_member_types_are_precise() {
+    let child = "\
+extends BaseThing
+func go() -> void:
+\tvar _total: int = hp
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://child.gd", "")]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+
+    let tree = parse(child).tree;
+    let mut found = false;
+    for id in tree.iter_ids() {
+        if let gd_syntax::ast::NodeKind::Identifier(ident) = &tree.get(id).kind {
+            if ident.name == "hp" {
+                let dt = result.types.get(id);
+                if dt.is_set() {
+                    assert_eq!(format!("{dt}"), "int", "hp must type as int via the chain");
+                    found = true;
+                }
+            }
+        }
+    }
+    assert!(found, "expected a typed `hp` identifier");
 }
 
 /// The `Cannot get property from enum value.` false-positive family: a regular cross-file const

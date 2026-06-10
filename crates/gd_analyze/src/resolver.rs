@@ -2505,7 +2505,7 @@ fn resolve_enum_type(
 // --- Type constructors (analyzer.cpp:95-160, 5765) -------------------------------------------------
 
 /// `make_signal_type` (analyzer.cpp:95).
-fn make_signal_type(sig: MethodSig) -> DataType {
+pub(crate) fn make_signal_type(sig: MethodSig) -> DataType {
     DataType {
         type_source: TypeSource::AnnotatedExplicit,
         kind: DtKind::Builtin,
