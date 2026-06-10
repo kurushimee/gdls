@@ -4613,6 +4613,17 @@ fn resolve_for(ctx: &mut AnalysisContext, for_id: NodeId) {
                     variable_type.kind = DtKind::Builtin;
                     variable_type.builtin_type = VariantType::Float;
                 }
+                bt if crate::data_type::typed_container_element(bt).is_some() => {
+                    // analyzer.cpp:2293-2295 — `list_type.is_typed_container_type()` ⇒ the
+                    // iterator takes `get_typed_container_type()` (the packed array's fixed
+                    // element type). Ordered before the ARRAY/DICTIONARY/!is_hard_type arms,
+                    // matching Godot's branch order, so soft packed lists still get element
+                    // typing rather than degrading to Variant.
+                    variable_type.type_source = list_type.type_source;
+                    variable_type.kind = DtKind::Builtin;
+                    variable_type.builtin_type = crate::data_type::typed_container_element(bt)
+                        .expect("invariant: guard above checked is_some");
+                }
                 VariantType::Array if !list_type.container_element_types.is_empty() => {
                     // analyzer.cpp:2310-2317 — typed Array[T] yields T as the iterator var
                     // type. Element type carries its own type_source; we stamp it directly.
@@ -5112,6 +5123,70 @@ mod tests {
     #[test]
     fn native_base_resolves_clean() {
         assert!(errors("extends Node\nfunc f():\n\tpass\n").is_empty());
+    }
+
+    #[test]
+    fn packed_array_iteration_accepts_every_packed_type() {
+        // analyzer.cpp:2293-2295 routes packed arrays through the typed-container element table
+        // (gdscript_parser.cpp:5508-5530); each used to fall into the hard-type error tail as
+        // `Unable to iterate on value of type "Packed…Array".`.
+        let src = "\
+extends RefCounted
+func go(bs: PackedByteArray, i32s: PackedInt32Array, i64s: PackedInt64Array,
+\t\tf32s: PackedFloat32Array, f64s: PackedFloat64Array, ss: PackedStringArray,
+\t\tv2s: PackedVector2Array, v3s: PackedVector3Array, cs: PackedColorArray,
+\t\tv4s: PackedVector4Array) -> void:
+\tfor _b in bs:
+\t\tpass
+\tfor _i in i32s:
+\t\tpass
+\tfor _j in i64s:
+\t\tpass
+\tfor _f in f32s:
+\t\tpass
+\tfor _g in f64s:
+\t\tpass
+\tfor _s in ss:
+\t\tpass
+\tfor _v in v2s:
+\t\tpass
+\tfor _w in v3s:
+\t\tpass
+\tfor _c in cs:
+\t\tpass
+\tfor _x in v4s:
+\t\tpass
+";
+        assert_eq!(errors(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn packed_string_array_iterator_variable_types_string() {
+        let src = "extends RefCounted\nfunc go(paths: PackedStringArray) -> void:\n\tfor p in paths:\n\t\tvar _s := p\n";
+        let tree = gd_syntax::parse(src).tree;
+        let native = mini_native();
+        let result = crate::analyze(
+            &tree,
+            Some(FileId::new(1)),
+            "",
+            &native,
+            &NoCrossFile,
+            &policy(),
+        );
+        let mut found = false;
+        for id in tree.iter_ids() {
+            if let gd_syntax::ast::NodeKind::Identifier(ident) = &tree.get(id).kind {
+                if ident.name == "p" {
+                    let dt = result.types.get(id);
+                    if dt.is_set() {
+                        assert_eq!(dt.kind, DtKind::Builtin);
+                        assert_eq!(dt.builtin_type, VariantType::String);
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found, "expected a typed `p` identifier in the loop body");
     }
 
     #[test]

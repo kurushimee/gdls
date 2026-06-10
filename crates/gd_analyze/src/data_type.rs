@@ -202,6 +202,25 @@ pub fn variant_can_convert_strict(from: VariantType, to: VariantType) -> bool {
     valid.contains(&from)
 }
 
+/// `_variant_type_to_typed_array_element_type` (gdscript_parser.cpp:5508-5530), the table behind
+/// `DataType::is_typed_container_type()` / `get_typed_container_type()` (gdscript_parser.cpp:5532/
+/// 5536). A `Packed*Array`'s fixed element type; `None` for everything that isn't a packed array.
+/// Consumed by `resolve_for`'s iterator typing (analyzer.cpp:2293-2295); the indexed-subscript
+/// matrix (analyzer.cpp:5057-5101) shares the same mapping.
+pub fn typed_container_element(t: VariantType) -> Option<VariantType> {
+    use VariantType::*;
+    Some(match t {
+        PackedByteArray | PackedInt32Array | PackedInt64Array => Int,
+        PackedFloat32Array | PackedFloat64Array => Float,
+        PackedStringArray => String,
+        PackedVector2Array => Vector2,
+        PackedVector3Array => Vector3,
+        PackedColorArray => Color,
+        PackedVector4Array => Vector4,
+        _ => return None,
+    })
+}
+
 /// `Variant::get_type_name(p_type)` (`core/variant/variant.cpp:43`). Used in Godot's verbatim
 /// "Invalid operands to operator …" error message (analyzer.cpp:3130). Lowercase for the atomic
 /// types (`bool`/`int`/`float`/`Nil`) and capitalized for the rest, matching Godot exactly.
