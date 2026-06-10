@@ -1236,6 +1236,71 @@ fn resolve_class_interface(ctx: &mut AnalysisContext, class_id: NodeId) {
     for i in 0..member_count(ctx, class_id) {
         resolve_class_member(ctx, class_id, i, None);
     }
+
+    // REDUNDANT_STATIC_UNLOAD (analyzer.cpp:1275, 1318-1338): `@static_unload` on a class with
+    // no static data. The static-data flag is the parser-side one — a `static var` member or a
+    // `static func _static_init` — OR'd over the class itself and its *direct* inner classes
+    // (each inner contributes only its own flag, exactly as upstream reads
+    // `member.m_class->has_static_data`). Anchored at the `@static_unload` annotation.
+    let annotated_static_unload = find_class_annotation(ctx, class_id, "@static_unload");
+    if let Some(ann_id) = annotated_static_unload {
+        let mut has_static_data = class_has_static_data(ctx, class_id);
+        if !has_static_data {
+            for i in 0..member_count(ctx, class_id) {
+                if let Some(Member::Class(inner)) = nth_member(ctx, class_id, i) {
+                    if class_has_static_data(ctx, inner) {
+                        has_static_data = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !has_static_data {
+            ctx.push_warning(
+                crate::warnings::WarningCode::RedundantStaticUnload,
+                &[],
+                ann_id,
+            );
+        }
+    }
+}
+
+/// The parser-side `ClassNode::has_static_data` flag, re-derived from the tree: a `static var`
+/// member (gdscript_parser.cpp:1103-1106) or a `static func _static_init` constructor
+/// (gdscript_parser.cpp:1725-1729). Non-recursive — callers OR direct inner classes themselves,
+/// mirroring the analyzer's read of each inner's own flag.
+fn class_has_static_data(ctx: &AnalysisContext, class_id: NodeId) -> bool {
+    for i in 0..member_count(ctx, class_id) {
+        match nth_member(ctx, class_id, i) {
+            Some(Member::Variable(v)) => {
+                if matches!(&ctx.node(v).kind, NodeKind::Variable(var) if var.is_static) {
+                    return true;
+                }
+            }
+            Some(Member::Function(f)) => {
+                if let NodeKind::Function(func) = &ctx.node(f).kind {
+                    if func.is_static && decl_identifier_name(ctx, f) == "_static_init" {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The class's annotation node named `name`, if any — e.g. `@static_unload`
+/// (the anchor Godot picks at analyzer.cpp:1330-1336).
+fn find_class_annotation(ctx: &AnalysisContext, class_id: NodeId, name: &str) -> Option<NodeId> {
+    for &ann_id in &ctx.node(class_id).annotations {
+        if let NodeKind::Annotation(a) = &ctx.node(ann_id).kind {
+            if a.name == name {
+                return Some(ann_id);
+            }
+        }
+    }
+    None
 }
 
 /// Trigger [`resolve_class_member`] for the in-`class_id` member named `name` (called from
@@ -1627,20 +1692,50 @@ pub(crate) fn resolve_function_signature(ctx: &mut AnalysisContext, func_id: Nod
     };
     if let Some(rp) = rest_param {
         resolve_parameter(ctx, rp);
-        let rt = ctx.get_type(rp).clone();
-        if rt.is_set() {
-            let is_array = rt.kind == DtKind::Builtin && rt.builtin_type == VariantType::Array;
-            if !is_array {
-                ctx.push_error(
-                    format!(r#"The rest parameter type must be "Array", but "{rt}" is specified."#),
-                    rp,
-                );
-            } else if !rt.container_element_types.is_empty() {
-                ctx.push_error(
-                    "Typed arrays are currently not supported for the rest parameter.",
-                    rp,
-                );
+        // analyzer.cpp:1801-1820 — the Array validation applies only when a type IS specified;
+        // an untyped rest parameter is an *inferred* `Array` plus an UNTYPED_DECLARATION
+        // warning, never an error (validating the unspecified shape false-positived
+        // `func f(...args):` with `…but "Variant" is specified` through v1.0.2).
+        let has_specifier = matches!(
+            &ctx.node(rp).kind,
+            NodeKind::Parameter(p) if p.datatype_specifier.is_some()
+        );
+        if has_specifier {
+            let rt = ctx.get_type(rp).clone();
+            if rt.is_set() {
+                let is_array = rt.kind == DtKind::Builtin && rt.builtin_type == VariantType::Array;
+                if !is_array {
+                    ctx.push_error(
+                        format!(
+                            r#"The rest parameter type must be "Array", but "{rt}" is specified."#
+                        ),
+                        rp,
+                    );
+                } else if !rt.container_element_types.is_empty() {
+                    ctx.push_error(
+                        "Typed arrays are currently not supported for the rest parameter.",
+                        rp,
+                    );
+                }
             }
+        } else {
+            ctx.set_type(
+                rp,
+                DataType {
+                    type_source: TypeSource::Inferred,
+                    kind: DtKind::Builtin,
+                    builtin_type: VariantType::Array,
+                    ..Default::default()
+                },
+            );
+            // The dedicated vararg warning at analyzer.cpp:1817 — in addition to the generic
+            // one `resolve_assignable` queued for the same node, exactly as upstream.
+            let rp_name = decl_identifier_name(ctx, rp);
+            ctx.push_warning(
+                crate::warnings::WarningCode::UntypedDeclaration,
+                &["Parameter".to_owned(), rp_name],
+                rp,
+            );
         }
     }
 
@@ -1724,6 +1819,23 @@ pub(crate) fn resolve_function_signature(ctx: &mut AnalysisContext, func_id: Nod
         if _resolution_clean {
             adopt_parent_return_type(ctx, func_id, &name);
         }
+    }
+
+    // analyzer.cpp:1966-1969 — UNTYPED_DECLARATION on a function without an explicit return
+    // type (constructors included, as upstream). `function_visible_name` (analyzer.cpp:1772-
+    // 1775): the empty name here means a lambda — named declarations always carry an
+    // identifier by the time signature resolution runs.
+    if return_type.is_none() {
+        let visible_name = if name.is_empty() {
+            "<anonymous lambda>".to_owned()
+        } else {
+            name.clone()
+        };
+        ctx.push_warning(
+            crate::warnings::WarningCode::UntypedDeclaration,
+            &["Function".to_owned(), visible_name],
+            func_id,
+        );
     }
 
     ctx.current_function = previous_function;
@@ -2490,12 +2602,50 @@ fn resolve_assignable(
         }
     }
 
+    // analyzer.cpp:2176-2191 (DEBUG_ENABLED) — UNTYPED_DECLARATION / INFERRED_DECLARATION on a
+    // declaration with no `: Type` specifier. `:=` (or a constant, whose type is its value's) is
+    // the inferred shape; a constant whose initializer is a metatype (a "type import" like
+    // `const V2 = Vector2`) is exempt because there is no way to spell its true type.
+    let is_parameter = matches!(ctx.node(node_id).kind, NodeKind::Parameter(_));
+    if !has_specified_type {
+        let declaration_type = if is_constant {
+            "Constant"
+        } else if is_parameter {
+            "Parameter"
+        } else {
+            "Variable"
+        };
+        let infer_datatype = match &ctx.node(node_id).kind {
+            NodeKind::Variable(v) => v.infer_datatype,
+            NodeKind::Constant(c) => c.infer_datatype,
+            NodeKind::Parameter(p) => p.infer_datatype,
+            _ => false,
+        };
+        let name = decl_identifier_name(ctx, node_id);
+        if infer_datatype || is_constant {
+            let is_type_import =
+                is_constant && initializer.is_some_and(|init| ctx.get_type(init).is_meta_type);
+            if !is_type_import {
+                ctx.push_warning(
+                    crate::warnings::WarningCode::InferredDeclaration,
+                    &[declaration_type.to_owned(), name],
+                    node_id,
+                );
+            }
+        } else {
+            ctx.push_warning(
+                crate::warnings::WarningCode::UntypedDeclaration,
+                &[declaration_type.to_owned(), name],
+                node_id,
+            );
+        }
+    }
+
     // analyzer.cpp:2193-2204 (DEBUG_ENABLED) — ENUM_VARIABLE_WITHOUT_DEFAULT. Fires when a
     // variable (NOT a parameter or constant) has an explicit enum type, no initializer, and the
     // enum doesn't have a value of 0 (which would otherwise be the silent default). Godot's
     // `specified_type.kind == ENUM` reads the explicit annotation's resolved type; gdls's
     // equivalent is the same `ty` after the no-initializer path through `resolve_datatype`.
-    let is_parameter = matches!(ctx.node(node_id).kind, NodeKind::Parameter(_));
     if has_specified_type
         && !is_parameter
         && !is_constant
@@ -2545,6 +2695,15 @@ fn resolve_signal_type(ctx: &mut AnalysisContext, signal_id: NodeId, name: &str)
         let spec = parameter_specifier(ctx, param_id);
         let param_type = type_from_metatype(resolve_datatype(ctx, spec));
         ctx.set_type(param_id, param_type.clone());
+        // analyzer.cpp:1131-1135 — signal parameters don't go through `resolve_assignable`,
+        // so the unannotated-parameter warning has its own site here.
+        if spec.is_none() {
+            ctx.push_warning(
+                crate::warnings::WarningCode::UntypedDeclaration,
+                &["Parameter".to_owned(), pname.clone()],
+                param_id,
+            );
+        }
         sig_params.push((pname, param_type));
     }
     make_signal_type(MethodSig {
@@ -4128,15 +4287,118 @@ fn resolve_suite(ctx: &mut AnalysisContext, suite_id: NodeId, is_root: bool) {
         _ => return,
     };
     ctx.suite_stack.push(suite_id);
+    // Parse-time control-flow state, re-derived in resolve order. Godot computes `unreachable =
+    // current_suite->has_return && !current_suite->has_unreachable_code` at the head of
+    // `parse_statement` (gdscript_parser.cpp:2005) and latches + warns at its tail (:2205-2215);
+    // gd_syntax keeps only the suite-final `has_return` flag, so the running value is rebuilt
+    // here from the same three triggers (see `statement_guarantees_return`).
+    let mut has_return = false;
+    let mut has_unreachable_code = false;
     for stmt in stmts {
+        // gdscript_parser.cpp:2132-2160 — expression-statement shape warnings. Queued at parse
+        // time in Godot, so on a shared line they precede both UNREACHABLE_CODE (queued at the
+        // statement's parse tail) and any analyzer warning from inside the statement.
+        emit_standalone_statement_warnings(ctx, stmt);
+        if has_return && !has_unreachable_code {
+            // The latch is unconditional; the warning needs an enclosing function (Godot skips
+            // property setters/getters via its `if (current_function)` — same TODO as upstream).
+            has_unreachable_code = true;
+            if let Some(func_id) = ctx.current_function {
+                let symbol = function_warning_name(ctx, func_id);
+                ctx.push_warning(
+                    crate::warnings::WarningCode::UnreachableCode,
+                    &[symbol],
+                    stmt,
+                );
+            }
+        }
         resolve_node(ctx, stmt, is_root);
         // analyzer.cpp:2068 — drain pending lambda bodies after each statement so lambdas
         // queued by the just-resolved expression resolve in the right pass-relative order
         // (matters for the Godot-vs-gdls emission order on holding-function-with-lambdas cases).
         drain_pending_lambda_bodies(ctx);
         decide_suite_type(ctx, suite_id, stmt);
+        has_return = has_return || statement_guarantees_return(ctx, stmt);
     }
     ctx.suite_stack.pop();
+}
+
+/// Godot's parse-time statement-shape warnings (gdscript_parser.cpp:2132-2160): an expression
+/// used as a statement. `Assignment`/`Await`/`Call` are effectful; `preload` is function-like
+/// but its result must be consumed (RETURN_VALUE_DISCARDED with symbol "preload"); a standalone
+/// lambda is a parse *error* (emitted by `gd_syntax`); a `String` literal doubles as a multiline
+/// comment; every other expression kind has no effect.
+fn emit_standalone_statement_warnings(ctx: &mut AnalysisContext, stmt_id: NodeId) {
+    use crate::warnings::WarningCode;
+    let kind = ctx.node(stmt_id).kind.clone();
+    match &kind {
+        NodeKind::Assignment(_) | NodeKind::Await(_) | NodeKind::Call(_) => {}
+        NodeKind::Preload(_) => {
+            ctx.push_warning(
+                WarningCode::ReturnValueDiscarded,
+                &["preload".to_owned()],
+                stmt_id,
+            );
+        }
+        NodeKind::Lambda(_) => {} // `Standalone lambdas cannot be accessed` — gd_syntax error.
+        NodeKind::Literal(lit) => {
+            // Godot exempts `Variant::STRING` only — a StringName or NodePath literal warns.
+            if !matches!(lit.value, gd_syntax::token::Literal::String(_)) {
+                ctx.push_warning(WarningCode::StandaloneExpression, &[], stmt_id);
+            }
+        }
+        NodeKind::TernaryOp(_) => {
+            ctx.push_warning(WarningCode::StandaloneTernary, &[], stmt_id);
+        }
+        k if k.is_expression() => {
+            ctx.push_warning(WarningCode::StandaloneExpression, &[], stmt_id);
+        }
+        _ => {} // Statement kinds — not the expression-statement arm.
+    }
+}
+
+/// The three parse-time `current_suite->has_return = true` triggers, re-derived per statement
+/// (gd_syntax records only the suite-final flag): a `return` statement
+/// (gdscript_parser.cpp:2078), an `if` whose both blocks return (:2383-2385), and a `match`
+/// where every branch returns and a wildcard pattern exists (:2458-2460).
+fn statement_guarantees_return(ctx: &AnalysisContext, stmt_id: NodeId) -> bool {
+    let suite_returns = |b: Option<NodeId>| {
+        b.is_some_and(|b| match &ctx.node(b).kind {
+            NodeKind::Suite(s) => s.has_return,
+            _ => false,
+        })
+    };
+    match &ctx.node(stmt_id).kind {
+        NodeKind::Return(_) => true,
+        NodeKind::If(n) => suite_returns(n.true_block) && suite_returns(n.false_block),
+        NodeKind::Match(n) => {
+            let mut have_wildcard = false;
+            let mut all_have_return = true;
+            for &branch in &n.branches {
+                if let NodeKind::MatchBranch(b) = &ctx.node(branch).kind {
+                    have_wildcard = have_wildcard || b.has_wildcard;
+                    all_have_return = all_have_return && suite_returns(b.block);
+                }
+            }
+            all_have_return && have_wildcard
+        }
+        _ => false,
+    }
+}
+
+/// The enclosing function's name for the UNREACHABLE_CODE symbol —
+/// `current_function->identifier ? name : "<anonymous lambda>"` (gdscript_parser.cpp:2209).
+fn function_warning_name(ctx: &AnalysisContext, func_id: NodeId) -> String {
+    let ident = match &ctx.node(func_id).kind {
+        NodeKind::Function(f) => f.identifier,
+        _ => None,
+    };
+    ident
+        .and_then(|id| match &ctx.node(id).kind {
+            NodeKind::Identifier(i) => Some(i.name.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| "<anonymous lambda>".to_owned())
 }
 
 /// `decide_suite_type` (analyzer.cpp:2031-2056). After each statement in a suite, propagate
@@ -4841,7 +5103,23 @@ fn resolve_for(ctx: &mut AnalysisContext, for_id: NodeId) {
             }
             ctx.set_type(v, specified_type);
         } else {
-            ctx.set_type(v, variable_type);
+            ctx.set_type(v, variable_type.clone());
+            // analyzer.cpp:2356-2362 — an unannotated iterator variable: a hard list-derived
+            // type is an implicit inference; anything softer is plain untyped.
+            let v_name = ident_name(ctx, v).unwrap_or_default();
+            if variable_type.is_hard_type() {
+                ctx.push_warning(
+                    crate::warnings::WarningCode::InferredDeclaration,
+                    &[r#""for" iterator variable"#.to_owned(), v_name],
+                    v,
+                );
+            } else {
+                ctx.push_warning(
+                    crate::warnings::WarningCode::UntypedDeclaration,
+                    &[r#""for" iterator variable"#.to_owned(), v_name],
+                    v,
+                );
+            }
         }
     }
 
@@ -4994,6 +5272,29 @@ fn resolve_assert(ctx: &mut AnalysisContext, assert_id: NodeId) {
     if let Some(m) = msg {
         crate::reducer::reduce_expression(ctx, m, false);
     }
+    // ASSERT_ALWAYS_TRUE / ASSERT_ALWAYS_FALSE (analyzer.cpp:2393-2399): a constant condition.
+    // The FALSE arm skips a literal bool (`assert(false)` is a deliberate trap). An `Opaque`
+    // fold's truthiness is unknown to gdls's value subset — skip rather than guess (Godot
+    // booleanizes the materialized Variant; never lie).
+    if let Some(c) = cond {
+        if let Some(folded) = ctx.folds.get(c).cloned() {
+            use crate::foldtable::FoldedValue;
+            use crate::warnings::WarningCode;
+            if !matches!(folded, FoldedValue::Opaque(_)) {
+                if crate::reducer::booleanize(&folded) {
+                    ctx.push_warning(WarningCode::AssertAlwaysTrue, &[], c);
+                } else {
+                    let is_bool_literal = matches!(
+                        &ctx.node(c).kind,
+                        NodeKind::Literal(l) if matches!(l.value, gd_syntax::token::Literal::Bool(_))
+                    );
+                    if !is_bool_literal {
+                        ctx.push_warning(WarningCode::AssertAlwaysFalse, &[], c);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `resolve_match` (analyzer.cpp:2407): reduce the test, resolve each branch.
@@ -5005,7 +5306,21 @@ fn resolve_match(ctx: &mut AnalysisContext, match_id: NodeId) {
     if let Some(t) = test {
         crate::reducer::reduce_expression(ctx, t, false);
     }
+    // UNREACHABLE_PATTERN (gdscript_parser.cpp:2433-2436): parse-time wildcard tracking — any
+    // branch after one with a wildcard/bind-all pattern is unreachable, anchored at the
+    // branch's first pattern. The check runs before the branch's own wildcard accumulates.
+    let mut have_wildcard = false;
     for branch in branches {
+        let (branch_has_wildcard, first_pattern) = match &ctx.node(branch).kind {
+            NodeKind::MatchBranch(b) => (b.has_wildcard, b.patterns.first().copied()),
+            _ => (false, None),
+        };
+        if have_wildcard {
+            if let Some(p0) = first_pattern {
+                ctx.push_warning(crate::warnings::WarningCode::UnreachablePattern, &[], p0);
+            }
+        }
+        have_wildcard = have_wildcard || branch_has_wildcard;
         resolve_match_branch(ctx, branch, test);
     }
 }

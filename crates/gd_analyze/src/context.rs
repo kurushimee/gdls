@@ -473,14 +473,8 @@ impl<'a> AnalysisContext<'a> {
 
     /// Godot's `parser->push_warning(p_source, code, p_symbols)` (gdscript_parser.cpp:257). The
     /// effective level comes from the [`WarnPolicy`] precedence chain; `Ignore` drops silently,
-    /// `Warn` / `Error` produce a [`Diagnostic`] anchored at `at_node`'s span. Per-node
-    /// `@warning_ignore("CODE_NAME")` annotations on the target node suppress the warning the
-    /// same way Godot's `apply_pending_warnings` consults `warning_ignored_lines` for that
-    /// node's `start_line` (gdscript_parser.cpp:281).
-    ///
-    /// For warnings anchored at a sub-node (e.g. the identifier inside a `VariableNode`), use
-    /// [`Self::push_warning_for`] to keep the annotation-bearing parent node distinct from the
-    /// diagnostic anchor.
+    /// `Warn` / `Error` produce a [`Diagnostic`] anchored at `at_node`'s span (with the anchor's
+    /// start line stamped for `finish`'s by-line warning ordering).
     pub fn push_warning(
         &mut self,
         code: crate::warnings::WarningCode,
@@ -505,7 +499,7 @@ impl<'a> AnalysisContext<'a> {
             return;
         }
         let level = self.policy.effective_level(code);
-        self.sink.push_warning(code, level, symbols, span);
+        self.sink.push_warning(code, level, symbols, span, line);
     }
 
     /// `True` when the diagnostic byte `pos` falls inside any `@warning_ignore_start(code)` /

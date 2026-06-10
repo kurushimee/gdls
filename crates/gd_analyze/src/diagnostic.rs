@@ -156,24 +156,30 @@ impl DiagnosticSink {
 
     /// Emit a warning at the given resolved level. `Ignore` is dropped (returns `false`); `Warn` and
     /// `Error` produce a diagnostic with the verbatim Godot message (returns `true`).
+    /// `anchor_line` is the anchor node's 1-based start line — Godot's `pw.source->start_line` —
+    /// stamped on the diagnostic so [`Self::finish`] can mirror `apply_pending_warnings`'
+    /// by-line warning ordering.
     pub fn push_warning(
         &mut self,
         code: WarningCode,
         level: WarnLevel,
         symbols: &[String],
         span: ByteSpan,
+        anchor_line: u32,
     ) -> bool {
         let severity = match level {
             WarnLevel::Ignore => return false,
             WarnLevel::Warn => Severity::Warning,
             WarnLevel::Error => Severity::Error,
         };
-        self.diagnostics.push(Diagnostic::new_warning(
+        let mut warning = Diagnostic::new_warning(
             severity,
             span,
             code,
             warnings::format_warning(code, symbols),
-        ));
+        );
+        warning.line = Some(anchor_line);
+        self.diagnostics.push(warning);
         true
     }
 
@@ -199,12 +205,30 @@ impl DiagnosticSink {
         self.diagnostics.len()
     }
 
-    /// Consume the sink, yielding the diagnostics in emission order. Godot's runner
-    /// captures diagnostics in real-time during analysis so the `.out` files reflect the
-    /// traversal sequence (interface-pass emissions before body-pass emissions, etc.).
-    /// gdls's resolver mirrors that traversal sequence; preserving emission order matches
-    /// Godot's golden files exactly without re-sorting.
-    pub fn finish(self) -> Vec<Diagnostic> {
+    /// Consume the sink. **Errors** keep emission order: Godot's runner captures them in
+    /// real-time during analysis, so the `.out` files reflect the traversal sequence, which
+    /// gdls's resolver mirrors. **Warnings** are stable-sorted by anchor position among
+    /// themselves (errors don't move): Godot queues warnings as pending and
+    /// `apply_pending_warnings` (gdscript_parser.cpp:269-299) insertion-sorts them by
+    /// `start_line`, same-line entries keeping queue order — without this, a signature-pass
+    /// warning on a late line (e.g. UNTYPED_DECLARATION on the second function) would render
+    /// before a body-pass warning on an earlier line.
+    pub fn finish(mut self) -> Vec<Diagnostic> {
+        let warning_slots: Vec<usize> = (0..self.diagnostics.len())
+            .filter(|&i| self.diagnostics[i].warning_code.is_some())
+            .collect();
+        let mut warnings: Vec<Diagnostic> = Vec::with_capacity(warning_slots.len());
+        for &i in warning_slots.iter().rev() {
+            warnings.push(self.diagnostics.remove(i));
+        }
+        warnings.reverse();
+        // Stable, keyed on the anchor LINE exactly like upstream's `pw.source->start_line`
+        // insertion sort — same-line warnings keep queue order (a byte-offset key would flip
+        // same-line pairs whose later-queued warning anchors at an earlier column).
+        warnings.sort_by_key(|d| d.line.unwrap_or(u32::MAX));
+        for (&slot, w) in warning_slots.iter().zip(warnings) {
+            self.diagnostics.insert(slot, w);
+        }
         self.diagnostics
     }
 }
@@ -236,6 +260,7 @@ mod tests {
             WarnLevel::Ignore,
             &["x".to_owned()],
             span(),
+            1,
         );
         assert!(!emitted);
         assert!(sink.is_empty());
@@ -249,6 +274,7 @@ mod tests {
             WarnLevel::Error,
             &["variable".to_owned()],
             span(),
+            1,
         );
         let d = &sink.diagnostics()[0];
         assert_eq!(d.severity(), Severity::Error);

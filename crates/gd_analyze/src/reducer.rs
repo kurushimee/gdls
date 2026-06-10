@@ -197,6 +197,19 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
             if let (Some(te), Some(fe)) = (t.true_expr, t.false_expr) {
                 let tt = ctx.get_type(te).clone();
                 let ft = ctx.get_type(fe).clone();
+                // INCOMPATIBLE_TERNARY (analyzer.cpp:5172-5184): neither branch type accepts
+                // the other — the values have no common type and the expression degrades to
+                // Variant. Variant-typed (or unset, tail-guard-pending) branches are exempt,
+                // exactly as upstream's `is_variant()` early arm.
+                if tt.is_set()
+                    && ft.is_set()
+                    && tt.kind != DtKind::Variant
+                    && ft.kind != DtKind::Variant
+                    && !is_type_compatible(ctx, &tt, &ft, false)
+                    && !is_type_compatible(ctx, &ft, &tt, false)
+                {
+                    ctx.push_warning(crate::warnings::WarningCode::IncompatibleTernary, &[], id);
+                }
                 if tt.is_set()
                     && ft.is_set()
                     && tt.kind == ft.kind
@@ -418,6 +431,23 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
     if !left_dt.is_set() || !right_dt.is_set() {
         // Match Godot: leave the result Unresolved; the dispatcher tail-guard paints it Variant.
         return;
+    }
+
+    // INTEGER_DIVISION (analyzer.cpp:3104-3113): `/` over int (or integer-vector) operands
+    // discards the decimal part. Reads `builtin_type` directly with no kind gate, as upstream —
+    // non-builtin kinds carry `Object` there and never match.
+    if op_node.operation == BinaryOp::Division
+        && matches!(
+            left_dt.builtin_type,
+            VariantType::Int
+                | VariantType::Vector2i
+                | VariantType::Vector3i
+                | VariantType::Vector4i
+        )
+        && (right_dt.builtin_type == VariantType::Int
+            || right_dt.builtin_type == left_dt.builtin_type)
+    {
+        ctx.push_warning(crate::warnings::WarningCode::IntegerDivision, &[], id);
     }
 
     // Both-constant fold path (analyzer.cpp:3118-3143). Our `FoldedValue` set has no sharing
@@ -1023,7 +1053,8 @@ fn compare(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedValue
 }
 
 /// `Variant::booleanize` over our subset — every value falsy/truthy as the engine sees it.
-fn booleanize(v: &FoldedValue) -> bool {
+/// `pub(crate)` for `resolve_assert`'s ASSERT_ALWAYS_TRUE/_FALSE constant-condition check.
+pub(crate) fn booleanize(v: &FoldedValue) -> bool {
     use FoldedValue::*;
     match v {
         Nil => false,
