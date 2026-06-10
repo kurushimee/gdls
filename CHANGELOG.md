@@ -9,6 +9,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 (nothing yet)
 
+## [1.0.2] — 2026-06-11
+
+The first-run robustness release. The first real-world Claude Code plugin session on a fresh
+Windows machine hit three failures at once: the synchronous `extension_api.json` auto-dump
+wedged for the full 60 s timeout before the first request was answered, the timed-out dump left
+the whole session on an **empty native DB** — so every native annotation in every file errored
+`Could not find type "X" in the current scope.` — and hover on declarations rendered the opaque
+`<Script #N>` placeholder. v1.0.2 makes the first run converge to the same behavior as every
+later run, with no false positives at any point in between. (#24, #25, #26)
+
+### Fixed — native API resolution (#24)
+- **Embedded stock fallback**: a gzipped stock 4.6.3 no-docs `extension_api.json` (0.4 MB) ships
+  inside the binary as the last resolution step — builtins always resolve on a fresh install
+  with no Godot anywhere. Kill switch: `embeddedApiFallback` (default `true`); also covers an
+  unreadable explicit `extensionApiPath`.
+- **Provenance-gated negative claims**: `NativeDb` now carries `ApiProvenance`
+  (`Exact` project-derived / `Generic` embedded / `Absent` empty). Native-rooted negative
+  diagnostics — the terminal `Could not find type`, super-call misses, meta-base
+  `Cannot find member` — fire only under `Exact`: a generic surface can prove what exists,
+  never what doesn't (a custom engine build's class is indistinguishable from a typo).
+  Documented as a deliberate deviation in `docs/02` §11b.
+
+### Fixed — auto-dump lifecycle (#25)
+- **The dump runs on a background thread** and is adopted mid-session through the event loop
+  (reload native DB → republish open buffers → refresh the warm-start cache). The first request
+  never queues behind a Godot boot; first-run diagnostics converge the moment the dump lands.
+- **Child stdout/stderr are drained concurrently** — a chatty engine boot could fill the 64 KB
+  pipe and ride the whole dump into the timeout.
+- **"The artifact decides" now covers the timeout path**: a deadline-killed Godot that already
+  wrote a complete dump is adopted (parse-validated; torn files quarantine and fall through).
+- **Mid-session reload stability**: a reload that resolves strictly worse than the live DB (a
+  torn read of a mid-write dump) keeps the live DB; identical content (the post-adoption watcher
+  echo) skips the re-analyze entirely.
+- didOpen/didChange/didClose now drain the dirty set they populate: open dependents get fresh
+  diagnostics immediately instead of waiting for the next unrelated watcher batch.
+
+### Fixed — hover (#26)
+- **Declaration-site signatures**: hover on the name of a `func`/`var`/`const`/`signal`/inner
+  `class` renders the member's signature through the same formatter as the call-site hover
+  (statics now show `static` in both). Inner-class members resolve through their interface
+  scope; body-level locals keep the analyzer's resolved-type hover.
+- **Human type labels**: script-typed values render their `class_name` (or file basename) and
+  in-file class metas their identifier — the `<Script #N>` / `<Class>` Display placeholders
+  never reach hover output. Untyped members with an inferred initializer append the resolved
+  type (`var made: ReproEntity`).
+
 ## [1.0.1] — 2026-06-10
 
 The urgent diagnostics-correctness release. A post-v1.0.0 full-project sweep (didOpen every

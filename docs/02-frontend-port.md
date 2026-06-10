@@ -185,6 +185,26 @@ parse scenes (Phase 2), so:
   names → node types → instanced-scene `class_name`s), at which point `$`/`%` diagnostics converge with
   Godot. See `07-milestones-risks.md`.
 
+## 11b. Native-surface provenance gating (deliberate deviation, v1.0.2)
+
+Godot can never run without its own ClassDB; gdls can — when no project-derived
+`extension_api.json` resolves, it serves an **embedded stock 4.6.3 surface** (`Generic`
+provenance) or, with the fallback disabled, an empty DB (`Absent`). In those states a *negative*
+claim — "this type/member does not exist" — has no basis: a custom engine build's class is
+indistinguishable from a typo.
+
+- **Rule:** the analyzer's native-rooted negative diagnostics (`Could not find type "X" in the
+  current scope.`, the super-call miss templates, `Cannot find member "X" in base "Y".` on
+  native-rooted bases) fire only under `Exact` provenance (a project-context dump, a pinned
+  `extensionApiPath`, or a project-root `extension_api.json`). Under `Generic`/`Absent` the
+  unknown degrades to a silent Variant — the docs/00 "unknown stays dynamic" rule.
+- Positive resolution is unaffected: under the embedded fallback, builtins resolve, hover works,
+  and member checks against classes the stock surface *does* know remain faithful.
+- The session upgrades itself: the background auto-dump's adoption mid-session swaps in an
+  `Exact` DB, re-analyzes, and republishes — first-run diagnostics converge to exactly what a
+  warm session reports. Implementation: `gd_types::ApiProvenance`, gates in
+  `gd_analyze::resolver::resolve_datatype` + `gd_analyze::reducer`.
+
 ## 12. Sources
 
 - Module pipeline & shallow/full cache — https://github.com/godotengine/godot/blob/master/modules/gdscript/README.md

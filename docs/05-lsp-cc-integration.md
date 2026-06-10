@@ -109,9 +109,10 @@ in `plugin.json`):
 | Key | Type | Meaning |
 |---|---|---|
 | `projectRoot` | string (path) | `res://` root. Optional; falls back to workspace folder / nearest `project.godot`. |
-| `extensionApiPath` | string (path) | Pin a hand-made `extension_api.json`. Optional — when absent, the v1.0.1 auto-dump resolution applies (`03-indexing-freshness.md` §1); when neither yields a dump, native types degrade to dynamic. |
+| `extensionApiPath` | string (path) | Pin a hand-made `extension_api.json`. Optional — when absent, the auto-dump resolution applies (`03-indexing-freshness.md` §1); when no project-derived source resolves, the embedded stock fallback serves builtins. |
 | `godotBinaryPath` | string (path) | Godot 4.x executable for the auto-dump. Optional; discovery falls back to `GDLS_GODOT`, then `godot4`/`godot` on PATH. |
-| `autoDumpExtensionApi` | bool | Allow gdls to spawn Godot at session startup to (re)generate the managed dump under `.gdls/`. Default `true`; `false` forbids spawning entirely. |
+| `autoDumpExtensionApi` | bool | Allow gdls to spawn Godot to (re)generate the managed dump under `.gdls/`. Since v1.0.2 the dump runs on a background thread and is adopted mid-session (reload + republish) — it never blocks a request. Default `true`; `false` forbids spawning entirely. |
+| `embeddedApiFallback` | bool | v1.0.2: when every native-API source misses, fall back to a bundled stock 4.6.3 class surface instead of an empty DB, so builtins always resolve on a fresh install. Under this fallback (`Generic` provenance) unknown-type/member negatives are suppressed — only a project-derived (`Exact`) dump may claim a name doesn't exist. Default `true`. |
 | `strict.profile` | `"godot"` \| `"strict"` \| `"off"` | Diagnostics profile (see `04-diagnostics-strict-mode.md`). Default `"godot"`. |
 | `strict.enableWarnings` / `disableWarnings` / `errorWarnings` | string[] | Fine-grained overrides. |
 
