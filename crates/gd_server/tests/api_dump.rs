@@ -65,8 +65,10 @@ fn boot_with_binary(
     (client, handle)
 }
 
-/// Open a trivial file and wait for its publish — proves the event loop armed (the dump runs
-/// during workspace load, strictly before this).
+/// Open a trivial file and wait for its publish — proves the event loop armed. Since v1.0.2
+/// (issue #25) the dump runs on a background thread, so the loop arms (and this publish
+/// arrives) without waiting for it; tests that assert on adoption poll for the managed dump
+/// with [`wait_for_adoption`].
 fn open_and_drain(client: &Connection, p: &TempProject) {
     let abs = p.root.join("main.gd");
     let text = std::fs::read_to_string(abs.as_std_path()).unwrap();
@@ -109,6 +111,24 @@ fn invocation_count(p: &TempProject) -> usize {
         .unwrap_or(0)
 }
 
+/// Poll until the background dump's adoption lands on disk (managed dump + meta). The dump is
+/// asynchronous since v1.0.2; "the session booted" no longer implies "the dump finished".
+fn wait_for_adoption(p: &TempProject) {
+    use std::time::Duration;
+    common::poll_until(Duration::from_secs(20), Duration::from_millis(50), || {
+        (p.root
+            .join(".gdls/extension_api.json")
+            .as_std_path()
+            .exists()
+            && p.root
+                .join(".gdls/extension_api.meta.json")
+                .as_std_path()
+                .exists())
+        .then_some(())
+    })
+    .expect("background dump adoption must land");
+}
+
 #[test]
 fn auto_dump_runs_once_and_is_fresh_on_second_boot() {
     let p = project();
@@ -116,21 +136,22 @@ fn auto_dump_runs_once_and_is_fresh_on_second_boot() {
 
     let (client, handle) = boot_with_binary(&p, &binary);
     open_and_drain(&client, &p);
+    wait_for_adoption(&p);
     common::shutdown(&client, handle);
 
-    let managed = p.root.join(".gdls/extension_api.json");
-    let meta = p.root.join(".gdls/extension_api.meta.json");
-    assert!(managed.as_std_path().exists(), "managed dump must exist");
-    assert!(meta.as_std_path().exists(), "staleness meta must exist");
     assert!(
         !p.root.join("extension_api.json").as_std_path().exists(),
         "the root-level dump must have been moved into .gdls/"
     );
     assert_eq!(invocation_count(&p), 1, "exactly one dump on first boot");
 
-    // Second boot: the meta is fresh (same binary, same gdextension set) — no re-dump.
+    // Second boot: the meta is fresh (same binary, same gdextension set) — no re-dump. The
+    // spawn decision is made synchronously before the event loop arms, so once the first
+    // publish has arrived a dump that WAS going to start has already appended its invocation
+    // line; a short settle covers the script's exec latency.
     let (client, handle) = boot_with_binary(&p, &binary);
     open_and_drain(&client, &p);
+    std::thread::sleep(std::time::Duration::from_millis(500));
     common::shutdown(&client, handle);
     assert_eq!(
         invocation_count(&p),
@@ -148,26 +169,27 @@ fn nonzero_exit_with_complete_dump_is_adopted() {
 
     let (client, handle) = boot_with_binary(&p, &binary);
     open_and_drain(&client, &p);
+    wait_for_adoption(&p);
     common::shutdown(&client, handle);
 
-    assert!(
-        p.root
-            .join(".gdls/extension_api.json")
-            .as_std_path()
-            .exists(),
-        "a complete dump must be adopted despite the exit status"
-    );
     assert_eq!(invocation_count(&p), 1);
 }
 
 #[test]
 fn dump_failure_degrades_and_server_keeps_serving() {
+    use std::time::Duration;
     let p = project();
     let binary = install_fake_godot(&p, 1, false); // fails, writes nothing
 
     let (client, handle) = boot_with_binary(&p, &binary);
-    // The server must still arm the loop and serve diagnostics with a dynamic native DB.
+    // The server must still arm the loop and serve diagnostics regardless of the dump.
     open_and_drain(&client, &p);
+    // Wait for the failed attempt to have run, then a settle for its (absent) adoption.
+    common::poll_until(Duration::from_secs(20), Duration::from_millis(50), || {
+        (invocation_count(&p) == 1).then_some(())
+    })
+    .expect("the dump attempt must spawn once");
+    std::thread::sleep(Duration::from_millis(300));
     common::shutdown(&client, handle);
 
     assert!(
@@ -189,6 +211,8 @@ fn pre_existing_root_file_is_never_clobbered_and_wins() {
 
     let (client, handle) = boot_with_binary(&p, &binary);
     open_and_drain(&client, &p);
+    // The no-dump decision is synchronous at startup; give a generous settle anyway.
+    std::thread::sleep(std::time::Duration::from_millis(500));
     common::shutdown(&client, handle);
 
     assert_eq!(

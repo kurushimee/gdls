@@ -146,6 +146,24 @@ pub enum LoadError {
     Parse(String, #[source] serde_json::Error),
 }
 
+/// How well this DB is known to match the engine the project actually runs on. The analyzer
+/// gates its *negative* claims on this: "type X does not exist" is only trustworthy when the
+/// class surface came from the project's own engine (a project-context dump or a user-pinned
+/// file). A bundled generic dump proves what *does* exist, never what doesn't — a project built
+/// on a custom engine build legitimately names classes a stock dump has never heard of.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ApiProvenance {
+    /// Project-derived: an auto-dump made with project context, a user `extensionApiPath`, or a
+    /// project-root `extension_api.json`. Unknown-type errors are trustworthy.
+    #[default]
+    Exact,
+    /// A bundled stock dump used as a last-resort fallback. Positive lookups are accurate for
+    /// the stock surface; absence proves nothing.
+    Generic,
+    /// No API source at all (the empty DB). Every native lookup misses; absence proves nothing.
+    Absent,
+}
+
 /// The native-class database.
 #[derive(Debug)]
 pub struct NativeDb {
@@ -160,10 +178,15 @@ pub struct NativeDb {
     header: api::Header,
     /// Hash of the source text — lets the M4 watcher skip reloads when the dump is unchanged.
     content_hash: u64,
+    /// See [`ApiProvenance`]. Constructors default to `Exact` (every pre-existing source is
+    /// project-derived); [`NativeDb::empty`] is `Absent`; the embedded-fallback loader in
+    /// `gd_server` downgrades its instance to `Generic`.
+    provenance: ApiProvenance,
 }
 
 impl NativeDb {
-    /// An empty DB: the graceful-degradation state when no dump is available.
+    /// An empty DB: the graceful-degradation state when no dump is available. Provenance is
+    /// [`ApiProvenance::Absent`] — the analyzer must not turn its misses into errors.
     pub fn empty() -> Self {
         NativeDb {
             interner: Interner::new(),
@@ -175,6 +198,7 @@ impl NativeDb {
             singletons: FxHashMap::default(),
             header: api::Header::default(),
             content_hash: 0,
+            provenance: ApiProvenance::Absent,
         }
     }
 
@@ -234,12 +258,24 @@ impl NativeDb {
             singletons,
             header: api.header,
             content_hash: 0,
+            provenance: ApiProvenance::Exact,
         }
     }
 
     /// True when no classes or builtins were ingested (the degraded state).
     pub fn is_empty(&self) -> bool {
         self.classes.is_empty() && self.builtins.is_empty()
+    }
+
+    /// See [`ApiProvenance`].
+    pub fn provenance(&self) -> ApiProvenance {
+        self.provenance
+    }
+
+    /// Tag this DB's [`ApiProvenance`] — the `gd_server` loader marks its embedded-fallback
+    /// instance `Generic` right after ingest.
+    pub fn set_provenance(&mut self, provenance: ApiProvenance) {
+        self.provenance = provenance;
     }
 
     pub fn class_count(&self) -> usize {

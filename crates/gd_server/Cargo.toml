@@ -32,6 +32,7 @@ walkdir.workspace = true
 rustc-hash.workspace = true
 # v1.0.1: PATH discovery of the Godot binary for the extension_api auto-dump (handles PATHEXT).
 which.workspace = true
+flate2.workspace = true
 # M5 Phase B (WP-O1 / WP-O2 / WP-O5). `tracing` is the structured-span + event API replacing the
 # log/env_logger stack on stderr; `tracing-subscriber` is the stderr sink + `EnvFilter` (`GDLS_LOG`)
 # + the hierarchical-profiler Layer slot for WP-O5's `GDLS_TRACE`; `tracing-log` is the bridge that

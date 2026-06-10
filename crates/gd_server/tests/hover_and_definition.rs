@@ -204,6 +204,93 @@ fn hover_on_typed_variable_renders_resolved_type() {
     shutdown(&client, handle);
 }
 
+/// v1.0.2 (issue #26): hover on a DECLARATION NAME renders the member's signature via the same
+/// formatter as the call-site hover — previously the typed-ancestor fallback surfaced the
+/// enclosing class's `<Script #N>` meta placeholder.
+#[test]
+fn hover_on_function_declaration_name_renders_signature() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/decl_sig.gd".parse().unwrap();
+    let src = "class_name DeclSig\nextends Node\n\n\nfunc spawn(parent: Node, at: Vector3) -> DeclSig:\n\treturn self\n\n\nstatic func make() -> DeclSig:\n\treturn null\n";
+    did_open(&client, &uri, src);
+
+    // Cursor on `spawn` in the declaration (line 4, col 5..10).
+    let hover = hover_at(&client, &uri, Position::new(4, 6)).expect("hover on func decl name");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("func spawn(parent: Node, at: Vector3) -> DeclSig"),
+        "declaration hover must render the signature, got {md:?}"
+    );
+    assert!(
+        !md.contains("<Script #"),
+        "the Display placeholder must never reach hover output, got {md:?}"
+    );
+
+    // Cursor on `make` in the static declaration (line 8).
+    let hover = hover_at(&client, &uri, Position::new(8, 12)).expect("hover on static func decl");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("static func make() -> DeclSig"),
+        "static declarations render the static keyword, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// v1.0.2 (issue #26): script-typed values render the script's `class_name` (or file basename),
+/// never `<Script #N>` — pinned on a member var whose type is inferred from a self-returning
+/// factory.
+#[test]
+fn hover_on_script_typed_member_renders_class_name() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/script_typed.gd".parse().unwrap();
+    let src = "class_name ScriptTyped\nextends Node\n\nvar made := factory()\n\n\nfunc factory() -> ScriptTyped:\n\treturn self\n";
+    did_open(&client, &uri, src);
+
+    // Cursor on `made` (line 3, col 4..8) — an untyped member var with an inferred script type.
+    let hover = hover_at(&client, &uri, Position::new(3, 5)).expect("hover on script-typed var");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("ScriptTyped"),
+        "script types must render their class_name, got {md:?}"
+    );
+    assert!(
+        !md.contains("<Script #"),
+        "the Display placeholder must never reach hover output, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// v1.0.2 (issue #26): hover on an inner `class X` declaration name renders `class X extends …`
+/// from the AST (inner classes aren't in the `class_name` registry).
+#[test]
+fn hover_on_inner_class_declaration_renders_class_line() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/inner_class.gd".parse().unwrap();
+    let src = "extends Node\n\nclass Accumulator extends RefCounted:\n\tvar total := 0\n\n\tfunc add(n: int) -> void:\n\t\ttotal += n\n";
+    did_open(&client, &uri, src);
+
+    // Cursor on `Accumulator` (line 2, col 6..17).
+    let hover = hover_at(&client, &uri, Position::new(2, 8)).expect("hover on inner class name");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("class Accumulator extends RefCounted"),
+        "inner-class declaration hover, got {md:?}"
+    );
+
+    // And an inner-class MEMBER declaration resolves through the inner interface scope:
+    // cursor on `add` (line 5, col 6..9).
+    let hover = hover_at(&client, &uri, Position::new(5, 7)).expect("hover on inner member decl");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("func add(n: int) -> void"),
+        "inner-class member declaration hover, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
 #[test]
 fn hover_returns_none_outside_any_node() {
     // A hover request whose position lands past the source end (a whitespace-only file) must

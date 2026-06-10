@@ -709,6 +709,16 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         // resolution exhausted: not a builtin, not a native, not a global class_name, not an
         // in-file class scope, not a class-level constant, not a local meta-typed constant,
         // not a global enum, not a cross-file base inner class.
+        //
+        // v1.0.2 deliberate deviation (issue #24, same rule as the cross-file Script-segment
+        // walk below): this negative claim is only trustworthy when the native surface came
+        // from the project's own engine. Under a `Generic` (embedded stock fallback) or
+        // `Absent` (no source at all) DB, a custom engine build's class is indistinguishable
+        // from a typo — Godot itself can never be in this state, so fidelity doesn't bind here;
+        // degrade to a silent Variant per the docs/00 "unknown stays dynamic" rule.
+        if ctx.native.provenance() != gd_types::ApiProvenance::Exact {
+            return bad_type;
+        }
         ctx.push_error(
             format!(r#"Could not find type "{first}" in the current scope."#),
             first_id,
@@ -5484,6 +5494,38 @@ func go(bs: PackedByteArray, i32s: PackedInt32Array, i64s: PackedInt64Array,
             ctx.has_errors(),
             "unresolved type must emit Could not find type error"
         );
+    }
+
+    /// v1.0.2 (issue #24): the `Could not find type` negative claim requires `Exact` native
+    /// provenance. Under `Absent` (no API source) or `Generic` (embedded stock fallback) the
+    /// unknown name degrades to a silent Variant — a custom engine build's class is
+    /// indistinguishable from a typo without the project's own surface.
+    #[test]
+    fn datatype_unknown_degrades_silently_without_exact_native_surface() {
+        let generic = {
+            let mut db = mini_native();
+            db.set_provenance(gd_types::ApiProvenance::Generic);
+            db
+        };
+        for (native, label) in [
+            (gd_types::NativeDb::empty(), "Absent"),
+            (generic, "Generic"),
+        ] {
+            let tree = gd_syntax::parse("extends Node\nvar g: Ghost\n").tree;
+            let xfile = NoCrossFile;
+            let pol = policy();
+            let mut ctx =
+                AnalysisContext::new(&tree, &native, &xfile, Some(FileId::new(1)), "", &pol);
+            let _ = resolve_inheritance(&mut ctx);
+            ctx.current_class = ctx.tree.root_id();
+            let type_id = first_var_type(&tree);
+            let dt = resolve_datatype(&mut ctx, Some(type_id));
+            assert!(dt.is_variant(), "{label}: unknown type must degrade");
+            assert!(
+                !ctx.has_errors(),
+                "{label}: no Could not find type error without Exact provenance"
+            );
+        }
     }
 
     #[test]

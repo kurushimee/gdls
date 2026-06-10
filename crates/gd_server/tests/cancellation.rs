@@ -33,6 +33,18 @@ fn try_recv(conn: &Connection, timeout: Duration) -> Option<Message> {
     conn.receiver.recv_timeout(timeout).ok()
 }
 
+/// `recv`, skipping server-initiated notifications (e.g. a watcher-echo diagnostics republish
+/// triggered by the startup cache write landing under the watch root) until a Response arrives.
+fn recv_response(conn: &Connection) -> lsp_server::Response {
+    loop {
+        match recv(conn) {
+            Message::Response(resp) => return resp,
+            Message::Notification(_) => continue,
+            other => panic!("expected a response; got {other:?}"),
+        }
+    }
+}
+
 fn request(id: i32, method: &str, params: serde_json::Value) -> Message {
     Message::Request(Request {
         id: RequestId::from(id),
@@ -209,10 +221,7 @@ fn cancel_after_response_is_an_idempotent_noop() {
             .unwrap(),
         ))
         .unwrap();
-    let third = recv(&client);
-    let Message::Response(resp) = third else {
-        panic!("expected a documentSymbol response for id 3; got {third:?}");
-    };
+    let resp = recv_response(&client);
     assert_eq!(
         resp.id,
         RequestId::from(3),
@@ -246,10 +255,13 @@ fn malformed_cancel_params_does_not_panic_or_block() {
         ))
         .unwrap();
 
-    // No response should arrive from a notification ever.
+    // No RESPONSE should arrive from a notification ever. Server-initiated notifications are
+    // legitimate in this window, though: the startup cache write under the watch root can echo
+    // back as a watcher batch whose end-of-batch republish re-pushes the open buffer's
+    // (unchanged) diagnostics — filter those out rather than racing the debouncer.
     let stray = try_recv(&client, Duration::from_millis(100));
     assert!(
-        stray.is_none(),
+        !matches!(stray, Some(Message::Response(_))),
         "no response should arrive for any `$/cancelRequest` notification; got {stray:?}"
     );
 
@@ -267,9 +279,7 @@ fn malformed_cancel_params_does_not_panic_or_block() {
             .unwrap(),
         ))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected a documentSymbol response after the malformed cancels");
-    };
+    let resp = recv_response(&client);
     assert_eq!(resp.id, RequestId::from(5));
     assert!(resp.error.is_none());
 

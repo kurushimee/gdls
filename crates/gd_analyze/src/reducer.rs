@@ -3876,7 +3876,15 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // utility (`typeof`, `Color()`, …) would false-positive every such call. Permissive
         // silence on `is_self && !is_super` keeps trimmed-dump runs honest while still letting
         // the super-call + subscript-base errors fire.
-        if !name_is_value && call.is_super {
+        if !name_is_value
+            && call.is_super
+            && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+        {
+            // v1.0.2 (issue #24): both super-miss templates below are negative claims whose
+            // lookup bottoms out in the native chain — under a `Generic`/`Absent` DB a custom
+            // engine build may define the member the stock surface lacks, so they only fire
+            // with `Exact` provenance.
+            //
             // analyzer.cpp:3742-3744 — super-call fall-through. When the function name is
             // `_init` and the parent is a native class that doesn't define a custom `_init`,
             // Godot classifies it as the virtual-constructor case and emits
@@ -4495,6 +4503,17 @@ fn reduce_subscript_attribute(
     if !valid {
         let attr_type = ctx.get_type(attr_id).clone();
         let base_instance = crate::resolver::type_from_metatype(base_type);
+        // v1.0.2 (issue #24): a member miss on a base whose lookup chain reaches the native
+        // surface (a Native base, or any script/class meta rooted in one — inherited native
+        // constants resolve through subclass names) is only a trustworthy negative under
+        // `Exact` provenance; a `Generic`/`Absent` DB can't disprove a custom engine build's
+        // member. Degrade to Variant silently, like the non-meta UNSAFE path above.
+        if ctx.native.provenance() != gd_types::ApiProvenance::Exact
+            && (base_instance.kind == DtKind::Native || !base_instance.native_type.is_empty())
+        {
+            ctx.set_type(sub_id, DataType::variant());
+            return;
+        }
         // Render in-file `Class`-kind bases with their identifier name instead of the
         // `Display`-side `<Class>` placeholder (analyzer.cpp:5339-5343, see
         // `class_identifier_name_or_default`).

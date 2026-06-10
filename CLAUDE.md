@@ -132,15 +132,20 @@ Phase 1 = v1 = **M0–M6**: M0 LSP skeleton · M1 tokenizer + parser · M2 envir
 [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md). Phase 2 (post-v1): `.tscn` node typing for `$`/`%`,
 `completion`, `signatureHelp`, `rename`/`documentHighlight`.
 
-**Current:** Phase 1 complete — **v1.0.1 shipped** (release notes in `CHANGELOG.md`). v1.0.1 fixed
-the cross-file false-positive families a full-project diagnostics sweep exposed after v1.0.0
-(`gd_analyze::script_chain` native-lineage/member resolution, `FoldedValue::Opaque` builtin
-constants, packed-array iteration, const chains), closed #13 (cross-file member nav via
-`Binding::Use`) and #14 (NTFS startup: `NoCache` watcher + `DiscoverOnly` reconcile), added the
-`extension_api.json` auto-dump (`crate::api_dump`; `godotBinaryPath`/`autoDumpExtensionApi`/
-`GDLS_GODOT`), and wired `uid://` autoloads. Both conformance ratchets hold at **1.0**: parser
-**186/186**, analyzer **300/300**. CI is green (`cargo fmt --check`, `cargo lint`,
-`cargo test --workspace`); three-layer fuzz gate (`parse` + `analyze` + `index_invariants`).
-Standing release gate: the `scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both
-acceptance projects (a nav-row walk is NOT a diagnostics gate). Per-milestone exit criteria:
-`docs/07`; the full history: `CHANGELOG.md`.
+**Current:** Phase 1 complete — **v1.0.2 shipped** (release notes in `CHANGELOG.md`). v1.0.2 is
+the first-run robustness release (#24/#25/#26, exposed by the first real plugin session on a
+fresh Windows machine): the auto-dump now runs on a **background thread** and is adopted
+mid-session (reload + republish + warm-cache refresh — never blocks a request, "the artifact
+decides" extended to the timeout path, child pipes drained concurrently); when no project-derived
+API source resolves, an **embedded stock 4.6.3 surface** (0.4 MB gz, `embeddedApiFallback`)
+serves builtins with `ApiProvenance::Generic` — and native-rooted *negative* diagnostics
+(`Could not find type …`, super-call misses, meta-base member misses) fire only under `Exact`
+provenance (deliberate deviation, `docs/02` §11b); hover renders declaration-site signatures and
+human type labels (`<Script #N>` never reaches hover). v1.0.1 before it fixed the cross-file
+false-positive families (`gd_analyze::script_chain`), closed #13/#14, and added the
+`extension_api.json` auto-dump. Both conformance ratchets hold at **1.0**: parser **186/186**,
+analyzer **300/300**. CI is green (`cargo fmt --check`, `cargo lint`, `cargo test --workspace`);
+three-layer fuzz gate (`parse` + `analyze` + `index_invariants`). Standing release gate: the
+`scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both acceptance projects (a nav-row
+walk is NOT a diagnostics gate). Per-milestone exit criteria: `docs/07`; the full history:
+`CHANGELOG.md`.

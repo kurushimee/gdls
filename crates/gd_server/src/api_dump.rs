@@ -30,23 +30,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::InitializationOptions;
 
-/// Whether this `Workspace::load` call may spawn Godot for a stale/missing dump. Only the
-/// session-startup path (`serve_inner`) passes `SpawnIfStale`; reloads mid-session, `gdls
-/// diagnose`, and every direct test construction stay `NeverSpawn` — a `.gdextension` change
-/// just marks the meta stale and the next startup re-dumps, so the single-threaded event loop
-/// never blocks on a Godot boot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApiDumpPolicy {
-    SpawnIfStale,
-    NeverSpawn,
+/// What the background auto-dump thread reports back to the event loop (issue #25). On
+/// `Adopted`, the dump has already been parsed, moved into `.gdls/`, and its meta written —
+/// the receiving loop only reloads the native DB and republishes open buffers.
+#[derive(Debug)]
+pub(crate) enum DumpOutcome {
+    Adopted { classes: usize, version: String },
+    Failed(String),
 }
 
 /// Bump independently of `gd_project::cache::CACHE_FORMAT_VERSION` when this file's shape changes.
 const META_FORMAT_VERSION: u32 = 1;
 
-/// Wall-clock budget for the dump. A cold Godot boot on a large project takes seconds; 60 s is
-/// generous without letting a hung binary wedge startup forever.
-const DUMP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Wall-clock budget for the dump. Generous on purpose: the dump runs on a background thread
+/// (never on the startup path), so a long wait costs only a lingering child process — while a
+/// tight deadline kills legitimate slow first boots (cold import caches, AV-scanned binaries,
+/// huge projects). A deadline kill still adopts a completed artifact ("the artifact decides").
+const DUMP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// `.gdls/extension_api.meta.json` — everything that decides whether the cached dump is fresh.
 /// Written only after the dump PARSED, so a torn dump can never look fresh.
@@ -75,14 +75,17 @@ fn meta_path(root: &Utf8Path) -> Utf8PathBuf {
 }
 
 /// Resolve the native DB when no explicit `extensionApiPath` is configured. The order:
-/// fresh `.gdls` dump → auto-dump (policy + kill-switch + binary permitting) → stale `.gdls`
-/// dump → `<root>/extension_api.json` (unmanaged user file) → empty (dynamic). One log line per
-/// decision so an operator can always reconstruct which source won.
+/// fresh `.gdls` dump → stale `.gdls` dump → `<root>/extension_api.json` (unmanaged user file) →
+/// embedded stock fallback → empty (dynamic). One log line per decision so an operator can
+/// always reconstruct which source won.
+///
+/// v1.0.2 (issue #25): resolution itself NEVER spawns Godot. The auto-dump runs on a background
+/// thread ([`spawn_background_dump`], session startup only) and is adopted mid-session through
+/// the event loop, so the first request never queues behind a Godot boot.
 pub(crate) fn resolve_native_db(
     options: &InitializationOptions,
     project: &ProjectModel,
     root: &Utf8Path,
-    policy: ApiDumpPolicy,
 ) -> NativeDb {
     let managed = dump_path(root);
     let binary = discover_binary(options);
@@ -110,38 +113,7 @@ pub(crate) fn resolve_native_db(
         }
     }
 
-    // (2) Auto-dump — only for a real Godot project. A bare-`.gd` session whose root fell back
-    // to some cwd has no project to dump against; booting Godot there is all cost and surprise.
-    let is_godot_project = root.join("project.godot").as_std_path().exists();
-    if options.auto_dump_extension_api && policy == ApiDumpPolicy::SpawnIfStale && !is_godot_project
-    {
-        log::debug!("native API: no project.godot at {root}; auto-dump skipped");
-    }
-    if options.auto_dump_extension_api && policy == ApiDumpPolicy::SpawnIfStale && is_godot_project
-    {
-        match &binary {
-            Some(bin) => match run_dump(bin, root) {
-                Ok(()) => {
-                    if let Ok(db) = try_adopt_dump(root, project, bin) {
-                        return db;
-                    }
-                }
-                Err(e) => {
-                    log::warn!("native API: auto-dump failed ({e}); falling back");
-                }
-            },
-            None => {
-                log::warn!(
-                    "native API: no Godot binary found (godotBinaryPath unset, GDLS_GODOT unset, \
-                     no godot4/godot on PATH); cannot auto-dump"
-                );
-            }
-        }
-    } else if !options.auto_dump_extension_api {
-        log::debug!("native API: auto-dump disabled by autoDumpExtensionApi=false");
-    }
-
-    // (3) Stale managed dump — known provenance (made with project context) beats nothing.
+    // (2) Stale managed dump — known provenance (made with project context) beats nothing.
     if managed.as_std_path().exists() {
         if let Ok(db) = NativeDb::load(managed.as_str()) {
             log::warn!(
@@ -154,7 +126,7 @@ pub(crate) fn resolve_native_db(
         }
     }
 
-    // (4) Unmanaged user file at the project root.
+    // (3) Unmanaged user file at the project root.
     let root_file = root.join("extension_api.json");
     if root_file.as_std_path().exists() {
         if let Ok(db) = NativeDb::load(root_file.as_str()) {
@@ -166,17 +138,162 @@ pub(crate) fn resolve_native_db(
         }
     }
 
+    // (4) Embedded stock fallback — builtins always resolve, even on a fresh install with no
+    // Godot binary anywhere. `Generic` provenance: the analyzer will not turn ITS misses into
+    // "Could not find type" errors (a custom engine build legitimately has classes this stock
+    // dump doesn't).
+    if options.embedded_api_fallback {
+        if let Some(db) = embedded_stock_db() {
+            log::warn!(
+                "native API: no project-derived source (no extensionApiPath, no cached dump, \
+                 auto-dump {}); using the embedded stock {} surface — project-specific native \
+                 classes degrade to dynamic. Set godotBinaryPath or GDLS_GODOT for an exact dump.",
+                if options.auto_dump_extension_api {
+                    "found no source"
+                } else {
+                    "disabled"
+                },
+                version_label(&db),
+            );
+            return db;
+        }
+    }
+
     // (5) Nothing — dynamic.
     log::warn!(
-        "native API unavailable (no extensionApiPath, no cached dump, auto-dump {}); native \
-         types degrade to dynamic — set godotBinaryPath or GDLS_GODOT",
+        "native API unavailable (no extensionApiPath, no cached dump, auto-dump {}, embedded \
+         fallback {}); native types degrade to dynamic — set godotBinaryPath or GDLS_GODOT",
         if options.auto_dump_extension_api {
             "found no source"
         } else {
             "disabled"
-        }
+        },
+        if options.embedded_api_fallback {
+            "failed"
+        } else {
+            "disabled"
+        },
     );
     NativeDb::empty()
+}
+
+/// Decide whether this session should auto-dump, and if so run it on a BACKGROUND thread:
+/// the dump (a full Godot boot, seconds — or a 5 min timeout when the binary wedges) must never
+/// sit between `initialize` and the first served request (issue #25). Returns the receiver the
+/// event loop selects on, or `None` when no dump is warranted (fresh cache, kill switch, a
+/// pinned `extensionApiPath`, no binary, no project, or a user-managed root file).
+///
+/// The thread does the whole job — spawn, drain, parse, move into `.gdls/`, write meta — and
+/// reports a [`DumpOutcome`]; the loop's only duty on `Adopted` is `reload_native` +
+/// republish. Mid-write watcher echoes of `<root>/extension_api.json` are harmless: the
+/// reload path never downgrades a populated DB on a torn read, and the content hash dedupes
+/// the post-adoption echo.
+pub(crate) fn spawn_background_dump(
+    options: &InitializationOptions,
+    project: &ProjectModel,
+    root: &Utf8Path,
+) -> Option<crossbeam_channel::Receiver<DumpOutcome>> {
+    if !options.auto_dump_extension_api {
+        log::debug!("native API: auto-dump disabled by autoDumpExtensionApi=false");
+        return None;
+    }
+    // A pinned explicit path makes the managed dump unservable — `load_native` resolves the
+    // `Some(extensionApiPath)` arm without ever consulting the `.gdls/` ladder — so the boot
+    // would be pure waste (adoption re-resolves the pinned path and dedupes to a no-op).
+    if options.extension_api_path.is_some() {
+        log::debug!("native API: extensionApiPath is pinned; auto-dump skipped");
+        return None;
+    }
+    // Only for a real Godot project. A bare-`.gd` session whose root fell back to some cwd has
+    // no project to dump against; booting Godot there is all cost and surprise.
+    if !root.join("project.godot").as_std_path().exists() {
+        log::debug!("native API: no project.godot at {root}; auto-dump skipped");
+        return None;
+    }
+    // A pre-existing user file at the dump's output path means NO dump (never clobber) — the
+    // resolution ladder already serves it as the unmanaged root-file source.
+    if root.join("extension_api.json").as_std_path().exists() {
+        log::debug!(
+            "native API: project-root extension_api.json is user-managed; auto-dump skipped"
+        );
+        return None;
+    }
+    let Some(binary) = discover_binary(options) else {
+        log::warn!(
+            "native API: no Godot binary found (godotBinaryPath unset, GDLS_GODOT unset, \
+             no godot4/godot on PATH); cannot auto-dump"
+        );
+        return None;
+    };
+    // Fresh managed dump ⇒ resolution step (1) already served it; nothing to do.
+    let stale_reason = staleness_reason(root, project, Some(&binary))?;
+
+    let (tx, rx) = crossbeam_channel::bounded::<DumpOutcome>(1);
+    let root = root.to_path_buf();
+    let project = project.clone();
+    let spawned = std::thread::Builder::new()
+        .name("gdls-api-dump".to_owned())
+        .spawn(move || {
+            let outcome = match run_dump(&binary, &root) {
+                Ok(()) => match try_adopt_dump(&root, &project, &binary) {
+                    Ok(db) => DumpOutcome::Adopted {
+                        classes: db.class_count(),
+                        version: version_label(&db).to_owned(),
+                    },
+                    Err(()) => DumpOutcome::Failed(
+                        "dump produced but not adoptable (unparseable — quarantined)".to_owned(),
+                    ),
+                },
+                Err(e) => DumpOutcome::Failed(e),
+            };
+            // A send error means the event loop dropped the receiver (session over) — fine.
+            let _ = tx.send(outcome);
+        });
+    match spawned {
+        Ok(_handle) => {
+            log::info!("native API: auto-dump started in the background ({stale_reason})");
+            Some(rx)
+        }
+        Err(e) => {
+            log::warn!("native API: could not spawn the dump thread: {e}");
+            None
+        }
+    }
+}
+
+/// The bundled stock-Godot class surface, gunzipped + ingested on demand. Regenerate the asset
+/// from a stock binary of the pinned reference version:
+/// `godot --headless --dump-extension-api` (no docs — types only, hover descriptions stay
+/// empty under the fallback), then minify + `gzip -9` to
+/// `assets/extension_api_4.6.3_stock.min.json.gz`.
+///
+/// `None` only if the embedded bytes fail to decompress/parse — corrupt vendored asset, caught
+/// by `embedded_stock_db_loads` in CI — so callers degrade rather than unwrap.
+pub(crate) fn embedded_stock_db() -> Option<NativeDb> {
+    use std::io::Read;
+
+    const EMBEDDED_GZ: &[u8] = include_bytes!("../assets/extension_api_4.6.3_stock.min.json.gz");
+    let start = Instant::now();
+    let mut text = String::new();
+    if let Err(e) = flate2::read::GzDecoder::new(EMBEDDED_GZ).read_to_string(&mut text) {
+        log::error!("native API: embedded stock dump failed to decompress: {e}");
+        return None;
+    }
+    match NativeDb::from_json(&text) {
+        Ok(mut db) => {
+            db.set_provenance(gd_types::ApiProvenance::Generic);
+            log::info!(
+                "native API: embedded stock fallback ingested ({} classes, {} ms)",
+                db.class_count(),
+                start.elapsed().as_millis()
+            );
+            Some(db)
+        }
+        Err(e) => {
+            log::error!("native API: embedded stock dump failed to parse: {e}");
+            None
+        }
+    }
 }
 
 /// Discovery order: explicit `godotBinaryPath` → `GDLS_GODOT` env (empty or `off` hard-disables)
@@ -284,8 +401,18 @@ fn gdextension_stats(root: &Utf8Path, project: &ProjectModel) -> Vec<FileStat> {
 
 /// Spawn the dump. The child's cwd is the project root and `--path` names it explicitly; the
 /// output lands at `<root>/extension_api.json` (Godot's fixed behavior). Guarded: a pre-existing
-/// user file at that path means NO dump (never clobber — resolution step 4 will use it).
+/// user file at that path means NO dump (never clobber — resolution step 3 will use it).
 fn run_dump(binary: &Utf8Path, root: &Utf8Path) -> Result<(), String> {
+    run_dump_with_timeout(binary, root, DUMP_TIMEOUT)
+}
+
+/// [`run_dump`] with an injectable deadline (production uses [`DUMP_TIMEOUT`]; tests shrink it
+/// to exercise the kill path without the full 5 min wait).
+fn run_dump_with_timeout(
+    binary: &Utf8Path,
+    root: &Utf8Path,
+    timeout: Duration,
+) -> Result<(), String> {
     let out_file = root.join("extension_api.json");
     if out_file.as_std_path().exists() {
         return Err(format!(
@@ -318,12 +445,29 @@ fn run_dump(binary: &Utf8Path, root: &Utf8Path) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("failed to spawn {binary}: {e}"))?;
 
+    // Drain stdout/stderr CONCURRENTLY (issue #25): a chatty engine boot (warnings scale with
+    // project size) can otherwise fill the 64 KB pipe buffer, block the child mid-dump, and
+    // ride the whole thing into the timeout. Each drainer keeps only a bounded tail for the
+    // failure log, reported over a channel — NOT a join handle, because a grandchild that
+    // inherited the pipe (an orphaned helper process after our deadline kill) holds the write
+    // end open past the child's death, and joining would hang on it.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let (tail_tx, tail_rx) = crossbeam_channel::bounded::<String>(1);
+    std::thread::spawn(move || {
+        // stdout tail is uninteresting (Godot's banner) — drain it purely for flow control.
+        drain_tail(stdout_pipe);
+    });
+    std::thread::spawn(move || {
+        let _ = tail_tx.send(drain_tail(stderr_pipe));
+    });
+
     // std::process has no timeout — poll, then kill + reap on the deadline.
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if start.elapsed() > DUMP_TIMEOUT {
+                if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
                     break None;
@@ -333,27 +477,30 @@ fn run_dump(binary: &Utf8Path, root: &Utf8Path) -> Result<(), String> {
             Err(e) => return Err(format!("wait failed: {e}")),
         }
     };
-    // Drain piped output so the handles close (and keep the stderr tail for diagnostics).
-    let output = child.wait_with_output().ok();
-    let stderr_tail = output
-        .as_ref()
-        .map(|o| {
-            let s = String::from_utf8_lossy(&o.stderr);
-            s.chars()
-                .rev()
-                .take(400)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
-        })
+    // Collect the stderr tail, briefly: after a clean exit it arrives immediately (pipe EOF);
+    // after a kill, an orphaned grandchild may hold the pipe open indefinitely — give up after
+    // a short grace and let the detached drainer die with the pipe.
+    let stderr_tail = tail_rx
+        .recv_timeout(Duration::from_millis(500))
         .unwrap_or_default();
 
     match status {
-        None => Err(format!(
-            "timed out after {}s; killed",
-            DUMP_TIMEOUT.as_secs()
-        )),
+        None => {
+            // Killed on the deadline. "The artifact decides, not the exit status" applies here
+            // too (issue #25): a binary that wrote a complete dump and then wedged on shutdown
+            // (Windows Error Reporting hold, audio-device teardown, …) still produced exactly
+            // what we need — adoption parses it, so a torn file can't slip through.
+            if out_file.as_std_path().exists() {
+                log::warn!(
+                    "native API: dump timed out after {}s and was killed, but a dump artifact \
+                     exists — adopting it (a torn file fails the parse and is quarantined)",
+                    timeout.as_secs()
+                );
+                Ok(())
+            } else {
+                Err(format!("timed out after {}s; killed", timeout.as_secs()))
+            }
+        }
         Some(st) => {
             // Godot 4.6.3 has been observed to abort on exit AFTER writing a complete dump —
             // the artifact decides, not the exit status.
@@ -376,6 +523,30 @@ fn run_dump(binary: &Utf8Path, root: &Utf8Path) -> Result<(), String> {
             }
         }
     }
+}
+
+/// Read a child pipe to EOF, retaining only the last ~4 KB (failure-log material). Never
+/// errors: a broken pipe mid-read just ends the drain with whatever tail was collected.
+fn drain_tail<R: std::io::Read>(pipe: Option<R>) -> String {
+    const TAIL_BYTES: usize = 4096;
+    let Some(mut pipe) = pipe else {
+        return String::new();
+    };
+    let mut tail: Vec<u8> = Vec::with_capacity(2 * TAIL_BYTES);
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&buf[..n]);
+                if tail.len() > 2 * TAIL_BYTES {
+                    let cut = tail.len() - TAIL_BYTES;
+                    tail.drain(..cut);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 /// Move the fresh root dump into `.gdls/`, parse it, write the meta, run the GDExtension
@@ -503,5 +674,152 @@ mod tests {
         );
         // Nothing anywhere.
         assert_eq!(discover_binary_with(None, None, lookup_misses), None);
+    }
+
+    /// CI guard on the vendored asset: the embedded stock dump must decompress, parse, carry
+    /// `Generic` provenance, and contain the everyday classes whose absence caused the v1.0.1
+    /// first-run false-positive storm (issue #24).
+    #[test]
+    fn embedded_stock_db_loads() {
+        let db = embedded_stock_db().expect("embedded stock dump must ingest");
+        assert_eq!(db.provenance(), gd_types::ApiProvenance::Generic);
+        for class in ["Node", "Timer", "Marker3D", "CollisionObject3D", "Object"] {
+            assert!(
+                db.class_named(class).is_some(),
+                "embedded stock dump is missing {class}"
+            );
+        }
+    }
+
+    /// `run_dump` behavior against fake "godot" binaries (issue #25). Shell-script fixtures, so
+    /// unix-only — the logic under test (drain threads, deadline kill, artifact-decides) is
+    /// platform-independent; Windows runs the embedded/discovery tests above.
+    #[cfg(unix)]
+    mod fake_binary {
+        use super::*;
+
+        const MINI_DUMP: &str = r#"{"header":{"version_major":4,"version_minor":6,"version_patch":3,"version_full_name":"Godot Engine v4.6.3.fake"},"classes":[{"name":"Object"},{"name":"Node","inherits":"Object"}]}"#;
+
+        /// A project root and a fake godot whose behavior is the given shell script body.
+        /// The script sees the dump target as `$root/extension_api.json` (run_dump sets the
+        /// child's cwd to the root).
+        fn fixture(script_body: &str) -> (tempfile::TempDir, Utf8PathBuf, Utf8PathBuf) {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+            std::fs::write(
+                root.join("project.godot").as_std_path(),
+                "config_version=5\n",
+            )
+            .expect("project.godot");
+            let bin = root.join("fake-godot.sh");
+            std::fs::write(bin.as_std_path(), format!("#!/bin/sh\n{script_body}\n"))
+                .expect("fake binary");
+            std::fs::set_permissions(bin.as_std_path(), std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            (dir, root, bin)
+        }
+
+        /// Crash-after-write (observed in the wild: a custom build aborts on audio-device
+        /// teardown AFTER dumping): the artifact decides, not the exit status.
+        #[test]
+        fn nonzero_exit_with_artifact_is_ok() {
+            let (_dir, root, bin) = fixture(&format!(
+                "cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 5"
+            ));
+            assert!(run_dump_with_timeout(&bin, &root, Duration::from_secs(10)).is_ok());
+            assert!(root.join("extension_api.json").as_std_path().exists());
+        }
+
+        /// Write-then-wedge (Windows Error Reporting hold, device teardown hang): the deadline
+        /// kill must still adopt the complete artifact instead of throwing it away (issue #25).
+        #[test]
+        fn timeout_with_artifact_is_ok() {
+            let (_dir, root, bin) = fixture(&format!(
+                "cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nsleep 60"
+            ));
+            let start = Instant::now();
+            assert!(run_dump_with_timeout(&bin, &root, Duration::from_secs(1)).is_ok());
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "must kill at the deadline, not wait for the child"
+            );
+            assert!(root.join("extension_api.json").as_std_path().exists());
+        }
+
+        /// A chatty child (engine warnings scale with project size) must not pipe-deadlock:
+        /// without the concurrent drain threads this test wedges until the deadline and fails.
+        #[test]
+        fn chatty_child_does_not_deadlock() {
+            // ~1 MB of stderr noise — far past the ~64 KB pipe buffer — then a valid dump.
+            let (_dir, root, bin) = fixture(&format!(
+                "i=0\nwhile [ $i -lt 16384 ]; do\n  printf 'WARNING: noisy engine boot line with some padding to make it long\\n' >&2\n  i=$((i+1))\ndone\ncat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 0"
+            ));
+            let start = Instant::now();
+            assert!(run_dump_with_timeout(&bin, &root, Duration::from_secs(20)).is_ok());
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "drain must keep the child flowing (took {:?})",
+                start.elapsed()
+            );
+        }
+
+        /// No artifact + nonzero exit = a real failure.
+        #[test]
+        fn no_artifact_is_err() {
+            let (_dir, root, bin) = fixture("exit 1");
+            assert!(run_dump_with_timeout(&bin, &root, Duration::from_secs(10)).is_err());
+        }
+
+        /// End-to-end: spawn_background_dump decision + thread + adoption. The fake binary
+        /// writes a parseable mini dump; the outcome must be `Adopted` with the dump moved
+        /// into `.gdls/` + meta written, and a follow-up resolution must serve it as the
+        /// fresh managed source.
+        #[test]
+        fn background_dump_adopts_end_to_end() {
+            let (_dir, root, bin) = fixture(&format!(
+                "cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 0"
+            ));
+            let options = InitializationOptions {
+                godot_binary_path: Some(bin.to_string()),
+                ..Default::default()
+            };
+            let project = ProjectModel::load(&root);
+            let rx = spawn_background_dump(&options, &project, &root)
+                .expect("stale/missing cache + binary => dump spawns");
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(DumpOutcome::Adopted { classes, .. }) => assert_eq!(classes, 2),
+                other => panic!("expected Adopted, got {other:?}"),
+            }
+            assert!(dump_path(&root).as_std_path().exists(), "managed dump");
+            assert!(meta_path(&root).as_std_path().exists(), "meta");
+            assert!(
+                !root.join("extension_api.json").as_std_path().exists(),
+                "root artifact moved into .gdls/"
+            );
+            // The next resolution serves the adopted dump as step (1) — and a fresh
+            // spawn_background_dump declines (nothing stale).
+            let db = resolve_native_db(&options, &project, &root);
+            assert_eq!(db.provenance(), gd_types::ApiProvenance::Exact);
+            assert_eq!(db.class_count(), 2);
+            assert!(spawn_background_dump(&options, &project, &root).is_none());
+        }
+
+        /// A pinned extensionApiPath makes the managed dump unservable (`load_native` never
+        /// consults the `.gdls/` ladder when the explicit path is set), so no background boot
+        /// fires even when everything else — binary, project, missing cache — warrants one.
+        #[test]
+        fn pinned_extension_api_path_skips_dump() {
+            let (_dir, root, bin) = fixture(&format!(
+                "cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 0"
+            ));
+            let options = InitializationOptions {
+                godot_binary_path: Some(bin.to_string()),
+                extension_api_path: Some(root.join("pinned.json").to_string()),
+                ..Default::default()
+            };
+            let project = ProjectModel::load(&root);
+            assert!(spawn_background_dump(&options, &project, &root).is_none());
+        }
     }
 }

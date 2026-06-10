@@ -64,7 +64,11 @@ gdls diagnose --reconcile --root /path/to/your/godot/project
    (`godotBinaryPath` option → `GDLS_GODOT` env → `godot4`/`godot` on PATH), runs
    `--dump-extension-api-with-docs` with project context — which is what captures the project's
    GDExtension classes — and manages the result under `.gdls/`, regenerating only when the
-   binary or the project's `.gdextension` set changes. To pin a hand-made dump instead, set
+   binary or the project's `.gdextension` set changes. Since v1.0.2 the dump runs in the
+   background (it never delays a request; the session re-checks open files the moment it lands),
+   and when no binary is discoverable at all, a bundled stock 4.6.3 class surface keeps builtins
+   (`Node`, `Timer`, …) resolving — without inventing "unknown type" errors for classes only
+   your engine build knows. To pin a hand-made dump instead, set
    `initializationOptions.extensionApiPath`; to forbid gdls from ever spawning Godot, set
    `autoDumpExtensionApi: false` (or `GDLS_GODOT=off`) and dump manually from inside the
    project directory:
