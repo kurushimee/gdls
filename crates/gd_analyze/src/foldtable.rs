@@ -6,6 +6,7 @@
 //! arguments, `const` initializers) where the analyzer must evaluate an expression to a value.
 
 use gd_syntax::ast::NodeId;
+use crate::data_type::VariantType;
 
 /// A folded compile-time constant. The subset of `Variant` the analyzer needs in constant contexts;
 /// `Array`/`Dictionary` folding is added with the `make_*_reduced_value` family (WP-F).
@@ -16,6 +17,7 @@ pub enum FoldedValue {
     Int(i64),
     Float(f64),
     String(String),
+    Opaque(VariantType),
 }
 
 /// `NodeId` → its folded constant value, if the expression reduced to one.

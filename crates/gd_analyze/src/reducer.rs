@@ -311,6 +311,7 @@ pub fn type_from_variant(value: &FoldedValue) -> DataType {
             FoldedValue::Int(_) => VariantType::Int,
             FoldedValue::Float(_) => VariantType::Float,
             FoldedValue::String(_) => VariantType::String,
+            FoldedValue::Opaque(t) => *t,
         },
         ..Default::default()
     }
@@ -421,36 +422,44 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
     // semantics — every value is by-value — so the `!is_shared()` guards are trivially satisfied.
     // (Array/Dictionary literals do NOT get a `FoldedValue`, so `is_reduced` is false for them —
     // matching Godot's `is_shared()` skip; those go through the type-only path below.)
+    let mut both_reduced = false;
+    let mut opaque_skip = false;
+
     if let (Some(l), Some(r)) = (op_node.left_operand, op_node.right_operand) {
         if ctx.folds.is_reduced(l) && ctx.folds.is_reduced(r) {
+            both_reduced = true;
             let lv = ctx.folds.get(l).cloned();
             let rv = ctx.folds.get(r).cloned();
             if let (Some(lv), Some(rv)) = (lv, rv) {
-                if let Some(folded) = eval_binary(op_node.operation, &lv, &rv) {
-                    let dt = type_from_variant(&folded);
-                    ctx.folds.set(id, folded);
-                    ctx.set_type(id, dt);
+                if matches!(lv, FoldedValue::Opaque(_)) || matches!(rv, FoldedValue::Opaque(_)) {
+                    opaque_skip = true;
+                } else {
+                    if let Some(folded) = eval_binary(op_node.operation, &lv, &rv) {
+                        let dt = type_from_variant(&folded);
+                        ctx.folds.set(id, folded);
+                        ctx.set_type(id, dt);
+                        return;
+                    }
+                    // Fold attempted and failed — Godot's `r_valid = false` arm at
+                    // analyzer.cpp:3126-3135. Emit the exact `Invalid operands to operator OP, A and B.`
+                    // diagnostic the corpus pins (`errors/invalid_concatenation_bool.gd`,
+                    // `errors/bitwise_float_{left,right}_operand.gd`). Variant's evaluator names the
+                    // operand types via `Variant::get_type_name`, not `DataType::to_string` (the latter
+                    // form is the get_operation_type path at analyzer.cpp:3166).
+                    let lname = data_type::variant_type_name(folded_variant_type(&lv));
+                    let rname = data_type::variant_type_name(folded_variant_type(&rv));
+                    ctx.push_error(
+                        format!(
+                            "Invalid operands to operator {}, {} and {}.",
+                            binary_op_symbol(op_node.operation),
+                            lname,
+                            rname,
+                        ),
+                        id,
+                    );
+                    ctx.set_type(id, variant_dt());
                     return;
                 }
-                // Fold attempted and failed — Godot's `r_valid = false` arm at
-                // analyzer.cpp:3126-3135. Emit the exact `Invalid operands to operator OP, A and B.`
-                // diagnostic the corpus pins (`errors/invalid_concatenation_bool.gd`,
-                // `errors/bitwise_float_{left,right}_operand.gd`). Variant's evaluator names the
-                // operand types via `Variant::get_type_name`, not `DataType::to_string` (the latter
-                // form is the get_operation_type path at analyzer.cpp:3166).
-                let lname = data_type::variant_type_name(folded_variant_type(&lv));
-                let rname = data_type::variant_type_name(folded_variant_type(&rv));
-                ctx.push_error(
-                    format!(
-                        "Invalid operands to operator {}, {} and {}.",
-                        binary_op_symbol(op_node.operation),
-                        lname,
-                        rname,
-                    ),
-                    id,
-                );
-                ctx.set_type(id, variant_dt());
-                return;
             }
         }
     }
@@ -466,6 +475,7 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
         && left_dt.kind == DtKind::Builtin
         && left_dt.builtin_type == VariantType::String;
 
+    let mut op_valid = true;
     let result = if nil_eq {
         DataType {
             type_source: TypeSource::AnnotatedExplicit,
@@ -488,6 +498,7 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
         // Variant operator-validity table; an unregistered (op, a_type, b_type) triple emits the
         // `Invalid operands "X" and "Y" for "OP" operator.` error.
         let (res_dt, valid) = get_operation_type(op_node.operation, &left_dt, &right_dt);
+        op_valid = valid;
         if !valid {
             ctx.push_error(
                 format!(
@@ -499,7 +510,11 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
         }
         res_dt
     };
-    ctx.set_type(id, result);
+    ctx.set_type(id, result.clone());
+
+    if both_reduced && opaque_skip && op_valid && result.kind == DtKind::Builtin {
+        ctx.folds.set(id, FoldedValue::Opaque(result.builtin_type));
+    }
 }
 
 /// `GDScriptAnalyzer::get_operation_type(op, a, b, &valid, src)` (analyzer.cpp:6223). Mirrors
@@ -966,6 +981,7 @@ fn booleanize(v: &FoldedValue) -> bool {
         Int(i) => *i != 0,
         Float(f) => *f != 0.0,
         String(s) => !s.is_empty(),
+        Opaque(_) => false,
     }
 }
 
@@ -979,6 +995,7 @@ fn folded_variant_type(v: &FoldedValue) -> VariantType {
         FoldedValue::Int(_) => VariantType::Int,
         FoldedValue::Float(_) => VariantType::Float,
         FoldedValue::String(_) => VariantType::String,
+        FoldedValue::Opaque(t) => *t,
     }
 }
 
@@ -1157,6 +1174,9 @@ fn fold_lua_dict_key(ctx: &mut AnalysisContext, key_id: NodeId) {
 /// `StringName/String/NodePath` are coalesced into `FoldedValue::String` so they compare equal,
 /// matching `errors/dictionary_string_stringname_equivalent.gd`.
 fn folded_value_eq(a: &FoldedValue, b: &FoldedValue) -> bool {
+    if matches!(a, FoldedValue::Opaque(_)) || matches!(b, FoldedValue::Opaque(_)) {
+        return false;
+    }
     a == b
 }
 
@@ -1170,6 +1190,7 @@ fn folded_key_display(v: &FoldedValue) -> String {
         FoldedValue::Int(i) => i.to_string(),
         FoldedValue::Float(f) => f.to_string(),
         FoldedValue::String(s) => s.clone(),
+        FoldedValue::Opaque(_) => "<opaque>".to_owned(),
     }
 }
 
@@ -4251,12 +4272,10 @@ fn reduce_identifier_from_base(
                     ..Default::default()
                 };
                 ctx.set_type(identifier_id, typed);
-                // Stamp a placeholder `Nil` fold so downstream callers' `is_reduced` gate
-                // recognises this as a constant expression. The value itself isn't read by the
-                // assignment-compat / cast paths (they only consult the **type**), so a
-                // placeholder is sufficient. Faithful Color/Vector2/etc. value folding needs
-                // FoldedValue carrying the opaque builtin value, which is a separate slice.
-                ctx.folds.set(identifier_id, FoldedValue::Nil);
+                // We use an Opaque fold so downstream callers' `is_reduced` gate
+                // recognises this as a constant expression, but binary ops skip
+                // full evaluation (preventing false "Invalid operands" errors).
+                ctx.folds.set(identifier_id, FoldedValue::Opaque(base.builtin_type));
                 return;
             }
 
