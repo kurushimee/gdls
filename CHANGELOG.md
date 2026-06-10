@@ -15,8 +15,10 @@ The urgent diagnostics-correctness release. A post-v1.0.0 full-project sweep (di
 `.gd`, tally `publishDiagnostics`) found error-level **false positives in ~45–55% of files** on
 real layered projects (Pixelorama @ stock 4.6.3: 133/243 files, 1,223 errors; a 2,338-script
 production project: 1,051 files, 6,167 errors) — all violations of the "never lie" rule, all
-reproducing on vanilla Godot 4.6.3 fixtures. v1.0.1 fixes the four families behind that, closes
-both v1.0.0 follow-ups (#13, #14), and removes the last manual setup step (`extension_api.json`).
+reproducing on vanilla Godot 4.6.3 fixtures. v1.0.1 fixes the four families behind that — and the
+long tail the new sweep gate then exposed — closes both v1.0.0 follow-ups (#13, #14), and removes
+the last manual setup step (`extension_api.json`). **Outcome: the Pixelorama sweep reports 0
+files with errors** (from 133), with the conformance ratchets still at 186/186 + 300/300.
 
 ### Fixed — analyzer false positives
 - **Cross-file `extends ClassName` lost native lineage and inherited members** (#15): a new
@@ -42,6 +44,22 @@ both v1.0.0 follow-ups (#13, #14), and removes the last manual setup step (`exte
 - Cross-file named enums carry their **declared** integer values (literal chains; unknown values
   suppress `INT_AS_ENUM_WITHOUT_MATCH` / `ENUM_VARIABLE_WITHOUT_DEFAULT` instead of judging
   against sequential placeholders).
+- The long tail the sweep gate exposed, all vanilla: relative `preload("sibling.gd")` /
+  `extends "../x.gd"` paths resolve against the referring script's directory; autoloads work as
+  TYPE annotations (`-> Global`) and nested types under Script heads resolve
+  (`-> BaseLayer.BlendModes`); builtin INSTANCE members type (`pos.x` → `int`); `Object`-returning
+  utilities are Native-kind (fixes `instance_from_id(...) is Node3D`); the transform/xform
+  operator registrations are ported (`Transform2D * Vector2`, Basis/Quaternion/Projection
+  families); implicit conversion accepts Object-derived arguments for `RID` parameters; native
+  SIGNALS and bare native members resolve through the implicit class base (`position`,
+  `changed.connect(…)`); bare inherited calls walk the chain and call arity honors parameter
+  DEFAULTS; interfaces capture obvious `:=` member initializer types (literals, `Color.PURPLE`
+  via the dump, `X.new()`); builtin constructor calls over constant args are constant
+  (`match v:` `Vector2(-1, -1):`); ternaries of two hard same-shaped branches infer; assigning
+  through singleton metas is legal (`Engine.max_fps = x`); `Variant.Type` annotations resolve;
+  non-script preloads type by extension (`.tscn` → PackedScene, `.gdshader` → Shader); and a
+  same-file Class↔Script identity bridge fixes `self is OwnSubclass` / `node = node.parent`
+  chains.
 
 ### Added
 - **Cross-file member navigation slice** (#13): member access through typed bases and bare
