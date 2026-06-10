@@ -1920,6 +1920,7 @@ fn reduce_cast(ctx: &mut AnalysisContext, id: NodeId) {
     // Godot raises this inside `update_const_expression_builtin_type` with `p_is_cast=true`;
     // gdls's `reduce_cast` has its own validity matrix below, so the check is inlined here.
     if cast_type.kind == DtKind::Enum
+        && !cast_type.enum_values_inexact
         && (op_type.builtin_type == VariantType::Int || op_type.kind == DtKind::Enum)
     {
         if let Some(crate::foldtable::FoldedValue::Int(v)) = ctx.folds.get(operand_id).cloned() {
@@ -4430,11 +4431,20 @@ fn reduce_identifier_from_base(
                     dt.script_type = Some(sr.clone());
                     dt.is_constant = true;
                     // Populate enum_values from the EnumDecl so `MyEnum.VALUE` lookups via
-                    // `reduce_identifier_from_base`'s Enum-meta arm succeed (the values'
-                    // declared integer assignments aren't on the EnumDecl — only the names
-                    // — so we stamp sequential indices as placeholders).
-                    for (i, value_name) in enum_decl.values.iter().enumerate() {
-                        dt.enum_values.insert(value_name.clone(), i as i64);
+                    // `reduce_identifier_from_base`'s Enum-meta arm succeed. The interface
+                    // carries each value's syntactically-known integer; one the extractor
+                    // couldn't read keeps a sequential placeholder and marks the map inexact
+                    // so value-dependent diagnostics skip rather than judge against a guess.
+                    for (i, v) in enum_decl.values.iter().enumerate() {
+                        match v.value {
+                            Some(val) => {
+                                dt.enum_values.insert(v.name.clone(), val);
+                            }
+                            None => {
+                                dt.enum_values_inexact = true;
+                                dt.enum_values.insert(v.name.clone(), i as i64);
+                            }
+                        }
                     }
                     ctx.set_type(identifier_id, dt);
                     return;

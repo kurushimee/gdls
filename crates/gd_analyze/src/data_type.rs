@@ -356,6 +356,12 @@ pub struct DataType {
     pub method_sig: Option<Box<MethodSig>>,
     /// Members of an `Enum` kind.
     pub enum_values: HashMap<String, i64>,
+    /// `Enum` kind only: at least one of [`Self::enum_values`] is a placeholder, not the real
+    /// declared integer (a cross-file enum whose value expression the interface extractor could
+    /// not read). Value-dependent diagnostics (INT_AS_ENUM_WITHOUT_MATCH,
+    /// ENUM_VARIABLE_WITHOUT_DEFAULT) must skip when set — membership lookups stay valid.
+    /// Analyzer-internal; never serialized.
+    pub enum_values_inexact: bool,
     /// `Array[T]` → `[T]`; `Dictionary[K, V]` → `[K, V]`. Empty = unparameterized.
     pub container_element_types: Vec<DataType>,
 }

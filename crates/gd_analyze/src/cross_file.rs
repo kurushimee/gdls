@@ -76,6 +76,15 @@ pub trait CrossFileQuery {
         self.interface(file)?.enums.iter().find(|e| e.name == name)
     }
 
+    /// True iff `name` is a constant hoisted from an unnamed `enum { … }` block in `file`'s head
+    /// class. Drives `reduce_identifier_from_base`'s Script-meta anonymous-enum arm: only genuine
+    /// hoists may type as an enum *value* (Godot's ENUM_VALUE member arm, analyzer.cpp:4203-4209);
+    /// a regular `const` takes the CONSTANT arm (analyzer.cpp:4193-4200) and its declared type.
+    fn is_unnamed_enum_value(&self, file: FileId, name: &str) -> bool {
+        self.interface(file)
+            .is_some_and(|i| i.unnamed_enum_values.iter().any(|v| v == name))
+    }
+
     /// True iff the file's class is `@tool`. Used by MISSING_TOOL emission in resolve_class_inheritance.
     fn is_file_tool(&self, file: FileId) -> bool {
         self.interface(file).is_some_and(|i| i.is_tool)

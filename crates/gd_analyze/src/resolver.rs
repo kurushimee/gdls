@@ -2378,6 +2378,7 @@ fn resolve_assignable(
         && !is_constant
         && initializer.is_none()
         && ty.kind == DtKind::Enum
+        && !ty.enum_values_inexact
         && !ty.enum_values.is_empty()
         && !ty.enum_values.values().any(|&v| v == 0)
     {

@@ -106,7 +106,21 @@ pub struct MemberDecl {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EnumDecl {
     pub name: String,
-    pub values: Vec<String>,
+    pub values: Vec<EnumValueDecl>,
+}
+
+/// One value of a named enum: its identifier plus the integer it is syntactically known to hold.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EnumValueDecl {
+    pub name: String,
+    /// The value's integer when the extractor can read it without evaluation: an int literal, a
+    /// negated int literal, or the implicit previous-value-plus-one chain (Godot resolves these
+    /// in the analyzer, `gdscript_analyzer.cpp:1150-1197`; this parser-only pass follows the same
+    /// chain for literal assignments). `None` when the assigned expression needs evaluation
+    /// (`A = compute()`, `B = FLAG | 2`) — and every later implicit value in the same enum is then
+    /// also unknown. Consumers must degrade permissively on `None`: suppress value-dependent
+    /// diagnostics, never guess.
+    pub value: Option<i64>,
 }
 
 /// The shallow interface of one class: what it exposes, with no types resolved.
@@ -128,6 +142,12 @@ pub struct Interface {
     /// Named enums + their value identifiers. Reachable as `Self.<EnumName>.<value>` or
     /// (cross-file) `<preload_const>.<EnumName>.<value>`.
     pub enums: Vec<EnumDecl>,
+    /// Names of constants hoisted from *unnamed* `enum { … }` blocks. The hoisted members appear
+    /// in [`Self::members`] as ordinary `MemberKind::Const` entries (Godot hoists them the same
+    /// way); this list is what lets a cross-file consumer tell an anonymous-enum value apart from
+    /// a regular `const` — typing a regular const as an enum value is exactly the
+    /// `Cannot get property from enum value.` false-positive family.
+    pub unnamed_enum_values: Vec<String>,
     /// WP-RD12: `res://` paths this file `preload(...)`s / `load(...)`s. M2 deliberately excluded
     /// these as "body-level" edges, but a cross-file member-initializer cycle (WP-R2) reaches its
     /// target THROUGH a `const X = preload("res://b.gd")` — a const has no type annotation, so it
@@ -172,8 +192,12 @@ impl Interface {
             inner.signature_hash().hash(h);
         }
         for e in &self.enums {
+            // EnumValueDecl::value participates deliberately: explicit enum-value edits shift the
+            // value-dependent diagnostics of dependents (INT_AS_ENUM_WITHOUT_MATCH,
+            // ENUM_VARIABLE_WITHOUT_DEFAULT), so they must re-analyze.
             e.hash(h);
         }
+        self.unnamed_enum_values.hash(h);
     }
 }
 
@@ -231,6 +255,7 @@ fn extract_class(tree: &ParseTree, class: &ClassNode, annotations: &[NodeId]) ->
     let mut members = Vec::new();
     let mut inner = Vec::new();
     let mut enums = Vec::new();
+    let mut unnamed_enum_values = Vec::new();
     for member in &class.members {
         match member {
             Member::Class(id) => {
@@ -247,8 +272,14 @@ fn extract_class(tree: &ParseTree, class: &ClassNode, annotations: &[NodeId]) ->
                 members.extend(enum_member(tree, *id));
                 enums.extend(enum_decl(tree, *id));
             }
-            // A value of an *unnamed* enum is hoisted to a class constant.
-            Member::EnumValue(value) => members.extend(enum_value_member(tree, value)),
+            // A value of an *unnamed* enum is hoisted to a class constant; remember its name so
+            // cross-file consumers can tell it apart from a regular `const`.
+            Member::EnumValue(value) => {
+                if let Some(m) = enum_value_member(tree, value) {
+                    unnamed_enum_values.push(m.name.clone());
+                    members.push(m);
+                }
+            }
             // `@export_group`/category/subgroup — presentation only, not an exposed name.
             Member::Group(_) => {}
         }
@@ -263,6 +294,7 @@ fn extract_class(tree: &ParseTree, class: &ClassNode, annotations: &[NodeId]) ->
         members,
         inner,
         enums,
+        unnamed_enum_values,
         // WP-RD12: populated only on the head interface by `extract` (the DepGraph is per-file);
         // inner classes' preloads roll up there.
         preload_deps: Vec::new(),
@@ -418,22 +450,56 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     })
 }
 
-/// Build the [`EnumDecl`] sidecar for a *named* enum member — the enum name plus the identifier
-/// of every value inside it. Mirrors Godot's `EnumNode::values[i].identifier->name` walk
-/// (parsed from `gdscript_parser.cpp::parse_enum`). The values' integer assignments are not
-/// captured here — only their names, since the consumer set (cross-file enum-value attribute
-/// resolution, e.g. `preload_enum_error.gd`'s `P.Named.VALUE_A`) only needs membership.
+/// Build the [`EnumDecl`] sidecar for a *named* enum member — the enum name plus every value's
+/// identifier and (when syntactically readable) its integer. Mirrors Godot's
+/// `EnumNode::values[i]` walk: implicit values are previous + 1 (`gdscript_analyzer.cpp:
+/// 1174-1177`); a custom value that is an int literal (optionally negated) is read directly;
+/// anything needing evaluation yields `None` and poisons every later implicit value in the chain.
 fn enum_decl(tree: &ParseTree, id: NodeId) -> Option<EnumDecl> {
     let NodeKind::Enum(e) = &tree.get(id).kind else {
         return None;
     };
     let name = ident_name(tree, e.identifier)?;
-    let values = e
-        .values
-        .iter()
-        .filter_map(|v| ident_name(tree, v.identifier))
-        .collect();
+    let mut values = Vec::with_capacity(e.values.len());
+    let mut prev: Option<i64> = Some(-1);
+    for v in &e.values {
+        let Some(value_name) = ident_name(tree, v.identifier) else {
+            continue;
+        };
+        let value = match v.custom_value {
+            None => prev.map(|p| p.wrapping_add(1)),
+            Some(cv) => int_literal_value(tree, cv),
+        };
+        prev = value;
+        values.push(EnumValueDecl {
+            name: value_name,
+            value,
+        });
+    }
     Some(EnumDecl { name, values })
+}
+
+/// Read an int literal (optionally under a single unary minus) without evaluation; anything else
+/// is `None` — the extractor never folds expressions (that's the analyzer's job).
+fn int_literal_value(tree: &ParseTree, id: NodeId) -> Option<i64> {
+    use gd_syntax::ast::UnaryOp;
+    use gd_syntax::token::Literal;
+    match &tree.get(id).kind {
+        NodeKind::Literal(l) => match l.value {
+            Literal::Int(v) => Some(v),
+            _ => None,
+        },
+        NodeKind::UnaryOp(u) if u.operation == UnaryOp::Negative => {
+            match &tree.get(u.operand?).kind {
+                NodeKind::Literal(l) => match l.value {
+                    Literal::Int(v) => Some(v.wrapping_neg()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn enum_value_member(tree: &ParseTree, value: &EnumValue) -> Option<MemberDecl> {
@@ -500,6 +566,37 @@ mod tests {
 
     fn iface(src: &str) -> Interface {
         extract(&gd_syntax::parse(src).tree)
+    }
+
+    #[test]
+    fn enum_values_follow_literal_chain_and_poison_on_expressions() {
+        let i = iface(
+            "enum Mode { A, B = 5, C, D = -2, E }\nenum Hard { X = 1 << 3, Y, Z = 9 }\nenum { LOOSE, FREE }\nconst PLAIN := 1\n",
+        );
+        let mode = i.enums.iter().find(|e| e.name == "Mode").expect("Mode");
+        let vals: Vec<(String, Option<i64>)> = mode
+            .values
+            .iter()
+            .map(|v| (v.name.clone(), v.value))
+            .collect();
+        assert_eq!(
+            vals,
+            vec![
+                ("A".into(), Some(0)),
+                ("B".into(), Some(5)),
+                ("C".into(), Some(6)),
+                ("D".into(), Some(-2)),
+                ("E".into(), Some(-1)),
+            ]
+        );
+        // `1 << 3` needs evaluation — unknown, and it poisons the implicit `Y`; the explicit
+        // literal `Z` recovers.
+        let hard = i.enums.iter().find(|e| e.name == "Hard").expect("Hard");
+        let vals: Vec<Option<i64>> = hard.values.iter().map(|v| v.value).collect();
+        assert_eq!(vals, vec![None, None, Some(9)]);
+        // Unnamed-enum hoists are tracked by name; a regular const is not.
+        assert_eq!(i.unnamed_enum_values, vec!["LOOSE", "FREE"]);
+        assert!(i.members.iter().any(|m| m.name == "PLAIN"));
     }
 
     #[test]
