@@ -18,6 +18,16 @@ fn recv(conn: &Connection) -> Message {
         .expect("timed out waiting for a message from the server")
 }
 
+/// `recv`, skipping server-initiated notifications (a `publishDiagnostics` can land later than a
+/// timeout-based drain expected on a slow host) until a Response arrives.
+fn recv_response(conn: &Connection) -> lsp_server::Response {
+    loop {
+        if let Message::Response(resp) = recv(conn) {
+            return resp;
+        }
+    }
+}
+
 fn request(id: i32, method: &str, params: serde_json::Value) -> Message {
     Message::Request(Request {
         id: RequestId::from(id),
@@ -61,9 +71,7 @@ fn m0_lifecycle_diagnostics_and_symbols() {
         ))
         .unwrap();
 
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected an initialize response");
-    };
+    let resp = recv_response(&client);
     assert_eq!(resp.id, RequestId::from(1));
     assert!(resp.error.is_none(), "initialize errored: {:?}", resp.error);
     let result: InitializeResult =
@@ -137,9 +145,7 @@ fn m0_lifecycle_diagnostics_and_symbols() {
         ))
         .unwrap();
 
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected a documentSymbol response");
-    };
+    let resp = recv_response(&client);
     assert_eq!(resp.id, RequestId::from(2));
     assert!(resp.error.is_none());
     // A1 changed documentSymbol: now returns a single root Class wrapping members. For an unnamed
@@ -161,9 +167,7 @@ fn m0_lifecycle_diagnostics_and_symbols() {
         .sender
         .send(request(3, "shutdown", serde_json::Value::Null))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected a shutdown response");
-    };
+    let resp = recv_response(&client);
     assert_eq!(resp.id, RequestId::from(3));
     client
         .sender

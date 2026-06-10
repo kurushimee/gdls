@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{file_uri, notification, recv, request, shutdown, TempProject};
+use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};
 use lsp_types::{
     ClientCapabilities, DocumentLinkParams, GeneralClientCapabilities, InitializeParams,
@@ -77,9 +77,7 @@ fn initialize_advertises_document_link_provider() {
         ..Default::default()
     };
     client.sender.send(request(1, "initialize", init)).unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected initialize response");
-    };
+    let resp = recv_response(&client);
     let result: InitializeResult =
         serde_json::from_value(resp.result.expect("initialize result")).unwrap();
     assert!(
@@ -128,9 +126,7 @@ fn document_link_returns_res_path_links() {
         ))
         .unwrap();
 
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected documentLink response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "documentLink errored: {:?}",
@@ -187,9 +183,7 @@ fn document_link_no_link_for_nonexistent_res_path() {
         ))
         .unwrap();
 
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected documentLink response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "documentLink errored: {:?}",
@@ -233,9 +227,7 @@ fn document_link_ignores_non_res_strings() {
         ))
         .unwrap();
 
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected documentLink response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "documentLink errored: {:?}",
@@ -282,9 +274,7 @@ fn document_link_links_non_gd_resource() {
         ))
         .unwrap();
 
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected documentLink response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "documentLink errored: {:?}",
@@ -337,9 +327,7 @@ fn document_link_no_link_for_nonexistent_non_gd_resource() {
         ))
         .unwrap();
 
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected documentLink response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "documentLink errored: {:?}",

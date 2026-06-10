@@ -20,6 +20,16 @@ fn recv(conn: &Connection) -> Message {
         .expect("timed out waiting for a message from the server")
 }
 
+/// `recv`, skipping server-initiated notifications (a `publishDiagnostics` can land later than a
+/// timeout-based drain expected on a slow host) until a Response arrives.
+fn recv_response(conn: &Connection) -> lsp_server::Response {
+    loop {
+        if let Message::Response(resp) = recv(conn) {
+            return resp;
+        }
+    }
+}
+
 fn request(id: i32, method: &str, params: serde_json::Value) -> Message {
     Message::Request(Request {
         id: RequestId::from(id),
@@ -135,9 +145,7 @@ fn hover_at(client: &Connection, uri: &Uri, position: Position) -> Option<Hover>
             serde_json::to_value(params).unwrap(),
         ))
         .unwrap();
-    let Message::Response(resp) = recv(client) else {
-        panic!("expected hover response");
-    };
+    let resp = recv_response(client);
     let value = resp.result.expect("hover result is always present");
     serde_json::from_value(value).expect("valid Option<Hover>")
 }
@@ -163,9 +171,7 @@ fn definition_at(
             serde_json::to_value(params).unwrap(),
         ))
         .unwrap();
-    let Message::Response(resp) = recv(client) else {
-        panic!("expected definition response");
-    };
+    let resp = recv_response(client);
     let value = resp.result.expect("definition result is always present");
     serde_json::from_value(value).expect("valid Option<GotoDefinitionResponse>")
 }
