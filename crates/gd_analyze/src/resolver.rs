@@ -1095,7 +1095,24 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
                         resolve_class_member(ctx, look, idx, None);
                     }
                 }
-                let const_dt = ctx.get_type(const_id).clone();
+                let mut const_dt = ctx.get_type(const_id).clone();
+                // `const X: Script = preload("…")` used as a TYPE: the explicit `Script`
+                // annotation hides the preload's Script-meta — but Godot's type usage reads
+                // the constant's reduced VALUE (the loaded script class), so prefer the
+                // initializer's meta when the annotated type isn't one.
+                if !const_dt.is_meta_type {
+                    if let NodeKind::Constant(c) = ctx.node(const_id).kind.clone() {
+                        if let Some(init) = c.initializer {
+                            crate::reducer::reduce_expression(ctx, init, false);
+                            let init_dt = ctx.get_type(init).clone();
+                            if init_dt.is_meta_type
+                                && matches!(init_dt.kind, DtKind::Script | DtKind::Class)
+                            {
+                                const_dt = init_dt;
+                            }
+                        }
+                    }
+                }
                 if const_dt.is_set() {
                     return Some(const_dt);
                 }
