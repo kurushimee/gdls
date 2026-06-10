@@ -199,6 +199,43 @@ fn serve_inner(
         "memory budget resolved"
     );
 
+    // Arm the filesystem watcher BEFORE the workspace loads (issue #14): every modification that
+    // lands while the load's stat pass runs is then a queued channel event replayed once the
+    // loop arms — which is exactly what lets the startup reconcile run in `DiscoverOnly` mode
+    // (enumeration-only for known files) instead of re-statting the whole tree. The watcher only
+    // needs the root path; `ProjectModel::load` stores that same path verbatim. WP-RD3: the
+    // injected source replaces the real watcher with a caller-fed receiver (no handle,
+    // never-ticker) so the dark watcher branches are drivable from `tests/watcher_event_loop.rs`.
+    let (watcher, mut watcher_rx, ticker): (
+        Option<FileWatcher>,
+        Option<Receiver<DebounceEventResult>>,
+        Receiver<Instant>,
+    ) = match watcher_source {
+        WatcherSource::Real => {
+            let arm_start = Instant::now();
+            let watcher = match FileWatcher::new(&root) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    log::warn!("FileWatcher disabled: {e}; freshness will be open-buffer-only");
+                    None
+                }
+            };
+            // Issue #14 attribution: arming used to hide a full-tree FileIdMap scan inside this
+            // call; keep the timing visible so a regression can't masquerade as reconcile cost.
+            log::info!(
+                "watcher: armed on {root} in {} ms",
+                arm_start.elapsed().as_millis()
+            );
+            let rx = watcher.as_ref().map(|w| w.events().clone());
+            (
+                watcher,
+                rx,
+                crossbeam_channel::tick(WATCHER_LIVENESS_INTERVAL),
+            )
+        }
+        WatcherSource::Injected(rx) => (None, Some(rx), crossbeam_channel::never::<Instant>()),
+    };
+
     // Build the workspace (native DB + project model + cold index) only after the `initialize`
     // response is sent, so a large scan never stalls the handshake (WP-F: start inline).
     let workspace = Workspace::load(&root, &options);
@@ -223,45 +260,23 @@ fn serve_inner(
         memory_pressure: MemoryPressure::Normal,
     };
 
-    // Construct the filesystem watcher AND its event-source seam AFTER cold-index finishes; in
-    // production the real `FileWatcher` is armed on the project root so events during the heavy
-    // cold-scan window are queued rather than lost, and the liveness ticker re-stats the root.
-    // Reconciliation (below) diffs the freshly-walked tree against the index to catch anything
-    // `notify` dropped during that window (see `docs/03 §6.1`). WP-RD3: the injected source
-    // replaces the real watcher with a caller-fed receiver (no handle, never-ticker) so the dark
-    // watcher branches are drivable from `tests/watcher_event_loop.rs`.
-    let (watcher, mut watcher_rx, ticker): (
-        Option<FileWatcher>,
-        Option<Receiver<DebounceEventResult>>,
-        Receiver<Instant>,
-    ) = match watcher_source {
-        WatcherSource::Real => {
-            let watcher = match FileWatcher::new(&state.workspace.project.root) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    log::warn!("FileWatcher disabled: {e}; freshness will be open-buffer-only");
-                    None
-                }
-            };
-            let rx = watcher.as_ref().map(|w| w.events().clone());
-            (
-                watcher,
-                rx,
-                crossbeam_channel::tick(WATCHER_LIVENESS_INTERVAL),
-            )
-        }
-        WatcherSource::Injected(rx) => (None, Some(rx), crossbeam_channel::never::<Instant>()),
-    };
     // At startup no buffers are open yet, so this set is empty; building it via the same helper the
     // watcher uses keeps the "open buffer wins" rule uniform and correct even if a future change
     // opens a buffer before this point. The dirty set this reconcile produces is drained lazily —
     // each file clears its own bit on first `analyze`, so there is no
     // startup-time republish to perform here.
     let open_paths = open_buffer_paths(&state);
-    // On a warm start this is the second full walk (`warm_index_from_cache` already stat-diffed
-    // the tree) — deliberate: reconcile is the single authoritative settle pass for cold and warm
-    // alike. Rationale and bench witness in `warm_index_from_cache`'s doc.
-    let report = state.workspace.reconcile(&open_paths);
+    // The settle pass. With a real watcher armed (BEFORE the load, above), every known file was
+    // just stat-validated by the load itself and modifications in the gap are queued events —
+    // so the backstop only needs added/removed discovery (`DiscoverOnly`). Without a live
+    // watcher (construction failed, or the injected test seam) freshness is already degraded,
+    // so buy the full stat-diff insurance.
+    let reconcile_mode = if watcher.is_some() {
+        crate::workspace::ReconcileMode::DiscoverOnly
+    } else {
+        crate::workspace::ReconcileMode::FullStat
+    };
+    let report = state.workspace.reconcile_with(reconcile_mode, &open_paths);
     // M5 WP-O1 — preserved verbatim marker (operators & log-greppers depend on this exact label).
     // The reconcile span has already closed at this point (it lives inside Workspace::reconcile),
     // so this event arrives at root scope and stands alone in the trace — exactly the way it

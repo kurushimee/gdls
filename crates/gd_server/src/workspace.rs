@@ -642,6 +642,21 @@ impl Workspace {
     /// indexed file from the index. Operators see the skip as a `walk_errors` count in the
     /// summary line so they can investigate.
     pub fn reconcile(&mut self, open_paths: &FxHashSet<Utf8PathBuf>) -> ReconciliationReport {
+        self.reconcile_with(ReconcileMode::FullStat, open_paths)
+    }
+
+    /// [`Self::reconcile`] with an explicit [`ReconcileMode`]. `FullStat` is the historical
+    /// behavior (stat-diff every walked file); `DiscoverOnly` is the startup backstop when a
+    /// live watcher is armed BEFORE the workspace loads: the load's own stat pass already
+    /// validated every known file and any modification since lands as a queued watcher event,
+    /// so the only job left is discovering files ADDED or REMOVED outside both — enumeration
+    /// plus stat/parse for unknown paths only. On NTFS at 2.3k files that turns the 7–9 s
+    /// re-stat walk into a sub-second directory enumeration (issue #14).
+    pub fn reconcile_with(
+        &mut self,
+        mode: ReconcileMode,
+        open_paths: &FxHashSet<Utf8PathBuf>,
+    ) -> ReconciliationReport {
         // M5 WP-O1: reconcile span. Both the cold-start post-load reconcile and the watcher's
         // `need_rescan` overflow path flow through here. The 6 counters in the on-close fields
         // mirror the `cold_index_reconciled` marker line below — the marker line stays for
@@ -726,14 +741,23 @@ impl Workspace {
                 continue;
             }
 
+            // DiscoverOnly: a path already in the stat table was validated by the load's own
+            // stat pass moments ago, and any modification since is a queued watcher event —
+            // skip the per-file stat entirely. Unknown paths (added while the server was off)
+            // fall through to the full stat + parse below.
+            if mode == ReconcileMode::DiscoverOnly && self.stat_table.contains_key(&path) {
+                continue;
+            }
+
             // Stat-based change detection: compare (size, mtime_ns) against the stored table.
             // If stat fails (vanished mid-walk, permission), fall back to re-parsing so we don't
-            // silently drop an added file or leave a stale interface.
-            let meta = std::fs::metadata(path.as_std_path());
-            let new_stat = meta
-                .as_ref()
+            // silently drop an added file or leave a stale interface. The stat comes from the
+            // walk entry — free on Windows (populated by directory enumeration, issue #14), the
+            // same single stat on unix.
+            let new_stat = entry
+                .metadata()
                 .ok()
-                .map(|m| cache::stat_from_metadata(path.clone(), m));
+                .map(|m| cache::stat_from_metadata(path.clone(), &m));
 
             let in_table = self.stat_table.get(&path);
             let stat_changed = match (in_table, &new_stat) {
@@ -805,12 +829,17 @@ impl Workspace {
         };
 
         // M5 WP-O1 — preserved verbatim marker (operators & log-greppers depend on this exact
-        // label). Migrated from `log::info!` to `tracing::info!` so the event is attached to the
-        // surrounding `reconcile` span instead of arriving at root scope.
+        // label; the trailing `mode=` field is additive). Migrated from `log::info!` to
+        // `tracing::info!` so the event is attached to the surrounding `reconcile` span instead
+        // of arriving at root scope.
+        let mode_label = match mode {
+            ReconcileMode::FullStat => "full",
+            ReconcileMode::DiscoverOnly => "discover",
+        };
         tracing::info!(
             "cold_index_reconciled added={added} modified={modified} removed={removed} \
              walked={walked} walk_errors={walk_errors} skipped_unreadable={skipped_unreadable} \
-             skipped_non_utf8={skipped_non_utf8}"
+             skipped_non_utf8={skipped_non_utf8} mode={mode_label}"
         );
         _span.record("added", added as u64);
         _span.record("modified", modified as u64);
@@ -829,6 +858,19 @@ impl Workspace {
             skipped_non_utf8,
         }
     }
+}
+
+/// How [`Workspace::reconcile_with`] treats files already known to the stat table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileMode {
+    /// Stat-diff every walked file (the historical behavior). The watcher `need_rescan` overflow
+    /// path, the watcher-disabled fallback tick, and `gdls diagnose --reconcile` need this —
+    /// they run when freshness has genuinely degraded.
+    FullStat,
+    /// Enumeration-only for known paths: stat + parse only files absent from the stat table
+    /// (added), plus the standard removal pass. Sound only when a live watcher was armed before
+    /// the workspace loaded (modifications in the gap are queued events).
+    DiscoverOnly,
 }
 
 /// Outcome of a [`Workspace::reconcile`] pass. Used by `gdls diagnose --reconcile` (WP-T3) and by
@@ -949,12 +991,13 @@ fn warm_index_from_cache(
         let path = gd_project::normalize_path(p);
         walked_paths.insert(path.clone());
 
-        // Stat the file and compare to the cached table entry.
-        let meta = std::fs::metadata(path.as_std_path());
-        let new_stat = meta
-            .as_ref()
+        // Stat from the walk entry, not a fresh `fs::metadata`: on Windows the DirEntry's
+        // metadata is populated from the directory enumeration itself (zero extra syscalls —
+        // issue #14's per-file CreateFile cost), and on unix it's the same one stat.
+        let new_stat = entry
+            .metadata()
             .ok()
-            .map(|m| cache::stat_from_metadata(path.clone(), m));
+            .map(|m| cache::stat_from_metadata(path.clone(), &m));
 
         let stat_changed = match (stat_table.get(&path), &new_stat) {
             (None, _) => true,       // added — not in cache
