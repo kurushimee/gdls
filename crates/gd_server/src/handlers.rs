@@ -1,6 +1,8 @@
 //! LSP request handlers.
 
-use gd_analyze::{find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, DtKind};
+use gd_analyze::{
+    find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, BindingTargetKind, DtKind,
+};
 use gd_syntax::ast::{
     ClassNode, ConstantNode, FunctionNode, LiteralNode, NodeId, NodeKind, ParseTree, SignalNode,
     SubscriptAccess, VariableNode,
@@ -324,6 +326,38 @@ pub fn definition(
         return Some(GotoDefinitionResponse::Scalar(loc));
     }
 
+    // (1.5) Cross-file member access (#13): the analyzer records a `Binding::Use` at this exact
+    // identifier span with the DECLARING file whenever the cross-file member walk
+    // (`lookup_script_chain_member`) resolved it — attribute sites (`obj.sig`, `obj.method`) and
+    // bare inherited members alike. Projecting the binding inherits the analyzer's resolution by
+    // construction (the same "never lie" shape as the autoload gate below). Class-kind bindings
+    // are excluded — class_name/autoload jumps belong to steps (2)/(D) and their own gates.
+    {
+        let node_span = parsed.tree.get(node_id).span;
+        let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+        let target = analyzed.as_deref().and_then(|a| {
+            a.bindings().iter().find_map(|b| match b {
+                Binding::Use {
+                    site,
+                    target_file: Some(f),
+                    target_kind,
+                    target_name,
+                } if *site == node_span
+                    && *target_kind != BindingTargetKind::Class
+                    && target_name == &name =>
+                {
+                    Some(*f)
+                }
+                _ => None,
+            })
+        });
+        if let Some(fid) = target {
+            if let Some(loc) = member_decl_location(state, fid, &name) {
+                return Some(GotoDefinitionResponse::Scalar(loc));
+            }
+        }
+    }
+
     // (2) Cross-file `class_name`.
     if let Some(loc) = find_global_class_definition(state, &name) {
         return Some(GotoDefinitionResponse::Scalar(loc));
@@ -641,13 +675,12 @@ fn format_func_signature(fn_name: &str, decl: &gd_project::MemberDecl) -> String
 }
 
 /// Member-signature hover for a subscript ATTRIBUTE identifier outside a callee position — the
-/// signal in `obj.sig.emit()` / `Singleton.sig.connect(…)`, or an uncalled method reference like
-/// `var f = obj.method` — where the base expression resolves to a project script. The Call-gated
-/// [`hover_member_signature`] can't reach these: for `obj.sig.emit()` the enclosing Call's callee
-/// attribute is `emit`, never `sig`. Renders `func`/`signal` member signatures from the base
-/// script's interface; every other member kind returns `None` so the expression-type label keeps
-/// reporting the analyzer's resolved type (the honest answer until the cross-file instance-member
-/// typing slice lands — see the Script-instance deferral note in `reducer.rs`).
+/// signal in `obj.sig.emit()` / `Singleton.sig.connect(…)`, an uncalled method reference like
+/// `var f = obj.method`, or a `var`/`const` member — where the base expression resolves to a
+/// project script. The Call-gated [`hover_member_signature`] can't reach these: for
+/// `obj.sig.emit()` the enclosing Call's callee attribute is `emit`, never `sig`. Renders the
+/// member's declaration shape from the base script's interface; named enums return `None` so the
+/// expression-type label keeps reporting the analyzer's resolved enum meta type.
 fn hover_attribute_member_signature(
     state: &ServerState,
     tree: &ParseTree,
@@ -672,24 +705,68 @@ fn hover_attribute_member_signature(
     })?;
     let base_id = sub_base?;
 
-    let base_dt = analyzed.types.get(base_id);
-    if base_dt.kind != DtKind::Script {
-        return None;
-    }
-    let script_ref = base_dt.script_type.as_ref()?;
-    let iface = state.workspace.index.interface(script_ref.file)?;
     let name = ident_name(tree, attr_id);
     if name.is_empty() {
         return None;
     }
-    let decl = iface.members.iter().find(|m| m.name.as_str() == name)?;
+    let attr_span = tree.get(attr_id).span;
+
+    // The declaring interface, two ways: the analyzer's `Binding::Use` at this attribute names
+    // the PRECISE declaring file (covers Class-kind `self.<member>` bases and members inherited
+    // deeper in the chain); a Script-kind base's head interface is the fallback for accesses the
+    // member walk deliberately skipped (e.g. an instance method referenced through a meta base —
+    // still worth a signature hover).
+    let binding_iface = analyzed.bindings().iter().find_map(|b| match b {
+        Binding::Use {
+            site,
+            target_file: Some(f),
+            target_name,
+            ..
+        } if *site == attr_span && target_name.as_str() == name => {
+            state.workspace.index.interface(*f)
+        }
+        _ => None,
+    });
+    let base_dt = analyzed.types.get(base_id);
+    let direct_iface = if base_dt.kind == DtKind::Script {
+        base_dt
+            .script_type
+            .as_ref()
+            .and_then(|sr| state.workspace.index.interface(sr.file))
+    } else {
+        None
+    };
+    let decl = [binding_iface, direct_iface]
+        .into_iter()
+        .flatten()
+        .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))?;
 
     let sig = match decl.kind {
         gd_project::MemberKind::Func => format_func_signature(name, decl),
         gd_project::MemberKind::Signal => {
             format!("signal {}({})", name, format_member_params(decl))
         }
-        _ => return None,
+        gd_project::MemberKind::Var | gd_project::MemberKind::Property => {
+            let keyword = if decl.flags.is_static {
+                "static var"
+            } else {
+                "var"
+            };
+            match &decl.ty {
+                gd_project::TypeExpr::Named { path, .. } => {
+                    format!("{keyword} {name}: {}", path.join("."))
+                }
+                gd_project::TypeExpr::None => format!("{keyword} {name}"),
+            }
+        }
+        gd_project::MemberKind::Const => match &decl.ty {
+            gd_project::TypeExpr::Named { path, .. } => {
+                format!("const {name}: {}", path.join("."))
+            }
+            gd_project::TypeExpr::None => format!("const {name}"),
+        },
+        // Named enums keep the analyzer's enum-meta type label (no signature to render).
+        gd_project::MemberKind::Enum => return None,
     };
     Some(format!("```gdscript\n{sig}\n```"))
 }
@@ -907,6 +984,49 @@ fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
 /// parse tree has no root identifier (genuinely empty file). I/O failures on the closed path are
 /// logged at `warn` so operators can see "definition vanished because the file became unreadable"
 /// rather than silently degrading to "no definition found."
+/// Location of `name`'s declaration in `fid`'s head interface (any member kind, incl. named
+/// enums and unnamed-enum hoists — they all carry a `MemberDecl` with a span). Built against the
+/// target file's current text (open buffer wins over disk), like
+/// [`find_global_class_definition`]. Inner-class members aren't head-interface visible and
+/// degrade to `None` (the documented inner-class stance).
+fn member_decl_location(
+    state: &mut ServerState,
+    fid: gd_project::FileId,
+    name: &str,
+) -> Option<Location> {
+    let span = state
+        .workspace
+        .index
+        .interface(fid)?
+        .members
+        .iter()
+        .find(|m| m.name == name)
+        .map(|m| m.span)?;
+    let path = state.workspace.index.path(fid)?.to_path_buf();
+    let uri = path_to_file_uri(&path)?;
+    let uri_str = uri.as_str().to_owned();
+    let text = if let Some(text) = state.vfs.get(&uri_str).map(|d| d.text()) {
+        text
+    } else {
+        match std::fs::read_to_string(path.as_std_path()) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!(
+                    "could not read {path} for member definition of `{name}`: {e}; \
+                     jump degrades to no-result"
+                );
+                return None;
+            }
+        }
+    };
+    let rope = ropey::Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    Some(Location {
+        uri,
+        range: mapper.span_to_range(span),
+    })
+}
+
 fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<Location> {
     let entry = state.workspace.index.registry().get(name)?;
     let path = entry.path.clone();

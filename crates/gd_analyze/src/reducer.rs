@@ -1562,7 +1562,15 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
 /// The cross-file Script base at the bottom of the current class's in-file chain, if any —
 /// the entry point for inherited-member lookups that must continue past the file boundary.
 fn current_class_script_base(ctx: &AnalysisContext) -> Option<crate::data_type::ScriptRef> {
-    let mut cur = ctx.current_class?;
+    script_base_of_class(ctx, ctx.current_class?)
+}
+
+/// The cross-file Script base at the bottom of `class_id`'s in-file base chain, if any.
+fn script_base_of_class(
+    ctx: &AnalysisContext,
+    class_id: NodeId,
+) -> Option<crate::data_type::ScriptRef> {
+    let mut cur = class_id;
     loop {
         let base = ctx.bases.get(&cur).cloned().unwrap_or_default();
         match base.kind {
@@ -4792,6 +4800,20 @@ fn reduce_identifier_from_base(
                     ctx.folds.set(identifier_id, fv);
                 }
                 return;
+            }
+            // The in-file walk missed; continue into the cross-file part of the chain (the
+            // analyzer.cpp:4166-4267 script_classes loop crossing the file boundary) — this is
+            // what types `self.hp` when `hp` lives in a cross-file base.
+            if let Some(sr) = script_base_of_class(ctx, class_id) {
+                if let Some((dt, fold)) =
+                    lookup_script_chain_member(ctx, &sr, &name, base.is_meta_type, identifier_id)
+                {
+                    if let Some(fv) = fold {
+                        ctx.folds.set(identifier_id, fv);
+                    }
+                    ctx.set_type(identifier_id, dt);
+                    return;
+                }
             }
         }
         // Constructor (`.new` ⇒ `_init`) on an in-file class: synthesize a Callable so the
