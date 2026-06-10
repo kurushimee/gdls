@@ -494,6 +494,34 @@ fn walks_back_to(ctx: &AnalysisContext, class_id: NodeId, result: &DataType) -> 
     false
 }
 
+/// A bare enum name resolved through the current class's inherited scope: script-chain base
+/// enums first (they shadow native), then the native inherits chain (returning the DECLARING
+/// class so the enum renders `BT.Status`). Meta-typed — annotations lower via
+/// `type_from_metatype`.
+fn inherited_enum_annotation(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> {
+    let class_id = ctx.current_class?;
+    if let Some(sr) = crate::reducer::current_class_script_base(ctx) {
+        let chain = crate::script_chain::resolve_script_chain(ctx, &sr);
+        for link in chain.links.clone() {
+            let has = crate::script_chain::link_interface(ctx.xfile, &link)
+                .is_some_and(|i| i.enums.iter().any(|e| e.name == name));
+            if has && link.inner.is_empty() {
+                return crate::reducer::cross_file_named_enum(ctx, link.file, name, true);
+            }
+        }
+    }
+    let root = nearest_native_ancestor(ctx, class_id)?;
+    let mut cur = Some(root);
+    while let Some(c) = cur {
+        let nc = ctx.native.class_named(&c)?;
+        if nc.enums.iter().any(|e| ctx.native.name_of(e.name) == name) {
+            return Some(make_native_enum_type(ctx, name, &c, true));
+        }
+        cur = nc.inherits.map(|s| ctx.native.name_of(s).to_owned());
+    }
+    None
+}
+
 /// Build the base [`DataType`] for an `extends`-ed project script, with the chain's native root
 /// stamped into `native_type` — Godot's `class_type.native_type = result.native_type`
 /// (analyzer.cpp:617-619), which is what keeps `$`/`@onready`/self-compat working through
@@ -668,6 +696,12 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         // shape as the global-class arm; nested segments (`Keychain.InputAction`) continue
         // through the Script-segment walk below.
         result = script_base_datatype(ctx, fid);
+    } else if let Some(dt) = inherited_enum_annotation(ctx, &first) {
+        // A bare enum NAME from the class's INHERITED scope: a cross-file script base's enum
+        // (`-> Status` with `enum Status` on the base) or a native base-chain enum (LimboAI's
+        // `BT.Status` reachable bare inside `extends BTDecorator`). Godot's in-scope type
+        // lookup includes base members (analyzer.cpp:860-898) and ClassDB enums.
+        result = dt;
     }
 
     if !result.is_set() {

@@ -1595,7 +1595,9 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
 
 /// The cross-file Script base at the bottom of the current class's in-file chain, if any —
 /// the entry point for inherited-member lookups that must continue past the file boundary.
-fn current_class_script_base(ctx: &AnalysisContext) -> Option<crate::data_type::ScriptRef> {
+pub(crate) fn current_class_script_base(
+    ctx: &AnalysisContext,
+) -> Option<crate::data_type::ScriptRef> {
     script_base_of_class(ctx, ctx.current_class?)
 }
 
@@ -4788,7 +4790,13 @@ fn lookup_script_chain_member(
                 if base_is_meta && !member.flags.is_static {
                     continue; // VARIABLE arm condition (analyzer.cpp:4219-4226)
                 }
-                let dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
+                let mut dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
+                // A VAR member is never a constant, whatever its TYPE carries — enum-typed
+                // members (`var key: Key`) get instance types whose constructors mark
+                // is_constant, and leaving it set made `obj.key = x` error
+                // `Cannot assign a new value to a constant.` project-wide.
+                dt.is_constant = false;
+                dt.is_read_only = false;
                 record_member_use(ctx, link, BindingSymbolKind::Variable, name, bind_site);
                 return Some((dt, None));
             }
