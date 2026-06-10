@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **Background dump timeout raised 60 s → 5 min**: the deadline exists only to reap a wedged
+  Godot child, and the dump left the critical path in v1.0.2 — a generous budget costs nothing,
+  while 60 s could kill legitimate slow first boots (cold import caches, AV-scanned binaries,
+  huge projects) mid-dump.
+
 ### Fixed
 - **No background auto-dump when `extensionApiPath` is pinned**: `load_native` never consults
   the managed `.gdls/` dump while an explicit path is set, so the background Godot boot was

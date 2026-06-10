@@ -46,7 +46,8 @@ of their class hints resolving) and logs the remediation (open the project in th
 resolution ladder when no explicit path is set: fresh `.gdls` dump → auto-dump → stale `.gdls` dump →
 unmanaged `<root>/extension_api.json` → empty/dynamic. Spawning happens only at session startup, only
 for real projects (`project.godot` present), with the child's stdout/stderr piped (stdout is the LSP
-wire) and a 60 s kill-timeout.
+wire) and a 5 min kill-timeout (off the critical path since v1.0.2, so the budget is deliberately
+generous — and a deadline-killed dump that already wrote its artifact is still adopted).
 
 **Manual workflow (auto-dump disabled or no binary):** after rebuilding Godot, re-run
 `--dump-extension-api-with-docs` from inside the project and point gdls at the JSON via

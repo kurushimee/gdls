@@ -42,9 +42,11 @@ pub(crate) enum DumpOutcome {
 /// Bump independently of `gd_project::cache::CACHE_FORMAT_VERSION` when this file's shape changes.
 const META_FORMAT_VERSION: u32 = 1;
 
-/// Wall-clock budget for the dump. A cold Godot boot on a large project takes seconds; 60 s is
-/// generous without letting a hung binary wedge startup forever.
-const DUMP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Wall-clock budget for the dump. Generous on purpose: the dump runs on a background thread
+/// (never on the startup path), so a long wait costs only a lingering child process — while a
+/// tight deadline kills legitimate slow first boots (cold import caches, AV-scanned binaries,
+/// huge projects). A deadline kill still adopts a completed artifact ("the artifact decides").
+const DUMP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// `.gdls/extension_api.meta.json` — everything that decides whether the cached dump is fresh.
 /// Written only after the dump PARSED, so a torn dump can never look fresh.
@@ -176,7 +178,7 @@ pub(crate) fn resolve_native_db(
 }
 
 /// Decide whether this session should auto-dump, and if so run it on a BACKGROUND thread:
-/// the dump (a full Godot boot, seconds — or a 60 s timeout when the binary wedges) must never
+/// the dump (a full Godot boot, seconds — or a 5 min timeout when the binary wedges) must never
 /// sit between `initialize` and the first served request (issue #25). Returns the receiver the
 /// event loop selects on, or `None` when no dump is warranted (fresh cache, kill switch, a
 /// pinned `extensionApiPath`, no binary, no project, or a user-managed root file).
@@ -405,7 +407,7 @@ fn run_dump(binary: &Utf8Path, root: &Utf8Path) -> Result<(), String> {
 }
 
 /// [`run_dump`] with an injectable deadline (production uses [`DUMP_TIMEOUT`]; tests shrink it
-/// to exercise the kill path without a 60 s wait).
+/// to exercise the kill path without the full 5 min wait).
 fn run_dump_with_timeout(
     binary: &Utf8Path,
     root: &Utf8Path,

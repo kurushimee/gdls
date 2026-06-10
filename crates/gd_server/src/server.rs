@@ -242,7 +242,7 @@ fn serve_inner(
     // native source (cached dump → root file → embedded stock → empty) and serves on that.
     let workspace = Workspace::load(&root, &options);
     // Kick the auto-dump off on a background thread when the cache is stale/missing — the dump
-    // (a full Godot boot; up to a 60 s timeout when the binary wedges) must never sit between
+    // (a full Godot boot; up to a 5 min timeout when the binary wedges) must never sit between
     // `initialize` and the first served request. Its completion is a select! arm below: adopt,
     // reload, republish — the first run converges to the same state as every later run,
     // mid-session.
