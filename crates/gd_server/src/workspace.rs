@@ -1174,8 +1174,25 @@ fn load_native(
                 db
             }
             Err(e) => {
-                log::warn!("native API unavailable ({e}); native types degrade to dynamic");
-                NativeDb::empty()
+                // A pinned-but-unreadable path still beats nothing: fall back to the embedded
+                // stock surface (Generic provenance) before degrading to the empty DB.
+                match options
+                    .embedded_api_fallback
+                    .then(crate::api_dump::embedded_stock_db)
+                    .flatten()
+                {
+                    Some(db) => {
+                        log::warn!(
+                            "extensionApiPath unreadable ({e}); using the embedded stock surface \
+                             — fix the path for an exact dump"
+                        );
+                        db
+                    }
+                    None => {
+                        log::warn!("native API unavailable ({e}); native types degrade to dynamic");
+                        NativeDb::empty()
+                    }
+                }
             }
         },
         // No explicit path: the v1.0.1 managed resolution — fresh .gdls dump → auto-dump →

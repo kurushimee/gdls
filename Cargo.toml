@@ -39,6 +39,9 @@ camino = { version = "1", features = ["serde1"] }
 # Pinned here so a future Phase-H walk that needs the same lookup from `gd_server` (e.g. the
 # `gdls diagnose --godot-check` path) doesn't re-pick a different version.
 which = "8.0.2"
+# v1.0.2: gunzip for the embedded stock `extension_api.json` fallback (`gd_server::api_dump`).
+# `rust_backend` only — no C toolchain dependency for a 0.4 MB one-shot decompress at startup.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # rustc-hash (FxHashMap/FxHashSet): used by gd_analyze, gd_project, gd_server, and gd_types.
 # Hoisted here so the shared version lives in exactly one place per the workspace
 # dependency policy — previously each of the four crates pinned `2.1.2` independently.

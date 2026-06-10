@@ -166,17 +166,78 @@ pub(crate) fn resolve_native_db(
         }
     }
 
-    // (5) Nothing — dynamic.
+    // (5) Embedded stock fallback — builtins always resolve, even on a fresh install with no
+    // Godot binary anywhere. `Generic` provenance: the analyzer will not turn ITS misses into
+    // "Could not find type" errors (a custom engine build legitimately has classes this stock
+    // dump doesn't).
+    if options.embedded_api_fallback {
+        if let Some(db) = embedded_stock_db() {
+            log::warn!(
+                "native API: no project-derived source (no extensionApiPath, no cached dump, \
+                 auto-dump {}); using the embedded stock {} surface — project-specific native \
+                 classes degrade to dynamic. Set godotBinaryPath or GDLS_GODOT for an exact dump.",
+                if options.auto_dump_extension_api {
+                    "found no source"
+                } else {
+                    "disabled"
+                },
+                version_label(&db),
+            );
+            return db;
+        }
+    }
+
+    // (6) Nothing — dynamic.
     log::warn!(
-        "native API unavailable (no extensionApiPath, no cached dump, auto-dump {}); native \
-         types degrade to dynamic — set godotBinaryPath or GDLS_GODOT",
+        "native API unavailable (no extensionApiPath, no cached dump, auto-dump {}, embedded \
+         fallback {}); native types degrade to dynamic — set godotBinaryPath or GDLS_GODOT",
         if options.auto_dump_extension_api {
             "found no source"
         } else {
             "disabled"
-        }
+        },
+        if options.embedded_api_fallback {
+            "failed"
+        } else {
+            "disabled"
+        },
     );
     NativeDb::empty()
+}
+
+/// The bundled stock-Godot class surface, gunzipped + ingested on demand. Regenerate the asset
+/// from a stock binary of the pinned reference version:
+/// `godot --headless --dump-extension-api` (no docs — types only, hover descriptions stay
+/// empty under the fallback), then minify + `gzip -9` to
+/// `assets/extension_api_4.6.3_stock.min.json.gz`.
+///
+/// `None` only if the embedded bytes fail to decompress/parse — corrupt vendored asset, caught
+/// by `embedded_stock_db_loads` in CI — so callers degrade rather than unwrap.
+pub(crate) fn embedded_stock_db() -> Option<NativeDb> {
+    use std::io::Read;
+
+    const EMBEDDED_GZ: &[u8] = include_bytes!("../assets/extension_api_4.6.3_stock.min.json.gz");
+    let start = Instant::now();
+    let mut text = String::new();
+    if let Err(e) = flate2::read::GzDecoder::new(EMBEDDED_GZ).read_to_string(&mut text) {
+        log::error!("native API: embedded stock dump failed to decompress: {e}");
+        return None;
+    }
+    match NativeDb::from_json(&text) {
+        Ok(mut db) => {
+            db.set_provenance(gd_types::ApiProvenance::Generic);
+            log::info!(
+                "native API: embedded stock fallback ingested ({} classes, {} ms)",
+                db.class_count(),
+                start.elapsed().as_millis()
+            );
+            Some(db)
+        }
+        Err(e) => {
+            log::error!("native API: embedded stock dump failed to parse: {e}");
+            None
+        }
+    }
 }
 
 /// Discovery order: explicit `godotBinaryPath` → `GDLS_GODOT` env (empty or `off` hard-disables)
@@ -503,5 +564,20 @@ mod tests {
         );
         // Nothing anywhere.
         assert_eq!(discover_binary_with(None, None, lookup_misses), None);
+    }
+
+    /// CI guard on the vendored asset: the embedded stock dump must decompress, parse, carry
+    /// `Generic` provenance, and contain the everyday classes whose absence caused the v1.0.1
+    /// first-run false-positive storm (issue #24).
+    #[test]
+    fn embedded_stock_db_loads() {
+        let db = embedded_stock_db().expect("embedded stock dump must ingest");
+        assert_eq!(db.provenance(), gd_types::ApiProvenance::Generic);
+        for class in ["Node", "Timer", "Marker3D", "CollisionObject3D", "Object"] {
+            assert!(
+                db.class_named(class).is_some(),
+                "embedded stock dump is missing {class}"
+            );
+        }
     }
 }

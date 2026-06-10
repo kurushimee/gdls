@@ -25,6 +25,12 @@ pub struct InitializationOptions {
     /// cached dump is missing or stale. Default **true** — the whole point is that the user
     /// never configures native types; set false to forbid gdls from ever spawning Godot.
     pub auto_dump_extension_api: bool,
+    /// v1.0.2: when every native-API source misses (no `extensionApiPath`, no cached dump, no
+    /// auto-dump, no project-root file), fall back to a bundled stock 4.6.3 `extension_api.json`
+    /// instead of an empty DB, so builtins (`Node`, `Timer`, …) always resolve on a fresh
+    /// install. Default **true**; set false to reproduce the bare-DB degraded mode (tests,
+    /// memory-floor measurements).
+    pub embedded_api_fallback: bool,
     /// Diagnostics strictness (consumed starting in M3).
     pub strict: StrictConfig,
     /// M5 WP-O3 / WP-O4 — per-call analyzer knobs the LSP server threads into
@@ -49,6 +55,7 @@ impl Default for InitializationOptions {
             extension_api_path: None,
             godot_binary_path: None,
             auto_dump_extension_api: true,
+            embedded_api_fallback: true,
             strict: StrictConfig::default(),
             analyzer: AnalyzerConfig::default(),
             memory: MemoryConfig::default(),

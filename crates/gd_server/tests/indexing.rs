@@ -50,15 +50,18 @@ fn missing_dump_degrades_but_still_resolves_scripts() {
     let project = sample_project();
     // Remove the sample's root-level dump: since v1.0.1 an unmanaged `<root>/extension_api.json`
     // is a legitimate fallback source (the auto-dump resolution ladder), so "missing dump" must
-    // mean genuinely missing — no extensionApiPath, no `.gdls` dump, no root file, dump disabled.
+    // mean genuinely missing — no extensionApiPath, no `.gdls` dump, no root file, dump disabled,
+    // and (v1.0.2) the embedded stock fallback disabled too.
     project.remove("extension_api.json");
     let opts = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": project.root.as_str(),
         "autoDumpExtensionApi": false,
+        "embeddedApiFallback": false,
     })));
     let ws = Workspace::load(&project.root, &opts);
 
     assert!(ws.native.is_empty(), "no dump ⇒ native types degrade");
+    assert_eq!(ws.native.provenance(), gd_types::ApiProvenance::Absent);
     let enemy = ws
         .index
         .file_id(&project.root.join("src/enemy.gd"))
@@ -70,6 +73,26 @@ fn missing_dump_degrades_but_still_resolves_scripts() {
     ));
     let hero = ws.index.file_id(&project.root.join("src/hero.gd")).unwrap();
     assert_eq!(ws.index.resolve_base(hero, &ws.native), Resolution::Unknown);
+}
+
+/// v1.0.2 (issue #24): with every project-derived source missing and the default options, the
+/// embedded stock surface steps in — builtins resolve (`Generic` provenance), so a fresh install
+/// with no Godot binary anywhere still types `Node2D` instead of erroring on every native name.
+#[test]
+fn missing_dump_falls_back_to_embedded_stock_surface() {
+    let project = sample_project();
+    project.remove("extension_api.json");
+    let opts = InitializationOptions::parse(Some(&serde_json::json!({
+        "projectRoot": project.root.as_str(),
+        "autoDumpExtensionApi": false,
+    })));
+    let ws = Workspace::load(&project.root, &opts);
+
+    assert!(!ws.native.is_empty(), "embedded fallback must ingest");
+    assert_eq!(ws.native.provenance(), gd_types::ApiProvenance::Generic);
+    let hero = ws.index.file_id(&project.root.join("src/hero.gd")).unwrap();
+    // hero.gd `extends Node2D` resolves natively through the embedded stock surface.
+    assert_eq!(ws.index.resolve_base(hero, &ws.native), Resolution::Native);
 }
 
 // ---- The full LSP loop against the indexed project ----------------------------------------------
