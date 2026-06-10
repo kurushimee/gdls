@@ -21,16 +21,11 @@ of scope (diagnostics only).
 - **Prebuilt binaries** — download `gdls` (Linux x86_64) or `gdls.exe` (Windows x86_64) from
   [GitHub Releases](https://github.com/kurushimee/gdls/releases).
 
-- **From source (cargo)** — installs the `gdls` binary into `~/.cargo/bin`:
+- **From source (cargo)** — builds straight from this repo and installs the `gdls` binary into
+  `~/.cargo/bin` (no checkout needed):
 
   ```sh
-  cargo install --path crates/gd_server
-  ```
-
-- **From source (build in place)** — produces `target/release/gdls`:
-
-  ```sh
-  cargo build --release --bin gdls
+  cargo install --git https://github.com/kurushimee/gdls gd_server
   ```
 
 The toolchain is pinned by `rust-toolchain.toml` (stable).
