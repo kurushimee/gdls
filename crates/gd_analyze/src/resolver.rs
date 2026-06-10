@@ -197,7 +197,7 @@ fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option
         // Relative paths (resolved against the script's dir in Godot) are deferred; M2 indexes by
         // `res://`. An unresolved path is Godot's "Could not resolve super class path".
         return match ctx.xfile.resolve_res_path(&path) {
-            Some(fid) => Ok(Some(script_base_datatype(fid))),
+            Some(fid) => Ok(Some(script_base_datatype(ctx, fid))),
             None => {
                 ctx.push_error(
                     format!(r#"Could not resolve super class path "{path}"."#),
@@ -221,7 +221,7 @@ fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option
         if Some(fid) == ctx.file {
             ctx.get_type(root_or(ctx, class_id)).clone()
         } else {
-            script_base_datatype(fid)
+            script_base_datatype(ctx, fid)
         }
     } else if ctx.native.class_named(&name).is_some() {
         // A native engine class (analyzer.cpp:521-528). Godot rejects `extends` of an
@@ -289,15 +289,18 @@ fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option
                 })
             });
             if let Some((file, new_inner)) = resolved {
+                let sref = ScriptRef {
+                    file,
+                    inner: new_inner,
+                };
                 base = DataType {
                     kind: DtKind::Script,
                     type_source: TypeSource::AnnotatedExplicit,
                     is_meta_type: true,
                     builtin_type: VariantType::Object,
-                    script_type: Some(ScriptRef {
-                        file,
-                        inner: new_inner,
-                    }),
+                    native_type: crate::script_chain::chain_native_root(ctx, &sref)
+                        .unwrap_or_default(),
+                    script_type: Some(sref),
                     ..Default::default()
                 };
                 continue;
@@ -487,19 +490,22 @@ fn walks_back_to(ctx: &AnalysisContext, class_id: NodeId, result: &DataType) -> 
     false
 }
 
-/// Build the base [`DataType`] for an `extends`-ed project script. WP-C records the file reference; the
-/// resolved native root (needed for cross-file member access) is filled in once interface resolution
-/// can walk a depended file (WP-D).
-fn script_base_datatype(fid: gd_project::FileId) -> DataType {
+/// Build the base [`DataType`] for an `extends`-ed project script, with the chain's native root
+/// stamped into `native_type` — Godot's `class_type.native_type = result.native_type`
+/// (analyzer.cpp:617-619), which is what keeps `$`/`@onready`/self-compat working through
+/// arbitrary script-to-script chains. An unresolvable chain leaves it empty (permissive).
+pub(crate) fn script_base_datatype(ctx: &AnalysisContext, fid: gd_project::FileId) -> DataType {
+    let sref = ScriptRef {
+        file: fid,
+        inner: Vec::new(),
+    };
     DataType {
         kind: DtKind::Script,
         type_source: TypeSource::AnnotatedExplicit,
         is_meta_type: true,
         builtin_type: VariantType::Object,
-        script_type: Some(ScriptRef {
-            file: fid,
-            inner: Vec::new(),
-        }),
+        native_type: crate::script_chain::chain_native_root(ctx, &sref).unwrap_or_default(),
+        script_type: Some(sref),
         ..Default::default()
     }
 }
@@ -634,7 +640,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         result = if Some(fid) == ctx.file {
             ctx.get_type(root_or(ctx, type_id)).clone()
         } else {
-            script_base_datatype(fid)
+            script_base_datatype(ctx, fid)
         };
     } else if let Some(base) = datatype_in_scope(ctx, &first) {
         // In-file class in the current scope (analyzer.cpp:847-900, class-name case).
@@ -987,24 +993,19 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
     }
 
     // analyzer.cpp:860-898's cross-file fallthrough: when none of the in-file scope classes
-    // contain `name`, walk the in-file root class's cross-file base chain (Script bases via
-    // CrossFileQuery) looking for an inner class. Handles
-    // `features/external_parser.gd`'s `var _v: TypeFromBase` where TypeFromBase is an
-    // inner class of a transitively-preloaded base.
+    // contain `name`, walk the in-file root class's cross-file base chain (every link via
+    // `crate::script_chain`, including `Extends::Names` hops the old Path-only loop missed)
+    // looking for an inner class. Handles `features/external_parser.gd`'s
+    // `var _v: TypeFromBase` where TypeFromBase is an inner class of a transitively-preloaded
+    // base.
     for look in scope {
         let base = ctx.bases.get(&look).cloned().unwrap_or_default();
         if base.kind == crate::data_type::DtKind::Script {
             if let Some(sr) = base.script_type.as_ref() {
-                let mut file = sr.file;
-                let mut depth = 0;
-                loop {
-                    if depth > 16 {
-                        break;
-                    }
-                    depth += 1;
-                    let iface = match ctx.xfile.interface(file) {
-                        Some(i) => i,
-                        None => break,
+                let chain = crate::script_chain::resolve_script_chain(ctx, sr);
+                for link in &chain.links {
+                    let Some(iface) = crate::script_chain::link_interface(ctx.xfile, link) else {
+                        continue;
                     };
                     if iface
                         .inner
@@ -1015,18 +1016,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
                         // Return a Script meta type with the file id — sufficient to mark
                         // the name as a valid type annotation so the head-segment
                         // "Could not find type" error doesn't false-positive.
-                        return Some(script_base_datatype(file));
-                    }
-                    // Walk further if the iface extends a sibling script via path.
-                    match &iface.extends {
-                        gd_project::Extends::Path(p) => match ctx.xfile.resolve_res_path(p) {
-                            Some(next) => {
-                                file = next;
-                                continue;
-                            }
-                            None => break,
-                        },
-                        gd_project::Extends::Names(_) | gd_project::Extends::None => break,
+                        return Some(script_base_datatype(ctx, link.file));
                     }
                 }
             }
@@ -3586,31 +3576,14 @@ pub(crate) fn nearest_native_ancestor(ctx: &AnalysisContext, class_id: NodeId) -
                 cur = base.class_node;
             }
             DtKind::Script => {
-                // Walk the cross-file chain via `Interface::extends`. Bail when the chain
-                // hits a non-Path extends (Names/None — gdls doesn't resolve native bases
-                // by name through the cross-file query yet, so the script's native ancestor
-                // is RefCounted by default).
-                let Some(script_ref) = base.script_type.as_ref() else {
-                    return Some("RefCounted".to_owned());
-                };
-                let mut file = script_ref.file;
-                let mut depth = 0;
-                loop {
-                    if depth > 16 {
-                        return Some("RefCounted".to_owned());
-                    }
-                    depth += 1;
-                    let Some(iface) = ctx.xfile.interface(file) else {
-                        return Some("RefCounted".to_owned());
-                    };
-                    match &iface.extends {
-                        gd_project::Extends::Path(p) => match ctx.xfile.resolve_res_path(p) {
-                            Some(next) => file = next,
-                            None => return Some("RefCounted".to_owned()),
-                        },
-                        _ => return Some("RefCounted".to_owned()),
-                    }
-                }
+                // Walk the cross-file chain (`crate::script_chain`) to its native root — Godot
+                // reads the eagerly-propagated `base_type.native_type` here (analyzer.cpp:3868).
+                // `None` = unknown chain ⇒ consumers (the `$`/`@onready`/`@export` node-ness
+                // gates, shadow warnings) stay silent; the old `RefCounted` fallback for
+                // `Extends::Names` chains was the `Cannot use "$" on a class that isn't a node`
+                // false-positive family.
+                let script_ref = base.script_type.as_ref()?;
+                return crate::script_chain::chain_native_root(ctx, script_ref);
             }
             _ => return None,
         }
@@ -4455,17 +4428,17 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
 
     // analyzer.cpp:6135-6188 — SHADOWED_VARIABLE_BASE_CLASS. Walk the base class chain
     // (in-file Class -> cross-file Script -> Native) looking for a same-named member.
-    // For cross-file Script bases, read `MemberDecl::line` from the interface and emit
-    // the 5-symbol template `... already-declared X at line N in the base class "Y".`.
+    // For cross-file Script bases, walk every chain link (`crate::script_chain` — including
+    // `Extends::Names` hops the old Path-only loop missed), read `MemberDecl::line` from the
+    // interface, and emit the 5-symbol template
+    // `... already-declared X at line N in the base class "Y".`.
     let base = ctx.bases.get(&class_id).cloned().unwrap_or_default();
     if base.kind == DtKind::Script {
         if let Some(sr) = base.script_type.as_ref() {
-            let mut file = sr.file;
-            let mut depth = 0;
-            while depth < 16 {
-                depth += 1;
-                let Some(iface) = ctx.xfile.interface(file) else {
-                    break;
+            let chain = crate::script_chain::resolve_script_chain(ctx, sr);
+            for link in &chain.links {
+                let Some(iface) = crate::script_chain::link_interface(ctx.xfile, link) else {
+                    continue;
                 };
                 if let Some(member) = iface.members.iter().find(|m| m.name == name) {
                     use gd_project::MemberKind as MK;
@@ -4490,13 +4463,6 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
                         ident_id,
                     );
                     return;
-                }
-                match &iface.extends {
-                    gd_project::Extends::Path(p) => match ctx.xfile.resolve_res_path(p) {
-                        Some(next) => file = next,
-                        None => break,
-                    },
-                    _ => break,
                 }
             }
         }

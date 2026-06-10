@@ -281,6 +281,13 @@ pub struct AnalysisContext<'a> {
     /// M5 WP-O4: cooperative cancellation token. Read every 256 nodes inside the reducer /
     /// resolver checkpoints. `None` (the default for tests / fuzz) skips the check entirely.
     pub cancellation: Option<&'a CancellationToken>,
+    /// Memoized cross-file `extends`-chain resolutions (`crate::script_chain`). One walk per
+    /// distinct [`crate::data_type::ScriptRef`] per analysis pass — `is_type_compatible` and the
+    /// member walks would otherwise re-resolve the same base chain per argument/identifier.
+    /// `RefCell` because several consumers hold `&AnalysisContext`.
+    pub(crate) script_chains: std::cell::RefCell<
+        FxHashMap<crate::data_type::ScriptRef, std::rc::Rc<crate::script_chain::ResolvedChain>>,
+    >,
     /// M5 WP-O3 / O4: once tripped, every subsequent governor / cancellation checkpoint
     /// short-circuits (the synthetic error has already been pushed; we don't want to spam the
     /// same diagnostic for every remaining call). Toggle is one-way per analyze pass.
@@ -337,6 +344,7 @@ impl<'a> AnalysisContext<'a> {
             iter_count: 0,
             iter_limit: 0,
             cancellation: None,
+            script_chains: std::cell::RefCell::new(FxHashMap::default()),
             bailed: false,
             sink: DiagnosticSink::new(),
         }

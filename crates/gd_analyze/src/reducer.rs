@@ -71,27 +71,22 @@ fn caller_function_name(ctx: &AnalysisContext) -> Option<String> {
 /// per the plan's "lands OR documented bench witness" rule (the cheap `extends`-chain walk RD6
 /// introduced is already far tighter than the prior whole-tree `func`-name scan it replaced).
 fn resolve_callee_file(ctx: &AnalysisContext, name: &str) -> Option<gd_project::FileId> {
-    let mut current = ctx.file;
-    let mut guard: rustc_hash::FxHashSet<gd_project::FileId> = rustc_hash::FxHashSet::default();
-    while let Some(fid) = current {
-        if !guard.insert(fid) {
-            break; // extends-chain cycle guard (a malformed `A extends B extends A`)
-        }
-        let iface = ctx.xfile.interface(fid)?;
+    let start = crate::data_type::ScriptRef {
+        file: ctx.file?,
+        inner: Vec::new(),
+    };
+    let chain = crate::script_chain::resolve_script_chain(ctx, &start);
+    for link in &chain.links {
+        let Some(iface) = crate::script_chain::link_interface(ctx.xfile, link) else {
+            break;
+        };
         if iface
             .members
             .iter()
             .any(|m| m.name == name && m.kind == gd_project::MemberKind::Func)
         {
-            return Some(fid);
+            return Some(link.file);
         }
-        current = match &iface.extends {
-            gd_project::Extends::Names(names) => {
-                names.first().and_then(|n| ctx.xfile.global_class_file(n))
-            }
-            gd_project::Extends::Path(p) => ctx.xfile.resolve_res_path(p),
-            gd_project::Extends::None => None,
-        };
     }
     None
 }
@@ -1424,7 +1419,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
                 .unwrap_or_default();
             ctx.set_type(id, root);
         } else {
-            ctx.set_type(id, script_meta_type(fid));
+            ctx.set_type(id, script_meta_type(ctx, fid));
         }
         return;
     }
@@ -1516,7 +1511,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         // field-identical if those helpers change. This makes `reduce_identifier_from_base` /
         // `reduce_subscript` walk the script's interface members — the same path that resolves
         // `var l: Lib; l.helper()` (M6-E), which already works.
-        ctx.set_type(id, type_from_metatype(script_meta_type(fid)));
+        ctx.set_type(id, type_from_metatype(script_meta_type(ctx, fid)));
         return;
     }
 
@@ -1550,38 +1545,63 @@ fn is_plausible_native_member(ctx: &AnalysisContext, name: &str) -> bool {
     loop {
         let base = ctx.bases.get(&cur).cloned().unwrap_or_default();
         match base.kind {
-            DtKind::Native => {
-                let mut native = Some(base.native_type);
-                while let Some(c) = native {
-                    if let Some(nc) = ctx.native.class_named(&c) {
-                        if nc
-                            .methods
-                            .iter()
-                            .any(|m| ctx.native.name_of(m.name) == name)
-                        {
-                            return true;
-                        }
-                        if nc
-                            .properties
-                            .iter()
-                            .any(|p| ctx.native.name_of(p.name) == name)
-                        {
-                            return true;
-                        }
-                        native = nc.inherits.map(|s| ctx.native.name_of(s).to_owned());
-                    } else {
-                        break;
-                    }
-                }
-                return false;
-            }
+            DtKind::Native => return native_member_plausible(ctx, &base.native_type, name),
             DtKind::Class => match base.class_node {
                 Some(c) => cur = c,
                 None => return false,
             },
+            DtKind::Script => {
+                // Cross-file base: an inherited script member (any kind) makes the name
+                // plausible, then the chain's native root continues the native probe — the
+                // direct analog of Godot's script_classes walk + ClassDB tail
+                // (analyzer.cpp:4166-4360). An unknown chain treats everything as plausible:
+                // permissive, never `Identifier "x" not declared` against a base we can't see.
+                let Some(sr) = base.script_type.as_ref() else {
+                    return true;
+                };
+                let chain = crate::script_chain::resolve_script_chain(ctx, sr);
+                for link in &chain.links {
+                    if let Some(iface) = crate::script_chain::link_interface(ctx.xfile, link) {
+                        if iface.members.iter().any(|m| m.name == name) {
+                            return true;
+                        }
+                    }
+                }
+                return match chain.native_root.as_deref() {
+                    Some(root) => native_member_plausible(ctx, root, name),
+                    None => true,
+                };
+            }
             _ => return false,
         }
     }
+}
+
+/// Whether `name` is a method or property anywhere up `native`'s inherits chain — the native
+/// tail of [`is_plausible_native_member`], shared by the in-file and cross-file base arms.
+fn native_member_plausible(ctx: &AnalysisContext, native: &str, name: &str) -> bool {
+    let mut native = Some(native.to_owned());
+    while let Some(c) = native {
+        let Some(nc) = ctx.native.class_named(&c) else {
+            break;
+        };
+        if nc
+            .methods
+            .iter()
+            .any(|m| ctx.native.name_of(m.name) == name)
+        {
+            return true;
+        }
+        if nc
+            .properties
+            .iter()
+            .any(|p| ctx.native.name_of(p.name) == name)
+        {
+            return true;
+        }
+        native = nc.inherits.map(|s| ctx.native.name_of(s).to_owned());
+    }
+    false
 }
 
 // --- reduce_identifier helpers ---------------------------------------------------------------------
@@ -1829,18 +1849,21 @@ fn builtin_meta_type(t: VariantType) -> DataType {
 }
 
 /// Build a script-file metatype, the result of `Identifier "MyClass"` where `MyClass` is a project
-/// `class_name` (analyzer.cpp:4548).
-fn script_meta_type(file: gd_project::FileId) -> DataType {
+/// `class_name` (analyzer.cpp:4548). Carries the chain's native root like every Script type
+/// (analyzer.cpp:617-619 propagation).
+fn script_meta_type(ctx: &AnalysisContext, file: gd_project::FileId) -> DataType {
+    let sref = crate::data_type::ScriptRef {
+        file,
+        inner: Vec::new(),
+    };
     DataType {
         type_source: TypeSource::AnnotatedExplicit,
         kind: DtKind::Script,
         builtin_type: VariantType::Object,
         is_meta_type: true,
         is_constant: true,
-        script_type: Some(crate::data_type::ScriptRef {
-            file,
-            inner: Vec::new(),
-        }),
+        native_type: crate::script_chain::chain_native_root(ctx, &sref).unwrap_or_default(),
+        script_type: Some(sref),
         ..Default::default()
     }
 }
@@ -4288,11 +4311,11 @@ pub(crate) fn resolve_interface_type_expr(
         if path.len() > 1 {
             let chain: Vec<&str> = path[1..].iter().map(String::as_str).collect();
             if ctx.xfile.resolve_inner_chain(fid, &chain).is_some() {
-                return script_instance_datatype(fid, path[1..].to_vec());
+                return script_instance_datatype(ctx, fid, path[1..].to_vec());
             }
             return DataType::variant();
         }
-        return script_instance_datatype(fid, Vec::new());
+        return script_instance_datatype(ctx, fid, Vec::new());
     } else if let Some(dt) = cross_file_enum_instance(ctx, declaring_file, first) {
         // A named enum of the declaring file itself (`var mode: Mode`).
         return dt;
@@ -4303,7 +4326,7 @@ pub(crate) fn resolve_interface_type_expr(
             .is_some()
     {
         // An inner class of the declaring file (`var helper: InnerHelper`).
-        return script_instance_datatype(declaring_file, path.clone());
+        return script_instance_datatype(ctx, declaring_file, path.clone());
     } else if ctx.native.global_enum(first).is_some() {
         result = crate::resolver::make_global_enum_type(ctx, first, "", false);
     } else {
@@ -4315,13 +4338,19 @@ pub(crate) fn resolve_interface_type_expr(
 
 /// A Script-typed INSTANCE DataType for `file` (+ inner-class chain). The cross-file counterpart
 /// of `resolver::script_base_datatype` with `is_meta_type = false`.
-pub(crate) fn script_instance_datatype(file: gd_project::FileId, inner: Vec<String>) -> DataType {
+pub(crate) fn script_instance_datatype(
+    ctx: &AnalysisContext,
+    file: gd_project::FileId,
+    inner: Vec<String>,
+) -> DataType {
+    let sref = crate::data_type::ScriptRef { file, inner };
     DataType {
         kind: DtKind::Script,
         type_source: TypeSource::AnnotatedExplicit,
         is_meta_type: false,
         builtin_type: VariantType::Object,
-        script_type: Some(crate::data_type::ScriptRef { file, inner }),
+        native_type: crate::script_chain::chain_native_root(ctx, &sref).unwrap_or_default(),
+        script_type: Some(sref),
         ..Default::default()
     }
 }

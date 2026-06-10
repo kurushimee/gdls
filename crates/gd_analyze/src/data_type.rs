@@ -308,7 +308,7 @@ pub enum TypeSource {
 
 /// Identifies an external GDScript class: the file plus an optional inner-class chain
 /// (`extends Outer.Inner` → `inner = ["Inner"]`). Replaces Godot's `Ref<Script>` + `script_path`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScriptRef {
     pub file: FileId,
     /// Inner-class chain; empty for the file's top-level class.
