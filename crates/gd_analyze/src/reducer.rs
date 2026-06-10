@@ -2118,42 +2118,113 @@ pub(crate) fn is_type_compatible(
         return true;
     }
 
-    // Polymorphism for object types. Godot walks Native/Script/Class chains via `ClassDB` +
-    // script ref + class-node bases; gdls walks the native chain via [`NativeDb`] and the in-file
-    // class-node base chain via `ctx.bases`. Cross-file Script bases (the engine `Ref<Script>`
-    // walk at analyzer.cpp:6434-6440) are deferred to the cross-file E3 slice — we conservatively
-    // return false for cross-script polymorphism for now (rather than risking a false-positive
-    // "compatible" verdict that suppresses a real error).
-    match (target.kind, source.kind) {
-        (DtKind::Native, DtKind::Native) => {
-            // analyzer.cpp:6428: `is_parent_class(src_native, target.native_type)`.
-            ctx.native
-                .is_subclass_of_named(&source.native_type, &target.native_type)
+    // Polymorphism for object types — Godot's source decomposition + target switch
+    // (`check_type_compatibility`'s object half, analyzer.cpp:6210-6296). The SOURCE decomposes
+    // into (native root, script ref, class node); the TARGET kind then picks which of those to
+    // compare. Cross-file Script chains resolve through `crate::script_chain`; an INCOMPLETE
+    // chain (native_root unknown) makes the verdict permissively `true` — a deliberate,
+    // documented deviation from Godot (whose ClassDB always bottoms out): an unresolvable chain
+    // must never manufacture an "incompatible" error. In-file-only degenerate chains keep the
+    // strict `false` they had before this decomposition.
+
+    // --- Source decomposition (analyzer.cpp:6221-6258) ---------------------------------------
+    let mut src_native: Option<String> = None;
+    let mut src_script: Option<crate::data_type::ScriptRef> = None;
+    let mut src_chain_unknown = false;
+    match source.kind {
+        DtKind::Native => {
+            // analyzer.cpp:6221-6231 — a native source can only satisfy a Native target.
+            if target.kind != DtKind::Native {
+                return false;
+            }
+            src_native = Some(source.native_type.clone());
         }
-        (DtKind::Native, DtKind::Class) => {
-            // Walk the in-file class's base chain until we reach a Native root.
-            let mut native_root: Option<String> = None;
+        DtKind::Script => {
+            if source.is_meta_type {
+                // A script META is an engine `Script` object (analyzer.cpp:6233-6236). The
+                // trimmed DB may not carry the `Script` class, so stay permissive — the
+                // pre-decomposition code returned `true` for every Script operand.
+                return true;
+            }
+            let Some(sr) = source.script_type.as_ref() else {
+                return true; // degenerate Script type — permissive
+            };
+            src_script = Some(sr.clone());
+            match crate::script_chain::chain_native_root(ctx, sr) {
+                Some(root) => src_native = Some(root),
+                None => src_chain_unknown = true,
+            }
+        }
+        DtKind::Class => {
+            // Walk the in-file base chain to the bottom (analyzer.cpp:6246-6258); a Script
+            // bottom continues through the cross-file chain — that link is what makes
+            // `f(self)` against a cross-file base class compatible.
             let mut cur = source.class_node;
+            let mut hops = 0usize;
             while let Some(n) = cur {
-                let base = ctx.bases.get(&n).cloned().unwrap_or_default();
-                if base.kind == DtKind::Native {
-                    native_root = Some(base.native_type.clone());
-                    break;
+                hops += 1;
+                if hops > 256 {
+                    break; // defensive: malformed in-file cycle
                 }
-                cur = base.class_node;
-                if cur == source.class_node {
-                    break; // defensive: cycle (shouldn't happen — cycle check is in WP-C)
+                let base = ctx.bases.get(&n).cloned().unwrap_or_default();
+                match base.kind {
+                    DtKind::Native => {
+                        src_native = Some(base.native_type.clone());
+                        break;
+                    }
+                    DtKind::Script => {
+                        if let Some(sr) = base.script_type.as_ref() {
+                            src_script = Some(sr.clone());
+                            if !base.native_type.is_empty() {
+                                src_native = Some(base.native_type.clone());
+                            } else {
+                                match crate::script_chain::chain_native_root(ctx, sr) {
+                                    Some(root) => src_native = Some(root),
+                                    None => src_chain_unknown = true,
+                                }
+                            }
+                        } else {
+                            src_chain_unknown = true;
+                        }
+                        break;
+                    }
+                    DtKind::Class => cur = base.class_node,
+                    _ => break, // unresolved in-file base — keep the strict legacy verdict
                 }
             }
-            native_root
-                .map(|native| {
-                    ctx.native
-                        .is_subclass_of_named(&native, &target.native_type)
-                })
+        }
+        _ => return false,
+    }
+
+    // --- Target switch (analyzer.cpp:6266-6296) ----------------------------------------------
+    match target.kind {
+        DtKind::Native => {
+            if src_chain_unknown {
+                return true;
+            }
+            src_native
+                .map(|n| ctx.native.is_subclass_of_named(&n, &target.native_type))
                 .unwrap_or(false)
         }
-        (DtKind::Class, DtKind::Class) => {
-            // Walk source class's base chain looking for target.class_node.
+        DtKind::Script => {
+            // analyzer.cpp:6274-6284 — the `get_base_script()` loop: the source's script chain
+            // must pass through the target's ScriptRef (file + inner identity).
+            let Some(target_sr) = target.script_type.as_ref() else {
+                return true; // degenerate Script target — permissive
+            };
+            let Some(start) = src_script else {
+                return src_chain_unknown;
+            };
+            let chain = crate::script_chain::resolve_script_chain(ctx, &start);
+            if chain.links.iter().any(|l| l == target_sr) {
+                return true;
+            }
+            // Complete chain without a hit ⇒ genuinely incompatible; incomplete ⇒ permissive.
+            chain.native_root.is_none()
+        }
+        DtKind::Class => {
+            // analyzer.cpp:6285-6295 — in-file node-identity walk. Script/Native sources never
+            // satisfy an in-file Class target (Godot 6226/6233).
             let target_node = match target.class_node {
                 Some(n) => n,
                 None => return false,
@@ -2166,12 +2237,6 @@ pub(crate) fn is_type_compatible(
                 cur = ctx.bases.get(&n).and_then(|b| b.class_node);
             }
             false
-        }
-        (DtKind::Script, _) | (_, DtKind::Script) => {
-            // Cross-file Script polymorphism — deferred. Treat as incompatible only when both sides
-            // are hard-typed objects with no Variant/Native overlap; otherwise return true so we
-            // don't emit a false positive against an un-resolved external script.
-            true
         }
         _ => false,
     }

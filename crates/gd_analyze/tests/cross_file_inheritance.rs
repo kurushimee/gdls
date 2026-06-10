@@ -192,6 +192,53 @@ fn extends_cycle_terminates_permissively() {
     assert_eq!(error_messages(&result), Vec::<String>::new());
 }
 
+/// Family A, part (d): `self` (and any instance of a class extending a cross-file base) is
+/// compatible with both the named base class and its native root — Godot's source decomposition
+/// walks `base_type.class_type`/`get_base_script()` chains (analyzer.cpp:6210-6296). Both calls
+/// used to error `Invalid argument ... but is "<Class>".`.
+#[test]
+fn self_compat_through_cross_file_chain() {
+    let child = "\
+extends BaseThing
+func take(b: BaseThing) -> void:
+\tpass
+func need_node(n: Node) -> void:
+\tpass
+func go() -> void:
+\ttake(self)
+\tneed_node(self)
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://child.gd", "")]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}
+
+/// The decomposition must not over-correct: an unrelated class (complete chain, no hit) still
+/// fails argument compatibility.
+#[test]
+fn unrelated_class_argument_still_errors() {
+    let child = "\
+extends BaseThing
+func take(b: BaseThing) -> void:
+\tpass
+func go(c: Constants) -> void:
+\ttake(c)
+";
+    let project = Project::new(&[
+        ("res://base.gd", BASE_GD),
+        ("res://constants.gd", CONSTANTS_GD),
+        ("res://child.gd", ""),
+    ]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    let errors = error_messages(&result);
+    assert!(
+        errors
+            .iter()
+            .any(|m| m.contains(r#"Invalid argument for "take()""#)),
+        "expected the arg-compat error for an unrelated class, got {errors:?}"
+    );
+}
+
 /// #13: member access through a typed cross-file base records `Binding::Use` against the
 /// DECLARING file — what references/definition project for member-access sites.
 #[test]
