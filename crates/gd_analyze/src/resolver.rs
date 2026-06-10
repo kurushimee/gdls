@@ -1060,6 +1060,19 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
                 if ctx.get_type(enum_id).has_no_type() {
                     resolve_class_interface(ctx, look);
                 }
+                if ctx.get_type(enum_id).has_no_type() {
+                    // STILL untyped ⇒ we are mid-interface-resolution of this very class (the
+                    // `resolved_interfaces` guard no-opped the call) and the enum is declared
+                    // AFTER the member naming it — `signal s(t: MyEnum)` above `enum MyEnum`.
+                    // Godot's two-pass interface resolution handles the order; mirror it by
+                    // resolving just this enum member directly.
+                    if let Some(idx) = match &ctx.node(look).kind {
+                        NodeKind::Class(c) => c.members_indices.get(name).copied(),
+                        _ => None,
+                    } {
+                        resolve_class_member(ctx, look, idx, None);
+                    }
+                }
                 return Some(ctx.get_type(enum_id).clone());
             }
             Some(Member::Constant(const_id)) => {

@@ -437,8 +437,13 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
             let lv = ctx.folds.get(l).cloned();
             let rv = ctx.folds.get(r).cloned();
             if let (Some(lv), Some(rv)) = (lv, rv) {
-                let has_opaque =
-                    matches!(lv, FoldedValue::Opaque(_)) || matches!(rv, FoldedValue::Opaque(_));
+                let has_opaque = matches!(lv, FoldedValue::Opaque(_))
+                    || matches!(rv, FoldedValue::Opaque(_))
+                    // Constant `"fmt %s" % x` — the format itself isn't evaluated (Godot folds
+                    // it; gdls has no formatter), so route through the type tail's str_format
+                    // arm and keep constancy via the Opaque result stamp.
+                    || (op_node.operation == BinaryOp::Modulo
+                        && matches!(lv, FoldedValue::String(_)));
                 if has_opaque {
                     opaque_operand_types =
                         Some((folded_variant_type(&lv), folded_variant_type(&rv)));
