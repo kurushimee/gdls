@@ -45,8 +45,16 @@ gdls diagnose --reconcile --root /path/to/your/godot/project
 
 ## Quick start
 
-1. **Register the server** with your LSP client. For Claude Code, drop a plugin manifest
-   ([`examples/.lsp.json`](examples/.lsp.json)) at the plugin root — the core is five lines:
+1. **Register the server** with your LSP client. For Claude Code, install the official plugin
+   from the [`kurushimee/gdls-plugin`](https://github.com/kurushimee/gdls-plugin) marketplace —
+   inside a Claude Code session:
+
+   ```
+   /plugin marketplace add kurushimee/gdls-plugin
+   /plugin install gdls@gdls-plugin
+   ```
+
+   For any other LSP client (or a hand-rolled plugin), the core registration is five lines:
 
    ```json
    {

@@ -67,9 +67,9 @@ fn print_usage() {
          \x20   gdls bench --record <path> | --replay <path>\n\
          \x20                                         Record / replay a request trace (local repro)\n\
          \n\
-         The server is normally launched by an LSP client (see examples/.lsp.json). Logs go to\n\
-         stderr; set GDLS_LOG (e.g. GDLS_LOG=info) to tune verbosity and GDLS_TRACE for the\n\
-         hierarchical span profiler.",
+         The server is normally launched by an LSP client (the Claude Code plugin lives at\n\
+         github.com/kurushimee/gdls-plugin). Logs go to stderr; set GDLS_LOG (e.g.\n\
+         GDLS_LOG=info) to tune verbosity and GDLS_TRACE for the hierarchical span profiler.",
         env!("CARGO_PKG_VERSION")
     );
 }
