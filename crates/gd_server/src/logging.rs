@@ -16,14 +16,12 @@
 //! `bench/budget.toml` (WP-P5).
 //!
 //! Idempotent via [`Once`] — safe to call from each `serve` and repeatedly from tests. A second
-//! call returns immediately; it never re-installs the global default subscriber (would panic) or
-//! re-runs `LogTracer::init` (returns `SetLoggerError`).
+//! call returns immediately; it never re-installs the global default subscriber or re-runs
+//! `LogTracer::init` (returns `SetLoggerError`).
 
 use std::sync::Once;
 
-use tracing_subscriber::{
-    fmt, layer::SubscriberExt, registry::LookupSpan, util::SubscriberInitExt, EnvFilter, Layer,
-};
+use tracing_subscriber::{fmt, layer::SubscriberExt, registry::LookupSpan, EnvFilter, Layer};
 
 use crate::observability;
 
@@ -67,18 +65,32 @@ pub fn init() {
         // `fmt::Layer<S, DefaultFields, Format<Full,…>, _>`) that one expression can't return both;
         // splitting the install at the dispatch keeps each branch monomorphic so Rust can infer
         // the subscriber type without manual boxing.
-        if json_format_requested() {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(json_fmt_layer())
-                .with(profiler)
-                .init();
+        // Installed via `set_global_default`, NOT `SubscriberInitExt::init()`: with the
+        // subscriber's `tracing-log` feature on (which we need for bridged-event metadata
+        // normalization), `init()` re-attempts `LogTracer::init()` internally and panics on the
+        // bridge we just installed above. `set_global_default` touches only the tracing side;
+        // an `Err` means an embedding host already installed a subscriber — degrade to its
+        // pipeline rather than killing init.
+        let install = if json_format_requested() {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(json_fmt_layer())
+                    .with(profiler),
+            )
         } else {
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(text_fmt_layer())
-                .with(profiler)
-                .init();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry()
+                    .with(filter)
+                    .with(text_fmt_layer())
+                    .with(profiler),
+            )
+        };
+        if let Err(e) = install {
+            eprintln!(
+                "gdls: tracing subscriber not installed ({e}); events flow to the pre-existing \
+                 global subscriber"
+            );
         }
     });
 }

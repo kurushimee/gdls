@@ -47,13 +47,16 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # dependency policy — previously each of the four crates pinned `2.1.2` independently.
 rustc-hash = "2.1.2"
 # M5 Phase B (observability). Pinned at the de-facto tracing 0.1 / subscriber 0.3 / log-bridge 0.2
-# pair tokio + rust-analyzer ship with. `tracing-subscriber` enables only `env-filter` + `fmt` (the
-# default features add `tracing-log` re-export + chrono + the `ansi` heuristics — we install the
-# log bridge ourselves and skip the rest, keeping the transitive graph small per WP-O1's dep-audit
-# call-out). `sysinfo` drops every default feature and re-enables only `system` (its `disk` /
-# `component` / `network` collectors are all dead code for an RSS sampler).
+# pair tokio + rust-analyzer ship with. `tracing-subscriber` keeps default features off (skipping
+# `ansi` + `smallvec`) but must enable its `tracing-log` feature: that is what makes `fmt` and
+# `EnvFilter` normalize events arriving over the `LogTracer` bridge back to their original
+# target/file/line. Without it every `log::*` callsite in the workspace renders as target `log`
+# with `log.target=…` field noise — and `GDLS_LOG=gd_server::api_dump=debug`-style per-target
+# directives can't match bridged events at all. No new transitives: `tracing-log` is already the
+# bridge dependency below. `sysinfo` drops every default feature and re-enables only `system`
+# (its `disk` / `component` / `network` collectors are all dead code for an RSS sampler).
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json", "registry", "std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json", "registry", "std", "tracing-log"] }
 tracing-log = { version = "0.2.0", default-features = false, features = ["log-tracer", "std"] }
 sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }
 # M5 Phase D (WP-H2). `lru` 0.18 — bounded `parse_cache` / `analysis_cache` with LRU eviction so a
