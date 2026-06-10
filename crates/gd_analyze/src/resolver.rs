@@ -2379,20 +2379,13 @@ fn resolve_assignable(
             {
                 // For parameters, the `@warning_ignore` typically attaches to the enclosing
                 // function (`@warning_ignore("inference_on_variant")` above
-                // `func f(p := variant())`), not the parameter itself. Route the ignore lookup
-                // through the function so the corpus's `features/hard_variants.gd` cases on
-                // lines 11 stay silent. Variable / constant decls carry their own annotation
-                // on the declaration node, so the default same-node ignore-context works there.
-                let ignore_ctx = if matches!(&ctx.node(node_id).kind, NodeKind::Parameter(_)) {
-                    ctx.current_function.unwrap_or(node_id)
-                } else {
-                    node_id
-                };
-                ctx.push_warning_for(
+                // `func f(p := variant())`), not the parameter itself. The function span in
+                // `warning_ignored_lines` (annotation line through signature end) covers every
+                // parameter line, so the plain line filter suppresses it — same as upstream.
+                ctx.push_warning(
                     crate::warnings::WarningCode::InferenceOnVariant,
                     &[kind_label.to_owned()],
                     node_id,
-                    ignore_ctx,
                 );
             }
         } else if !has_specified_type && !initializer_type.is_set() {
@@ -3515,15 +3508,16 @@ fn emit_unused_member_warnings(ctx: &mut AnalysisContext, class_id: NodeId) {
                 if referenced.contains(&name) {
                     continue;
                 }
-                // Anchor the warning at the variable's identifier (Godot:1446 anchors there too),
-                // but route the `@warning_ignore` check through the variable node — that's where
-                // the annotations live in the AST (`@warning_ignore("…") var _b` attaches the
-                // annotation to the `VariableNode`, not its identifier child).
+                // Anchor the warning at the variable's identifier (gdscript_analyzer.cpp:1444
+                // anchors there too). The `@warning_ignore("…") var _b` span recorded by
+                // `build_warning_ignored_lines` runs from the annotation through the declaration
+                // header, which contains the identifier's line — suppression is by line, as
+                // upstream.
                 let at = match &ctx.node(var_id).kind {
                     NodeKind::Variable(v) => v.identifier.unwrap_or(var_id),
                     _ => var_id,
                 };
-                ctx.push_warning_for(WarningCode::UnusedPrivateClassVariable, &[name], at, var_id);
+                ctx.push_warning(WarningCode::UnusedPrivateClassVariable, &[name], at);
             }
             Member::Signal(sig_id) => {
                 let name = decl_identifier_name(ctx, sig_id);
@@ -3537,7 +3531,7 @@ fn emit_unused_member_warnings(ctx: &mut AnalysisContext, class_id: NodeId) {
                     NodeKind::Signal(s) => s.identifier.unwrap_or(sig_id),
                     _ => sig_id,
                 };
-                ctx.push_warning_for(WarningCode::UnusedSignal, &[name], at, sig_id);
+                ctx.push_warning(WarningCode::UnusedSignal, &[name], at);
             }
             _ => {}
         }
