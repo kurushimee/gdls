@@ -311,6 +311,7 @@ pub fn type_from_variant(value: &FoldedValue) -> DataType {
             FoldedValue::Int(_) => VariantType::Int,
             FoldedValue::Float(_) => VariantType::Float,
             FoldedValue::String(_) => VariantType::String,
+            FoldedValue::Opaque(vt) => *vt,
         },
         ..Default::default()
     }
@@ -421,36 +422,50 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
     // semantics — every value is by-value — so the `!is_shared()` guards are trivially satisfied.
     // (Array/Dictionary literals do NOT get a `FoldedValue`, so `is_reduced` is false for them —
     // matching Godot's `is_shared()` skip; those go through the type-only path below.)
+    //
+    // An `Opaque` fold (builtin named constant — value unknown, kind known) can't be evaluated;
+    // Godot would fold the real values here. Instead the pair drops to the type-only tail below,
+    // which validates against the same operator table `Variant::evaluate` dispatches over — the
+    // operand kinds are remembered so the invalid arm keeps Godot's constant-operand error
+    // template, and a valid result re-stamps `Opaque` so the expression stays constant for
+    // `const`/match contexts.
+    let mut opaque_operand_types: Option<(VariantType, VariantType)> = None;
     if let (Some(l), Some(r)) = (op_node.left_operand, op_node.right_operand) {
         if ctx.folds.is_reduced(l) && ctx.folds.is_reduced(r) {
             let lv = ctx.folds.get(l).cloned();
             let rv = ctx.folds.get(r).cloned();
             if let (Some(lv), Some(rv)) = (lv, rv) {
-                if let Some(folded) = eval_binary(op_node.operation, &lv, &rv) {
+                let has_opaque =
+                    matches!(lv, FoldedValue::Opaque(_)) || matches!(rv, FoldedValue::Opaque(_));
+                if has_opaque {
+                    opaque_operand_types =
+                        Some((folded_variant_type(&lv), folded_variant_type(&rv)));
+                } else if let Some(folded) = eval_binary(op_node.operation, &lv, &rv) {
                     let dt = type_from_variant(&folded);
                     ctx.folds.set(id, folded);
                     ctx.set_type(id, dt);
                     return;
+                } else {
+                    // Fold attempted and failed — Godot's `r_valid = false` arm at
+                    // analyzer.cpp:3126-3135. Emit the exact `Invalid operands to operator OP, A and B.`
+                    // diagnostic the corpus pins (`errors/invalid_concatenation_bool.gd`,
+                    // `errors/bitwise_float_{left,right}_operand.gd`). Variant's evaluator names the
+                    // operand types via `Variant::get_type_name`, not `DataType::to_string` (the latter
+                    // form is the get_operation_type path at analyzer.cpp:3166).
+                    let lname = data_type::variant_type_name(folded_variant_type(&lv));
+                    let rname = data_type::variant_type_name(folded_variant_type(&rv));
+                    ctx.push_error(
+                        format!(
+                            "Invalid operands to operator {}, {} and {}.",
+                            binary_op_symbol(op_node.operation),
+                            lname,
+                            rname,
+                        ),
+                        id,
+                    );
+                    ctx.set_type(id, variant_dt());
+                    return;
                 }
-                // Fold attempted and failed — Godot's `r_valid = false` arm at
-                // analyzer.cpp:3126-3135. Emit the exact `Invalid operands to operator OP, A and B.`
-                // diagnostic the corpus pins (`errors/invalid_concatenation_bool.gd`,
-                // `errors/bitwise_float_{left,right}_operand.gd`). Variant's evaluator names the
-                // operand types via `Variant::get_type_name`, not `DataType::to_string` (the latter
-                // form is the get_operation_type path at analyzer.cpp:3166).
-                let lname = data_type::variant_type_name(folded_variant_type(&lv));
-                let rname = data_type::variant_type_name(folded_variant_type(&rv));
-                ctx.push_error(
-                    format!(
-                        "Invalid operands to operator {}, {} and {}.",
-                        binary_op_symbol(op_node.operation),
-                        lname,
-                        rname,
-                    ),
-                    id,
-                );
-                ctx.set_type(id, variant_dt());
-                return;
             }
         }
     }
@@ -489,16 +504,37 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
         // `Invalid operands "X" and "Y" for "OP" operator.` error.
         let (res_dt, valid) = get_operation_type(op_node.operation, &left_dt, &right_dt);
         if !valid {
-            ctx.push_error(
-                format!(
-                    r#"Invalid operands "{left_dt}" and "{right_dt}" for "{op}" operator."#,
-                    op = binary_op_symbol(op_node.operation),
-                ),
-                id,
-            );
+            if let Some((lt, rt)) = opaque_operand_types {
+                // Constant operands take Godot's `Variant::evaluate r_valid=false` template
+                // (analyzer.cpp:3126-3135) even though we validated by type — the value was
+                // opaque, but the operands were still constants.
+                ctx.push_error(
+                    format!(
+                        "Invalid operands to operator {}, {} and {}.",
+                        binary_op_symbol(op_node.operation),
+                        data_type::variant_type_name(lt),
+                        data_type::variant_type_name(rt),
+                    ),
+                    id,
+                );
+            } else {
+                ctx.push_error(
+                    format!(
+                        r#"Invalid operands "{left_dt}" and "{right_dt}" for "{op}" operator."#,
+                        op = binary_op_symbol(op_node.operation),
+                    ),
+                    id,
+                );
+            }
         }
         res_dt
     };
+    // A valid op over constant-but-opaque operands is itself a constant of known kind (Godot
+    // folds the real value; the invalid arm returns a Variant-kinded result, so the Builtin
+    // gate below excludes it).
+    if opaque_operand_types.is_some() && result.kind == DtKind::Builtin {
+        ctx.folds.set(id, FoldedValue::Opaque(result.builtin_type));
+    }
     ctx.set_type(id, result);
 }
 
@@ -829,6 +865,12 @@ fn is_nil_builtin(dt: &DataType) -> bool {
 /// `errors/invalid_concatenation_bool.gd` (`print(true + true)`) pins.
 fn eval_binary(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedValue> {
     use FoldedValue::*;
+    // An `Opaque` operand has no materialized value to evaluate — `reduce_binary_op` routes those
+    // to the type-only path before calling here; this guard keeps the function total (and keeps
+    // the booleanize-based logic arms below from fabricating a value).
+    if matches!(a, Opaque(_)) || matches!(b, Opaque(_)) {
+        return None;
+    }
     // Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) — Variant registers comparisons for many type
     // pairs incl. Bool×Bool (variant_op.cpp:488/610/731/762). The mixed-numeric (Int↔Bool/Float)
     // cases also have entries; `compare` mirrors them by widening through `to_float` for any pair
@@ -966,6 +1008,9 @@ fn booleanize(v: &FoldedValue) -> bool {
         Int(i) => *i != 0,
         Float(f) => *f != 0.0,
         String(s) => !s.is_empty(),
+        // Unreachable in practice: `eval_binary` rejects Opaque operands before its
+        // booleanize-driven logic arms run. Total for safety; never trust an unknown value.
+        Opaque(_) => false,
     }
 }
 
@@ -979,6 +1024,7 @@ fn folded_variant_type(v: &FoldedValue) -> VariantType {
         FoldedValue::Int(_) => VariantType::Int,
         FoldedValue::Float(_) => VariantType::Float,
         FoldedValue::String(_) => VariantType::String,
+        FoldedValue::Opaque(vt) => *vt,
     }
 }
 
@@ -1157,6 +1203,12 @@ fn fold_lua_dict_key(ctx: &mut AnalysisContext, key_id: NodeId) {
 /// `StringName/String/NodePath` are coalesced into `FoldedValue::String` so they compare equal,
 /// matching `errors/dictionary_string_stringname_equivalent.gd`.
 fn folded_value_eq(a: &FoldedValue, b: &FoldedValue) -> bool {
+    // An `Opaque` constant's value is unknown — it can never be *proven* a duplicate, so it never
+    // compares equal (`{Vector3.UP: 1, Vector3.DOWN: 2}` must not flag a phantom dup-key; Godot
+    // compares the real folded vectors).
+    if matches!(a, FoldedValue::Opaque(_)) || matches!(b, FoldedValue::Opaque(_)) {
+        return false;
+    }
     a == b
 }
 
@@ -1170,6 +1222,9 @@ fn folded_key_display(v: &FoldedValue) -> String {
         FoldedValue::Int(i) => i.to_string(),
         FoldedValue::Float(f) => f.to_string(),
         FoldedValue::String(s) => s.clone(),
+        // Unreachable: `folded_value_eq` never matches an Opaque key, so the dup-key error can't
+        // name one. Total for safety — render the kind, the only thing we know.
+        FoldedValue::Opaque(vt) => data_type::variant_type_name(*vt).to_owned(),
     }
 }
 
@@ -4231,32 +4286,34 @@ fn reduce_identifier_from_base(
             };
 
             // 1. Constants (analyzer.cpp:4059-4067). Godot types these by `type_from_variant`
-            //    over the constant's real value. gdls's NativeDb ingests builtin constants
-            //    without a per-constant type field (only `name` and `value`); however, every
-            //    builtin's named-constant table holds values of that same builtin type
-            //    (Color.RED is Color, Vector2.ZERO is Vector2, ...) — there are no
-            //    cross-type constants on builtins. Type the result as the parent builtin so
-            //    downstream assignment-compat / cast checks work for the
-            //    `var s: String = Color.RED`-shape corpus cases.
-            if bt
+            //    over the constant's real value; the dump carries each constant's declared type,
+            //    which is the same information without materializing the value (`Vector3.UP` →
+            //    Vector3, `Vector3.AXIS_X` → int). Fall back to the parent builtin if the dump
+            //    omitted the type (every builtin's same-typed constants make that a safe default).
+            if let Some(c) = bt
                 .constants
                 .iter()
-                .any(|c| ctx.native.name_of(c.name) == name)
+                .find(|c| ctx.native.name_of(c.name) == name)
             {
+                let const_bt =
+                    c.ty.and_then(|sym| {
+                        crate::resolver::builtin_type_from_name(ctx.native.name_of(sym))
+                    })
+                    .unwrap_or(base.builtin_type);
                 let typed = DataType {
                     type_source: TypeSource::AnnotatedExplicit,
                     kind: DtKind::Builtin,
-                    builtin_type: base.builtin_type,
+                    builtin_type: const_bt,
                     is_constant: true,
                     ..Default::default()
                 };
                 ctx.set_type(identifier_id, typed);
-                // Stamp a placeholder `Nil` fold so downstream callers' `is_reduced` gate
-                // recognises this as a constant expression. The value itself isn't read by the
-                // assignment-compat / cast paths (they only consult the **type**), so a
-                // placeholder is sufficient. Faithful Color/Vector2/etc. value folding needs
-                // FoldedValue carrying the opaque builtin value, which is a separate slice.
-                ctx.folds.set(identifier_id, FoldedValue::Nil);
+                // Godot folds the constant's real value (`Variant::get_constant_value`,
+                // analyzer.cpp:4063); `FoldedValue` has no vector/color representations, so stamp
+                // an `Opaque` fold instead — downstream `is_reduced` gates still see a constant
+                // expression, while value-dependent paths (binary fold, dup-key) know there is no
+                // trustworthy value behind it.
+                ctx.folds.set(identifier_id, FoldedValue::Opaque(const_bt));
                 return;
             }
 
@@ -5404,5 +5461,121 @@ mod tests {
         let dt2 = ctx.get_type(id).clone();
         assert_eq!(dt1.builtin_type, dt2.builtin_type);
         assert!(ctx.reduced.contains(&id));
+    }
+
+    // --- FoldedValue::Opaque (builtin named constants) ------------------------------------------
+
+    /// A mini dump whose `builtin_classes` carry `Vector3` with typed named constants — the
+    /// surface the `Opaque` fold covers. `AXIS_X` is deliberately `int`-typed: the per-constant
+    /// type from the dump is what keeps integer constants on vector builtins from mis-typing as
+    /// the parent builtin.
+    fn vector_native() -> NativeDb {
+        NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "builtin_classes": [
+                    {"name": "Vector3", "constants": [
+                        {"name": "UP", "type": "Vector3", "value": "Vector3(0, 1, 0)"},
+                        {"name": "DOWN", "type": "Vector3", "value": "Vector3(0, -1, 0)"},
+                        {"name": "ONE", "type": "Vector3", "value": "Vector3(1, 1, 1)"},
+                        {"name": "AXIS_X", "type": "int", "value": "0"}
+                    ]}
+                ],
+                "classes": [{"name": "Object"}, {"name": "RefCounted", "inherits": "Object"}]
+            }"#,
+        )
+        .expect("valid mini dump")
+    }
+
+    fn analyze_error_messages(src: &str) -> Vec<String> {
+        let tree = gd_syntax::parse(src).tree;
+        let native = vector_native();
+        let result = crate::analyze(
+            &tree,
+            Some(FileId::new(1)),
+            "t.gd",
+            &native,
+            &NoCrossFile,
+            &policy(),
+        );
+        result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::diagnostic::Severity::Error)
+            .map(|d| d.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn opaque_vector_const_times_float_no_error_and_types_vector3() {
+        // The headline false positive: `Vector3.UP * 3.0` used to fold the constant as a
+        // placeholder Nil and report `Invalid operands to operator *, Nil and float.`.
+        let src = "extends RefCounted\nfunc go() -> void:\n\tvar _v = Vector3.UP * 3.0\n";
+        assert_eq!(analyze_error_messages(src), Vec::<String>::new());
+
+        // And the op's result type is the table's (Vector3, Float) ⇒ Vector3, still constant.
+        let tree = gd_syntax::parse(src).tree;
+        let native = vector_native();
+        let result = crate::analyze(
+            &tree,
+            Some(FileId::new(1)),
+            "t.gd",
+            &native,
+            &NoCrossFile,
+            &policy(),
+        );
+        let mut saw_binary = false;
+        for id in tree.iter_ids() {
+            if matches!(tree.get(id).kind, NodeKind::BinaryOp(_)) {
+                let dt = result.types.get(id);
+                assert_eq!(dt.kind, DtKind::Builtin);
+                assert_eq!(dt.builtin_type, VariantType::Vector3);
+                assert!(
+                    matches!(
+                        result.folds.get(id),
+                        Some(FoldedValue::Opaque(VariantType::Vector3))
+                    ),
+                    "valid op over opaque constants must stay a (kind-known) constant"
+                );
+                saw_binary = true;
+            }
+        }
+        assert!(saw_binary);
+    }
+
+    #[test]
+    fn opaque_invalid_pair_keeps_constant_error_template() {
+        // Constant operands always take Godot's `Variant::evaluate r_valid=false` template, even
+        // when gdls validated by type because the value is opaque.
+        let src = "extends RefCounted\nfunc go() -> void:\n\tvar _v = Vector3.UP * false\n";
+        assert_eq!(
+            analyze_error_messages(src),
+            vec!["Invalid operands to operator *, Vector3 and bool.".to_owned()]
+        );
+    }
+
+    #[test]
+    fn opaque_int_typed_constant_uses_declared_type() {
+        // `Vector3.AXIS_X` is an int constant; typing it as the parent Vector3 would
+        // false-positive `int & int`.
+        let src = "extends RefCounted\nfunc go() -> void:\n\tvar _m = Vector3.AXIS_X & 1\n";
+        assert_eq!(analyze_error_messages(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn opaque_dict_keys_never_report_duplicate() {
+        // Two distinct opaque constants used to share the placeholder Nil fold and flag a
+        // phantom dup-key. An unknown value can never be *proven* a duplicate.
+        let src =
+            "extends RefCounted\nfunc go() -> void:\n\tvar _d = {Vector3.UP: 1, Vector3.DOWN: 2}\n";
+        assert_eq!(analyze_error_messages(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn opaque_binary_result_satisfies_const_contexts() {
+        // `const` initializers gate on `is_reduced`; the Opaque result stamp keeps a valid op
+        // over builtin constants usable as a constant expression.
+        let src = "extends RefCounted\nconst SCALED = Vector3.ONE * 2.0\n";
+        assert_eq!(analyze_error_messages(src), Vec::<String>::new());
     }
 }

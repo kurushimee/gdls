@@ -88,6 +88,10 @@ pub struct NativeEnum {
 pub struct NamedConst {
     pub name: Sym,
     pub value: i64,
+    /// The constant's declared type name from the dump (`Vector3.UP` → `Vector3`,
+    /// `Vector3.AXIS_X` → `int`). `Some` only for builtin-class constants — engine-class
+    /// constants are bare integers and carry no type field in the API.
+    pub ty: Option<Sym>,
 }
 
 /// A native class and its members.
@@ -384,6 +388,7 @@ fn ingest_class(c: api::ClassDef, it: &mut Interner) -> NativeClass {
             .map(|k| NamedConst {
                 name: it.intern(&k.name),
                 value: k.value,
+                ty: None,
             })
             .collect(),
         brief_description: c.brief_description,
@@ -465,7 +470,10 @@ fn ingest_builtin(b: api::BuiltinClass, it: &mut Interner) -> BuiltinType {
             .into_iter()
             .map(|k| NamedConst {
                 name: it.intern(&k.name),
+                // Builtin-constant values are non-scalar literals ("Vector3(0, 1, 0)") the type
+                // model doesn't evaluate; the declared type below is what the analyzer consumes.
                 value: 0,
+                ty: non_empty(&k.ty, it),
             })
             .collect(),
     }
