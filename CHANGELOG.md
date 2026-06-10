@@ -9,6 +9,68 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 (nothing yet)
 
+## [1.0.1] — 2026-06-10
+
+The urgent diagnostics-correctness release. A post-v1.0.0 full-project sweep (didOpen every
+`.gd`, tally `publishDiagnostics`) found error-level **false positives in ~45–55% of files** on
+real layered projects (Pixelorama @ stock 4.6.3: 133/243 files, 1,223 errors; a 2,338-script
+production project: 1,051 files, 6,167 errors) — all violations of the "never lie" rule, all
+reproducing on vanilla Godot 4.6.3 fixtures. v1.0.1 fixes the four families behind that, closes
+both v1.0.0 follow-ups (#13, #14), and removes the last manual setup step (`extension_api.json`).
+
+### Fixed — analyzer false positives
+- **Cross-file `extends ClassName` lost native lineage and inherited members** (#15): a new
+  shared script-chain resolver (`gd_analyze::script_chain`, memoized, cycle-guarded) walks
+  `Interface::extends` links to the native root, mirroring Godot's `native_type` propagation
+  (analyzer.cpp:617-619). Fixes the false `Cannot use "$" on a class that isn't a node.`,
+  `"@onready" can only be used in classes that inherit "Node".`,
+  `Identifier "…" not declared in the current scope.` (inherited members), and
+  `Invalid argument … but is "<Class>".` (self-compat — `is_type_compatible` now ports Godot's
+  source decomposition, analyzer.cpp:6210-6296). Unknown/unresolvable chains stay permissive.
+- **Cross-file `Class.CONST.member` chains errored `Cannot get property from enum value.`**
+  (#18): regular consts now take Godot's CONSTANT member arm (typed from their declaration via
+  the new interface-TypeExpr resolver); only genuine `enum { … }` hoists type as anonymous-enum
+  values (the interface now records them explicitly).
+- **Builtin named constants poisoned constant arithmetic** (#16): `Vector3.UP * 3.0` reported
+  `Invalid operands to operator *, Nil and float.` because the constant folded as a placeholder
+  Nil. `FoldedValue::Opaque(kind)` keeps constancy without a fabricated value; binary ops
+  validate by type, dict dup-key treats unknown values as never-equal, and the dump's
+  per-constant declared types are now ingested (`Vector3.AXIS_X` is `int`).
+- **`Packed*Array` was not iterable** (#17): `for p in paths:` errored
+  `Unable to iterate on value of type "PackedStringArray".`; the typed-container element table
+  (gdscript_parser.cpp:5508-5530) is now ported into `resolve_for`.
+- Cross-file named enums carry their **declared** integer values (literal chains; unknown values
+  suppress `INT_AS_ENUM_WITHOUT_MATCH` / `ENUM_VARIABLE_WITHOUT_DEFAULT` instead of judging
+  against sequential placeholders).
+
+### Added
+- **Cross-file member navigation slice** (#13): member access through typed bases and bare
+  inherited identifiers now records `Binding::Use` against the *declaring* file —
+  `references` on a signal declaration finds cross-file `obj.sig.emit(…)` sites, `definition`
+  on a member-access jumps to the declaration, and hover renders `var`/`const` member shapes.
+- **Zero-config native types** (#20): gdls now auto-dumps `extension_api.json` into `.gdls/`
+  by running the user's Godot (`godotBinaryPath` → `GDLS_GODOT` → `godot4`/`godot` on PATH)
+  with project context — which is what captures GDExtension classes — and keeps staleness
+  metadata (binary identity + `.gdextension` set). Opt out with `autoDumpExtensionApi: false`.
+  Resolution order: explicit `extensionApiPath` → fresh `.gdls` dump → auto-dump → stale dump →
+  unmanaged `<root>/extension_api.json` → dynamic.
+- `uid://` autoload script targets resolve through the sidecar map (#19) — definition,
+  references, and singleton typing now work for `Name="*uid://…"` autoloads.
+- The full-project diagnostics sweep is committed as a release gate
+  (`scripts/m6-acceptance/scan_diags.py`) — a nav-row walk is not a diagnostics gate.
+
+### Performance
+- **Windows/NTFS startup** (#14): the 7–9 s window blamed on the reconcile walk was mostly the
+  file watcher's `FileIdMap` arming scan (a full-tree, handle-per-file walk that exists only to
+  pair rename events — which gdls already handles unpaired). The debouncer now runs `NoCache` on
+  every platform; reconcile and the warm-load walk reuse the directory enumeration's own
+  metadata (zero extra stats on Windows); and with the watcher armed *before* the workspace
+  loads, the startup backstop runs in `DiscoverOnly` mode (enumeration-only for known files).
+
+### Cache
+- `CACHE_FORMAT_VERSION` 1 → 2 (the interface now carries enum values + unnamed-enum hoists).
+  Old caches are ignored; expect one cold start after upgrading.
+
 ## [1.0.0] — 2026-06-10
 
 The first release. **M6 has landed** — the ship bar raised at the close of M5 (exposed-capability

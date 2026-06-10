@@ -96,7 +96,6 @@ in `plugin.json`):
     "extensionToLanguage": { ".gd": "gdscript" },
     "initializationOptions": {
       "projectRoot": "/home/me/MyGame",
-      "extensionApiPath": "/home/me/gdls/api/extension_api.json",
       "strict": { "profile": "strict" }
     },
     "restartOnCrash": true,
@@ -110,7 +109,9 @@ in `plugin.json`):
 | Key | Type | Meaning |
 |---|---|---|
 | `projectRoot` | string (path) | `res://` root. Optional; falls back to workspace folder / nearest `project.godot`. |
-| `extensionApiPath` | string (path) | Path to Godot's `extension_api.json`. Optional; missing → native types degrade to dynamic. |
+| `extensionApiPath` | string (path) | Pin a hand-made `extension_api.json`. Optional — when absent, the v1.0.1 auto-dump resolution applies (`03-indexing-freshness.md` §1); when neither yields a dump, native types degrade to dynamic. |
+| `godotBinaryPath` | string (path) | Godot 4.x executable for the auto-dump. Optional; discovery falls back to `GDLS_GODOT`, then `godot4`/`godot` on PATH. |
+| `autoDumpExtensionApi` | bool | Allow gdls to spawn Godot at session startup to (re)generate the managed dump under `.gdls/`. Default `true`; `false` forbids spawning entirely. |
 | `strict.profile` | `"godot"` \| `"strict"` \| `"off"` | Diagnostics profile (see `04-diagnostics-strict-mode.md`). Default `"godot"`. |
 | `strict.enableWarnings` / `disableWarnings` / `errorWarnings` | string[] | Fine-grained overrides. |
 
@@ -121,9 +122,11 @@ is undocumented — stay on stdio), `env`, `startupTimeout`, `shutdownTimeout`.
 
 - Ship a single static `gdls` (Rust release build) and place it on `PATH` (or reference it from a plugin
   that ensures it is installed).
-- Generate `extension_api.json` from Godot once per engine rebuild (`03-indexing-freshness.md` §1).
-- No other runtime files required; the server is stateless across restarts except for the optional
-  Phase-2 on-disk index cache.
+- `extension_api.json` is auto-managed since v1.0.1 (gdls dumps it via the discovered Godot binary and
+  regenerates on binary / `.gdextension` changes — `03-indexing-freshness.md` §1). Manual generation is
+  only needed when `autoDumpExtensionApi` is disabled or no Godot binary is discoverable.
+- No other runtime files required; the server is stateless across restarts except for the
+  `.gdls/` warm-start cache + managed dump.
 
 ## 5. Sources
 

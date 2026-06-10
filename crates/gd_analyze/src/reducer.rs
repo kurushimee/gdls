@@ -4652,8 +4652,9 @@ fn cross_file_enum_instance(
 /// `GDScriptAnalyzer::reduce_identifier_from_base(p_identifier, p_base)` (analyzer.cpp:4024). Look
 /// up `p_identifier` as a member of `p_base`. E3e ports the enum-meta / builtin-meta / native-class
 /// branches that drive the enum-access corpus family; the in-file class branch (script_classes
-/// walk at analyzer.cpp:4150-4251) and the cross-file Script branch (4253-4306) land alongside
-/// the cross-file machinery in a later slice.
+/// walk at analyzer.cpp:4150-4251) walks `lookup_class_member` and continues into the cross-file
+/// chain, and the Script branch (4253-4306) runs the full per-kind member walk over
+/// `crate::script_chain` (v1.0.1).
 ///
 /// `base = None` is Godot's "no explicit base" path that defaults to `current_class`. gdls's
 /// caller in `reduce_subscript` always passes an explicit base, so we don't yet exercise that arm.
@@ -4838,10 +4839,11 @@ fn reduce_identifier_from_base(
     }
 
     // --- SCRIPT branch (analyzer.cpp:4253-4306) ---------------------------------------------------
-    // Cross-file script-member introspection — deferred. Behave conservatively: an in-flight
-    // reference to a member on a cross-file script that we can't yet resolve degrades to Variant
-    // (avoids a false-positive "Cannot find member"). The full resolution joins with the
-    // cross-file slice that wires CrossFileQuery into reducer lookups.
+    // Cross-file member resolution over the full extends chain (v1.0.1): named enums, consts,
+    // vars, signals, and functions type per Godot's access-mode conditions, then the chain's
+    // native root carries the inherited native members. The one deliberate deviation: a complete
+    // miss still degrades to a SILENT Variant rather than `Cannot find member` — interfaces are
+    // shallow extracts and a gap in them must never become an error.
     if base.kind == DtKind::Script {
         if is_constructor {
             let mut t = DataType {
