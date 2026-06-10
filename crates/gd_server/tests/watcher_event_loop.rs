@@ -47,6 +47,7 @@ fn start(
     let init = InitializeParams {
         initialization_options: Some(serde_json::json!({
             "projectRoot": project.root.as_str(),
+            "autoDumpExtensionApi": false,
             "extensionApiPath": project.root.join("extension_api.json").as_str(),
         })),
         ..Default::default()
@@ -195,6 +196,42 @@ fn non_fatal_notify_error_keeps_watcher_armed() {
     assert!(
         open_and_expect_publish(&project, &client, "src/enemy.gd", 2),
         "a non-fatal notify error must not disable the watcher or kill the session"
+    );
+    shutdown(&client, thread);
+}
+
+/// The Windows-with-`NoCache` rename shape (issue #14): without the debouncer's FileIdMap there
+/// is no rename pairing, so `From`/`To` arrive as separate unpaired halves. The vanished-path
+/// arm removes the old file, the `To` arm reindexes the new one, and the session keeps serving —
+/// the contract that made dropping the (tree-walking, handle-per-file) cache safe.
+#[test]
+fn unpaired_rename_halves_keep_session_serving() {
+    let project = sample_project();
+    let (client, watcher_tx, thread) = start(&project);
+    assert!(open_and_expect_publish(&project, &client, "src/hero.gd", 1));
+
+    let old_abs = project.root.join("src/enemy.gd");
+    let new_abs = project.root.join("src/enemy_renamed.gd");
+    std::fs::rename(old_abs.as_std_path(), new_abs.as_std_path()).unwrap();
+
+    let from = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+        notify::event::RenameMode::From,
+    )))
+    .add_path(old_abs.as_std_path().to_path_buf());
+    let to = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+        notify::event::RenameMode::To,
+    )))
+    .add_path(new_abs.as_std_path().to_path_buf());
+    watcher_tx
+        .send(Ok(vec![
+            DebouncedEvent::new(from, Instant::now()),
+            DebouncedEvent::new(to, Instant::now()),
+        ]))
+        .unwrap();
+
+    assert!(
+        open_and_expect_publish(&project, &client, "src/enemy_renamed.gd", 2),
+        "after unpaired rename halves, the renamed file must open and publish"
     );
     shutdown(&client, thread);
 }

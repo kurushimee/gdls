@@ -13,16 +13,28 @@
       "name": "Variant.Operator",
       "is_bitfield": false,
       "values": [
-        {"name": "OP_EQUAL", "value": 0},
-        {"name": "OP_NOT_EQUAL", "value": 1}
+        {
+          "name": "OP_EQUAL",
+          "value": 0
+        },
+        {
+          "name": "OP_NOT_EQUAL",
+          "value": 1
+        }
       ]
     },
     {
       "name": "ClockDirection",
       "is_bitfield": false,
       "values": [
-        {"name": "CLOCKWISE", "value": 0},
-        {"name": "COUNTERCLOCKWISE", "value": 1}
+        {
+          "name": "CLOCKWISE",
+          "value": 0
+        },
+        {
+          "name": "COUNTERCLOCKWISE",
+          "value": 1
+        }
       ]
     },
     {
@@ -248,6 +260,27 @@
           "value": 48
         }
       ]
+    },
+    {
+      "name": "Variant.Type",
+      "values": [
+        {
+          "name": "TYPE_NIL",
+          "value": 0
+        },
+        {
+          "name": "TYPE_BOOL",
+          "value": 1
+        },
+        {
+          "name": "TYPE_INT",
+          "value": 2
+        },
+        {
+          "name": "TYPE_FLOAT",
+          "value": 3
+        }
+      ]
     }
   ],
   "global_constants": [],
@@ -259,8 +292,14 @@
       "is_vararg": false,
       "hash": 1,
       "arguments": [
-        {"name": "a", "type": "Variant"},
-        {"name": "b", "type": "Variant"}
+        {
+          "name": "a",
+          "type": "Variant"
+        },
+        {
+          "name": "b",
+          "type": "Variant"
+        }
       ]
     },
     {
@@ -270,7 +309,10 @@
       "is_vararg": false,
       "hash": 2,
       "arguments": [
-        {"name": "x", "type": "float"}
+        {
+          "name": "x",
+          "type": "float"
+        }
       ]
     },
     {
@@ -280,7 +322,10 @@
       "is_vararg": false,
       "hash": 3,
       "arguments": [
-        {"name": "x", "type": "Variant"}
+        {
+          "name": "x",
+          "type": "Variant"
+        }
       ]
     },
     {
@@ -290,7 +335,10 @@
       "is_vararg": false,
       "hash": 4,
       "arguments": [
-        {"name": "x", "type": "Variant"}
+        {
+          "name": "x",
+          "type": "Variant"
+        }
       ]
     },
     {
@@ -300,7 +348,10 @@
       "is_vararg": false,
       "hash": 5,
       "arguments": [
-        {"name": "x", "type": "Variant"}
+        {
+          "name": "x",
+          "type": "Variant"
+        }
       ]
     },
     {
@@ -2207,17 +2258,49 @@
       "indexing_return_type": "float",
       "is_keyed": false,
       "members": [
-        {"name": "r", "type": "float"},
-        {"name": "g", "type": "float"},
-        {"name": "b", "type": "float"},
-        {"name": "a", "type": "float"}
+        {
+          "name": "r",
+          "type": "float"
+        },
+        {
+          "name": "g",
+          "type": "float"
+        },
+        {
+          "name": "b",
+          "type": "float"
+        },
+        {
+          "name": "a",
+          "type": "float"
+        }
       ],
       "constants": [
-        {"name": "RED", "type": "Color", "value": "Color(1, 0, 0, 1)"},
-        {"name": "GREEN", "type": "Color", "value": "Color(0, 1, 0, 1)"},
-        {"name": "BLUE", "type": "Color", "value": "Color(0, 0, 1, 1)"},
-        {"name": "WHITE", "type": "Color", "value": "Color(1, 1, 1, 1)"},
-        {"name": "BLACK", "type": "Color", "value": "Color(0, 0, 0, 1)"}
+        {
+          "name": "RED",
+          "type": "Color",
+          "value": "Color(1, 0, 0, 1)"
+        },
+        {
+          "name": "GREEN",
+          "type": "Color",
+          "value": "Color(0, 1, 0, 1)"
+        },
+        {
+          "name": "BLUE",
+          "type": "Color",
+          "value": "Color(0, 0, 1, 1)"
+        },
+        {
+          "name": "WHITE",
+          "type": "Color",
+          "value": "Color(1, 1, 1, 1)"
+        },
+        {
+          "name": "BLACK",
+          "type": "Color",
+          "value": "Color(0, 0, 0, 1)"
+        }
       ],
       "enums": [],
       "methods": [],
@@ -2264,27 +2347,93 @@
       "indexing_return_type": "float",
       "is_keyed": false,
       "members": [
-        {"name": "x", "type": "float"},
-        {"name": "y", "type": "float"},
-        {"name": "z", "type": "float"}
+        {
+          "name": "x",
+          "type": "float"
+        },
+        {
+          "name": "y",
+          "type": "float"
+        },
+        {
+          "name": "z",
+          "type": "float"
+        }
       ],
       "constants": [
-        {"name": "ZERO", "type": "Vector3", "value": "Vector3(0, 0, 0)"},
-        {"name": "ONE", "type": "Vector3", "value": "Vector3(1, 1, 1)"}
+        {
+          "name": "ZERO",
+          "type": "Vector3",
+          "value": "Vector3(0, 0, 0)"
+        },
+        {
+          "name": "ONE",
+          "type": "Vector3",
+          "value": "Vector3(1, 1, 1)"
+        },
+        {
+          "name": "UP",
+          "type": "Vector3",
+          "value": "Vector3(0, 1, 0)"
+        },
+        {
+          "name": "DOWN",
+          "type": "Vector3",
+          "value": "Vector3(0, -1, 0)"
+        },
+        {
+          "name": "LEFT",
+          "type": "Vector3",
+          "value": "Vector3(-1, 0, 0)"
+        },
+        {
+          "name": "AXIS_X",
+          "type": "int",
+          "value": "0"
+        }
       ],
       "enums": [
         {
           "name": "Axis",
           "values": [
-            {"name": "AXIS_X", "value": 0},
-            {"name": "AXIS_Y", "value": 1},
-            {"name": "AXIS_Z", "value": 2}
+            {
+              "name": "AXIS_X",
+              "value": 0
+            },
+            {
+              "name": "AXIS_Y",
+              "value": 1
+            },
+            {
+              "name": "AXIS_Z",
+              "value": 2
+            }
           ]
         }
       ],
       "methods": [],
       "operators": [],
       "constructors": []
+    },
+    {
+      "name": "Vector2i",
+      "members": [
+        {
+          "name": "x",
+          "type": "int"
+        },
+        {
+          "name": "y",
+          "type": "int"
+        }
+      ],
+      "constants": [
+        {
+          "name": "ZERO",
+          "type": "Vector2i",
+          "value": "Vector2i(0, 0)"
+        }
+      ]
     }
   ],
   "classes": [

@@ -7,14 +7,24 @@ use std::num::NonZeroUsize;
 use serde::Deserialize;
 
 /// Options passed by the client under `initializationOptions`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct InitializationOptions {
     /// `res://` root. Optional; falls back to the workspace folder / nearest `project.godot` / cwd.
     pub project_root: Option<String>,
-    /// Path to Godot's `extension_api.json`. Optional; missing → native types degrade to dynamic.
-    /// Parsed for forward-compatibility; consumed starting in M2.
+    /// Path to Godot's `extension_api.json`. Optional. When set it is honored verbatim (the
+    /// user pinned a file — auto-dump never runs); when absent the v1.0.1 auto-dump resolution
+    /// takes over (`crate::api_dump`), falling back to dynamic native types only when every
+    /// source misses.
     pub extension_api_path: Option<String>,
+    /// Path to a Godot 4.x executable for the `extension_api.json` auto-dump. Optional; when
+    /// absent, discovery falls back to the `GDLS_GODOT` env var, then `godot4`/`godot` on PATH.
+    pub godot_binary_path: Option<String>,
+    /// v1.0.1: automatically dump `extension_api.json` (with project context, so GDExtension
+    /// classes are captured) into `.gdls/` when no explicit `extensionApiPath` is set and the
+    /// cached dump is missing or stale. Default **true** — the whole point is that the user
+    /// never configures native types; set false to forbid gdls from ever spawning Godot.
+    pub auto_dump_extension_api: bool,
     /// Diagnostics strictness (consumed starting in M3).
     pub strict: StrictConfig,
     /// M5 WP-O3 / WP-O4 — per-call analyzer knobs the LSP server threads into
@@ -27,6 +37,23 @@ pub struct InitializationOptions {
     /// ([`MemoryConfig::cache_capacity`], [`super::memory::DEFAULT_SOFT_CAP_MB`],
     /// [`super::memory::DEFAULT_HARD_CAP_MB`]).
     pub memory: MemoryConfig,
+}
+
+/// Manual so `parse(None)`, `parse(Some({}))`, and a missing single field all agree —
+/// `auto_dump_extension_api` defaults TRUE, which a derived `Default` (false) would silently
+/// disagree with under the container-level `#[serde(default)]`.
+impl Default for InitializationOptions {
+    fn default() -> Self {
+        InitializationOptions {
+            project_root: None,
+            extension_api_path: None,
+            godot_binary_path: None,
+            auto_dump_extension_api: true,
+            strict: StrictConfig::default(),
+            analyzer: AnalyzerConfig::default(),
+            memory: MemoryConfig::default(),
+        }
+    }
 }
 
 /// Per-call analyzer knobs surfaced through `initializationOptions.analyzer`. Optional; the

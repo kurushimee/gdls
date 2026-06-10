@@ -134,18 +134,20 @@ impl ProjectModel {
         }
     }
 
-    /// The `res://` script path a configured autoload `name` points at, or `None` if there is no such
-    /// autoload or its target is not a script (e.g. a scene). Consumed by go-to-definition on an
-    /// autoload identifier (M6-D).
+    /// The `res://` script path a configured autoload `name` points at, or `None` if there is no
+    /// such autoload or its target is not a script (e.g. a scene). `uid://` targets resolve
+    /// through [`Self::resolve_target`] first, so an autoload declared as `Name="*uid://…"`
+    /// whose sidecar maps to a `.gd` works exactly like a `res://….gd` one — Godot's
+    /// `ResourceLoader` dereferences the uid the same way (analyzer.cpp:4579). Scene targets
+    /// (direct or uid-resolved) stay `None`: scene-root script typing is the Phase-2 `.tscn`
+    /// family. Consumed by go-to-definition / references / singleton typing on autoload names.
     #[must_use]
-    pub fn autoload_script_path(&self, name: &str) -> Option<&str> {
-        self.autoloads
-            .iter()
-            .find(|a| a.name == name)
-            .and_then(|a| match &a.target {
-                ResTarget::Script(path) => Some(path.as_str()),
-                _ => None,
-            })
+    pub fn autoload_script_path(&self, name: &str) -> Option<String> {
+        let autoload = self.autoloads.iter().find(|a| a.name == name)?;
+        match self.resolve_target(&autoload.target)? {
+            ResTarget::Script(path) => Some(path),
+            _ => None,
+        }
     }
 }
 
@@ -157,6 +159,9 @@ mod tests {
 
     #[test]
     fn autoload_script_path_resolves_script_targets_only() {
+        let mut uids = FxHashMap::default();
+        uids.insert("uid://gdscript1".to_owned(), "res://via_uid.gd".to_owned());
+        uids.insert("uid://scene1".to_owned(), "res://via_uid.tscn".to_owned());
         let model = ProjectModel {
             root: Utf8PathBuf::from("/tmp/project"),
             config_version: 5,
@@ -172,14 +177,39 @@ mod tests {
                     target: ResTarget::Scene("res://music.tscn".into()),
                     is_singleton: true,
                 },
+                Autoload {
+                    name: "UidScript".into(),
+                    target: ResTarget::Uid("uid://gdscript1".into()),
+                    is_singleton: true,
+                },
+                Autoload {
+                    name: "UidScene".into(),
+                    target: ResTarget::Uid("uid://scene1".into()),
+                    is_singleton: true,
+                },
+                Autoload {
+                    name: "UidUnknown".into(),
+                    target: ResTarget::Uid("uid://nosidecar".into()),
+                    is_singleton: true,
+                },
             ],
             warnings: WarningConfig::default(),
             gdextensions: vec![],
-            uids: FxHashMap::default(),
+            uids,
         };
 
-        assert_eq!(model.autoload_script_path("Save"), Some("res://save.gd"));
+        assert_eq!(
+            model.autoload_script_path("Save"),
+            Some("res://save.gd".to_owned())
+        );
         assert_eq!(model.autoload_script_path("Music"), None); // non-script (Scene) target
         assert_eq!(model.autoload_script_path("Nope"), None); // unknown name
+        assert_eq!(
+            model.autoload_script_path("UidScript"),
+            Some("res://via_uid.gd".to_owned()),
+            "uid -> .gd resolves through the sidecar map"
+        );
+        assert_eq!(model.autoload_script_path("UidScene"), None); // uid -> scene: Phase 2
+        assert_eq!(model.autoload_script_path("UidUnknown"), None); // no sidecar entry
     }
 }

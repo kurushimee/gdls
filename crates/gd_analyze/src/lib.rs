@@ -29,6 +29,7 @@ pub mod diagnostic;
 pub mod foldtable;
 pub mod reducer;
 pub mod resolver;
+pub(crate) mod script_chain;
 pub mod typetable;
 pub mod warn_policy;
 pub mod warnings;

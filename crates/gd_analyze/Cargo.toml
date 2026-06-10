@@ -19,9 +19,11 @@ gd_syntax.workspace = true
 gd_types.workspace = true
 gd_project.workspace = true
 rustc-hash.workspace = true
+# v1.0.1: relative preload/extends path joins against the index's camino paths
+# (`SyntacticQuery::resolve_path_from`).
+camino.workspace = true
 
 [dev-dependencies]
-camino.workspace = true
 # `which`: M5 WP-D1 — PATH lookup for the local-only differential harness's `godot` discovery
 # (`tests/differential.rs`). Pinned in the workspace `[dependencies]` table per the workspace
 # policy in the root `Cargo.toml` (one version per shared external dep, lives in exactly one place).

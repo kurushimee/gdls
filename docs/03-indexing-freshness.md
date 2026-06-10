@@ -31,9 +31,26 @@ the analyzer and `hover` need.
 the file changes (i.e., after you rebuild the engine). If the file is **absent**, degrade gracefully: treat
 native types as unknown/dynamic and surface one informational notice — never crash.
 
-**Workflow (documented for the user):** after rebuilding Godot, re-run `--dump-extension-api` and point
-gdls at the new JSON (via `initializationOptions.extensionApiPath`, or drop it at a watched path). This is an
-out-of-band step and the only contact with anything Godot.
+**Auto-dump (v1.0.1 — the user does nothing).** When `extensionApiPath` is NOT set, gdls manages the
+dump itself: discover a Godot binary (`godotBinaryPath` option → `GDLS_GODOT` env, where empty/`off`
+hard-disables → `godot4`/`godot` on PATH), run
+`godot --headless --path <root> --dump-extension-api-with-docs` at session startup, and keep the result
+plus staleness metadata (binary path+size+mtime, the project's `.gdextension` file set) under `.gdls/`.
+Operational facts the implementation is built around (verified on 4.6.3): the dump lands in the
+**project root** regardless of the child's cwd (so a pre-existing user `<root>/extension_api.json`
+suppresses the dump entirely — never clobber — and the fresh output is moved into
+`.gdls/extension_api.json`); Godot may abort on exit *after* writing a complete dump, so the artifact
+decides, never the exit status; and a **never-imported** project (no `.godot/extension_list.cfg`) loads
+no GDExtensions, so its dump misses their classes — gdls detects the symptom (declared extensions, none
+of their class hints resolving) and logs the remediation (open the project in the editor once). The
+resolution ladder when no explicit path is set: fresh `.gdls` dump → auto-dump → stale `.gdls` dump →
+unmanaged `<root>/extension_api.json` → empty/dynamic. Spawning happens only at session startup, only
+for real projects (`project.godot` present), with the child's stdout/stderr piped (stdout is the LSP
+wire) and a 60 s kill-timeout.
+
+**Manual workflow (auto-dump disabled or no binary):** after rebuilding Godot, re-run
+`--dump-extension-api-with-docs` from inside the project and point gdls at the JSON via
+`initializationOptions.extensionApiPath` (an explicit path always wins and never triggers a spawn).
 
 > Alternative source considered: `doc/classes/*.xml`. Rejected as primary for engine classes because it
 > is doc-oriented and Godot's classes need their own `doc_classes` XML to appear; `extension_api.json` is
@@ -185,23 +202,28 @@ implementation plan and the watcher integration tests pin to one answer.
   and the watcher receiver; the only mutator on `Workspace` is the main loop. No locks, no shared
   mutable state. (This mirrors rust-analyzer's "the event loop accepts an `enum` of possible
   events" pattern — see rust-analyzer's architecture doc, "Observability".)
-- **Lifecycle ordering.** The watcher is constructed in `serve()` **after** the `initialize`
-  *response* has been sent and **after** `Workspace::load`'s cold-index scan completes. The server
-  does **not** send an `initialized` notification — `initialized` is a client→server message it only
-  receives and logs — so the watcher's construction is not ordered against it, and `initialized` may
-  legitimately arrive mid-cold-scan. Any change that landed during the cold scan is caught by the
-  reconciliation pass (next bullet); any change after the watcher starts is reported live. (The
-  module doc on `crates/gd_server/src/watcher.rs` is authoritative for this ordering.)
-- **Reconciliation pass after cold-index.** Immediately after the cold scan completes, the server
-  walks `res://**/*.gd` one more time, hashing `(path, mtime, size)`, diffs the result against the
-  freshly-built index, and synthesizes Create / Modify / Delete events for any drift. Logged via
-  `log::info!` with a `post_cold_reconcile` marker on the LSP cold path (`watcher_reconciled` for
-  live watcher passes; `cold_index_reconciled` on the `gdls diagnose --reconcile` CLI path); M5
-  swaps these `log::info!` stand-ins for `tracing` spans (WP-O1). This is the load-bearing fix for
-  `notify` dropping events during heavy startup (a documented behavior on every supported platform):
-  without reconciliation the index lies silently for the rest of the session. The same function is
-  also exposed as `gdls diagnose --reconcile` for ad-hoc use after wake-from-suspend or
-  remote-filesystem hiccups.
+- **Lifecycle ordering (v1.0.1).** The watcher is constructed in `serve()` after the `initialize`
+  *response* has been sent and **before** `Workspace::load` — every filesystem change that lands
+  while the load's stat pass runs is then a queued channel event, replayed once the loop arms.
+  Arming is cheap since the debouncer runs `NoCache` (the default `FileIdMap` cache walked the
+  ENTIRE tree opening a handle per file just to pair rename events — 7–9 s and ~70 MB on a
+  2.3k-file NTFS project, issue #14 — and gdls handles unpaired rename halves anyway). The server
+  does **not** send an `initialized` notification — `initialized` is a client→server message it
+  only receives and logs. (The module doc on `crates/gd_server/src/watcher.rs` is authoritative
+  for this ordering.)
+- **Reconciliation backstop after load.** After the load settles, the server walks
+  `res://**/*.gd` once more and diffs against the index. With a live watcher armed (the normal
+  case) this runs in **`DiscoverOnly` mode**: paths already in the stat table were just validated
+  by the load itself and modifications in the gap are queued watcher events, so the backstop only
+  stats/parses files *added* while the server was off, plus the standard removal pass —
+  enumeration-only for everything known (the per-file stat reuses the directory enumeration's own
+  metadata, which costs zero extra syscalls on Windows). When no watcher armed (construction
+  failed) the backstop runs `FullStat` — the historical stat-diff of every file — as do the
+  watcher `need_rescan` overflow path, the watcher-disabled fallback tick, and
+  `gdls diagnose --reconcile` (ad-hoc recovery after wake-from-suspend or remote-FS hiccups).
+  Logged with the `cold_index_reconciled … mode=discover|full` marker (a `tracing` span since M5
+  WP-O1). This split is the load-bearing fix for `notify` dropping events during heavy startup
+  AND for the NTFS wall-clock cost of re-statting a large tree at every launch.
 - **Atomic-write / rename heuristics.** `notify-debouncer-full`'s rename detection (create+delete
   within the debounce window classified as Rename) is used as-is; pathological cases (`mv a.gd b.gd
   && mv c.gd a.gd` within the same 250 ms window) are treated as two Modify events on the final

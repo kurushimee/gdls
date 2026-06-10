@@ -48,6 +48,7 @@ impl AutoloadQuery {
                 args: vec![],
             }],
             param_names: vec!["msg".to_string()],
+            required_params: 1,
             flags: Default::default(),
             span: Default::default(),
             line: 1,

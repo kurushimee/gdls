@@ -86,6 +86,12 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
         self.inner.resolve_res_path(path)
     }
 
+    fn resolve_path_from(&self, from: FileId, raw: &str) -> Option<FileId> {
+        // MUST delegate: the trait default is raw-only, and relative `preload("sibling.gd")`
+        // resolution lives in the SyntacticQuery override.
+        self.inner.resolve_path_from(from, raw)
+    }
+
     fn file_path(&self, file: FileId) -> Option<&str> {
         self.inner.file_path(file)
     }

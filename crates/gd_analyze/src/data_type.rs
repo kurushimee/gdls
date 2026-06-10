@@ -202,6 +202,25 @@ pub fn variant_can_convert_strict(from: VariantType, to: VariantType) -> bool {
     valid.contains(&from)
 }
 
+/// `_variant_type_to_typed_array_element_type` (gdscript_parser.cpp:5508-5530), the table behind
+/// `DataType::is_typed_container_type()` / `get_typed_container_type()` (gdscript_parser.cpp:5532/
+/// 5536). A `Packed*Array`'s fixed element type; `None` for everything that isn't a packed array.
+/// Consumed by `resolve_for`'s iterator typing (analyzer.cpp:2293-2295); the indexed-subscript
+/// matrix (analyzer.cpp:5057-5101) shares the same mapping.
+pub fn typed_container_element(t: VariantType) -> Option<VariantType> {
+    use VariantType::*;
+    Some(match t {
+        PackedByteArray | PackedInt32Array | PackedInt64Array => Int,
+        PackedFloat32Array | PackedFloat64Array => Float,
+        PackedStringArray => String,
+        PackedVector2Array => Vector2,
+        PackedVector3Array => Vector3,
+        PackedColorArray => Color,
+        PackedVector4Array => Vector4,
+        _ => return None,
+    })
+}
+
 /// `Variant::get_type_name(p_type)` (`core/variant/variant.cpp:43`). Used in Godot's verbatim
 /// "Invalid operands to operator …" error message (analyzer.cpp:3130). Lowercase for the atomic
 /// types (`bool`/`int`/`float`/`Nil`) and capitalized for the rest, matching Godot exactly.
@@ -289,7 +308,7 @@ pub enum TypeSource {
 
 /// Identifies an external GDScript class: the file plus an optional inner-class chain
 /// (`extends Outer.Inner` → `inner = ["Inner"]`). Replaces Godot's `Ref<Script>` + `script_path`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScriptRef {
     pub file: FileId,
     /// Inner-class chain; empty for the file's top-level class.
@@ -337,6 +356,12 @@ pub struct DataType {
     pub method_sig: Option<Box<MethodSig>>,
     /// Members of an `Enum` kind.
     pub enum_values: HashMap<String, i64>,
+    /// `Enum` kind only: at least one of [`Self::enum_values`] is a placeholder, not the real
+    /// declared integer (a cross-file enum whose value expression the interface extractor could
+    /// not read). Value-dependent diagnostics (INT_AS_ENUM_WITHOUT_MATCH,
+    /// ENUM_VARIABLE_WITHOUT_DEFAULT) must skip when set — membership lookups stay valid.
+    /// Analyzer-internal; never serialized.
+    pub enum_values_inexact: bool,
     /// `Array[T]` → `[T]`; `Dictionary[K, V]` → `[K, V]`. Empty = unparameterized.
     pub container_element_types: Vec<DataType>,
 }

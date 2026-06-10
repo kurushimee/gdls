@@ -30,7 +30,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crossbeam_channel::{unbounded, Receiver};
 use notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{
-    new_debouncer, DebounceEventResult, DebouncedEvent, Debouncer, RecommendedCache,
+    new_debouncer_opt, DebounceEventResult, DebouncedEvent, Debouncer, NoCache,
 };
 
 /// Quiet-time the debouncer waits before emitting a coalesced event set. 250 ms round-trips
@@ -121,7 +121,16 @@ pub enum FileChange {
 /// the debounced event stream.
 pub struct FileWatcher {
     /// Kept alive: drop = thread stops. Field is unread by design — the channel is the API.
-    _debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
+    ///
+    /// `NoCache`, NOT the debouncer's `RecommendedCache`: on every platform except Linux/Android
+    /// the recommended cache is a `FileIdMap` whose `add_root` synchronously walks the ENTIRE
+    /// watched tree (no gdls exclusions — `.godot/`, `.git/` included) opening a handle per file
+    /// to capture file IDs, and re-walks it on every rescan. On a 2.3k-script NTFS project that
+    /// arming scan cost 7–9 s of startup and ~70 MB of RSS (issue #14). The file IDs exist only
+    /// to pair rename halves; gdls already handles unpaired `From`/`To` events (the
+    /// vanished-path → remove / `To` → modified-reindex arms in `server.rs`), so the cache buys
+    /// nothing we need.
+    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
     rx: Receiver<DebounceEventResult>,
     /// The path handed to [`notify`] at construction. Retained so the main loop can re-stat it on
     /// a periodic tick (see [`Self::root_exists`]): notify's Windows backend silently `unwatch`es
@@ -156,10 +165,16 @@ impl FileWatcher {
     /// callers should use [`Self::new`].
     pub fn with_quiet_time(root: &Utf8Path, quiet_time: Duration) -> anyhow::Result<Self> {
         let (tx, rx) = unbounded::<DebounceEventResult>();
-        // `new_debouncer` accepts a Sender directly when the `crossbeam-channel` feature is on; no
-        // adapter closure or bridge thread needed.
-        let mut debouncer = new_debouncer(quiet_time, None, tx)
-            .with_context(|| format!("FileWatcher::new failed to start debouncer for {root}"))?;
+        // The Sender is accepted directly when the `crossbeam-channel` feature is on; no
+        // adapter closure or bridge thread needed. `NoCache` — see the `_debouncer` field doc.
+        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+            quiet_time,
+            None,
+            tx,
+            NoCache::new(),
+            notify::Config::default(),
+        )
+        .with_context(|| format!("FileWatcher::new failed to start debouncer for {root}"))?;
         debouncer
             .watch(root.as_std_path(), RecursiveMode::Recursive)
             .with_context(|| format!("FileWatcher failed to watch {root} recursively"))?;

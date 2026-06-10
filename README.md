@@ -57,22 +57,27 @@ gdls diagnose --reconcile --root /path/to/your/godot/project
    }
    ```
 
-2. **Generate `extension_api.json`** once per engine rebuild so native and installed
-   GDExtension classes resolve. Run the `godot` binary **from inside your project directory** (so
-   the dump captures the project's GDExtensions), with docs included for hover prose:
+2. **Native types: nothing to do** (since v1.0.1). gdls finds your Godot binary
+   (`godotBinaryPath` option → `GDLS_GODOT` env → `godot4`/`godot` on PATH), runs
+   `--dump-extension-api-with-docs` with project context — which is what captures the project's
+   GDExtension classes — and manages the result under `.gdls/`, regenerating only when the
+   binary or the project's `.gdextension` set changes. To pin a hand-made dump instead, set
+   `initializationOptions.extensionApiPath`; to forbid gdls from ever spawning Godot, set
+   `autoDumpExtensionApi: false` (or `GDLS_GODOT=off`) and dump manually from inside the
+   project directory:
 
    ```sh
    godot --dump-extension-api-with-docs
    ```
 
-   Point `initializationOptions.extensionApiPath` at the resulting file. Details and the
-   multi-source capture story (incl. `doc_classes` XML fallback) are in
+   Details and the multi-source capture story (incl. `doc_classes` XML fallback) are in
    [`docs/03-indexing-freshness.md`](docs/03-indexing-freshness.md) §1–§2.
 
 ## Configuration
 
 The server is configured entirely through LSP `initializationOptions` —
-`projectRoot`, `extensionApiPath`, and the `strict` diagnostics profile
+`projectRoot`, the auto-dump pair (`godotBinaryPath`, `autoDumpExtensionApi`),
+`extensionApiPath` to pin a manual dump, and the `strict` diagnostics profile
 (`godot` / `strict` / `off`) plus per-warning overrides. The full schema and a worked manifest are
 in [`docs/05-lsp-cc-integration.md`](docs/05-lsp-cc-integration.md) §3.
 
@@ -91,7 +96,10 @@ parity gaps vs Godot's own LSP (hover member signatures, `definition`/`documentL
 `implementation` overrides, autoload-singleton typing) and added a persistent, multi-instance-safe
 warm-start index cache (a warm relaunch is **>5×** faster than a cold scan). Verified by capability
 walks against a real Godot 4.6.3 OSS project and a Windows-native 2,338-script production project.
-**v1.0.0** is the first tagged release.
+**v1.0.1** is the current release: it fixes the cross-file false-positive families a full-project
+diagnostics sweep exposed right after v1.0.0 (cross-file inheritance typing, builtin-constant
+folds, packed-array iteration, const chains), ships cross-file member navigation, the
+`extension_api.json` auto-dump, and the NTFS startup fix.
 See [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md) for the M6 scope and
 [`CHANGELOG.md`](CHANGELOG.md) for the milestone history.
 

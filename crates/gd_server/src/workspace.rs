@@ -18,6 +18,7 @@ use lru::LruCache;
 use rustc_hash::{FxHashMap, FxHashSet};
 use walkdir::WalkDir;
 
+use crate::api_dump::ApiDumpPolicy;
 use crate::uri::CanonicalKey;
 use crate::xfile::WorkspaceXFileQuery;
 use gd_project::is_excluded;
@@ -110,7 +111,20 @@ impl Workspace {
     /// then either warm-start from the index cache (stat-diff only changed files) or cold-index
     /// every `.gd`. Runs after the `initialize` response is sent, so a large scan never stalls the
     /// handshake.
+    ///
+    /// Never spawns Godot — the auto-dump only runs through [`Self::load_with_api_policy`] with
+    /// [`ApiDumpPolicy::SpawnIfStale`], which `serve_inner` alone passes. Direct callers
+    /// (`gdls diagnose`, every test) stay process-free with zero changes.
     pub fn load(root: &Utf8Path, options: &InitializationOptions) -> Self {
+        Self::load_with_api_policy(root, options, ApiDumpPolicy::NeverSpawn)
+    }
+
+    /// [`Self::load`] with an explicit [`ApiDumpPolicy`] for the `extension_api.json` auto-dump.
+    pub fn load_with_api_policy(
+        root: &Utf8Path,
+        options: &InitializationOptions,
+        api_policy: ApiDumpPolicy,
+    ) -> Self {
         // M5 WP-O1: cold_index span. Captures the full bootstrap — project model + native DB +
         // eager interface index + warn policy — so a hierarchical-profiler dump nests anything
         // that crosses the threshold under it. Fields are recorded with `Empty` and filled in
@@ -124,7 +138,7 @@ impl Workspace {
         );
         let _enter = _span.enter();
         let project = ProjectModel::load(root);
-        let native = load_native(options, &project);
+        let native = load_native(options, &project, root, api_policy);
 
         // Build the cache key for warm-start attempt.
         let key = build_cache_key(&native, root);
@@ -368,7 +382,7 @@ impl Workspace {
                         .iter()
                         .filter_map(|a| {
                             let path = self.project.autoload_script_path(&a.name)?;
-                            let fid = self.index.resolve_res_path(path)?;
+                            let fid = self.index.resolve_res_path(&path)?;
                             Some((a.name.clone(), fid))
                         })
                         .collect();
@@ -605,15 +619,20 @@ impl Workspace {
             return;
         }
         self.project = project;
-        self.native = load_native(options, &self.project);
+        // NeverSpawn: a mid-session reload must not block the single-threaded event loop on a
+        // Godot boot. A `.gdextension` change marks the auto-dump meta stale; the next startup
+        // re-dumps.
+        self.native = load_native(options, &self.project, &root, ApiDumpPolicy::NeverSpawn);
         self.policy = WarnPolicy::build(&self.project.warnings, &strict_settings(&options.strict));
         self.analysis_cache.clear();
     }
 
     /// Re-load only the native DB (extension_api.json + every installed gdextension's doc XML).
-    /// Drops the analysis cache so types pick up the new native lattice.
+    /// Drops the analysis cache so types pick up the new native lattice. NeverSpawn — see
+    /// [`Self::reload_project_and_native`].
     pub fn reload_native(&mut self, options: &InitializationOptions) {
-        self.native = load_native(options, &self.project);
+        let root = self.project.root.clone();
+        self.native = load_native(options, &self.project, &root, ApiDumpPolicy::NeverSpawn);
         self.analysis_cache.clear();
     }
 
@@ -642,6 +661,21 @@ impl Workspace {
     /// indexed file from the index. Operators see the skip as a `walk_errors` count in the
     /// summary line so they can investigate.
     pub fn reconcile(&mut self, open_paths: &FxHashSet<Utf8PathBuf>) -> ReconciliationReport {
+        self.reconcile_with(ReconcileMode::FullStat, open_paths)
+    }
+
+    /// [`Self::reconcile`] with an explicit [`ReconcileMode`]. `FullStat` is the historical
+    /// behavior (stat-diff every walked file); `DiscoverOnly` is the startup backstop when a
+    /// live watcher is armed BEFORE the workspace loads: the load's own stat pass already
+    /// validated every known file and any modification since lands as a queued watcher event,
+    /// so the only job left is discovering files ADDED or REMOVED outside both — enumeration
+    /// plus stat/parse for unknown paths only. On NTFS at 2.3k files that turns the 7–9 s
+    /// re-stat walk into a sub-second directory enumeration (issue #14).
+    pub fn reconcile_with(
+        &mut self,
+        mode: ReconcileMode,
+        open_paths: &FxHashSet<Utf8PathBuf>,
+    ) -> ReconciliationReport {
         // M5 WP-O1: reconcile span. Both the cold-start post-load reconcile and the watcher's
         // `need_rescan` overflow path flow through here. The 6 counters in the on-close fields
         // mirror the `cold_index_reconciled` marker line below — the marker line stays for
@@ -726,14 +760,23 @@ impl Workspace {
                 continue;
             }
 
+            // DiscoverOnly: a path already in the stat table was validated by the load's own
+            // stat pass moments ago, and any modification since is a queued watcher event —
+            // skip the per-file stat entirely. Unknown paths (added while the server was off)
+            // fall through to the full stat + parse below.
+            if mode == ReconcileMode::DiscoverOnly && self.stat_table.contains_key(&path) {
+                continue;
+            }
+
             // Stat-based change detection: compare (size, mtime_ns) against the stored table.
             // If stat fails (vanished mid-walk, permission), fall back to re-parsing so we don't
-            // silently drop an added file or leave a stale interface.
-            let meta = std::fs::metadata(path.as_std_path());
-            let new_stat = meta
-                .as_ref()
+            // silently drop an added file or leave a stale interface. The stat comes from the
+            // walk entry — free on Windows (populated by directory enumeration, issue #14), the
+            // same single stat on unix.
+            let new_stat = entry
+                .metadata()
                 .ok()
-                .map(|m| cache::stat_from_metadata(path.clone(), m));
+                .map(|m| cache::stat_from_metadata(path.clone(), &m));
 
             let in_table = self.stat_table.get(&path);
             let stat_changed = match (in_table, &new_stat) {
@@ -805,12 +848,17 @@ impl Workspace {
         };
 
         // M5 WP-O1 — preserved verbatim marker (operators & log-greppers depend on this exact
-        // label). Migrated from `log::info!` to `tracing::info!` so the event is attached to the
-        // surrounding `reconcile` span instead of arriving at root scope.
+        // label; the trailing `mode=` field is additive). Migrated from `log::info!` to
+        // `tracing::info!` so the event is attached to the surrounding `reconcile` span instead
+        // of arriving at root scope.
+        let mode_label = match mode {
+            ReconcileMode::FullStat => "full",
+            ReconcileMode::DiscoverOnly => "discover",
+        };
         tracing::info!(
             "cold_index_reconciled added={added} modified={modified} removed={removed} \
              walked={walked} walk_errors={walk_errors} skipped_unreadable={skipped_unreadable} \
-             skipped_non_utf8={skipped_non_utf8}"
+             skipped_non_utf8={skipped_non_utf8} mode={mode_label}"
         );
         _span.record("added", added as u64);
         _span.record("modified", modified as u64);
@@ -829,6 +877,19 @@ impl Workspace {
             skipped_non_utf8,
         }
     }
+}
+
+/// How [`Workspace::reconcile_with`] treats files already known to the stat table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileMode {
+    /// Stat-diff every walked file (the historical behavior). The watcher `need_rescan` overflow
+    /// path, the watcher-disabled fallback tick, and `gdls diagnose --reconcile` need this —
+    /// they run when freshness has genuinely degraded.
+    FullStat,
+    /// Enumeration-only for known paths: stat + parse only files absent from the stat table
+    /// (added), plus the standard removal pass. Sound only when a live watcher was armed before
+    /// the workspace loaded (modifications in the gap are queued events).
+    DiscoverOnly,
 }
 
 /// Outcome of a [`Workspace::reconcile`] pass. Used by `gdls diagnose --reconcile` (WP-T3) and by
@@ -949,12 +1010,13 @@ fn warm_index_from_cache(
         let path = gd_project::normalize_path(p);
         walked_paths.insert(path.clone());
 
-        // Stat the file and compare to the cached table entry.
-        let meta = std::fs::metadata(path.as_std_path());
-        let new_stat = meta
-            .as_ref()
+        // Stat from the walk entry, not a fresh `fs::metadata`: on Windows the DirEntry's
+        // metadata is populated from the directory enumeration itself (zero extra syscalls —
+        // issue #14's per-file CreateFile cost), and on unix it's the same one stat.
+        let new_stat = entry
+            .metadata()
             .ok()
-            .map(|m| cache::stat_from_metadata(path.clone(), m));
+            .map(|m| cache::stat_from_metadata(path.clone(), &m));
 
         let stat_changed = match (stat_table.get(&path), &new_stat) {
             (None, _) => true,       // added — not in cache
@@ -1096,7 +1158,12 @@ fn warn_on_unknown_codes(names: &[String], context: &str) {
 
 /// Load the native DB from `extensionApiPath` (degrading to empty on absence/error), then merge each
 /// installed GDExtension's `doc_classes` XML — those classes are absent from the stock dump.
-fn load_native(options: &InitializationOptions, project: &ProjectModel) -> NativeDb {
+fn load_native(
+    options: &InitializationOptions,
+    project: &ProjectModel,
+    root: &Utf8Path,
+    api_policy: ApiDumpPolicy,
+) -> NativeDb {
     let mut db = match options.extension_api_path.as_deref() {
         Some(path) => match NativeDb::load(path) {
             Ok(db) => {
@@ -1111,10 +1178,9 @@ fn load_native(options: &InitializationOptions, project: &ProjectModel) -> Nativ
                 NativeDb::empty()
             }
         },
-        None => {
-            log::info!("no extensionApiPath configured; native types degrade to dynamic");
-            NativeDb::empty()
-        }
+        // No explicit path: the v1.0.1 managed resolution — fresh .gdls dump → auto-dump →
+        // stale dump → project-root file → empty (crate::api_dump has the full ladder + logs).
+        None => crate::api_dump::resolve_native_db(options, project, root, api_policy),
     };
 
     let mut merged = 0usize;

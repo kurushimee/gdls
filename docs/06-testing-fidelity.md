@@ -111,6 +111,19 @@ proves coverage gaps in the trimmed slice.
 Milestone exit criteria in `07-milestones-risks.md` reference these oracles directly — e.g., "M1: corpus
 parse-phase fidelity meets its calibrated target", "M3: analyze-phase fidelity meets its calibrated target" — thresholds calibrated against the vendored corpus and ratcheted in CI.
 
+**Full-project diagnostics sweep (v1.0.1 lesson).** The corpus (single-file fixtures) and the
+nav-row acceptance walks both structurally missed an error-level false-positive epidemic on real
+layered projects (the v1.0.0 → v1.0.1 cross-file families: 133/243 Pixelorama files carried bogus
+errors). `scripts/m6-acceptance/scan_diags.py` didOpens **every** `.gd` in a project and tallies
+`publishDiagnostics`; running it on both acceptance projects is a standing pre-release gate
+(`files_with_errors` ~0, remainder justified against `godot --check-only`). See
+`scripts/m6-acceptance/README.md` for the gate rule.
+
+**Test-rig rule (auto-dump).** Every `gd_server` integration rig that boots via `serve()` must
+pass `"autoDumpExtensionApi": false` in its `initializationOptions` (or pin `extensionApiPath`) —
+otherwise a dev machine with `godot` on PATH spawns a real dump per test session. Direct
+`Workspace::load` constructions are spawn-free by design (`ApiDumpPolicy::NeverSpawn`).
+
 ## 7. M3 calibration record (closed at 1.0)
 
 The M3 analyzer port closed at **300/300 = 1.0000** analyze-phase conformance on the vendored

@@ -5,6 +5,7 @@
 //! This crate is split into a library (so the event loop can be driven over an in-memory connection
 //! in integration tests) and a thin `main.rs` binary that calls [`run`].
 
+pub mod api_dump;
 pub mod bench;
 pub mod cancellation;
 pub mod config;

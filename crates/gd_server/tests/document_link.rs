@@ -26,6 +26,7 @@ fn boot(project: &TempProject) -> (Connection, std::thread::JoinHandle<anyhow::R
         },
         initialization_options: Some(serde_json::json!({
             "projectRoot": project.root.as_str(),
+        "autoDumpExtensionApi": false,
         })),
         ..Default::default()
     };
@@ -71,6 +72,7 @@ fn initialize_advertises_document_link_provider() {
     let init = InitializeParams {
         initialization_options: Some(serde_json::json!({
             "projectRoot": p.root.as_str(),
+        "autoDumpExtensionApi": false,
         })),
         ..Default::default()
     };

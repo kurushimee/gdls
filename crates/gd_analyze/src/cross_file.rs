@@ -76,6 +76,24 @@ pub trait CrossFileQuery {
         self.interface(file)?.enums.iter().find(|e| e.name == name)
     }
 
+    /// True iff `name` is a constant hoisted from an unnamed `enum { … }` block in `file`'s head
+    /// class. Drives `reduce_identifier_from_base`'s Script-meta anonymous-enum arm: only genuine
+    /// hoists may type as an enum *value* (Godot's ENUM_VALUE member arm, analyzer.cpp:4203-4209);
+    /// a regular `const` takes the CONSTANT arm (analyzer.cpp:4193-4200) and its declared type.
+    fn is_unnamed_enum_value(&self, file: FileId, name: &str) -> bool {
+        self.interface(file)
+            .is_some_and(|i| i.unnamed_enum_values.iter().any(|v| v == name))
+    }
+
+    /// Resolve a script path that may be RELATIVE to the referring file — Godot resolves
+    /// `preload("sibling.gd")` / `extends "../base.gd"` against the script's own directory
+    /// (analyzer.cpp:437's relativization). The default tries the raw path only (correct for
+    /// `NoCrossFile` and for queries whose `resolve_res_path` already handles relative forms);
+    /// [`SyntacticQuery`] overrides with a real join against the index's path table.
+    fn resolve_path_from(&self, _from: FileId, raw: &str) -> Option<FileId> {
+        self.resolve_res_path(raw)
+    }
+
     /// True iff the file's class is `@tool`. Used by MISSING_TOOL emission in resolve_class_inheritance.
     fn is_file_tool(&self, file: FileId) -> bool {
         self.interface(file).is_some_and(|i| i.is_tool)
@@ -155,6 +173,31 @@ impl CrossFileQuery for SyntacticQuery<'_> {
 
     fn resolve_res_path(&self, path: &str) -> Option<FileId> {
         self.index.resolve_res_path(path)
+    }
+
+    fn resolve_path_from(&self, from: FileId, raw: &str) -> Option<FileId> {
+        if let Some(fid) = self.index.resolve_res_path(raw) {
+            return Some(fid);
+        }
+        if raw.starts_with("res://") || raw.starts_with("user://") || raw.starts_with("uid://") {
+            return None; // an absolute form that simply doesn't resolve
+        }
+        // Relative: join against the referring file's directory and normalize `.`/`..`
+        // lexically (the index keys are normalized absolute paths).
+        let base = self.index.path(from)?;
+        let dir = base.parent()?;
+        let mut parts: Vec<&str> = dir.as_str().split('/').collect();
+        for seg in raw.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                s => parts.push(s),
+            }
+        }
+        let joined = camino::Utf8PathBuf::from(parts.join("/"));
+        self.index.file_id(&joined)
     }
 
     fn file_path(&self, file: FileId) -> Option<&str> {

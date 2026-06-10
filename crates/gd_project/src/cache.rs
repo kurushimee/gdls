@@ -34,7 +34,11 @@ use crate::index::{Index, IndexCache};
 /// Bump this whenever `CacheFile`'s layout or `IndexCache`'s format changes in a way that makes
 /// old files unreadable. The cache filename embeds this version so old files are silently ignored,
 /// not quarantined (a format bump is not corruption).
-pub const CACHE_FORMAT_VERSION: u32 = 1;
+///
+/// v2: `Interface` gained `unnamed_enum_values` and `EnumDecl.values` became
+/// `Vec<EnumValueDecl { name, value }>` — a v1 cache would deserialize-fail or, worse,
+/// misclassify every anonymous-enum const as a regular const, so v1 files are ignored.
+pub const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
