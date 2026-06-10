@@ -4216,6 +4216,150 @@ fn reduce_subscript_attribute(
 }
 
 // ===================================================================================================
+// resolve_interface_type_expr — the cross-file analog of resolve_datatype (analyzer.cpp:654-900)
+// ===================================================================================================
+
+/// Project a cross-file `MemberDecl`'s syntactic [`gd_project::TypeExpr`] into the lattice. The
+/// names were written in the DECLARING file's scope, so they resolve through interfaces only —
+/// mirroring `resolve_datatype`'s order (Variant → builtin → native → global class → file scope →
+/// global enum) minus the pieces an interface can't see (locals, outer-class consts).
+///
+/// NEVER pushes a diagnostic and NEVER returns Unresolved: an unresolvable name degrades to
+/// Variant ("unknown stays dynamic", docs/00). `TypeExpr::None` is also Variant — deliberately
+/// NOT void, because interface extraction collapses `-> void` and "no annotation" into `None`,
+/// and a hard void would false-positive `Cannot get return value of call to "X()" because it
+/// returns "void".` on every unannotated cross-file function.
+pub(crate) fn resolve_interface_type_expr(
+    ctx: &mut AnalysisContext,
+    declaring_file: gd_project::FileId,
+    ty: &gd_project::TypeExpr,
+) -> DataType {
+    let gd_project::TypeExpr::Named { path, args } = ty else {
+        return DataType::variant();
+    };
+    let Some(first) = path.first().map(String::as_str) else {
+        return DataType::variant();
+    };
+
+    let mut result = DataType {
+        type_source: TypeSource::AnnotatedExplicit,
+        ..Default::default()
+    };
+
+    if first == "Variant" {
+        result.kind = DtKind::Variant;
+    } else if let Some(builtin) = crate::resolver::builtin_type_from_name(first) {
+        result.kind = DtKind::Builtin;
+        result.builtin_type = builtin;
+        // `Array[T]` / `Dictionary[K, V]` element types recurse through the same resolver
+        // (analyzer.cpp:894-925's container walk, interface-shaped).
+        let expected = match builtin {
+            VariantType::Array => 1,
+            VariantType::Dictionary => 2,
+            _ => 0,
+        };
+        if expected > 0 && !args.is_empty() {
+            for arg in args.iter().take(expected) {
+                result
+                    .container_element_types
+                    .push(resolve_interface_type_expr(ctx, declaring_file, arg));
+            }
+            while result.container_element_types.len() < expected {
+                result.container_element_types.push(DataType::variant());
+            }
+        }
+    } else if ctx.native.class_named(first).is_some() {
+        if path.len() == 2 && native_has_enum(ctx, first, &path[1]) {
+            // `TileSet.TileShape` — a native-class enum; a member of that type holds a VALUE.
+            result = crate::resolver::make_native_enum_type(ctx, &path[1], first, false);
+        } else {
+            result.kind = DtKind::Native;
+            result.builtin_type = VariantType::Object;
+            result.native_type = first.to_owned();
+        }
+    } else if let Some(fid) = ctx.xfile.global_class_file(first) {
+        // Project `class_name` → Script INSTANCE. `Outer.SomeEnum` as the trailing segment is
+        // an enum of that file; deeper segments walk its inner classes. Misses degrade.
+        if path.len() == 2 {
+            if let Some(dt) = cross_file_enum_instance(ctx, fid, &path[1]) {
+                return dt;
+            }
+        }
+        if path.len() > 1 {
+            let chain: Vec<&str> = path[1..].iter().map(String::as_str).collect();
+            if ctx.xfile.resolve_inner_chain(fid, &chain).is_some() {
+                return script_instance_datatype(fid, path[1..].to_vec());
+            }
+            return DataType::variant();
+        }
+        return script_instance_datatype(fid, Vec::new());
+    } else if let Some(dt) = cross_file_enum_instance(ctx, declaring_file, first) {
+        // A named enum of the declaring file itself (`var mode: Mode`).
+        return dt;
+    } else if path.len() == 1
+        && ctx
+            .xfile
+            .resolve_inner_chain(declaring_file, &[first])
+            .is_some()
+    {
+        // An inner class of the declaring file (`var helper: InnerHelper`).
+        return script_instance_datatype(declaring_file, path.clone());
+    } else if ctx.native.global_enum(first).is_some() {
+        result = crate::resolver::make_global_enum_type(ctx, first, "", false);
+    } else {
+        return DataType::variant();
+    }
+
+    result
+}
+
+/// A Script-typed INSTANCE DataType for `file` (+ inner-class chain). The cross-file counterpart
+/// of `resolver::script_base_datatype` with `is_meta_type = false`.
+pub(crate) fn script_instance_datatype(file: gd_project::FileId, inner: Vec<String>) -> DataType {
+    DataType {
+        kind: DtKind::Script,
+        type_source: TypeSource::AnnotatedExplicit,
+        is_meta_type: false,
+        builtin_type: VariantType::Object,
+        script_type: Some(crate::data_type::ScriptRef { file, inner }),
+        ..Default::default()
+    }
+}
+
+/// A cross-file named enum as an INSTANCE type (a value of `file`'s enum `name`), values
+/// populated from the interface — the non-meta sibling of the Script-meta enum arm in
+/// `reduce_identifier_from_base`. `None` when `file` has no such named enum.
+fn cross_file_enum_instance(
+    ctx: &AnalysisContext,
+    file: gd_project::FileId,
+    name: &str,
+) -> Option<DataType> {
+    let enum_decl = ctx.xfile.lookup_file_enum(file, name)?;
+    let base_path = ctx
+        .xfile
+        .file_path(file)
+        .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_owned())
+        .unwrap_or_default();
+    let mut dt = crate::resolver::make_enum_type(name, &base_path, false);
+    dt.script_type = Some(crate::data_type::ScriptRef {
+        file,
+        inner: Vec::new(),
+    });
+    for (i, v) in enum_decl.values.iter().enumerate() {
+        match v.value {
+            Some(val) => {
+                dt.enum_values.insert(v.name.clone(), val);
+            }
+            None => {
+                dt.enum_values_inexact = true;
+                dt.enum_values.insert(v.name.clone(), i as i64);
+            }
+        }
+    }
+    Some(dt)
+}
+
+// ===================================================================================================
 // reduce_identifier_from_base — analyzer.cpp:4024
 // ===================================================================================================
 
@@ -4449,29 +4593,42 @@ fn reduce_identifier_from_base(
                     ctx.set_type(identifier_id, dt);
                     return;
                 }
-                // Cross-file unnamed-enum-value member (the file has `enum { VALUE }` and
-                // VALUE is hoisted to a Const class member). Godot types this as the
-                // anonymous-enum value with `<file.gd>.<anonymous enum>` fqcn — drives the
-                // assignment-compat checks for `local_var = P.VALUE_B` style accesses in
-                // `errors/enum_preload_unnamed_assign_to_named.gd`. We detect the unnamed-
-                // enum case heuristically: the file's `enums` list doesn't carry the value,
-                // but the file's `members` list has a `Const` named `VALUE` whose
-                // declaration position falls inside (or near) an `enum { ... }` block. A
-                // simpler safe heuristic: if the cross-file iface has a member with this
-                // name marked `Const` AND no matching named-enum lookup succeeded, treat
-                // it as an anonymous-enum value (overrides the default Variant fallback).
+                // Cross-file Const member. Two cases, told apart by the interface's
+                // `unnamed_enum_values` list:
+                // * a value hoisted from an unnamed `enum { VALUE }` block — Godot's ENUM_VALUE
+                //   member arm (analyzer.cpp:4203-4209) types it as the anonymous-enum value with
+                //   `<file.gd>.<anonymous enum>` fqcn (drives
+                //   `errors/enum_preload_unnamed_assign_to_named.gd`'s assignment-compat pair);
+                // * a regular `const` — Godot's CONSTANT member arm (analyzer.cpp:4193-4200)
+                //   types it from the member's resolved type. gdls projects the declared
+                //   annotation through `resolve_interface_type_expr`; an untyped/inferred const
+                //   degrades to Variant — permissive, never an enum value. (Typing every Const as
+                //   an anonymous-enum value was the `Cannot get property from enum value.`
+                //   false-positive family: any `Constants.SOME_DICT.size()` chain errored.)
                 if let Some(member) = ctx.xfile.lookup_file_member(sr.file, &name) {
                     if matches!(member.kind, gd_project::MemberKind::Const) {
-                        let mut dt =
-                            crate::resolver::make_enum_type("<anonymous enum>", &base_path, false);
-                        dt.script_type = Some(sr.clone());
+                        if ctx.xfile.is_unnamed_enum_value(sr.file, &name) {
+                            let mut dt = crate::resolver::make_enum_type(
+                                "<anonymous enum>",
+                                &base_path,
+                                false,
+                            );
+                            dt.script_type = Some(sr.clone());
+                            dt.is_constant = true;
+                            ctx.set_type(identifier_id, dt);
+                            // Stamp a placeholder fold so `is_reduced` gates downstream callers
+                            // (the assignment-with-specified-type const-companion in
+                            // `update_const_expression_builtin_type` reads only the type, so a
+                            // placeholder Int suffices).
+                            ctx.folds.set(identifier_id, FoldedValue::Int(0));
+                            return;
+                        }
+                        let mut dt = resolve_interface_type_expr(ctx, sr.file, &member.ty);
                         dt.is_constant = true;
                         ctx.set_type(identifier_id, dt);
-                        // Stamp a placeholder fold so `is_reduced` gates downstream callers
-                        // (the assignment-with-specified-type const-companion in
-                        // `update_const_expression_builtin_type` reads only the type, so a
-                        // placeholder Int suffices).
-                        ctx.folds.set(identifier_id, FoldedValue::Int(0));
+                        // No fold: the value isn't materializable cross-file. Every fold consumer
+                        // is an `is_reduced` gate or type-only narrowing, so absence only skips
+                        // const-companion diagnostics — it never adds one.
                         return;
                     }
                 }
