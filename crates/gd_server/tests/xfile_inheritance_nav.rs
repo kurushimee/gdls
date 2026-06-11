@@ -252,3 +252,124 @@ fn hover_on_var_and_const_members_renders_declarations() {
     );
     shutdown(&client, handle);
 }
+
+const USER_GD: &str = "\
+extends Node
+func use_lib() -> void:
+\tvar b: NavBase = NavBase.new()
+\tb.boost(1)
+";
+
+/// v1.0.3 real-project walk regression: `definition` on the attribute callee of a dotted
+/// method call through a typed var (`b.boost(1)`, b: NavBase) must jump to the declaring file.
+/// Hover resolved the signature here while definition returned null — the reducer's attribute
+/// paths record no `Binding::Use`, so the handler now projects the `Binding::Call` whose callee
+/// identifier contains the cursor (the same projection references' call-site click uses).
+#[test]
+fn definition_on_dotted_method_call_jumps_to_declaring_file() {
+    let p = project();
+    p.write("user.gd", USER_GD);
+    let (client, handle) = boot_with_api(&p);
+    did_open(&client, &p, "user.gd");
+
+    let user_uri = file_uri(&p.root.join("user.gd"));
+    let params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: user_uri.clone(),
+            },
+            // line 3 `\tb.boost(1)`, character 4 inside `boost`.
+            position: Position {
+                line: 3,
+                character: 4,
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    client
+        .sender
+        .send(request(41, "textDocument/definition", params))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "definition errored: {:?}", resp.error);
+    let result: Option<GotoDefinitionResponse> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let Some(GotoDefinitionResponse::Scalar(loc)) = result else {
+        panic!("expected a scalar definition location for `b.boost(1)`, got {result:?}");
+    };
+    assert!(
+        loc.uri.as_str().ends_with("base.gd"),
+        "must jump to the declaring file, got {}",
+        loc.uri.as_str()
+    );
+    shutdown(&client, handle);
+}
+
+/// v1.0.3 real-project walk regression: `callHierarchy/incomingCalls` on a method declaration
+/// must surface CROSS-FILE callers that reach the method through a typed var. The candidate set
+/// used to come from the interface-level `name_referencers` index, which never contains
+/// body-only method names — incoming calls were structurally empty across files.
+#[test]
+fn incoming_calls_surface_cross_file_dotted_callers() {
+    use lsp_types::{
+        CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+        CallHierarchyPrepareParams,
+    };
+    let p = project();
+    p.write("user.gd", USER_GD);
+    let (client, handle) = boot_with_api(&p);
+    did_open(&client, &p, "base.gd");
+    did_open(&client, &p, "user.gd");
+
+    let base_uri = file_uri(&p.root.join("base.gd"));
+    let prepare = CallHierarchyPrepareParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: base_uri.clone(),
+            },
+            // line 5 `func boost(amount: int) -> void:`, character 6 inside `boost`.
+            position: Position {
+                line: 5,
+                character: 6,
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    client
+        .sender
+        .send(request(42, "textDocument/prepareCallHierarchy", prepare))
+        .unwrap();
+    let resp = recv_response(&client);
+    let items: Option<Vec<CallHierarchyItem>> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let item = items
+        .and_then(|v| v.into_iter().next())
+        .expect("prepare returns the boost item");
+    assert_eq!(item.name, "boost");
+
+    let incoming = CallHierarchyIncomingCallsParams {
+        item,
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    client
+        .sender
+        .send(request(43, "callHierarchy/incomingCalls", incoming))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "incoming errored: {:?}", resp.error);
+    let calls: Option<Vec<CallHierarchyIncomingCall>> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let calls = calls.unwrap_or_default();
+    let cross_file = calls
+        .iter()
+        .find(|c| c.from.uri.as_str().ends_with("user.gd"))
+        .unwrap_or_else(|| panic!("expected a caller from user.gd, got {calls:?}"));
+    assert_eq!(cross_file.from.name, "use_lib");
+    assert!(
+        !cross_file.from_ranges.is_empty(),
+        "the call site range must be reported"
+    );
+    shutdown(&client, handle);
+}

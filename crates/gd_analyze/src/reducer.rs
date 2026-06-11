@@ -2125,10 +2125,45 @@ fn reduce_cast(ctx: &mut AnalysisContext, id: NodeId) {
 
     if !valid {
         let cast_type_anchor = cast.cast_type.unwrap_or(id);
+        // Humanized rendering: through v1.0.2 this message leaked the `Display` impl's
+        // `<Script #N>` placeholder onto real projects (the v1.0.3 acceptance sweep caught
+        // `Invalid cast. Cannot convert from "Nil" to "<Script #3095>".`).
+        let from_str = script_type_display(ctx, &op_type);
+        let to_str = script_type_display(ctx, &cast_type);
         ctx.push_error(
-            format!(r#"Invalid cast. Cannot convert from "{op_type}" to "{cast_type}"."#),
+            format!(r#"Invalid cast. Cannot convert from "{from_str}" to "{to_str}"."#),
             cast_type_anchor,
         );
+    }
+}
+
+/// Render a `DataType` the way Godot's `DataType::to_string()` does for user-facing messages:
+/// a `Script`-kind type shows its global `class_name` when declared, else the script file's
+/// basename (`script_path.get_file()`), with any inner-class path appended; `Class` kinds
+/// delegate to [`class_identifier_name_or_default`]. The bare `Display` impl has no index
+/// access, so it renders the `<Script #N>` / `<Class>` diagnostic placeholders — fine for
+/// internal logs, never for diagnostics text.
+pub(crate) fn script_type_display(ctx: &AnalysisContext, dt: &DataType) -> String {
+    if dt.kind != DtKind::Script {
+        return class_identifier_name_or_default(ctx, dt);
+    }
+    let Some(sr) = &dt.script_type else {
+        return dt.to_string();
+    };
+    let head = ctx
+        .xfile
+        .interface(sr.file)
+        .and_then(|i| i.class_name.clone())
+        .or_else(|| {
+            ctx.xfile
+                .file_path(sr.file)
+                .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_owned())
+                .filter(|s| !s.is_empty())
+        });
+    match head {
+        Some(h) if sr.inner.is_empty() => h,
+        Some(h) => format!("{h}.{}", sr.inner.join(".")),
+        None => dt.to_string(),
     }
 }
 
