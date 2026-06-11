@@ -48,6 +48,11 @@ def main():
     ap.add_argument("--gdls", required=True, help="path to the gdls binary")
     ap.add_argument("--api", help="extension_api.json to pin (optional)")
     ap.add_argument("--out", default="scan-report.json", help="report output path")
+    ap.add_argument(
+        "--strict",
+        action="store_true",
+        help="run under the strict diagnostics profile (promotes the UNSAFE_* family to errors)",
+    )
     ap.add_argument("--timeout", type=int, default=600, help="shutdown barrier timeout (s)")
     args = ap.parse_args()
 
@@ -103,6 +108,8 @@ def main():
         stdin.flush()
 
     init_options = {"projectRoot": root}
+    if args.strict:
+        init_options["strict"] = {"profile": "strict"}
     if args.api:
         init_options["extensionApiPath"] = os.path.abspath(args.api)
         init_options["autoDumpExtensionApi"] = False
@@ -168,11 +175,17 @@ def main():
     err_files, warn_only_files = [], []
     sev_hist = {}
     msg_hist = {}
+    warn_hist = {}
     for uri, p in snapshot.items():
         errs = [d for d in p.get("diagnostics", []) if d.get("severity") == 1]
         warns = [d for d in p.get("diagnostics", []) if d.get("severity") == 2]
         for d in p.get("diagnostics", []):
             sev_hist[str(d.get("severity"))] = sev_hist.get(str(d.get("severity")), 0) + 1
+        for w in warns:
+            # The warning CODE prefix (the `(CODE)` Godot renders) is the stable bucket; fall
+            # back to a message prefix for codeless shapes.
+            key = w["message"][:70]
+            warn_hist[key] = warn_hist.get(key, 0) + 1
         if errs:
             err_files.append(
                 {
@@ -202,6 +215,7 @@ def main():
         "files_with_errors": len(err_files),
         "files_warnings_only": len(warn_only_files),
         "error_message_histogram": dict(sorted(msg_hist.items(), key=lambda kv: -kv[1])),
+        "warning_message_histogram": dict(sorted(warn_hist.items(), key=lambda kv: -kv[1])),
         "error_files": err_files,
     }
     with open(args.out, "w") as fh:
