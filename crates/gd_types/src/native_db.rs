@@ -41,6 +41,10 @@ impl ApiType {
 pub struct Param {
     pub name: Sym,
     pub ty: TypeRef,
+    /// The dump's default-value literal, verbatim (`"0"`, `"null"`, `"&\"\""`), when the
+    /// argument is optional. Interned — defaults are short, heavily repeated strings. Signal
+    /// parameters never carry one (the dump has no such field for them).
+    pub default_value: Option<Sym>,
 }
 
 /// A native method (engine or — via the XML reader — GDExtension).
@@ -134,6 +138,26 @@ pub struct UtilityFn {
     pub return_type: TypeRef,
     pub is_vararg: bool,
     pub params: Vec<Param>,
+}
+
+/// One member found by [`NativeDb::lookup_member`] / [`NativeDb::lookup_builtin_member`],
+/// borrowing from the declaring class. The variants cover every name a `Class.member` access can
+/// reach in the dump's data model.
+#[derive(Clone, Copy, Debug)]
+pub enum NativeMember<'a> {
+    Property(&'a Property),
+    Method(&'a Method),
+    Signal(&'a Signal),
+    /// The enum *itself* (`Input.MouseMode`).
+    Enum(&'a NativeEnum),
+    /// A bare class constant (`Object.NOTIFICATION_READY`) — no enum membership in the dump.
+    Constant(&'a NamedConst),
+    /// A value declared inside a named enum (`Input.MOUSE_MODE_CAPTURED` → owner `MouseMode`).
+    EnumValue {
+        owner: &'a NativeEnum,
+        name: Sym,
+        value: i64,
+    },
 }
 
 /// Failure modes of [`NativeDb::load`]. The *caller* decides whether to degrade to
@@ -375,6 +399,85 @@ impl NativeDb {
         self.interner.get(name).and_then(|s| self.utilities.get(&s))
     }
 
+    /// Find `member` on `class` or anywhere up its `inherits` chain, returning the **declaring**
+    /// class alongside the member. Probe order mirrors the analyzer's attribute resolution
+    /// (upstream `reduce_identifier_from_base`): property → method → signal → enum →
+    /// constant / enum value. Server-side consumers only (hover, definition, stub rendering) —
+    /// the analyzer keeps its own port-faithful walks in `gd_analyze`.
+    pub fn lookup_member<'a>(
+        &'a self,
+        class: &str,
+        member: &str,
+    ) -> Option<(&'a NativeClass, NativeMember<'a>)> {
+        // A name the interner never saw cannot exist anywhere in the DB.
+        let target = self.interner.get(member)?;
+        let mut cur = self.class_named(class);
+        while let Some(nc) = cur {
+            if let Some(m) = member_of(
+                target,
+                &nc.properties,
+                &nc.methods,
+                Some(&nc.signals),
+                &nc.enums,
+                &nc.constants,
+            ) {
+                return Some((nc, m));
+            }
+            cur = nc.inherits.and_then(|s| self.classes.get(&s));
+        }
+        None
+    }
+
+    /// [`Self::lookup_member`]'s builtin-type analog (`Vector3.ZERO`, `vec.length()`). Builtins
+    /// have no inheritance chain and no signals; their `members` field plays the property role.
+    pub fn lookup_builtin_member<'a>(
+        &'a self,
+        builtin: &str,
+        member: &str,
+    ) -> Option<(&'a BuiltinType, NativeMember<'a>)> {
+        let target = self.interner.get(member)?;
+        let bt = self.builtin_named(builtin)?;
+        member_of(
+            target,
+            &bt.members,
+            &bt.methods,
+            None,
+            &bt.enums,
+            &bt.constants,
+        )
+        .map(|m| (bt, m))
+    }
+
+    /// Render a [`TypeRef`] the way the editor surfaces type names: `Array[int]`,
+    /// `Dictionary[int, String]`, scoped enums as `Class.Name`. `trim_scope` drops a same-class
+    /// enum qualifier (`Input.MouseMode` rendered from inside `Input` reads `MouseMode`),
+    /// mirroring the class-reference convention Godot's own LSP details inherit from DocData.
+    pub fn display_type(&self, ty: &TypeRef, trim_scope: Option<&str>) -> String {
+        match ty {
+            TypeRef::Variant => "Variant".to_owned(),
+            TypeRef::Void => "void".to_owned(),
+            TypeRef::Named(sym) => self.name_of(*sym).to_owned(),
+            TypeRef::TypedArray(elem) => {
+                format!("Array[{}]", self.display_type(elem, trim_scope))
+            }
+            TypeRef::TypedDict(k, v) => format!(
+                "Dictionary[{}, {}]",
+                self.display_type(k, trim_scope),
+                self.display_type(v, trim_scope)
+            ),
+            TypeRef::Enum { scope, name } | TypeRef::Bitfield { scope, name } => {
+                let name = self.name_of(*name);
+                match scope {
+                    Some(s) if trim_scope != Some(self.name_of(*s)) => {
+                        format!("{}.{name}", self.name_of(*s))
+                    }
+                    _ => name.to_owned(),
+                }
+            }
+            TypeRef::Pointer(inner) => format!("{}*", self.display_type(inner, trim_scope)),
+        }
+    }
+
     /// Merge a class parsed from doc XML as a fallback tier. Returns `false` and changes nothing if a
     /// class of that name already exists — the JSON dump always wins (`docs/03-indexing-freshness.md`
     /// §2). The XML reader normalizes its type strings into the dump's encoding, so ingestion is
@@ -546,6 +649,11 @@ fn ingest_args(args: Vec<api::ArgumentDef>, it: &mut Interner) -> Vec<Param> {
             Param {
                 name: it.intern(&a.name),
                 ty,
+                default_value: a
+                    .default_value
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| it.intern(s)),
             }
         })
         .collect()
@@ -553,6 +661,43 @@ fn ingest_args(args: Vec<api::ArgumentDef>, it: &mut Interner) -> Vec<Param> {
 
 fn non_empty(s: &str, it: &mut Interner) -> Option<Sym> {
     (!s.is_empty()).then(|| it.intern(s))
+}
+
+/// Probe one class's (or builtin's) member lists for `target`, in the shared lookup order:
+/// property → method → signal → enum → constant → enum value. Builtins pass `signals: None`.
+fn member_of<'a>(
+    target: Sym,
+    properties: &'a [Property],
+    methods: &'a [Method],
+    signals: Option<&'a [Signal]>,
+    enums: &'a [NativeEnum],
+    constants: &'a [NamedConst],
+) -> Option<NativeMember<'a>> {
+    if let Some(p) = properties.iter().find(|p| p.name == target) {
+        return Some(NativeMember::Property(p));
+    }
+    if let Some(m) = methods.iter().find(|m| m.name == target) {
+        return Some(NativeMember::Method(m));
+    }
+    if let Some(s) = signals.and_then(|sigs| sigs.iter().find(|s| s.name == target)) {
+        return Some(NativeMember::Signal(s));
+    }
+    if let Some(e) = enums.iter().find(|e| e.name == target) {
+        return Some(NativeMember::Enum(e));
+    }
+    if let Some(k) = constants.iter().find(|k| k.name == target) {
+        return Some(NativeMember::Constant(k));
+    }
+    for e in enums {
+        if let Some((name, value)) = e.values.iter().find(|(n, _)| *n == target) {
+            return Some(NativeMember::EnumValue {
+                owner: e,
+                name: *name,
+                value: *value,
+            });
+        }
+    }
+    None
 }
 
 fn hash_str(s: &str) -> u64 {

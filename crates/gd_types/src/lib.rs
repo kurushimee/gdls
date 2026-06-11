@@ -18,6 +18,6 @@ pub use doc_xml::{parse_class as parse_doc_class, DocXmlError};
 pub use intern::{Interner, Sym};
 pub use native_db::{
     ApiProvenance, ApiType, BuiltinType, LoadError, Method, NamedConst, NativeClass, NativeDb,
-    NativeEnum, Param, Property, Signal, UtilityFn,
+    NativeEnum, NativeMember, Param, Property, Signal, UtilityFn,
 };
 pub use type_ref::{decode as decode_type, TypeRef};
