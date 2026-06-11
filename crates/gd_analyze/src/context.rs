@@ -236,6 +236,14 @@ pub struct AnalysisContext<'a> {
     /// scope-tracked lookups; gdls's AST keeps `SuiteNode::locals` but not the back-pointer, so
     /// we walk this stack inside `reduce_identifier` instead.
     pub suite_stack: Vec<NodeId>,
+    /// Godot's per-variable `assignments` counter, keyed by the declaring node. Upstream keeps
+    /// it on `VariableNode` (debug-only): the declaration initializer contributes one
+    /// (gdscript_parser.cpp:1261 — folded in lazily by `crate::reducer::assignment_count`) and
+    /// `reduce_assignment` increments for local-variable assignees before reducing the assignee
+    /// (gdscript_analyzer.cpp:2852-2860). Read by the UNASSIGNED_VARIABLE /
+    /// UNASSIGNED_VARIABLE_OP_ASSIGN checks; traversal-order evolution is the point — a read
+    /// before the first assignment warns even if a later statement assigns.
+    pub assignments: FxHashMap<NodeId, u32>,
 
     /// Per-member cross-file initializer xrefs, recorded by [`Self::record_member_xref`] from
     /// the reducer's Script-meta attribute-access path. Moved into
@@ -332,6 +340,7 @@ impl<'a> AnalysisContext<'a> {
             resolved_functions: FxHashSet::default(),
             abstract_nodes: FxHashSet::default(),
             suite_stack: Vec::new(),
+            assignments: FxHashMap::default(),
             warning_ignore_regions,
             warning_ignored_lines,
             member_xrefs: FxHashMap::default(),

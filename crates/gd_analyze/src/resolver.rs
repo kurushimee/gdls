@@ -2573,9 +2573,11 @@ fn resolve_assignable(
             // `!(!is_constant && reverse_compat)` => `is_constant || !reverse_compat` (de Morgan).
             let reverse_compat =
                 !is_constant && crate::reducer::is_type_compatible(ctx, &init_type, &ty, false);
+            // The forward check passes the initializer node upstream (analyzer.cpp:2158) — an
+            // int initializer for an enum-typed declaration warns INT_AS_ENUM_WITHOUT_CAST.
             if init_type.is_hard_type()
                 && !init_type.is_variant()
-                && !crate::reducer::is_type_compatible(ctx, &ty, &init_type, true)
+                && !crate::reducer::is_type_compatible_with_source(ctx, &ty, &init_type, true, init)
                 && !reverse_compat
             {
                 let name = decl_identifier_name(ctx, node_id);
@@ -4516,8 +4518,63 @@ fn resolve_node(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
 fn resolve_variable_local(ctx: &mut AnalysisContext, var_id: NodeId) {
     let (spec, init, infer) = variable_assignable_parts(ctx, var_id);
     resolve_assignable(ctx, var_id, spec, init, infer, false);
+    // UNUSED_VARIABLE (analyzer.cpp:2214-2218): `usages == 0` and not `_`-prefixed, anchored
+    // at the declaration. Queued after resolve_assignable's own warnings, as upstream.
+    warn_unused_local(ctx, var_id, crate::warnings::WarningCode::UnusedVariable);
     warn_local_shadowing(ctx, var_id, "variable");
     warn_confusable_identifier(ctx, var_id);
+}
+
+/// The `usages == 0 && !name.begins_with("_")` check shared by UNUSED_VARIABLE
+/// (analyzer.cpp:2214-2218) and UNUSED_LOCAL_CONSTANT (:2228-2231). Godot's parser counts
+/// `usages` by binding identifiers to locals at parse time; gdls has no parse-time identifier
+/// resolution, so this sweeps identifier nodes between the declaration's end and the declaring
+/// suite's end — over-approximating "used" exactly like `emit_unused_parameter_warnings` (a
+/// same-named identifier that would bind to another scope still counts), so it can under-warn
+/// but never false-positive. Declaration identifiers themselves are excluded, mirroring the
+/// parameter sweep.
+fn warn_unused_local(
+    ctx: &mut AnalysisContext,
+    decl_id: NodeId,
+    code: crate::warnings::WarningCode,
+) {
+    let name = decl_identifier_name(ctx, decl_id);
+    if name.is_empty() || name.starts_with('_') {
+        return;
+    }
+    let Some(&suite_id) = ctx.suite_stack.last() else {
+        return;
+    };
+    let suite_end = ctx.node(suite_id).span.end;
+    let decl_end = ctx.node(decl_id).span.end;
+    // Declaration identifiers never count as uses (Godot's `usages` counts references only).
+    // One O(nodes) pre-pass per declaration — same profile as `emit_unused_parameter_warnings`.
+    let mut decl_ident_ids = rustc_hash::FxHashSet::<NodeId>::default();
+    for id in ctx.tree.iter_ids() {
+        let owner_ident = match &ctx.node(id).kind {
+            NodeKind::Variable(v) => v.identifier,
+            NodeKind::Constant(c) => c.identifier,
+            NodeKind::Parameter(p) => p.identifier,
+            NodeKind::Function(f) => f.identifier,
+            NodeKind::Signal(s) => s.identifier,
+            _ => None,
+        };
+        if let Some(i) = owner_ident {
+            decl_ident_ids.insert(i);
+        }
+    }
+    for id in ctx.tree.iter_ids() {
+        let node = ctx.node(id);
+        if node.span.start < decl_end || node.span.end > suite_end {
+            continue;
+        }
+        if let NodeKind::Identifier(i) = &node.kind {
+            if i.name == name && !decl_ident_ids.contains(&id) {
+                return; // used
+            }
+        }
+    }
+    ctx.push_warning(code, std::slice::from_ref(&name), decl_id);
 }
 
 /// SHADOWED_GLOBAL_IDENTIFIER for class-level variables (mirrors `warn_local_shadowing`'s
@@ -4575,6 +4632,12 @@ fn warn_confusable_identifier(ctx: &mut AnalysisContext, node_id: NodeId) {
 fn resolve_constant_local(ctx: &mut AnalysisContext, const_id: NodeId) {
     let (spec, init, infer) = constant_assignable_parts(ctx, const_id);
     resolve_assignable(ctx, const_id, spec, init, infer, true);
+    // UNUSED_LOCAL_CONSTANT (analyzer.cpp:2227-2231) — the constant sibling of UNUSED_VARIABLE.
+    warn_unused_local(
+        ctx,
+        const_id,
+        crate::warnings::WarningCode::UnusedLocalConstant,
+    );
     warn_confusable_identifier(ctx, const_id);
     // analyzer.cpp:2118-2123 — constant initializer must reduce to a constant expression.
     // gdls's fold table is incomplete (preload / Color.RED / native enum values stamp
@@ -5065,10 +5128,17 @@ fn resolve_for(ctx: &mut AnalysisContext, for_id: NodeId) {
     if let Some(v) = variable {
         if let Some(spec) = datatype_specifier {
             let specified_type = type_from_metatype(resolve_datatype(ctx, Some(spec)));
+            // The forward check passes `p_for->variable` upstream (analyzer.cpp:2335).
             if !specified_type.is_variant()
                 && !variable_type.is_variant()
                 && variable_type.is_hard_type()
-                && !crate::reducer::is_type_compatible(ctx, &specified_type, &variable_type, true)
+                && !crate::reducer::is_type_compatible_with_source(
+                    ctx,
+                    &specified_type,
+                    &variable_type,
+                    true,
+                    v,
+                )
                 && !crate::reducer::is_type_compatible(ctx, &variable_type, &specified_type, false)
             {
                 ctx.push_error(
@@ -5237,8 +5307,10 @@ fn resolve_return(ctx: &mut AnalysisContext, ret_id: NodeId) {
     // anchoring at the same node keeps the stable insertion order intact through
     // `DiagnosticSink::finish`'s `sort_by_key(span.start)`.
     if !expected_type.is_variant() && !result.is_variant() && result.is_hard_type() {
+        // The forward check passes `p_return` upstream (analyzer.cpp:2572/2575); gdls anchors
+        // at the return value (same line) per the emission-order note above.
         let target_to_source =
-            crate::reducer::is_type_compatible(ctx, &expected_type, &result, true);
+            crate::reducer::is_type_compatible_with_source(ctx, &expected_type, &result, true, v);
         if !target_to_source {
             let reverse = crate::reducer::is_type_compatible(ctx, &result, &expected_type, false);
             if !reverse {

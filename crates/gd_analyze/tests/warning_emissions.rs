@@ -514,3 +514,173 @@ fn static_unload_with_static_data_is_silent() {
     let src = "@static_unload\nextends Node\n\nclass Inner:\n\tstatic var s = 1\n";
     assert!(!codes(src, &godot_policy()).contains(&WarningCode::RedundantStaticUnload));
 }
+
+// --- UNASSIGNED_VARIABLE / UNASSIGNED_VARIABLE_OP_ASSIGN
+//     (analyzer.cpp:4435-4439, 2852-2860, 3043-3050) -------------------------------------------
+
+#[test]
+fn unassigned_variable_flow_insensitive_counter() {
+    // The upstream parser/warnings/unassigned_variable.gd shape: reads before the first
+    // assignment warn; once any assignment was traversed, later reads stay silent
+    // ("maybe assigned"), even when the assignment sat in a dead branch.
+    let src = "extends Node\n\n\nfunc test() -> void:\n\tvar unassigned\n\tprint(unassigned)\n\tunassigned = \"something\"\n\n\tvar a\n\tprint(a)\n\tif a:\n\t\ta = 1\n\t\tprint(a)\n\tprint(a)\n";
+    let got: Vec<u32> = warnings_with_lines(src, &godot_policy())
+        .into_iter()
+        .filter(|(c, _)| *c == WarningCode::UnassignedVariable)
+        .map(|(_, l)| l)
+        .collect();
+    assert_eq!(got, vec![6, 10, 11], "print(unassigned); print(a); if a:");
+}
+
+#[test]
+fn unassigned_variable_exempts_hard_builtin_and_initialized() {
+    // `var x: int` zero-initializes meaningfully (hard builtin) — exempt; an initializer
+    // counts as the first assignment; member reads never fire (source classified post-switch).
+    let src = "extends Node\n\nvar m\n\n\nfunc test() -> void:\n\tvar i: int\n\tprint(i)\n\tvar j = 1\n\tprint(j)\n\tprint(m)\n";
+    assert!(!codes(src, &godot_policy()).contains(&WarningCode::UnassignedVariable));
+}
+
+#[test]
+fn unassigned_variable_op_assign_on_uninitialized_local() {
+    // upstream parser/warnings/unassigned_variable_op_assign.gd — note `var __: int` is
+    // hard-builtin so the plain UNASSIGNED_VARIABLE read check stays quiet, but the
+    // compound assignment still warns.
+    let src = "extends Node\n\n\nfunc test() -> void:\n\tvar __: int\n\t__ += 15\n";
+    let tree = gd_syntax::parse(src).tree;
+    let r = gd_analyze::analyze(
+        &tree,
+        None,
+        "t.gd",
+        &mini_native(),
+        &NoCrossFile,
+        &godot_policy(),
+    );
+    let msgs: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.warning_code() == Some(WarningCode::UnassignedVariableOpAssign))
+        .map(|d| d.message())
+        .collect();
+    assert_eq!(
+        msgs,
+        vec![
+            r#"The variable "__" is modified with the compound-assignment operator "+=" but was not previously initialized."#
+        ]
+    );
+}
+
+#[test]
+fn op_assign_after_initialization_is_silent() {
+    for body in [
+        "\tvar x = 1\n\tx += 1\n\tprint(x)\n", // initializer counts
+        "\tvar x: int\n\tx = 1\n\tx += 1\n\tprint(x)\n", // plain assignment counts
+    ] {
+        let src = format!("extends Node\n\n\nfunc test() -> void:\n{body}");
+        assert!(
+            !codes(&src, &godot_policy()).contains(&WarningCode::UnassignedVariableOpAssign),
+            "{body}"
+        );
+    }
+}
+
+// --- UNUSED_VARIABLE / UNUSED_LOCAL_CONSTANT (analyzer.cpp:2214-2218, 2227-2231) ---------------
+
+#[test]
+fn unused_variable_and_local_constant_warn() {
+    let src =
+        "extends Node\n\n\nfunc test() -> void:\n\tvar dead = 1\n\tconst DEAD_C = 2\n\tpass\n";
+    let got = warnings_with_lines(src, &godot_policy());
+    assert!(
+        got.contains(&(WarningCode::UnusedVariable, 5)),
+        "got {got:?}"
+    );
+    assert!(
+        got.contains(&(WarningCode::UnusedLocalConstant, 6)),
+        "got {got:?}"
+    );
+}
+
+#[test]
+fn used_underscored_or_written_locals_are_silent() {
+    // A read, an underscore prefix, or even a write-only assignment (Godot's parser counts
+    // assignee identifiers as usages) all suppress.
+    let src = "extends Node\n\n\nfunc test() -> void:\n\tvar used = 1\n\tprint(used)\n\tvar _ignored = 2\n\tconst _IGN = 3\n\tvar written = 4\n\twritten = 5\n";
+    let got = codes(src, &godot_policy());
+    assert!(
+        !got.contains(&WarningCode::UnusedVariable)
+            && !got.contains(&WarningCode::UnusedLocalConstant),
+        "got {got:?}"
+    );
+}
+
+// --- RETURN_VALUE_DISCARDED (call statements, analyzer.cpp:3684-3689) --------------------------
+
+#[test]
+fn return_value_discarded_on_non_void_call_statement() {
+    let policy = policy_enabling(&["RETURN_VALUE_DISCARDED"]);
+    let src =
+        "extends Node\n\n\nfunc gives() -> int:\n\treturn 1\n\n\nfunc f() -> void:\n\tgives()\n";
+    assert_eq!(
+        warnings_with_lines(src, &policy),
+        vec![(WarningCode::ReturnValueDiscarded, 9)]
+    );
+    // Void calls, used-value calls, and the ignore-by-default level all stay silent.
+    let silent = "extends Node\n\n\nfunc gives() -> int:\n\treturn 1\n\n\nfunc nothing() -> void:\n\tpass\n\n\nfunc f() -> void:\n\tnothing()\n\tvar _x = gives()\n";
+    assert_eq!(codes(silent, &policy), vec![]);
+    assert_eq!(codes(src, &godot_policy()), vec![]);
+}
+
+// --- STATIC_CALLED_ON_INSTANCE (analyzer.cpp:3691-3694) ----------------------------------------
+
+#[test]
+fn static_called_on_instance_warns() {
+    let src = "class_name Helper\nextends Node\n\nstatic func compute() -> int:\n\treturn 1\n\n\nfunc f(h: Helper) -> void:\n\tvar _x = h.compute()\n";
+    let tree = gd_syntax::parse(src).tree;
+    let r = gd_analyze::analyze(
+        &tree,
+        None,
+        "t.gd",
+        &mini_native(),
+        &NoCrossFile,
+        &godot_policy(),
+    );
+    let msgs: Vec<&str> = r
+        .diagnostics
+        .iter()
+        .filter(|d| d.warning_code() == Some(WarningCode::StaticCalledOnInstance))
+        .map(|d| d.message())
+        .collect();
+    assert_eq!(
+        msgs,
+        vec![
+            r#"The function "compute()" is a static function but was called from an instance. Instead, it should be directly called from the type: "Helper.compute()"."#
+        ]
+    );
+}
+
+#[test]
+fn static_called_through_class_or_self_is_silent() {
+    // Through the class name (meta base), or bare/self on the own class — no warning.
+    let src = "class_name Helper2\nextends Node\n\nstatic func compute() -> int:\n\treturn 1\n\n\nfunc f() -> void:\n\tvar _a = Helper2.compute()\n\tvar _b = compute()\n";
+    assert!(!codes(src, &godot_policy()).contains(&WarningCode::StaticCalledOnInstance));
+}
+
+// --- INT_AS_ENUM_WITHOUT_CAST (analyzer.cpp:6139-6150 via node-passing callers) ----------------
+
+#[test]
+fn int_as_enum_without_cast_on_initializer_and_assignment() {
+    let src = "extends Node\n\nenum State { OFF = 1, ON = 2 }\n\nvar s: State = 1\n\n\nfunc f() -> void:\n\ts = 2\n";
+    let got: Vec<u32> = warnings_with_lines(src, &godot_policy())
+        .into_iter()
+        .filter(|(c, _)| *c == WarningCode::IntAsEnumWithoutCast)
+        .map(|(_, l)| l)
+        .collect();
+    assert_eq!(got, vec![5, 9], "initializer line 5 + assignment line 9");
+}
+
+#[test]
+fn enum_value_flows_without_cast_warning() {
+    // Assigning a real enum member (or a cast int) is the blessed shape.
+    let src = "extends Node\n\nenum State { OFF = 1, ON = 2 }\n\nvar s: State = State.OFF\n\n\nfunc f() -> void:\n\ts = State.ON\n\ts = 2 as State\n";
+    assert!(!codes(src, &godot_policy()).contains(&WarningCode::IntAsEnumWithoutCast));
+}
