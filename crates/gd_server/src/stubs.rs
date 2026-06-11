@@ -17,6 +17,8 @@
 //! self-diagnose (`server.rs` publishes empty diagnostics for URIs under the stubs base): an
 //! API page need not be analyzable GDScript, only readable as it.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -78,6 +80,15 @@ pub(crate) fn is_stub_uri(uri: &lsp_types::Uri, override_root: Option<&str>) -> 
     };
     crate::uri::uri_to_path(uri).is_some_and(|p| p.starts_with(&base))
 }
+
+/// Per-session cache of rendered pages: a class's page is a pure function of the dump (keyed
+/// by its content hash), so each (dump, class) pair renders at most once per session — repeat
+/// definition requests into a large class skip the O(members) rebuild. Interior-mutable so
+/// shared-`&` request paths can fill it. The disk probe in [`ensure_class_stub`] still runs
+/// per call: a foreign session's GC may collect the file while this cache is warm, and the
+/// probe re-materializes it.
+#[derive(Default)]
+pub(crate) struct StubCache(RefCell<FxHashMap<String, (u64, Rc<RenderedStub>)>>);
 
 /// A rendered API page: the text, the 0-based line of the class header, and the 0-based line of
 /// every member keyed by name (enum values included) — the definition anchors.
@@ -191,49 +202,79 @@ fn push_doc(text: &mut String, line: &mut u32, doc: &str) {
     }
 }
 
-/// Render `class_name`'s stub in memory and write it to disk if absent (atomic temp + rename;
-/// identical bytes per key make a concurrent double-write benign). Returns the stub path and
-/// the rendered line map; `None` on any IO failure — the caller degrades to "no definition".
+/// Resolve `class_name`'s rendered stub (from `cache`, rendering on first sight of this dump's
+/// hash) and write it to disk if absent (atomic temp + rename; identical bytes per key make a
+/// concurrent double-write benign). Returns the stub path and the rendered line map; `None` on
+/// any IO failure — the caller degrades to "no definition".
 pub(crate) fn ensure_class_stub(
+    cache: &StubCache,
     db: &NativeDb,
     class_name: &str,
     override_root: Option<&str>,
-) -> Option<(Utf8PathBuf, RenderedStub)> {
+) -> Option<(Utf8PathBuf, Rc<RenderedStub>)> {
     let class = db.class_named(class_name)?;
     let dir = stub_dir(db, override_root)?;
     std::fs::create_dir_all(dir.as_std_path()).ok()?;
     if let Some(base) = stubs_base_dir(override_root) {
-        session_gc(&base, &dir);
+        freshen_and_gc(&base, &dir);
     }
-    let stub = render(db, class);
+    let hash = db.content_hash();
+    let stub = {
+        let mut map = cache.0.borrow_mut();
+        match map.get(class_name) {
+            Some((h, stub)) if *h == hash => Rc::clone(stub),
+            _ => {
+                // A mid-session dump adoption changes the hash: sweep the dead
+                // generation out instead of accumulating two dumps' pages.
+                map.retain(|_, (h, _)| *h == hash);
+                let stub = Rc::new(render(db, class));
+                map.insert(class_name.to_owned(), (hash, Rc::clone(&stub)));
+                stub
+            }
+        }
+    };
     let path = dir.join(format!("{class_name}.gd"));
     if !path.as_std_path().exists() {
         let tmp = dir.join(format!(".{class_name}.gd.tmp"));
         std::fs::write(tmp.as_std_path(), &stub.text).ok()?;
-        std::fs::rename(tmp.as_std_path(), path.as_std_path()).ok()?;
+        if std::fs::rename(tmp.as_std_path(), path.as_std_path()).is_err() {
+            // Windows refuses to rename onto an existing target, so losing a double-write
+            // race to a concurrent session lands here with that session's identical bytes
+            // already at `path` — serve them. Only a rename failure with NO file at the
+            // target is a real IO failure.
+            let _ = std::fs::remove_file(tmp.as_std_path());
+            if !path.as_std_path().exists() {
+                return None;
+            }
+        }
     }
     Some((path, stub))
 }
 
-/// Best-effort stale-stub collection + a freshness touch on the current directory, once per
-/// server session (the work is per-process idempotent; repeating it per request would be IO
-/// churn for nothing). All IO errors ignored — stubs are regenerable cache.
-fn session_gc(base: &Utf8Path, current: &Utf8Path) {
+/// Refresh the current directory's freshness sentinel (every call) and collect stale stub
+/// directories (once per server session — the scan is per-process idempotent, so repeating
+/// IT per request would be IO churn for nothing). All IO errors ignored — stubs are
+/// regenerable cache.
+fn freshen_and_gc(base: &Utf8Path, current: &Utf8Path) {
+    // Rewriting `.touch` updates the FILE's mtime, the freshness signal `gc_stale_stubs`
+    // reads — a directory's own mtime only moves on entry creation/removal, so it goes
+    // stale once every page is materialized no matter how recently a session read them.
+    // One tiny write per native-definition request keeps even a months-long session's
+    // directory alive against a foreign session's 30-day collection.
+    let _ = std::fs::write(current.join(".touch").as_std_path(), b"");
     static GC_DONE: AtomicBool = AtomicBool::new(false);
     if GC_DONE.swap(true, Ordering::Relaxed) {
         return;
     }
-    // Creating/truncating a file inside `current` bumps the directory's mtime, which is the
-    // age signal `gc_stale_stubs` reads — a long-lived dump stays fresh as long as some
-    // session keeps using it.
-    let _ = std::fs::write(current.join(".touch").as_std_path(), b"");
     gc_stale_stubs(base, current);
 }
 
-/// The ungated GC body (separated from [`session_gc`]'s process-global once-flag so tests can
-/// drive it directly): remove sibling stub directories with an older `STUB_FORMAT_VERSION`
+/// The ungated GC body (separated from [`freshen_and_gc`]'s process-global once-flag so tests
+/// can drive it directly): remove sibling stub directories with an older `STUB_FORMAT_VERSION`
 /// unconditionally, and same-version foreign-hash directories only when untouched for 30+ days
-/// — another live project's session may legitimately own a different hash.
+/// — another live project's session may legitimately own a different hash. A directory's age
+/// is the newest evidence of life: its `.touch` sentinel's mtime (rewritten by every ensure)
+/// or the directory's own mtime (last entry change), whichever is fresher.
 pub(crate) fn gc_stale_stubs(base: &Utf8Path, current: &Utf8Path) {
     const STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 3600);
     let Ok(entries) = std::fs::read_dir(base.as_std_path()) else {
@@ -250,10 +291,15 @@ pub(crate) fn gc_stale_stubs(base: &Utf8Path, current: &Utf8Path) {
             .and_then(|rest| rest.split_once('-'))
             .and_then(|(v, _)| v.parse::<u32>().ok())
             .is_some_and(|v| v < STUB_FORMAT_VERSION);
-        let stale_by_age = e
-            .metadata()
+        let dir_mtime = e.metadata().and_then(|m| m.modified()).ok();
+        let touch_mtime = std::fs::metadata(p.join(".touch"))
             .and_then(|m| m.modified())
-            .ok()
+            .ok();
+        let freshness = match (dir_mtime, touch_mtime) {
+            (Some(d), Some(t)) => Some(d.max(t)),
+            (d, t) => d.or(t),
+        };
+        let stale_by_age = freshness
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age > STALE_AFTER);
         if old_version || stale_by_age {
@@ -326,14 +372,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_string_lossy().into_owned();
         let db = db();
-        let (path, _) = ensure_class_stub(&db, "Widget", Some(&root)).expect("stub written");
+        let cache = StubCache::default();
+        let (path, stub) =
+            ensure_class_stub(&cache, &db, "Widget", Some(&root)).expect("stub written");
         assert!(path.as_std_path().exists());
+        assert!(
+            path.parent().unwrap().join(".touch").as_std_path().exists(),
+            "every ensure refreshes the freshness sentinel"
+        );
         let first = std::fs::metadata(path.as_std_path())
             .unwrap()
             .modified()
             .unwrap();
-        let (path2, stub2) = ensure_class_stub(&db, "Widget", Some(&root)).expect("stub reused");
+        let (path2, stub2) =
+            ensure_class_stub(&cache, &db, "Widget", Some(&root)).expect("stub reused");
         assert_eq!(path, path2);
+        assert!(
+            Rc::ptr_eq(&stub, &stub2),
+            "second ensure reuses the session-cached render"
+        );
         let second = std::fs::metadata(path2.as_std_path())
             .unwrap()
             .modified()
@@ -345,6 +402,76 @@ mod tests {
             "on-disk bytes equal the in-memory render"
         );
         assert!(path.as_str().contains(&format!("v{STUB_FORMAT_VERSION}-")));
+    }
+
+    #[test]
+    fn ensure_serves_a_file_another_session_already_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().into_owned();
+        let db = db();
+        // Materialize via one "session", then start a fresh cache (a second session) over
+        // the same root: the page is already on disk, so the second session reuses it (no
+        // rewrite) while still returning its own in-memory render of the same bytes.
+        let first_session = StubCache::default();
+        let (path, _) =
+            ensure_class_stub(&first_session, &db, "Widget", Some(&root)).expect("stub written");
+        let before = std::fs::metadata(path.as_std_path())
+            .unwrap()
+            .modified()
+            .unwrap();
+        let second_session = StubCache::default();
+        let (path2, stub) = ensure_class_stub(&second_session, &db, "Widget", Some(&root))
+            .expect("a page already on disk is served, not an IO failure");
+        assert_eq!(path, path2);
+        let after = std::fs::metadata(path2.as_std_path())
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(before, after, "an existing on-disk page is never rewritten");
+        assert_eq!(
+            std::fs::read_to_string(path.as_std_path()).unwrap(),
+            stub.text
+        );
+    }
+
+    /// The >30-day-session scenario: a directory whose ENTRIES stopped changing long ago
+    /// (stale dir mtime — on POSIX materializing the last page is the last mtime bump) but
+    /// whose `.touch` sentinel a still-live session keeps rewriting must survive a foreign
+    /// GC; one stale by both signals is collected. Unix-only: faking a directory's mtime
+    /// needs `File::open` on a directory, which Windows refuses.
+    #[cfg(unix)]
+    #[test]
+    fn gc_freshness_prefers_the_touch_sentinel_over_dir_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = Utf8PathBuf::from_path_buf(tmp.path().to_path_buf()).unwrap();
+        let current = base.join(format!("v{STUB_FORMAT_VERSION}-{:016x}", 1u64));
+        let live_long_session = base.join(format!("v{STUB_FORMAT_VERSION}-{:016x}", 2u64));
+        let dead = base.join(format!("v{STUB_FORMAT_VERSION}-{:016x}", 3u64));
+        for d in [&current, &live_long_session, &dead] {
+            std::fs::create_dir_all(d.as_std_path()).unwrap();
+        }
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 3600);
+        let set_mtime = |p: &Utf8PathBuf| {
+            std::fs::File::open(p.as_std_path())
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        std::fs::write(live_long_session.join(".touch").as_std_path(), b"").unwrap();
+        set_mtime(&live_long_session); // dir mtime stale, sentinel fresh
+        let dead_touch = dead.join(".touch");
+        std::fs::write(dead_touch.as_std_path(), b"").unwrap();
+        set_mtime(&dead_touch);
+        set_mtime(&dead); // both signals stale
+        gc_stale_stubs(&base, &current);
+        assert!(
+            live_long_session.as_std_path().exists(),
+            "a fresh sentinel keeps the directory alive past a stale dir mtime"
+        );
+        assert!(
+            !dead.as_std_path().exists(),
+            "stale by both signals is collected"
+        );
     }
 
     #[test]

@@ -97,6 +97,11 @@ pub struct ServerState {
     /// `memory_soft_cap_evicted` event, not 1 200 of them. Defaults to `Normal` at startup; a
     /// first-tick transition to Soft/Hard fires the corresponding event.
     pub(crate) memory_pressure: MemoryPressure,
+    /// Per-session cache of rendered native API pages (#34) — see
+    /// [`crate::stubs::StubCache`]. Interior-mutable so shared-`&` request paths fill it;
+    /// keyed by the dump's content hash, so a mid-session dump adoption invalidates it
+    /// naturally.
+    pub(crate) stub_cache: crate::stubs::StubCache,
 }
 
 /// Build and run the server on stdio. This is the binary entry point's worker.
@@ -266,6 +271,7 @@ fn serve_inner(
         current_token: None,
         budget,
         memory_pressure: MemoryPressure::Normal,
+        stub_cache: crate::stubs::StubCache::default(),
     };
 
     // At startup no buffers are open yet, so this set is empty; building it via the same helper the
@@ -1631,6 +1637,7 @@ mod tests {
             // arm at MemoryPressure::Normal across the run.
             budget: MemoryBudget::from_caps_mb(u64::MAX / 2, u64::MAX / 2),
             memory_pressure: MemoryPressure::Normal,
+            stub_cache: crate::stubs::StubCache::default(),
         };
         (state, rx)
     }
@@ -1674,6 +1681,7 @@ mod tests {
             current_token: None,
             budget,
             memory_pressure: MemoryPressure::Normal,
+            stub_cache: crate::stubs::StubCache::default(),
         };
         (state, rx)
     }
@@ -1888,6 +1896,7 @@ mod tests {
             current_token: None,
             budget,
             memory_pressure: MemoryPressure::Normal,
+            stub_cache: crate::stubs::StubCache::default(),
         };
 
         // Pre-populate the cache via the dev/test debug-insert helpers. Without entries to

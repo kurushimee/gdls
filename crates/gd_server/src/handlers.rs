@@ -487,8 +487,12 @@ fn native_definition(
 
     // 1. Native class name.
     if state.workspace.native.class_named(name).is_some() {
-        let (path, stub) =
-            crate::stubs::ensure_class_stub(&state.workspace.native, name, stub_root.as_deref())?;
+        let (path, stub) = crate::stubs::ensure_class_stub(
+            &state.stub_cache,
+            &state.workspace.native,
+            name,
+            stub_root.as_deref(),
+        )?;
         return stub_location(&path, stub.class_line);
     }
 
@@ -518,6 +522,11 @@ fn native_definition(
                 );
             }
         }
+        // Deliberate stop, not a fall-through miss: the cursor names an ATTRIBUTE site, so
+        // the bare-call arm below can never describe it — and a non-Native base is project
+        // territory the script arms already resolved (or correctly failed to) before this
+        // function ran. Falling through could only mis-anchor the name at an unrelated bare
+        // call elsewhere in the file.
         return None;
     }
 
@@ -566,7 +575,8 @@ fn native_member_stub_location(
     let db = &state.workspace.native;
     let (decl, _) = db.lookup_member(class, member)?;
     let declaring = db.name_of(decl.name).to_owned();
-    let (path, stub) = crate::stubs::ensure_class_stub(db, &declaring, stub_root)?;
+    let (path, stub) =
+        crate::stubs::ensure_class_stub(&state.stub_cache, db, &declaring, stub_root)?;
     stub_location(&path, *stub.member_lines.get(member)?)
 }
 
