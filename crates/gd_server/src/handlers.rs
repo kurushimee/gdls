@@ -318,8 +318,10 @@ fn smallest_typed_containing(
 ///      class), found by walking the [`ClassNode::members`] list of the file's root class.
 ///   2. Cross-file: a project `class_name` registered in the [`gd_project::Index`], resolved via
 ///      [`gd_project::Index::file_id`] → the indexed file's URI + interface span.
-///   3. Native and unknown identifiers return `None` (the LSP wire = `null`); native classes
-///      don't have an `extension_api.json`-backed location to jump to.
+///   3. Native symbols (v1.0.4 #34): the class's API page is materialized as a real document
+///      under the user-level stub cache ([`crate::stubs`]) and the Location points into it —
+///      the class header for a class name, the member's rendered line for attribute /
+///      implicit-self member access. Unknown identifiers return `None` (the LSP wire = `null`).
 pub fn definition(
     state: &mut ServerState,
     params: GotoDefinitionParams,
@@ -457,8 +459,125 @@ pub fn definition(
         }
     }
 
-    // (3) Native / unknown: no location.
+    // (3) Native symbols (v1.0.4 #34): materialize the class's API page as a real read-only
+    // document under the user-level stub cache and return a standard `file://` Location into it
+    // — LSP ≤ 3.17 has no virtual-document mechanism, and the generic-LSP principle (#30) rules
+    // out custom URI schemes. Runs LAST so every project-level resolution keeps shadowing
+    // natives. Unknown identifiers still return null.
+    native_definition(state, &parsed.tree, byte, &uri, &name, &text)
+        .map(GotoDefinitionResponse::Scalar)
+}
+
+/// The native arm of [`definition`] — three cursor shapes, all anchoring into a stub
+/// materialized by [`crate::stubs::ensure_class_stub`]:
+///   1. the identifier IS a native class name → the stub's `class_name` header;
+///   2. a subscript attribute whose base type is Native (`player.stop`) → the member's line in
+///      its DECLARING class's stub;
+///   3. a bare call callee (`queue_free()` under a Node-rooted script) → the same member anchor
+///      through the file's chain native root — definition/hover symmetry (#35's bare-call path).
+fn native_definition(
+    state: &mut ServerState,
+    tree: &ParseTree,
+    byte: usize,
+    uri: &Uri,
+    name: &str,
+    text: &str,
+) -> Option<Location> {
+    let stub_root = state.options.stub_cache_dir.clone();
+
+    // 1. Native class name.
+    if state.workspace.native.class_named(name).is_some() {
+        let (path, stub) =
+            crate::stubs::ensure_class_stub(&state.workspace.native, name, stub_root.as_deref())?;
+        return stub_location(&path, stub.class_line);
+    }
+
+    // 2. Subscript attribute over a Native-typed base: resolve the member to its declaring
+    // class. The analyzer result is cached (same call hover makes).
+    let attr_site = tree.iter_ids().find_map(|id| {
+        if let NodeKind::Subscript(sub) = &tree.get(id).kind {
+            if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
+                let s = tree.get(attr_id).span;
+                if s.start <= byte && byte < s.end && ident_name(tree, attr_id) == name {
+                    return Some(sub.base);
+                }
+            }
+        }
+        None
+    });
+    if let Some(Some(base_id)) = attr_site {
+        let analyzed = analyze_if_gd(state, uri, tree, text);
+        let base_dt = analyzed.as_deref().map(|a| a.types.get(base_id).clone());
+        if let Some(base_dt) = base_dt {
+            if base_dt.kind == gd_analyze::DtKind::Native && !base_dt.native_type.is_empty() {
+                return native_member_stub_location(
+                    state,
+                    &base_dt.native_type,
+                    name,
+                    stub_root.as_deref(),
+                );
+            }
+        }
+        return None;
+    }
+
+    // 3. Bare call callee through the implicit self — the file's chain native root, with
+    // project members shadowing (the hover bare-call rule).
+    let is_bare_callee = tree.iter_ids().any(|id| {
+        if let NodeKind::Call(c) = &tree.get(id).kind {
+            if let Some(callee) = c.callee {
+                if let NodeKind::Identifier(i) = &tree.get(callee).kind {
+                    let s = tree.get(callee).span;
+                    return s.start <= byte && byte < s.end && i.name == name;
+                }
+            }
+        }
+        false
+    });
+    if is_bare_callee {
+        let fid = uri_to_path(uri).and_then(|p| state.workspace.index.file_id(&p))?;
+        let (chain, root) = state
+            .workspace
+            .index
+            .extends_chain_files(fid, &state.workspace.native);
+        let declared_in_project = chain.iter().any(|f| {
+            state
+                .workspace
+                .index
+                .interface(*f)
+                .is_some_and(|i| i.members.iter().any(|m| m.name == name))
+        });
+        if declared_in_project {
+            return None;
+        }
+        return native_member_stub_location(state, &root?, name, stub_root.as_deref());
+    }
     None
+}
+
+/// Materialize the stub of the class DECLARING `member` (found by the chain walk from `class`)
+/// and anchor at the member's rendered line.
+fn native_member_stub_location(
+    state: &ServerState,
+    class: &str,
+    member: &str,
+    stub_root: Option<&str>,
+) -> Option<Location> {
+    let db = &state.workspace.native;
+    let (decl, _) = db.lookup_member(class, member)?;
+    let declaring = db.name_of(decl.name).to_owned();
+    let (path, stub) = crate::stubs::ensure_class_stub(db, &declaring, stub_root)?;
+    stub_location(&path, *stub.member_lines.get(member)?)
+}
+
+/// A zero-width Location at the start of `line` (0-based) in the stub at `path`.
+fn stub_location(path: &camino::Utf8Path, line: u32) -> Option<Location> {
+    let uri = path_to_file_uri(path)?;
+    let pos = Position::new(line, 0);
+    Some(Location {
+        uri,
+        range: lsp_types::Range::new(pos, pos),
+    })
 }
 
 /// Run the analyzer if `uri` points to a `.gd` file. Mirrors the gate used in `publish_diagnostics`

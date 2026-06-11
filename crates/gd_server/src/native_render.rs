@@ -41,7 +41,6 @@ pub fn member_detail(db: &NativeDb, declaring: &str, member: &NativeMember) -> S
 }
 
 /// A member's declaration line, unqualified (`func name(...)`) — the stub-body shape (#34).
-#[allow(dead_code)] // the stub renderer is this fn's consumer; it lands in the #34 commit
 pub fn member_decl(db: &NativeDb, declaring: &str, member: &NativeMember) -> String {
     member_line(db, declaring, false, member)
 }

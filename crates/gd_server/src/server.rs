@@ -1468,26 +1468,36 @@ fn parse_params<P: serde::de::DeserializeOwned>(
 /// by a content fingerprint, so the same `didChange` doesn't pay the cost twice when
 /// `documentSymbol` and `publishDiagnostics` race on identical buffer text.
 fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) {
-    let diagnostics: Vec<Diagnostic> = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
-        Some(text) => {
-            let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
-            // Only `.gd` files go through the analyzer — for any other open buffer the syntax
-            // diagnostics carry the publish on their own.
-            let analyzed = analyze_gd(state, &uri, &parsed.tree, &text);
-            match state.vfs.get(uri.as_str()) {
-                Some(doc) => {
-                    let mapper = PositionMapper::new(&doc.rope, state.encoding);
-                    collect_diagnostics(&mapper, &parsed.diagnostics, analyzed.as_deref())
+    // v1.0.4 (#34): stub buffers never self-diagnose — a materialized native API page need not
+    // be analyzable GDScript, only readable as it. Matched against the stubs BASE root (any
+    // version/hash: an old-hash stub can stay open across a mid-session dump swap). The publish
+    // below still runs with the empty set, so a client that somehow held diagnostics for the
+    // path clears them.
+    let is_stub = crate::stubs::is_stub_uri(&uri, state.options.stub_cache_dir.as_deref());
+    let diagnostics: Vec<Diagnostic> = if is_stub {
+        Vec::new()
+    } else {
+        match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+            Some(text) => {
+                let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+                // Only `.gd` files go through the analyzer — for any other open buffer the syntax
+                // diagnostics carry the publish on their own.
+                let analyzed = analyze_gd(state, &uri, &parsed.tree, &text);
+                match state.vfs.get(uri.as_str()) {
+                    Some(doc) => {
+                        let mapper = PositionMapper::new(&doc.rope, state.encoding);
+                        collect_diagnostics(&mapper, &parsed.diagnostics, analyzed.as_deref())
+                    }
+                    None => Vec::new(),
                 }
-                None => Vec::new(),
             }
-        }
-        None => {
-            // No open buffer: the expected `didClose` clear-path, or a publish for a URI we never
-            // opened. We deliberately push an empty set either way, but log it so an empty result
-            // is never silently indistinguishable from "parsed clean".
-            log::debug!("publishing empty diagnostics for {uri:?}: no open buffer");
-            Vec::new()
+            None => {
+                // No open buffer: the expected `didClose` clear-path, or a publish for a URI we never
+                // opened. We deliberately push an empty set either way, but log it so an empty result
+                // is never silently indistinguishable from "parsed clean".
+                log::debug!("publishing empty diagnostics for {uri:?}: no open buffer");
+                Vec::new()
+            }
         }
     };
 
