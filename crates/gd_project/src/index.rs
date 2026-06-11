@@ -323,6 +323,47 @@ impl Index {
         self.resolve_path(res)
     }
 
+    /// Walk `fid`'s extends chain — `fid` first, then each project-script ancestor — to its
+    /// native root. Returns the visited project files plus the first native class name reached:
+    /// `None` when a link is unknown/unresolvable or the chain cycles; an absent `extends`
+    /// clause roots at `RefCounted` (Godot's scriptless default, the `gd_analyze::script_chain`
+    /// convention). Server-side consumers only — the implicit-self hover/definition paths
+    /// (#34/#35); the analyzer's equivalent walk lives in `gd_analyze::script_chain`.
+    pub fn extends_chain_files(
+        &self,
+        fid: FileId,
+        native: &NativeDb,
+    ) -> (Vec<FileId>, Option<String>) {
+        let mut files = Vec::new();
+        let mut cur = fid;
+        loop {
+            if files.contains(&cur) {
+                return (files, None); // cycle — root unknowable
+            }
+            files.push(cur);
+            let Some(iface) = self.interfaces.get(&cur) else {
+                return (files, None);
+            };
+            match &iface.extends {
+                Extends::None => return (files, Some("RefCounted".to_owned())),
+                Extends::Path(p) => match self.resolve_path(p) {
+                    Some(next) => cur = next,
+                    None => return (files, None),
+                },
+                Extends::Names(names) => {
+                    let Some(head) = names.first() else {
+                        return (files, None);
+                    };
+                    match self.resolve_name(head, native) {
+                        Resolution::Script(next) => cur = next,
+                        Resolution::Native => return (files, Some(head.clone())),
+                        Resolution::Unknown => return (files, None),
+                    }
+                }
+            }
+        }
+    }
+
     /// `res://…` → its absolute path under the project root — a pure path-join with **no existence
     /// check** (mirrors [`ProjectModel::res_to_path`](crate::ProjectModel::res_to_path)). Unlike
     /// [`Self::resolve_res_path`], this does not require the target to be an indexed `.gd` file, so

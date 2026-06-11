@@ -1095,3 +1095,136 @@ fn did_save_triggers_a_diagnostic_republish() {
 
     shutdown(&client, handle);
 }
+
+/// v1.0.4 (#35): hover on native members renders the editor-LSP declaration line — never the
+/// bare expression type (`stop()` used to hover as `Nil`, `volume_db` as `float`). Covers every
+/// repro row from the issue: attribute callee, property, class name, enum constant, bare
+/// implicit-self call, builtin method, and a `@GlobalScope` utility — plus member docs after
+/// the fence when the dump carries them.
+#[test]
+fn hover_native_members_render_declaration_lines() {
+    let fixture_dir = std::env::temp_dir().join("gdls_native_hover");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    let api_path = fixture_dir.join("extension_api.json");
+    std::fs::write(
+        &api_path,
+        r#"{
+        "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
+        "builtin_classes": [
+            {"name": "Vector2", "is_keyed": false,
+             "methods": [{"name": "length", "is_const": true, "is_static": false,
+                          "is_vararg": false, "return_type": "float", "arguments": []}]}
+        ],
+        "classes": [
+            {"name": "Object", "is_instantiable": true},
+            {"name": "Node", "inherits": "Object", "is_instantiable": true},
+            {"name": "AudioStreamPlayer", "inherits": "Node", "is_instantiable": true,
+             "properties": [{"name": "volume_db", "type": "float",
+                             "setter": "set_volume_db", "getter": "get_volume_db"}],
+             "methods": [{"name": "stop", "is_const": false, "is_static": false,
+                          "is_vararg": false, "is_virtual": false, "hash": 1, "arguments": [],
+                          "description": "Stops the audio."}]},
+            {"name": "Input", "inherits": "Object", "is_instantiable": true,
+             "enums": [{"name": "MouseMode", "is_bitfield": false,
+                        "values": [{"name": "MOUSE_MODE_CAPTURED", "value": 2}]}]}
+        ],
+        "utility_functions": [
+            {"name": "print", "category": "general", "is_vararg": true, "arguments": []}
+        ]
+    }"#,
+    )
+    .expect("write fixture JSON");
+
+    let src = "extends AudioStreamPlayer\n\
+               func _ready() -> void:\n\
+               \tvar player := AudioStreamPlayer.new()\n\
+               \tplayer.stop()\n\
+               \tplayer.volume_db = 0.0\n\
+               \tvar mode := Input.MOUSE_MODE_CAPTURED\n\
+               \tvar v: Vector2\n\
+               \tstop()\n\
+               \tprint([mode, v.length()])\n";
+    let script_path = fixture_dir.join("main.gd");
+    std::fs::write(&script_path, src).expect("write main.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+        "extensionApiPath": api_path.to_string_lossy().as_ref(),
+        "autoDumpExtensionApi": false,
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+    let uri: Uri = format!(
+        "file:///{}",
+        script_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &uri, src);
+
+    let md_at = |line: u32, character: u32, what: &str| -> String {
+        let hover = hover_at(&client, &uri, Position::new(line, character))
+            .unwrap_or_else(|| panic!("hover must answer on {what} at {line}:{character}"));
+        hover_markdown(&hover).to_string()
+    };
+
+    // Class name (`extends AudioStreamPlayer`) → the editor-LSP class line + nothing lost.
+    let md = md_at(0, 12, "class name");
+    assert!(
+        md.contains("<Native> class AudioStreamPlayer extends Node"),
+        "class hover renders the declaration line, got {md:?}"
+    );
+
+    // Attribute callee: `player.stop()` → the full signature, with the member doc after.
+    let md = md_at(3, 9, "player.stop callee");
+    assert!(
+        md.contains("func AudioStreamPlayer.stop() -> void"),
+        "method hover renders the signature, not `Nil`, got {md:?}"
+    );
+    assert!(
+        md.contains("Stops the audio."),
+        "member description renders after the fence, got {md:?}"
+    );
+
+    // Property attribute: `player.volume_db` → var line, not `float`.
+    let md = md_at(4, 10, "player.volume_db");
+    assert!(
+        md.contains("var AudioStreamPlayer.volume_db: float"),
+        "property hover renders the declaration, got {md:?}"
+    );
+
+    // Native class meta + enum value: `Input.MOUSE_MODE_CAPTURED`.
+    let md = md_at(5, 14, "Input class name");
+    assert!(
+        md.contains("<Native> class Input extends Object"),
+        "got {md:?}"
+    );
+    let md = md_at(5, 25, "MOUSE_MODE_CAPTURED");
+    assert!(
+        md.contains("const Input.MOUSE_MODE_CAPTURED: MouseMode = 2"),
+        "enum-value hover renders the const line, got {md:?}"
+    );
+
+    // Bare implicit-self call: `stop()` under `extends AudioStreamPlayer`.
+    let md = md_at(7, 2, "bare stop()");
+    assert!(
+        md.contains("func AudioStreamPlayer.stop() -> void"),
+        "bare inherited call resolves through the chain root, got {md:?}"
+    );
+
+    // Builtin method + utility function.
+    let md = md_at(8, 17, "v.length()");
+    assert!(
+        md.contains("func Vector2.length() -> float"),
+        "builtin method hover renders the signature, got {md:?}"
+    );
+    let md = md_at(8, 2, "print utility");
+    assert!(
+        md.contains("func print(...) -> void"),
+        "utility hover renders the vararg signature, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}

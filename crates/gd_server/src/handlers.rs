@@ -258,7 +258,11 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
             analyzed
                 .as_deref()
                 .and_then(|a| hover_attribute_member_signature(state, &parsed.tree, byte, a))
-        });
+        })
+        // v1.0.4 (#35): bare calls — an inherited native method / signal through the implicit
+        // self (`stop()` under `extends AudioStreamPlayer`), or a `@GlobalScope` utility
+        // (`print(...)`). Runs last so any project-script resolution above keeps shadowing.
+        .or_else(|| hover_bare_native_signature(state, &parsed.tree, byte, &uri));
 
     let markdown = if let Some(sig) = member_sig {
         sig
@@ -541,9 +545,14 @@ fn render_hover(
     // the M5 verification report; those still fall through to the typed-ancestor branch below.)
     let leaf_type_label: Option<String> = match &leaf.kind {
         NodeKind::Identifier(ident) => {
-            if state.workspace.native.class_named(&ident.name).is_some() {
+            if let Some(class) = state.workspace.native.class_named(&ident.name) {
+                // v1.0.4 (#35): the editor-LSP declaration line (`<Native> class X extends Y`)
+                // instead of the bare name — the docs append below as before.
                 native_lookup = Some(ident.name.clone());
-                Some(ident.name.clone())
+                Some(crate::native_render::class_detail(
+                    &state.workspace.native,
+                    class,
+                ))
             } else if state.workspace.index.registry().get(&ident.name).is_some() {
                 Some(ident.name.clone())
             } else {
@@ -580,10 +589,13 @@ fn render_hover(
     // rather than this leaf identifier.
     if native_lookup.is_none() {
         if let NodeKind::Identifier(ident) = &node.kind {
-            if state.workspace.native.class_named(&ident.name).is_some() {
+            if let Some(class) = state.workspace.native.class_named(&ident.name) {
                 if md.is_empty() {
                     md.push_str("```gdscript\n");
-                    md.push_str(&ident.name);
+                    md.push_str(&crate::native_render::class_detail(
+                        &state.workspace.native,
+                        class,
+                    ));
                     md.push('\n');
                     md.push_str("```");
                 }
@@ -665,27 +677,141 @@ fn hover_member_signature(
         return None;
     }
 
-    // Get the base expression's resolved type — must be a project Script kind.
-    let base_dt = analyzed.types.get(base_id);
-    if base_dt.kind != DtKind::Script {
-        return None;
-    }
-    let script_ref = base_dt.script_type.as_ref()?;
-    let callee_file = script_ref.file;
-
-    // Look up the method name in the callee file's interface.
     let fn_name = &call_node.function_name;
     if fn_name.is_empty() {
         return None;
     }
-    let iface = state.workspace.index.interface(callee_file)?;
-    let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
 
-    let sig = format_func_signature(fn_name, decl);
-    let mut md = String::from("```gdscript\n");
-    md.push_str(&sig);
-    md.push_str("\n```");
-    Some(md)
+    // The base expression's resolved type routes the lookup: a project Script kind reads the
+    // declaring interface; a Native (or Builtin) kind reads the NativeDb (v1.0.4 #35 — these
+    // used to fall through to the bare expression-type label, `stop()` → `Nil`).
+    let base_dt = analyzed.types.get(base_id);
+    match base_dt.kind {
+        DtKind::Script => {
+            let script_ref = base_dt.script_type.as_ref()?;
+            let callee_file = script_ref.file;
+
+            // Look up the method name in the callee file's interface.
+            let iface = state.workspace.index.interface(callee_file)?;
+            let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
+
+            let sig = format_func_signature(fn_name, decl);
+            let mut md = String::from("```gdscript\n");
+            md.push_str(&sig);
+            md.push_str("\n```");
+            Some(md)
+        }
+        DtKind::Native if !base_dt.native_type.is_empty() => {
+            let (decl, member) = state
+                .workspace
+                .native
+                .lookup_member(&base_dt.native_type, fn_name)?;
+            let declaring = state.workspace.native.name_of(decl.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        DtKind::Builtin => {
+            let bt_name = gd_analyze::data_type::variant_type_name(base_dt.builtin_type);
+            let (bt, member) = state
+                .workspace
+                .native
+                .lookup_builtin_member(bt_name, fn_name)?;
+            let declaring = state.workspace.native.name_of(bt.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The fenced native-member hover body: the declaration line in Godot's detail format, then the
+/// member's docstring when the dump carries one (`append_class_docs`-style) — never the bare
+/// expression type (#35).
+fn native_member_hover_md(
+    db: &gd_types::NativeDb,
+    declaring: &str,
+    member: &gd_types::NativeMember,
+) -> String {
+    let sig = crate::native_render::member_detail(db, declaring, member);
+    let mut md = format!("```gdscript\n{sig}\n```");
+    let desc = match member {
+        gd_types::NativeMember::Method(m) => m.description.as_str(),
+        gd_types::NativeMember::Property(p) => p.description.as_str(),
+        gd_types::NativeMember::Signal(s) => s.description.as_str(),
+        _ => "",
+    };
+    if !desc.is_empty() {
+        md.push_str("\n\n");
+        md.push_str(desc);
+    }
+    md
+}
+
+/// Bare-call hover (v1.0.4 #35): the callee identifier of `stop()` under
+/// `extends AudioStreamPlayer` resolves through the file's chain native root; `print(...)`
+/// resolves as a `@GlobalScope` utility. Project members shadow natives — a name declared
+/// anywhere in the file's extends chain returns `None` so the project-script paths own it.
+fn hover_bare_native_signature(
+    state: &ServerState,
+    tree: &ParseTree,
+    cursor_byte: usize,
+    uri: &Uri,
+) -> Option<String> {
+    // A Call whose callee is a BARE identifier spanning the cursor. Callee identifier spans are
+    // disjoint source tokens, so the first hit is the only hit.
+    let callee_name = tree.iter_ids().find_map(|id| {
+        let node = tree.get(id);
+        if let NodeKind::Call(c) = &node.kind {
+            let callee = c.callee?;
+            if let NodeKind::Identifier(i) = &tree.get(callee).kind {
+                let s = tree.get(callee).span;
+                if s.start <= cursor_byte && cursor_byte < s.end {
+                    return Some(i.name.clone());
+                }
+            }
+        }
+        None
+    })?;
+
+    let db = &state.workspace.native;
+    if let Some(fid) = crate::uri::uri_to_path(uri).and_then(|p| state.workspace.index.file_id(&p))
+    {
+        let (chain, root) = state.workspace.index.extends_chain_files(fid, db);
+        let declared_in_project = chain.iter().any(|f| {
+            state
+                .workspace
+                .index
+                .interface(*f)
+                .is_some_and(|i| i.members.iter().any(|m| m.name == callee_name))
+        });
+        if declared_in_project {
+            return None;
+        }
+        if let Some(root) = root {
+            if let Some((decl, member)) = db.lookup_member(&root, &callee_name) {
+                // Only callable shapes — a bare property/constant identifier isn't a call.
+                if matches!(
+                    member,
+                    gd_types::NativeMember::Method(_) | gd_types::NativeMember::Signal(_)
+                ) {
+                    let declaring = db.name_of(decl.name).to_owned();
+                    return Some(native_member_hover_md(db, &declaring, &member));
+                }
+            }
+        }
+    }
+    // `@GlobalScope` utility — also reachable in buffers outside the project index.
+    let u = db.utility(&callee_name)?;
+    Some(format!(
+        "```gdscript\n{}\n```",
+        crate::native_render::utility_detail(db, u)
+    ))
 }
 
 /// Render a `MemberDecl`'s params as `name: Type, …` — zip `param_names` and `params` in lockstep;
@@ -787,13 +913,46 @@ fn hover_attribute_member_signature(
     } else {
         None
     };
-    let decl = [binding_iface, direct_iface]
+    if let Some(decl) = [binding_iface, direct_iface]
         .into_iter()
         .flatten()
-        .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))?;
+        .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))
+    {
+        let sig = format_member_signature(name, decl)?;
+        return Some(format!("```gdscript\n{sig}\n```"));
+    }
 
-    let sig = format_member_signature(name, decl)?;
-    Some(format!("```gdscript\n{sig}\n```"))
+    // v1.0.4 (#35): no project declaration — a Native (or Builtin) base reads the NativeDb:
+    // `player.volume_db`, `Input.MOUSE_MODE_CAPTURED`, an uncalled `player.stop` reference,
+    // `Vector2.ZERO`. These used to fall through to the bare expression-type label.
+    match base_dt.kind {
+        DtKind::Native if !base_dt.native_type.is_empty() => {
+            let (decl, member) = state
+                .workspace
+                .native
+                .lookup_member(&base_dt.native_type, name)?;
+            let declaring = state.workspace.native.name_of(decl.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        DtKind::Builtin => {
+            let bt_name = gd_analyze::data_type::variant_type_name(base_dt.builtin_type);
+            let (bt, member) = state
+                .workspace
+                .native
+                .lookup_builtin_member(bt_name, name)?;
+            let declaring = state.workspace.native.name_of(bt.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Render a [`gd_project::MemberDecl`]'s declaration shape — the one formatter behind both the
