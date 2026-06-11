@@ -464,3 +464,25 @@ func check() -> void:
     let result = analyze_file(&project, "res://bridge_base.gd", base_src);
     assert_eq!(error_messages(&result), Vec::<String>::new());
 }
+
+/// v1.0.4 (#32 companion): a native method missing from every chain INTERFACE still binds its
+/// real signature through the chain's native root — upstream's get_function_signature continues
+/// into ClassDB after the script walk. Discriminating assert: `get_class()` (declared on the
+/// trimmed fixture's `Object` root, returns String) assigned to an `int` must produce the
+/// assignment-mismatch error; the pre-fix silent-Variant degrade produced nothing.
+#[test]
+fn chain_interface_miss_binds_native_method_signature() {
+    let child = "\
+extends BaseThing
+func f() -> void:
+\tvar n: int = get_class()
+\tprint_debug(n)
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://child.gd", "")]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    let errors = error_messages(&result);
+    assert!(
+        errors.iter().any(|m| m.contains("Cannot assign")),
+        "String-returning native method through the chain must type-check the assignment; got {errors:?}"
+    );
+}

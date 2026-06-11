@@ -3727,11 +3727,39 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                             }
                             ChainCall::Other => {}
                             ChainCall::Missing => {
-                                // A script base means the interface view may be incomplete —
-                                // degrade silently rather than risk a phantom not-found.
-                                return_type = Some(DataType::variant());
+                                // Interface miss: probe the chain's native root first —
+                                // upstream's get_function_signature continues into ClassDB, so
+                                // an inherited native method through a cross-file chain binds
+                                // its real signature. Only a genuine native miss keeps the
+                                // silent-Variant degrade (the interface view may be incomplete;
+                                // never risk a phantom not-found).
+                                let native_sig = crate::script_chain::chain_native_root(ctx, &sr)
+                                    .and_then(|root| {
+                                        lookup_native_method(ctx, &root, &function_name)
+                                    });
+                                if let Some(s) = native_sig {
+                                    return_type = Some(s.return_dt.clone());
+                                    sig = s;
+                                } else {
+                                    return_type = Some(DataType::variant());
+                                }
                                 found = true;
                             }
+                        }
+                    } else if let Some(root) =
+                        crate::resolver::nearest_native_ancestor(ctx, class_id)
+                    {
+                        // The chain bottoms out at a native base directly (a plain
+                        // `extends Node2D` script): bind the inherited native method's
+                        // signature like the explicit Native arm below. Mandatory companion to
+                        // reduce_identifier_from_base's CLASS-branch native tail — without it,
+                        // the not-found branch would re-reduce `self.queue_free` to a Callable
+                        // VALUE and emit the bogus `Name "X" is a Callable...` error on every
+                        // native method call through a class base.
+                        if let Some(s) = lookup_native_method(ctx, &root, &function_name) {
+                            return_type = Some(s.return_dt.clone());
+                            sig = s;
+                            found = true;
                         }
                     }
                 }
@@ -3768,10 +3796,19 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     // Exists as a non-Func — fall through; the value-callable path fires.
                 }
                 ChainCall::Missing => {
-                    // Not in any chain interface — silent degrade ("Unknown stays dynamic"):
-                    // shallow interfaces may miss inner-class methods etc., so a phantom
-                    // "Function not found" is never acceptable here.
-                    return_type = Some(DataType::variant());
+                    // Not in any chain interface — probe the chain's native root first
+                    // (upstream's get_function_signature continues into ClassDB), then the
+                    // silent degrade ("Unknown stays dynamic"): shallow interfaces may miss
+                    // inner-class methods etc., so a phantom "Function not found" is never
+                    // acceptable here.
+                    let native_sig = crate::script_chain::chain_native_root(ctx, script_ref)
+                        .and_then(|root| lookup_native_method(ctx, &root, &function_name));
+                    if let Some(s) = native_sig {
+                        return_type = Some(s.return_dt.clone());
+                        sig = s;
+                    } else {
+                        return_type = Some(DataType::variant());
+                    }
                     found = true;
                 }
             }
@@ -4711,17 +4748,49 @@ fn reduce_subscript_attribute(
                 ctx.folds.set(sub_id, folded);
             }
         } else if !base_type.is_meta_type || !base_type.is_constant {
-            // analyzer.cpp:4878-4886 — the UNSAFE_PROPERTY_ACCESS path. A property miss on a
+            // analyzer.cpp:4878-4886 — the UNSAFE_PROPERTY_ACCESS arm. A property miss on a
             // non-meta or non-constant base ⇒ the lookup is dynamic, not an error; the access
-            // types as Variant. The warning itself stays DEFERRED, deliberately: it is a
-            // negative claim ("not present on the inferred type"), and gdls's attribute lookup
-            // is not yet complete enough to make it truthfully — e.g. native *signals* through
-            // an attribute (`await self.changed`, corpus await_with_signals_no_warning.gd) and
-            // some native property shapes (`sprite.axis`, global_builtin_and_native_enums.gd)
-            // miss here while real Godot resolves them. Emitting would false-positive — and
-            // under the strict profile this code is promoted to an ERROR. Revisit when the
-            // native attribute walk covers signals + the full property surface.
+            // types as Variant and Godot warns (debug builds) that the property is "not present
+            // on the inferred type". The emission was deferred through v1.0.3 while the
+            // attribute walk couldn't truthfully make that negative claim; the CLASS-branch
+            // native tail (`await self.changed`) and its interface-gap guard closed the known
+            // false positives (#32). Two deliberate deviations remain, both docs/02 §11b
+            // epistemics: (1) a native-rooted miss only warns under `Exact` provenance — a
+            // generic/absent DB can't disprove a custom build's member (the same gate as the
+            // `!valid` arm below); (2) Script-kind bases never reach here at all — their branch
+            // degrades a total miss to a silent set Variant ("an interface gap must never
+            // lie"), which suppresses this warning on exactly the bases gdls sees shallowly.
             valid = base_type.kind != DtKind::Builtin;
+            // The negative claim is sound only when gdls saw the base's FULL member surface:
+            // a native-rooted miss needs `Exact` provenance, and a Class base whose chain root
+            // is UNRESOLVABLE (e.g. extends a fork-native class under the stock embedded
+            // fallback) has an incomplete surface — never warn there, under any provenance.
+            let negative_is_sound = match base_type.kind {
+                DtKind::Native => ctx.native.provenance() == gd_types::ApiProvenance::Exact,
+                DtKind::Class => match base_type
+                    .class_node
+                    .and_then(|cid| crate::resolver::nearest_native_ancestor(ctx, cid))
+                {
+                    Some(_) => ctx.native.provenance() == gd_types::ApiProvenance::Exact,
+                    None => false,
+                },
+                _ => true,
+            };
+            if valid && negative_is_sound {
+                let attr_name = match &ctx.node(attr_id).kind {
+                    NodeKind::Identifier(i) => i.name.clone(),
+                    _ => String::new(),
+                };
+                // Godot passes `base_type.to_string()` RAW — no `type_from_metatype`
+                // conversion, unlike the `!valid` error arm below. The helper renders
+                // in-file Class kinds by identifier name and everything else via `Display`.
+                let base_str = class_identifier_name_or_default(ctx, &base_type);
+                ctx.push_warning(
+                    crate::warnings::WarningCode::UnsafePropertyAccess,
+                    &[attr_name, base_str],
+                    sub_id,
+                );
+            }
             result_type = DataType::variant();
         }
     }
@@ -5173,9 +5242,11 @@ fn cross_file_enum_instance(
 /// `GDScriptAnalyzer::reduce_identifier_from_base(p_identifier, p_base)` (analyzer.cpp:4024). Look
 /// up `p_identifier` as a member of `p_base`. E3e ports the enum-meta / builtin-meta / native-class
 /// branches that drive the enum-access corpus family; the in-file class branch (script_classes
-/// walk at analyzer.cpp:4150-4251) walks `lookup_class_member` and continues into the cross-file
-/// chain, and the Script branch (4253-4306) runs the full per-kind member walk over
-/// `crate::script_chain` (v1.0.1).
+/// walk at analyzer.cpp:4150-4251) walks `lookup_class_member`, continues into the cross-file
+/// chain, and finishes with the chain's native root (`try_native_member`, v1.0.4 #32 — upstream
+/// FALLS THROUGH from the class loop to the native check at :4324, so `self.changed` on a
+/// `extends Resource` class resolves the inherited native signal); the Script branch (4253-4306)
+/// runs the full per-kind member walk over `crate::script_chain` (v1.0.1) with the same tail.
 ///
 /// `base = None` is Godot's "no explicit base" path that defaults to `current_class`. gdls's
 /// caller in `reduce_subscript` always passes an explicit base, so we don't yet exercise that arm.
@@ -5366,6 +5437,17 @@ fn reduce_identifier_from_base(
                     return;
                 }
             }
+            // Native tail (analyzer.cpp:4324-4360) — upstream's single function FALLS THROUGH
+            // from the class loop to the native-member check for every base kind; this is the
+            // CLASS branch's leg of that fall-through. `await self.changed` on a
+            // `extends Resource` class resolves the inherited native signal here (issue #32's
+            // corpus pin, await_with_signals_no_warning.gd). A hit types the identifier; a miss
+            // falls through to the caller's error/warning semantics, like upstream.
+            if let Some(root) = crate::resolver::nearest_native_ancestor(ctx, class_id) {
+                if try_native_member(ctx, &root, &name, is_constructor, identifier_id) {
+                    return;
+                }
+            }
         }
         // Constructor (`.new` ⇒ `_init`) on an in-file class: synthesize a Callable so the
         // outer subscript doesn't error on legitimate `MyClass.new()` patterns. The full call
@@ -5381,6 +5463,18 @@ fn reduce_identifier_from_base(
             };
             t.is_meta_type = false;
             ctx.set_type(identifier_id, t);
+            return;
+        }
+        // Not found anywhere. When the chain crossed a file boundary the interface view may be
+        // incomplete — degrade the non-meta/non-constant case to a SILENT Variant (the SCRIPT
+        // branch's never-lie rule below) instead of leaving the type unset, which would read as
+        // a trustworthy miss to the caller's UNSAFE_PROPERTY_ACCESS arm. The meta+constant case
+        // stays unset so `Cannot find member` (and its provenance gate) behaves exactly as
+        // before.
+        if base.class_node.is_some_and(|cid| {
+            script_base_of_class(ctx, cid).is_some() && (!base.is_meta_type || !base.is_constant)
+        }) {
+            ctx.set_type(identifier_id, DataType::variant());
             return;
         }
         // Not found — leave datatype unset, let the caller (reduce_subscript) emit
@@ -5509,9 +5603,11 @@ fn reduce_identifier_from_base(
 }
 
 /// The native member arms of `reduce_identifier_from_base` (analyzer.cpp:4308-4360), shared by
-/// the NATIVE branch (miss ⇒ caller's `Cannot find member`) and the Script branch's native tail
-/// (miss ⇒ silent Variant — an interface gap must never error). Sets the identifier's type/fold
-/// and returns whether a member was found.
+/// the NATIVE branch (miss ⇒ caller's `Cannot find member` / UNSAFE_PROPERTY_ACCESS), the CLASS
+/// branch's native tail (v1.0.4 #32 — same miss semantics as NATIVE), the Script branch's
+/// native tail (miss ⇒ silent Variant — an interface gap must never error), and the
+/// bare-identifier implicit-self walk (reduce_identifier step 3.5). Sets the identifier's
+/// type/fold and returns whether a member was found.
 fn try_native_member(
     ctx: &mut AnalysisContext,
     native_name: &str,
@@ -5703,10 +5799,12 @@ fn lookup_native_constant(
     None
 }
 
-/// Convert a `gd_types::TypeRef` to a [`DataType`] for property-typing. `TypeRef::Named` is
-/// ambiguous (builtin or class) so we probe the NativeDb to disambiguate — same trick as
-/// Godot's late-binding lookup. The full mapping (enums/arrays/signals) is more elaborate in
-/// Godot; this E3e cut covers Named (builtin or class), which is what the corpus exercises.
+/// Convert a `gd_types::TypeRef` to a [`DataType`] for property/return/param typing.
+/// `TypeRef::Named` is ambiguous (builtin or class) so we probe the NativeDb to disambiguate —
+/// same trick as Godot's late-binding lookup. Enum/bitfield refs mirror `type_from_property`'s
+/// CLASS_IS_ENUM / CLASS_IS_BITFIELD arms (analyzer.cpp:5744-5759); typed collections stay
+/// soft Variant (the typed-collection slice is deferred work — hardening them here would
+/// activate container-element checks this port hasn't validated against the corpus).
 fn type_from_type_ref(ctx: &AnalysisContext, ty: &gd_types::TypeRef) -> DataType {
     use gd_types::TypeRef;
     match ty {
@@ -5741,7 +5839,47 @@ fn type_from_type_ref(ctx: &AnalysisContext, ty: &gd_types::TypeRef) -> DataType
             builtin_type: VariantType::Nil,
             ..Default::default()
         },
-        _ => DataType::variant(),
+        TypeRef::Enum { scope, name } => {
+            // analyzer.cpp:5746-5757 (type_from_property): an INT flagged CLASS_IS_ENUM. Godot
+            // probes CoreConstants FIRST — a dotted name like `Variant.Type` is a *global* enum,
+            // not class-scoped — then splits `Class.Enum` into upstream's bare `make_enum_type`
+            // (no value fill at this site; values are populated only by the identifier-from-base
+            // constant arm). Either way the result is a VALUE, not a constant.
+            let enum_name = ctx.native.name_of(*name).to_owned();
+            let mut t = match scope {
+                Some(s) => {
+                    let scope_name = ctx.native.name_of(*s).to_owned();
+                    if ctx
+                        .native
+                        .global_enum(&format!("{scope_name}.{enum_name}"))
+                        .is_some()
+                    {
+                        crate::resolver::make_global_enum_type(ctx, &enum_name, &scope_name, false)
+                    } else {
+                        crate::resolver::make_enum_type(&enum_name, &scope_name, false)
+                    }
+                }
+                None => crate::resolver::make_global_enum_type(ctx, &enum_name, "", false),
+            };
+            t.is_constant = false;
+            t
+        }
+        // PROPERTY_USAGE_CLASS_IS_BITFIELD (analyzer.cpp:5758): "BitField[T] isn't supported
+        // (yet?), use plain int."
+        TypeRef::Bitfield { .. } => {
+            let mut t = DataType {
+                type_source: TypeSource::AnnotatedExplicit,
+                kind: DtKind::Builtin,
+                builtin_type: VariantType::Int,
+                ..Default::default()
+            };
+            t.is_meta_type = false;
+            t
+        }
+        TypeRef::Variant
+        | TypeRef::TypedArray(_)
+        | TypeRef::TypedDict(_, _)
+        | TypeRef::Pointer(_) => DataType::variant(),
     }
 }
 

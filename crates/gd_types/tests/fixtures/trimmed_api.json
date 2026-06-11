@@ -8572,7 +8572,12 @@
       "inherits": "RefCounted",
       "is_refcounted": true,
       "is_instantiable": true,
-      "api_type": "core"
+      "api_type": "core",
+      "signals": [
+        {
+          "name": "changed"
+        }
+      ]
     },
     {
       "name": "TileSet",
@@ -8692,8 +8697,50 @@
       "api_type": "core"
     },
     {
-      "name": "Sprite3D",
+      "name": "SpriteBase3D",
       "inherits": "Node3D",
+      "is_refcounted": false,
+      "is_instantiable": false,
+      "api_type": "core",
+      "methods": [
+        {
+          "name": "set_axis",
+          "is_const": false,
+          "is_vararg": false,
+          "is_static": false,
+          "is_virtual": false,
+          "hash": 1144690656,
+          "arguments": [
+            {
+              "name": "axis",
+              "type": "enum::Vector3.Axis"
+            }
+          ]
+        },
+        {
+          "name": "get_axis",
+          "is_const": true,
+          "is_vararg": false,
+          "is_static": false,
+          "is_virtual": false,
+          "hash": 3050976882,
+          "return_value": {
+            "type": "enum::Vector3.Axis"
+          }
+        }
+      ],
+      "properties": [
+        {
+          "type": "int",
+          "name": "axis",
+          "setter": "set_axis",
+          "getter": "get_axis"
+        }
+      ]
+    },
+    {
+      "name": "Sprite3D",
+      "inherits": "SpriteBase3D",
       "is_refcounted": false,
       "is_instantiable": true,
       "api_type": "core"
