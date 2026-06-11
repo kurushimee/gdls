@@ -474,6 +474,10 @@ impl Parser {
             }
             self.current = self.lexer.scan();
         }
+        // gdscript_parser.cpp:482-489 — EOF right after the leading skip means an empty script
+        // file. Godot pushes the EMPTY_FILE warning here; gdls records the signal on the tree
+        // and `gd_analyze` (owner of the warning set) emits it.
+        self.tree.starts_at_eof = self.current.kind == TokenKind::Eof;
     }
 
     // ----- node allocation & extent tracking (gdscript_parser.h:1467, cpp:5614) -----

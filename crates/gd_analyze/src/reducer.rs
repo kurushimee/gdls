@@ -197,6 +197,19 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
             if let (Some(te), Some(fe)) = (t.true_expr, t.false_expr) {
                 let tt = ctx.get_type(te).clone();
                 let ft = ctx.get_type(fe).clone();
+                // INCOMPATIBLE_TERNARY (analyzer.cpp:5172-5184): neither branch type accepts
+                // the other — the values have no common type and the expression degrades to
+                // Variant. Variant-typed (or unset, tail-guard-pending) branches are exempt,
+                // exactly as upstream's `is_variant()` early arm.
+                if tt.is_set()
+                    && ft.is_set()
+                    && tt.kind != DtKind::Variant
+                    && ft.kind != DtKind::Variant
+                    && !is_type_compatible(ctx, &tt, &ft, false)
+                    && !is_type_compatible(ctx, &ft, &tt, false)
+                {
+                    ctx.push_warning(crate::warnings::WarningCode::IncompatibleTernary, &[], id);
+                }
                 if tt.is_set()
                     && ft.is_set()
                     && tt.kind == ft.kind
@@ -418,6 +431,23 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
     if !left_dt.is_set() || !right_dt.is_set() {
         // Match Godot: leave the result Unresolved; the dispatcher tail-guard paints it Variant.
         return;
+    }
+
+    // INTEGER_DIVISION (analyzer.cpp:3104-3113): `/` over int (or integer-vector) operands
+    // discards the decimal part. Reads `builtin_type` directly with no kind gate, as upstream —
+    // non-builtin kinds carry `Object` there and never match.
+    if op_node.operation == BinaryOp::Division
+        && matches!(
+            left_dt.builtin_type,
+            VariantType::Int
+                | VariantType::Vector2i
+                | VariantType::Vector3i
+                | VariantType::Vector4i
+        )
+        && (right_dt.builtin_type == VariantType::Int
+            || right_dt.builtin_type == left_dt.builtin_type)
+    {
+        ctx.push_warning(crate::warnings::WarningCode::IntegerDivision, &[], id);
     }
 
     // Both-constant fold path (analyzer.cpp:3118-3143). Our `FoldedValue` set has no sharing
@@ -1023,7 +1053,8 @@ fn compare(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedValue
 }
 
 /// `Variant::booleanize` over our subset — every value falsy/truthy as the engine sees it.
-fn booleanize(v: &FoldedValue) -> bool {
+/// `pub(crate)` for `resolve_assert`'s ASSERT_ALWAYS_TRUE/_FALSE constant-condition check.
+pub(crate) fn booleanize(v: &FoldedValue) -> bool {
     use FoldedValue::*;
     match v {
         Nil => false,
@@ -1345,6 +1376,21 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
                     }
                 }
             }
+            // UNASSIGNED_VARIABLE (analyzer.cpp:4435-4439, LOCAL_VARIABLE arm): a read of a
+            // local variable with zero assignments so far — flow-insensitive: an assignment in
+            // a not-yet-resolved later statement doesn't save an earlier read, and once any
+            // assignment has been counted, later reads stay silent ("maybe assigned"). Hard
+            // builtin types are exempt (they zero-initialize meaningfully).
+            if local.kind == gd_syntax::ast::LocalKind::Variable
+                && assignment_count(ctx, local.source) == 0
+                && !(dt.is_hard_type() && dt.kind == DtKind::Builtin)
+            {
+                ctx.push_warning(
+                    crate::warnings::WarningCode::UnassignedVariable,
+                    std::slice::from_ref(&name),
+                    id,
+                );
+            }
             ctx.set_type(id, dt);
             return;
         }
@@ -1389,6 +1435,12 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             if let Some(fv) = fold {
                 ctx.folds.set(id, fv);
             }
+            // No UNASSIGNED_VARIABLE here, deliberately: upstream's warning block sits in the
+            // `p_identifier->source` switch (analyzer.cpp:4408-4441), and a member identifier's
+            // `source` is classified AFTER that switch on first resolution — so the
+            // MEMBER_VARIABLE/STATIC_VARIABLE arms only see re-reduced identifiers and members
+            // never warn in practice (the corpus's property/static fixtures pin this). Only
+            // parse-time-classified LOCALS fire the warning on first reduce.
             ctx.set_type(id, dt);
             // analyzer.cpp:4464-4490 — when accessing a non-static instance member from a static
             // function (or a static-variable initializer), Godot emits
@@ -2073,10 +2125,45 @@ fn reduce_cast(ctx: &mut AnalysisContext, id: NodeId) {
 
     if !valid {
         let cast_type_anchor = cast.cast_type.unwrap_or(id);
+        // Humanized rendering: through v1.0.2 this message leaked the `Display` impl's
+        // `<Script #N>` placeholder onto real projects (the v1.0.3 acceptance sweep caught
+        // `Invalid cast. Cannot convert from "Nil" to "<Script #3095>".`).
+        let from_str = script_type_display(ctx, &op_type);
+        let to_str = script_type_display(ctx, &cast_type);
         ctx.push_error(
-            format!(r#"Invalid cast. Cannot convert from "{op_type}" to "{cast_type}"."#),
+            format!(r#"Invalid cast. Cannot convert from "{from_str}" to "{to_str}"."#),
             cast_type_anchor,
         );
+    }
+}
+
+/// Render a `DataType` the way Godot's `DataType::to_string()` does for user-facing messages:
+/// a `Script`-kind type shows its global `class_name` when declared, else the script file's
+/// basename (`script_path.get_file()`), with any inner-class path appended; `Class` kinds
+/// delegate to [`class_identifier_name_or_default`]. The bare `Display` impl has no index
+/// access, so it renders the `<Script #N>` / `<Class>` diagnostic placeholders — fine for
+/// internal logs, never for diagnostics text.
+pub(crate) fn script_type_display(ctx: &AnalysisContext, dt: &DataType) -> String {
+    if dt.kind != DtKind::Script {
+        return class_identifier_name_or_default(ctx, dt);
+    }
+    let Some(sr) = &dt.script_type else {
+        return dt.to_string();
+    };
+    let head = ctx
+        .xfile
+        .interface(sr.file)
+        .and_then(|i| i.class_name.clone())
+        .or_else(|| {
+            ctx.xfile
+                .file_path(sr.file)
+                .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_owned())
+                .filter(|s| !s.is_empty())
+        });
+    match head {
+        Some(h) if sr.inner.is_empty() => h,
+        Some(h) => format!("{h}.{}", sr.inner.join(".")),
+        None => dt.to_string(),
     }
 }
 
@@ -2092,6 +2179,32 @@ fn reduce_cast(ctx: &mut AnalysisContext, id: NodeId) {
 ///
 /// [`is_type_compatible_strict_collections`] sits one layer above this and rejects typed-collection
 /// → untyped-collection assignments that this routine would otherwise accept.
+/// [`is_type_compatible`] **with a source node** — upstream's warning-emitting wrapper
+/// (analyzer.cpp:6139-6150): when the target is an enum and the source a builtin `int`,
+/// INT_AS_ENUM_WITHOUT_CAST fires at the node, independent of the compatibility verdict (the
+/// assignment may well compile — the cast is just missing). Only the call sites whose upstream
+/// counterpart passes `p_source_node` route through here; node-less upstream calls (ternary,
+/// type-test, cast, call arguments) keep the plain function and never warn.
+pub(crate) fn is_type_compatible_with_source(
+    ctx: &mut AnalysisContext,
+    target: &DataType,
+    source: &DataType,
+    allow_implicit_conversion: bool,
+    source_node: NodeId,
+) -> bool {
+    if target.kind == DtKind::Enum
+        && source.kind == DtKind::Builtin
+        && source.builtin_type == VariantType::Int
+    {
+        ctx.push_warning(
+            crate::warnings::WarningCode::IntAsEnumWithoutCast,
+            &[],
+            source_node,
+        );
+    }
+    is_type_compatible(ctx, target, source, allow_implicit_conversion)
+}
+
 pub(crate) fn is_type_compatible(
     ctx: &AnalysisContext,
     target: &DataType,
@@ -2593,6 +2706,19 @@ fn reduce_assignment(ctx: &mut AnalysisContext, id: NodeId) {
     if let Some(v) = assign.assigned_value {
         reduce_expression(ctx, v, false);
     }
+    // analyzer.cpp:2852-2860 — count the assignment for a local-variable assignee BEFORE
+    // reducing the assignee, so the assignee's own read (`x` in `x = 1`) doesn't fire
+    // UNASSIGNED_VARIABLE for the very assignment that initializes it.
+    if let Some(a) = assign.assignee {
+        if let NodeKind::Identifier(i) = &ctx.node(a).kind {
+            let name = i.name.clone();
+            if let Some(local) = lookup_local(ctx, &name) {
+                if local.kind == gd_syntax::ast::LocalKind::Variable {
+                    *ctx.assignments.entry(local.source).or_insert(0) += 1;
+                }
+            }
+        }
+    }
     if let Some(a) = assign.assignee {
         reduce_expression(ctx, a, false);
     }
@@ -2745,7 +2871,9 @@ fn reduce_assignment(ctx: &mut AnalysisContext, id: NodeId) {
     if !assignee_is_variant
         && compatible
         && assign.operation == gd_syntax::ast::AssignOp::None
-        && !is_type_compatible(ctx, &assignee_type, &op_type, assignee_is_hard)
+        // Upstream's forward check passes `p_assignment->assigned_value` (analyzer.cpp:3009) —
+        // assigning a plain int to an enum-typed variable warns INT_AS_ENUM_WITHOUT_CAST.
+        && !is_type_compatible_with_source(ctx, &assignee_type, &op_type, assignee_is_hard, value_id)
         && assignee_is_hard
         && !is_type_compatible(ctx, &op_type, &assignee_type, false)
     {
@@ -2776,7 +2904,62 @@ fn reduce_assignment(ctx: &mut AnalysisContext, id: NodeId) {
         );
     }
 
+    // analyzer.cpp:3043-3050 (`DEBUG_ENABLED`) — UNASSIGNED_VARIABLE_OP_ASSIGN: a compound
+    // assignment to a local variable whose count is exactly the one this assignment added at
+    // the head of this function ("Use == 1 here because this assignment was already counted
+    // in the beginning of the function").
+    if assign.operation != gd_syntax::ast::AssignOp::None {
+        if let NodeKind::Identifier(i) = &ctx.node(assignee_id).kind {
+            let name = i.name.clone();
+            if let Some(local) = lookup_local(ctx, &name) {
+                if local.kind == gd_syntax::ast::LocalKind::Variable
+                    && assignment_count(ctx, local.source) == 1
+                {
+                    let op = assign_op_variant_name(assign.operation);
+                    ctx.push_warning(
+                        crate::warnings::WarningCode::UnassignedVariableOpAssign,
+                        &[name, op.to_owned()],
+                        id,
+                    );
+                }
+            }
+        }
+    }
+
     ctx.set_type(id, op_type);
+}
+
+/// Godot's `VariableNode::assignments` total for a declaration: the lazily-folded initializer
+/// contribution (gdscript_parser.cpp:1261 — `variable->assignments++` when an initializer is
+/// parsed) plus the per-assignment increments `reduce_assignment` recorded on
+/// [`AnalysisContext::assignments`].
+pub(crate) fn assignment_count(ctx: &AnalysisContext, decl_id: NodeId) -> u32 {
+    let initializer_bump = match &ctx.node(decl_id).kind {
+        NodeKind::Variable(v) => u32::from(v.initializer.is_some()),
+        _ => 0,
+    };
+    initializer_bump + ctx.assignments.get(&decl_id).copied().unwrap_or(0)
+}
+
+/// `Variant::get_operator_name` for the compound-assignment operators
+/// (core/variant/variant_op.cpp's name table) — the `{1}` symbol in
+/// UNASSIGNED_VARIABLE_OP_ASSIGN's message, which appends its own `=`.
+fn assign_op_variant_name(op: gd_syntax::ast::AssignOp) -> &'static str {
+    use gd_syntax::ast::AssignOp::*;
+    match op {
+        None => "",
+        Addition => "+",
+        Subtraction => "-",
+        Multiplication => "*",
+        Division => "/",
+        Modulo => "%",
+        Power => "**",
+        BitShiftLeft => "<<",
+        BitShiftRight => ">>",
+        BitAnd => "&",
+        BitOr => "|",
+        BitXor => "^",
+    }
 }
 
 /// Whether a builtin type is "shared" (analyzer.cpp:2928 wraps `Variant::is_type_shared`). Shared
@@ -2841,7 +3024,9 @@ pub(crate) fn update_const_expression_builtin_type(
     // Callers in this slice pass `is_cast=false` (the reduce_cast path uses its own check), so we
     // don't need to wire it here; explicit casts go through `reduce_cast`'s validity matrix.
 
-    if !is_type_compatible(ctx, p_type, &expression_type, true) {
+    // Upstream's call passes `p_expression` (analyzer.cpp:2729), so an int constant flowing
+    // into an enum-typed slot warns INT_AS_ENUM_WITHOUT_CAST through the wrapper.
+    if !is_type_compatible_with_source(ctx, p_type, &expression_type, true, expr_id) {
         ctx.push_error(
             format!(r#"Cannot {p_usage} a value of type "{expression_type}" as "{p_type}"."#),
             expr_id,
@@ -2849,19 +3034,22 @@ pub(crate) fn update_const_expression_builtin_type(
         return;
     }
 
-    // analyzer.cpp:2749-2751 — when the source value's `builtin_type` already matches the
-    // target's `builtin_type`, the cast is a no-op narrowing: just stamp the target type onto
-    // the expression and return. This preserves the target's `ANNOTATED_*` source bits and
-    // `container_element_types`, which downstream `is_type_compatible_strict_collections`
-    // checks rely on (`update_array_literal_element_type` calls this after a typed-array
-    // literal narrowing to lift each element's datatype to the parameterized type).
-    if expression_type.kind == DtKind::Builtin
-        && p_type.kind == DtKind::Builtin
-        && expression_type.builtin_type == p_type.builtin_type
-    {
+    // analyzer.cpp:2747-2751 — when the source VALUE's `builtin_type` already matches the
+    // target's, the conversion is a no-op narrowing: stamp the target type onto the expression
+    // and return. The comparison is on bare `builtin_type` with no kind gate, exactly as
+    // upstream — that's what re-types an int constant flowing into an enum slot (enums carry
+    // `builtin_type = INT`) so the caller's later compatibility check sees an enum source and
+    // INT_AS_ENUM_WITHOUT_CAST fires exactly once, from this function's wrapper call.
+    let value_type = ctx
+        .folds
+        .get(expr_id)
+        .map(type_from_variant)
+        .unwrap_or_else(|| expression_type.clone());
+    if value_type.builtin_type == p_type.builtin_type {
         ctx.set_type(expr_id, p_type.clone());
     }
 
+    // (When the builtin types differ:)
     // analyzer.cpp:2754-2770 — `Variant::construct(p_type.builtin_type, value)` runtime narrowing
     // for values whose builtin_type doesn't already match. Used for things like
     // `const X: int = 1.5` where the literal folds to 1.5 but the target is `int` → Godot
@@ -2912,7 +3100,9 @@ pub(crate) fn update_array_literal_element_type(
         if actual.has_no_type() || actual.is_variant() || !actual.is_hard_type() {
             continue; // soft / Variant → mark_node_unsafe (WP-F warning), not an error.
         }
-        if !is_type_compatible(ctx, &expected, &actual, true)
+        // Upstream's forward check passes `p_array` (analyzer.cpp:2786) — the warning wrapper
+        // anchors at the array literal, not the element; the reverse check is node-less.
+        if !is_type_compatible_with_source(ctx, &expected, &actual, true, array_id)
             && !is_type_compatible(ctx, &actual, &expected, false)
         {
             // analyzer.cpp:2794 — `Cannot have an element of type "X" in an array of type
@@ -2970,10 +3160,11 @@ pub(crate) fn update_dictionary_literal_element_type(
             let actual = ctx.get_type(k).clone();
             // analyzer.cpp:2818 — Godot's `has_no_type || is_variant || !is_hard_type` guard
             // de-Morgan'd to a positive `is_hard_type && !is_variant && !has_no_type`.
+            // Upstream's forward check passes `p_dictionary` (analyzer.cpp:2817).
             if actual.is_hard_type()
                 && !actual.is_variant()
                 && !actual.has_no_type()
-                && !is_type_compatible(ctx, &expected_key, &actual, true)
+                && !is_type_compatible_with_source(ctx, &expected_key, &actual, true, dict_id)
                 && !is_type_compatible(ctx, &actual, &expected_key, false)
             {
                 ctx.push_error(
@@ -2990,10 +3181,11 @@ pub(crate) fn update_dictionary_literal_element_type(
                 update_const_expression_builtin_type(ctx, v, &expected_value, "include");
             }
             let actual = ctx.get_type(v).clone();
+            // Upstream's forward check passes `p_dictionary` (analyzer.cpp:2833).
             if actual.is_hard_type()
                 && !actual.is_variant()
                 && !actual.has_no_type()
-                && !is_type_compatible(ctx, &expected_value, &actual, true)
+                && !is_type_compatible_with_source(ctx, &expected_value, &actual, true, dict_id)
                 && !is_type_compatible(ctx, &actual, &expected_value, false)
             {
                 ctx.push_error(
@@ -3673,6 +3865,35 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     id,
                 );
             }
+        }
+
+        // RETURN_VALUE_DISCARDED (analyzer.cpp:3684-3689, ignore-by-default): a call used as a
+        // statement whose resolved return type isn't void. Builtin constructors and utility
+        // functions early-return above this section and never warn — upstream's own FIXME.
+        // `super._init()` is exempt, as upstream.
+        if let Some(rt) = &return_type {
+            if is_root
+                && rt.kind != DtKind::Unresolved
+                && rt.builtin_type != VariantType::Nil
+                && !(call.is_super && function_name == "_init")
+            {
+                ctx.push_warning(
+                    crate::warnings::WarningCode::ReturnValueDiscarded,
+                    std::slice::from_ref(&function_name),
+                    id,
+                );
+            }
+        }
+
+        // STATIC_CALLED_ON_INSTANCE (analyzer.cpp:3691-3694): a static method reached through
+        // an instance receiver rather than the class name.
+        if sig.is_static && !is_constructor && !base_type.is_meta_type && !is_self {
+            let caller_type = class_identifier_name_or_default(ctx, &base_type);
+            ctx.push_warning(
+                crate::warnings::WarningCode::StaticCalledOnInstance,
+                &[function_name.clone(), caller_type],
+                id,
+            );
         }
 
         // analyzer.cpp:3622-3636 — typed-collection arg narrowing. For each array/dictionary
@@ -4490,11 +4711,16 @@ fn reduce_subscript_attribute(
                 ctx.folds.set(sub_id, folded);
             }
         } else if !base_type.is_meta_type || !base_type.is_constant {
-            // analyzer.cpp:4864-4873 — the UNSAFE_PROPERTY_ACCESS path. A property miss on a
-            // non-meta or non-constant base ⇒ the lookup is dynamic, not an error; Godot
-            // marks the node unsafe + emits the UNSAFE_PROPERTY_ACCESS warning (WP-F). We
-            // accept the access silently here so legitimate `self.dynamic` / `node.x` patterns
-            // don't false-positive `Cannot find member`.
+            // analyzer.cpp:4878-4886 — the UNSAFE_PROPERTY_ACCESS path. A property miss on a
+            // non-meta or non-constant base ⇒ the lookup is dynamic, not an error; the access
+            // types as Variant. The warning itself stays DEFERRED, deliberately: it is a
+            // negative claim ("not present on the inferred type"), and gdls's attribute lookup
+            // is not yet complete enough to make it truthfully — e.g. native *signals* through
+            // an attribute (`await self.changed`, corpus await_with_signals_no_warning.gd) and
+            // some native property shapes (`sprite.axis`, global_builtin_and_native_enums.gd)
+            // miss here while real Godot resolves them. Emitting would false-positive — and
+            // under the strict profile this code is promoted to an ERROR. Revisit when the
+            // native attribute walk covers signals + the full property surface.
             valid = base_type.kind != DtKind::Builtin;
             result_type = DataType::variant();
         }

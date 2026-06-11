@@ -103,10 +103,16 @@ parity gaps vs Godot's own LSP (hover member signatures, `definition`/`documentL
 `implementation` overrides, autoload-singleton typing) and added a persistent, multi-instance-safe
 warm-start index cache (a warm relaunch is **>5×** faster than a cold scan). Verified by capability
 walks against a real Godot 4.6.3 OSS project and a Windows-native 2,338-script production project.
-**v1.0.1** is the current release: it fixes the cross-file false-positive families a full-project
-diagnostics sweep exposed right after v1.0.0 (cross-file inheritance typing, builtin-constant
-folds, packed-array iteration, const chains), ships cross-file member navigation, the
-`extension_api.json` auto-dump, and the NTFS startup fix.
+**v1.0.3** is the current release — the warning-completeness release: the full Godot warning set
+now actually fires (19 previously-declared-but-silent codes ported function-for-function, from
+`UNREACHABLE_CODE` and `STANDALONE_EXPRESSION` to `UNASSIGNED_VARIABLE` and `INTEGER_DIVISION`),
+`@warning_ignore` suppresses across multi-line targets exactly like Godot's annotation→target
+spans, and a real-project walk of every exposed capability fixed cross-file `definition` on
+dotted method calls, cross-file `incomingCalls`, call-site `prepareCallHierarchy`, and the last
+`<Script #N>` placeholder leak. Before it, **v1.0.2** made the first run robust (background
+`extension_api.json` auto-dump adopted mid-session, embedded stock 4.6.3 fallback with
+provenance-gated negative diagnostics) and **v1.0.1** fixed the cross-file false-positive
+families a full-project diagnostics sweep exposed right after v1.0.0.
 See [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md) for the M6 scope and
 [`CHANGELOG.md`](CHANGELOG.md) for the milestone history.
 

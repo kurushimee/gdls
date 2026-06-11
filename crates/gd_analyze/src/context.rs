@@ -236,6 +236,14 @@ pub struct AnalysisContext<'a> {
     /// scope-tracked lookups; gdls's AST keeps `SuiteNode::locals` but not the back-pointer, so
     /// we walk this stack inside `reduce_identifier` instead.
     pub suite_stack: Vec<NodeId>,
+    /// Godot's per-variable `assignments` counter, keyed by the declaring node. Upstream keeps
+    /// it on `VariableNode` (debug-only): the declaration initializer contributes one
+    /// (gdscript_parser.cpp:1261 — folded in lazily by `crate::reducer::assignment_count`) and
+    /// `reduce_assignment` increments for local-variable assignees before reducing the assignee
+    /// (gdscript_analyzer.cpp:2852-2860). Read by the UNASSIGNED_VARIABLE /
+    /// UNASSIGNED_VARIABLE_OP_ASSIGN checks; traversal-order evolution is the point — a read
+    /// before the first assignment warns even if a later statement assigns.
+    pub assignments: FxHashMap<NodeId, u32>,
 
     /// Per-member cross-file initializer xrefs, recorded by [`Self::record_member_xref`] from
     /// the reducer's Script-meta attribute-access path. Moved into
@@ -288,6 +296,10 @@ pub struct AnalysisContext<'a> {
     pub(crate) script_chains: std::cell::RefCell<
         FxHashMap<crate::data_type::ScriptRef, std::rc::Rc<crate::script_chain::ResolvedChain>>,
     >,
+    /// Memoized decl-name-slot identifier set (see [`Self::decl_ident_ids`]). A pure function of
+    /// the immutable tree, built once on first use instead of once per name-set sweep call.
+    /// `OnceCell` because the sweep helpers hold `&AnalysisContext`.
+    decl_ident_ids: std::cell::OnceCell<FxHashSet<NodeId>>,
     /// M5 WP-O3 / O4: once tripped, every subsequent governor / cancellation checkpoint
     /// short-circuits (the synthetic error has already been pushed; we don't want to spam the
     /// same diagnostic for every remaining call). Toggle is one-way per analyze pass.
@@ -332,6 +344,7 @@ impl<'a> AnalysisContext<'a> {
             resolved_functions: FxHashSet::default(),
             abstract_nodes: FxHashSet::default(),
             suite_stack: Vec::new(),
+            assignments: FxHashMap::default(),
             warning_ignore_regions,
             warning_ignored_lines,
             member_xrefs: FxHashMap::default(),
@@ -345,9 +358,22 @@ impl<'a> AnalysisContext<'a> {
             iter_limit: 0,
             cancellation: None,
             script_chains: std::cell::RefCell::new(FxHashMap::default()),
+            decl_ident_ids: std::cell::OnceCell::new(),
             bailed: false,
             sink: DiagnosticSink::new(),
         }
+    }
+
+    /// Identifier NodeIds that are the *name slot* of a declaration (Variable / Constant /
+    /// Signal / Function / Parameter / Enum / EnumValue / Class) — declaration sites, not
+    /// references. Godot's `usages` counter only increments on true references
+    /// (`reduce_identifier`), never on the decl identifier itself, so the name-set sweeps
+    /// (`referenced_names`, `emit_unused_parameter_warnings`, `warn_unused_local`) all exclude
+    /// these ids. Built lazily with one O(nodes) walk on first access and shared by every
+    /// sweep in the same analysis pass.
+    pub fn decl_ident_ids(&self) -> &FxHashSet<NodeId> {
+        self.decl_ident_ids
+            .get_or_init(|| build_decl_ident_ids(self.tree))
     }
 
     /// M5 WP-O3 / O4: per-node governor + cancellation checkpoint. Call once at the entry of
@@ -473,55 +499,33 @@ impl<'a> AnalysisContext<'a> {
 
     /// Godot's `parser->push_warning(p_source, code, p_symbols)` (gdscript_parser.cpp:257). The
     /// effective level comes from the [`WarnPolicy`] precedence chain; `Ignore` drops silently,
-    /// `Warn` / `Error` produce a [`Diagnostic`] anchored at `at_node`'s span. Per-node
-    /// `@warning_ignore("CODE_NAME")` annotations on the target node suppress the warning the
-    /// same way Godot's `apply_pending_warnings` consults `warning_ignored_lines` for that
-    /// node's `start_line` (gdscript_parser.cpp:281).
-    ///
-    /// For warnings anchored at a sub-node (e.g. the identifier inside a `VariableNode`), use
-    /// [`Self::push_warning_for`] to keep the annotation-bearing parent node distinct from the
-    /// diagnostic anchor.
+    /// `Warn` / `Error` produce a [`Diagnostic`] anchored at `at_node`'s span (with the anchor's
+    /// start line stamped for `finish`'s by-line warning ordering).
     pub fn push_warning(
         &mut self,
         code: crate::warnings::WarningCode,
         symbols: &[String],
         at_node: gd_syntax::ast::NodeId,
     ) {
-        self.push_warning_for(code, symbols, at_node, at_node);
-    }
-
-    /// Like [`Self::push_warning`] but takes a separate `ignore_context` node whose annotations
-    /// the `@warning_ignore` filter consults. Mirrors Godot's `push_warning(member.variable,
-    /// ...)` calls where the anchor is `member.variable->identifier` for line fidelity but the
-    /// `@warning_ignore` lookup walks `member.variable->annotations` (gdscript_analyzer.cpp:1446).
-    pub fn push_warning_for(
-        &mut self,
-        code: crate::warnings::WarningCode,
-        symbols: &[String],
-        at_node: gd_syntax::ast::NodeId,
-        ignore_context: gd_syntax::ast::NodeId,
-    ) {
-        if self.is_warning_ignored_at(code, at_node)
-            || self.is_warning_ignored_at(code, ignore_context)
-        {
-            return;
-        }
-        let span: ByteSpan = self.tree.get(at_node).span;
-        if self.is_warning_ignored_in_region(code, span.start) {
-            return;
-        }
-        // Per-line `@warning_ignore` ignored-set (Godot's `warning_ignored_lines[code]`). This
-        // catches the case where an `@warning_ignore("CODE")` hangs on a parent node (e.g. a
-        // print statement) whose nested expression is what the warning anchors to. Godot's
-        // filter uses `pw.source->start_line`; gdls compares the anchor node's 1-based start line.
+        // Suppression mirrors Godot's `apply_pending_warnings` (gdscript_parser.cpp:269-281):
+        // drop when the anchor's 1-based start line is in `warning_ignored_lines[code]` — the
+        // per-line set [`build_warning_ignored_lines`] expands from each `@warning_ignore`'s
+        // annotation-to-target-header span — or when the anchor falls inside a
+        // `@warning_ignore_start`/`_restore` region. There is no node-attached annotation walk:
+        // upstream filters purely by line, and the spans already cover every line of the
+        // annotated target's header (continuation lines included).
         let line = self.tree.get(at_node).loc.start.line;
         if let Some(lines) = self.warning_ignored_lines.get(&code) {
             if lines.contains(&line) {
                 return;
             }
         }
+        let span: ByteSpan = self.tree.get(at_node).span;
+        if self.is_warning_ignored_in_region(code, span.start) {
+            return;
+        }
         let level = self.policy.effective_level(code);
-        self.sink.push_warning(code, level, symbols, span);
+        self.sink.push_warning(code, level, symbols, span, line);
     }
 
     /// `True` when the diagnostic byte `pos` falls inside any `@warning_ignore_start(code)` /
@@ -533,44 +537,6 @@ impl<'a> AnalysisContext<'a> {
             return false;
         };
         regions.iter().any(|&(s, e)| pos >= s && pos < e)
-    }
-
-    /// `True` when `node`'s own `@warning_ignore("CODE_NAME")` annotation list mentions `code`'s
-    /// Godot name (case-insensitive — Godot lowercases the arg before lookup via
-    /// `code_from_name`, which we mirror here).
-    fn is_warning_ignored_at(
-        &self,
-        code: crate::warnings::WarningCode,
-        node: gd_syntax::ast::NodeId,
-    ) -> bool {
-        use gd_syntax::ast::NodeKind;
-        use gd_syntax::token::Literal;
-        let want = crate::warnings::name_from_code(code);
-        for &ann_id in &self.tree.get(node).annotations {
-            let ann = match &self.tree.get(ann_id).kind {
-                NodeKind::Annotation(a) => a,
-                _ => continue,
-            };
-            if ann.name != "@warning_ignore" {
-                continue;
-            }
-            for &arg in &ann.arguments {
-                if let NodeKind::Literal(lit) = &self.tree.get(arg).kind {
-                    let s = match &lit.value {
-                        Literal::String(s) | Literal::StringName(s) | Literal::NodePath(s) => {
-                            Some(s.as_str())
-                        }
-                        _ => None,
-                    };
-                    if let Some(s) = s {
-                        if s.eq_ignore_ascii_case(want) {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        false
     }
 
     pub fn has_errors(&self) -> bool {
@@ -639,6 +605,41 @@ impl<'a> AnalysisContext<'a> {
 /// `[region.start, region.end)`. The start byte for a `_start` annotation is **after** the
 /// annotation's own span, so the annotation line itself is NOT in the region (matching the
 /// Godot's `start_line` semantics which fires from the next line on).
+/// One O(nodes) walk collecting every declaration's name-slot identifier id — the backing
+/// builder for [`AnalysisContext::decl_ident_ids`]. The kind set is the union of what each
+/// name-set sweep excludes: Enum / EnumValue / Class entries are class-body-only declarations
+/// (their identifiers can never fall inside a function-body sweep window), so including them
+/// is a no-op for `emit_unused_parameter_warnings` / `warn_unused_local` while
+/// `referenced_names` needs them.
+fn build_decl_ident_ids(tree: &ParseTree) -> FxHashSet<NodeId> {
+    use gd_syntax::ast::NodeKind;
+
+    let mut out = FxHashSet::default();
+    for id in tree.iter_ids() {
+        let name_slot = match &tree.get(id).kind {
+            NodeKind::Variable(v) => v.identifier,
+            NodeKind::Constant(c) => c.identifier,
+            NodeKind::Signal(s) => s.identifier,
+            NodeKind::Function(f) => f.identifier,
+            NodeKind::Parameter(p) => p.identifier,
+            NodeKind::Class(c) => c.identifier,
+            NodeKind::Enum(e) => {
+                for v in &e.values {
+                    if let Some(i) = v.identifier {
+                        out.insert(i);
+                    }
+                }
+                e.identifier
+            }
+            _ => None,
+        };
+        if let Some(i) = name_slot {
+            out.insert(i);
+        }
+    }
+    out
+}
+
 fn build_warning_ignore_regions(
     tree: &ParseTree,
 ) -> FxHashMap<crate::warnings::WarningCode, Vec<(usize, usize)>> {
@@ -700,11 +701,15 @@ fn build_warning_ignore_regions(
     regions
 }
 
-/// Build the per-line ignored-warnings set — Godot's `warning_ignored_lines[code]` table at
-/// gdscript_parser.cpp:281. Walks every node in the tree and, for each `@warning_ignore("CODE")`
-/// annotation in `node.annotations`, records `node.loc.start.line` (1-based) under the named
-/// code. Used by `push_warning_for` to suppress warnings whose anchor sits on a line that any
-/// node's `@warning_ignore` lists — same effect as Godot's annotated-line dedup.
+/// Build the per-line ignored-warnings set — Godot's `warning_ignored_lines[code]` table, filled
+/// by `GDScriptParser::warning_ignore_annotation` (gdscript_parser.cpp:5078-5151). For each
+/// `@warning_ignore("CODE")` in a node's `annotations`, every 1-based line from the annotation's
+/// start line through a target-kind-specific end line is recorded under the code. The end line is
+/// the target's *header* end — initializer / list / condition / test end, function signature end,
+/// match-branch patterns end — NOT the body end, so a multi-line declaration is covered through
+/// its last header line while body lines stay live. Consumed by [`AnalysisContext::push_warning`],
+/// which drops a warning whose anchor start line is in the set (Godot's `apply_pending_warnings`
+/// line filter, gdscript_parser.cpp:269-281).
 fn build_warning_ignored_lines(
     tree: &ParseTree,
 ) -> FxHashMap<crate::warnings::WarningCode, rustc_hash::FxHashSet<u32>> {
@@ -720,7 +725,6 @@ fn build_warning_ignored_lines(
         if owner.annotations.is_empty() {
             continue;
         }
-        let owner_line = owner.loc.start.line;
         for &ann_id in &owner.annotations {
             let ann = match &tree.get(ann_id).kind {
                 NodeKind::Annotation(a) => a,
@@ -729,6 +733,57 @@ fn build_warning_ignored_lines(
             if ann.name != "@warning_ignore" {
                 continue;
             }
+            // Per-target-kind span (gdscript_parser.cpp:5086-5141): annotation start line
+            // through the target's header end.
+            let mut start_line = tree.get(ann_id).loc.start.line;
+            let mut end_line = owner.loc.end.line;
+            // `SIMPLE_CASE`: the named header field's end line, or the target's own start line
+            // when the field is absent.
+            let header_end = |field: Option<gd_syntax::ast::NodeId>| match field {
+                Some(f) => tree.get(f).loc.end.line,
+                None => owner.loc.start.line,
+            };
+            match &owner.kind {
+                // Can contain properties (set/get).
+                NodeKind::Variable(v) => end_line = header_end(v.initializer),
+                // Contain bodies.
+                NodeKind::For(f) => end_line = header_end(f.list),
+                NodeKind::If(i) => end_line = header_end(i.condition),
+                NodeKind::Match(m) => end_line = header_end(m.test),
+                NodeKind::While(w) => end_line = header_end(w.condition),
+                NodeKind::Class(_) => {
+                    // The class *header*, widened over all of its annotations (so a
+                    // `@warning_ignore` stacked under `@tool`/`@icon` covers the whole block).
+                    end_line = owner.loc.start.line;
+                    for &other in &owner.annotations {
+                        let other_loc = tree.get(other).loc;
+                        start_line = start_line.min(other_loc.start.line);
+                        end_line = end_line.max(other_loc.end.line);
+                    }
+                }
+                NodeKind::Function(f) => {
+                    // Signature end: max over parameter (+ default initializer) end lines.
+                    // Upstream walks only `parameters` — a rest parameter is held outside that
+                    // list and does not extend the span; mirrored here.
+                    end_line = owner.loc.start.line;
+                    for &param in &f.parameters {
+                        end_line = end_line.max(tree.get(param).loc.end.line);
+                        if let NodeKind::Parameter(p) = &tree.get(param).kind {
+                            if let Some(init) = p.initializer {
+                                end_line = end_line.max(tree.get(init).loc.end.line);
+                            }
+                        }
+                    }
+                }
+                NodeKind::MatchBranch(b) => {
+                    end_line = owner.loc.start.line;
+                    for &pat in &b.patterns {
+                        end_line = end_line.max(tree.get(pat).loc.end.line);
+                    }
+                }
+                _ => {}
+            }
+            let end_line = end_line.max(start_line); // Prevent infinite loop.
             for &arg in &ann.arguments {
                 let NodeKind::Literal(lit) = &tree.get(arg).kind else {
                     continue;
@@ -738,7 +793,10 @@ fn build_warning_ignored_lines(
                     _ => continue,
                 };
                 if let Some(code) = code_from_name(&s.to_ascii_uppercase()) {
-                    out.entry(code).or_default().insert(owner_line);
+                    let lines = out.entry(code).or_default();
+                    for line in start_line..=end_line {
+                        lines.insert(line);
+                    }
                 }
             }
         }
@@ -820,5 +878,153 @@ mod checkpoint_tests {
             "the cancel must be honoured at the next 256-gate"
         );
         assert!(ctx.bailed);
+    }
+}
+
+#[cfg(test)]
+mod warning_ignore_span_tests {
+    //! Pins the `@warning_ignore` span model ported from Godot's `warning_ignore_annotation`
+    //! (gdscript_parser.cpp:5078-5151): the ignored-lines table runs from the annotation's start
+    //! line through the target's *header* end — multi-line headers covered, bodies not.
+
+    use super::*;
+    use crate::cross_file::NoCrossFile;
+    use crate::warn_policy::StrictSettings;
+    use crate::warnings::WarningCode;
+    use gd_project::WarningConfig;
+
+    /// The recorded ignore-lines for `code` after parsing `src`, sorted.
+    fn span_lines(src: &str, code: WarningCode) -> Vec<u32> {
+        let tree = gd_syntax::parse(src).tree;
+        let map = build_warning_ignored_lines(&tree);
+        let mut lines: Vec<u32> = map
+            .get(&code)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        lines.sort_unstable();
+        lines
+    }
+
+    fn mini_native() -> NativeDb {
+        NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Object"},
+                    {"name": "Node", "inherits": "Object"}
+                ]
+            }"#,
+        )
+        .expect("valid mini dump")
+    }
+
+    /// Warning codes of all warning diagnostics `src` analyzes to.
+    fn warning_codes(src: &str) -> Vec<WarningCode> {
+        let tree = gd_syntax::parse(src).tree;
+        let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+        let result = crate::analyze(
+            &tree,
+            Some(FileId::new(1)),
+            "t.gd",
+            &mini_native(),
+            &NoCrossFile,
+            &policy,
+        );
+        result
+            .diagnostics
+            .iter()
+            .filter_map(|d| d.warning_code)
+            .collect()
+    }
+
+    /// FUNCTION target: the span runs from the annotation through the signature end (max over
+    /// parameter end lines) — the multi-line-signature shape from issue #28 — and NOT the body.
+    #[test]
+    fn function_span_covers_multi_line_signature_not_body() {
+        let src = "extends Node\n\nvar health = 3\n\n\n@warning_ignore(\"shadowed_variable\")\nfunc hurt(\n\t\thealth: int) -> void:\n\tprint(health)\n";
+        assert_eq!(
+            span_lines(src, WarningCode::ShadowedVariable),
+            vec![6, 7, 8],
+            "annotation line 6 through signature end 8; body line 9 stays live"
+        );
+    }
+
+    /// VARIABLE target with a multi-line initializer: span reaches the initializer's end line.
+    #[test]
+    fn variable_span_covers_multi_line_initializer() {
+        let src = "extends Node\n\n@warning_ignore(\"unused_private_class_variable\")\nvar _x = [\n\t1,\n\t2,\n]\n";
+        assert_eq!(
+            span_lines(src, WarningCode::UnusedPrivateClassVariable),
+            vec![3, 4, 5, 6, 7],
+        );
+    }
+
+    /// VARIABLE target without an initializer: span ends at the declaration's own start line.
+    #[test]
+    fn variable_span_without_initializer_ends_at_declaration() {
+        let src = "extends Node\n@warning_ignore(\"unused_private_class_variable\")\nvar _x: int\n";
+        assert_eq!(
+            span_lines(src, WarningCode::UnusedPrivateClassVariable),
+            vec![2, 3],
+        );
+    }
+
+    /// MATCH_BRANCH target: span covers the (multi-line) patterns, not the branch body.
+    #[test]
+    fn match_branch_span_covers_patterns_not_body() {
+        let src = "extends Node\n\n\nfunc f(v: Array) -> void:\n\tmatch v:\n\t\t@warning_ignore(\"unused_variable\")\n\t\t[1,\n\t\t\t\t2]:\n\t\t\tvar x = 1\n\t\t_:\n\t\t\tpass\n";
+        assert_eq!(
+            span_lines(src, WarningCode::UnusedVariable),
+            vec![6, 7, 8],
+            "patterns end line 8; branch body line 9 stays live"
+        );
+    }
+
+    /// IF target: span covers the (multi-line) condition, not the body.
+    #[test]
+    fn if_span_covers_condition_not_body() {
+        let src = "extends Node\n\n\nfunc f(a: int, b: int) -> void:\n\t@warning_ignore(\"standalone_expression\")\n\tif (a >\n\t\t\tb):\n\t\tpass\n";
+        assert_eq!(
+            span_lines(src, WarningCode::StandaloneExpression),
+            vec![5, 6, 7],
+        );
+    }
+
+    /// CLASS target: the span is the annotation block plus the class *header* — members are NOT
+    /// blanket-covered (Godot's `@warning_ignore_start` regions exist for that).
+    #[test]
+    fn class_span_covers_header_only() {
+        let src =
+            "extends Node\n\n\n@warning_ignore(\"unused_signal\")\nclass Inner:\n\tsignal _alarm\n";
+        assert_eq!(span_lines(src, WarningCode::UnusedSignal), vec![4, 5]);
+    }
+
+    /// End-to-end issue #28 repro: a parameter on a continuation line of an annotated function's
+    /// signature must be suppressed (was a false positive vs Godot 4.6.3).
+    #[test]
+    fn multi_line_signature_shadow_is_suppressed() {
+        let src = "extends Node\n\nvar health = 3\n\n\n@warning_ignore(\"shadowed_variable\")\nfunc hurt(\n\t\thealth: int) -> void:\n\thealth += 1\n";
+        assert!(
+            !warning_codes(src).contains(&WarningCode::ShadowedVariable),
+            "the ignore span covers the continuation line of the signature"
+        );
+    }
+
+    /// End-to-end single-line shape keeps suppressing (regression guard for the span rewrite).
+    #[test]
+    fn single_line_signature_shadow_is_suppressed() {
+        let src = "extends Node\n\nvar health = 3\n\n\n@warning_ignore(\"shadowed_variable\")\nfunc hurt(health: int) -> void:\n\thealth += 1\n";
+        assert!(!warning_codes(src).contains(&WarningCode::ShadowedVariable));
+    }
+
+    /// End-to-end over-suppression guard: an annotation on the function must NOT swallow a shadow
+    /// in the body — the span stops at the signature, exactly like upstream.
+    #[test]
+    fn function_annotation_does_not_suppress_body_shadow() {
+        let src = "extends Node\n\nvar health = 3\n\n\n@warning_ignore(\"shadowed_variable\")\nfunc hurt() -> void:\n\tvar health := 4\n\thealth += 1\n";
+        assert!(
+            warning_codes(src).contains(&WarningCode::ShadowedVariable),
+            "body lines are outside the ignore span and must still warn"
+        );
     }
 }

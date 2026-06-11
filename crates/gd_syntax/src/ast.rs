@@ -579,6 +579,12 @@ pub struct ParseTree {
     /// `resolve_match_pattern`'s subscript-Index arm to mirror Godot's line 7 on
     /// `match_with_subscript.gd`.
     pub eof_line: u32,
+    /// `true` when the token stream was already at EOF after the leading newline/error skip —
+    /// i.e. the source held no meaningful tokens (empty, whitespace-only, or comment-only).
+    /// This is the exact condition Godot's `parse()` checks for the `EMPTY_FILE` warning
+    /// (gdscript_parser.cpp:482-489); the warning itself is emitted by `gd_analyze`, which owns
+    /// the warning set — this crate stays engine-free and only records the signal.
+    pub starts_at_eof: bool,
 }
 
 impl ParseTree {

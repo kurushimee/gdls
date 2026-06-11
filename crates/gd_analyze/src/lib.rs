@@ -143,6 +143,14 @@ pub fn analyze_with_options<'a>(
     let mut ctx = AnalysisContext::new(tree, native, xfile, file, script_path, policy);
     ctx.iter_limit = options.iter_limit.unwrap_or(DEFAULT_ITER_LIMIT);
     ctx.cancellation = options.cancellation;
+    // EMPTY_FILE (gdscript_parser.cpp:482-489): Godot queues it from `parse()` when the token
+    // stream is already at EOF after the leading newline skip — before any analysis, so it is
+    // the first warning. `gd_syntax` records the signal; the analyzer owns the warning set.
+    if tree.starts_at_eof {
+        if let Some(root) = tree.root_id() {
+            ctx.push_warning(warnings::WarningCode::EmptyFile, &[], root);
+        }
+    }
     if resolver::resolve_inheritance(&mut ctx).is_ok() {
         resolver::resolve_interface(&mut ctx);
         // analyzer.cpp:6587 — the third top-level pass. `resolve_body` walks every function body

@@ -158,9 +158,7 @@ fn cancel_for_unknown_id_does_not_panic_or_block_subsequent_requests() {
         ))
         .unwrap();
 
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected a documentSymbol response after the cancel");
-    };
+    let resp = recv_response(&client);
     assert_eq!(resp.id, RequestId::from(2));
     assert!(
         resp.error.is_none(),

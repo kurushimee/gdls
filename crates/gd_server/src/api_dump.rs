@@ -441,9 +441,23 @@ fn run_dump_with_timeout(
         cmd.creation_flags(0x0800_0000);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to spawn {binary}: {e}"))?;
+    // ETXTBSY retry: exec transiently fails with "Text file busy" while the binary is open
+    // for write anywhere — a Godot build mid-link/mid-copy on the user's side, or another
+    // thread's fork briefly holding a just-written file's fd until its own exec (CLOEXEC
+    // closes at exec, not at fork). The condition clears in milliseconds; retry briefly
+    // before treating it as fatal.
+    let mut child = loop {
+        match cmd.spawn() {
+            Ok(child) => break child,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && start.elapsed() < Duration::from_millis(500) =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("failed to spawn {binary}: {e}")),
+        }
+    };
 
     // Drain stdout/stderr CONCURRENTLY (issue #25): a chatty engine boot (warnings scale with
     // project size) can otherwise fill the 64 KB pipe buffer, block the child mid-dump, and
@@ -727,7 +741,8 @@ mod tests {
             let (_dir, root, bin) = fixture(&format!(
                 "cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 5"
             ));
-            assert!(run_dump_with_timeout(&bin, &root, Duration::from_secs(10)).is_ok());
+            run_dump_with_timeout(&bin, &root, Duration::from_secs(10))
+                .expect("artifact present => Ok regardless of exit status");
             assert!(root.join("extension_api.json").as_std_path().exists());
         }
 
@@ -739,7 +754,8 @@ mod tests {
                 "cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nsleep 60"
             ));
             let start = Instant::now();
-            assert!(run_dump_with_timeout(&bin, &root, Duration::from_secs(1)).is_ok());
+            run_dump_with_timeout(&bin, &root, Duration::from_secs(1))
+                .expect("complete artifact at the deadline kill => Ok");
             assert!(
                 start.elapsed() < Duration::from_secs(30),
                 "must kill at the deadline, not wait for the child"
@@ -756,7 +772,8 @@ mod tests {
                 "i=0\nwhile [ $i -lt 16384 ]; do\n  printf 'WARNING: noisy engine boot line with some padding to make it long\\n' >&2\n  i=$((i+1))\ndone\ncat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 0"
             ));
             let start = Instant::now();
-            assert!(run_dump_with_timeout(&bin, &root, Duration::from_secs(20)).is_ok());
+            run_dump_with_timeout(&bin, &root, Duration::from_secs(20))
+                .expect("a chatty child must still dump successfully");
             assert!(
                 start.elapsed() < Duration::from_secs(15),
                 "drain must keep the child flowing (took {:?})",

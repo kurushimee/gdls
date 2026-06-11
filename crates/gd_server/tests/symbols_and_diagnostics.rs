@@ -17,6 +17,16 @@ fn recv(conn: &Connection) -> Message {
         .expect("timed out waiting for a message from the server")
 }
 
+/// `recv`, skipping server-initiated notifications (a `publishDiagnostics` can land later than a
+/// timeout-based drain expected on a slow host) until a Response arrives.
+fn recv_response(conn: &Connection) -> lsp_server::Response {
+    loop {
+        if let Message::Response(resp) = recv(conn) {
+            return resp;
+        }
+    }
+}
+
 fn request(id: i32, method: &str, params: serde_json::Value) -> Message {
     Message::Request(Request {
         id: RequestId::from(id),
@@ -58,9 +68,7 @@ fn boot() -> (Connection, std::thread::JoinHandle<()>) {
             serde_json::to_value(init).unwrap(),
         ))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected an initialize response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "initialize errored: {:?}", resp.error);
     client
         .sender
@@ -166,9 +174,7 @@ fn document_symbol_projects_nested_outline_with_kinds() {
             .unwrap(),
         ))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected a documentSymbol response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none());
     // A1: documentSymbol now returns a single root Class wrapping all members as children.
     // The root is named by the file basename ("syms.gd") since no `class_name` is declared.
@@ -370,9 +376,7 @@ fn document_symbol_on_malformed_buffer_still_returns_recoverable_symbols() {
             .unwrap(),
         ))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected a documentSymbol response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "documentSymbol must still answer on a parse-error tree: {:?}",
@@ -655,9 +659,7 @@ fn boot_with_options(
             serde_json::to_value(init).unwrap(),
         ))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected an initialize response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "initialize errored: {:?}", resp.error);
     client
         .sender

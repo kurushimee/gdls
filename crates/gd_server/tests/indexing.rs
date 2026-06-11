@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{file_uri, options_for, recv, sample_project};
+use common::{file_uri, options_for, recv, recv_response, sample_project};
 use gd_project::Resolution;
 use gd_server::config::InitializationOptions;
 use gd_server::Workspace;
@@ -120,9 +120,7 @@ fn server_indexes_at_startup_and_serves_symbols() {
             params: serde_json::to_value(init).unwrap(),
         }))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected initialize response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "initialize errored: {:?}", resp.error);
 
     client
@@ -170,9 +168,7 @@ fn server_indexes_at_startup_and_serves_symbols() {
             .unwrap(),
         }))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected documentSymbol response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none());
     let body = serde_json::to_string(&resp.result.unwrap()).unwrap();
     assert!(

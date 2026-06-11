@@ -22,7 +22,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    file_uri, notification, poll_until, recv, request, sample_project, shutdown, try_recv,
+    file_uri, notification, poll_until, recv, recv_response, request, sample_project, shutdown,
+    try_recv,
 };
 use lsp_server::{Connection, Message, RequestId};
 use lsp_types::{
@@ -111,9 +112,7 @@ fn references_finds_cross_file_class_usage() {
         .sender
         .send(request(10, "textDocument/references", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected references response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
     let locations: Option<Vec<Location>> = serde_json::from_value(resp.result.unwrap()).unwrap();
     let locations = locations.unwrap_or_default();
@@ -203,9 +202,7 @@ fn references_does_not_double_report_in_file_call_sites() {
         .sender
         .send(request(11, "textDocument/references", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected references response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
     let locations: Vec<Location> =
         serde_json::from_value::<Option<Vec<Location>>>(resp.result.unwrap())
@@ -265,9 +262,7 @@ fn implementation_lists_direct_subclasses() {
         .sender
         .send(request(20, "textDocument/implementation", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected implementation response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "implementation errored: {:?}",
@@ -323,9 +318,7 @@ fn workspace_symbol_finds_class_by_prefix() {
         .sender
         .send(request(30, "workspace/symbol", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected workspace/symbol response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "workspace/symbol errored: {:?}",
@@ -405,9 +398,7 @@ fn call_hierarchy_prepare_and_outgoing_for_attack() {
             prepare_params,
         ))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected prepareCallHierarchy response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "prepare errored: {:?}", resp.error);
     let items: Option<Vec<CallHierarchyItem>> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
@@ -429,9 +420,7 @@ fn call_hierarchy_prepare_and_outgoing_for_attack() {
         .sender
         .send(request(41, "callHierarchy/outgoingCalls", outgoing_params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected outgoingCalls response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "outgoing errored: {:?}", resp.error);
     let outgoing: Option<Vec<CallHierarchyOutgoingCall>> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
@@ -505,9 +494,7 @@ fn call_hierarchy_outgoing_records_dotted_self_call() {
         .sender
         .send(request(75, "textDocument/prepareCallHierarchy", prepare))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected prepareCallHierarchy response");
-    };
+    let resp = recv_response(&client);
     let items: Option<Vec<CallHierarchyItem>> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
     let item = items
@@ -524,9 +511,7 @@ fn call_hierarchy_outgoing_records_dotted_self_call() {
         .sender
         .send(request(76, "callHierarchy/outgoingCalls", outgoing))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected outgoingCalls response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "outgoing errored: {:?}", resp.error);
     let outgoing: Option<Vec<CallHierarchyOutgoingCall>> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
@@ -724,9 +709,7 @@ fn call_hierarchy_incoming_for_attack() {
         .sender
         .send(request(70, "textDocument/prepareCallHierarchy", prepare))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected prepareCallHierarchy response");
-    };
+    let resp = recv_response(&client);
     let items: Option<Vec<CallHierarchyItem>> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
     let item = items.and_then(|v| v.into_iter().next()).expect(
@@ -745,9 +728,7 @@ fn call_hierarchy_incoming_for_attack() {
         .sender
         .send(request(71, "callHierarchy/incomingCalls", incoming))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected incomingCalls response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "incoming errored: {:?}", resp.error);
     let incoming: Option<Vec<CallHierarchyIncomingCall>> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
@@ -801,9 +782,7 @@ fn call_hierarchy_incoming_surfaces_top_level_caller() {
         .sender
         .send(request(90, "textDocument/prepareCallHierarchy", prepare))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected prepareCallHierarchy response");
-    };
+    let resp = recv_response(&client);
     let items: Option<Vec<CallHierarchyItem>> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
     let item = items
@@ -820,9 +799,7 @@ fn call_hierarchy_incoming_surfaces_top_level_caller() {
         .sender
         .send(request(91, "callHierarchy/incomingCalls", incoming))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected incomingCalls response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "incoming errored: {:?}", resp.error);
     let incoming: Vec<CallHierarchyIncomingCall> =
         serde_json::from_value(resp.result.unwrap()).unwrap_or_default();
@@ -884,9 +861,7 @@ fn call_hierarchy_incoming_from_item_points_at_caller_declaration() {
         .sender
         .send(request(73, "textDocument/prepareCallHierarchy", prepare))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected prepareCallHierarchy response");
-    };
+    let resp = recv_response(&client);
     let items: Option<Vec<CallHierarchyItem>> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
     let item = items
@@ -902,9 +877,7 @@ fn call_hierarchy_incoming_from_item_points_at_caller_declaration() {
         .sender
         .send(request(74, "callHierarchy/incomingCalls", incoming_params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected incomingCalls response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "incoming errored: {:?}", resp.error);
     let incoming: Option<Vec<CallHierarchyIncomingCall>> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
@@ -971,9 +944,7 @@ fn nav_handlers_return_null_for_whitespace_position() {
         .sender
         .send(request(80, "textDocument/references", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected references response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "references at whitespace errored");
     // Result must be JSON null OR an empty array. Either is LSP-conformant.
     let val = resp.result.unwrap_or(serde_json::Value::Null);
@@ -999,9 +970,7 @@ fn nav_handlers_return_null_for_whitespace_position() {
         .sender
         .send(request(81, "textDocument/implementation", impl_params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected implementation response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "implementation at whitespace errored");
 
     // prepareCallHierarchy at whitespace
@@ -1016,9 +985,7 @@ fn nav_handlers_return_null_for_whitespace_position() {
         .sender
         .send(request(82, "textDocument/prepareCallHierarchy", prep))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected prepareCallHierarchy response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "prepare at whitespace errored");
 
     shutdown(&client, server_thread);
@@ -1059,9 +1026,7 @@ fn nav_handlers_clamp_out_of_range_position() {
         .sender
         .send(request(85, "textDocument/references", refs))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected references response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "references at out-of-range position errored (must clamp)"
@@ -1084,9 +1049,7 @@ fn nav_handlers_clamp_out_of_range_position() {
         .sender
         .send(request(86, "textDocument/prepareCallHierarchy", prep))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected prepareCallHierarchy response");
-    };
+    let resp = recv_response(&client);
     assert!(
         resp.error.is_none(),
         "prepareCallHierarchy at out-of-range position errored (must clamp)"
@@ -1116,9 +1079,7 @@ fn workspace_symbol_empty_query_returns_empty() {
         .sender
         .send(request(90, "workspace/symbol", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected workspace/symbol response");
-    };
+    let resp = recv_response(&client);
     assert!(resp.error.is_none(), "empty query errored");
     let response: Option<WorkspaceSymbolResponse> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
@@ -1154,9 +1115,7 @@ fn workspace_symbol_fuzzy_matches_partial_query() {
         .sender
         .send(request(91, "workspace/symbol", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected workspace/symbol response");
-    };
+    let resp = recv_response(&client);
     let response: Option<WorkspaceSymbolResponse> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
     let symbols: Vec<SymbolInformation> = match response {
@@ -1197,9 +1156,7 @@ fn workspace_symbol_class_outranks_member_on_score_tie() {
         .sender
         .send(request(95, "workspace/symbol", params))
         .unwrap();
-    let Message::Response(resp) = recv(&client) else {
-        panic!("expected workspace/symbol response");
-    };
+    let resp = recv_response(&client);
     let response: Option<WorkspaceSymbolResponse> =
         serde_json::from_value(resp.result.unwrap()).unwrap();
     let symbols: Vec<SymbolInformation> = match response {

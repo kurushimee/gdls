@@ -374,6 +374,40 @@ pub fn definition(
         }
     }
 
+    // (1.6) Cross-file dotted method call (`obj.method()` through a typed var): the attribute
+    // identifier inside a call callee records no `Binding::Use` (the reducer's attribute paths
+    // are a deliberate recording scope cut — see `AnalysisResult::bindings`), but `reduce_call`
+    // recorded a `Binding::Call` whose `callee_file` names the declaring script. Project the
+    // call binding whose callee-identifier span contains the cursor — the same projection the
+    // references handler's call-site click uses (M6-E) — and jump to the declaration. Hover
+    // already resolves these through the type table; definition returning null here was the
+    // asymmetry the v1.0.3 real-project walk caught.
+    {
+        let node_byte = byte;
+        let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+        let target = analyzed.as_deref().and_then(|a| {
+            let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+            a.bindings().iter().find_map(|b| match b {
+                Binding::Call {
+                    callee_file: Some(f),
+                    callee_name,
+                    call_site,
+                    ..
+                } if callee_name == &name => {
+                    let spans = spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
+                    let ident = spans.get(call_site).copied()?;
+                    (ident.start <= node_byte && node_byte < ident.end).then_some(*f)
+                }
+                _ => None,
+            })
+        });
+        if let Some(fid) = target {
+            if let Some(loc) = member_decl_location(state, fid, &name) {
+                return Some(GotoDefinitionResponse::Scalar(loc));
+            }
+        }
+    }
+
     // (2) Cross-file `class_name`.
     if let Some(loc) = find_global_class_definition(state, &name) {
         return Some(GotoDefinitionResponse::Scalar(loc));
@@ -1373,29 +1407,60 @@ fn load_candidate_analysis(
 /// skipping `exclude` (the file the caller already handles) and any path that won't percent-encode
 /// into a URI (logged at warn — an unreported reference, same as an unreadable candidate). Shared by
 /// `references` and `incomingCalls`.
-fn collect_name_referencer_uris(
-    index: &gd_project::Index,
+/// Project-wide candidate collection for method/signal-shaped names — Godot's two-phase
+/// workspace strategy (workspace.cpp:472, adopted in M6-E): enumerate every indexed file, keep
+/// the ones whose TEXT contains `name` (VFS-first read, no analysis), and let the caller
+/// lazy-analyze only those hits. The interface-level `name_referencers` set cannot see body-only
+/// uses (a method called through a typed var never appears in the caller's *interface*), so
+/// `references` and `incomingCalls` both fan out through this scan — riding `name_referencers`
+/// alone left `callHierarchy/incomingCalls` structurally blind to cross-file callers (caught by
+/// the v1.0.3 real-project walk).
+fn method_scan_candidate_uris(
+    state: &mut ServerState,
     name: &str,
-    exclude: Option<&camino::Utf8Path>,
+    exclude_fid: Option<gd_project::FileId>,
     log_ctx: &str,
 ) -> Vec<(camino::Utf8PathBuf, Uri)> {
+    // Collect (FileId → path) from the index first (index borrow), then read text separately
+    // (VFS / disk borrow) so borrows don't overlap.
+    let all_paths: Vec<(gd_project::FileId, camino::Utf8PathBuf)> = state
+        .workspace
+        .index
+        .iter_interfaces()
+        .filter_map(|(fid, _)| {
+            state
+                .workspace
+                .index
+                .path(fid)
+                .map(|p| (fid, p.to_path_buf()))
+        })
+        .collect();
+
     let mut out = Vec::new();
-    for fid in index.name_referencers(name) {
-        let Some(p) = index.path(fid).map(|p| p.to_path_buf()) else {
-            continue;
-        };
-        if exclude.is_some_and(|e| normalize_eq(e, &p)) {
+    for (fid, p) in all_paths {
+        if exclude_fid.is_some_and(|e| e == fid) {
             continue;
         }
-        match path_to_file_uri(&p) {
-            Some(uri) => out.push((p, uri)),
-            // warn (not debug) for parity with `load_candidate_analysis`'s unreadable-candidate skip:
-            // both silently under-report an otherwise authoritative-looking cross-file result, so an
-            // operator on the default log level must see the dropped reference.
-            None => log::warn!(
-                "{log_ctx}: dropping candidate {p} — path_to_file_uri rejected the path; \
-                 cross-file edges from that file will be missing"
-            ),
+        let Some(cand_uri) = path_to_file_uri(&p) else {
+            log::warn!("{log_ctx}: dropping candidate {p} — path_to_file_uri rejected the path");
+            continue;
+        };
+        // Pre-filter: only read text (VFS-first, no analysis). If the file's text doesn't
+        // contain `name` as a substring, it cannot have a reference — skip it cheaply.
+        let text_opt = state
+            .vfs
+            .get(cand_uri.as_str())
+            .map(|d| d.text())
+            .or_else(|| std::fs::read_to_string(p.as_std_path()).ok());
+        let Some(text) = text_opt else {
+            log::warn!(
+                "{log_ctx}: skipping candidate {p} (unreadable); \
+                 cross-file results may be under-reported"
+            );
+            continue;
+        };
+        if text.contains(name) {
+            out.push((p, cand_uri));
         }
     }
     out
@@ -1730,52 +1795,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // This matches Godot's behavior; a future identifier-occurrence index could optimize it. Do NOT
     // full-analyze every file — text-prefilter first, analyze only textual hits.
     let candidates: Vec<(camino::Utf8PathBuf, Uri)> = if is_method_or_signal || is_autoload {
-        // Project-wide textual scan: collect all (FileId → path) from the index first (index
-        // borrow), then read text separately (VFS / disk borrow) so borrows don't overlap.
-        let all_paths: Vec<(gd_project::FileId, camino::Utf8PathBuf)> = state
-            .workspace
-            .index
-            .iter_interfaces()
-            .filter_map(|(fid, _)| {
-                state
-                    .workspace
-                    .index
-                    .path(fid)
-                    .map(|p| (fid, p.to_path_buf()))
-            })
-            .collect();
-
-        let mut out = Vec::new();
-        for (fid, p) in all_paths {
-            // Exclude the current file (already scanned above).
-            if current_fid.is_some_and(|cfid| cfid == fid) {
-                continue;
-            }
-            let Some(cand_uri) = path_to_file_uri(&p) else {
-                log::warn!(
-                    "references: dropping candidate {p} — path_to_file_uri rejected the path"
-                );
-                continue;
-            };
-            // Pre-filter: only read text (VFS-first, no analysis). If the file's text doesn't
-            // contain `name` as a substring, it cannot have a reference — skip it cheaply.
-            let text_opt = state
-                .vfs
-                .get(cand_uri.as_str())
-                .map(|d| d.text())
-                .or_else(|| std::fs::read_to_string(p.as_std_path()).ok());
-            let Some(text) = text_opt else {
-                log::warn!(
-                    "references: skipping candidate {p} (unreadable); \
-                     cross-file results may be under-reported"
-                );
-                continue;
-            };
-            if text.contains(name.as_str()) {
-                out.push((p, cand_uri));
-            }
-        }
-        out
+        method_scan_candidate_uris(state, &name, current_fid, "references")
     } else {
         // Fast-path for class/type/variable names: only files whose interface mentions `name` can
         // reference it; `name_referencers` already has that set. (Autoloads are excluded — they
@@ -2383,6 +2403,80 @@ pub fn prepare_call_hierarchy(
     let mapper = PositionMapper::new(&rope, enc);
     let byte = mapper.position_to_byte(tdp.position);
 
+    // A cursor on a CALL-SITE callee identifier prepares the CALLEE's item, not the function
+    // the cursor happens to sit inside — exploring `boost` from `b.boost(1)` must target
+    // boost's hierarchy (the v1.0.3 real-project walk caught the old enclosing-only behavior
+    // returning the caller). Same Binding::Call projection as definition's dotted-call step;
+    // a native/unresolved callee (callee_file None) falls through to the enclosing item.
+    if let Some(node_id) = parsed.tree.innermost_node_at(byte) {
+        if let Some(name) = cursor_identifier(&parsed.tree, node_id) {
+            if let Some(analyzed) = analyze_if_gd(state, &uri, &parsed.tree, &text) {
+                // Unlike references' subscript-only `callee_ident_spans` (bare callees ride
+                // `Binding::Use` there), prepare needs BOTH callee shapes: a bare in-file call
+                // (`_find_attached_meshes()`) records a `Binding::Call` too, and the cursor on
+                // its identifier must prepare that callee rather than the enclosing function.
+                let build_spans = || {
+                    let mut map = callee_ident_spans(&parsed.tree);
+                    for nid in parsed.tree.iter_ids() {
+                        let node = parsed.tree.get(nid);
+                        let NodeKind::Call(call) = &node.kind else {
+                            continue;
+                        };
+                        let Some(callee_id) = call.callee else {
+                            continue;
+                        };
+                        if matches!(parsed.tree.get(callee_id).kind, NodeKind::Identifier(_)) {
+                            map.insert(node.span, parsed.tree.get(callee_id).span);
+                        }
+                    }
+                    map
+                };
+                let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+                let target = analyzed.bindings().iter().find_map(|b| match b {
+                    Binding::Call {
+                        callee_file: Some(f),
+                        callee_name,
+                        call_site,
+                        ..
+                    } if callee_name == &name => {
+                        let spans = spans.get_or_insert_with(build_spans);
+                        let ident = spans.get(call_site).copied()?;
+                        (ident.start <= byte && byte < ident.end).then_some(*f)
+                    }
+                    _ => None,
+                });
+                if let Some(fid) = target {
+                    if let Some((path, callee_uri)) = state
+                        .workspace
+                        .index
+                        .path(fid)
+                        .map(|p| p.to_path_buf())
+                        .and_then(|p| path_to_file_uri(&p).map(|u| (p, u)))
+                    {
+                        let (range, selection_range) =
+                            resolve_fn_item_ranges(state, &path, &callee_uri, &name);
+                        let data = serde_json::json!({
+                            "uri": callee_uri.as_str(),
+                            "name": name,
+                        });
+                        #[allow(deprecated)]
+                        let item = CallHierarchyItem {
+                            name,
+                            kind: LspSymbolKind::FUNCTION,
+                            tags: None,
+                            detail: None,
+                            uri: callee_uri,
+                            range,
+                            selection_range,
+                            data: Some(data),
+                        };
+                        return Some(vec![item]);
+                    }
+                }
+            }
+        }
+    }
+
     // Find the enclosing FunctionNode: walk every node, take the smallest-span Function whose
     // span contains `byte`. Linear over the arena, like `innermost_node_at` and
     // `smallest_typed_containing` above. The natural optimization — `innermost_node_at(byte)`
@@ -2654,13 +2748,16 @@ pub fn incoming_calls(
     let enc = state.encoding;
 
     // Candidate caller files: the target's own file (a function may call itself or other in-file
-    // funcs) + every file the interface-pass index records as referencing this name.
+    // funcs) + every file whose TEXT mentions the name (the project-wide two-phase scan shared
+    // with `references`). The previous interface-level `name_referencers` set was structurally
+    // blind to body-only callers — `cel.get_image()` through a typed var never names `get_image`
+    // in the caller's interface — so cross-file incoming calls always came back empty.
     let mut candidates: Vec<(camino::Utf8PathBuf, Uri)> = Vec::new();
     candidates.push((target_path.clone(), target_uri.clone()));
-    candidates.extend(collect_name_referencer_uris(
-        &state.workspace.index,
+    candidates.extend(method_scan_candidate_uris(
+        state,
         &target_name,
-        Some(&target_path),
+        target_fid,
         "incomingCalls",
     ));
 

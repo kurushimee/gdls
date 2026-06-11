@@ -5,13 +5,83 @@ All notable changes to `gdls` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.3] — 2026-06-11
+
+The warning-completeness release. The v1.0.2 plugin sessions exposed that the existing LSP test
+suite cannot be the single source of truth: 22+ declared warning codes had no emission site
+(#29), `@warning_ignore` missed multi-line targets (#28), and several navigation capabilities
+quietly returned nothing on shapes every real project uses. Each fix below was verified the same
+way the bugs were found — driving every exposed capability against the two acceptance projects
+and reading what actually comes back, for native and script symbols alike.
+
+### Fixed — analyzer warnings (#28, #29)
+- **`@warning_ignore` covers multi-line targets**: the ignored-lines table now records Godot's
+  annotation→target-header span (`warning_ignore_annotation`, gdscript_parser.cpp:5078-5151)
+  per target kind — multi-line signatures, initializers, `for`/`if`/`while`/`match` headers,
+  match-branch patterns — instead of a single line. The compensating node-attached annotation
+  walk is removed: upstream filters purely by anchor line, and the spans subsume it (no
+  over-suppression: body lines past the header still warn, exactly as upstream).
+- **19 missing warning emission sites ported** function-for-function from
+  `gdscript_analyzer.cpp`/`gdscript_parser.cpp` @ 4.6.3-stable: `EMPTY_FILE`,
+  `STANDALONE_EXPRESSION`, `STANDALONE_TERNARY`, `UNREACHABLE_CODE`, `UNREACHABLE_PATTERN`,
+  `ASSERT_ALWAYS_TRUE`, `ASSERT_ALWAYS_FALSE`, `INTEGER_DIVISION`, `INCOMPATIBLE_TERNARY`,
+  `UNTYPED_DECLARATION`, `INFERRED_DECLARATION`, `REDUNDANT_STATIC_UNLOAD`,
+  `UNASSIGNED_VARIABLE`, `UNASSIGNED_VARIABLE_OP_ASSIGN`, `UNUSED_VARIABLE`,
+  `UNUSED_LOCAL_CONSTANT`, `RETURN_VALUE_DISCARDED`, `STATIC_CALLED_ON_INSTANCE`,
+  `INT_AS_ENUM_WITHOUT_CAST`. (The issue's audit under-counted: `UNASSIGNED_VARIABLE` and
+  `UNUSED_VARIABLE` were also silent — 24 total, of which `DEPRECATED_KEYWORD` and the 3
+  deprecated `*_USED_AS_*` codes have no emission site in upstream either and stay silent by
+  fidelity.) Per-code unit tests in `gd_analyze/tests/warning_emissions.rs`; the conformance
+  ratchet holds 300/300.
+- **`UNSAFE_PROPERTY_ACCESS` stays deferred, deliberately**: it is a negative claim and the
+  attribute lookup is not yet complete enough to make it truthfully (native signals through
+  attributes and some property shapes resolve in Godot but miss in gdls); under the strict
+  profile it is promoted to an error, so a premature site would false-positive loudly. The
+  would-be emission site documents the blockers.
+- **Warning output order matches `apply_pending_warnings`**: warnings are stable-sorted by
+  anchor line among themselves (errors keep emission order) — signature-pass warnings on late
+  lines no longer render before body-pass warnings on earlier lines.
+- **Untyped rest parameters no longer error**: `func f(...args):` false-positived
+  `The rest parameter type must be "Array", but "Variant" is specified.` — upstream validates
+  only when a type is specified; the untyped shape is an inferred `Array` plus
+  UNTYPED_DECLARATION.
+
+### Fixed — navigation (found by the real-project capability walk)
+- **`definition` on a dotted method call through a typed var** (`cel.on_remove()`) jumped
+  nowhere while hover resolved the signature; it now projects the call binding's declaring file
+  and jumps to the member declaration.
+- **`callHierarchy/incomingCalls` was structurally empty across files**: its candidates came
+  from the interface-level reverse index, which never contains body-only method names. It now
+  uses the same project-wide two-phase textual scan as `references` (Godot's workspace.cpp:472
+  strategy).
+- **`prepareCallHierarchy` on a call-site callee prepares the callee** (dotted and bare),
+  not the function the cursor happens to sit inside; declaration clicks and non-identifier
+  positions keep the enclosing-function behavior.
+- **`<Script #N>` no longer leaks into cast errors**: `Invalid cast. Cannot convert from "Nil"
+  to "<Script #3095>".` now renders the script's `class_name` (or file basename), matching
+  Godot's `DataType::to_string()`.
+
+### Fixed — logging & CI
+- **Bridged `log::*` events render with their real target/file/line** (and `GDLS_LOG`
+  per-target directives can match them): `tracing-subscriber`'s `tracing-log` feature was off,
+  so every bridged event carried target `log` plus `log.target=…` field noise.
+- **ETXTBSY spawn retry in the auto-dump**: exec can transiently fail with "Text file busy"
+  while the Godot binary is open for write (mid-rebuild/copy — or, in CI, a concurrent test's
+  fork briefly holding a fixture script's fd). A bounded 500 ms retry absorbs it; this was the
+  ubuntu-latest flake in `chatty_child_does_not_deadlock`.
+- **Integration tests read responses by skipping interleaved notifications**: on slow runners a
+  `publishDiagnostics` could outlive the post-open drain and land where a response was expected
+  (the windows-latest call-hierarchy failures); all request/response reads now match like a
+  real LSP client.
 
 ### Changed
 - **Background dump timeout raised 60 s → 5 min**: the deadline exists only to reap a wedged
   Godot child, and the dump left the critical path in v1.0.2 — a generous budget costs nothing,
   while 60 s could kill legitimate slow first boots (cold import caches, AV-scanned binaries,
   huge projects) mid-dump.
+- **Acceptance warning baselines re-based** for the new emission sites (error baselines hold
+  exactly on both acceptance projects, verified per-platform — the private project on Windows
+  with the Windows binary): Pixelorama 43 → 116 warnings (0 errors before and after).
 
 ### Fixed
 - **No background auto-dump when `extensionApiPath` is pinned**: `load_native` never consults
