@@ -4343,11 +4343,14 @@ fn emit_standalone_statement_warnings(ctx: &mut AnalysisContext, stmt_id: NodeId
             );
         }
         NodeKind::Lambda(_) => {} // `Standalone lambdas cannot be accessed` — gd_syntax error.
-        NodeKind::Literal(lit) => {
-            // Godot exempts `Variant::STRING` only — a StringName or NodePath literal warns.
-            if !matches!(lit.value, gd_syntax::token::Literal::String(_)) {
-                ctx.push_warning(WarningCode::StandaloneExpression, &[], stmt_id);
-            }
+        // Godot exempts `Variant::STRING` only — a StringName or NodePath literal warns. Two
+        // un-guarded arms, NOT one arm with a `!String` guard: a failed guard falls through to
+        // the `is_expression()` catch-all below, which would warn for String literals too.
+        NodeKind::Literal(gd_syntax::ast::LiteralNode {
+            value: gd_syntax::token::Literal::String(_),
+        }) => {}
+        NodeKind::Literal(_) => {
+            ctx.push_warning(WarningCode::StandaloneExpression, &[], stmt_id);
         }
         NodeKind::TernaryOp(_) => {
             ctx.push_warning(WarningCode::StandaloneTernary, &[], stmt_id);
