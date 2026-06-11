@@ -296,6 +296,10 @@ pub struct AnalysisContext<'a> {
     pub(crate) script_chains: std::cell::RefCell<
         FxHashMap<crate::data_type::ScriptRef, std::rc::Rc<crate::script_chain::ResolvedChain>>,
     >,
+    /// Memoized decl-name-slot identifier set (see [`Self::decl_ident_ids`]). A pure function of
+    /// the immutable tree, built once on first use instead of once per name-set sweep call.
+    /// `OnceCell` because the sweep helpers hold `&AnalysisContext`.
+    decl_ident_ids: std::cell::OnceCell<FxHashSet<NodeId>>,
     /// M5 WP-O3 / O4: once tripped, every subsequent governor / cancellation checkpoint
     /// short-circuits (the synthetic error has already been pushed; we don't want to spam the
     /// same diagnostic for every remaining call). Toggle is one-way per analyze pass.
@@ -354,9 +358,22 @@ impl<'a> AnalysisContext<'a> {
             iter_limit: 0,
             cancellation: None,
             script_chains: std::cell::RefCell::new(FxHashMap::default()),
+            decl_ident_ids: std::cell::OnceCell::new(),
             bailed: false,
             sink: DiagnosticSink::new(),
         }
+    }
+
+    /// Identifier NodeIds that are the *name slot* of a declaration (Variable / Constant /
+    /// Signal / Function / Parameter / Enum / EnumValue / Class) — declaration sites, not
+    /// references. Godot's `usages` counter only increments on true references
+    /// (`reduce_identifier`), never on the decl identifier itself, so the name-set sweeps
+    /// (`referenced_names`, `emit_unused_parameter_warnings`, `warn_unused_local`) all exclude
+    /// these ids. Built lazily with one O(nodes) walk on first access and shared by every
+    /// sweep in the same analysis pass.
+    pub fn decl_ident_ids(&self) -> &FxHashSet<NodeId> {
+        self.decl_ident_ids
+            .get_or_init(|| build_decl_ident_ids(self.tree))
     }
 
     /// M5 WP-O3 / O4: per-node governor + cancellation checkpoint. Call once at the entry of
@@ -588,6 +605,41 @@ impl<'a> AnalysisContext<'a> {
 /// `[region.start, region.end)`. The start byte for a `_start` annotation is **after** the
 /// annotation's own span, so the annotation line itself is NOT in the region (matching the
 /// Godot's `start_line` semantics which fires from the next line on).
+/// One O(nodes) walk collecting every declaration's name-slot identifier id — the backing
+/// builder for [`AnalysisContext::decl_ident_ids`]. The kind set is the union of what each
+/// name-set sweep excludes: Enum / EnumValue / Class entries are class-body-only declarations
+/// (their identifiers can never fall inside a function-body sweep window), so including them
+/// is a no-op for `emit_unused_parameter_warnings` / `warn_unused_local` while
+/// `referenced_names` needs them.
+fn build_decl_ident_ids(tree: &ParseTree) -> FxHashSet<NodeId> {
+    use gd_syntax::ast::NodeKind;
+
+    let mut out = FxHashSet::default();
+    for id in tree.iter_ids() {
+        let name_slot = match &tree.get(id).kind {
+            NodeKind::Variable(v) => v.identifier,
+            NodeKind::Constant(c) => c.identifier,
+            NodeKind::Signal(s) => s.identifier,
+            NodeKind::Function(f) => f.identifier,
+            NodeKind::Parameter(p) => p.identifier,
+            NodeKind::Class(c) => c.identifier,
+            NodeKind::Enum(e) => {
+                for v in &e.values {
+                    if let Some(i) = v.identifier {
+                        out.insert(i);
+                    }
+                }
+                e.identifier
+            }
+            _ => None,
+        };
+        if let Some(i) = name_slot {
+            out.insert(i);
+        }
+    }
+    out
+}
+
 fn build_warning_ignore_regions(
     tree: &ParseTree,
 ) -> FxHashMap<crate::warnings::WarningCode, Vec<(usize, usize)>> {

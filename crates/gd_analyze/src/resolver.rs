@@ -3954,59 +3954,13 @@ fn referenced_names(ctx: &AnalysisContext) -> rustc_hash::FxHashSet<String> {
     use gd_syntax::ast::NodeKind;
     use gd_syntax::token::Literal;
 
-    // First pass: collect every identifier NodeId that is *itself the name slot* of a declaration
-    // (Variable/Constant/Signal/Function/Parameter/Enum/EnumValue/Class). These are declaration
-    // sites, not references — Godot's `usages` counter is incremented in `reduce_identifier`
-    // for true references, never on the decl identifier. We exclude them from the use-set so a
-    // `var _a` declaration doesn't mark "_a" as referenced.
-    let mut decl_ident_ids = rustc_hash::FxHashSet::<gd_syntax::ast::NodeId>::default();
-    for id in ctx.tree.iter_ids() {
-        match &ctx.node(id).kind {
-            NodeKind::Variable(v) => {
-                if let Some(i) = v.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            NodeKind::Constant(c) => {
-                if let Some(i) = c.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            NodeKind::Signal(s) => {
-                if let Some(i) = s.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            NodeKind::Function(f) => {
-                if let Some(i) = f.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            NodeKind::Parameter(p) => {
-                if let Some(i) = p.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            NodeKind::Enum(e) => {
-                if let Some(i) = e.identifier {
-                    decl_ident_ids.insert(i);
-                }
-                for v in &e.values {
-                    if let Some(i) = v.identifier {
-                        decl_ident_ids.insert(i);
-                    }
-                }
-            }
-            NodeKind::Class(c) => {
-                if let Some(i) = c.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            _ => {}
-        }
-    }
+    // Decl-name-slot identifiers are excluded from the use-set so a `var _a` declaration
+    // doesn't mark "_a" as referenced — Godot's `usages` counter is incremented in
+    // `reduce_identifier` for true references, never on the decl identifier. The set is the
+    // shared per-analysis cache on the context (built once, reused by every sweep).
+    let decl_ident_ids = ctx.decl_ident_ids();
 
-    // Second pass: collect names from identifier references (excluding the decl-name slots) and
+    // Collect names from identifier references (excluding the decl-name slots) and
     // from specific call-argument string-literal payloads. Godot's signal-usage tracking only
     // counts string-literal args to `emit_signal()` / `connect()` / `disconnect()` / `Signal()`
     // when the arg is `is_constant` (analyzer.cpp:3411-3425 + 3681-3692), not random string
@@ -4208,38 +4162,8 @@ fn emit_unused_parameter_warnings(
 
     // Collect identifier-name references inside the body's byte span. Skip declaration
     // identifiers (Godot's `usages` counter only counts true references, not the decl
-    // identifier itself — see the equivalent gate in `referenced_names`).
-    let mut decl_ident_ids = rustc_hash::FxHashSet::<NodeId>::default();
-    for id in ctx.tree.iter_ids() {
-        match &ctx.node(id).kind {
-            NodeKind::Variable(v) => {
-                if let Some(i) = v.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            NodeKind::Constant(c) => {
-                if let Some(i) = c.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            NodeKind::Parameter(p) => {
-                if let Some(i) = p.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            NodeKind::Function(f) => {
-                if let Some(i) = f.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            NodeKind::Signal(s) => {
-                if let Some(i) = s.identifier {
-                    decl_ident_ids.insert(i);
-                }
-            }
-            _ => {}
-        }
-    }
+    // identifier itself), via the shared per-analysis cache on the context.
+    let decl_ident_ids = ctx.decl_ident_ids();
     let mut used_names = rustc_hash::FxHashSet::<String>::default();
     for id in ctx.tree.iter_ids() {
         let node = ctx.node(id);
@@ -4551,21 +4475,9 @@ fn warn_unused_local(
     let suite_end = ctx.node(suite_id).span.end;
     let decl_end = ctx.node(decl_id).span.end;
     // Declaration identifiers never count as uses (Godot's `usages` counts references only).
-    // One O(nodes) pre-pass per declaration — same profile as `emit_unused_parameter_warnings`.
-    let mut decl_ident_ids = rustc_hash::FxHashSet::<NodeId>::default();
-    for id in ctx.tree.iter_ids() {
-        let owner_ident = match &ctx.node(id).kind {
-            NodeKind::Variable(v) => v.identifier,
-            NodeKind::Constant(c) => c.identifier,
-            NodeKind::Parameter(p) => p.identifier,
-            NodeKind::Function(f) => f.identifier,
-            NodeKind::Signal(s) => s.identifier,
-            _ => None,
-        };
-        if let Some(i) = owner_ident {
-            decl_ident_ids.insert(i);
-        }
-    }
+    // The set comes from the shared per-analysis cache on the context — one O(nodes) walk per
+    // analysis, not per declaration.
+    let decl_ident_ids = ctx.decl_ident_ids();
     for id in ctx.tree.iter_ids() {
         let node = ctx.node(id);
         if node.span.start < decl_end || node.span.end > suite_end {
