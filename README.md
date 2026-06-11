@@ -103,15 +103,16 @@ parity gaps vs Godot's own LSP (hover member signatures, `definition`/`documentL
 `implementation` overrides, autoload-singleton typing) and added a persistent, multi-instance-safe
 warm-start index cache (a warm relaunch is **>5×** faster than a cold scan). Verified by capability
 walks against a real Godot 4.6.3 OSS project and a Windows-native 2,338-script production project.
-**v1.0.3** is the current release — the warning-completeness release: the full Godot warning set
-now actually fires (19 previously-declared-but-silent codes ported function-for-function, from
-`UNREACHABLE_CODE` and `STANDALONE_EXPRESSION` to `UNASSIGNED_VARIABLE` and `INTEGER_DIVISION`),
-`@warning_ignore` suppresses across multi-line targets exactly like Godot's annotation→target
-spans, and a real-project walk of every exposed capability fixed cross-file `definition` on
-dotted method calls, cross-file `incomingCalls`, call-site `prepareCallHierarchy`, and the last
-`<Script #N>` placeholder leak. Before it, **v1.0.2** made the first run robust (background
-`extension_api.json` auto-dump adopted mid-session, embedded stock 4.6.3 fallback with
-provenance-gated negative diagnostics) and **v1.0.1** fixed the cross-file false-positive
+**v1.0.4** is the current release — the native-surface completeness release: hover and
+`definition` now work on native classes and members (declaration-line hover pinned to Godot's
+own LSP detail formats; `definition` jumps into readable API stubs materialized under the user
+cache), `workspace/symbol` anchors `class_name` declarations instead of line 0, the analyzer
+restores upstream's class→native fall-through so int-typed native surfaces type faithfully, and
+`UNSAFE_PROPERTY_ACCESS` — the one deliberately-deferred warning — now fires, provenance-gated
+so it never false-positives on incomplete class surfaces. Before it, **v1.0.3** made the full
+Godot warning set actually fire (19 silent codes ported function-for-function) with exact
+`@warning_ignore` spans, **v1.0.2** made the first run robust (background `extension_api.json`
+auto-dump, embedded stock 4.6.3 fallback), and **v1.0.1** fixed the cross-file false-positive
 families a full-project diagnostics sweep exposed right after v1.0.0.
 See [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md) for the M6 scope and
 [`CHANGELOG.md`](CHANGELOG.md) for the milestone history.

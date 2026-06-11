@@ -132,26 +132,26 @@ Phase 1 = v1 = **M0–M6**: M0 LSP skeleton · M1 tokenizer + parser · M2 envir
 [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md). Phase 2 (post-v1): `.tscn` node typing for `$`/`%`,
 `completion`, `signatureHelp`, `rename`/`documentHighlight`.
 
-**Current:** Phase 1 complete — **v1.0.3 shipped** (release notes in `CHANGELOG.md`). v1.0.3 is
-the warning-completeness release (#28/#29 + navigation fixes found by driving every exposed
-capability against the acceptance projects): `@warning_ignore` records Godot's
-annotation→target-header **spans** (multi-line targets suppress; the node-attached walk is
-gone — suppression is purely by anchor line, as upstream); **19 missing warning emission
-sites** are ported function-for-function (per-code tests in
-`gd_analyze/tests/warning_emissions.rs`; `DEPRECATED_KEYWORD` + the 3 deprecated codes are
-silent in upstream too; `UNSAFE_PROPERTY_ACCESS` stays deferred — the attribute lookup can't
-yet make that negative claim truthfully, and strict mode promotes it to an error); warnings
-render in `apply_pending_warnings`' by-line order; untyped rest parameters no longer
-false-positive. Navigation: `definition` works on dotted method calls through typed vars,
-`incomingCalls` sees cross-file callers (the two-phase textual scan `references` uses),
-`prepareCallHierarchy` on a call-site callee targets the callee, and cast errors render
-`class_name`/basenames instead of `<Script #N>`. v1.0.2 before it was the first-run robustness
-release (#24/#25/#26: background auto-dump adopted mid-session, embedded stock 4.6.3 fallback +
-provenance-gated negatives per `docs/02` §11b, declaration-site hover). Both conformance
-ratchets hold at **1.0**: parser **186/186**, analyzer **300/300**. CI is green
-(`cargo fmt --check`, `cargo lint`, `cargo test --workspace`); three-layer fuzz gate (`parse` +
-`analyze` + `index_invariants`). Standing release gate: the
+**Current:** Phase 1 complete — **v1.0.4 shipped** (release notes in `CHANGELOG.md`). v1.0.4 is
+the native-surface completeness release (#32–#35 + adjacent gaps #37–#41, one PR of
+per-work-package commits): native member/class **hover** renders real declaration lines via the
+shared `native_render` formatter pinned to `gdscript_workspace.cpp` detail formats (builtin +
+`@GlobalScope` utility arms included); **`definition`** on native classes/members materializes
+readable API stubs under the user-level cache (`stubs/v{N}-{hash}/Class.gd`, atomic
+write-if-absent, GC'd once per session) and jumps into them once project resolution misses;
+`workspace/symbol` anchors `class_name` declarations (ClassEntry records the line/identifier
+span, cache format v3); the analyzer restores upstream's class-loop → native-check
+fall-through plus `type_from_type_ref`'s enum/bitfield arms; **`UNSAFE_PROPERTY_ACCESS` now
+fires** (`gdscript_analyzer.cpp:4880-4886`), provenance-gated per `docs/02` §11b so it never
+lies on incomplete class surfaces — conformance holds **300/300 with the warning live**.
+v1.0.3 before it was the warning-completeness release (#28/#29: 19 silent emission sites
+ported function-for-function, `@warning_ignore` annotation→target-header spans, navigation
+fixes from the real-project capability walk). Both conformance ratchets hold at **1.0**:
+parser **186/186**, analyzer **300/300**. CI is green (`cargo fmt --check`, `cargo lint`,
+`cargo test --workspace`); three-layer fuzz gate (`parse` + `analyze` + `index_invariants`;
+the analyze target revived and re-wired in #41). Standing release gate: the
 `scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both acceptance projects (a nav-row
-walk is NOT a diagnostics gate; error baselines must hold — warning counts re-based in v1.0.3),
-with the private project swept **on Windows with the Windows binary**. Per-milestone exit
-criteria: `docs/07`; the full history: `CHANGELOG.md`.
+walk is NOT a diagnostics gate; error baselines must hold — warning counts re-based in v1.0.4,
+and the sweep now takes `--strict` + a warning histogram), with the private project swept
+**on Windows with the Windows binary**. Per-milestone exit criteria: `docs/07`; the full
+history: `CHANGELOG.md`.

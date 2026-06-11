@@ -5,6 +5,65 @@ All notable changes to `gdls` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] — 2026-06-12
+
+The native-surface completeness release. v1.0.3's real-project capability walks showed
+script-side navigation had outpaced the native side: hover on a native member fell back to a
+degraded type label, `definition` on a native class or member had nowhere to jump,
+`workspace/symbol` anchored every global class at line 0, and the analyzer dropped to dynamic
+exactly where upstream's class-resolution loop falls through to the native check — the same gap
+that kept `UNSAFE_PROPERTY_ACCESS` deferred. Every v1.0.4 milestone issue clustered on that
+surface (#32–#35); the adjacent gaps the work surfaced were fixed in the same pass (#37–#41).
+
+### Added — native hover (#35, #40)
+- **Native member and class hover render real declaration lines** via a shared `native_render`
+  formatter pinned to Godot's `gdscript_workspace.cpp` detail formats, with native + builtin
+  arms in both member paths (call callees and plain attribute access). Bare calls resolve
+  implicit `self` through the extends chain, and `@GlobalScope` utility functions render too
+  (#40). Class-name hover upgrades to `<Native> class X extends Y`.
+
+### Added — definition into native API stubs (#34, #38, #39)
+- **`definition` on a native class or member materializes a readable API stub** under the
+  user-level cache (`stubs/v{N}-{hash}/Class.gd`; per-request keying, atomic write-if-absent)
+  and returns a plain `file://` Location into it: the class header for class references, the
+  declaring class's member line for members — implicit-`self` member calls included (#38). The
+  native arms run only after every project resolution has missed, stub buffers publish empty
+  diagnostics, the stub tree is GC'd once per session (#39), and a `stubCacheDir` seam keeps it
+  testable (docs/05).
+
+### Added — analyzer native fall-through + `UNSAFE_PROPERTY_ACCESS` (#32, #37)
+- **The CLASS-branch native tail restores upstream's class-loop → native-check fall-through**,
+  `type_from_type_ref` gains its enum/bitfield arms (`gdscript_analyzer.cpp:5744-5759`), and
+  `reduce_call` probes the native surface on an interface miss (#37) — so int-typed native
+  surfaces resolve faithfully instead of silently degrading to dynamic.
+- **`UNSAFE_PROPERTY_ACCESS` now fires** (`gdscript_analyzer.cpp:4880-4886`) — until now the one
+  deliberately-deferred warning code. Emission stays gated on negative-claim soundness per
+  docs/02 §11b: unresolvable chain roots and cross-file shallow-interface misses are silent
+  under any provenance, so the warning can't lie. Conformance holds **300/300 with the warning
+  live**. On Pixelorama the default profile holds 0 errors (+3 `INTEGER_DIVISION` warnings on
+  the newly int-typed surfaces) while the strict profile gains +677 genuinely subtype-dependent
+  `UNSAFE_PROPERTY_ACCESS` findings — and sheds 50 `UNSAFE_CALL_ARGUMENT` + 29 `UNSAFE_CAST`
+  false positives from the same typing improvements.
+
+### Fixed — workspace/symbol anchors (#33)
+- **`ClassEntry` records the `class_name` declaration line + identifier span** at index time
+  (cache format v3): `workspace/symbol` anchors global classes at their declaration instead of
+  a zero-width line-0 location, and `find_global_class_definition`'s closed-file arm drops its
+  per-lookup re-parse.
+
+### Changed
+- **gd_types groundwork**: `NativeDb::lookup_member`/`lookup_builtin_member` chain-walk the
+  class hierarchy and report the declaring class, `Param.default_value` survives ingestion, and
+  `display_type` produces the hover labels.
+- **`scan_diags.py` grows `--strict` and a per-code warning histogram**, so the release-gate
+  sweep can gate the strict profile too.
+
+### Fixed — hardening
+- **Stub machinery**: per-session render cache, rename-race fallback, sentinel-mtime GC
+  freshness, a stub-name guard, span content checks, and a native chain-walk depth cap.
+- **The `analyze` fuzz target is revived and wired into CI's bounded fuzz job** (#41) — it had
+  rotted out of the build (95,904 clean runs / 121 s locally).
+
 ## [1.0.3] — 2026-06-11
 
 The warning-completeness release. The v1.0.2 plugin sessions exposed that the existing LSP test
