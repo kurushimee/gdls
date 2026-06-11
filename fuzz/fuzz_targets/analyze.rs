@@ -3,7 +3,7 @@
 use libfuzzer_sys::fuzz_target;
 
 use gd_analyze::{NoCrossFile, StrictSettings, WarnPolicy};
-use gd_project::{FileId, WarningConfig};
+use gd_project::WarningConfig;
 use gd_types::NativeDb;
 
 // Layer 2 of the fuzz gate, covering the M3 analyzer: any input that successfully parses through
@@ -18,8 +18,8 @@ fuzz_target!(|data: &str| {
     let native = NativeDb::empty();
     let xfile = NoCrossFile;
     let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
-    // FileId(0) is the safe placeholder used by gd_server when a file isn't yet in the index; the
-    // analyzer's `file` parameter only feeds ScriptRef self-identity, so a fresh ID per call is
-    // fine for fuzz purposes.
-    let _ = gd_analyze::analyze(&tree, FileId(0), "fuzz.gd", &native, &xfile, &policy);
+    // `file: None` is the orphan-buffer shape gd_server uses for files not yet in the index; the
+    // analyzer's `file` parameter only feeds ScriptRef self-identity, so the orphan shape is the
+    // right production-faithful stub for single-buffer fuzzing.
+    let _ = gd_analyze::analyze(&tree, None, "fuzz.gd", &native, &xfile, &policy);
 });
