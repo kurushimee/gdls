@@ -2403,6 +2403,60 @@ pub fn prepare_call_hierarchy(
     let mapper = PositionMapper::new(&rope, enc);
     let byte = mapper.position_to_byte(tdp.position);
 
+    // A cursor on a CALL-SITE callee identifier prepares the CALLEE's item, not the function
+    // the cursor happens to sit inside — exploring `boost` from `b.boost(1)` must target
+    // boost's hierarchy (the v1.0.3 real-project walk caught the old enclosing-only behavior
+    // returning the caller). Same Binding::Call projection as definition's dotted-call step;
+    // a native/unresolved callee (callee_file None) falls through to the enclosing item.
+    if let Some(node_id) = parsed.tree.innermost_node_at(byte) {
+        if let Some(name) = cursor_identifier(&parsed.tree, node_id) {
+            if let Some(analyzed) = analyze_if_gd(state, &uri, &parsed.tree, &text) {
+                let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+                let target = analyzed.bindings().iter().find_map(|b| match b {
+                    Binding::Call {
+                        callee_file: Some(f),
+                        callee_name,
+                        call_site,
+                        ..
+                    } if callee_name == &name => {
+                        let spans = spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
+                        let ident = spans.get(call_site).copied()?;
+                        (ident.start <= byte && byte < ident.end).then_some(*f)
+                    }
+                    _ => None,
+                });
+                if let Some(fid) = target {
+                    if let Some((path, callee_uri)) = state
+                        .workspace
+                        .index
+                        .path(fid)
+                        .map(|p| p.to_path_buf())
+                        .and_then(|p| path_to_file_uri(&p).map(|u| (p, u)))
+                    {
+                        let (range, selection_range) =
+                            resolve_fn_item_ranges(state, &path, &callee_uri, &name);
+                        let data = serde_json::json!({
+                            "uri": callee_uri.as_str(),
+                            "name": name,
+                        });
+                        #[allow(deprecated)]
+                        let item = CallHierarchyItem {
+                            name,
+                            kind: LspSymbolKind::FUNCTION,
+                            tags: None,
+                            detail: None,
+                            uri: callee_uri,
+                            range,
+                            selection_range,
+                            data: Some(data),
+                        };
+                        return Some(vec![item]);
+                    }
+                }
+            }
+        }
+    }
+
     // Find the enclosing FunctionNode: walk every node, take the smallest-span Function whose
     // span contains `byte`. Linear over the arena, like `innermost_node_at` and
     // `smallest_typed_containing` above. The natural optimization — `innermost_node_at(byte)`

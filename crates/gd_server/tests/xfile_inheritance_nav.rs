@@ -373,3 +373,48 @@ fn incoming_calls_surface_cross_file_dotted_callers() {
     );
     shutdown(&client, handle);
 }
+
+/// v1.0.3 real-project walk regression: `prepareCallHierarchy` with the cursor on a CALL-SITE
+/// callee identifier must prepare the CALLEE's item (here `boost`, declared in base.gd), not
+/// the function the cursor happens to sit inside — the old enclosing-only walk returned
+/// `use_lib` for this position.
+#[test]
+fn prepare_call_hierarchy_at_call_site_targets_the_callee() {
+    use lsp_types::{CallHierarchyItem, CallHierarchyPrepareParams};
+    let p = project();
+    p.write("user.gd", USER_GD);
+    let (client, handle) = boot_with_api(&p);
+    did_open(&client, &p, "user.gd");
+
+    let user_uri = file_uri(&p.root.join("user.gd"));
+    let prepare = CallHierarchyPrepareParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: user_uri.clone(),
+            },
+            // line 3 `\tb.boost(1)`, character 4 inside `boost` (the callee identifier).
+            position: Position {
+                line: 3,
+                character: 4,
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    client
+        .sender
+        .send(request(44, "textDocument/prepareCallHierarchy", prepare))
+        .unwrap();
+    let resp = recv_response(&client);
+    let items: Option<Vec<CallHierarchyItem>> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let item = items
+        .and_then(|v| v.into_iter().next())
+        .expect("prepare returns an item for the callee");
+    assert_eq!(item.name, "boost", "the callee, not the enclosing function");
+    assert!(
+        item.uri.as_str().ends_with("base.gd"),
+        "the item must locate the callee's declaring file, got {}",
+        item.uri.as_str()
+    );
+    shutdown(&client, handle);
+}
