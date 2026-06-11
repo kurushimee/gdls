@@ -362,7 +362,9 @@ fn warm_load_produces_same_index_as_cold() {
         "src/base.gd",
         "class_name WarmBase\nextends Node\nfunc greet() -> String:\n\treturn \"hi\"\n",
     );
-    p.write("src/child.gd", "class_name WarmChild\nextends WarmBase\n");
+    // child puts `class_name` on line 2 — the #33 shape whose declaration line must survive the
+    // cache round-trip (the registry serializes `ClassEntry.line`/`name_span`).
+    p.write("src/child.gd", "extends WarmBase\nclass_name WarmChild\n");
     p.write("src/orphan.gd", "extends Node\nvar x: int = 0\n");
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
@@ -397,6 +399,17 @@ fn warm_load_produces_same_index_as_cold() {
         warm_ws.index.registry().len() >= 2,
         "warm load must have class_name registry entries (WarmBase, WarmChild)"
     );
+
+    // #33: the declaration line survives the cache round-trip — a warm session must anchor
+    // `WarmChild` (declared on line 2) exactly where the cold one does.
+    for (ws, label) in [(&cold_ws, "cold"), (&warm_ws, "warm")] {
+        let entry = ws.index.registry().get("WarmChild").expect("registered");
+        assert_eq!(entry.line, 2, "{label}: class_name line 2 must be recorded");
+        assert!(
+            !entry.name_span.is_empty(),
+            "{label}: identifier span must be recorded"
+        );
+    }
 }
 
 /// Issue 1 + Issue 2 seam test: disk edit → save → warm load skips re-parse on stat-match.

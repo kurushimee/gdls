@@ -1266,13 +1266,14 @@ fn member_decl_location(
 fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<Location> {
     let entry = state.workspace.index.registry().get(name)?;
     let path = entry.path.clone();
+    let indexed_span = entry.name_span;
     let uri = path_to_file_uri(&path)?;
     let uri_str = uri.as_str().to_owned();
 
-    // Open buffer: reuse the cached parse. Closed file: read + parse directly. The parse cache is
-    // content-addressed now (see `workspace::CacheEntry`), so caching this closed-file read would
-    // be correct — but a one-shot nav lookup needn't populate the hot open-buffer cache, so we
-    // parse directly and leave it uncluttered.
+    // Open buffer: reuse the cached parse — an edited buffer is newer than the index, so the live
+    // tree is the only correct span source. Closed file: the registry's recorded identifier span
+    // (#33) replaces the old per-lookup re-parse; the bounds check guards a watcher-lagged index
+    // whose span no longer fits the on-disk text (fall back to a fresh parse).
     let (ident_span, text) = if let Some(text) = state.vfs.get(&uri_str).map(|d| d.text()) {
         let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
         (root_class_identifier_span(&parsed.tree)?, text)
@@ -1286,8 +1287,12 @@ fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<L
                 return None;
             }
         };
-        let tree = gd_syntax::parse(&text).tree;
-        (root_class_identifier_span(&tree)?, text)
+        if !indexed_span.is_empty() && indexed_span.end <= text.len() {
+            (indexed_span, text)
+        } else {
+            let tree = gd_syntax::parse(&text).tree;
+            (root_class_identifier_span(&tree)?, text)
+        }
     };
 
     // Build the location's range against a rope of the target's text. The path may live outside
@@ -2866,14 +2871,16 @@ pub fn workspace_symbol(
     );
     let mut candidates: Vec<Candidate> = Vec::new();
 
-    // Class-name registry entries — top-level class declarations across the project.
+    // Class-name registry entries — top-level class declarations across the project, anchored at
+    // the `class_name` identifier's recorded line (#33; line 1 only as the registry's defensive
+    // default).
     for (name, entry) in state.workspace.index.registry().entries() {
         candidates.push((
             name.to_string(),
             LspSymbolKind::CLASS,
             None,
             entry.path.clone(),
-            1,
+            entry.line,
             true,
         ));
     }

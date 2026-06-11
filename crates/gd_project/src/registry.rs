@@ -10,6 +10,7 @@
 //! after an M4 DB reload.
 
 use camino::{Utf8Path, Utf8PathBuf};
+use gd_syntax::ByteSpan;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +44,14 @@ pub struct ClassEntry {
     pub path: Utf8PathBuf,
     pub base: BaseRef,
     pub is_abstract: bool,
+    /// 1-based source line of the `class_name` identifier — anchors `workspace/symbol` class
+    /// results at the declaration instead of the file top (#33). `1` when the interface carried
+    /// no location (defensive default; a registered class always has an identifier).
+    pub line: u32,
+    /// Byte span of the `class_name` identifier, for precise `definition` ranges without
+    /// re-parsing the declaring file. Zero-width when unknown; consumers must bounds-check
+    /// against the current file text (the indexed span can lag an unsaved edit).
+    pub name_span: ByteSpan,
 }
 
 /// `class_name` → [`ClassEntry`]. Only top-level `class_name` declarations are global (inner classes
@@ -86,8 +95,16 @@ impl ClassNameRegistry {
     /// Register `name`'s declaration, derived from a file's interface base. If `path` previously
     /// declared a *different* name, that stale entry is dropped first. A duplicate `class_name` across
     /// two files is last-writer-wins (a project error the analyzer reports in M3; the registry does
-    /// not arbitrate).
-    pub fn insert(&mut self, name: String, path: &Utf8Path, extends: &Extends, is_abstract: bool) {
+    /// not arbitrate). `name_loc` is the `class_name` identifier's (1-based line, byte span) from
+    /// the interface; `None` (defensive — a named class always has an identifier) anchors at line 1.
+    pub fn insert(
+        &mut self,
+        name: String,
+        path: &Utf8Path,
+        extends: &Extends,
+        is_abstract: bool,
+        name_loc: Option<(u32, ByteSpan)>,
+    ) {
         // If this path already declared a different name, retire it (guarding a name now owned by a
         // different path).
         if let Some(prev) = self.by_path.get(path).cloned() {
@@ -95,10 +112,13 @@ impl ClassNameRegistry {
                 self.by_name.remove(&prev);
             }
         }
+        let (line, name_span) = name_loc.unwrap_or((1, ByteSpan::default()));
         let entry = ClassEntry {
             path: path.to_path_buf(),
             base: BaseRef::from_extends(extends),
             is_abstract,
+            line,
+            name_span,
         };
         self.by_path.insert(entry.path.clone(), name.clone());
         self.by_name.insert(name, entry);
@@ -172,6 +192,7 @@ mod tests {
             &p("/proj/hero.gd"),
             &Extends::Names(vec!["Node2D".into()]),
             false,
+            None,
         );
         let e = r.get("Hero").unwrap();
         assert_eq!(e.path, p("/proj/hero.gd"));
@@ -183,18 +204,20 @@ mod tests {
     #[test]
     fn base_ref_from_each_extends_shape() {
         let mut r = ClassNameRegistry::new();
-        r.insert("A".into(), &p("/a.gd"), &Extends::None, false);
+        r.insert("A".into(), &p("/a.gd"), &Extends::None, false, None);
         r.insert(
             "B".into(),
             &p("/b.gd"),
             &Extends::Path("res://x.gd".into()),
             false,
+            None,
         );
         r.insert(
             "C".into(),
             &p("/c.gd"),
             &Extends::Names(vec!["Outer".into(), "Inner".into()]),
             true,
+            None,
         );
         assert_eq!(r.get("A").unwrap().base, BaseRef::None);
         assert_eq!(r.get("B").unwrap().base, BaseRef::Path("res://x.gd".into()));
@@ -206,9 +229,41 @@ mod tests {
     }
 
     #[test]
+    fn insert_stores_name_loc_with_defensive_default() {
+        let mut r = ClassNameRegistry::new();
+        r.insert(
+            "Hero".into(),
+            &p("/proj/hero.gd"),
+            &Extends::None,
+            false,
+            Some((3, ByteSpan::new(27, 31))),
+        );
+        let e = r.get("Hero").unwrap();
+        assert_eq!(e.line, 3);
+        assert_eq!(e.name_span, ByteSpan::new(27, 31));
+        // No location recorded → the defensive line-1 anchor, zero-width span.
+        r.insert(
+            "Bare".into(),
+            &p("/proj/bare.gd"),
+            &Extends::None,
+            false,
+            None,
+        );
+        let e = r.get("Bare").unwrap();
+        assert_eq!(e.line, 1);
+        assert!(e.name_span.is_empty());
+    }
+
+    #[test]
     fn remove_by_path_returns_names() {
         let mut r = ClassNameRegistry::new();
-        r.insert("Hero".into(), &p("/proj/hero.gd"), &Extends::None, false);
+        r.insert(
+            "Hero".into(),
+            &p("/proj/hero.gd"),
+            &Extends::None,
+            false,
+            None,
+        );
         let removed = r.remove_by_path(&p("/proj/hero.gd"));
         assert_eq!(removed, vec!["Hero".to_string()]);
         assert!(r.is_empty());
@@ -219,8 +274,8 @@ mod tests {
         // A file renaming its class_name (insert without a preceding remove) must not leave the old
         // name registered.
         let mut r = ClassNameRegistry::new();
-        r.insert("Old".into(), &p("/a.gd"), &Extends::None, false);
-        r.insert("New".into(), &p("/a.gd"), &Extends::None, false);
+        r.insert("Old".into(), &p("/a.gd"), &Extends::None, false, None);
+        r.insert("New".into(), &p("/a.gd"), &Extends::None, false, None);
         assert!(r.get("Old").is_none());
         assert!(r.get("New").is_some());
         assert_eq!(r.len(), 1);
@@ -235,8 +290,9 @@ mod tests {
             &p("/a.gd"),
             &Extends::Names(vec!["Node2D".into()]),
             false,
+            None,
         );
-        r.insert("Enemy".into(), &p("/b.gd"), &Extends::None, true);
+        r.insert("Enemy".into(), &p("/b.gd"), &Extends::None, true, None);
         let mut entries: Vec<(&str, &Utf8PathBuf, bool)> = r
             .entries()
             .map(|(n, e)| (n, &e.path, e.is_abstract))
@@ -254,8 +310,8 @@ mod tests {
         // Two files declaring the same class_name: the last wins; removing the *loser*'s path leaves
         // the winner registered.
         let mut r = ClassNameRegistry::new();
-        r.insert("Dup".into(), &p("/first.gd"), &Extends::None, false);
-        r.insert("Dup".into(), &p("/second.gd"), &Extends::None, false);
+        r.insert("Dup".into(), &p("/first.gd"), &Extends::None, false, None);
+        r.insert("Dup".into(), &p("/second.gd"), &Extends::None, false, None);
         assert_eq!(r.get("Dup").unwrap().path, p("/second.gd"));
         // Removing the first file reports the name (so referencers relink) but keeps the winner.
         assert_eq!(r.remove_by_path(&p("/first.gd")), vec!["Dup".to_string()]);

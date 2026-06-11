@@ -108,8 +108,13 @@ impl Index {
         // Drop any class_name this file used to declare, then register its current one.
         self.registry.remove_by_path(&key);
         if let Some(name) = &iface.class_name {
-            self.registry
-                .insert(name.clone(), &key, &iface.extends, iface.is_abstract);
+            self.registry.insert(
+                name.clone(),
+                &key,
+                &iface.extends,
+                iface.is_abstract,
+                iface.class_name_loc,
+            );
         }
         self.interfaces.insert(fid, iface);
         fid
@@ -1095,6 +1100,7 @@ impl IndexMut<'_> {
             &normalize(Utf8Path::new("/fuzz/ghost_never_interned.gd")),
             &Extends::None,
             false,
+            None,
         );
     }
 }
@@ -1673,7 +1679,7 @@ mod tests {
         let mut idx = Index::new(Utf8PathBuf::from("/proj"));
         let ghost = normalize(&abs("ghost.gd"));
         idx.registry
-            .insert("Ghost".to_string(), &ghost, &Extends::None, false);
+            .insert("Ghost".to_string(), &ghost, &Extends::None, false, None);
 
         match idx.verify() {
             Err(v) if v.len() == 1 && matches!(v[0], IndexInvariant::DanglingClassName { .. }) => {}
@@ -1801,6 +1807,7 @@ mod tests {
                 &normalize(&abs("ghost.gd")),
                 &Extends::None,
                 false,
+                None,
             );
             panic!("simulated mid-mutation panic after a partial registry write");
         });
