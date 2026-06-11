@@ -1102,9 +1102,8 @@ fn did_save_triggers_a_diagnostic_republish() {
 /// the fence when the dump carries them.
 #[test]
 fn hover_native_members_render_declaration_lines() {
-    let fixture_dir = std::env::temp_dir().join("gdls_native_hover");
-    let _ = std::fs::remove_dir_all(&fixture_dir);
-    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    let fixture = tempfile::tempdir().expect("create fixture dir");
+    let fixture_dir = fixture.path().to_path_buf();
     std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
     let api_path = fixture_dir.join("extension_api.json");
     std::fs::write(
@@ -1225,7 +1224,6 @@ fn hover_native_members_render_declaration_lines() {
     );
 
     shutdown(&client, handle);
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
 /// v1.0.4 (#34): definition on native symbols materializes the class API as a real document
@@ -1236,9 +1234,8 @@ fn hover_native_members_render_declaration_lines() {
 /// need not be analyzable GDScript). Project classes keep shadowing the native arm.
 #[test]
 fn definition_on_native_symbols_jumps_into_materialized_stubs() {
-    let fixture_dir = std::env::temp_dir().join("gdls_native_stubs");
-    let _ = std::fs::remove_dir_all(&fixture_dir);
-    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    let fixture = tempfile::tempdir().expect("create fixture dir");
+    let fixture_dir = fixture.path().to_path_buf();
     std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
     let stub_cache = fixture_dir.join("stub-cache");
     let api_path = fixture_dir.join("extension_api.json");
@@ -1401,5 +1398,4 @@ fn definition_on_native_symbols_jumps_into_materialized_stubs() {
     );
 
     shutdown(&client, handle);
-    let _ = std::fs::remove_dir_all(&fixture_dir);
 }

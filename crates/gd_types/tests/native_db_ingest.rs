@@ -223,6 +223,23 @@ fn lookup_member_walks_inherits_and_reports_declaring_class() {
 }
 
 #[test]
+fn lookup_member_terminates_on_a_cyclic_inherits_chain() {
+    // A hand-edited dump can carry an `inherits` cycle; the walk must degrade to a miss, not
+    // hang the request.
+    let db = NativeDb::from_json(
+        r#"{
+            "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+            "classes": [
+                {"name": "Yin", "inherits": "Yang"},
+                {"name": "Yang", "inherits": "Yin"}
+            ]
+        }"#,
+    )
+    .expect("ingest stores the cycle verbatim");
+    assert!(db.lookup_member("Yin", "nope").is_none());
+}
+
+#[test]
 fn lookup_builtin_member_covers_members_methods_constants() {
     let db = NativeDb::from_json(MINI).expect("mini parses");
     assert!(matches!(

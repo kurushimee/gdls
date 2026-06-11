@@ -412,7 +412,10 @@ impl NativeDb {
         // A name the interner never saw cannot exist anywhere in the DB.
         let target = self.interner.get(member)?;
         let mut cur = self.class_named(class);
-        while let Some(nc) = cur {
+        // Real chains are ~10 deep; the cap only turns a hand-edited dump's `inherits` cycle
+        // into a miss instead of a hung request (never crash, never lie — never hang either).
+        for _ in 0..64 {
+            let Some(nc) = cur else { break };
             if let Some(m) = member_of(
                 target,
                 &nc.properties,

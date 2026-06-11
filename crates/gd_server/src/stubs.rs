@@ -78,7 +78,27 @@ pub(crate) fn is_stub_uri(uri: &lsp_types::Uri, override_root: Option<&str>) -> 
     let Some(base) = stubs_base_dir(override_root) else {
         return false;
     };
-    crate::uri::uri_to_path(uri).is_some_and(|p| p.starts_with(&base))
+    let Some(p) = crate::uri::uri_to_path(uri) else {
+        return false;
+    };
+    if p.starts_with(&base) {
+        return true;
+    }
+    // Windows filesystems are case-insensitive and clients re-derive URIs with their own
+    // casing (VS Code lowercases the drive letter), while `base` comes from the environment —
+    // a literal component compare can miss and a stub page would self-diagnose. Retry folded.
+    #[cfg(windows)]
+    {
+        let mut pc = p.components();
+        base.components().all(|b| {
+            pc.next()
+                .is_some_and(|c| c.as_str().eq_ignore_ascii_case(b.as_str()))
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Per-session cache of rendered pages: a class's page is a pure function of the dump (keyed
@@ -212,6 +232,13 @@ pub(crate) fn ensure_class_stub(
     class_name: &str,
     override_root: Option<&str>,
 ) -> Option<(Utf8PathBuf, Rc<RenderedStub>)> {
+    // The name becomes a path component below, and the dump is project-supplied data (a
+    // project-root `extension_api.json` is auto-adopted): refuse anything that isn't
+    // identifier-shaped rather than let a crafted class name (`../…`) write outside the stub
+    // directory. Engine and GDExtension class names are always ASCII identifiers.
+    if !is_identifier_shaped(class_name) {
+        return None;
+    }
     let class = db.class_named(class_name)?;
     let dir = stub_dir(db, override_root)?;
     std::fs::create_dir_all(dir.as_std_path()).ok()?;
@@ -249,6 +276,15 @@ pub(crate) fn ensure_class_stub(
         }
     }
     Some((path, stub))
+}
+
+/// `[A-Za-z_][A-Za-z0-9_]*` — the only class-name shape allowed to become a stub filename.
+fn is_identifier_shaped(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Refresh the current directory's freshness sentinel (every call) and collect stale stub
@@ -431,6 +467,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path.as_std_path()).unwrap(),
             stub.text
+        );
+    }
+
+    #[test]
+    fn hostile_class_name_never_becomes_a_path() {
+        // A crafted dump (a project-root extension_api.json is auto-adopted from any opened
+        // repo) must not turn a class name into a path traversal: `../escape` would land the
+        // stub at `<root>/stubs/escape.gd`, outside its version-hash directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().into_owned();
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [{"name": "../escape", "is_instantiable": true}]
+            }"#,
+        )
+        .expect("ingest stores names verbatim");
+        let cache = StubCache::default();
+        assert!(
+            ensure_class_stub(&cache, &db, "../escape", Some(&root)).is_none(),
+            "non-identifier class names are refused"
+        );
+        assert!(
+            !tmp.path().join("stubs").join("escape.gd").exists(),
+            "nothing may be written outside the version-hash directory"
         );
     }
 

@@ -327,8 +327,10 @@ impl Index {
     /// native root. Returns the visited project files plus the first native class name reached:
     /// `None` when a link is unknown/unresolvable or the chain cycles; an absent `extends`
     /// clause roots at `RefCounted` (Godot's scriptless default, the `gd_analyze::script_chain`
-    /// convention). Server-side consumers only — the implicit-self hover/definition paths
-    /// (#34/#35); the analyzer's equivalent walk lives in `gd_analyze::script_chain`.
+    /// convention). Dotted `extends Outer.Inner` is approximated by its head: the walk
+    /// continues through `Outer`'s file root, not the inner class's own base. Server-side
+    /// consumers only — the implicit-self hover/definition paths (#34/#35); the analyzer's
+    /// equivalent walk lives in `gd_analyze::script_chain`.
     pub fn extends_chain_files(
         &self,
         fid: FileId,

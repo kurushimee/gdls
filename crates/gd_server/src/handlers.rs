@@ -475,6 +475,11 @@ pub fn definition(
 ///      its DECLARING class's stub;
 ///   3. a bare call callee (`queue_free()` under a Node-rooted script) → the same member anchor
 ///      through the file's chain native root — definition/hover symmetry (#35's bare-call path).
+///
+/// Builtin members (`v.length`) stay hover-only: builtin types have no class-page shape to
+/// materialize, so `definition` keeps returning null there. And shape 3's project-shadowing
+/// check sees interface MEMBERS only — a local `Callable` shadowing an inherited native name
+/// still jumps to the native; the interface walk can't see function bodies (accepted gap).
 fn native_definition(
     state: &mut ServerState,
     tree: &ParseTree,
@@ -886,6 +891,9 @@ fn native_member_hover_md(
 /// `extends AudioStreamPlayer` resolves through the file's chain native root; `print(...)`
 /// resolves as a `@GlobalScope` utility. Project members shadow natives — a name declared
 /// anywhere in the file's extends chain returns `None` so the project-script paths own it.
+/// Interface MEMBERS only: a local `Callable` shadowing an inherited native name still hovers
+/// as the native — the interface walk can't see function bodies (accepted gap, same as
+/// [`native_definition`]'s bare-call arm).
 fn hover_bare_native_signature(
     state: &ServerState,
     tree: &ParseTree,
@@ -1560,8 +1568,9 @@ fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<L
 
     // Open buffer: reuse the cached parse — an edited buffer is newer than the index, so the live
     // tree is the only correct span source. Closed file: the registry's recorded identifier span
-    // (#33) replaces the old per-lookup re-parse; the bounds check guards a watcher-lagged index
-    // whose span no longer fits the on-disk text (fall back to a fresh parse).
+    // (#33) replaces the old per-lookup re-parse, accepted only while its bytes still spell the
+    // class name — a watcher-lagged index (the file shifted or shrank underneath the recorded
+    // span) falls back to a fresh parse instead of anchoring at stale coordinates.
     let (ident_span, text) = if let Some(text) = state.vfs.get(&uri_str).map(|d| d.text()) {
         let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
         (root_class_identifier_span(&parsed.tree)?, text)
@@ -1575,7 +1584,7 @@ fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<L
                 return None;
             }
         };
-        if !indexed_span.is_empty() && indexed_span.end <= text.len() {
+        if text.get(indexed_span.start..indexed_span.end) == Some(name) {
             (indexed_span, text)
         } else {
             let tree = gd_syntax::parse(&text).tree;

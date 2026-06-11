@@ -182,9 +182,10 @@ def main():
         for d in p.get("diagnostics", []):
             sev_hist[str(d.get("severity"))] = sev_hist.get(str(d.get("severity")), 0) + 1
         for w in warns:
-            # The warning CODE prefix (the `(CODE)` Godot renders) is the stable bucket; fall
-            # back to a message prefix for codeless shapes.
-            key = w["message"][:70]
+            # The diagnostic's `code` field (gdls sends the warning PNAME, e.g.
+            # UNSAFE_PROPERTY_ACCESS) is the stable bucket — a message prefix would fragment
+            # parameterized templates into per-symbol buckets. Codeless shapes fall back to one.
+            key = w.get("code") or w["message"][:70]
             warn_hist[key] = warn_hist.get(key, 0) + 1
         if errs:
             err_files.append(

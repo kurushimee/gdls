@@ -6,9 +6,10 @@
 //! (`gdscript_workspace.cpp:246-353` @ 4.6.3-stable):
 //!
 //! - class:    `<Native> class AudioStreamPlayer extends Node` (extends only when a parent exists)
-//! - method:   `func AudioStreamPlayer.stop() -> void` — args render `name: Type`, and once any
-//!   argument carries a default every following one renders ` = default` (upstream's
-//!   `arg_default_value_started`); vararg appends `...`; an empty return type reads `void`.
+//! - method:   `func AudioStreamPlayer.stop() -> void` — args render `name: Type`, optional args
+//!   append ` = default` (matching upstream's `arg_default_value_started` output on real dumps,
+//!   whose defaults are contiguous trailing); vararg appends `...`; an empty return type reads
+//!   `void`.
 //! - property: `var Input.mouse_mode: MouseMode` — enum-typed properties prefer the enum name,
 //!   with a same-class scope trimmed (`Input.MouseMode` hovered on `Input` reads `MouseMode`).
 //! - constant: `const Input.MOUSE_MODE_CAPTURED: MouseMode = 2` (`: Enum` only when enum-owned).
@@ -95,24 +96,18 @@ pub fn utility_detail(db: &NativeDb, u: &UtilityFn) -> String {
     format!("func {}({args}) -> {ret}", db.name_of(u.name))
 }
 
-/// `name: Type = default, …` with upstream's `arg_default_value_started` semantics
-/// (gdscript_workspace.cpp:323-341): once any argument carries a default, every following
-/// argument renders its own (real dumps have contiguous trailing defaults, so the guard on a
-/// present value only protects against odd data). Vararg appends `...`.
+/// `name: Type = default, …` — every argument carrying a dump default renders it. Real dumps
+/// have contiguous trailing defaults, so this emits byte-for-byte what upstream's
+/// `arg_default_value_started` loop (gdscript_workspace.cpp:323-341) does, without its
+/// stateful flag. Vararg appends `...`.
 fn args_list(db: &NativeDb, params: &[Param], is_vararg: bool, declaring: &str) -> String {
     let trim = (!declaring.is_empty()).then_some(declaring);
-    let mut started = false;
     let mut parts: Vec<String> = Vec::with_capacity(params.len() + 1);
     for p in params {
-        if p.default_value.is_some() {
-            started = true;
-        }
         let mut part = format!("{}: {}", db.name_of(p.name), db.display_type(&p.ty, trim));
-        if started {
-            if let Some(dv) = p.default_value {
-                part.push_str(" = ");
-                part.push_str(db.name_of(dv));
-            }
+        if let Some(dv) = p.default_value {
+            part.push_str(" = ");
+            part.push_str(db.name_of(dv));
         }
         parts.push(part);
     }
