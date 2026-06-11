@@ -381,10 +381,7 @@ fn definition_on_unknown_name_returns_null() {
 
     // `FrobnicateWidget` is at line 0, columns 8..24.
     let response = definition_at(&client, &uri, Position::new(0, 10));
-    assert!(
-        response.is_none(),
-        "unknown name ⇒ null, got {response:?}"
-    );
+    assert!(response.is_none(), "unknown name ⇒ null, got {response:?}");
 
     shutdown(&client, handle);
 }
