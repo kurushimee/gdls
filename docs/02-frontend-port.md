@@ -195,9 +195,15 @@ indistinguishable from a typo.
 
 - **Rule:** the analyzer's native-rooted negative diagnostics (`Could not find type "X" in the
   current scope.`, the super-call miss templates, `Cannot find member "X" in base "Y".` on
-  native-rooted bases) fire only under `Exact` provenance (a project-context dump, a pinned
-  `extensionApiPath`, or a project-root `extension_api.json`). Under `Generic`/`Absent` the
-  unknown degrades to a silent Variant — the docs/00 "unknown stays dynamic" rule.
+  native-rooted bases, and the `UNSAFE_PROPERTY_ACCESS` warning — promoted to an error under the
+  strict profile — on native-rooted attribute misses, v1.0.4 #32) fire only under `Exact`
+  provenance (a project-context dump, a pinned `extensionApiPath`, or a project-root
+  `extension_api.json`). Under `Generic`/`Absent` the unknown degrades to a silent Variant — the
+  docs/00 "unknown stays dynamic" rule. `UNSAFE_PROPERTY_ACCESS` adds two refinements: a Class
+  base whose chain root is *unresolvable* (e.g. `extends ForkClass` under the stock fallback)
+  never warns under any provenance — the member surface is incomplete; and a Class chain that
+  crossed a file boundary and missed everywhere degrades to a silent set Variant (the SCRIPT
+  branch's never-lie rule), so shallow-interface gaps can't surface as warnings either.
 - Positive resolution is unaffected: under the embedded fallback, builtins resolve, hover works,
   and member checks against classes the stock surface *does* know remain faithful.
 - The session upgrades itself: the background auto-dump's adoption mid-session swaps in an

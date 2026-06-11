@@ -20,7 +20,9 @@ pub mod xfile;
 
 mod handlers;
 pub mod logging;
+mod native_render;
 mod server;
+mod stubs;
 
 pub use server::{run, run_with_recorder, serve, serve_with_injected_watcher, serve_with_recorder};
 pub use workspace::Workspace;

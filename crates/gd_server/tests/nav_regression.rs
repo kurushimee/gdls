@@ -16,6 +16,9 @@
 //!   - **callee_file inherited**: `inherited_bare_call_records_callee_file_none` parses a
 //!     file that calls `_ready()` (inherited from `Node`) and asserts the recorded
 //!     `Binding::Call.callee_file` is `None`, not `Some(ctx.file)`.
+//!   - **class-entry line** (#33): `workspace_symbol_anchors_class_at_declaration_line` pins
+//!     that a `class_name` on line ≥ 2 anchors at its declaration, not file top — the registry
+//!     used to store no line and the handler hardcoded line 1.
 //!   - **watcher-channel death**: not pinned here (intentional gap — see the
 //!     module-level comment block below). Adding a regression test would require refactoring
 //!     `gd_server::serve` to accept an injectable watcher receiver; that refactor is M5 scope.
@@ -115,6 +118,81 @@ fn lsp_responds_under_space_containing_project_path() {
         hero.location.uri.as_str().contains("%20"),
         "Hero URI under a space-containing project root must be percent-encoded; got {:?}",
         hero.location.uri
+    );
+
+    shutdown(&client, server_thread);
+    drop(dir);
+}
+
+// ============================================================================
+// workspace/symbol class entries anchor at the class_name declaration (#33)
+// ============================================================================
+
+/// The common `extends`-first script shape puts `class_name` on line 2 (or later). The registry
+/// used to store only the declaring path, and `workspace_symbol` hardcoded line 1 — every class
+/// result anchored at file top, only accidentally correct for line-1 declarations. The fix
+/// records the identifier's line on the `ClassEntry` at index time; this pins the rendered
+/// 0-based LSP line for a line-3 declaration.
+#[test]
+fn workspace_symbol_anchors_class_at_declaration_line() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root =
+        camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("temp dir is UTF-8");
+
+    std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+    std::fs::write(root.join("extension_api.json"), MINI_API).unwrap();
+    std::fs::write(
+        root.join("knight.gd"),
+        "# leading comment\nextends Node2D\nclass_name Knight\n",
+    )
+    .unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+
+    let init = InitializeParams {
+        initialization_options: Some(serde_json::json!({
+            "projectRoot": root.as_str(),
+            "autoDumpExtensionApi": false,
+            "extensionApiPath": root.join("extension_api.json").as_str(),
+        })),
+        ..Default::default()
+    };
+    client.sender.send(request(1, "initialize", init)).unwrap();
+    let _ = recv(&client);
+    client
+        .sender
+        .send(notification("initialized", InitializedParams {}))
+        .unwrap();
+
+    client
+        .sender
+        .send(request(
+            2,
+            "workspace/symbol",
+            WorkspaceSymbolParams {
+                query: "Knight".to_string(),
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let resp = recv(&client);
+    let Message::Response(r) = resp else {
+        panic!("expected Response, got {resp:?}");
+    };
+    let result: WorkspaceSymbolResponse = serde_json::from_value(r.result.expect("ok result"))
+        .expect("workspace/symbol returns a WorkspaceSymbolResponse");
+    let WorkspaceSymbolResponse::Flat(symbols) = result else {
+        panic!("expected Flat shape");
+    };
+    let knight = symbols
+        .iter()
+        .find(|s| s.name == "Knight")
+        .expect("Knight must be visible in workspace/symbol");
+    assert_eq!(
+        knight.location.range.start.line, 2,
+        "class_name on source line 3 must render LSP line 2, not the file top"
     );
 
     shutdown(&client, server_thread);

@@ -115,6 +115,7 @@ in `plugin.json`):
 | `embeddedApiFallback` | bool | v1.0.2: when every native-API source misses, fall back to a bundled stock 4.6.3 class surface instead of an empty DB, so builtins always resolve on a fresh install. Under this fallback (`Generic` provenance) unknown-type/member negatives are suppressed — only a project-derived (`Exact`) dump may claim a name doesn't exist. Default `true`. |
 | `strict.profile` | `"godot"` \| `"strict"` \| `"off"` | Diagnostics profile (see `04-diagnostics-strict-mode.md`). Default `"godot"`. |
 | `strict.enableWarnings` / `disableWarnings` / `errorWarnings` | string[] | Fine-grained overrides. |
+| `stubCacheDir` | string | v1.0.4 (#34): override the root under which native-class API stubs (the `definition` targets for native symbols) are materialized. Default: the user-level gdls cache (`%LOCALAPPDATA%\gdls` / `~/.cache/gdls`) — deliberately outside any workspace root. Normally left unset; the in-process tests point it at a tempdir. |
 
 Other config fields supported by CC and usable here: `transport` (`"stdio"` default; `"socket"` exists but
 is undocumented — stay on stdio), `env`, `startupTimeout`, `shutdownTimeout`.

@@ -684,3 +684,193 @@ fn enum_value_flows_without_cast_warning() {
     let src = "extends Node\n\nenum State { OFF = 1, ON = 2 }\n\nvar s: State = State.OFF\n\n\nfunc f() -> void:\n\ts = State.ON\n\ts = 2 as State\n";
     assert!(!codes(src, &godot_policy()).contains(&WarningCode::IntAsEnumWithoutCast));
 }
+
+// --- UNSAFE_PROPERTY_ACCESS (gdscript_analyzer.cpp:4878-4886) — issue #32 ---------------------
+
+/// A member-rich dump for the attribute-walk tests: a native class with a property, signal,
+/// enum (+ value), constant, and method, plus a memberless subclass to force inherits-chain
+/// walks. The bare `mini_native()` above stays member-free for the older tests' expectations.
+fn member_native() -> NativeDb {
+    NativeDb::from_json(
+        r#"{
+            "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+            "classes": [
+                {"name": "Object"},
+                {"name": "Node", "inherits": "Object",
+                 "properties": [{"name": "mode", "type": "int", "setter": "set_mode", "getter": "get_mode"}],
+                 "signals": [{"name": "renamed"}],
+                 "enums": [{"name": "Kind", "is_bitfield": false, "values": [{"name": "KIND_A", "value": 0}]}],
+                 "constants": [{"name": "NOTIF_READY", "value": 13}],
+                 "methods": [{"name": "get_name", "is_const": true, "is_static": false, "is_vararg": false,
+                              "is_virtual": false, "hash": 1, "return_value": {"type": "String"}, "arguments": []}]},
+                {"name": "Node2D", "inherits": "Node"}
+            ]
+        }"#,
+    )
+    .expect("valid member dump")
+}
+
+/// `warnings_with_lines` against an explicit DB (the shared harness pins `mini_native()`).
+fn warnings_with_lines_in(
+    src: &str,
+    policy: &WarnPolicy,
+    native: &NativeDb,
+) -> Vec<(WarningCode, u32)> {
+    let tree = gd_syntax::parse(src).tree;
+    let result = gd_analyze::analyze(&tree, None, "t.gd", native, &NoCrossFile, policy);
+    result
+        .diagnostics
+        .iter()
+        .filter_map(|d| {
+            let code = d.warning_code()?;
+            let line = 1 + src.as_bytes()[..d.span().start.min(src.len())]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count() as u32;
+            Some((code, line))
+        })
+        .collect()
+}
+
+/// Non-warning diagnostic messages (errors), for the reduce_call companion assertions.
+fn errors_in(src: &str, native: &NativeDb) -> Vec<String> {
+    let tree = gd_syntax::parse(src).tree;
+    let result = gd_analyze::analyze(&tree, None, "t.gd", native, &NoCrossFile, &godot_policy());
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| d.warning_code().is_none())
+        .map(|d| d.message().to_owned())
+        .collect()
+}
+
+#[test]
+fn unsafe_property_access_fires_on_typed_native_miss() {
+    // analyzer.cpp:4880-4884: attribute unset, base non-meta — warn anchored at the SUBSCRIPT,
+    // symbols [attribute name, base_type.to_string()].
+    let src = "extends Node\nfunc f(n: Node2D) -> void:\n\tvar x = n.nope\n\tprint_debug(x)\n";
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    let native = member_native();
+    assert_eq!(
+        warnings_with_lines_in(src, &policy, &native),
+        vec![(WarningCode::UnsafePropertyAccess, 3)]
+    );
+    // The exact upstream template, with the base rendered like Godot's to_string().
+    let tree = gd_syntax::parse(src).tree;
+    let result = gd_analyze::analyze(&tree, None, "t.gd", &native, &NoCrossFile, &policy);
+    let msg = result
+        .diagnostics
+        .iter()
+        .find(|d| d.warning_code() == Some(WarningCode::UnsafePropertyAccess))
+        .expect("warning present")
+        .message()
+        .to_owned();
+    assert!(
+        msg.contains(
+            r#"The property "nope" is not present on the inferred type "Node2D" (but may be present on a subtype)."#
+        ),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn unsafe_property_access_silent_on_every_resolving_member_kind() {
+    // Property / signal / method-reference / constant / enum value, all through the inherits
+    // chain (Node2D declares none of them), plus the CLASS-branch native tail for implicit
+    // self (`await self.renamed` — the await_with_signals_no_warning.gd shape).
+    let src = "extends Node\n\
+               func f(n: Node2D) -> void:\n\
+               \tvar a = n.mode\n\
+               \tvar b = n.renamed\n\
+               \tvar c = n.get_name\n\
+               \tvar d = n.NOTIF_READY\n\
+               \tvar e = n.KIND_A\n\
+               \tawait self.renamed\n\
+               \tprint_debug([a, b, c, d, e])\n";
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &member_native());
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafePropertyAccess),
+        "all members resolve — no UNSAFE_PROPERTY_ACCESS, got {got:?}"
+    );
+}
+
+#[test]
+fn unsafe_property_access_gated_to_exact_provenance() {
+    // docs/02 §11b: a Generic (stock-fallback) DB cannot disprove a custom build's member.
+    let src = "extends Node\nfunc f(n: Node2D) -> void:\n\tvar x = n.nope\n\tprint_debug(x)\n";
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    let mut native = member_native();
+    native.set_provenance(gd_types::ApiProvenance::Generic);
+    assert!(
+        warnings_with_lines_in(src, &policy, &native).is_empty(),
+        "native-rooted negative under Generic provenance must stay silent"
+    );
+}
+
+#[test]
+fn unsafe_property_access_silent_on_unresolvable_chain_root() {
+    // `extends UnknownForkClass`: the chain's native root is unresolvable, so the member
+    // surface is incomplete — never warn, even under Exact provenance. (The extends miss
+    // itself is a separate, already-pinned error family.)
+    let src =
+        "extends UnknownForkClass\nfunc f() -> void:\n\tvar x = self.anything\n\tprint_debug(x)\n";
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &member_native());
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafePropertyAccess),
+        "unresolvable chain root must not warn, got {got:?}"
+    );
+}
+
+#[test]
+fn unsafe_property_access_silent_on_builtin_and_deferred_node_bases() {
+    // Builtin instance miss: upstream's `valid = kind != BUILTIN` excludes builtins from the
+    // warning. `$Node` miss: the deferred-node type is deliberately permissive (docs/02 §11).
+    let src = "extends Node\n\
+               func f() -> void:\n\
+               \tvar v: Vector2\n\
+               \tvar a = v.nope\n\
+               \tvar b = $Child.anything\n\
+               \tprint_debug([a, b])\n";
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &member_native());
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafePropertyAccess),
+        "builtin/deferred-node bases never warn, got {got:?}"
+    );
+}
+
+#[test]
+fn native_calls_through_class_base_stay_clean() {
+    // The mandatory reduce_call companion (#32): with the CLASS-branch native tail live,
+    // `self.get_name()` must bind the native signature — NOT re-reduce the callee to a
+    // Callable value and emit `Name "get_name" is a Callable...`.
+    let src = "extends Node\nfunc f() -> void:\n\tvar n = self.get_name()\n\tprint_debug(n)\n";
+    assert!(
+        errors_in(src, &member_native()).is_empty(),
+        "a native method call through the class base is clean"
+    );
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    assert!(
+        warnings_with_lines_in(src, &policy, &member_native()).is_empty(),
+        "...and not UNSAFE_PROPERTY_ACCESS either"
+    );
+}
+
+#[test]
+fn native_property_called_as_function_keeps_upstream_error() {
+    // The positive-claim counterpart: a property invoked as a function reaches the value-callable
+    // path and emits upstream's `Name "X" called as a function but is a "Y".`.
+    let src = "extends Node\nfunc f() -> void:\n\tself.mode()\n";
+    let errors = errors_in(src, &member_native());
+    assert!(
+        errors
+            .iter()
+            .any(|m| m.contains(r#"Name "mode" called as a function"#)),
+        "got: {errors:?}"
+    );
+}

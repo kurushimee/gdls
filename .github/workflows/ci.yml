@@ -61,7 +61,7 @@ jobs:
   # and the `fuzz/` crate lives outside the workspace so the `check` job above never compiles it.
   # Runs on pushes to main and on the weekly schedule; PRs rely on the Layer-1 smoke test for speed.
   fuzz:
-    name: fuzz · parser (nightly libFuzzer)
+    name: fuzz · parse + analyze + index (nightly libFuzzer)
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     env:
@@ -76,10 +76,16 @@ jobs:
         run: cargo install cargo-fuzz --locked
       - name: Seed corpus from the conformance .gd files
         run: |
-          mkdir -p fuzz/corpus/parse
+          mkdir -p fuzz/corpus/parse fuzz/corpus/analyze
           find crates/gd_syntax/tests/conformance/corpus -name '*.gd' -exec cp {} fuzz/corpus/parse/ \;
+          find crates/gd_analyze/tests/conformance/corpus -name '*.gd' -exec cp {} fuzz/corpus/analyze/ \;
       - name: Fuzz parse (bounded)
         run: cargo +nightly fuzz run parse -- -max_total_time=60 -timeout=10
+      # Layer 2 of the three-layer gate (docs/06): the analyzer must never panic on any input the
+      # parser accepts. This step was missing — the analyze target silently rotted (it didn't even
+      # compile against the current `analyze` signature) until the v1.0.4 work tripped over it.
+      - name: Fuzz analyze (bounded)
+        run: cargo +nightly fuzz run analyze -- -max_total_time=60 -timeout=10
       # The index-invariant target's op set is change / remove: it drives `Index`'s incremental
       # mutators and asserts `verify()` holds after every mutation. `txn`'s quarantine RECOVERY path
       # is intentionally NOT fuzzed — under cargo-fuzz's debug-assertions-on build `txn` answers any

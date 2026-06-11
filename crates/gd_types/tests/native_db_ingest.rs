@@ -1,7 +1,7 @@
 //! Ingestion tests: precise assertions against the synthetic fixture, and real-format coverage
 //! against the trimmed real dump.
 
-use gd_types::{NativeClass, NativeDb, TypeRef};
+use gd_types::{NativeClass, NativeDb, NativeMember, TypeRef};
 
 const MINI: &str = include_str!("fixtures/mini_api.json");
 const TRIMMED: &str = include_str!("fixtures/trimmed_api.json");
@@ -174,4 +174,119 @@ fn trimmed_real_fixture_parses_and_chains() {
     assert!(db
         .class_named("Node")
         .is_some_and(|c| !c.methods.is_empty()));
+}
+
+// ============================================================================
+// v1.0.4 groundwork: lookup_member / lookup_builtin_member / default_value /
+// display_type (consumed by hover #35, definition stubs #34)
+// ============================================================================
+
+#[test]
+fn lookup_member_walks_inherits_and_reports_declaring_class() {
+    let db = NativeDb::from_json(MINI).expect("mini parses");
+
+    // Inherited members resolve through the chain and name the DECLARING class.
+    let (decl, m) = db.lookup_member("MiniNode", "changed").expect("signal");
+    assert_eq!(db.name_of(decl.name), "MiniObject");
+    assert!(matches!(m, NativeMember::Signal(s) if db.name_of(s.name) == "changed"));
+
+    let (decl, m) = db.lookup_member("MiniNode", "mode").expect("property");
+    assert_eq!(db.name_of(decl.name), "MiniObject");
+    assert!(matches!(m, NativeMember::Property(_)));
+
+    // Own members resolve on the class itself.
+    let (decl, m) = db.lookup_member("MiniNode", "add_child").expect("method");
+    assert_eq!(db.name_of(decl.name), "MiniNode");
+    assert!(matches!(m, NativeMember::Method(_)));
+
+    // Enum, bare constant, and enum-value shapes.
+    assert!(matches!(
+        db.lookup_member("MiniObject", "Mode"),
+        Some((_, NativeMember::Enum(e))) if db.name_of(e.name) == "Mode"
+    ));
+    assert!(matches!(
+        db.lookup_member("MiniObject", "VERSION"),
+        Some((_, NativeMember::Constant(k))) if k.value == 2
+    ));
+    match db.lookup_member("MiniNode", "MODE_B") {
+        Some((decl, NativeMember::EnumValue { owner, value, .. })) => {
+            assert_eq!(db.name_of(decl.name), "MiniObject");
+            assert_eq!(db.name_of(owner.name), "Mode");
+            assert_eq!(value, 1);
+        }
+        other => panic!("MODE_B: {other:?}"),
+    }
+
+    // Misses: unknown member, unknown class.
+    assert!(db.lookup_member("MiniNode", "nope").is_none());
+    assert!(db.lookup_member("Ghost", "changed").is_none());
+}
+
+#[test]
+fn lookup_member_terminates_on_a_cyclic_inherits_chain() {
+    // A hand-edited dump can carry an `inherits` cycle; the walk must degrade to a miss, not
+    // hang the request.
+    let db = NativeDb::from_json(
+        r#"{
+            "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+            "classes": [
+                {"name": "Yin", "inherits": "Yang"},
+                {"name": "Yang", "inherits": "Yin"}
+            ]
+        }"#,
+    )
+    .expect("ingest stores the cycle verbatim");
+    assert!(db.lookup_member("Yin", "nope").is_none());
+}
+
+#[test]
+fn lookup_builtin_member_covers_members_methods_constants() {
+    let db = NativeDb::from_json(MINI).expect("mini parses");
+    assert!(matches!(
+        db.lookup_builtin_member("Vector2", "x"),
+        Some((_, NativeMember::Property(_)))
+    ));
+    assert!(matches!(
+        db.lookup_builtin_member("Vector2", "length"),
+        Some((_, NativeMember::Method(_)))
+    ));
+    assert!(matches!(
+        db.lookup_builtin_member("Vector2", "ZERO"),
+        Some((_, NativeMember::Constant(_)))
+    ));
+    assert!(db.lookup_builtin_member("Vector2", "nope").is_none());
+}
+
+#[test]
+fn argument_default_values_survive_ingestion() {
+    let db = NativeDb::from_json(MINI).expect("mini parses");
+    let node = db.class_named("MiniNode").expect("MiniNode");
+    let add_child = method(&db, node, "add_child");
+    assert_eq!(add_child.params[0].default_value, None, "required arg");
+    let dv = add_child.params[1]
+        .default_value
+        .expect("optional arg keeps its dump default");
+    assert_eq!(db.name_of(dv), "false");
+}
+
+#[test]
+fn display_type_renders_editor_style_labels() {
+    let db = NativeDb::from_json(MINI).expect("mini parses");
+    let obj = db.class_named("MiniObject").expect("MiniObject");
+
+    let label = |name: &str| db.display_type(&method(&db, obj, name).return_type, None);
+    assert_eq!(label("get_class"), "String");
+    assert_eq!(label("_ready"), "void");
+    assert_eq!(label("call_va"), "Variant");
+    assert_eq!(label("get_children"), "Array[MiniObject]");
+    assert_eq!(label("get_table"), "Dictionary[int, String]");
+    assert_eq!(label("get_mode_enum"), "MiniObject.Mode");
+    assert_eq!(label("get_flags"), "MiniObject.Flags");
+    assert_eq!(label("get_error"), "MiniError");
+    assert_eq!(label("get_buffer_ptr"), "void*");
+
+    // Same-class scope trims; a different scope does not.
+    let mode = &method(&db, obj, "get_mode_enum").return_type;
+    assert_eq!(db.display_type(mode, Some("MiniObject")), "Mode");
+    assert_eq!(db.display_type(mode, Some("MiniNode")), "MiniObject.Mode");
 }

@@ -132,6 +132,12 @@ pub struct EnumValueDecl {
 pub struct Interface {
     /// `class_name X` for the top-level class, or the declared name of an inner `class X:`.
     pub class_name: Option<String>,
+    /// Where the `class_name` identifier sits: 1-based source line + its byte span. Lets the
+    /// registry anchor `workspace/symbol` results and `definition` jumps at the declaration
+    /// without re-parsing the file (#33). **Excluded from [`Self::signature_hash`]** like
+    /// [`MemberDecl::span`]: an edit that only shifts the declaration line must not look like an
+    /// interface change to dependents.
+    pub class_name_loc: Option<(u32, ByteSpan)>,
     pub extends: Extends,
     pub is_abstract: bool,
     /// `@tool` annotation on the class. Godot's `ClassNode::is_tool` (set from the parser's
@@ -180,6 +186,7 @@ impl Interface {
 
     fn hash_into(&self, h: &mut FxHasher) {
         self.class_name.hash(h);
+        // self.class_name_loc is intentionally NOT hashed (a span, like MemberDecl::span).
         self.extends.hash(h);
         self.is_abstract.hash(h);
         self.is_tool.hash(h);
@@ -292,6 +299,10 @@ fn extract_class(tree: &ParseTree, class: &ClassNode, annotations: &[NodeId]) ->
 
     Interface {
         class_name: ident_name(tree, class.identifier),
+        class_name_loc: class.identifier.map(|id| {
+            let n = tree.get(id);
+            (n.loc.start.line, n.span)
+        }),
         extends: extends_of(tree, class),
         is_abstract: has_annotation(tree, annotations, |n| n == "@abstract"),
         is_tool: has_annotation(tree, annotations, |n| n == "@tool"),
@@ -759,6 +770,29 @@ mod tests {
         assert_eq!(i.class_name.as_deref(), Some("Hero"));
         assert_eq!(i.extends, Extends::Names(vec!["Node2D".into()]));
         assert!(i.is_abstract);
+    }
+
+    #[test]
+    fn class_name_loc_records_identifier_line_and_span() {
+        // The common `extends`-first shape (#33): `class_name` sits on line 2, and the recorded
+        // span covers exactly the `Hero` identifier bytes.
+        let src = "extends Node2D\nclass_name Hero\n";
+        let i = iface(src);
+        let (line, span) = i.class_name_loc.expect("named class records its location");
+        assert_eq!(line, 2);
+        assert_eq!(&src[span.start..span.end], "Hero");
+        // An anonymous script records none.
+        assert!(iface("extends Node\n").class_name_loc.is_none());
+    }
+
+    #[test]
+    fn class_name_loc_is_excluded_from_signature_hash() {
+        // Shifting the declaration down a line moves the loc but must not look like an interface
+        // change to dependents (the MemberDecl::span rule).
+        let a = iface("class_name Hero\nextends Node2D\n");
+        let b = iface("# moved\n\nclass_name Hero\nextends Node2D\n");
+        assert_ne!(a.class_name_loc, b.class_name_loc);
+        assert_eq!(a.signature_hash(), b.signature_hash());
     }
 
     #[test]

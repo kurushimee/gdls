@@ -258,7 +258,11 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
             analyzed
                 .as_deref()
                 .and_then(|a| hover_attribute_member_signature(state, &parsed.tree, byte, a))
-        });
+        })
+        // v1.0.4 (#35): bare calls — an inherited native method / signal through the implicit
+        // self (`stop()` under `extends AudioStreamPlayer`), or a `@GlobalScope` utility
+        // (`print(...)`). Runs last so any project-script resolution above keeps shadowing.
+        .or_else(|| hover_bare_native_signature(state, &parsed.tree, byte, &uri));
 
     let markdown = if let Some(sig) = member_sig {
         sig
@@ -314,8 +318,10 @@ fn smallest_typed_containing(
 ///      class), found by walking the [`ClassNode::members`] list of the file's root class.
 ///   2. Cross-file: a project `class_name` registered in the [`gd_project::Index`], resolved via
 ///      [`gd_project::Index::file_id`] → the indexed file's URI + interface span.
-///   3. Native and unknown identifiers return `None` (the LSP wire = `null`); native classes
-///      don't have an `extension_api.json`-backed location to jump to.
+///   3. Native symbols (v1.0.4 #34): the class's API page is materialized as a real document
+///      under the user-level stub cache ([`crate::stubs`]) and the Location points into it —
+///      the class header for a class name, the member's rendered line for attribute /
+///      implicit-self member access. Unknown identifiers return `None` (the LSP wire = `null`).
 pub fn definition(
     state: &mut ServerState,
     params: GotoDefinitionParams,
@@ -453,8 +459,140 @@ pub fn definition(
         }
     }
 
-    // (3) Native / unknown: no location.
+    // (3) Native symbols (v1.0.4 #34): materialize the class's API page as a real read-only
+    // document under the user-level stub cache and return a standard `file://` Location into it
+    // — LSP ≤ 3.17 has no virtual-document mechanism, and the generic-LSP principle (#30) rules
+    // out custom URI schemes. Runs LAST so every project-level resolution keeps shadowing
+    // natives. Unknown identifiers still return null.
+    native_definition(state, &parsed.tree, byte, &uri, &name, &text)
+        .map(GotoDefinitionResponse::Scalar)
+}
+
+/// The native arm of [`definition`] — three cursor shapes, all anchoring into a stub
+/// materialized by [`crate::stubs::ensure_class_stub`]:
+///   1. the identifier IS a native class name → the stub's `class_name` header;
+///   2. a subscript attribute whose base type is Native (`player.stop`) → the member's line in
+///      its DECLARING class's stub;
+///   3. a bare call callee (`queue_free()` under a Node-rooted script) → the same member anchor
+///      through the file's chain native root — definition/hover symmetry (#35's bare-call path).
+///
+/// Builtin members (`v.length`) stay hover-only: builtin types have no class-page shape to
+/// materialize, so `definition` keeps returning null there. And shape 3's project-shadowing
+/// check sees interface MEMBERS only — a local `Callable` shadowing an inherited native name
+/// still jumps to the native; the interface walk can't see function bodies (accepted gap).
+fn native_definition(
+    state: &mut ServerState,
+    tree: &ParseTree,
+    byte: usize,
+    uri: &Uri,
+    name: &str,
+    text: &str,
+) -> Option<Location> {
+    let stub_root = state.options.stub_cache_dir.clone();
+
+    // 1. Native class name.
+    if state.workspace.native.class_named(name).is_some() {
+        let (path, stub) = crate::stubs::ensure_class_stub(
+            &state.stub_cache,
+            &state.workspace.native,
+            name,
+            stub_root.as_deref(),
+        )?;
+        return stub_location(&path, stub.class_line);
+    }
+
+    // 2. Subscript attribute over a Native-typed base: resolve the member to its declaring
+    // class. The analyzer result is cached (same call hover makes).
+    let attr_site = tree.iter_ids().find_map(|id| {
+        if let NodeKind::Subscript(sub) = &tree.get(id).kind {
+            if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
+                let s = tree.get(attr_id).span;
+                if s.start <= byte && byte < s.end && ident_name(tree, attr_id) == name {
+                    return Some(sub.base);
+                }
+            }
+        }
+        None
+    });
+    if let Some(Some(base_id)) = attr_site {
+        let analyzed = analyze_if_gd(state, uri, tree, text);
+        let base_dt = analyzed.as_deref().map(|a| a.types.get(base_id).clone());
+        if let Some(base_dt) = base_dt {
+            if base_dt.kind == gd_analyze::DtKind::Native && !base_dt.native_type.is_empty() {
+                return native_member_stub_location(
+                    state,
+                    &base_dt.native_type,
+                    name,
+                    stub_root.as_deref(),
+                );
+            }
+        }
+        // Deliberate stop, not a fall-through miss: the cursor names an ATTRIBUTE site, so
+        // the bare-call arm below can never describe it — and a non-Native base is project
+        // territory the script arms already resolved (or correctly failed to) before this
+        // function ran. Falling through could only mis-anchor the name at an unrelated bare
+        // call elsewhere in the file.
+        return None;
+    }
+
+    // 3. Bare call callee through the implicit self — the file's chain native root, with
+    // project members shadowing (the hover bare-call rule).
+    let is_bare_callee = tree.iter_ids().any(|id| {
+        if let NodeKind::Call(c) = &tree.get(id).kind {
+            if let Some(callee) = c.callee {
+                if let NodeKind::Identifier(i) = &tree.get(callee).kind {
+                    let s = tree.get(callee).span;
+                    return s.start <= byte && byte < s.end && i.name == name;
+                }
+            }
+        }
+        false
+    });
+    if is_bare_callee {
+        let fid = uri_to_path(uri).and_then(|p| state.workspace.index.file_id(&p))?;
+        let (chain, root) = state
+            .workspace
+            .index
+            .extends_chain_files(fid, &state.workspace.native);
+        let declared_in_project = chain.iter().any(|f| {
+            state
+                .workspace
+                .index
+                .interface(*f)
+                .is_some_and(|i| i.members.iter().any(|m| m.name == name))
+        });
+        if declared_in_project {
+            return None;
+        }
+        return native_member_stub_location(state, &root?, name, stub_root.as_deref());
+    }
     None
+}
+
+/// Materialize the stub of the class DECLARING `member` (found by the chain walk from `class`)
+/// and anchor at the member's rendered line.
+fn native_member_stub_location(
+    state: &ServerState,
+    class: &str,
+    member: &str,
+    stub_root: Option<&str>,
+) -> Option<Location> {
+    let db = &state.workspace.native;
+    let (decl, _) = db.lookup_member(class, member)?;
+    let declaring = db.name_of(decl.name).to_owned();
+    let (path, stub) =
+        crate::stubs::ensure_class_stub(&state.stub_cache, db, &declaring, stub_root)?;
+    stub_location(&path, *stub.member_lines.get(member)?)
+}
+
+/// A zero-width Location at the start of `line` (0-based) in the stub at `path`.
+fn stub_location(path: &camino::Utf8Path, line: u32) -> Option<Location> {
+    let uri = path_to_file_uri(path)?;
+    let pos = Position::new(line, 0);
+    Some(Location {
+        uri,
+        range: lsp_types::Range::new(pos, pos),
+    })
 }
 
 /// Run the analyzer if `uri` points to a `.gd` file. Mirrors the gate used in `publish_diagnostics`
@@ -541,9 +679,14 @@ fn render_hover(
     // the M5 verification report; those still fall through to the typed-ancestor branch below.)
     let leaf_type_label: Option<String> = match &leaf.kind {
         NodeKind::Identifier(ident) => {
-            if state.workspace.native.class_named(&ident.name).is_some() {
+            if let Some(class) = state.workspace.native.class_named(&ident.name) {
+                // v1.0.4 (#35): the editor-LSP declaration line (`<Native> class X extends Y`)
+                // instead of the bare name — the docs append below as before.
                 native_lookup = Some(ident.name.clone());
-                Some(ident.name.clone())
+                Some(crate::native_render::class_detail(
+                    &state.workspace.native,
+                    class,
+                ))
             } else if state.workspace.index.registry().get(&ident.name).is_some() {
                 Some(ident.name.clone())
             } else {
@@ -580,10 +723,13 @@ fn render_hover(
     // rather than this leaf identifier.
     if native_lookup.is_none() {
         if let NodeKind::Identifier(ident) = &node.kind {
-            if state.workspace.native.class_named(&ident.name).is_some() {
+            if let Some(class) = state.workspace.native.class_named(&ident.name) {
                 if md.is_empty() {
                     md.push_str("```gdscript\n");
-                    md.push_str(&ident.name);
+                    md.push_str(&crate::native_render::class_detail(
+                        &state.workspace.native,
+                        class,
+                    ));
                     md.push('\n');
                     md.push_str("```");
                 }
@@ -665,27 +811,144 @@ fn hover_member_signature(
         return None;
     }
 
-    // Get the base expression's resolved type — must be a project Script kind.
-    let base_dt = analyzed.types.get(base_id);
-    if base_dt.kind != DtKind::Script {
-        return None;
-    }
-    let script_ref = base_dt.script_type.as_ref()?;
-    let callee_file = script_ref.file;
-
-    // Look up the method name in the callee file's interface.
     let fn_name = &call_node.function_name;
     if fn_name.is_empty() {
         return None;
     }
-    let iface = state.workspace.index.interface(callee_file)?;
-    let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
 
-    let sig = format_func_signature(fn_name, decl);
-    let mut md = String::from("```gdscript\n");
-    md.push_str(&sig);
-    md.push_str("\n```");
-    Some(md)
+    // The base expression's resolved type routes the lookup: a project Script kind reads the
+    // declaring interface; a Native (or Builtin) kind reads the NativeDb (v1.0.4 #35 — these
+    // used to fall through to the bare expression-type label, `stop()` → `Nil`).
+    let base_dt = analyzed.types.get(base_id);
+    match base_dt.kind {
+        DtKind::Script => {
+            let script_ref = base_dt.script_type.as_ref()?;
+            let callee_file = script_ref.file;
+
+            // Look up the method name in the callee file's interface.
+            let iface = state.workspace.index.interface(callee_file)?;
+            let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
+
+            let sig = format_func_signature(fn_name, decl);
+            let mut md = String::from("```gdscript\n");
+            md.push_str(&sig);
+            md.push_str("\n```");
+            Some(md)
+        }
+        DtKind::Native if !base_dt.native_type.is_empty() => {
+            let (decl, member) = state
+                .workspace
+                .native
+                .lookup_member(&base_dt.native_type, fn_name)?;
+            let declaring = state.workspace.native.name_of(decl.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        DtKind::Builtin => {
+            let bt_name = gd_analyze::data_type::variant_type_name(base_dt.builtin_type);
+            let (bt, member) = state
+                .workspace
+                .native
+                .lookup_builtin_member(bt_name, fn_name)?;
+            let declaring = state.workspace.native.name_of(bt.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The fenced native-member hover body: the declaration line in Godot's detail format, then the
+/// member's docstring when the dump carries one (`append_class_docs`-style) — never the bare
+/// expression type (#35).
+fn native_member_hover_md(
+    db: &gd_types::NativeDb,
+    declaring: &str,
+    member: &gd_types::NativeMember,
+) -> String {
+    let sig = crate::native_render::member_detail(db, declaring, member);
+    let mut md = format!("```gdscript\n{sig}\n```");
+    let desc = match member {
+        gd_types::NativeMember::Method(m) => m.description.as_str(),
+        gd_types::NativeMember::Property(p) => p.description.as_str(),
+        gd_types::NativeMember::Signal(s) => s.description.as_str(),
+        _ => "",
+    };
+    if !desc.is_empty() {
+        md.push_str("\n\n");
+        md.push_str(desc);
+    }
+    md
+}
+
+/// Bare-call hover (v1.0.4 #35): the callee identifier of `stop()` under
+/// `extends AudioStreamPlayer` resolves through the file's chain native root; `print(...)`
+/// resolves as a `@GlobalScope` utility. Project members shadow natives — a name declared
+/// anywhere in the file's extends chain returns `None` so the project-script paths own it.
+/// Interface MEMBERS only: a local `Callable` shadowing an inherited native name still hovers
+/// as the native — the interface walk can't see function bodies (accepted gap, same as
+/// [`native_definition`]'s bare-call arm).
+fn hover_bare_native_signature(
+    state: &ServerState,
+    tree: &ParseTree,
+    cursor_byte: usize,
+    uri: &Uri,
+) -> Option<String> {
+    // A Call whose callee is a BARE identifier spanning the cursor. Callee identifier spans are
+    // disjoint source tokens, so the first hit is the only hit.
+    let callee_name = tree.iter_ids().find_map(|id| {
+        let node = tree.get(id);
+        if let NodeKind::Call(c) = &node.kind {
+            let callee = c.callee?;
+            if let NodeKind::Identifier(i) = &tree.get(callee).kind {
+                let s = tree.get(callee).span;
+                if s.start <= cursor_byte && cursor_byte < s.end {
+                    return Some(i.name.clone());
+                }
+            }
+        }
+        None
+    })?;
+
+    let db = &state.workspace.native;
+    if let Some(fid) = crate::uri::uri_to_path(uri).and_then(|p| state.workspace.index.file_id(&p))
+    {
+        let (chain, root) = state.workspace.index.extends_chain_files(fid, db);
+        let declared_in_project = chain.iter().any(|f| {
+            state
+                .workspace
+                .index
+                .interface(*f)
+                .is_some_and(|i| i.members.iter().any(|m| m.name == callee_name))
+        });
+        if declared_in_project {
+            return None;
+        }
+        if let Some(root) = root {
+            if let Some((decl, member)) = db.lookup_member(&root, &callee_name) {
+                // Only callable shapes — a bare property/constant identifier isn't a call.
+                if matches!(
+                    member,
+                    gd_types::NativeMember::Method(_) | gd_types::NativeMember::Signal(_)
+                ) {
+                    let declaring = db.name_of(decl.name).to_owned();
+                    return Some(native_member_hover_md(db, &declaring, &member));
+                }
+            }
+        }
+    }
+    // `@GlobalScope` utility — also reachable in buffers outside the project index.
+    let u = db.utility(&callee_name)?;
+    Some(format!(
+        "```gdscript\n{}\n```",
+        crate::native_render::utility_detail(db, u)
+    ))
 }
 
 /// Render a `MemberDecl`'s params as `name: Type, …` — zip `param_names` and `params` in lockstep;
@@ -787,13 +1050,46 @@ fn hover_attribute_member_signature(
     } else {
         None
     };
-    let decl = [binding_iface, direct_iface]
+    if let Some(decl) = [binding_iface, direct_iface]
         .into_iter()
         .flatten()
-        .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))?;
+        .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))
+    {
+        let sig = format_member_signature(name, decl)?;
+        return Some(format!("```gdscript\n{sig}\n```"));
+    }
 
-    let sig = format_member_signature(name, decl)?;
-    Some(format!("```gdscript\n{sig}\n```"))
+    // v1.0.4 (#35): no project declaration — a Native (or Builtin) base reads the NativeDb:
+    // `player.volume_db`, `Input.MOUSE_MODE_CAPTURED`, an uncalled `player.stop` reference,
+    // `Vector2.ZERO`. These used to fall through to the bare expression-type label.
+    match base_dt.kind {
+        DtKind::Native if !base_dt.native_type.is_empty() => {
+            let (decl, member) = state
+                .workspace
+                .native
+                .lookup_member(&base_dt.native_type, name)?;
+            let declaring = state.workspace.native.name_of(decl.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        DtKind::Builtin => {
+            let bt_name = gd_analyze::data_type::variant_type_name(base_dt.builtin_type);
+            let (bt, member) = state
+                .workspace
+                .native
+                .lookup_builtin_member(bt_name, name)?;
+            let declaring = state.workspace.native.name_of(bt.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Render a [`gd_project::MemberDecl`]'s declaration shape — the one formatter behind both the
@@ -1266,13 +1562,15 @@ fn member_decl_location(
 fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<Location> {
     let entry = state.workspace.index.registry().get(name)?;
     let path = entry.path.clone();
+    let indexed_span = entry.name_span;
     let uri = path_to_file_uri(&path)?;
     let uri_str = uri.as_str().to_owned();
 
-    // Open buffer: reuse the cached parse. Closed file: read + parse directly. The parse cache is
-    // content-addressed now (see `workspace::CacheEntry`), so caching this closed-file read would
-    // be correct — but a one-shot nav lookup needn't populate the hot open-buffer cache, so we
-    // parse directly and leave it uncluttered.
+    // Open buffer: reuse the cached parse — an edited buffer is newer than the index, so the live
+    // tree is the only correct span source. Closed file: the registry's recorded identifier span
+    // (#33) replaces the old per-lookup re-parse, accepted only while its bytes still spell the
+    // class name — a watcher-lagged index (the file shifted or shrank underneath the recorded
+    // span) falls back to a fresh parse instead of anchoring at stale coordinates.
     let (ident_span, text) = if let Some(text) = state.vfs.get(&uri_str).map(|d| d.text()) {
         let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
         (root_class_identifier_span(&parsed.tree)?, text)
@@ -1286,8 +1584,12 @@ fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<L
                 return None;
             }
         };
-        let tree = gd_syntax::parse(&text).tree;
-        (root_class_identifier_span(&tree)?, text)
+        if text.get(indexed_span.start..indexed_span.end) == Some(name) {
+            (indexed_span, text)
+        } else {
+            let tree = gd_syntax::parse(&text).tree;
+            (root_class_identifier_span(&tree)?, text)
+        }
     };
 
     // Build the location's range against a rope of the target's text. The path may live outside
@@ -2866,14 +3168,16 @@ pub fn workspace_symbol(
     );
     let mut candidates: Vec<Candidate> = Vec::new();
 
-    // Class-name registry entries — top-level class declarations across the project.
+    // Class-name registry entries — top-level class declarations across the project, anchored at
+    // the `class_name` identifier's recorded line (#33; line 1 only as the registry's defensive
+    // default).
     for (name, entry) in state.workspace.index.registry().entries() {
         candidates.push((
             name.to_string(),
             LspSymbolKind::CLASS,
             None,
             entry.path.clone(),
-            1,
+            entry.line,
             true,
         ));
     }

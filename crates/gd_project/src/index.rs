@@ -108,8 +108,13 @@ impl Index {
         // Drop any class_name this file used to declare, then register its current one.
         self.registry.remove_by_path(&key);
         if let Some(name) = &iface.class_name {
-            self.registry
-                .insert(name.clone(), &key, &iface.extends, iface.is_abstract);
+            self.registry.insert(
+                name.clone(),
+                &key,
+                &iface.extends,
+                iface.is_abstract,
+                iface.class_name_loc,
+            );
         }
         self.interfaces.insert(fid, iface);
         fid
@@ -316,6 +321,49 @@ impl Index {
     /// build the base's `DataType` itself.
     pub fn resolve_res_path(&self, res: &str) -> Option<FileId> {
         self.resolve_path(res)
+    }
+
+    /// Walk `fid`'s extends chain — `fid` first, then each project-script ancestor — to its
+    /// native root. Returns the visited project files plus the first native class name reached:
+    /// `None` when a link is unknown/unresolvable or the chain cycles; an absent `extends`
+    /// clause roots at `RefCounted` (Godot's scriptless default, the `gd_analyze::script_chain`
+    /// convention). Dotted `extends Outer.Inner` is approximated by its head: the walk
+    /// continues through `Outer`'s file root, not the inner class's own base. Server-side
+    /// consumers only — the implicit-self hover/definition paths (#34/#35); the analyzer's
+    /// equivalent walk lives in `gd_analyze::script_chain`.
+    pub fn extends_chain_files(
+        &self,
+        fid: FileId,
+        native: &NativeDb,
+    ) -> (Vec<FileId>, Option<String>) {
+        let mut files = Vec::new();
+        let mut cur = fid;
+        loop {
+            if files.contains(&cur) {
+                return (files, None); // cycle — root unknowable
+            }
+            files.push(cur);
+            let Some(iface) = self.interfaces.get(&cur) else {
+                return (files, None);
+            };
+            match &iface.extends {
+                Extends::None => return (files, Some("RefCounted".to_owned())),
+                Extends::Path(p) => match self.resolve_path(p) {
+                    Some(next) => cur = next,
+                    None => return (files, None),
+                },
+                Extends::Names(names) => {
+                    let Some(head) = names.first() else {
+                        return (files, None);
+                    };
+                    match self.resolve_name(head, native) {
+                        Resolution::Script(next) => cur = next,
+                        Resolution::Native => return (files, Some(head.clone())),
+                        Resolution::Unknown => return (files, None),
+                    }
+                }
+            }
+        }
     }
 
     /// `res://…` → its absolute path under the project root — a pure path-join with **no existence
@@ -1095,6 +1143,7 @@ impl IndexMut<'_> {
             &normalize(Utf8Path::new("/fuzz/ghost_never_interned.gd")),
             &Extends::None,
             false,
+            None,
         );
     }
 }
@@ -1673,7 +1722,7 @@ mod tests {
         let mut idx = Index::new(Utf8PathBuf::from("/proj"));
         let ghost = normalize(&abs("ghost.gd"));
         idx.registry
-            .insert("Ghost".to_string(), &ghost, &Extends::None, false);
+            .insert("Ghost".to_string(), &ghost, &Extends::None, false, None);
 
         match idx.verify() {
             Err(v) if v.len() == 1 && matches!(v[0], IndexInvariant::DanglingClassName { .. }) => {}
@@ -1801,6 +1850,7 @@ mod tests {
                 &normalize(&abs("ghost.gd")),
                 &Extends::None,
                 false,
+                None,
             );
             panic!("simulated mid-mutation panic after a partial registry write");
         });

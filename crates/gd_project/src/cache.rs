@@ -38,7 +38,10 @@ use crate::index::{Index, IndexCache};
 /// v2: `Interface` gained `unnamed_enum_values` and `EnumDecl.values` became
 /// `Vec<EnumValueDecl { name, value }>` — a v1 cache would deserialize-fail or, worse,
 /// misclassify every anonymous-enum const as a regular const, so v1 files are ignored.
-pub const CACHE_FORMAT_VERSION: u32 = 2;
+///
+/// v3: `Interface` gained `class_name_loc` and `ClassEntry` gained `line`/`name_span` (#33) — a
+/// v2 cache would deserialize-fail (missing fields), so v2 files are ignored and rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 3;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool

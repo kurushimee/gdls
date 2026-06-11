@@ -370,19 +370,18 @@ fn definition_jumps_to_in_file_function_declaration() {
 
 #[test]
 fn definition_on_unknown_name_returns_null() {
-    // `extends Node` references `Node`. With no `extension_api.json` loaded the boot has an empty
-    // native DB, the analyzer is permissive (WP-G), and the index has no project `class_name`
-    // matching "Node". The definition request must resolve to `null` (no jump target), not error.
+    // `extends FrobnicateWidget` references a name that is neither a project `class_name` nor a
+    // class in the native DB (the default boot serves the embedded stock fallback since v1.0.2).
+    // The definition request must resolve to `null` (no jump target), not error. KNOWN native
+    // names are no longer null — they jump into a materialized API stub (#34; pinned by
+    // `definition_on_native_symbols_jumps_into_materialized_stubs`).
     let (client, handle) = boot();
     let uri: Uri = "file:///test/unknown.gd".parse().unwrap();
-    did_open(&client, &uri, "extends Node\n");
+    did_open(&client, &uri, "extends FrobnicateWidget\n");
 
-    // `Node` is at line 0, columns 8..12.
+    // `FrobnicateWidget` is at line 0, columns 8..24.
     let response = definition_at(&client, &uri, Position::new(0, 10));
-    assert!(
-        response.is_none(),
-        "unknown native + no class_name ⇒ null, got {response:?}"
-    );
+    assert!(response.is_none(), "unknown name ⇒ null, got {response:?}");
 
     shutdown(&client, handle);
 }
@@ -1092,6 +1091,311 @@ fn did_save_triggers_a_diagnostic_republish() {
         panic!("expected publishDiagnostics notification, got {msg:?}");
     };
     assert_eq!(note.method, "textDocument/publishDiagnostics");
+
+    shutdown(&client, handle);
+}
+
+/// v1.0.4 (#35): hover on native members renders the editor-LSP declaration line — never the
+/// bare expression type (`stop()` used to hover as `Nil`, `volume_db` as `float`). Covers every
+/// repro row from the issue: attribute callee, property, class name, enum constant, bare
+/// implicit-self call, builtin method, and a `@GlobalScope` utility — plus member docs after
+/// the fence when the dump carries them.
+#[test]
+fn hover_native_members_render_declaration_lines() {
+    let fixture = tempfile::tempdir().expect("create fixture dir");
+    let fixture_dir = fixture.path().to_path_buf();
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    let api_path = fixture_dir.join("extension_api.json");
+    std::fs::write(
+        &api_path,
+        r#"{
+        "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
+        "builtin_classes": [
+            {"name": "Vector2", "is_keyed": false,
+             "methods": [{"name": "length", "is_const": true, "is_static": false,
+                          "is_vararg": false, "return_type": "float", "arguments": []}]}
+        ],
+        "classes": [
+            {"name": "Object", "is_instantiable": true},
+            {"name": "Node", "inherits": "Object", "is_instantiable": true},
+            {"name": "AudioStreamPlayer", "inherits": "Node", "is_instantiable": true,
+             "properties": [{"name": "volume_db", "type": "float",
+                             "setter": "set_volume_db", "getter": "get_volume_db"}],
+             "methods": [{"name": "stop", "is_const": false, "is_static": false,
+                          "is_vararg": false, "is_virtual": false, "hash": 1, "arguments": [],
+                          "description": "Stops the audio."}]},
+            {"name": "Input", "inherits": "Object", "is_instantiable": true,
+             "enums": [{"name": "MouseMode", "is_bitfield": false,
+                        "values": [{"name": "MOUSE_MODE_CAPTURED", "value": 2}]}]}
+        ],
+        "utility_functions": [
+            {"name": "print", "category": "general", "is_vararg": true, "arguments": []}
+        ]
+    }"#,
+    )
+    .expect("write fixture JSON");
+
+    let src = "extends AudioStreamPlayer\n\
+               func _ready() -> void:\n\
+               \tvar player := AudioStreamPlayer.new()\n\
+               \tplayer.stop()\n\
+               \tplayer.volume_db = 0.0\n\
+               \tvar mode := Input.MOUSE_MODE_CAPTURED\n\
+               \tvar v: Vector2\n\
+               \tstop()\n\
+               \tprint([mode, v.length()])\n";
+    let script_path = fixture_dir.join("main.gd");
+    std::fs::write(&script_path, src).expect("write main.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+        "extensionApiPath": api_path.to_string_lossy().as_ref(),
+        "autoDumpExtensionApi": false,
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+    let uri: Uri = format!(
+        "file:///{}",
+        script_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &uri, src);
+
+    let md_at = |line: u32, character: u32, what: &str| -> String {
+        let hover = hover_at(&client, &uri, Position::new(line, character))
+            .unwrap_or_else(|| panic!("hover must answer on {what} at {line}:{character}"));
+        hover_markdown(&hover).to_string()
+    };
+
+    // Class name (`extends AudioStreamPlayer`) → the editor-LSP class line + nothing lost.
+    let md = md_at(0, 12, "class name");
+    assert!(
+        md.contains("<Native> class AudioStreamPlayer extends Node"),
+        "class hover renders the declaration line, got {md:?}"
+    );
+
+    // Attribute callee: `player.stop()` → the full signature, with the member doc after.
+    let md = md_at(3, 9, "player.stop callee");
+    assert!(
+        md.contains("func AudioStreamPlayer.stop() -> void"),
+        "method hover renders the signature, not `Nil`, got {md:?}"
+    );
+    assert!(
+        md.contains("Stops the audio."),
+        "member description renders after the fence, got {md:?}"
+    );
+
+    // Property attribute: `player.volume_db` → var line, not `float`.
+    let md = md_at(4, 10, "player.volume_db");
+    assert!(
+        md.contains("var AudioStreamPlayer.volume_db: float"),
+        "property hover renders the declaration, got {md:?}"
+    );
+
+    // Native class meta + enum value: `Input.MOUSE_MODE_CAPTURED`.
+    let md = md_at(5, 14, "Input class name");
+    assert!(
+        md.contains("<Native> class Input extends Object"),
+        "got {md:?}"
+    );
+    let md = md_at(5, 25, "MOUSE_MODE_CAPTURED");
+    assert!(
+        md.contains("const Input.MOUSE_MODE_CAPTURED: MouseMode = 2"),
+        "enum-value hover renders the const line, got {md:?}"
+    );
+
+    // Bare implicit-self call: `stop()` under `extends AudioStreamPlayer`.
+    let md = md_at(7, 2, "bare stop()");
+    assert!(
+        md.contains("func AudioStreamPlayer.stop() -> void"),
+        "bare inherited call resolves through the chain root, got {md:?}"
+    );
+
+    // Builtin method + utility function.
+    let md = md_at(8, 17, "v.length()");
+    assert!(
+        md.contains("func Vector2.length() -> float"),
+        "builtin method hover renders the signature, got {md:?}"
+    );
+    let md = md_at(8, 2, "print utility");
+    assert!(
+        md.contains("func print(...) -> void"),
+        "utility hover renders the vararg signature, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// v1.0.4 (#34): definition on native symbols materializes the class API as a real document
+/// under the (test-overridden) stub cache and returns a plain `file://` Location into it —
+/// class names anchor at the `class_name` header, member access anchors at the member's
+/// rendered declaration line (in the DECLARING class's stub), and implicit-self bare calls
+/// resolve through the chain root. Opening a stub publishes EMPTY diagnostics (an API page
+/// need not be analyzable GDScript). Project classes keep shadowing the native arm.
+#[test]
+fn definition_on_native_symbols_jumps_into_materialized_stubs() {
+    let fixture = tempfile::tempdir().expect("create fixture dir");
+    let fixture_dir = fixture.path().to_path_buf();
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    let stub_cache = fixture_dir.join("stub-cache");
+    let api_path = fixture_dir.join("extension_api.json");
+    std::fs::write(
+        &api_path,
+        r#"{
+        "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
+        "classes": [
+            {"name": "Object", "is_instantiable": true},
+            {"name": "Node", "inherits": "Object", "is_instantiable": true,
+             "methods": [{"name": "queue_free", "is_const": false, "is_static": false,
+                          "is_vararg": false, "is_virtual": false, "hash": 1, "arguments": []}]},
+            {"name": "AudioStreamPlayer", "inherits": "Node", "is_instantiable": true,
+             "properties": [{"name": "volume_db", "type": "float",
+                             "setter": "set_volume_db", "getter": "get_volume_db"}],
+             "methods": [{"name": "stop", "is_const": false, "is_static": false,
+                          "is_vararg": false, "is_virtual": false, "hash": 2, "arguments": []}]}
+        ]
+    }"#,
+    )
+    .expect("write fixture JSON");
+    // A project class that shares a workflow with natives — must keep shadowing them.
+    std::fs::write(
+        fixture_dir.join("shadow.gd"),
+        "class_name ShadowHero\nextends Node\n",
+    )
+    .expect("write shadow.gd");
+
+    let src = "extends AudioStreamPlayer\n\
+               func _ready() -> void:\n\
+               \tvar player: AudioStreamPlayer\n\
+               \tplayer.stop()\n\
+               \tqueue_free()\n\
+               \tvar h: ShadowHero\n\
+               \tprint_debug([player, h])\n";
+    let script_path = fixture_dir.join("main.gd");
+    std::fs::write(&script_path, src).expect("write main.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+        "extensionApiPath": api_path.to_string_lossy().as_ref(),
+        "autoDumpExtensionApi": false,
+        "stubCacheDir": stub_cache.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+    let uri: Uri = format!(
+        "file:///{}",
+        script_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &uri, src);
+
+    let location_at = |line: u32, character: u32, what: &str| -> lsp_types::Location {
+        match definition_at(&client, &uri, Position::new(line, character))
+            .unwrap_or_else(|| panic!("definition must answer on {what} at {line}:{character}"))
+        {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            other => panic!("{what}: expected scalar Location, got {other:?}"),
+        }
+    };
+
+    // 1. Class name (`extends AudioStreamPlayer`) → the stub's class_name header.
+    let loc = location_at(0, 12, "native class name");
+    let stub_path = gd_server::uri::uri_to_path(&loc.uri).expect("stub uri is a file path");
+    assert!(
+        stub_path
+            .as_std_path()
+            .starts_with(std::path::Path::new(&stub_cache)),
+        "stub lands under the overridden cache root, got {stub_path:?}"
+    );
+    assert!(stub_path.as_str().ends_with("AudioStreamPlayer.gd"));
+    let stub_text =
+        std::fs::read_to_string(stub_path.as_std_path()).expect("stub file exists on disk");
+    let header_line = stub_text
+        .lines()
+        .nth(loc.range.start.line as usize)
+        .expect("class_line within the stub");
+    assert_eq!(header_line, "class_name AudioStreamPlayer");
+    assert!(
+        stub_text.contains("func stop() -> void") && stub_text.contains("var volume_db: float"),
+        "the page renders the whole API, got:\n{stub_text}"
+    );
+
+    // 2. Member attribute (`player.stop`) → the member's line in the stub.
+    let loc = location_at(3, 9, "member attribute");
+    let asp_stub_uri = loc.uri.clone();
+    let stub_text = std::fs::read_to_string(
+        gd_server::uri::uri_to_path(&loc.uri)
+            .expect("file uri")
+            .as_std_path(),
+    )
+    .expect("stub readable");
+    assert_eq!(
+        stub_text
+            .lines()
+            .nth(loc.range.start.line as usize)
+            .unwrap(),
+        "func stop() -> void",
+        "member access anchors at the rendered declaration"
+    );
+
+    // 3. Implicit-self bare call (`queue_free()`) → the DECLARING class's stub (Node).
+    let loc = location_at(4, 3, "bare inherited call");
+    let path = gd_server::uri::uri_to_path(&loc.uri).expect("file uri");
+    assert!(
+        path.as_str().ends_with("Node.gd"),
+        "declaring class owns the stub, got {path:?}"
+    );
+    let stub_text = std::fs::read_to_string(path.as_std_path()).expect("Node stub readable");
+    assert_eq!(
+        stub_text
+            .lines()
+            .nth(loc.range.start.line as usize)
+            .unwrap(),
+        "func queue_free() -> void"
+    );
+
+    // 4. A project class keeps shadowing the native arm.
+    let loc = location_at(5, 9, "project class");
+    assert!(
+        loc.uri.as_str().ends_with("/shadow.gd"),
+        "project class_name wins over stub materialization, got {:?}",
+        loc.uri
+    );
+
+    // 5. Opening a stub publishes EMPTY diagnostics.
+    let stub_uri = asp_stub_uri;
+    let stub_doc = std::fs::read_to_string(
+        gd_server::uri::uri_to_path(&stub_uri)
+            .expect("file uri")
+            .as_std_path(),
+    )
+    .unwrap();
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            serde_json::to_value(lsp_types::DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: stub_uri.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 1,
+                    text: stub_doc,
+                },
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let Message::Notification(n) = recv(&client) else {
+        panic!("expected publishDiagnostics after didOpen");
+    };
+    assert_eq!(n.method, "textDocument/publishDiagnostics");
+    let params: lsp_types::PublishDiagnosticsParams = serde_json::from_value(n.params).unwrap();
+    assert_eq!(params.uri.as_str(), stub_uri.as_str());
+    assert!(
+        params.diagnostics.is_empty(),
+        "a stub buffer must not self-diagnose, got {:?}",
+        params.diagnostics
+    );
 
     shutdown(&client, handle);
 }

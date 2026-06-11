@@ -43,6 +43,10 @@ pub struct InitializationOptions {
     /// ([`MemoryConfig::cache_capacity`], [`super::memory::DEFAULT_SOFT_CAP_MB`],
     /// [`super::memory::DEFAULT_HARD_CAP_MB`]).
     pub memory: MemoryConfig,
+    /// v1.0.4 (#34): override the root under which native-class API stubs are materialized
+    /// (default: the user-level gdls cache — `%LOCALAPPDATA%\gdls` / `~/.cache/gdls`). The
+    /// in-process integration tests point this at a tempdir; end users normally leave it unset.
+    pub stub_cache_dir: Option<String>,
 }
 
 /// Manual so `parse(None)`, `parse(Some({}))`, and a missing single field all agree —
@@ -59,6 +63,7 @@ impl Default for InitializationOptions {
             strict: StrictConfig::default(),
             analyzer: AnalyzerConfig::default(),
             memory: MemoryConfig::default(),
+            stub_cache_dir: None,
         }
     }
 }
