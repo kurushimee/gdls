@@ -2411,6 +2411,26 @@ pub fn prepare_call_hierarchy(
     if let Some(node_id) = parsed.tree.innermost_node_at(byte) {
         if let Some(name) = cursor_identifier(&parsed.tree, node_id) {
             if let Some(analyzed) = analyze_if_gd(state, &uri, &parsed.tree, &text) {
+                // Unlike references' subscript-only `callee_ident_spans` (bare callees ride
+                // `Binding::Use` there), prepare needs BOTH callee shapes: a bare in-file call
+                // (`_find_attached_meshes()`) records a `Binding::Call` too, and the cursor on
+                // its identifier must prepare that callee rather than the enclosing function.
+                let build_spans = || {
+                    let mut map = callee_ident_spans(&parsed.tree);
+                    for nid in parsed.tree.iter_ids() {
+                        let node = parsed.tree.get(nid);
+                        let NodeKind::Call(call) = &node.kind else {
+                            continue;
+                        };
+                        let Some(callee_id) = call.callee else {
+                            continue;
+                        };
+                        if matches!(parsed.tree.get(callee_id).kind, NodeKind::Identifier(_)) {
+                            map.insert(node.span, parsed.tree.get(callee_id).span);
+                        }
+                    }
+                    map
+                };
                 let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
                 let target = analyzed.bindings().iter().find_map(|b| match b {
                     Binding::Call {
@@ -2419,7 +2439,7 @@ pub fn prepare_call_hierarchy(
                         call_site,
                         ..
                     } if callee_name == &name => {
-                        let spans = spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
+                        let spans = spans.get_or_insert_with(build_spans);
                         let ident = spans.get(call_site).copied()?;
                         (ident.start <= byte && byte < ident.end).then_some(*f)
                     }
