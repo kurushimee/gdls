@@ -47,9 +47,35 @@ const ERR_CONTENT_MODIFIED: i32 = -32801;
 /// the actionable error promptly while a single `symlink_metadata` every 3 s is a non-event for CPU.
 const WATCHER_LIVENESS_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Client capabilities gdls branches on, captured once at `initialize` (the position encoding
+/// negotiates separately into [`ServerState::encoding`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ClientCaps {
+    /// `textDocument.documentSymbol.hierarchicalDocumentSymbolSupport`. Absent ⇒ `false` ⇒ the
+    /// flat 3.16 `SymbolInformation[]` documentSymbol shape (rust-analyzer's
+    /// `.unwrap_or_default()` convention): a client that did not opt in must not receive the
+    /// nested shape it declined.
+    pub(crate) hierarchical_document_symbols: bool,
+}
+
+impl ClientCaps {
+    fn negotiate(caps: &lsp_types::ClientCapabilities) -> Self {
+        ClientCaps {
+            hierarchical_document_symbols: caps
+                .text_document
+                .as_ref()
+                .and_then(|t| t.document_symbol.as_ref())
+                .and_then(|d| d.hierarchical_document_symbol_support)
+                .unwrap_or(false),
+        }
+    }
+}
+
 /// All mutable server state for one session.
 pub struct ServerState {
     pub(crate) encoding: PositionEncoding,
+    /// Client capabilities captured at `initialize` — see [`ClientCaps`].
+    pub(crate) caps: ClientCaps,
     /// Parsed `initializationOptions`. Consumed by [`Workspace::load`] at startup to seed the
     /// native API path and the strict-mode policy; retained on the server state so the
     /// filesystem watcher can call [`Workspace::reload_project_and_native`] and
@@ -167,6 +193,7 @@ fn serve_inner(
     let init: InitializeParams = serde_json::from_value(init_value)?;
 
     let encoding = PositionEncoding::negotiate(&init.capabilities);
+    let caps = ClientCaps::negotiate(&init.capabilities);
     let options = InitializationOptions::parse(init.initialization_options.as_ref());
     let root = resolve_root(&options, &init);
 
@@ -261,6 +288,7 @@ fn serve_inner(
     warn_if_cold_index_exceeds_budget(post_cold_index_rss, &budget);
     let mut state = ServerState {
         encoding,
+        caps,
         options,
         workspace,
         vfs: Vfs::default(),
@@ -1624,6 +1652,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<Message>();
         let state = ServerState {
             encoding: PositionEncoding::Utf16,
+            caps: ClientCaps::default(),
             options,
             workspace,
             vfs: Vfs::default(),
@@ -1671,6 +1700,7 @@ mod tests {
         rss.sample_now("test_baseline");
         let state = ServerState {
             encoding: PositionEncoding::Utf16,
+            caps: ClientCaps::default(),
             options,
             workspace,
             vfs: Vfs::default(),
@@ -1886,6 +1916,7 @@ mod tests {
         let budget = MemoryBudget::from_caps_mb(1, u64::MAX / (1024 * 1024 * 2));
         let mut state = ServerState {
             encoding: PositionEncoding::Utf16,
+            caps: ClientCaps::default(),
             options,
             workspace,
             vfs: Vfs::default(),

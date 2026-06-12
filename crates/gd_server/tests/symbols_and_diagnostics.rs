@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
-    ClientCapabilities, DocumentSymbol, DocumentSymbolParams, GeneralClientCapabilities,
-    InitializeParams, InitializedParams, Position, PositionEncodingKind, PublishDiagnosticsParams,
-    SymbolKind, TextDocumentIdentifier, TextDocumentItem, Uri,
+    ClientCapabilities, DocumentSymbol, DocumentSymbolClientCapabilities, DocumentSymbolParams,
+    GeneralClientCapabilities, InitializeParams, InitializedParams, Position, PositionEncodingKind,
+    PublishDiagnosticsParams, SymbolInformation, SymbolKind, TextDocumentClientCapabilities,
+    TextDocumentIdentifier, TextDocumentItem, Uri,
 };
 
 fn recv(conn: &Connection) -> Message {
@@ -42,22 +43,18 @@ fn notification(method: &str, params: serde_json::Value) -> Message {
     })
 }
 
-/// Boot a server over an in-memory connection and complete the `initialize`/`initialized` handshake,
-/// negotiating UTF-8 so LSP character offsets equal byte offsets for the ASCII test documents.
-fn boot() -> (Connection, std::thread::JoinHandle<()>) {
+/// Boot a server over an in-memory connection and complete the `initialize`/`initialized`
+/// handshake with the given client capabilities.
+fn boot_with_capabilities(
+    capabilities: ClientCapabilities,
+) -> (Connection, std::thread::JoinHandle<()>) {
     let (server, client) = Connection::memory();
     let handle = std::thread::spawn(move || {
         gd_server::serve(server).expect("serve() returned an error");
     });
 
     let init = InitializeParams {
-        capabilities: ClientCapabilities {
-            general: Some(GeneralClientCapabilities {
-                position_encodings: Some(vec![PositionEncodingKind::UTF8]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
+        capabilities,
         ..Default::default()
     };
     client
@@ -79,6 +76,30 @@ fn boot() -> (Connection, std::thread::JoinHandle<()>) {
         .unwrap();
 
     (client, handle)
+}
+
+/// UTF-8 so LSP character offsets equal byte offsets for the ASCII test documents.
+fn utf8_general() -> Option<GeneralClientCapabilities> {
+    Some(GeneralClientCapabilities {
+        position_encodings: Some(vec![PositionEncodingKind::UTF8]),
+        ..Default::default()
+    })
+}
+
+/// [`boot_with_capabilities`] with UTF-8 + hierarchical documentSymbol support — the nested
+/// outline shape the documentSymbol tests assert (mirrors VS Code's capabilities).
+fn boot() -> (Connection, std::thread::JoinHandle<()>) {
+    boot_with_capabilities(ClientCapabilities {
+        general: utf8_general(),
+        text_document: Some(TextDocumentClientCapabilities {
+            document_symbol: Some(DocumentSymbolClientCapabilities {
+                hierarchical_document_symbol_support: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 fn did_open(client: &Connection, uri: &Uri, text: &str) {
@@ -239,6 +260,109 @@ fn document_symbol_projects_nested_outline_with_kinds() {
     assert_eq!(members[0].selection_range.start, Position::new(3, 7));
 
     shutdown(&client, handle);
+}
+
+/// Drive a documentSymbol request against a server booted WITHOUT hierarchical support and
+/// assert the flat 3.16 `SymbolInformation[]` shape: preorder root-first, full ranges, the
+/// parent symbol as `containerName`. Deserializing as `Vec<SymbolInformation>` is the shape
+/// discriminator — a nested `DocumentSymbol[]` response would fail serde on the missing
+/// `location` field.
+fn assert_flat_document_symbols(client: Connection, handle: std::thread::JoinHandle<()>) {
+    let uri: Uri = "file:///test/flat.gd".parse().unwrap();
+    let src = concat!(
+        "extends Node\n",
+        "\n",
+        "@warning_ignore(\"unused_signal\")\n",
+        "signal hit(damage)\n",
+        "\n",
+        "enum State { IDLE, RUN }\n",
+        "\n",
+        "func _ready():\n",
+        "\tpass\n",
+        "\n",
+        "class Inner:\n",
+        "\tvar x := 0\n",
+    );
+    did_open(&client, &uri, src);
+    let _ = recv_publish_diagnostics(&client);
+
+    client
+        .sender
+        .send(request(
+            2,
+            "textDocument/documentSymbol",
+            serde_json::to_value(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none());
+    let symbols: Vec<SymbolInformation> =
+        serde_json::from_value(resp.result.expect("documentSymbol result"))
+            .expect("a client without hierarchical support must receive SymbolInformation[]");
+
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["flat.gd", "hit", "State", "IDLE", "RUN", "_ready", "Inner", "x"],
+        "preorder walk: root first, children after their parents"
+    );
+    let container_of = |name: &str| -> Option<&str> {
+        symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("`{name}` missing"))
+            .container_name
+            .as_deref()
+    };
+    assert_eq!(container_of("flat.gd"), None, "the root has no container");
+    assert_eq!(container_of("hit"), Some("flat.gd"));
+    assert_eq!(container_of("IDLE"), Some("State"));
+    assert_eq!(container_of("x"), Some("Inner"));
+    assert!(
+        symbols.iter().all(|s| s.location.uri == uri),
+        "every flat symbol locates in the requested document"
+    );
+    let hit = symbols.iter().find(|s| s.name == "hit").unwrap();
+    assert_eq!(hit.kind, SymbolKind::EVENT);
+    assert_eq!(
+        hit.location.range.start,
+        Position::new(3, 0),
+        "flat locations carry the symbol's FULL range (declaration start), the 3.16 reveal shape"
+    );
+
+    shutdown(&client, handle);
+}
+
+#[test]
+fn document_symbol_flat_when_client_lacks_hierarchical_support() {
+    // No documentSymbol capability at all: absent ⇒ flat (the rust-analyzer `.unwrap_or_default()`
+    // convention — a client that never opted in must not get the nested shape).
+    let (client, handle) = boot_with_capabilities(ClientCapabilities {
+        general: utf8_general(),
+        ..Default::default()
+    });
+    assert_flat_document_symbols(client, handle);
+}
+
+#[test]
+fn document_symbol_explicit_false_yields_flat() {
+    let (client, handle) = boot_with_capabilities(ClientCapabilities {
+        general: utf8_general(),
+        text_document: Some(TextDocumentClientCapabilities {
+            document_symbol: Some(DocumentSymbolClientCapabilities {
+                hierarchical_document_symbol_support: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert_flat_document_symbols(client, handle);
 }
 
 #[test]

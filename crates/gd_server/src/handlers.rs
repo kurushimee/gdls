@@ -30,16 +30,26 @@ use crate::uri::{path_to_file_uri, uri_to_path, CanonicalKey};
 /// [`lsp_types::DocumentSymbol`] tree — kinds plus byte→position ranges, with the full declaration as
 /// `range` and the identifier as `selection_range`. Reads the shared cached parse (the same one
 /// `publishDiagnostics` uses), so an edit is parsed once.
+///
+/// The nested shape is opt-in: clients advertise
+/// `textDocument.documentSymbol.hierarchicalDocumentSymbolSupport`, and one that didn't (Helix
+/// sends an explicit `false`) must get the flat 3.16 `SymbolInformation[]` fallback instead —
+/// rust-analyzer/gopls/clangd all downgrade the same way (absent ⇒ flat).
 pub fn document_symbol(
     state: &mut ServerState,
     params: DocumentSymbolParams,
 ) -> DocumentSymbolResponse {
+    let hierarchical = state.caps.hierarchical_document_symbols;
     let uri = params.text_document.uri;
     // Single VFS lookup: hold `doc` across the parse and reuse its already-built rope for the
     // mapper (disjoint `&state.vfs` / `&mut state.workspace` borrows compose). Avoids both the
     // redundant hash lookup and re-allocating a rope we already hold.
     let Some(doc) = state.vfs.get(uri.as_str()) else {
-        return DocumentSymbolResponse::Nested(Vec::new());
+        return if hierarchical {
+            DocumentSymbolResponse::Nested(Vec::new())
+        } else {
+            DocumentSymbolResponse::Flat(Vec::new())
+        };
     };
     let text = doc.text();
     let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
@@ -57,7 +67,7 @@ pub fn document_symbol(
         .unwrap_or("")
         .to_string();
 
-    let symbols = parsed
+    let symbols: Vec<lsp_types::DocumentSymbol> = parsed
         .symbols
         .iter()
         .map(|s| {
@@ -68,7 +78,11 @@ pub fn document_symbol(
             lsp
         })
         .collect();
-    DocumentSymbolResponse::Nested(symbols)
+    if hierarchical {
+        DocumentSymbolResponse::Nested(symbols)
+    } else {
+        DocumentSymbolResponse::Flat(flatten_symbols(&symbols, &uri))
+    }
 }
 
 /// Map `gd_syntax`'s frontend symbol kind to LSP's. GDScript signals surface as `EVENT` (the LSP
@@ -85,6 +99,44 @@ fn symbol_kind(kind: gd_syntax::SymbolKind) -> LspSymbolKind {
         Enum => LspSymbolKind::ENUM,
         EnumMember => LspSymbolKind::ENUM_MEMBER,
     }
+}
+
+/// The 3.16-compat projection for clients without `hierarchicalDocumentSymbolSupport`: a
+/// preorder walk emitting [`SymbolInformation`] with the symbol's FULL `range` (the spec's
+/// reveal contract for the flat shape) and `containerName` = the parent symbol's name — the
+/// flatten shape all three reference servers ship.
+#[allow(
+    deprecated,
+    reason = "lsp_types::SymbolInformation::deprecated is a (deprecated) non-optional field we must set"
+)]
+fn flatten_symbols(symbols: &[lsp_types::DocumentSymbol], uri: &Uri) -> Vec<SymbolInformation> {
+    fn walk(
+        out: &mut Vec<SymbolInformation>,
+        symbols: &[lsp_types::DocumentSymbol],
+        uri: &Uri,
+        container: Option<&str>,
+    ) {
+        for sym in symbols {
+            #[allow(deprecated)]
+            out.push(SymbolInformation {
+                name: sym.name.clone(),
+                kind: sym.kind,
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri: uri.clone(),
+                    range: sym.range,
+                },
+                container_name: container.map(str::to_owned),
+            });
+            if let Some(children) = &sym.children {
+                walk(out, children, uri, Some(&sym.name));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&mut out, symbols, uri, None);
+    out
 }
 
 #[allow(
