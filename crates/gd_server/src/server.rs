@@ -78,6 +78,11 @@ pub(crate) struct ClientCaps {
     /// `workDoneToken` inside request params) is independent of this flag — the token's
     /// presence is its own opt-in.
     pub(crate) work_done_progress: bool,
+    /// `workspace.configuration` (M7 #59) — when true, a `workspace/didChangeConfiguration`
+    /// notification triggers a `workspace/configuration` pull for the `"gdls"` section instead
+    /// of trusting the notification's payload shape (many clients send `settings: null`); the
+    /// modern-client convention.
+    pub(crate) workspace_configuration: bool,
 }
 
 impl ClientCaps {
@@ -101,8 +106,22 @@ impl ClientCaps {
                 .as_ref()
                 .and_then(|w| w.work_done_progress)
                 .unwrap_or(false),
+            workspace_configuration: caps
+                .workspace
+                .as_ref()
+                .and_then(|w| w.configuration)
+                .unwrap_or(false),
         }
     }
+}
+
+/// M7 (#59): what an outstanding server→client request is FOR — how the worker applies its
+/// response. (`window/workDoneProgress/create` never appears here; the router consumes those.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutboundKind {
+    /// A `workspace/configuration` pull for the `"gdls"` section — the response carries one
+    /// settings object per requested item; `result[0]` is applied as a runtime re-config.
+    Configuration,
 }
 
 /// All mutable server state for one session.
@@ -156,6 +175,12 @@ pub struct ServerState {
     /// `memory_soft_cap_evicted` event, not 1 200 of them. Defaults to `Normal` at startup; a
     /// first-tick transition to Soft/Hard fires the corresponding event.
     pub(crate) memory_pressure: MemoryPressure,
+    /// M7 (#59): outstanding server→client requests the WORKER must correlate (the router
+    /// fully consumes `window/workDoneProgress/create` responses itself; everything else is
+    /// forwarded here). Keyed by the `"gdls-out-{n}"` ids from
+    /// [`crate::router::SessionShared::next_outgoing_id`]. A response with an unknown id is a
+    /// warn-log no-op — never a "Method not found" bounce (anti-catalog W3).
+    pub(crate) outbound: FxHashMap<RequestId, OutboundKind>,
     /// Per-session cache of rendered native API pages (#34) — see
     /// [`crate::stubs::StubCache`]. Interior-mutable so shared-`&` request paths fill it;
     /// keyed by the dump's content hash, so a mid-session dump adoption invalidates it
@@ -353,6 +378,7 @@ fn serve_inner(
         current_token: None,
         budget,
         memory_pressure: MemoryPressure::Normal,
+        outbound: FxHashMap::default(),
         stub_cache: crate::stubs::StubCache::default(),
     };
 
@@ -498,7 +524,7 @@ fn serve_inner(
                     }
                     dispatch_notification(&mut state, note);
                 }
-                Ok(Message::Response(_)) => {} // server-initiated request responses: correlated from M7 PR2 on
+                Ok(Message::Response(resp)) => handle_outbound_response(&mut state, resp),
                 Err(_) => break, // router hung up — connection closed or `exit` already forwarded
             },
             recv(watcher_arm) -> result => match result {
@@ -796,6 +822,138 @@ pub(crate) fn react_to_memory_pressure(state: &mut ServerState) {
             );
         }
     }
+}
+
+/// M7 (#59): correlate a client response to an outstanding server→client request. Unknown ids
+/// are a warn-log no-op — never a "Method not found" bounce (anti-catalog W3).
+fn handle_outbound_response(state: &mut ServerState, resp: Response) {
+    let Some(kind) = state.outbound.remove(&resp.id) else {
+        log::warn!(
+            "ignoring a response with unknown id {:?} (no outstanding server request)",
+            resp.id
+        );
+        return;
+    };
+    match kind {
+        OutboundKind::Configuration => {
+            if let Some(err) = &resp.error {
+                log::warn!(
+                    "client rejected workspace/configuration ({}); keeping the previous                      configuration",
+                    err.message
+                );
+                return;
+            }
+            // One settings value per requested item; we request exactly one ("gdls").
+            let section = resp
+                .result
+                .as_ref()
+                .and_then(|r| r.as_array())
+                .and_then(|items| items.first())
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if section.is_null() {
+                log::info!(
+                    "workspace/configuration returned no \"gdls\" section; keeping the                      previous configuration"
+                );
+                return;
+            }
+            apply_runtime_config(state, &section);
+        }
+    }
+}
+
+/// M7 (#59): apply a runtime re-configuration payload — the same schema as
+/// `initializationOptions`, with the runtime contract: malformed input keeps the PREVIOUS
+/// configuration (logged + surfaced via `window/showMessage`), never a mid-session reset to
+/// defaults; session-structural fields are warned about and retained; only genuinely changed
+/// runtime-reloadable groups (`strict`, `analyzer`, `memory`) re-apply, so a no-op payload
+/// causes no cache churn and no republish.
+fn apply_runtime_config(state: &mut ServerState, raw: &serde_json::Value) {
+    let new_options = match InitializationOptions::parse_runtime(raw) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            log::warn!("invalid runtime configuration ({e}); keeping the previous configuration");
+            show_message(
+                state,
+                lsp_types::MessageType::WARNING,
+                "gdls: invalid configuration payload; keeping the previous configuration",
+            );
+            return;
+        }
+    };
+
+    // Session-structural fields can't re-apply mid-session — each is baked into the workspace
+    // load / watcher / dump topology at startup. Warn per drifted field, keep the old value.
+    let old = &state.options;
+    let structural: [(&str, bool); 6] = [
+        ("projectRoot", new_options.project_root != old.project_root),
+        (
+            "extensionApiPath",
+            new_options.extension_api_path != old.extension_api_path,
+        ),
+        (
+            "godotBinaryPath",
+            new_options.godot_binary_path != old.godot_binary_path,
+        ),
+        (
+            "autoDumpExtensionApi",
+            new_options.auto_dump_extension_api != old.auto_dump_extension_api,
+        ),
+        (
+            "embeddedApiFallback",
+            new_options.embedded_api_fallback != old.embedded_api_fallback,
+        ),
+        (
+            "stubCacheDir",
+            new_options.stub_cache_dir != old.stub_cache_dir,
+        ),
+    ];
+    for (field, drifted) in structural {
+        if drifted {
+            log::warn!(
+                "runtime configuration changes `{field}`, which is session-structural —                  keeping the current value (restart gdls to apply it)"
+            );
+        }
+    }
+
+    let strict_changed = new_options.strict != state.options.strict;
+    let analyzer_changed = new_options.analyzer != state.options.analyzer;
+    let memory_changed = new_options.memory != state.options.memory;
+
+    if strict_changed {
+        log::info!(
+            "runtime configuration: strict profile/overrides changed; rebuilding the warning              policy and republishing open buffers"
+        );
+        state.options.strict = new_options.strict;
+        state.workspace.apply_strict(&state.options.strict);
+    }
+    if analyzer_changed {
+        log::info!("runtime configuration: analyzer knobs changed; invalidating cached analyses");
+        state.options.analyzer = new_options.analyzer;
+        state.workspace.set_analyzer_config(&state.options.analyzer);
+    }
+    if memory_changed {
+        log::info!("runtime configuration: memory budget/caches changed");
+        state.options.memory = new_options.memory;
+        state.budget = MemoryBudget::resolve(&state.options.memory, bench_budget_path().as_deref());
+        state
+            .workspace
+            .set_cache_capacity(state.options.memory.cache_capacity());
+    }
+    if strict_changed || analyzer_changed {
+        republish_all_open_buffers(state);
+    }
+}
+
+/// Send a `window/showMessage` notification — the operator-facing channel for conditions that
+/// deserve more than a stderr log line (M7 §5 showMessage conventions: used sparingly, never as
+/// log spam).
+fn show_message(state: &ServerState, kind: lsp_types::MessageType, message: &str) {
+    let note = Notification {
+        method: "window/showMessage".to_string(),
+        params: serde_json::json!({ "type": kind, "message": message }),
+    };
+    let _ = state.sender.send(Message::Notification(note));
 }
 
 /// M7 (#58): a begun server-initiated progress reporter for a mid-session phase (re-index,
@@ -1575,6 +1733,39 @@ fn dispatch_notification(state: &mut ServerState, note: Notification) {
                 log::debug!("$/cancelRequest for {id:?} reached the worker (in-flight: {found})");
             }
         }
+        "workspace/didChangeConfiguration" => {
+            // M7 (#59): runtime re-config. With `workspace.configuration` advertised, the
+            // notification's payload is ignored (many clients send `settings: null` by
+            // convention) and the real settings are pulled via `workspace/configuration`;
+            // otherwise the payload itself is applied — accepting either a sectioned
+            // `settings.gdls` object or the bare settings object.
+            if state.caps.workspace_configuration {
+                let id = state.shared.next_outgoing_id();
+                state
+                    .outbound
+                    .insert(id.clone(), OutboundKind::Configuration);
+                let req = Request {
+                    id,
+                    method: "workspace/configuration".to_string(),
+                    params: serde_json::json!({
+                        "items": [{ "section": "gdls" }],
+                    }),
+                };
+                if state.sender.send(Message::Request(req)).is_err() {
+                    log::warn!("workspace/configuration send failed (client disconnected?)");
+                }
+            } else if let Ok(p) =
+                parse_params::<lsp_types::DidChangeConfigurationParams>(&method, params)
+            {
+                let raw = match &p.settings {
+                    serde_json::Value::Object(map) if map.contains_key("gdls") => {
+                        p.settings["gdls"].clone()
+                    }
+                    other => other.clone(),
+                };
+                apply_runtime_config(state, &raw);
+            }
+        }
         "initialized" => log::info!("client reported initialized"),
         other => log::debug!("ignoring notification: {other}"),
     }
@@ -2079,6 +2270,7 @@ mod tests {
             // arm at MemoryPressure::Normal across the run.
             budget: MemoryBudget::from_caps_mb(u64::MAX / 2, u64::MAX / 2),
             memory_pressure: MemoryPressure::Normal,
+            outbound: FxHashMap::default(),
             stub_cache: crate::stubs::StubCache::default(),
         };
         (state, rx)
@@ -2124,6 +2316,7 @@ mod tests {
             current_token: None,
             budget,
             memory_pressure: MemoryPressure::Normal,
+            outbound: FxHashMap::default(),
             stub_cache: crate::stubs::StubCache::default(),
         };
         (state, rx)
@@ -2409,6 +2602,7 @@ mod tests {
             current_token: None,
             budget,
             memory_pressure: MemoryPressure::Normal,
+            outbound: FxHashMap::default(),
             stub_cache: crate::stubs::StubCache::default(),
         };
 

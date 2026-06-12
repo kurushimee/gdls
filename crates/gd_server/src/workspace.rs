@@ -214,6 +214,35 @@ impl Workspace {
         self.analysis_generation
     }
 
+    /// M7 (#59): apply a runtime strict-config change — rebuild the warning policy against the
+    /// unchanged `project.godot` warning config, and invalidate every cached analysis (its
+    /// diagnostics were filtered through the old policy; content hash + epoch can't see that,
+    /// hence the generation bump). The caller republishes open buffers.
+    pub fn apply_strict(&mut self, strict: &StrictConfig) {
+        self.policy = WarnPolicy::build(&self.project.warnings, &strict_settings(strict));
+        self.analysis_cache.clear();
+        self.analysis_generation += 1;
+    }
+
+    /// M7 (#59): apply runtime analyzer knobs (iteration cap, checkpoint delay). Cached results
+    /// computed under the old knobs stay valid in content terms, but an operator lowering the
+    /// cap to force-trip the governor expects fresh runs — clear + bump like [`Self::apply_strict`].
+    pub fn set_analyzer_config(&mut self, analyzer: &crate::config::AnalyzerConfig) {
+        self.analyzer_iter_limit = analyzer.iter_limit;
+        self.analyzer_checkpoint_delay = analyzer
+            .checkpoint_delay_us
+            .map(std::time::Duration::from_micros);
+        self.analysis_cache.clear();
+        self.analysis_generation += 1;
+    }
+
+    /// M7 (#59): resize both LRU caches to a runtime `memory.cacheCapacity`. `lru::resize`
+    /// evicts oldest entries when shrinking; no invalidation semantics change.
+    pub fn set_cache_capacity(&mut self, cap: std::num::NonZeroUsize) {
+        self.parse_cache.resize(cap);
+        self.analysis_cache.resize(cap);
+    }
+
     /// Atomically persist the index + stat table to the `.gdls` cache directory.
     /// Fire-and-forget: failures are logged at `warn` and never propagated (never crash).
     /// Call AFTER build + reconcile have settled — not mid-reconcile.
