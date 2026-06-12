@@ -138,10 +138,14 @@ Governing principle (issue #30): generic LSP first — Godot-specific data addit
 no custom protocol; every feature capability-gated. The Godot-LSP anti-catalog in `docs/09 §3` is
 binding.
 
-**Current:** Phase 1 complete — **v1.0.5 shipped** (2026-06-12). Release notes and the full
-history live in `CHANGELOG.md`; per-milestone exit criteria in `docs/07`. Both conformance
-ratchets hold at **1.0** with empty known-failures lists; CI is green on both legs with the
-three-layer fuzz gate (`parse` + `analyze` + `index_invariants`). Standing release gate: the
+**Current:** Phase 1 complete — **v1.0.5 shipped** (2026-06-12); Phase 2 underway: **M7
+(protocol foundations) implemented** — all seven issues (#57–#63) merged 2026-06-13; milestone
+close pends the interactive editor smoke walk + remaining capability-profile captures
+(`crates/gd_server/tests/fixtures/client_caps/README.md`). Phase 2 ships no per-milestone
+releases (deferred until the phase matures). Release notes and the full history live in
+`CHANGELOG.md`; per-milestone exit criteria in `docs/07`. Both conformance ratchets hold at
+**1.0** with empty known-failures lists; CI is green on both legs with the three-layer fuzz
+gate (`parse` + `analyze` + `index_invariants`). Standing release gate: the
 `scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both acceptance projects, run
 comparatively against the previous release binary (`--strict` + warning histogram; error
 baselines must hold; a nav-row walk is NOT a diagnostics gate), with the private project swept

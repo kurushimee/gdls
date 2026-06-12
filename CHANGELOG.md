@@ -5,6 +5,45 @@ All notable changes to `gdls` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+M7 — Phase 2 protocol foundations (#57–#63), merged 2026-06-13. No release cut: Phase 2
+milestones land on `main` and release together once the phase matures.
+
+### Added
+- **True `$/cancelRequest` preemption** (#57): a router thread drains the wire and flips
+  cancellation tokens the moment a cancel arrives, so the analyzer's cooperative checkpoints
+  abort mid-handler; results invalidated by an intervening edit return `ContentModified`
+  (-32801). The shutdown handshake no longer risks lsp-server's 30 s `handle_shutdown` stall.
+- **`workDoneProgress`** (#58): one progress token spans the cold start (exact percentages on
+  the cold-index walk); mid-session re-index/reconcile arcs; client `workDoneToken` honored on
+  `references` and `workspace/symbol`. Nothing is ever sent without `window.workDoneProgress`.
+- **Runtime re-configuration** (#59): `workspace/didChangeConfiguration` re-reads the
+  `initializationOptions` schema (pulling via `workspace/configuration` when advertised);
+  malformed payloads keep the previous config (+ `window/showMessage` warning); sparse payloads
+  keep absent groups; strict/analyzer changes republish open buffers live.
+- **Dynamic `didChangeWatchedFiles`** (#60): the one dynamic registration gdls performs;
+  client events merge into the native watcher's mutation funnel with content-fingerprint
+  dedupe — Helix's only watch path now keeps the index fresh on its own.
+- **Pull diagnostics** (#61): `textDocument/diagnostic` shares push's computation (items
+  byte-identical), with `unchanged` short-circuits via a `version:hash:epoch:generation`
+  resultId; `workspace/diagnostic` is a documented skip.
+- **Documentation pipeline** (#62): the lexer records `##` doc comments in a side-channel
+  (token stream untouched; both ratchets hold at 1.0); Godot's association rules ported
+  post-parse; docs ride the `Interface` outside the signature hash; one BBCode→GFM converter
+  serves all outgoing prose (hover now; completion/signatureHelp in M8); `hover.contentFormat`
+  honored with a plaintext downgrade.
+- **`codeDescription` gating + per-code anchors** (#63): emission now requires
+  `publishDiagnostics.codeDescriptionSupport`; each warning links its own
+  `debug/gdscript/warnings/*` ProjectSettings anchor (deprecated trio → overview page).
+- M7 §7.4 editor-profile harness: vendored real client-capability JSONs replayed per-profile
+  (`tests/editor_profiles.rs`, self-extending); `scripts/lsp-poke.py` gained a `capabilities`
+  session key. Helix 25.07.1 captured; remaining editors land with the milestone exit walk.
+
+### Changed
+- The warm-start cache format bumped (v4 → v5) for the doc-carrying `Interface` shape — one
+  cold re-index per project on first launch after upgrading, self-healing.
+
 ## [1.0.5] — 2026-06-12
 
 The LSP protocol-conventions release. A post-v1.0.4 audit compared every exposed capability
