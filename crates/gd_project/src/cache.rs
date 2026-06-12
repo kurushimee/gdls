@@ -41,7 +41,11 @@ use crate::index::{Index, IndexCache};
 ///
 /// v3: `Interface` gained `class_name_loc` and `ClassEntry` gained `line`/`name_span` (#33) — a
 /// v2 cache would deserialize-fail (missing fields), so v2 files are ignored and rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 3;
+///
+/// v4: `MemberDecl` gained `name_span` (#44/#46) — a v3 cache would deserialize-fail (missing
+/// field), so v3 files are ignored and rebuilt. Deliberately NOT `#[serde(default)]`: a defaulted
+/// zero-width span loaded from an old cache would silently degrade every name-token anchor.
+pub const CACHE_FORMAT_VERSION: u32 = 4;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool

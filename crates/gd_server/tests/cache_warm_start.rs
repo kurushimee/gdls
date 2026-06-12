@@ -410,6 +410,26 @@ fn warm_load_produces_same_index_as_cold() {
             "{label}: identifier span must be recorded"
         );
     }
+
+    // v4: a member's name_span survives the round-trip too — a warm session must anchor
+    // `greet`'s name token exactly where the cold one does.
+    let base_src = std::fs::read_to_string(p.root.join("src/base.gd").as_std_path()).unwrap();
+    for (ws, label) in [(&cold_ws, "cold"), (&warm_ws, "warm")] {
+        let iface = ws
+            .index
+            .interface_of(&p.root.join("src/base.gd"))
+            .expect("base.gd indexed");
+        let m = iface
+            .members
+            .iter()
+            .find(|m| m.name == "greet")
+            .expect("greet member");
+        assert_eq!(
+            &base_src[m.name_span.start..m.name_span.end],
+            "greet",
+            "{label}: member name_span must slice the identifier"
+        );
+    }
 }
 
 /// Issue 1 + Issue 2 seam test: disk edit → save → warm load skips re-parse on stat-match.
