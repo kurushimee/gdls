@@ -440,7 +440,8 @@ fn document_symbol_details_render_signatures() {
     shutdown(&client, handle);
 }
 
-/// Boot advertising `publishDiagnostics.tagSupport` with `Unnecessary` in the value set.
+/// Boot advertising the full diagnostics-metadata surface: `publishDiagnostics.tagSupport` with
+/// `Unnecessary` in the value set, plus `codeDescriptionSupport` (M7 #63).
 fn boot_with_tag_support() -> (Connection, std::thread::JoinHandle<()>) {
     boot_with_capabilities(ClientCapabilities {
         general: utf8_general(),
@@ -449,6 +450,7 @@ fn boot_with_tag_support() -> (Connection, std::thread::JoinHandle<()>) {
                 tag_support: Some(lsp_types::TagSupport {
                     value_set: vec![DiagnosticTag::UNNECESSARY, DiagnosticTag::DEPRECATED],
                 }),
+                code_description_support: Some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -479,11 +481,13 @@ fn unused_variable_diagnostic_carries_unnecessary_tag_when_supported() {
         .unwrap_or_else(|| panic!("UNUSED_VARIABLE must fire; got {:?}", diags.diagnostics));
     assert_eq!(unused.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
     assert!(
-        unused
-            .code_description
-            .as_ref()
-            .is_some_and(|cd| cd.href.as_str().ends_with("warning_system.html")),
-        "warning-coded diagnostics link Godot's warning docs; got {:?}",
+        unused.code_description.as_ref().is_some_and(|cd| {
+            cd.href.as_str().ends_with(
+                "class_projectsettings.html\
+                 #class-projectsettings-property-debug-gdscript-warnings-unused-variable",
+            )
+        }),
+        "warning-coded diagnostics link the warning's own ProjectSettings anchor (M7 #63); got {:?}",
         unused.code_description
     );
     assert_eq!(
@@ -499,8 +503,9 @@ fn unused_variable_diagnostic_carries_unnecessary_tag_when_supported() {
     shutdown(&client, handle);
 }
 
-/// Without `tagSupport`, the same diagnostic carries NO tags (pyright-style gating) — but the
-/// docs link ships ungated (rust-analyzer-style; clients ignore unknown members).
+/// Without `tagSupport` / `codeDescriptionSupport`, the same diagnostic carries NO tags and NO
+/// docs link — both gated on the client capability (M7 #63 closed the previously-ungated
+/// codeDescription), so a capability-less client gets byte-identical pre-metadata diagnostics.
 #[test]
 fn diagnostic_tags_absent_without_client_tag_support() {
     let (client, handle) = boot();
@@ -519,7 +524,10 @@ fn diagnostic_tags_absent_without_client_tag_support() {
         })
         .expect("UNUSED_VARIABLE must fire");
     assert_eq!(unused.tags, None, "tags are gated on the client capability");
-    assert!(unused.code_description.is_some());
+    assert_eq!(
+        unused.code_description, None,
+        "codeDescription is gated on publishDiagnostics.codeDescriptionSupport"
+    );
 
     shutdown(&client, handle);
 }
@@ -553,7 +561,13 @@ fn non_unused_warning_carries_no_unnecessary_tag() {
             )
         });
     assert_eq!(narrowing.tags, None);
-    assert!(narrowing.code_description.is_some());
+    // The capability is advertised in this boot, so the (untagged) warning still links its own
+    // per-code anchor.
+    assert!(narrowing.code_description.as_ref().is_some_and(|cd| {
+        cd.href
+            .as_str()
+            .ends_with("-property-debug-gdscript-warnings-narrowing-conversion")
+    }));
 
     shutdown(&client, handle);
 }

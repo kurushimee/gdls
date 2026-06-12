@@ -66,6 +66,12 @@ pub(crate) struct ClientCaps {
     /// unused/unreachable diagnostic tags (pyright-style: clients without the capability get
     /// byte-identical pre-tag diagnostics).
     pub(crate) diagnostic_tag_unnecessary: bool,
+    /// `textDocument.publishDiagnostics.codeDescriptionSupport` — gates `codeDescription.href`
+    /// (the per-warning documentation link) on every warning-coded diagnostic. Governs the pull
+    /// path too once `textDocument/diagnostic` lands (M7 #61): LSP 3.17's pull-diagnostic client
+    /// capabilities carry no codeDescription/tag fields of their own, so the publishDiagnostics
+    /// capabilities are the convention for both (rust-analyzer does the same).
+    pub(crate) code_description: bool,
 }
 
 impl ClientCaps {
@@ -80,6 +86,10 @@ impl ClientCaps {
                 .and_then(|t| t.publish_diagnostics.as_ref())
                 .and_then(|p| p.tag_support.as_ref())
                 .is_some_and(|t| t.value_set.contains(&DiagnosticTag::UNNECESSARY)),
+            code_description: td
+                .and_then(|t| t.publish_diagnostics.as_ref())
+                .and_then(|p| p.code_description_support)
+                .unwrap_or(false),
         }
     }
 }
@@ -1695,9 +1705,13 @@ fn collect_diagnostics(
                 } else {
                     None
                 },
-                code_description: d.warning_code().map(|_| CodeDescription {
-                    href: godot_warning_docs_uri(),
-                }),
+                code_description: if caps.code_description {
+                    d.warning_code().map(|code| CodeDescription {
+                        href: warning_docs_uri(code),
+                    })
+                } else {
+                    None
+                },
                 related_information: project_related(
                     d.related(),
                     mapper,
@@ -1805,16 +1819,40 @@ fn unnecessary_tag(code: Option<gd_analyze::warnings::WarningCode>) -> Option<Ve
     }
 }
 
-/// Godot's warning-system documentation — the `codeDescription` target for every warning-coded
-/// diagnostic. The page carries no per-code anchors, so one page-level link serves all codes.
-fn godot_warning_docs_uri() -> Uri {
-    static DOCS: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
-    DOCS.get_or_init(|| {
-        "https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/warning_system.html"
+/// Documentation link for one warning code — the `codeDescription.href` target. Every active
+/// warning has a `debug/gdscript/warnings/<lower_name>` project setting documented in the
+/// ProjectSettings class reference (`gdscript.cpp`'s `GLOBAL_DEF` loop registers one per code),
+/// and Godot's docs generator derives a stable Sphinx anchor for each property mechanically
+/// (`doc/tools/make_rst.py`: `class_ProjectSettings_property_<path>`, with `/` and `_` rendered
+/// as `-`), so the link lands on that warning's own description. The three deprecated codes are
+/// registered as *internal* settings (hidden from the class reference, verified against
+/// `doc/classes/ProjectSettings.xml` at 4.6.3-stable) and fall back to the warning-system
+/// overview page. The whole mapping lives in this one function so a docs-site layout change is
+/// a one-line fix.
+fn warning_docs_uri(code: gd_analyze::warnings::WarningCode) -> Uri {
+    use gd_analyze::warnings::WarningCode::{
+        ConstantUsedAsFunction, FunctionUsedAsProperty, PropertyUsedAsFunction,
+    };
+    match code {
+        PropertyUsedAsFunction | ConstantUsedAsFunction | FunctionUsedAsProperty => {
+            "https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/warning_system.html"
+                .parse()
+                .expect("invariant: the static Godot docs URL parses as a Uri")
+        }
+        _ => {
+            // Sphinx renders the RST label's `_` (and the setting path's `/`) as `-` in the
+            // HTML anchor id — verified live against the published stable page.
+            let name = gd_analyze::name_from_code(code)
+                .to_ascii_lowercase()
+                .replace('_', "-");
+            format!(
+                "https://docs.godotengine.org/en/stable/classes/class_projectsettings.html\
+                 #class-projectsettings-property-debug-gdscript-warnings-{name}"
+            )
             .parse()
-            .expect("invariant: the static Godot docs URL parses as a Uri")
-    })
-    .clone()
+            .expect("invariant: a lowercased warning name embeds in a valid docs Uri")
+        }
+    }
 }
 
 /// `gd_analyze::Severity` was deliberately laid out with the same discriminants as
@@ -2057,6 +2095,38 @@ mod tests {
             "Hard pressure with no cached analysis must publish parser-only diagnostics, not run analyzer; got {:?}",
             params.diagnostics
         );
+    }
+
+    /// M7 (#63): every active warning code links its own ProjectSettings property anchor
+    /// (verified live against the published stable docs); the three deprecated codes are
+    /// internal settings with no class-reference entry and fall back to the warning-system
+    /// overview page.
+    #[test]
+    fn warning_docs_uri_maps_per_code_anchors_with_deprecated_fallback() {
+        use gd_analyze::warnings::WarningCode;
+        assert_eq!(
+            warning_docs_uri(WarningCode::UnusedVariable).as_str(),
+            "https://docs.godotengine.org/en/stable/classes/class_projectsettings.html\
+             #class-projectsettings-property-debug-gdscript-warnings-unused-variable"
+        );
+        // Multi-word name: every `_` in the setting name renders as `-` in the Sphinx anchor.
+        assert_eq!(
+            warning_docs_uri(WarningCode::GetNodeDefaultWithoutOnready).as_str(),
+            "https://docs.godotengine.org/en/stable/classes/class_projectsettings.html\
+             #class-projectsettings-property-debug-gdscript-warnings-get-node-default-without-onready"
+        );
+        for deprecated in [
+            WarningCode::PropertyUsedAsFunction,
+            WarningCode::ConstantUsedAsFunction,
+            WarningCode::FunctionUsedAsProperty,
+        ] {
+            assert!(
+                warning_docs_uri(deprecated)
+                    .as_str()
+                    .ends_with("warning_system.html"),
+                "deprecated codes have no ProjectSettings entry and must use the overview page"
+            );
+        }
     }
 
     /// M7 (#57): the interrupt gate deregisters the request and maps its lifecycle verdict —
