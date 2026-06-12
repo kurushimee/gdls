@@ -36,7 +36,7 @@ pub mod warnings;
 
 pub use binding::{
     find_incoming_calls, find_outgoing_calls, find_use_bindings, Binding, BindingTargetKind,
-    MemberName, MemberXref,
+    CalleeTarget, MemberName, MemberXref,
 };
 pub use cancellation::CancellationToken;
 pub use context::{AnalysisContext, AnalysisResult};

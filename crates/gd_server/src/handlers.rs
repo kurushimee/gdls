@@ -481,7 +481,7 @@ pub fn definition(
     // (1.6) Cross-file dotted method call (`obj.method()` through a typed var): the attribute
     // identifier inside a call callee records no `Binding::Use` (the reducer's attribute paths
     // are a deliberate recording scope cut — see `AnalysisResult::bindings`), but `reduce_call`
-    // recorded a `Binding::Call` whose `callee_file` names the declaring script. Project the
+    // recorded a `Binding::Call` whose callee target names the declaring script. Project the
     // call binding whose callee-identifier span contains the cursor — the same projection the
     // references handler's call-site click uses (M6-E) — and jump to the declaration. Hover
     // already resolves these through the type table; definition returning null here was the
@@ -493,14 +493,15 @@ pub fn definition(
             let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
             a.bindings().iter().find_map(|b| match b {
                 Binding::Call {
-                    callee_file: Some(f),
+                    callee,
                     callee_name,
                     call_site,
                     ..
                 } if callee_name == &name => {
+                    let f = callee.script_file()?;
                     let spans = spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
                     let ident = spans.get(call_site).copied()?;
-                    (ident.start <= node_byte && node_byte < ident.end).then_some(*f)
+                    (ident.start <= node_byte && node_byte < ident.end).then_some(f)
                 }
                 _ => None,
             })
@@ -2056,12 +2057,13 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         {
             let cur_result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
             // Look for a Binding::Call whose callee identifier span (in the parse tree)
-            // contains the cursor byte. If found (call-site click), target_file = callee_file.
-            // The shared callee-span map (`callee_spans`, hoisted above) is built lazily on the
-            // first matching binding and reused by push_callee_ident_locations below.
+            // contains the cursor byte. If found (call-site click), target_file = the callee's
+            // Script-declaring file. The shared callee-span map (`callee_spans`, hoisted above)
+            // is built lazily on the first matching binding and reused by
+            // push_callee_ident_locations below.
             cur_result.bindings().iter().find_map(|b| {
                 if let Binding::Call {
-                    callee_file,
+                    callee,
                     callee_name,
                     call_site,
                     ..
@@ -2072,7 +2074,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                             callee_spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
                         if let Some(ident_span) = spans.get(call_site).copied() {
                             if ident_span.start <= byte && byte < ident_span.end {
-                                return Some(*callee_file);
+                                return Some(callee.script_file());
                             }
                         }
                     }
@@ -2084,11 +2086,11 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         };
         // Distinguish the two None origins that the old `.flatten().or(current_fid)` conflated —
         // collapsing them dropped every cross-file reference for native subscript calls
-        // (e.g. `node.queue_free()`, whose Binding::Call carries callee_file: None):
+        // (e.g. `node.queue_free()`, whose Binding::Call classifies a non-Script callee):
         //   Some(Some(f)) — call-site click on a resolved callee: the declaring file is `f`.
         //   Some(None)    — call-site click on a NATIVE/unresolved callee: keep target_file None so
         //                   the scan falls back to push_identifier_locations (raw text scan) rather
-        //                   than filtering on a callee_file that no Binding::Call carries.
+        //                   than filtering on a Script file no Binding::Call carries.
         //   None          — no Binding::Call at the cursor (declaration-site click): the current
         //                   file declares the method, so target_file = current_fid.
         match target_file_from_binding {
@@ -2465,9 +2467,9 @@ fn callee_name_token_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
 /// declared in `target_file`. Only subscript-attribute call sites are emitted here; bare and
 /// `super` call sites are intentionally absent — but NOT dropped from references. The dispatcher
 /// pre-reduces a bare callee (and a subscript callee's base) as an identifier, recording a
-/// `Binding::Use` at that narrow span which [`push_binding_locations`] reports. (Bare calls DO carry
-/// `callee_file == Some(declaring_file)` via `resolve_callee_file`/WP-RD6 — recall for them rides
-/// that `Use` binding, not this call projection; see `references_finds_bare_same_file_call` and
+/// `Binding::Use` at that narrow span which [`push_binding_locations`] reports. (Bare calls DO
+/// classify their declaring script on `CalleeTarget::Script` — recall for them rides that `Use`
+/// binding, not this call projection; see `references_finds_bare_same_file_call` and
 /// `references_finds_signal_emit_and_connect_sites`.)
 ///
 /// Caller must ensure `target_file` is `Some` before calling; the `None` guard lives in
@@ -2491,13 +2493,13 @@ fn push_callee_ident_locations(
 ) {
     for binding in result.bindings() {
         if let Binding::Call {
-            callee_file: Some(cf),
+            callee,
             callee_name,
             call_site,
             ..
         } = binding
         {
-            if *cf == target_file && callee_name == name {
+            if callee.script_file() == Some(target_file) && callee_name == name {
                 let spans = callee_spans.get_or_insert_with(|| callee_ident_spans(tree));
                 if let Some(span) = spans.get(call_site).copied() {
                     out.push(Location {
@@ -2897,15 +2899,16 @@ pub fn prepare_call_hierarchy(
                 let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
                 let target = analyzed.bindings().iter().find_map(|b| match b {
                     Binding::Call {
-                        callee_file: Some(f),
+                        callee,
                         callee_name,
                         call_site,
                         ..
                     } if callee_name == &name => {
+                        let f = callee.script_file()?;
                         let spans =
                             spans.get_or_insert_with(|| callee_name_token_spans(&parsed.tree));
                         let ident = spans.get(call_site).copied()?;
-                        (ident.start <= byte && byte < ident.end).then_some(*f)
+                        (ident.start <= byte && byte < ident.end).then_some(f)
                     }
                     _ => None,
                 });
@@ -3136,8 +3139,8 @@ pub fn outgoing_calls(
     let mapper = PositionMapper::new(&rope, enc);
     let result = analyze_with_request_token(state, &key, &path, &parsed.tree, &text);
 
-    // Group calls by (callee_file, callee_name), preserving first-seen order. `find_outgoing_calls`
-    // already filtered to Call bindings whose caller matches `fn_name`.
+    // Group calls by (Script-declaring file, callee_name), preserving first-seen order.
+    // `find_outgoing_calls` already filtered to Call bindings whose caller matches `fn_name`.
     type CalleeKey = (Option<gd_project::FileId>, String);
     let callee_spans = callee_name_token_spans(&parsed.tree);
     let groups: Vec<(CalleeKey, Vec<lsp_types::Range>)> = group_call_ranges(
@@ -3146,10 +3149,10 @@ pub fn outgoing_calls(
         &callee_spans,
         |b| match b {
             Binding::Call {
-                callee_file,
+                callee,
                 callee_name,
                 ..
-            } => Some((*callee_file, callee_name.clone())),
+            } => Some((callee.script_file(), callee_name.clone())),
             _ => None,
         },
     );
