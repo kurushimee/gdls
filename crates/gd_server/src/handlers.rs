@@ -1563,27 +1563,22 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 ///   method call site; the cursor lands on the `helper` attribute Identifier).
 ///
 /// A bare attribute **property read** (`node.position`, `self.hp`) is *not* a call callee and
-/// returns `false` so it falls through to the raw-identifier scan in `references`. This matters for
-/// recall: the method/signal code path filters to `Binding::Call` records (via
-/// [`push_callee_ident_locations`]), and the analyzer records no binding for a property attribute
-/// read — so routing property reads through it would silently drop every read occurrence. Letting
-/// them use the raw scan restores correct (over-approximating, never under-reporting) recall, which
-/// is the v1 stance for property/field references.
+/// returns `false`, routing it to the non-method classification ([`NonMethodTarget`]): resolved
+/// member reads ride the binding-backed precise path; only unresolvable reads keep the raw-scan
+/// floor.
 ///
-/// The declaration arm deliberately matches a `Function`/`Signal` identifier at *any* class depth —
-/// inner-class methods (`class Foo:` … `func helper():`) included. `Binding::Call` records carry a
-/// `callee_file` but no owning-class path, so a root-class and an inner-class method sharing one
-/// name in one file are indistinguishable at call-site granularity: both declaration clicks take
-/// the project-wide scan and their result sets may mix the two methods' call sites. That is the
-/// same over-approximating, never under-reporting stance as above — routing inner declarations to
-/// the raw-identifier scan instead would *drop* their cross-file call sites (the `name_referencers`
-/// index only sees interface-level names) while still mixing in-file textual matches. Splitting
-/// them cleanly needs the owning class recorded on `Binding::Call` — a post-v1 refinement.
+/// The declaration arm deliberately matches a `Function`/`Signal` identifier at *any* class
+/// depth — inner-class methods (`class Foo:` … `func helper():`) included. The references
+/// method path still filters call sites at FILE granularity, so a root-class and an inner-class
+/// method sharing one name in one file may mix their call-site sets — the bounded residue of
+/// the over-approximating stance. (`CalleeTarget::Script` now records the owning `class_path`;
+/// threading it through the method path's target resolution — which would need the cursor
+/// side's owning class too — is the remaining refinement.)
 ///
-/// Used to decide whether `textDocument/references` uses the project-wide text scan (correct for
-/// method/signal targets reached through body-local typed vars) or the faster `name_referencers`
-/// index (correct for class/type/variable/property targets). Purely structural (O(#nodes), no
-/// analyzer involvement); works identically whether the cursor is on the declaration or a call site.
+/// Used to decide whether `textDocument/references` takes the method path (call-site
+/// projection + project-wide text scan) or the non-method classification. Purely structural
+/// (O(#nodes), no analyzer involvement); works identically whether the cursor is on the
+/// declaration or a call site.
 fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
     // Single pass: short-circuit on a func/signal declaration; otherwise remember the subscript
     // that owns this attribute identifier and collect every `Call` callee node, then decide.
@@ -1935,29 +1930,38 @@ fn group_call_ranges<'a, K: PartialEq>(
 /// server to resolve project-wide references for the symbol denoted by the given text document
 /// position." Returns `Location[]` or `null`. Source: <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_references>.
 ///
-/// Algorithm (per the M4 plan §6 + `docs/03 §7.1`, updated for M6-E):
-///   1. Resolve cursor → identifier name.
+/// Algorithm (per the M4 plan §6 + `docs/03 §7.1`, updated for M6-E and the precision rework):
+///   1. Resolve cursor → identifier name, then classify the target:
+///      - **Method/signal targets** (structural check) keep the M6-E shape: call-site
+///        projection filtered by the callee's declaring file where resolved, raw scan where
+///        not.
+///      - **Non-method targets** classify via [`NonMethodTarget`]: a Use binding at the cursor
+///        or a root-class member declaration ⇒ a resolved MEMBER target; an enclosing-function
+///        local/parameter ⇒ a LOCAL target; everything else (class/enum/type names, autoloads,
+///        unresolvable buffers) ⇒ the raw-scan residue.
 ///   2. Choose candidate files:
-///      - **Method/signal targets** (M6-E) and **autoload singleton names** (M6-D): project-wide
-///        textual scan matching Godot's `gdscript_workspace.cpp:472` two-phase strategy — enumerate
-///        ALL project files from the index, read text (VFS/disk; no analysis), keep only files whose
-///        text contains `name` as a substring. This catches callers that reach the method through a
-///        body-local typed var (`var l: Lib = Lib.new(); l.helper()`) that wouldn't appear in
-///        `name_referencers`, and autoload names (`Global`) which appear only in function bodies,
-///        never in interface-level annotations.
-///      - **Class/type/variable targets**: `Index::name_referencers(name)` fast-path (interface-pass
-///        filter); these can only be reached through interface-level type annotations.
+///      - Method/signal/autoload targets AND resolved member targets: project-wide textual
+///        scan matching Godot's `gdscript_workspace.cpp:472` two-phase strategy — enumerate
+///        ALL project files, read text (VFS/disk; no analysis), keep files whose text contains
+///        `name`. This catches accesses through body-local typed vars
+///        (`var l: Lib = Lib.new(); l.helper()` / `l.speed`) that never appear in
+///        `name_referencers`.
+///      - Local targets: none (locals cannot be referenced cross-file).
+///      - Residue targets: `Index::name_referencers(name)` fast-path (interface-pass filter).
 ///   3. For each candidate (plus the current buffer): lazy-parse, lazy-analyze, then collect
-///      occurrences two ways and de-dupe: (a) the parser-level identifier scan
-///      (`push_identifier_locations`) — every `Identifier` node named `name`, covering call-site
-///      callees, `extends Foo`, `class_name`, and identifier-typed annotations at the precise
-///      identifier range; (b) the analyzer's `Binding::Use` records (`push_binding_locations`) for
-///      resolved member/identifier uses (a strict-subset cross-check that de-dupes exactly against
-///      the identifier scan). `Binding::Call` is intentionally NOT projected — its span is the whole
-///      call expression, and the identifier scan already emits the callee at the correct narrower
-///      range, so projecting both double-reported every call site.
-///   4. If `params.context.include_declaration`, prepend the declaration site
-///      (`find_in_file_definition` / `find_global_class_definition` from the M3 definition path).
+///      and de-dupe per the classification: resolved member targets project ONLY
+///      `Binding::Use` records filtered by `(declaring file, name)`
+///      (`push_use_binding_locations_for`) — the raw scan's cross-class bleed is exactly what
+///      this removes; local targets scan identifiers within the enclosing function; residue
+///      targets keep both the loose binding scan and the raw identifier scan
+///      (`push_identifier_locations` — `extends Foo`, `class_name`, annotations). The
+///      never-under-report floor thus survives exactly where resolution can't decide.
+///      `Binding::Call` is intentionally NOT projected on non-method paths — its span is the
+///      whole call expression, and callee identifiers ride the scans above.
+///   4. Resolve the declaration site unconditionally (`find_in_file_definition` /
+///      `find_global_class_definition` from the M3 definition path):
+///      `includeDeclaration: true` prepends it; `false` FILTERS any scan hit on it at final
+///      assembly.
 ///
 /// Returns `None` when the cursor doesn't land on an identifier (LSP wire = null). Returns
 /// `Some(vec)` (possibly empty) otherwise.
@@ -2102,6 +2106,30 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         None
     };
 
+    // Classify NON-method targets BEFORE declaration resolution — a LOCAL target's declaration
+    // lives inside its function, and resolving it through the class-member table would return a
+    // same-named member's declaration instead. See [`NonMethodTarget`]: a resolved member scans
+    // binding-backed, a local scans its enclosing function, and only the unresolved residue
+    // keeps the raw-scan floor.
+    let mut non_method_target = NonMethodTarget::Unresolved;
+    if !is_method_or_signal && !is_autoload {
+        if let Some(p) = current_path
+            .as_ref()
+            .filter(|p| p.extension() == Some("gd"))
+        {
+            let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+            let node_span = parsed.tree.get(node_id).span;
+            non_method_target = classify_non_method_target(
+                &parsed.tree,
+                &result,
+                node_span,
+                byte,
+                &name,
+                current_fid,
+            );
+        }
+    }
+
     // Resolve the declaration site(s) UNCONDITIONALLY — `includeDeclaration` is a filter, not
     // just a prepend: when `true` the declaration joins the result up front, and when `false`
     // any scan hit on the declaration's own name token must be REMOVED at final assembly (the
@@ -2170,6 +2198,14 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 if let Some(loc) = find_autoload_definition(state, &name) {
                     decls.push(loc);
                 }
+            } else if let NonMethodTarget::Local(fn_span) = &non_method_target {
+                // A local's declaration is its own identifier inside the enclosing function —
+                // find_in_file_definition would wrongly return a same-named class member's.
+                if let Some(loc) =
+                    local_declaration_location(&parsed.tree, *fn_span, &name, &uri, &mapper)
+                {
+                    decls.push(loc);
+                }
             } else if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
                 decls.push(loc);
             } else if let Some(loc) = find_global_class_definition(state, &name) {
@@ -2182,16 +2218,17 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         locations.extend(declaration_locations.iter().cloned());
     }
 
-    // Always scan the current file's bindings — name_referencers is the interface-level filter
-    // (cross-file dependents), not the self-references set. The body of the current file may
-    // contain many uses of `name` that name_referencers won't surface.
+    // Always scan the current file — name_referencers is the interface-level filter (cross-file
+    // dependents), not the self-references set. The body of the current file may contain many
+    // uses of `name` that name_referencers won't surface. The analysis is the cached result the
+    // classification above already computed.
     if let Some(p) = current_path
         .as_ref()
         .filter(|p| p.extension() == Some("gd"))
     {
         let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
-        push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
         if is_method_or_signal {
+            push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
             // For method/signal targets: use callee-filtered call projection instead of raw
             // identifier scan to avoid false positives from identically-named declarations.
             // Only project when target_file is Some — if None (native/unresolved), fall back
@@ -2211,12 +2248,39 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
             }
         } else {
-            // Non-method targets: raw identifier scan picks up `extends Foo`, type annotations,
-            // `class_name`, and other parser-level refs the reducer doesn't record. Cross-file
-            // candidates below already get this scan; without it here, in-file extends/type/
-            // class_name references to `name` would be silently under-reported. The dedup pass
-            // at the end collapses any overlap with the binding scan.
-            push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
+            match &non_method_target {
+                NonMethodTarget::Member(tf) => {
+                    // Binding-backed: every recorded use resolving to (declaring file, name) —
+                    // bare member uses, `self.x` writes/reads, typed attribute accesses. The
+                    // raw scan is NOT run here; its cross-class bleed is the bug this closes.
+                    push_use_binding_locations_for(
+                        &mut locations,
+                        &result,
+                        *tf,
+                        &name,
+                        &uri,
+                        &mapper,
+                    );
+                }
+                NonMethodTarget::Local(fn_span) => {
+                    push_identifier_locations_within(
+                        &mut locations,
+                        &parsed.tree,
+                        &name,
+                        *fn_span,
+                        &uri,
+                        &mapper,
+                    );
+                }
+                NonMethodTarget::Unresolved => {
+                    // Residue floor (incl. autoload + Class/Enum targets): the binding scan
+                    // plus the raw identifier scan, which picks up `extends Foo`, type
+                    // annotations, `class_name`, and other parser-level refs the reducer
+                    // doesn't record. The dedup pass collapses overlap.
+                    push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
+                    push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
+                }
+            }
         }
     }
 
@@ -2244,29 +2308,44 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     let candidates: Vec<(camino::Utf8PathBuf, Uri)> = if is_method_or_signal || is_autoload {
         method_scan_candidate_uris(state, &name, current_fid, "references")
     } else {
-        // Fast-path for class/type/variable names: only files whose interface mentions `name` can
-        // reference it; `name_referencers` already has that set. (Autoloads are excluded — they
-        // take the project-wide textual scan above since they never appear in interface sets.)
-        let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
-        for fid in state.workspace.index.name_referencers(&name) {
-            candidate_fids.insert(fid);
-        }
-        let mut out = Vec::new();
-        for fid in candidate_fids {
-            let Some(p) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
-                continue;
-            };
-            if current_path.as_deref().is_some_and(|e| normalize_eq(e, &p)) {
-                continue;
+        match &non_method_target {
+            // Resolved member: the same project-wide textual fan-out method targets use —
+            // also a RECALL fix: `a.speed` through a body-local typed var never names `speed`
+            // in the accessor's interface, so the old `name_referencers` set missed those
+            // files entirely.
+            NonMethodTarget::Member(_) => {
+                method_scan_candidate_uris(state, &name, current_fid, "references")
             }
-            match path_to_file_uri(&p) {
-                Some(uri) => out.push((p, uri)),
-                None => log::warn!(
-                    "references: dropping candidate {p} — path_to_file_uri rejected the path"
-                ),
+            // Locals can never be referenced from another file — no fan-out at all.
+            NonMethodTarget::Local(_) => Vec::new(),
+            NonMethodTarget::Unresolved => {
+                // Fast-path for class/type names: only files whose interface mentions `name`
+                // can reference it; `name_referencers` already has that set. (Autoloads are
+                // excluded — they take the project-wide textual scan above since they never
+                // appear in interface sets.)
+                let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
+                for fid in state.workspace.index.name_referencers(&name) {
+                    candidate_fids.insert(fid);
+                }
+                let mut out = Vec::new();
+                for fid in candidate_fids {
+                    let Some(p) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+                        continue;
+                    };
+                    if current_path.as_deref().is_some_and(|e| normalize_eq(e, &p)) {
+                        continue;
+                    }
+                    match path_to_file_uri(&p) {
+                        Some(uri) => out.push((p, uri)),
+                        None => log::warn!(
+                            "references: dropping candidate {p} — path_to_file_uri rejected \
+                             the path"
+                        ),
+                    }
+                }
+                out
             }
         }
-        out
     };
 
     for (path, cand_uri) in candidates {
@@ -2277,8 +2356,8 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         };
         let rope = Rope::from_str(&text);
         let cand_mapper = PositionMapper::new(&rope, enc);
-        push_binding_locations(&mut locations, &cand_result, &name, &cand_uri, &cand_mapper);
         if is_method_or_signal {
+            push_binding_locations(&mut locations, &cand_result, &name, &cand_uri, &cand_mapper);
             // For method/signal targets: use callee-filtered call projection (accurate) rather
             // than raw identifier scan (which would pick up unrelated same-named declarations
             // like `func helper():` in other.gd). When target_file is None (native/unresolved),
@@ -2305,9 +2384,40 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 );
             }
         } else {
-            // Non-method targets: identifier scan picks up `extends Foo` and other parser-level
-            // refs the reducer doesn't record. De-dupes happen below.
-            push_identifier_locations(&mut locations, &parsed.tree, &name, &cand_uri, &cand_mapper);
+            match &non_method_target {
+                NonMethodTarget::Member(tf) => {
+                    // Binding-backed only — a candidate's same-named member of a DIFFERENT
+                    // class records a different declaring file and is filtered out here.
+                    push_use_binding_locations_for(
+                        &mut locations,
+                        &cand_result,
+                        *tf,
+                        &name,
+                        &cand_uri,
+                        &cand_mapper,
+                    );
+                }
+                // Local targets fan out no candidates (unreachable; kept exhaustive).
+                NonMethodTarget::Local(_) => {}
+                NonMethodTarget::Unresolved => {
+                    // Residue floor: identifier scan picks up `extends Foo` and other
+                    // parser-level refs the reducer doesn't record. De-dupes happen below.
+                    push_binding_locations(
+                        &mut locations,
+                        &cand_result,
+                        &name,
+                        &cand_uri,
+                        &cand_mapper,
+                    );
+                    push_identifier_locations(
+                        &mut locations,
+                        &parsed.tree,
+                        &name,
+                        &cand_uri,
+                        &cand_mapper,
+                    );
+                }
+            }
         }
     }
 
@@ -2339,12 +2449,215 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     Some(locations)
 }
 
+/// How `references` should scan for a NON-method cursor target — resolved before any scan runs,
+/// so precision rides the binding layer where resolution succeeded and the raw-scan floor
+/// survives exactly where it can't decide.
+enum NonMethodTarget {
+    /// The cursor's symbol is a member DECLARED in this file: scan `Binding::Use` records
+    /// filtered by `(declaring file, name)` — two unrelated `var speed`s in different classes
+    /// stop reporting each other's sites.
+    Member(gd_project::FileId),
+    /// A local/parameter of the enclosing function (its span): scan identifiers within that
+    /// function only — locals can never be referenced cross-file, so the old project-wide scan
+    /// was pure over-report.
+    Local(ByteSpan),
+    /// Couldn't resolve — the documented "over-approximate, never under-report" residue floor
+    /// (raw identifier scan). Class/Enum/EnumValue targets classify here DELIBERATELY:
+    /// `extends Foo`, `class_name`, and type annotations are resolver-level references with no
+    /// bindings, so a binding-only scan would under-report them.
+    Unresolved,
+}
+
+/// Classify a non-method cursor target (see [`NonMethodTarget`]). Resolution sources, in order:
+/// a `Binding::Use` at the exact cursor span (attribute reads, bare member uses — inheriting
+/// the analyzer's resolution by construction), the root class's own member declarations (a
+/// declaration click), and the enclosing function's local declarations.
+fn classify_non_method_target(
+    tree: &ParseTree,
+    result: &AnalysisResult,
+    node_span: ByteSpan,
+    byte: usize,
+    name: &str,
+    current_fid: Option<gd_project::FileId>,
+) -> NonMethodTarget {
+    for b in result.bindings() {
+        if let Binding::Use {
+            target_file: Some(f),
+            target_kind,
+            target_name,
+            site,
+        } = b
+        {
+            if *site == node_span
+                && target_name == name
+                && !matches!(
+                    target_kind,
+                    BindingTargetKind::Class
+                        | BindingTargetKind::Enum
+                        | BindingTargetKind::EnumValue
+                )
+            {
+                return NonMethodTarget::Member(*f);
+            }
+        }
+    }
+    if let Some(fid) = current_fid {
+        if let Some(root) = tree.root() {
+            if let NodeKind::Class(class) = &root.kind {
+                for m in &class.members {
+                    // Class/Enum declaration clicks keep the union path (their references
+                    // live in annotations/extends the reducer doesn't record).
+                    if matches!(m, Member::Class(_) | Member::Enum(_)) {
+                        continue;
+                    }
+                    if let Some(decl) = member_named(tree, m, name) {
+                        if let Some(ident) = declaration_identifier(tree, decl) {
+                            if tree.get(ident).span == node_span {
+                                return NonMethodTarget::Member(fid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(fn_span) = enclosing_function_declaring(tree, byte, name) {
+        return NonMethodTarget::Local(fn_span);
+    }
+    NonMethodTarget::Unresolved
+}
+
+/// The span of the smallest function containing `byte`, iff that function declares `name` as a
+/// parameter or a body-local var/const. A class-level member can never pass the span filter
+/// (declarations outside the function body), so a member target never mis-classifies as local.
+fn enclosing_function_declaring(tree: &ParseTree, byte: usize, name: &str) -> Option<ByteSpan> {
+    let mut best: Option<ByteSpan> = None;
+    for id in tree.iter_ids() {
+        if let NodeKind::Function(_) = &tree.get(id).kind {
+            let span = tree.get(id).span;
+            if span.start <= byte
+                && byte < span.end
+                && best.is_none_or(|s| span.end - span.start < s.end - s.start)
+            {
+                best = Some(span);
+            }
+        }
+    }
+    let fn_span = best?;
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if node.span.start < fn_span.start || node.span.end > fn_span.end {
+            continue;
+        }
+        let ident = match &node.kind {
+            NodeKind::Parameter(p) => p.identifier,
+            NodeKind::Variable(v) => v.identifier,
+            NodeKind::Constant(c) => c.identifier,
+            _ => None,
+        };
+        if ident.is_some_and(|iid| ident_name(tree, iid) == name) {
+            return Some(fn_span);
+        }
+    }
+    None
+}
+
+/// Append a [`Location`] for every [`Binding::Use`] that resolved to the member `name` DECLARED
+/// in `target_file` — the precise, binding-backed references path for resolved member targets.
+/// The raw identifier scan is deliberately NOT run alongside this: its project-wide cross-class
+/// bleed is exactly what the binding filter removes.
+fn push_use_binding_locations_for(
+    out: &mut Vec<Location>,
+    result: &AnalysisResult,
+    target_file: gd_project::FileId,
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
+    for binding in result.bindings() {
+        if let Binding::Use {
+            target_file: Some(tf),
+            target_name,
+            site,
+            ..
+        } = binding
+        {
+            if *tf == target_file && target_name == name {
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(*site),
+                });
+            }
+        }
+    }
+}
+
+/// The declaration [`Location`] of the local/parameter `name` inside `scope` (the enclosing
+/// function's span): the first `Parameter`/`Variable`/`Constant` identifier of that name in
+/// arena order — the local-target analog of [`find_in_file_definition`].
+fn local_declaration_location(
+    tree: &ParseTree,
+    scope: ByteSpan,
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) -> Option<Location> {
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if node.span.start < scope.start || node.span.end > scope.end {
+            continue;
+        }
+        let ident = match &node.kind {
+            NodeKind::Parameter(p) => p.identifier,
+            NodeKind::Variable(v) => v.identifier,
+            NodeKind::Constant(c) => c.identifier,
+            _ => None,
+        };
+        if let Some(iid) = ident {
+            if ident_name(tree, iid) == name {
+                return Some(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(tree.get(iid).span),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// [`push_identifier_locations`] restricted to identifiers inside `scope` — the function-scoped
+/// references path for locals/parameters. A same-named member ACCESS inside the same function
+/// still matches (bounded over-approximation); the cross-function and cross-file bleed is gone.
+fn push_identifier_locations_within(
+    out: &mut Vec<Location>,
+    tree: &ParseTree,
+    name: &str,
+    scope: ByteSpan,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if node.span.start < scope.start || node.span.end > scope.end {
+            continue;
+        }
+        if let NodeKind::Identifier(i) = &node.kind {
+            if i.name == name {
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(node.span),
+                });
+            }
+        }
+    }
+}
+
 /// Append a [`Location`] for every [`Binding::Use`] in `result.bindings` whose `target_name` is
 /// `name`. [`Binding::Call`] is deliberately excluded (see the body comment): the callee-identifier
 /// occurrence of every call is already covered by [`push_identifier_locations`] at the correct,
-/// narrower range. The kind filter is intentionally loose for v1 — over-reporting hits for distinct
-/// same-named symbols is preferable to under-reporting, and `Index.name_referencers` already
-/// narrowed the candidate set before we got here.
+/// narrower range. The name-only filter belongs to the UNRESOLVED-target residue path (and the
+/// method path's loose current-file scan) — resolved member targets take
+/// [`push_use_binding_locations_for`]'s file-filtered projection instead.
 fn push_binding_locations(
     out: &mut Vec<Location>,
     result: &AnalysisResult,
