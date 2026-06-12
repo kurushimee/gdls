@@ -27,8 +27,6 @@ cargo test --workspace
 
 - **CI denies all warnings** (`RUSTFLAGS: -D warnings`); be clippy-clean on first write. Use `cargo lint`
   (the alias in `.cargo/config.toml`), not bare `cargo clippy`.
-- **Single test:** `cargo test -p gd_syntax simple_var_declaration` (name substring), or an integration
-  file: `cargo test -p gd_server --test lifecycle`. Add `-- --nocapture` for output.
 - **Run it:** `cargo run --bin gdls` (debug) or `target/release/gdls` (release). It speaks JSON-RPC over
   stdio, so a bare invocation just waits for an LSP client.
 
@@ -132,29 +130,11 @@ Phase 1 = v1 = **M0–M6**: M0 LSP skeleton · M1 tokenizer + parser · M2 envir
 [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md). Phase 2 (post-v1): `.tscn` node typing for `$`/`%`,
 `completion`, `signatureHelp`, `rename`/`documentHighlight`.
 
-**Current:** Phase 1 complete — **v1.0.5 shipped** (release notes in `CHANGELOG.md`). v1.0.5 is
-the LSP protocol-conventions release: the post-v1.0.4 exposed-capability audit (spec +
-rust-analyzer/gopls/clangd comparison) filed twelve issues (#43–#54, one PR of
-per-work-package commits) and all twelve closed. Ranges anchor the symbol **name token**
-everywhere — cross-file `definition` (`MemberDecl.name_span`, index cache **v4**: one-time
-cold rebuild), `workspace/symbol` (no more zero-width column-0 points), callHierarchy
-`fromRanges`, and stub jumps; client capabilities are honored (`documentSymbol` downgrades to
-flat without `hierarchicalDocumentSymbolSupport`, `references` treats
-`includeDeclaration: false` as a filter, the empty `workspace/symbol` query returns all
-symbols, UNUSED_*/UNREACHABLE_* carry `DiagnosticTag.Unnecessary` gated on `tagSupport` +
-`codeDescription` docs links); call hierarchy is fully walkable (to-items carry `data` +
-uri/selectionRange re-resolution, native callees anchor into the API stubs — the fabricated
-caller-file (0,0) arm is deleted, unresolvable callees are omitted — and `detail` renders
-signatures / `res://` paths); SHADOWED_* warnings publish `relatedInformation` at the shadowed
-declaration (messages byte-identical); and **references precision** landed in full (#54 pulled
-forward from Phase 2): `Binding::Call` classifies a `CalleeTarget` (Script + owning class
-path / Native / Unresolved, one consolidated recording site), in-file attribute reads record
-`Binding::Use`, and resolved member targets scan binding-backed with the raw-scan floor
-surviving only where resolution can't decide. Both conformance ratchets hold at **1.0**:
-parser **186/186**, analyzer **300/300**. CI is green (`cargo fmt --check`, `cargo lint`,
-`cargo test --workspace`); three-layer fuzz gate (`parse` + `analyze` + `index_invariants`).
-Standing release gate: the `scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both
-acceptance projects (a nav-row walk is NOT a diagnostics gate; error baselines must hold —
-warning counts re-based in v1.0.4, and the sweep takes `--strict` + a warning histogram), with
-the private project swept **on Windows with the Windows binary**. Per-milestone exit criteria:
-`docs/07`; the full history: `CHANGELOG.md`.
+**Current:** Phase 1 complete — **v1.0.5 shipped** (2026-06-12). Release notes and the full
+history live in `CHANGELOG.md`; per-milestone exit criteria in `docs/07`. Both conformance
+ratchets hold at **1.0** with empty known-failures lists; CI is green on both legs with the
+three-layer fuzz gate (`parse` + `analyze` + `index_invariants`). Standing release gate: the
+`scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both acceptance projects, run
+comparatively against the previous release binary (`--strict` + warning histogram; error
+baselines must hold; a nav-row walk is NOT a diagnostics gate), with the private project swept
+on Windows with the Windows binary.
