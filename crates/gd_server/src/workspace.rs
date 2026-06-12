@@ -102,6 +102,12 @@ pub struct Workspace {
     /// makes every analyze pass deterministically slow. Same per-call override semantics as
     /// [`Self::analyzer_iter_limit`]. `None` in production.
     analyzer_checkpoint_delay: Option<std::time::Duration>,
+    /// M7 (#61): bumped whenever the analysis cache is cleared wholesale (`project.godot` /
+    /// native-DB reload, and runtime config changes once #59 lands) — invalidations the
+    /// content-hash + epoch composite key cannot see, because neither the file's bytes nor its
+    /// dependency epochs changed. The third component of the pull-diagnostics `resultId`, so a
+    /// pulled report is never wrongly answered `unchanged` across such a reload.
+    analysis_generation: u64,
     /// Per-file stat snapshot used for warm-start cache saves and stat-based reconcile. Keyed by
     /// normalized path (`gd_project::normalize_path`). Populated during warm-load (stat-diff walk)
     /// and after a cold `Index::build` (stat sweep of all interned files). Updated by
@@ -183,8 +189,15 @@ impl Workspace {
                 .analyzer
                 .checkpoint_delay_us
                 .map(std::time::Duration::from_micros),
+            analysis_generation: 0,
             stat_table,
         }
+    }
+
+    /// M7 (#61): the wholesale-invalidation counter component of the pull-diagnostics
+    /// `resultId` — see the field doc.
+    pub fn analysis_generation(&self) -> u64 {
+        self.analysis_generation
     }
 
     /// Atomically persist the index + stat table to the `.gdls` cache directory.
@@ -632,6 +645,7 @@ impl Workspace {
         self.adopt_native(native, false);
         self.policy = WarnPolicy::build(&self.project.warnings, &strict_settings(&options.strict));
         self.analysis_cache.clear();
+        self.analysis_generation += 1;
     }
 
     /// Re-load only the native DB (extension_api.json + every installed gdextension's doc XML).
@@ -681,6 +695,7 @@ impl Workspace {
         }
         self.native = new;
         self.analysis_cache.clear();
+        self.analysis_generation += 1;
         true
     }
 
