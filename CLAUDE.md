@@ -139,10 +139,11 @@ no custom protocol; every feature capability-gated. The Godot-LSP anti-catalog i
 binding.
 
 **Current:** Phase 1 complete — **v1.0.5 shipped** (2026-06-12); Phase 2 underway: **M7
-(protocol foundations) implemented** — all seven issues (#57–#63) merged 2026-06-13; milestone
-close pends the interactive editor smoke walk + remaining capability-profile captures
-(`crates/gd_server/tests/fixtures/client_caps/README.md`). Phase 2 ships no per-milestone
-releases (deferred until the phase matures). Release notes and the full history live in
+(protocol foundations) complete** — all seven issues (#57–#63) merged 2026-06-13, milestone
+closed. Per-milestone interactive checks are batched into ONE end-of-Phase-2 trial by the user
+in real work (capability captures are Claude's, headless — inventory + gaps in
+`crates/gd_server/tests/fixtures/client_caps/README.md`; deferred feel-check items in
+`docs/09 §7.4`). Phase 2 ships no per-milestone releases (deferred until the phase matures). Release notes and the full history live in
 `CHANGELOG.md`; per-milestone exit criteria in `docs/07`. Both conformance ratchets hold at
 **1.0** with empty known-failures lists; CI is green on both legs with the three-layer fuzz
 gate (`parse` + `analyze` + `index_invariants`). Standing release gate: the

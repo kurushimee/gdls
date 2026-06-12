@@ -302,6 +302,16 @@ Godot editor as differential oracle (manual, not CI — the editor's completion 
 the scene-typing convergence sweep (M11 exit). Fuzzing extends to the `.tscn` parser (M11) under
 the same any-panic-blocks-release rule.
 
+**Process note (2026-06-13):** the per-milestone *interactive* smoke checks are batched into
+one end-of-Phase-2 trial — the user observes the finished tool in real work; they perform no
+per-milestone captures or test-rig steps. Editor capability captures are done headlessly as
+each becomes feasible (`crates/gd_server/tests/fixtures/client_caps/README.md` tracks the
+inventory and this machine's gaps). Deferred interactive items accumulate here per milestone:
+
+- **M7:** cancellation under editor load with no stuck UI; cold-index progress spinner
+  visibility; `##` doc prose rendering in hover across editors; pull-vs-push diagnostics
+  agreement observed live.
+
 ## 8. Phase 2 exit criteria
 
 1. Every capability in §5 marked M7–M11 is shipped, advertised exactly, and capability-gated.

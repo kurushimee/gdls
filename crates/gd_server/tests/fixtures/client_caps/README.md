@@ -19,16 +19,18 @@ file, and harvest the dump (capture rig from the M7 work, recreate as needed):
 
 ## Inventory
 
+Captures are **Claude's job** (headless/scriptable drivers — never assigned to the user); the
+user's only check is a single end-of-Phase-2 trial in real work.
+
 | Profile | Version captured | Status |
 |---|---|---|
-| `helix.json` | helix 25.07.1 | ✅ captured 2026-06-13 (WSL, snap) |
-| `vscode.json` | — | ⬜ capture during the M7 exit walk |
-| `neovim.json` | — | ⬜ capture during the M7 exit walk (≥0.11 built-in client) |
-| `zed.json` | — | ⬜ capture during the M7 exit walk |
-| `eglot.json` | — | ⬜ capture during the M7 exit walk (≥1.20) |
-| `sublime.json` | — | ⬜ capture during the M7 exit walk (Sublime LSP) |
-| `claude-code.json` | — | ⬜ capture — decides the absent-`contentFormat` hover default (`crate::docs::ProseFormat` doc) |
+| `helix.json` | helix 25.07.1 | ✅ captured 2026-06-13 (WSL snap, pty-driven) |
+| `neovim.json` | NVIM 0.12.3 | ✅ captured 2026-06-13 (`nvim --headless -l` + `vim.lsp.start`) |
+| `zed.json` | Zed 1.6.3-stable (Windows) | ✅ captured 2026-06-13 (settings-swapped `lsp.<server>.binary` → `wsl.exe` shim; settings restored byte-identical) |
+| `claude-code.json` | — | 🔶 armed: gitignored `.claude/.lsp.json` in this repo routes `.gd` → the capture shim; the **next CC session** completes it by touching any `.gd` via the LSP tool, then vendors the JSON, revisits the markdown-by-default decision on `crate::docs::ProseFormat`, and removes the armed config. (Config loads at session start only; not hot-reloadable.) |
+| `vscode.json` | — | ⬜ blocked: VS Code is not installed on this machine, and its capabilities come from a per-extension `vscode-languageclient`, so there is nothing generic to capture without one |
+| `eglot.json` | — | ⬜ blocked: no emacs binary and no sudo to install one; revisit if emacs appears |
+| `sublime.json` | — | ⬜ blocked: Sublime Text is not installed on this machine |
 
-The remaining captures need the editors' real environments (most live Windows-side here); they
-are part of the interactive milestone-exit walk, not CI. When `claude-code.json` lands, revisit
-the markdown-by-default decision documented on `ProseFormat`.
+Blocked rows are capability gaps of THIS machine, not user tasks — re-attempt whenever the
+tooling appears. The walk meanwhile runs over every vendored profile.
