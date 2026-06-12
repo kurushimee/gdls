@@ -8,12 +8,14 @@
 //! (`docs/02-frontend-port.md`). Type checking and warnings arrive later in `gd_analyze` (M3).
 
 pub mod ast;
+pub mod doc_comments;
 pub mod lexer;
 pub mod parser;
 pub mod span;
 pub mod token;
 
 pub use ast::ParseTree;
+pub use doc_comments::{ClassDoc, DocTable, MemberDoc};
 pub use lexer::{LexError, Lexer};
 pub use span::{ByteSpan, LineCol, LineColRange};
 pub use token::{Literal, Token, TokenKind};
@@ -70,7 +72,12 @@ pub struct ParseResult {
 pub fn parse(source: &str) -> ParseResult {
     let mut parser = parser::Parser::new(source);
     parser.parse_program();
-    let (tree, diagnostics) = parser.into_parts();
+    let comments = parser.take_comments();
+    let (mut tree, diagnostics) = parser.into_parts();
+    // M7 (#62): associate `##` doc comments post-parse — a read-only pass over the finished
+    // tree + the lexer's comment side-channel, so the ported grammar (and both conformance
+    // ratchets) never sees them.
+    tree.docs = doc_comments::associate(source, &tree, &comments);
     let symbols = parser::document_symbols(&tree);
     ParseResult {
         tree,
