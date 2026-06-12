@@ -45,7 +45,7 @@ A standalone server, **gdls**, that:
   is out of scope).
 - Parsing `.tscn` for precise `$Node` / `%Unique` typing → **Phase 2** (now specified: `09-phase-2.md` M11).
 - `signatureHelp` / `completion` → **Phase 2** (Claude Code does not consume them per its docs; editors do — `09-phase-2.md` M8).
-- Any GUI, debugger, formatter, or scene/resource editing. (Phase 2 adds an optional *external*-formatter bridge only — `09-phase-2.md` §5.)
+- Any GUI, debugger, formatter, or scene/resource editing. (Phase 2 adds an optional *external*-formatter bridge only — `09-phase-2.md` §6-M11.)
 
 ## 4. Locked decisions (from brainstorming)
 

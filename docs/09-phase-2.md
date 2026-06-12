@@ -160,6 +160,11 @@ by dependency and editor impact. Effort calibration: assume the M3 pattern (fide
 follow-on WPs, ~3× the initial WP list — `docs/07 §2`) for M8 and M11; M7/M9/M10 are
 glue/projection over existing structures, M6-sized.
 
+Every milestone's exit additionally includes the §7.4 editor-matrix capability walk — all six
+vendored client-capability profiles (Helix, VS Code, Neovim, Zed, eglot, Sublime) — over the
+features that milestone ships. Editors named inside an exit criterion below are the *interactive*
+smoke-checks for that milestone, not the full bar; the six-profile walk is.
+
 ### M7 — protocol foundations (de-weirding the session layer)
 
 Concurrent request dispatch so `$/cancelRequest` actually preempts (cancelled → `RequestCancelled`,

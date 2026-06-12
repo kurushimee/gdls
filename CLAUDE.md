@@ -11,7 +11,7 @@ coupling at 3,000–10,000+ `.gd` scale. Only the frontend is ported — the com
 Godot's module is out of scope (diagnostics only).
 
 Read `docs/00-overview.md` (problem, locked decisions) and `docs/01-architecture.md` first; the full
-spec is `docs/00`…`docs/08`.
+spec is `docs/00`…`docs/09`.
 
 ## Commands
 
