@@ -67,7 +67,7 @@ pub fn document_symbol(
         .unwrap_or("")
         .to_string();
 
-    let symbols: Vec<lsp_types::DocumentSymbol> = parsed
+    let mut symbols: Vec<lsp_types::DocumentSymbol> = parsed
         .symbols
         .iter()
         .map(|s| {
@@ -78,10 +78,56 @@ pub fn document_symbol(
             lsp
         })
         .collect();
+    // `detail` from a request-time interface extraction over the SAME parse tree — matches the
+    // open buffer exactly (no index staleness) and renders through the byte-stable formatters
+    // hover already pins. Flat responses drop it naturally (SymbolInformation has no field).
+    let iface = gd_project::extract_interface(&parsed.tree);
+    annotate_symbol_details(&mut symbols, &iface);
     if hierarchical {
         DocumentSymbolResponse::Nested(symbols)
     } else {
         DocumentSymbolResponse::Flat(flatten_symbols(&symbols, &uri))
+    }
+}
+
+/// The `extends` clause rendered for a class symbol's `detail` — what reference servers show
+/// dimmed next to the class name in the outline.
+fn extends_detail(extends: &gd_project::Extends) -> Option<String> {
+    match extends {
+        gd_project::Extends::None => None,
+        gd_project::Extends::Path(p) => Some(format!("extends \"{p}\"")),
+        gd_project::Extends::Names(names) => Some(format!("extends {}", names.join("."))),
+    }
+}
+
+/// Post-pass pairing the built LSP symbol tree with its [`gd_project::Interface`]: every symbol
+/// at one level IS the class `iface` describes (the A1 root wrapper, or a recursive inner-class
+/// symbol) — its `detail` is the extends clause; member children pair by name against
+/// `iface.members` (GDScript has no overloads, so first-match is exact) and render via
+/// [`format_member_signature`]; CLASS children recurse into the matching `iface.inner`. Symbols
+/// with no interface counterpart (enum values, named enums) keep `detail: None`.
+fn annotate_symbol_details(
+    symbols: &mut [lsp_types::DocumentSymbol],
+    iface: &gd_project::Interface,
+) {
+    for sym in symbols {
+        sym.detail = extends_detail(&iface.extends);
+        let Some(children) = sym.children.as_mut() else {
+            continue;
+        };
+        for child in children {
+            if child.kind == LspSymbolKind::CLASS {
+                if let Some(inner) = iface
+                    .inner
+                    .iter()
+                    .find(|i| i.class_name.as_deref() == Some(child.name.as_str()))
+                {
+                    annotate_symbol_details(std::slice::from_mut(child), inner);
+                }
+            } else if let Some(decl) = iface.members.iter().find(|m| m.name == child.name) {
+                child.detail = format_member_signature(&child.name, decl);
+            }
+        }
     }
 }
 
@@ -2860,7 +2906,7 @@ pub fn prepare_call_hierarchy(
                             name,
                             kind: LspSymbolKind::FUNCTION,
                             tags: None,
-                            detail: None,
+                            detail: script_detail(state, &path),
                             uri: callee_uri,
                             range,
                             selection_range,
@@ -2906,19 +2952,32 @@ pub fn prepare_call_hierarchy(
     let ident_range = mapper.span_to_range(parsed.tree.get(ident_id).span);
 
     let data = serde_json::json!({ "uri": uri.as_str(), "name": fn_name });
+    let detail = uri_to_path(&uri).and_then(|p| script_detail(state, &p));
 
     #[allow(deprecated)]
     let item = CallHierarchyItem {
         name: fn_name,
         kind: LspSymbolKind::FUNCTION,
         tags: None,
-        detail: None,
+        detail,
         uri,
         range: fn_range,
         selection_range: ident_range,
         data: Some(data),
     };
     Some(vec![item])
+}
+
+/// gopls-style container disambiguator for call-hierarchy items' `detail`: the script's
+/// `res://` path (same-named GDScript lifecycle callers — `_ready` in every script — are
+/// otherwise indistinguishable in the tree), falling back to the file basename for
+/// out-of-root paths.
+fn script_detail(state: &ServerState, path: &camino::Utf8Path) -> Option<String> {
+    state
+        .workspace
+        .project
+        .path_to_res(path)
+        .or_else(|| path.file_name().map(str::to_owned))
 }
 
 /// Find a function declaration by bare name anywhere in `tree` (root class methods or inner-class
@@ -3075,7 +3134,7 @@ pub fn outgoing_calls(
 
     let mut out = Vec::with_capacity(groups.len());
     for ((callee_file, callee_name), ranges) in groups {
-        let (to_uri, to_range, to_selection) = match callee_file {
+        let (to_uri, to_range, to_selection, to_detail) = match callee_file {
             Some(fid) => match state.workspace.index.path(fid).map(|p| p.to_path_buf()) {
                 Some(path) => match path_to_file_uri(&path) {
                     Some(u) => {
@@ -3083,7 +3142,8 @@ pub fn outgoing_calls(
                         // site — load the callee's file and resolve `func callee_name`'s spans.
                         let (range, selection) =
                             resolve_fn_item_ranges(state, &path, &u, &callee_name);
-                        (u, range, selection)
+                        let detail = script_detail(state, &path);
+                        (u, range, selection, detail)
                     }
                     None => {
                         log::debug!(
@@ -3114,8 +3174,9 @@ pub fn outgoing_calls(
             },
             // Native / unresolved callee: no project declaration to point at. Degrade to the
             // caller's URI with a zero-width range at file start (LSP requires a location), NOT the
-            // call-site range the pre-fix code used.
-            None => (uri.clone(), file_start_range(), file_start_range()),
+            // call-site range the pre-fix code used. No detail either — never label the
+            // fabricated anchor as if it were a resolved location.
+            None => (uri.clone(), file_start_range(), file_start_range(), None),
         };
         // `to` items carry the same {uri, name} blob prepare/incoming items do — the client
         // hands them back verbatim on expansion ("show outgoing calls of this callee"), and a
@@ -3129,7 +3190,7 @@ pub fn outgoing_calls(
             name: callee_name.clone(),
             kind: LspSymbolKind::FUNCTION,
             tags: None,
-            detail: None,
+            detail: to_detail,
             uri: to_uri,
             range: to_range,
             selection_range: to_selection,
@@ -3226,7 +3287,7 @@ pub fn incoming_calls(
                 name: caller_name.clone(),
                 kind: LspSymbolKind::FUNCTION,
                 tags: None,
-                detail: None,
+                detail: script_detail(state, &path),
                 uri: cand_uri.clone(),
                 range: from_range,
                 selection_range: from_selection,

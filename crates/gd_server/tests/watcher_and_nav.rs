@@ -409,6 +409,9 @@ fn call_hierarchy_prepare_and_outgoing_for_attack() {
     );
     let item = items.into_iter().next().unwrap();
     assert_eq!(item.name, "attack");
+    // `detail` carries the gopls-style res:// container so same-named callers from different
+    // scripts stay distinguishable in the tree.
+    assert_eq!(item.detail.as_deref(), Some("res://src/hero.gd"));
 
     // outgoingCalls — expect `helper` to appear.
     let outgoing_params = CallHierarchyOutgoingCallsParams {
@@ -431,6 +434,7 @@ fn call_hierarchy_prepare_and_outgoing_for_attack() {
         .unwrap_or_else(|| {
             panic!("expected `helper` in attack's outgoing calls; got {outgoing:?}")
         });
+    assert_eq!(helper_call.to.detail.as_deref(), Some("res://src/hero.gd"));
     // The `to` item locates the callee's DECLARATION (LSP 3.17), not the call site.
     // `func helper` is declared on line 5; the call `helper()` is on line 9. Pre-fix BOTH `range`
     // and `selection_range` pointed at the call site (line 9) — the contract violation this closes.

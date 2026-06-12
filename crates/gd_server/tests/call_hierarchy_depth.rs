@@ -149,6 +149,11 @@ fn outgoing_expands_to_depth_three_across_files() {
         "to items must carry the {{uri, name}} data blob; got {:?}",
         fb.to
     );
+    assert_eq!(
+        fb.to.detail.as_deref(),
+        Some("res://src/b.gd"),
+        "cross-file to-items disambiguate by their res:// detail"
+    );
 
     // Hop 2: the client hands fb's `to` item back verbatim.
     let hop2 = outgoing_of(&client, 12, fb.to.clone())

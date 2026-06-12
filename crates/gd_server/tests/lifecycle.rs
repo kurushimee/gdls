@@ -161,11 +161,13 @@ fn m0_lifecycle_diagnostics_and_symbols() {
     // A1 changed documentSymbol: now returns a single root Class wrapping members. For an unnamed
     // script ("extends Node" with no class_name), the root name is the file basename "a.gd"
     // (filled by the handler) and children is absent (no members declared). The selectionRange is
-    // zero-width at (0,0) since there's no class_name declaration to point at.
+    // zero-width at (0,0) since there's no class_name declaration to point at. The root's
+    // `detail` renders the extends clause.
     assert_eq!(
         resp.result,
         Some(serde_json::json!([{
             "name": "a.gd",
+            "detail": "extends Node",
             "kind": 5,
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
             "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}

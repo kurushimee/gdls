@@ -365,6 +365,81 @@ fn document_symbol_explicit_false_yields_flat() {
     assert_flat_document_symbols(client, handle);
 }
 
+/// Symbol `detail` renders each member's declaration shape through the same byte-stable
+/// formatters hover pins (issue #51): outlines show signatures dimmed next to the names, and
+/// the class symbols carry their extends clause.
+#[test]
+fn document_symbol_details_render_signatures() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/details.gd".parse().unwrap();
+    let src = concat!(
+        "extends Node\n",
+        "\n",
+        "@warning_ignore(\"unused_signal\")\n",
+        "signal hit(damage: int)\n",
+        "\n",
+        "const MAX := 100\n",
+        "\n",
+        "var speed: float = 1.0\n",
+        "\n",
+        "func helper(a: int) -> bool:\n",
+        "\treturn a > 0\n",
+        "\n",
+        "class Inner extends RefCounted:\n",
+        "\tvar x := 0\n",
+    );
+    did_open(&client, &uri, src);
+    let _ = recv_publish_diagnostics(&client);
+
+    client
+        .sender
+        .send(request(
+            3,
+            "textDocument/documentSymbol",
+            serde_json::to_value(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none());
+    let symbols: Vec<DocumentSymbol> =
+        serde_json::from_value(resp.result.expect("documentSymbol result")).unwrap();
+    let root = &symbols[0];
+    assert_eq!(root.detail.as_deref(), Some("extends Node"));
+
+    let members = root.children.as_deref().unwrap_or_default();
+    let detail_of = |name: &str| -> Option<&str> {
+        members
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("`{name}` missing from outline"))
+            .detail
+            .as_deref()
+    };
+    assert_eq!(detail_of("hit"), Some("signal hit(damage: int)"));
+    assert_eq!(detail_of("MAX"), Some("const MAX: int"));
+    assert_eq!(detail_of("speed"), Some("var speed: float"));
+    assert_eq!(detail_of("helper"), Some("func helper(a: int) -> bool"));
+    let inner = members
+        .iter()
+        .find(|s| s.name == "Inner")
+        .expect("Inner class in outline");
+    assert_eq!(inner.detail.as_deref(), Some("extends RefCounted"));
+    assert_eq!(
+        inner.children.as_deref().unwrap_or_default()[0]
+            .detail
+            .as_deref(),
+        Some("var x: int"),
+        "inner-class members pair with the inner interface"
+    );
+
+    shutdown(&client, handle);
+}
+
 /// Boot advertising `publishDiagnostics.tagSupport` with `Unnecessary` in the value set.
 fn boot_with_tag_support() -> (Connection, std::thread::JoinHandle<()>) {
     boot_with_capabilities(ClientCapabilities {
