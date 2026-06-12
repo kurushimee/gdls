@@ -83,6 +83,11 @@ pub(crate) struct ClientCaps {
     /// of trusting the notification's payload shape (many clients send `settings: null`); the
     /// modern-client convention.
     pub(crate) workspace_configuration: bool,
+    /// `workspace.didChangeWatchedFiles.dynamicRegistration` (M7 #60) — when true, gdls sends
+    /// `client/registerCapability` for its watch globs after `initialized`. The ONLY dynamic
+    /// registration gdls performs (docs/09 §7.1): it is the one capability Helix honors only
+    /// dynamically, and the spec forbids registering the same capability statically too.
+    pub(crate) dynamic_watched_files: bool,
 }
 
 impl ClientCaps {
@@ -111,6 +116,12 @@ impl ClientCaps {
                 .as_ref()
                 .and_then(|w| w.configuration)
                 .unwrap_or(false),
+            dynamic_watched_files: caps
+                .workspace
+                .as_ref()
+                .and_then(|w| w.did_change_watched_files.as_ref())
+                .and_then(|d| d.dynamic_registration)
+                .unwrap_or(false),
         }
     }
 }
@@ -122,6 +133,10 @@ pub(crate) enum OutboundKind {
     /// A `workspace/configuration` pull for the `"gdls"` section — the response carries one
     /// settings object per requested item; `result[0]` is applied as a runtime re-config.
     Configuration,
+    /// The one-shot `client/registerCapability` for the watch globs (M7 #60) — the response is
+    /// acknowledgment-only (success logs at debug; an error reply means the session runs on the
+    /// native watcher alone, which stays armed regardless).
+    RegisterWatchedFiles,
 }
 
 /// All mutable server state for one session.
@@ -381,6 +396,12 @@ fn serve_inner(
         outbound: FxHashMap::default(),
         stub_cache: crate::stubs::StubCache::default(),
     };
+
+    // M7 (#60): the one dynamic registration, sent once the session state exists (the
+    // `initialized` notification itself was already consumed by `initialize_finish` during the
+    // handshake — there is no later hook). No-op without
+    // `workspace.didChangeWatchedFiles.dynamicRegistration`.
+    register_watched_files(&mut state);
 
     // At startup no buffers are open yet, so this set is empty; building it via the same helper the
     // watcher uses keeps the "open buffer wins" rule uniform and correct even if a future change
@@ -861,6 +882,13 @@ fn handle_outbound_response(state: &mut ServerState, resp: Response) {
             }
             apply_runtime_config(state, &section);
         }
+        OutboundKind::RegisterWatchedFiles => match &resp.error {
+            Some(err) => log::warn!(
+                "client rejected client/registerCapability for didChangeWatchedFiles ({});                  running on the native watcher alone",
+                err.message
+            ),
+            None => log::debug!("client acknowledged the didChangeWatchedFiles registration"),
+        },
     }
 }
 
@@ -1022,10 +1050,26 @@ fn handle_watcher(state: &mut ServerState, events: Vec<DebouncedEvent>) {
         return;
     }
 
-    // Clone the project root ONCE per batch — the inner loop hits classify_event +
-    // apply_reaction per reaction, both of which need the root by reference. Cloning per
-    // reaction would scale linearly with the (typically large) debounced batch size.
+    // Clone the project root ONCE per batch — classification and application both need it by
+    // reference; cloning per reaction would scale linearly with the (typically large) batch.
     let root = state.workspace.project.root.clone();
+    let reactions: Vec<Reaction> = events
+        .iter()
+        .flat_map(|ev| watcher::classify_event(ev, &root))
+        .collect();
+    apply_reaction_batch(state, reactions, &root, &open_paths);
+}
+
+/// Apply one classified batch of [`Reaction`]s — the shared applier behind the native watcher
+/// (`handle_watcher`) and client-delivered `workspace/didChangeWatchedFiles` events (M7 #60), so
+/// every mutation from either source flows through the same `Workspace::reindex`/`remove` →
+/// `Index::txn` → `Index::verify()` funnel and the same coalesced project/native reload.
+fn apply_reaction_batch(
+    state: &mut ServerState,
+    reactions: Vec<Reaction>,
+    root: &Utf8Path,
+    open_paths: &FxHashSet<Utf8PathBuf>,
+) {
     // WP-RD11 (3): coalesce the project/native-DB reload. The per-file `GdSource` reactions are
     // applied as they come (each is an independent index mutation), but a batch that touches
     // `project.godot` AND two `.gdextension` files AND `extension_api.json` must reload the native
@@ -1033,19 +1077,17 @@ fn handle_watcher(state: &mut ServerState, events: Vec<DebouncedEvent>) {
     // Scan the batch into two booleans and do the (expensive) reload + republish at most once after.
     let mut project_changed = false;
     let mut native_changed = false;
-    for ev in events {
-        for reaction in watcher::classify_event(&ev, &root) {
-            match reaction {
-                // Coalesce the project/native-DB reactions into the post-batch reload below.
-                Reaction::ProjectGodot
-                | Reaction::Gdextension { .. }
-                | Reaction::DocClassesXml { .. } => project_changed = true,
-                Reaction::ExtensionApiJson => native_changed = true,
-                // GdSource (per-file index mutation) and Other (dropped) both flow through
-                // `apply_reaction` so each still opens a `watcher_event` span — the WP-RD7
-                // `SkipReason` on an `Other` surfaces in the trace there.
-                other => apply_reaction(state, other, &root, &open_paths),
-            }
+    for reaction in reactions {
+        match reaction {
+            // Coalesce the project/native-DB reactions into the post-batch reload below.
+            Reaction::ProjectGodot
+            | Reaction::Gdextension { .. }
+            | Reaction::DocClassesXml { .. } => project_changed = true,
+            Reaction::ExtensionApiJson => native_changed = true,
+            // GdSource (per-file index mutation) and Other (dropped) both flow through
+            // `apply_reaction` so each still opens a `watcher_event` span — the WP-RD7
+            // `SkipReason` on an `Other` surfaces in the trace there.
+            other => apply_reaction(state, other, root, open_paths),
         }
     }
     republish_dirty_open_buffers(state);
@@ -1081,6 +1123,74 @@ fn handle_watcher(state: &mut ServerState, events: Vec<DebouncedEvent>) {
     // switch can balloon the parse + analysis caches in one go; this catches that burst without
     // waiting for the 3-second ticker.
     state.rss.sample_now("post_watcher");
+}
+
+/// M7 (#60): translate client-delivered `FileEvent`s into [`Reaction`]s (same classification
+/// gate as the native watcher — `watcher::classify_client_event`) and run them through the
+/// shared batch applier. Out-of-root and excluded paths drop in classification/`apply_reaction`
+/// exactly as native events do; open buffers keep winning over disk.
+fn handle_client_file_events(state: &mut ServerState, changes: Vec<lsp_types::FileEvent>) {
+    if changes.is_empty() {
+        return;
+    }
+    let root = state.workspace.project.root.clone();
+    let open_paths = open_buffer_paths(state);
+    let reactions: Vec<Reaction> = changes
+        .iter()
+        .filter_map(|ev| {
+            let path = uri_to_path(&ev.uri)?;
+            let path = gd_project::normalize_path(&path);
+            let change = match ev.typ {
+                lsp_types::FileChangeType::CREATED => FileChange::Created,
+                lsp_types::FileChangeType::CHANGED => FileChange::Modified,
+                lsp_types::FileChangeType::DELETED => FileChange::Deleted,
+                other => {
+                    log::debug!("didChangeWatchedFiles: dropping unknown change type {other:?}");
+                    return None;
+                }
+            };
+            Some(watcher::classify_client_event(&path, change, &root))
+        })
+        .collect();
+    apply_reaction_batch(state, reactions, &root, &open_paths);
+}
+
+/// M7 (#60): the one dynamic registration gdls performs — `client/registerCapability` for the
+/// watch globs, sent after `initialized` iff the client advertised
+/// `workspace.didChangeWatchedFiles.dynamicRegistration`. Deliberately broad `**/` globs: the
+/// classification funnel re-applies the same root/exclusion rules the native watcher uses, so
+/// over-delivery converges to identical semantics. (`**/*.tscn` joins the list in M11.)
+fn register_watched_files(state: &mut ServerState) {
+    if !state.caps.dynamic_watched_files {
+        return;
+    }
+    let watcher = |glob: &str| serde_json::json!({ "globPattern": glob });
+    let id = state.shared.next_outgoing_id();
+    state
+        .outbound
+        .insert(id.clone(), OutboundKind::RegisterWatchedFiles);
+    let req = Request {
+        id,
+        method: "client/registerCapability".to_string(),
+        params: serde_json::json!({
+            "registrations": [{
+                "id": "gdls-watched-files",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": {
+                    "watchers": [
+                        watcher("**/*.gd"),
+                        watcher("**/project.godot"),
+                        watcher("**/*.gdextension"),
+                        watcher("**/extension_api.json"),
+                        watcher("**/doc_classes/*.xml"),
+                    ],
+                },
+            }],
+        }),
+    };
+    if state.sender.send(Message::Request(req)).is_err() {
+        log::warn!("client/registerCapability send failed (client disconnected?)");
+    }
 }
 
 /// Dispatch a single classified [`Reaction`] to the right [`Workspace`] mutator. Per-reaction
@@ -1192,9 +1302,22 @@ fn apply_reaction_inner(
                 FileChange::Created | FileChange::Modified => {
                     match std::fs::read_to_string(&path) {
                         Ok(text) => {
+                            // M7 (#60): duplicate-delivery gate — the same on-disk change can
+                            // arrive from BOTH the native watcher and a client's
+                            // didChangeWatchedFiles. A reindex is not a free no-op (it bumps the
+                            // epoch and forces re-analysis), so identical content skips it. The
+                            // stat refresh still runs to keep the warm-start table current.
+                            if state.workspace.disk_apply_is_duplicate(&path, &text) {
+                                log::debug!(
+                                    "watcher: duplicate delivery for {path}; reindex skipped"
+                                );
+                                state.workspace.update_stat_from_disk(&path);
+                                return;
+                            }
                             state
                                 .workspace
                                 .reindex(&path, &gd_syntax::parse(&text).tree);
+                            state.workspace.record_disk_apply(&path, &text);
                             // Disk-sourced: refresh stat_table so the next warm-load can skip this
                             // file if it hasn't changed again (Issue 1 perf fix).
                             state.workspace.update_stat_from_disk(&path);
@@ -1224,6 +1347,7 @@ fn apply_reaction_inner(
                     match std::fs::read_to_string(&to) {
                         Ok(text) => {
                             state.workspace.reindex(&to, &gd_syntax::parse(&text).tree);
+                            state.workspace.record_disk_apply(&to, &text);
                             // Disk-sourced rename target: refresh stat_table (Issue 1 perf fix).
                             state.workspace.update_stat_from_disk(&to);
                         }
@@ -1751,6 +1875,16 @@ fn dispatch_notification(state: &mut ServerState, note: Notification) {
                 log::debug!("$/cancelRequest for {id:?} reached the worker (in-flight: {found})");
             }
         }
+        "workspace/didChangeWatchedFiles" => {
+            // M7 (#60): client-observed file events merge into the same Reaction funnel the
+            // native watcher feeds — same exclusion filter, same classification, same
+            // batch-coalescing applier, so `Index::verify()` guards these mutations too. The
+            // native watcher stays armed; duplicate delivery of one change is collapsed by the
+            // content-fingerprint gate in `apply_reaction_inner`.
+            if let Ok(p) = parse_params::<lsp_types::DidChangeWatchedFilesParams>(&method, params) {
+                handle_client_file_events(state, p.changes);
+            }
+        }
         "workspace/didChangeConfiguration" => {
             // M7 (#59): runtime re-config. With `workspace.configuration` advertised, the
             // notification's payload is ignored (many clients send `settings: null` by
@@ -1787,6 +1921,10 @@ fn dispatch_notification(state: &mut ServerState, note: Notification) {
                 apply_runtime_config(state, &raw);
             }
         }
+        // NOTE: the `initialized` notification never reaches this dispatcher — lsp-server's
+        // `initialize_finish` consumes it as part of the handshake. Post-initialized work
+        // (e.g. the M7 #60 dynamic registration) lives in `serve_inner` after state
+        // construction instead.
         "initialized" => log::info!("client reported initialized"),
         other => log::debug!("ignoring notification: {other}"),
     }
@@ -1824,6 +1962,9 @@ fn reindex_from_disk(state: &mut ServerState, uri: &Uri) {
             state
                 .workspace
                 .reindex(&path, &gd_syntax::parse(&text).tree);
+            // Disk-sourced like the watcher arms: record for the M7 (#60) duplicate-delivery
+            // gate (the close-time disk state often echoes right back as a watcher event).
+            state.workspace.record_disk_apply(&path, &text);
             // Disk-sourced reindex: update stat_table so the next warm-load can skip this file
             // if it hasn't changed again. Must NOT be called on the buffer path (see
             // Workspace::update_stat_from_disk doc).

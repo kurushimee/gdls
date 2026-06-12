@@ -50,6 +50,11 @@ pub(crate) struct CacheEntry<T> {
     pub(crate) value: Rc<T>,
 }
 
+/// Normalized owned path in the index's key form (`gd_project::normalize_path`).
+fn normalize_path_buf(path: &Utf8Path) -> Utf8PathBuf {
+    gd_project::normalize_path(path)
+}
+
 /// Content fingerprint for cache validation: a fast non-cryptographic hash of the full text.
 /// FxHasher is a multiply-xor hash with weaker-than-ideal avalanche/distribution (no collision-
 /// resistance guarantee), so the true collision rate is worse than an idealized 1/2⁶⁴ — but it is
@@ -108,6 +113,14 @@ pub struct Workspace {
     /// dependency epochs changed. The third component of the pull-diagnostics `resultId`, so a
     /// pulled report is never wrongly answered `unchanged` across such a reload.
     analysis_generation: u64,
+    /// M7 (#60): content fingerprint of the last DISK-sourced reindex per canonical path —
+    /// the dedupe gate for double delivery of the same change by the native watcher AND a
+    /// client's `didChangeWatchedFiles`. `Index::on_file_changed` unconditionally bumps the
+    /// file's epoch (forcing re-analysis), so an identical-content reindex is NOT a free no-op;
+    /// this gate is what makes the belt-and-suspenders delivery free. Content-addressed (not a
+    /// time window), so an A→B→A edit sequence applies all three. Bounded LRU; entries drop on
+    /// [`Self::remove`].
+    last_applied_disk: LruCache<Utf8PathBuf, u64>,
     /// Per-file stat snapshot used for warm-start cache saves and stat-based reconcile. Keyed by
     /// normalized path (`gd_project::normalize_path`). Populated during warm-load (stat-diff walk)
     /// and after a cold `Index::build` (stat sweep of all interned files). Updated by
@@ -204,8 +217,27 @@ impl Workspace {
                 .checkpoint_delay_us
                 .map(std::time::Duration::from_micros),
             analysis_generation: 0,
+            last_applied_disk: LruCache::new(
+                std::num::NonZeroUsize::new(4096)
+                    .expect("invariant: the dedupe cache capacity is a nonzero constant"),
+            ),
             stat_table,
         }
+    }
+
+    /// M7 (#60): `true` when a disk-sourced reindex of `path` with exactly this content was
+    /// already applied — the duplicate-delivery gate (see [`Self::last_applied_disk`]).
+    pub(crate) fn disk_apply_is_duplicate(&mut self, path: &Utf8Path, text: &str) -> bool {
+        let hash = fingerprint(text);
+        self.last_applied_disk
+            .get(&normalize_path_buf(path))
+            .is_some_and(|h| *h == hash)
+    }
+
+    /// M7 (#60): record a disk-sourced reindex so the other delivery channel can dedupe it.
+    pub(crate) fn record_disk_apply(&mut self, path: &Utf8Path, text: &str) {
+        self.last_applied_disk
+            .put(normalize_path_buf(path), fingerprint(text));
     }
 
     /// M7 (#61): the wholesale-invalidation counter component of the pull-diagnostics
@@ -645,6 +677,9 @@ impl Workspace {
     /// entry would linger for the session. `remove` is only called off the hot edit path (watcher
     /// delete, `didClose` of a vanished file), so eviction here can't trigger a double-parse.
     pub fn remove(&mut self, path: &Utf8Path) {
+        // M7 (#60): a deleted file's dedupe record must not suppress a future re-create with
+        // identical content.
+        self.last_applied_disk.pop(&normalize_path_buf(path));
         self.index.txn(path, |idx| {
             idx.on_file_removed(path);
         });
