@@ -499,6 +499,77 @@ fn definition_jumps_across_files_via_class_name() {
     let _ = std::fs::remove_dir_all(&fixture_dir);
 }
 
+#[test]
+fn definition_on_cross_file_member_covers_the_name_token() {
+    // Cross-file member jumps must anchor the NAME token — the same shape the in-file arm
+    // returns — not the whole declaration node that `MemberDecl::span` covers: editors select
+    // the returned range, so a whole-func range visibly selects the entire function body.
+    // Covers both cross-file arms: the call-binding path (`l.helper(1)`) and the use-binding
+    // path (`l.sig`).
+    let fixture_dir = std::env::temp_dir().join("gdls_def_xfile_member");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    let lib_path = fixture_dir.join("lib.gd");
+    let b_path = fixture_dir.join("b.gd");
+    // `sig` ident on line 1 cols 7..10; `helper` ident on line 2 cols 5..11.
+    std::fs::write(
+        &lib_path,
+        "class_name DefLib\nsignal sig\nfunc helper(amount: int) -> int:\n\treturn amount\n",
+    )
+    .expect("write lib.gd");
+    let b_src = "extends Node\n\
+                 func go() -> void:\n\
+                 \tvar l: DefLib = DefLib.new()\n\
+                 \tl.helper(1)\n\
+                 \tprint(l.sig)\n";
+    std::fs::write(&b_path, b_src).expect("write b.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+        "autoDumpExtensionApi": false,
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+    let b_uri: Uri = format!("file:///{}", b_path.to_string_lossy().replace('\\', "/"))
+        .parse()
+        .unwrap();
+    did_open(&client, &b_uri, b_src);
+
+    let location_at = |line: u32, character: u32, what: &str| -> lsp_types::Location {
+        match definition_at(&client, &b_uri, Position::new(line, character))
+            .unwrap_or_else(|| panic!("definition must answer on {what} at {line}:{character}"))
+        {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            other => panic!("{what}: expected scalar Location, got {other:?}"),
+        }
+    };
+
+    // Call-binding arm: `helper` inside `l.helper(1)` → exactly the `helper` identifier in
+    // lib.gd (line 2, cols 5..11), not the whole `func helper(...)` node.
+    let loc = location_at(3, 4, "cross-file method callee");
+    assert!(
+        loc.uri.as_str().ends_with("/lib.gd"),
+        "jump must land in lib.gd, got {}",
+        loc.uri.as_str()
+    );
+    assert_eq!(loc.range.start, Position::new(2, 5));
+    assert_eq!(loc.range.end, Position::new(2, 11));
+
+    // Use-binding arm: `sig` inside `print(l.sig)` → exactly the `sig` identifier (line 1,
+    // cols 7..10).
+    let loc = location_at(4, 9, "cross-file signal attribute");
+    assert!(
+        loc.uri.as_str().ends_with("/lib.gd"),
+        "jump must land in lib.gd, got {}",
+        loc.uri.as_str()
+    );
+    assert_eq!(loc.range.start, Position::new(1, 7));
+    assert_eq!(loc.range.end, Position::new(1, 10));
+
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
 /// Fix 1: hover on a cross-file method call with parameters shows param NAMES in the signature.
 /// `func helper(amount: int, who: String) -> int` must render with `amount` and `who`, not just
 /// `int, String`.
@@ -1315,6 +1386,12 @@ fn definition_on_native_symbols_jumps_into_materialized_stubs() {
         .nth(loc.range.start.line as usize)
         .expect("class_line within the stub");
     assert_eq!(header_line, "class_name AudioStreamPlayer");
+    // The range covers exactly the class NAME token, not column 0 of the header line.
+    assert_eq!(loc.range.start.character, 11);
+    assert_eq!(
+        loc.range.end.character,
+        11 + "AudioStreamPlayer".len() as u32
+    );
     assert!(
         stub_text.contains("func stop() -> void") && stub_text.contains("var volume_db: float"),
         "the page renders the whole API, got:\n{stub_text}"
@@ -1337,6 +1414,9 @@ fn definition_on_native_symbols_jumps_into_materialized_stubs() {
         "func stop() -> void",
         "member access anchors at the rendered declaration"
     );
+    // `func stop() -> void` — the member's name token sits at cols 5..9.
+    assert_eq!(loc.range.start.character, 5);
+    assert_eq!(loc.range.end.character, 9);
 
     // 3. Implicit-self bare call (`queue_free()`) → the DECLARING class's stub (Node).
     let loc = location_at(4, 3, "bare inherited call");
@@ -1353,6 +1433,9 @@ fn definition_on_native_symbols_jumps_into_materialized_stubs() {
             .unwrap(),
         "func queue_free() -> void"
     );
+    // `func queue_free() -> void` — the name token sits at cols 5..15.
+    assert_eq!(loc.range.start.character, 5);
+    assert_eq!(loc.range.end.character, 15);
 
     // 4. A project class keeps shadowing the native arm.
     let loc = location_at(5, 9, "project class");

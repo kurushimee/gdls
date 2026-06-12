@@ -498,7 +498,14 @@ fn native_definition(
             name,
             stub_root.as_deref(),
         )?;
-        return stub_location(&path, stub.class_line);
+        // `name.len()` is a byte count, but ensure_class_stub only materializes
+        // identifier-shaped (ASCII) class names — see stub_token_location's encoding note.
+        return stub_token_location(
+            &path,
+            stub.class_line,
+            stub.class_name_col,
+            name.len() as u32,
+        );
     }
 
     // 2. Subscript attribute over a Native-typed base: resolve the member to its declaring
@@ -570,7 +577,7 @@ fn native_definition(
 }
 
 /// Materialize the stub of the class DECLARING `member` (found by the chain walk from `class`)
-/// and anchor at the member's rendered line.
+/// and anchor at the member's NAME token on its rendered line.
 fn native_member_stub_location(
     state: &ServerState,
     class: &str,
@@ -582,16 +589,19 @@ fn native_member_stub_location(
     let declaring = db.name_of(decl.name).to_owned();
     let (path, stub) =
         crate::stubs::ensure_class_stub(&state.stub_cache, db, &declaring, stub_root)?;
-    stub_location(&path, *stub.member_lines.get(member)?)
+    let anchor = *stub.member_lines.get(member)?;
+    stub_token_location(&path, anchor.line, anchor.name_col, anchor.name_len)
 }
 
-/// A zero-width Location at the start of `line` (0-based) in the stub at `path`.
-fn stub_location(path: &camino::Utf8Path, line: u32) -> Option<Location> {
+/// A Location covering a name token on `line` (0-based) of the stub at `path`. The columns are
+/// byte offsets within the line, valid under ANY negotiated position encoding: stub declaration
+/// lines open with fixed ASCII prefixes and engine names are ASCII identifiers (see
+/// [`crate::stubs::MemberAnchor`]).
+fn stub_token_location(path: &camino::Utf8Path, line: u32, col: u32, len: u32) -> Option<Location> {
     let uri = path_to_file_uri(path)?;
-    let pos = Position::new(line, 0);
     Some(Location {
         uri,
-        range: lsp_types::Range::new(pos, pos),
+        range: lsp_types::Range::new(Position::new(line, col), Position::new(line, col + len)),
     })
 }
 
@@ -1517,23 +1527,29 @@ fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
 /// logged at `warn` so operators can see "definition vanished because the file became unreadable"
 /// rather than silently degrading to "no definition found."
 /// Location of `name`'s declaration in `fid`'s head interface (any member kind, incl. named
-/// enums and unnamed-enum hoists — they all carry a `MemberDecl` with a span). Built against the
-/// target file's current text (open buffer wins over disk), like
-/// [`find_global_class_definition`]. Inner-class members aren't head-interface visible and
-/// degrade to `None` (the documented inner-class stance).
+/// enums and unnamed-enum hoists — they all carry a `MemberDecl` with a span), anchored on the
+/// declaration's NAME token (`MemberDecl::name_span`) so cross-file jumps share the in-file
+/// arm's identifier-span shape — never the whole declaration node, which editors would select.
+/// Built against the target file's current text (open buffer wins over disk), with the
+/// [`find_global_class_definition`] validation discipline: the indexed span is accepted only
+/// while its bytes still spell the member name; on drift (open-buffer edits / watcher lag) the
+/// identifier is re-located in a live parse, degrading to the whole-declaration span only when
+/// the member vanished from the live tree — never dropping a previously-working jump.
+/// Inner-class members aren't head-interface visible and degrade to `None` (the documented
+/// inner-class stance).
 fn member_decl_location(
     state: &mut ServerState,
     fid: gd_project::FileId,
     name: &str,
 ) -> Option<Location> {
-    let span = state
+    let (name_span, decl_span) = state
         .workspace
         .index
         .interface(fid)?
         .members
         .iter()
         .find(|m| m.name == name)
-        .map(|m| m.span)?;
+        .map(|m| (m.name_span, m.span))?;
     let path = state.workspace.index.path(fid)?.to_path_buf();
     let uri = path_to_file_uri(&path)?;
     let uri_str = uri.as_str().to_owned();
@@ -1553,9 +1569,19 @@ fn member_decl_location(
     };
     let rope = ropey::Rope::from_str(&text);
     let mapper = PositionMapper::new(&rope, state.encoding);
+    if text.get(name_span.start..name_span.end) == Some(name) {
+        return Some(Location {
+            uri,
+            range: mapper.span_to_range(name_span),
+        });
+    }
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    if let Some(loc) = find_in_file_definition(&parsed.tree, name, &uri, &mapper) {
+        return Some(loc);
+    }
     Some(Location {
         uri,
-        range: mapper.span_to_range(span),
+        range: mapper.span_to_range(decl_span),
     })
 }
 
