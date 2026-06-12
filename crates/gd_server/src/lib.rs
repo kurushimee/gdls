@@ -18,6 +18,7 @@ pub mod watcher;
 pub mod workspace;
 pub mod xfile;
 
+mod docs;
 mod handlers;
 pub mod logging;
 mod native_render;

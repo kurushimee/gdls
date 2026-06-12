@@ -4539,6 +4539,11 @@ impl Parser {
     }
 
     /// Consume the parser, yielding the owned tree and collected diagnostics (used by [`crate::parse`]).
+    /// M7 (#62): hand the lexer's recorded comments to the post-parse doc association.
+    pub fn take_comments(&mut self) -> std::collections::HashMap<u32, crate::lexer::CommentData> {
+        std::mem::take(&mut self.lexer.comments)
+    }
+
     pub fn into_parts(mut self) -> (ParseTree, Vec<Diagnostic>) {
         // WP-R3: stamp the lexer's final line counter onto the tree so analyzer emissions
         // anchored on the parser's `previous` token at end-of-parse can render at the

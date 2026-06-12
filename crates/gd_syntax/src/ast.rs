@@ -585,6 +585,11 @@ pub struct ParseTree {
     /// (gdscript_parser.cpp:482-489); the warning itself is emitted by `gd_analyze`, which owns
     /// the warning set — this crate stays engine-free and only records the signal.
     pub starts_at_eof: bool,
+    /// M7 (#62): `##` doc-comment associations, populated by [`crate::parse`] after the parse
+    /// completes (`doc_comments::associate`). Riding on the tree means every existing
+    /// interface-extraction call site gets docs with zero signature churn, and the parse cache
+    /// carries them for free. Empty for sources without doc comments.
+    pub docs: crate::doc_comments::DocTable,
 }
 
 impl ParseTree {

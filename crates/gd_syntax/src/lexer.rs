@@ -182,6 +182,21 @@ pub struct LexError {
     pub message: String,
 }
 
+/// One recorded comment (M7 #62) — the side-channel mirror of Godot's
+/// `GDScriptTokenizer::CommentData` (`gdscript_tokenizer.h:188`, recorded at
+/// `gdscript_tokenizer.cpp:1208` / `:1339` under `TOOLS_ENABLED`). The token stream is
+/// untouched: comments stay invisible to the ported grammar (both conformance ratchets see
+/// identical tokens), and the text is sliced from the source by span on demand instead of
+/// being built char-by-char in the hot loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommentData {
+    /// Byte range of the comment, from the `#` to (exclusive) the line's `\n`/EOF.
+    pub span: ByteSpan,
+    /// `true`: the comment starts at the beginning of the line or after indentation only.
+    /// `false`: inline (after some code) — Godot's `CommentData::new_line`.
+    pub new_line: bool,
+}
+
 /// The GDScript lexer. Drive it with [`Lexer::scan`] until it returns [`TokenKind::Eof`].
 pub struct Lexer {
     chars: Vec<char>,
@@ -209,6 +224,10 @@ pub struct Lexer {
 
     error_stack: Vec<Token>,
     pub errors: Vec<LexError>,
+    /// M7 (#62): comments keyed by 1-based line, mirroring Godot's `HashMap<int, CommentData>`
+    /// (one comment per line — a later comment on the same line overwrites, as upstream's
+    /// `comments[line] =` does). Consumed post-parse by `doc_comments::associate`.
+    pub comments: std::collections::HashMap<u32, CommentData>,
 }
 
 impl Lexer {
@@ -242,6 +261,7 @@ impl Lexer {
             indent_char: '\0',
             error_stack: Vec::new(),
             errors: Vec::new(),
+            comments: std::collections::HashMap::new(),
         }
     }
 
@@ -945,9 +965,19 @@ impl Lexer {
                 continue;
             }
             if self.peek(0) == '#' {
+                // M7 (#62): record the comment (Godot: gdscript_tokenizer.cpp:1208 — always
+                // `new_line: true` on this whole-line path) before consuming it.
+                let comment_start = self.byte_offsets[self.pos];
                 while self.peek(0) != '\n' && !self.is_at_end() {
                     self.advance();
                 }
+                self.comments.insert(
+                    self.line,
+                    CommentData {
+                        span: ByteSpan::new(comment_start, self.byte_offsets[self.pos]),
+                        new_line: true,
+                    },
+                );
                 if self.is_at_end() {
                     self.pending_indents -= self.indent_stack.len() as i32;
                     self.indent_stack.clear();
@@ -1044,9 +1074,19 @@ impl Lexer {
                     self.check_indent();
                 }
                 '#' => {
+                    // M7 (#62): record the comment (Godot: gdscript_tokenizer.cpp:1339 —
+                    // `new_line` is whether the line held no code before it).
+                    let comment_start = self.byte_offsets[self.pos];
                     while self.peek(0) != '\n' && !self.is_at_end() {
                         self.advance();
                     }
+                    self.comments.insert(
+                        self.line,
+                        CommentData {
+                            span: ByteSpan::new(comment_start, self.byte_offsets[self.pos]),
+                            new_line: is_bol,
+                        },
+                    );
                     if self.is_at_end() {
                         return;
                     }

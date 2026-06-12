@@ -38,13 +38,17 @@ Doc prose for `textDocument/hover` resolves through this priority order:
    from the dump (and for older dumps without docs); merged into the same native DB. Same XML
    format Godot's class reference uses. See `03-indexing-freshness.md` §1–§2 for the multi-source
    capture story.
-3. **Absent** — if neither tier carries prose, hover shows the type signature alone.
+3. **GDScript `##` doc comments (shipped in M7, #62)** — project-class/member prose: the lexer
+   records comments into a side-channel (token stream untouched; ratchets unaffected) and a
+   post-parse pass ports Godot's association rules (`gd_syntax::doc_comments`). Docs ride the
+   `Interface` outside the signature hash, so a doc-only edit never invalidates dependents.
+4. **Absent** — if no tier carries prose, hover shows the type signature alone.
 
-**Project-class (user-defined) doc prose is deferred to Phase 2 — now scheduled as M7.** GDScript's
-`##` doc-comment syntax is discarded by the M1 lexer (no `##`-token retention); restoring it
-requires either lexer work or a sidecar doc extractor. It lands in **M7** as part of the shared
-documentation pipeline (`09-phase-2.md` §7.2 — one BBCode→Markdown converter feeding hover, then
-completion/signatureHelp in M8). Until then, hover on a project class shows the resolved type only.
+All outgoing prose — dump descriptions and `##` docs alike are BBCode-flavored — flows through
+the single converter in `gd_server::docs` (`09-phase-2.md` §7.2): GFM out (fenced signature,
+`---` rule, prose — the rust-analyzer hover shape), or stripped plaintext when the client's
+`hover.contentFormat` prefers it. Raw BBCode never reaches the wire (anti-catalog W8). M8 feeds
+completion/signatureHelp documentation through the same converter.
 
 ### M4 nav handler semantics
 
