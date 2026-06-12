@@ -378,6 +378,22 @@ fn gd_source_one_sided(path: Utf8PathBuf, change: FileChange) -> Reaction {
     Reaction::GdSource { path, change }
 }
 
+/// M7 (#60): classify a client-delivered `workspace/didChangeWatchedFiles` event into the same
+/// [`Reaction`] funnel the native watcher uses — identical exclusion filter and path
+/// classification, so a client event can never reach an index mutation a native event couldn't.
+/// (LSP has no rename events; a client-observed rename arrives as a Deleted + Created pair and
+/// flows as two one-sided reactions, which the funnel already handles.)
+pub fn classify_client_event(
+    path: &Utf8Path,
+    change: FileChange,
+    project_root: &Utf8Path,
+) -> Reaction {
+    if is_excluded(path, project_root) {
+        return Reaction::Other(SkipReason::Excluded);
+    }
+    reaction_for_path(path, change, project_root)
+}
+
 fn reaction_for_path(path: &Utf8Path, change: FileChange, project_root: &Utf8Path) -> Reaction {
     let name = path.file_name().unwrap_or("");
     let lower = name.to_ascii_lowercase();
