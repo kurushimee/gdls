@@ -84,7 +84,9 @@ pub struct AnalyzerConfig {
     /// cancellation/staleness wire races be tested over a real session
     /// (`tests/concurrent_dispatch.rs`) and lets an operator simulate a pathologically slow
     /// project. `None` (the default — leave it unset in production) costs one branch per
-    /// checkpoint.
+    /// checkpoint. The value is deliberately unbounded (it exists to break responsiveness on
+    /// purpose), but note the scale: a large file crosses hundreds of gates, so even a few
+    /// thousand µs per gate makes every analysis-priced request feel hung in a live editor.
     pub checkpoint_delay_us: Option<u64>,
 }
 
