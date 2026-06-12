@@ -1223,6 +1223,18 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
             resolve_provider: Some(false),
             work_done_progress_options: Default::default(),
         }),
+        // M7 (#61): pull diagnostics. interFileDependencies — a dependency's interface edit
+        // changes this file's report (the resultId's epoch component tracks it).
+        // workspaceDiagnostics stays false permanently: project-wide pull conflicts with the
+        // per-file-diagnostics principle (docs/00 §4; documented skip in docs/09 §5).
+        diagnostic_provider: Some(lsp_types::DiagnosticServerCapabilities::Options(
+            lsp_types::DiagnosticOptions {
+                identifier: Some("gdls".to_string()),
+                inter_file_dependencies: true,
+                workspace_diagnostics: false,
+                work_done_progress_options: Default::default(),
+            },
+        )),
         // `textDocument/publishDiagnostics` is a server→client push, not a capability field.
         ..Default::default()
     }
@@ -1404,6 +1416,10 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         "callHierarchy/incomingCalls" => handle!(handlers::incoming_calls),
         "callHierarchy/outgoingCalls" => handle!(handlers::outgoing_calls),
         "workspace/symbol" => handle!(handlers::workspace_symbol),
+        // M7 (#61): pull diagnostics. NOT in the Hard-pressure shed list above — `analyze_gd`
+        // self-degrades to parser-only + cached results there, exactly like the push path, so
+        // pull and push stay byte-identical under pressure too.
+        "textDocument/diagnostic" => handle!(document_diagnostic),
         _ => Response::new_err(
             id,
             ERR_METHOD_NOT_FOUND,
@@ -1636,21 +1652,48 @@ fn parse_params<P: serde::de::DeserializeOwned>(
 /// by a content fingerprint, so the same `didChange` doesn't pay the cost twice when
 /// `documentSymbol` and `publishDiagnostics` race on identical buffer text.
 fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) {
+    let params = PublishDiagnosticsParams {
+        diagnostics: diagnostic_items(state, &uri),
+        uri,
+        version,
+    };
+    let value = serde_json::to_value(params).expect(
+        "invariant: PublishDiagnosticsParams has no field whose serde::Serialize impl can fail \
+         (every field is String / Vec / Option<i32> / serde_json::Value with infallible writers)",
+    );
+    let notif = Notification {
+        method: "textDocument/publishDiagnostics".to_string(),
+        params: value,
+    };
+    if let Err(e) = state.sender.send(Message::Notification(notif)) {
+        // Diagnostics publish is fire-and-forget — but a wedged channel means every
+        // subsequent edit silently fails to update the editor view. Warn so production
+        // logs surface the case at default level.
+        log::warn!("publishDiagnostics send failed (client likely disconnected): {e}");
+    }
+}
+
+/// Parse + analyze the open buffer for `uri` into the merged diagnostic set — the single
+/// computation behind `textDocument/publishDiagnostics` (push) and `textDocument/diagnostic`
+/// (pull), so the two wire shapes carry byte-identical items by construction. No open buffer
+/// yields the empty set (the `didClose` clear-path). The pull-only `resultId` is deliberately
+/// NOT computed here: the push path would discard it on every didOpen/didChange
+/// ([`result_id_for`] is the pull handler's job, exactly once per pull).
+fn diagnostic_items(state: &mut ServerState, uri: &Uri) -> Vec<Diagnostic> {
     // v1.0.4 (#34): stub buffers never self-diagnose — a materialized native API page need not
     // be analyzable GDScript, only readable as it. Matched against the stubs BASE root (any
-    // version/hash: an old-hash stub can stay open across a mid-session dump swap). The publish
-    // below still runs with the empty set, so a client that somehow held diagnostics for the
-    // path clears them.
-    let is_stub = crate::stubs::is_stub_uri(&uri, state.options.stub_cache_dir.as_deref());
-    let diagnostics: Vec<Diagnostic> = if is_stub {
+    // version/hash: an old-hash stub can stay open across a mid-session dump swap). The caller
+    // still publishes the empty set, so a client that somehow held diagnostics clears them.
+    let is_stub = crate::stubs::is_stub_uri(uri, state.options.stub_cache_dir.as_deref());
+    let items: Vec<Diagnostic> = if is_stub {
         Vec::new()
     } else {
         match state.vfs.get(uri.as_str()).map(|d| d.text()) {
             Some(text) => {
-                let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+                let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
                 // Only `.gd` files go through the analyzer — for any other open buffer the syntax
                 // diagnostics carry the publish on their own.
-                let analyzed = analyze_gd(state, &uri, &parsed.tree, &text);
+                let analyzed = analyze_gd(state, uri, &parsed.tree, &text);
                 // Related-location memo BEFORE the doc borrow: every distinct cross-file target
                 // (a SHADOWED_VARIABLE_BASE_CLASS base script) is read once into a rope for the
                 // encoding-correct projection below. Bounded by the related entries one file's
@@ -1663,7 +1706,7 @@ fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) 
                             &mapper,
                             state.encoding,
                             state.caps,
-                            &uri,
+                            uri,
                             &related_texts,
                             &parsed.diagnostics,
                             analyzed.as_deref(),
@@ -1681,26 +1724,86 @@ fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) 
             }
         }
     };
+    items
+}
 
-    let params = PublishDiagnosticsParams {
-        uri,
-        diagnostics,
-        version,
-    };
-    let value = serde_json::to_value(params).expect(
-        "invariant: PublishDiagnosticsParams has no field whose serde::Serialize impl can fail \
-         (every field is String / Vec / Option<i32> / serde_json::Value with infallible writers)",
-    );
-    let notif = Notification {
-        method: "textDocument/publishDiagnostics".to_string(),
-        params: value,
-    };
-    if let Err(e) = state.sender.send(Message::Notification(notif)) {
-        // Diagnostics publish is fire-and-forget — but a wedged channel means every
-        // subsequent edit silently fails to update the editor view. Warn so production
-        // logs surface the case at default level.
-        log::warn!("publishDiagnostics send failed (client likely disconnected): {e}");
+/// The pull-diagnostics `resultId` for `uri`'s CURRENT state — cheap (no parse, no analysis):
+/// `version:contentFingerprint:dependencyEpoch:analysisGeneration`.
+///
+/// - `version` + fingerprint: the buffer's own content identity.
+/// - [`gd_project::Index::epoch_of`]: dependency-aware — an edit to a dependency's *interface*
+///   bumps this file's epoch through the reverse-dependency closure, which is exactly what the
+///   advertised `interFileDependencies: true` promises a pulling client.
+/// - [`Workspace::analysis_generation`]: wholesale invalidations (native/project reloads) the
+///   other two components cannot see.
+///
+/// `None` (never matches, so a pull always recomputes) when there is no open buffer, or when a
+/// `.gd` buffer's analysis would be / was shed under Hard memory pressure with no cached result —
+/// a degraded report must never be pinned as `unchanged`.
+fn result_id_for(state: &mut ServerState, uri: &Uri) -> Option<String> {
+    let doc = state.vfs.get(uri.as_str())?;
+    let doc_version = doc.version;
+    let text = doc.text();
+    let is_stub = crate::stubs::is_stub_uri(uri, state.options.stub_cache_dir.as_deref());
+    let path = uri_to_path(uri);
+    let is_gd = !is_stub && path.as_deref().is_some_and(|p| p.extension() == Some("gd"));
+    if is_gd && state.memory_pressure == MemoryPressure::Hard {
+        let key = CanonicalKey::for_uri(uri);
+        let gd_path = path.as_deref().expect("invariant: is_gd implies a path");
+        // A shed (uncached) analysis must never be pinned as `unchanged` — no id at all.
+        state.workspace.cached_analysis(&key, gd_path, &text)?;
     }
+    let fingerprint = crate::workspace::fingerprint(&text);
+    let epoch = path
+        .as_deref()
+        .and_then(|p| state.workspace.index.file_id(p))
+        .map_or(0, |fid| state.workspace.index.epoch_of(fid));
+    let generation = state.workspace.analysis_generation();
+    Some(format!(
+        "{doc_version}:{fingerprint:016x}:{epoch}:{generation}"
+    ))
+}
+
+/// `textDocument/diagnostic` (M7 #61) — pull diagnostics. The same computation as push (items
+/// byte-identical); a matching `previousResultId` short-circuits to an `unchanged` report
+/// without parsing or analyzing. `workspace/diagnostic` stays deliberately unimplemented
+/// (`docs/09 §5` skip row: it conflicts with the per-file-diagnostics principle), and push
+/// stays on for older clients.
+fn document_diagnostic(
+    state: &mut ServerState,
+    params: lsp_types::DocumentDiagnosticParams,
+) -> lsp_types::DocumentDiagnosticReportResult {
+    use lsp_types::{
+        DocumentDiagnosticReport, DocumentDiagnosticReportResult, FullDocumentDiagnosticReport,
+        RelatedFullDocumentDiagnosticReport, RelatedUnchangedDocumentDiagnosticReport,
+        UnchangedDocumentDiagnosticReport,
+    };
+    let uri = params.text_document.uri;
+    // Computed exactly once per pull: it is valid both before and after `diagnostic_items`
+    // below — running the analysis changes none of the id's inputs (version, content
+    // fingerprint, dependency epoch, generation) on this single-threaded path.
+    let current = result_id_for(state, &uri);
+    if let (Some(previous), Some(current)) = (params.previous_result_id, current.clone()) {
+        if previous == current {
+            return DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Unchanged(
+                RelatedUnchangedDocumentDiagnosticReport {
+                    related_documents: None,
+                    unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
+                        result_id: current,
+                    },
+                },
+            ));
+        }
+    }
+    DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
+        RelatedFullDocumentDiagnosticReport {
+            related_documents: None,
+            full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                items: diagnostic_items(state, &uri),
+                result_id: current,
+            },
+        },
+    ))
 }
 
 /// Run the analyzer for a `.gd` buffer (returns `None` for other URIs or non-`file://` schemes).
