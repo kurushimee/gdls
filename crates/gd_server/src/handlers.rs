@@ -3183,29 +3183,34 @@ pub fn workspace_symbol(
     // (and only re-deriving the changed files' rows) would trade per-request CPU for memory + an
     // invalidation hook. The Phase-C calibration on a large real-world project measured this within
     // budget, so the precompute is deferred per the plan's "lands OR documented bench witness" rule.
-    // Build the flat candidate list. Each entry is (name, kind, container, path, line, is_class).
-    type Candidate = (
-        String,
-        LspSymbolKind,
-        Option<String>,
-        camino::Utf8PathBuf,
-        u32,
-        bool,
-    );
-    let mut candidates: Vec<Candidate> = Vec::new();
+    // Build the flat candidate list.
+    struct SymbolCandidate {
+        name: String,
+        kind: LspSymbolKind,
+        container: Option<String>,
+        path: camino::Utf8PathBuf,
+        /// 1-based declaration line — the zero-width fallback anchor when `name_span` fails
+        /// live-text validation.
+        line: u32,
+        is_class: bool,
+        /// The recorded name-identifier span (`ClassEntry::name_span` / `MemberDecl::name_span`).
+        name_span: ByteSpan,
+    }
+    let mut candidates: Vec<SymbolCandidate> = Vec::new();
 
     // Class-name registry entries — top-level class declarations across the project, anchored at
     // the `class_name` identifier's recorded line (#33; line 1 only as the registry's defensive
     // default).
     for (name, entry) in state.workspace.index.registry().entries() {
-        candidates.push((
-            name.to_string(),
-            LspSymbolKind::CLASS,
-            None,
-            entry.path.clone(),
-            entry.line,
-            true,
-        ));
+        candidates.push(SymbolCandidate {
+            name: name.to_string(),
+            kind: LspSymbolKind::CLASS,
+            container: None,
+            path: entry.path.clone(),
+            line: entry.line,
+            is_class: true,
+            name_span: entry.name_span,
+        });
     }
     // Per-file interface members — every Const / Var / Func / Signal / Enum reachable at file
     // scope. Inner classes' members aren't surfaced; M4 limitation, documented for future
@@ -3217,14 +3222,15 @@ pub fn workspace_symbol(
         let container = iface.class_name.clone();
         for member in &iface.members {
             let kind = member_kind_to_lsp(member.kind);
-            candidates.push((
-                member.name.clone(),
+            candidates.push(SymbolCandidate {
+                name: member.name.clone(),
                 kind,
-                container.clone(),
-                path.clone(),
-                member.line,
-                false,
-            ));
+                container: container.clone(),
+                path: path.clone(),
+                line: member.line,
+                is_class: false,
+                name_span: member.name_span,
+            });
         }
     }
 
@@ -3240,23 +3246,23 @@ pub fn workspace_symbol(
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut needle_buf: Vec<char> = Vec::new();
     let needle = Utf32Str::new(&query, &mut needle_buf);
-    let mut scored: Vec<(u16, Candidate)> = Vec::with_capacity(candidates.len().min(256));
+    let mut scored: Vec<(u16, SymbolCandidate)> = Vec::with_capacity(candidates.len().min(256));
     let mut hay_buf: Vec<char> = Vec::new();
     for cand in candidates {
         // nucleo asserts non-empty input. An empty haystack here would be a registry /
         // interface bug — log loudly so the operator can investigate the bad entry.
-        if cand.0.is_empty() {
+        if cand.name.is_empty() {
             log::warn!(
                 "workspace_symbol: empty-name candidate at {path} (line {line}); this should be \
                  impossible — Index registry / Interface members carry a name. Investigate the \
                  emit site.",
-                path = cand.3,
-                line = cand.4
+                path = cand.path,
+                line = cand.line
             );
             continue;
         }
         hay_buf.clear();
-        let hay = Utf32Str::new(&cand.0, &mut hay_buf);
+        let hay = Utf32Str::new(&cand.name, &mut hay_buf);
         if let Some(score) = matcher.fuzzy_match_greedy(hay, needle) {
             scored.push((score, cand));
         }
@@ -3267,8 +3273,8 @@ pub fn workspace_symbol(
     // anchor in nucleo-ranked search). Docstring above promises an LSP-latency cap; the
     // earlier `sort + truncate` did O(N log N) and didn't deliver it on 10k+ symbol
     // projects.
-    let cmp = |a: &(u16, Candidate), b: &(u16, Candidate)| {
-        b.0.cmp(&a.0).then_with(|| b.1 .5.cmp(&a.1 .5))
+    let cmp = |a: &(u16, SymbolCandidate), b: &(u16, SymbolCandidate)| {
+        b.0.cmp(&a.0).then_with(|| b.1.is_class.cmp(&a.1.is_class))
     };
     if scored.len() > 256 {
         let _ = scored.select_nth_unstable_by(255, cmp);
@@ -3276,37 +3282,67 @@ pub fn workspace_symbol(
     }
     scored.sort_by(cmp);
 
+    // Real name-token ranges need each winner file's text for the encoding-correct
+    // byte→character mapping (the spec reads the range to reveal/select the symbol; a
+    // zero-width point at column 0 lands the caret on leading syntax). Bounded by the 256
+    // cap: each distinct winner file is loaded ONCE (open buffer wins over disk, the
+    // member_decl_location pattern), one rope per file, and every recorded name span maps
+    // through it — accepted only while its bytes still spell the symbol's name (the
+    // find_global_class_definition validation discipline). Validation or read failure falls
+    // back to the pre-#46 zero-width point at the declaration line's start: never drop the
+    // symbol over a stale anchor.
+    let enc = state.encoding;
+    let mut texts: FxHashMap<camino::Utf8PathBuf, Option<(String, ropey::Rope)>> =
+        FxHashMap::default();
     #[allow(deprecated)]
     let symbols: Vec<SymbolInformation> = scored
         .into_iter()
-        .filter_map(|(_score, (name, kind, container, path, line, _))| {
-            let uri = match path_to_file_uri(&path) {
+        .filter_map(|(_score, cand)| {
+            let uri = match path_to_file_uri(&cand.path) {
                 Some(u) => u,
                 None => {
                     log::debug!(
                         "workspace_symbol: dropping {name} at {path} — path_to_file_uri \
-                         rejected the path; the symbol is invisible to the client"
+                         rejected the path; the symbol is invisible to the client",
+                        name = cand.name,
+                        path = cand.path,
                     );
                     return None;
                 }
             };
-            let pos = Position {
-                line: line.saturating_sub(1),
-                character: 0,
-            };
-            Some(SymbolInformation {
-                name,
-                kind,
-                tags: None,
-                deprecated: None,
-                location: Location {
-                    uri,
-                    range: Range {
+            let entry = texts.entry(cand.path.clone()).or_insert_with(|| {
+                let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+                    Some(t) => t,
+                    None => std::fs::read_to_string(cand.path.as_std_path()).ok()?,
+                };
+                let rope = ropey::Rope::from_str(&text);
+                Some((text, rope))
+            });
+            let range = match entry {
+                Some((text, rope))
+                    if text.get(cand.name_span.start..cand.name_span.end)
+                        == Some(cand.name.as_str()) =>
+                {
+                    PositionMapper::new(rope, enc).span_to_range(cand.name_span)
+                }
+                _ => {
+                    let pos = Position {
+                        line: cand.line.saturating_sub(1),
+                        character: 0,
+                    };
+                    Range {
                         start: pos,
                         end: pos,
-                    },
-                },
-                container_name: container,
+                    }
+                }
+            };
+            Some(SymbolInformation {
+                name: cand.name,
+                kind: cand.kind,
+                tags: None,
+                deprecated: None,
+                location: Location { uri, range },
+                container_name: cand.container,
             })
         })
         .collect();

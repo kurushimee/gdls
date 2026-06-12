@@ -194,6 +194,102 @@ fn workspace_symbol_anchors_class_at_declaration_line() {
         knight.location.range.start.line, 2,
         "class_name on source line 3 must render LSP line 2, not the file top"
     );
+    // The range covers exactly the `Knight` identifier (`class_name Knight` → cols 11..17),
+    // not a zero-width point at column 0.
+    assert_eq!(knight.location.range.start.character, 11);
+    assert_eq!(knight.location.range.end.character, 17);
+    assert_eq!(knight.location.range.end.line, 2);
+
+    shutdown(&client, server_thread);
+    drop(dir);
+}
+
+/// Every `workspace/symbol` result's range must cover the symbol's NAME token (the spec reads
+/// the range to reveal/select the hit; a zero-width point at column 0 lands the caret on
+/// leading syntax like `var ` or indentation). One fixture per member kind, each sliced back
+/// out of the source line by the returned character extent.
+#[test]
+fn workspace_symbol_ranges_cover_the_name_token() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root =
+        camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("temp dir is UTF-8");
+
+    let src = "class_name Arsenal\n\
+               extends Node2D\n\
+               const MAX_AMMO := 30\n\
+               var speed: float = 1.0\n\
+               signal fired(power: int)\n\
+               func reload(clip: int) -> bool:\n\
+               \treturn clip > 0\n\
+               enum Mode { SAFE, BURST }\n";
+    std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+    std::fs::write(root.join("extension_api.json"), MINI_API).unwrap();
+    std::fs::write(root.join("arsenal.gd"), src).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+
+    let init = InitializeParams {
+        initialization_options: Some(serde_json::json!({
+            "projectRoot": root.as_str(),
+            "autoDumpExtensionApi": false,
+            "extensionApiPath": root.join("extension_api.json").as_str(),
+        })),
+        ..Default::default()
+    };
+    client.sender.send(request(1, "initialize", init)).unwrap();
+    let _ = recv(&client);
+    client
+        .sender
+        .send(notification("initialized", InitializedParams {}))
+        .unwrap();
+
+    let lines: Vec<&str> = src.lines().collect();
+    for (id, name) in ["Arsenal", "MAX_AMMO", "speed", "fired", "reload", "Mode"]
+        .iter()
+        .enumerate()
+    {
+        client
+            .sender
+            .send(request(
+                id as i32 + 2,
+                "workspace/symbol",
+                WorkspaceSymbolParams {
+                    query: name.to_string(),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        let resp = recv(&client);
+        let Message::Response(r) = resp else {
+            panic!("expected Response, got {resp:?}");
+        };
+        let result: WorkspaceSymbolResponse =
+            serde_json::from_value(r.result.expect("ok result")).expect("response shape");
+        let WorkspaceSymbolResponse::Flat(symbols) = result else {
+            panic!("expected Flat shape");
+        };
+        let hit = symbols
+            .iter()
+            .find(|s| s.name == *name)
+            .unwrap_or_else(|| panic!("`{name}` must be visible in workspace/symbol"));
+        let range = hit.location.range;
+        assert_ne!(
+            range.start, range.end,
+            "`{name}`: no result may carry a zero-width range"
+        );
+        assert_eq!(
+            range.start.line, range.end.line,
+            "`{name}`: single-line token"
+        );
+        // The fixture is ASCII, so character offsets equal byte offsets within the line.
+        let line = lines[range.start.line as usize];
+        assert_eq!(
+            &line[range.start.character as usize..range.end.character as usize],
+            *name,
+            "`{name}`: the range must slice exactly the name token out of {line:?}"
+        );
+    }
 
     shutdown(&client, server_thread);
     drop(dir);
