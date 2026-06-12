@@ -105,6 +105,11 @@ pub struct MemberDecl {
     /// live text and fall back to [`Self::span`]. **Excluded from [`Interface::signature_hash`]**
     /// like [`Self::span`].
     pub name_span: ByteSpan,
+    /// M7 (#62): the member's `##` doc comment, when present. **Excluded from
+    /// [`Interface::signature_hash`]** like the spans: a doc-only edit re-analyzes the file
+    /// itself (the epoch bump) but never invalidates dependents — they read the live
+    /// `Interface` for hover prose, so docs stay fresh without reverse-dependency churn.
+    pub doc: Option<Box<gd_syntax::doc_comments::MemberDoc>>,
     /// 1-based source line of the declaration. Drives diagnostics like
     /// SHADOWED_VARIABLE_BASE_CLASS that include the member's line in the message
     /// (`"already-declared variable at line N"`).
@@ -125,6 +130,9 @@ pub struct EnumDecl {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EnumValueDecl {
     pub name: String,
+    /// M7 (#62): the value's `##` doc comment. Excluded from `signature_hash` (docs are not
+    /// interface-relevant for invalidation).
+    pub doc: Option<Box<gd_syntax::doc_comments::MemberDoc>>,
     /// The value's integer when the extractor can read it without evaluation: an int literal, a
     /// negated int literal, or the implicit previous-value-plus-one chain (Godot resolves these
     /// in the analyzer, `gdscript_analyzer.cpp:1150-1197`; this parser-only pass follows the same
@@ -155,6 +163,9 @@ pub struct Interface {
     pub is_tool: bool,
     pub icon_path: Option<String>,
     pub members: Vec<MemberDecl>,
+    /// M7 (#62): the class's `##` doc comment (brief/description/tutorials). Excluded from
+    /// [`Self::signature_hash`] — see [`MemberDecl::doc`].
+    pub doc: Option<Box<gd_syntax::doc_comments::ClassDoc>>,
     /// Inner classes, recursively (reachable as `Outer.Inner`).
     pub inner: Vec<Interface>,
     /// Named enums + their value identifiers. Reachable as `Self.<EnumName>.<value>` or
@@ -224,13 +235,14 @@ impl Interface {
 /// Extract the interface of a parsed source. A partial/empty AST yields a default (empty) interface —
 /// the parser always returns *something*, so extraction never fails (`docs/00`: never crash).
 pub fn extract(tree: &ParseTree) -> Interface {
-    let Some(root) = tree.root() else {
+    let Some(root_id) = tree.root_id() else {
         return Interface::default();
     };
+    let root = tree.get(root_id);
     let NodeKind::Class(class) = &root.kind else {
         return Interface::default();
     };
-    let mut head = extract_class(tree, class, &root.annotations);
+    let mut head = extract_class(tree, root_id, class, &root.annotations);
     // WP-RD12: capture this file's `preload`/`load` `res://` targets on the head interface so
     // `Index::recompute_edges` can turn them into `DepGraph` edges (the preload-const cross-file
     // cycle case). Walked once over the whole tree (a file-wide over-approximation of the const
@@ -271,7 +283,12 @@ fn collect_preload_deps(tree: &ParseTree) -> Vec<String> {
 /// records `@abstract`/`@export`/`@onready` as annotations rather than setting the corresponding bool
 /// fields (those are populated by the analyzer's annotation callbacks in M3), so M2 reads the flags
 /// off the attached annotations.
-fn extract_class(tree: &ParseTree, class: &ClassNode, annotations: &[NodeId]) -> Interface {
+fn extract_class(
+    tree: &ParseTree,
+    class_id: NodeId,
+    class: &ClassNode,
+    annotations: &[NodeId],
+) -> Interface {
     let mut members = Vec::new();
     let mut inner = Vec::new();
     let mut enums = Vec::new();
@@ -281,7 +298,7 @@ fn extract_class(tree: &ParseTree, class: &ClassNode, annotations: &[NodeId]) ->
             Member::Class(id) => {
                 let node = tree.get(*id);
                 if let NodeKind::Class(c) = &node.kind {
-                    inner.push(extract_class(tree, c, &node.annotations));
+                    inner.push(extract_class(tree, *id, c, &node.annotations));
                 }
             }
             Member::Variable(id) => members.extend(var_member(tree, *id)),
@@ -316,6 +333,7 @@ fn extract_class(tree: &ParseTree, class: &ClassNode, annotations: &[NodeId]) ->
         is_tool: has_annotation(tree, annotations, |n| n == "@tool"),
         icon_path: class.icon_path.clone(),
         members,
+        doc: tree.docs.class_docs.get(&class_id).cloned().map(Box::new),
         inner,
         enums,
         unnamed_enum_values,
@@ -339,6 +357,11 @@ fn extends_of(tree: &ParseTree, class: &ClassNode) -> Extends {
     } else {
         Extends::Names(names)
     }
+}
+
+/// M7 (#62): the associated `##` doc for a declaration node, boxed for the common no-doc case.
+fn member_doc(tree: &ParseTree, id: NodeId) -> Option<Box<gd_syntax::doc_comments::MemberDoc>> {
+    tree.docs.member_docs.get(&id).cloned().map(Box::new)
 }
 
 fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
@@ -376,6 +399,7 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         span: node.span,
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
+        doc: member_doc(tree, id),
     })
 }
 
@@ -401,6 +425,7 @@ fn const_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         span: node.span,
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
+        doc: member_doc(tree, id),
     })
 }
 
@@ -449,6 +474,7 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         span: node.span,
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
+        doc: member_doc(tree, id),
     })
 }
 
@@ -484,6 +510,7 @@ fn signal_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         span: node.span,
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
+        doc: member_doc(tree, id),
     })
 }
 
@@ -507,6 +534,7 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         span: node.span,
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
+        doc: member_doc(tree, id),
     })
 }
 
@@ -522,7 +550,7 @@ fn enum_decl(tree: &ParseTree, id: NodeId) -> Option<EnumDecl> {
     let name = ident_name(tree, e.identifier)?;
     let mut values = Vec::with_capacity(e.values.len());
     let mut prev: Option<i64> = Some(-1);
-    for v in &e.values {
+    for (i, v) in e.values.iter().enumerate() {
         let Some(value_name) = ident_name(tree, v.identifier) else {
             continue;
         };
@@ -533,6 +561,12 @@ fn enum_decl(tree: &ParseTree, id: NodeId) -> Option<EnumDecl> {
         prev = value;
         values.push(EnumValueDecl {
             name: value_name,
+            doc: tree
+                .docs
+                .enum_value_docs
+                .get(&(id, i))
+                .cloned()
+                .map(Box::new),
             value,
         });
     }
@@ -578,6 +612,7 @@ fn enum_value_member(tree: &ParseTree, value: &EnumValue) -> Option<MemberDecl> 
         span: node.span,
         name_span: node.span,
         line: node.loc.start.line,
+        doc: member_doc(tree, id),
     })
 }
 
@@ -932,6 +967,35 @@ mod tests {
         assert_eq!(i.inner[0].class_name.as_deref(), Some("Inner"));
         assert_eq!(i.inner[0].extends, Extends::Names(vec!["Resource".into()]));
         assert_eq!(i.inner[0].members[0].name, "x");
+    }
+
+    #[test]
+    fn doc_only_edit_keeps_signature_hash() {
+        // M7 (#62): docs are deliberately excluded from the hash — a doc edit re-analyzes only
+        // the file itself (epoch bump) and never invalidates dependents, which read the live
+        // Interface for hover prose anyway.
+        let a = iface("## Old doc.\nvar speed := 1.0\n");
+        let b = iface("## Completely rewritten doc.\nvar speed := 1.0\n");
+        assert_ne!(a.members[0].doc, b.members[0].doc, "docs extracted");
+        assert_eq!(a.signature_hash(), b.signature_hash());
+    }
+
+    #[test]
+    fn extraction_populates_class_member_and_enum_value_docs() {
+        let i = iface(
+            "## The class brief.\nclass_name Doc\nextends Node\n\n## Member doc.\nvar x := 1\n\nenum E {\n\t## Value doc.\n\tA,\n}\n",
+        );
+        assert_eq!(i.doc.as_ref().expect("class doc").brief, "The class brief.");
+        let member = i.members.iter().find(|m| m.name == "x").expect("x");
+        assert_eq!(
+            member.doc.as_ref().expect("member doc").description,
+            "Member doc."
+        );
+        let e = i.enums.iter().find(|e| e.name == "E").expect("enum E");
+        assert_eq!(
+            e.values[0].doc.as_ref().expect("value doc").description,
+            "Value doc."
+        );
     }
 
     #[test]

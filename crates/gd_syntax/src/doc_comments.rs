@@ -37,8 +37,9 @@ use crate::ast::{Member, NodeId, NodeKind, ParseTree};
 use crate::lexer::CommentData;
 
 /// `MemberDocData` (`gdscript_parser.h`): one member's doc prose + deprecation/experimental
-/// markers. `description` is the Godot-processed, still-BBCode string.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// markers. `description` is the Godot-processed, still-BBCode string. Serde + Hash so the
+/// extracted copies can ride `gd_project`'s `Interface` (warm-start cache serialization).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct MemberDoc {
     pub description: String,
     pub is_deprecated: bool,
@@ -48,7 +49,7 @@ pub struct MemberDoc {
 }
 
 /// `ClassDocData`: brief/long prose split at the first blank `##` line, plus `@tutorial` links.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ClassDoc {
     pub brief: String,
     pub description: String,

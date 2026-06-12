@@ -53,6 +53,7 @@ impl AutoloadQuery {
             span: Default::default(),
             name_span: Default::default(),
             line: 1,
+            doc: None,
         };
         let iface = Interface {
             class_name: None,
