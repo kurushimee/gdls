@@ -343,19 +343,22 @@ fn queued_request_behind_edit_is_shed_with_content_modified() {
     common::shutdown(&client, server_thread);
 }
 
-/// When a request is both staled by an edit and explicitly cancelled, the cancel wins — the
-/// client retracted the request and discards the response either way.
+/// When a request is both cancelled and staled by an edit, the cancel wins — the client
+/// retracted the request and discards the response either way. The cancel is sent FIRST: in the
+/// edit-then-cancel order the worker can legitimately bail Stale and finish in the microseconds
+/// between the router processing the two messages, so that order is not wire-deterministic —
+/// both flag orders are pinned deterministically by the `RequestLifecycle` unit tests instead.
 #[test]
 fn cancel_beats_stale_when_both_land() {
     let (_p, client, server_thread, uri) = boot();
 
     client.sender.send(references_msg(50, &uri, 3)).unwrap();
+    client.sender.send(cancel_msg(50)).unwrap();
     let edited = format!("{PROBE_TEXT}# stale\n");
     client
         .sender
         .send(did_change_msg(&uri, 2, &edited))
         .unwrap();
-    client.sender.send(cancel_msg(50)).unwrap();
 
     let resp = recv_response_slow(&client);
     assert_eq!(resp.id, RequestId::from(50));
