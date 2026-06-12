@@ -597,3 +597,78 @@ fn references_on_native_subscript_call_finds_cross_file_uses() {
 
     shutdown(&client, server_thread);
 }
+
+/// includeDeclaration:false on a NON-method target (the raw-identifier-scan path where the
+/// declaration token used to leak through unconditionally): a class-level `var` declaration
+/// click returns only the reads; with `true` the declaration appears exactly once.
+#[test]
+fn references_include_declaration_false_excludes_member_var_decl() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    // Line 1: `var hp: int = 0` — declaration `hp` at cols 4..6.
+    // Lines 3/5: `\tself.hp = …` — reads at cols 6..8.
+    p.write(
+        "obj.gd",
+        "extends Node\nvar hp: int = 0\nfunc a() -> void:\n\tself.hp = 1\nfunc b() -> void:\n\tself.hp = 2\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["obj.gd"]);
+
+    let uri = file_uri(&p.root.join("obj.gd"));
+    let send = |id: i32, include: bool| -> Vec<Location> {
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: include,
+            },
+        };
+        client
+            .sender
+            .send(request(id, "textDocument/references", params))
+            .unwrap();
+        let resp = common::recv_response(&client);
+        assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+        serde_json::from_value::<Option<Vec<Location>>>(resp.result.unwrap())
+            .unwrap()
+            .unwrap_or_default()
+    };
+
+    let decl_start = Position {
+        line: 1,
+        character: 4,
+    };
+    let without = send(20, false);
+    assert!(
+        !without.iter().any(|l| l.range.start == decl_start),
+        "the declaration's own name token must be filtered with includeDeclaration:false; \
+         got {without:?}"
+    );
+    for line in [3u32, 5] {
+        assert!(
+            without
+                .iter()
+                .any(|l| l.range.start == Position { line, character: 6 }),
+            "the line-{line} read must stay; got {without:?}"
+        );
+    }
+
+    let with = send(21, true);
+    assert_eq!(
+        with.iter().filter(|l| l.range.start == decl_start).count(),
+        1,
+        "with includeDeclaration:true the declaration appears exactly once; got {with:?}"
+    );
+
+    shutdown(&client, server_thread);
+}

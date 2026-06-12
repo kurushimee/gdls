@@ -166,6 +166,78 @@ fn references_finds_cross_file_class_usage() {
     shutdown(&client, server_thread);
 }
 
+/// `includeDeclaration: false` is a FILTER, not a no-op prepend: the raw identifier scan emits
+/// the declaration's own name token, so the handler must drop it. VS Code's compact-references
+/// flow does count arithmetic on exactly this distinction (query true, re-query false, compare).
+#[test]
+fn references_include_declaration_false_excludes_class_name_decl() {
+    let project = sample_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&project, &client, &["src/hero.gd", "src/enemy.gd"]);
+
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let send = |id: i32, line: u32, character: u32, uri: &lsp_types::Uri, include: bool| {
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: include,
+            },
+        };
+        client
+            .sender
+            .send(request(id, "textDocument/references", params))
+            .unwrap();
+        let resp = recv_response(&client);
+        assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+        let locations: Option<Vec<Location>> =
+            serde_json::from_value(resp.result.unwrap()).unwrap();
+        locations.unwrap_or_default()
+    };
+
+    // Declaration-site click with false: ONLY the enemy.gd use site comes back — the
+    // `class_name Hero` token itself is filtered.
+    let locations = send(15, 0, 12, &hero_uri, false);
+    assert_eq!(
+        locations.len(),
+        1,
+        "includeDeclaration:false must return only use sites; got {locations:?}"
+    );
+    assert!(locations[0].uri.as_str().contains("enemy.gd"));
+    assert_eq!(
+        (
+            locations[0].range.start.line,
+            locations[0].range.start.character,
+            locations[0].range.end.character
+        ),
+        (0, 8, 12)
+    );
+
+    // Use-site click (enemy.gd's `extends Hero`) with false: the declaring file's
+    // `class_name Hero` token must be absent too.
+    let enemy_uri = file_uri(&project.root.join("src/enemy.gd"));
+    let locations = send(16, 0, 10, &enemy_uri, false);
+    assert!(
+        !locations
+            .iter()
+            .any(|l| l.uri.as_str().ends_with("hero.gd") && l.range.start == Position::new(0, 11)),
+        "the hero.gd declaration token must be filtered; got {locations:?}"
+    );
+    assert!(
+        locations
+            .iter()
+            .any(|l| l.uri.as_str().contains("enemy.gd")),
+        "the enemy.gd use site itself stays; got {locations:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 #[test]
 fn references_does_not_double_report_in_file_call_sites() {
     // Regression: a function call site was reported TWICE in textDocument/references —

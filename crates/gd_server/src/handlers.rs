@@ -2099,18 +2099,24 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         None
     };
 
-    // include_declaration: prepend the declaration site when requested.
+    // Resolve the declaration site(s) UNCONDITIONALLY — `includeDeclaration` is a filter, not
+    // just a prepend: when `true` the declaration joins the result up front, and when `false`
+    // any scan hit on the declaration's own name token must be REMOVED at final assembly (the
+    // raw identifier scan below emits every matching token, declaration included; reference
+    // servers implement the flag as exactly this filter).
+    //
     // For method/signal targets, the declaring file may be different from the current file
     // (cross-file call-site click). When target_file is known and differs from the current file,
     // read the declaring file and use find_in_file_definition on its tree to get the narrow
     // identifier span (not MemberDecl.span, which is the whole func node).
-    if params.context.include_declaration {
+    let declaration_locations: Vec<Location> = {
+        let mut decls = Vec::new();
         let decl_found = if is_method_or_signal {
             if let Some(tf) = target_file {
                 if current_fid.is_some_and(|cf| cf == tf) {
                     // Declaration-site click: the current file IS the declaring file.
                     if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-                        locations.push(loc);
+                        decls.push(loc);
                         true
                     } else {
                         false
@@ -2141,7 +2147,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                             )
                         });
                     if let Some(loc) = decl_loc {
-                        locations.push(loc);
+                        decls.push(loc);
                         true
                     } else {
                         false
@@ -2159,14 +2165,18 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             // autoload script's start-of-file location (mirrors the M6-D definition handler).
             if is_autoload {
                 if let Some(loc) = find_autoload_definition(state, &name) {
-                    locations.push(loc);
+                    decls.push(loc);
                 }
             } else if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-                locations.push(loc);
+                decls.push(loc);
             } else if let Some(loc) = find_global_class_definition(state, &name) {
-                locations.push(loc);
+                decls.push(loc);
             }
         }
+        decls
+    };
+    if params.context.include_declaration {
+        locations.extend(declaration_locations.iter().cloned());
     }
 
     // Always scan the current file's bindings — name_referencers is the interface-level filter
@@ -2310,6 +2320,18 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             .then_with(|| range_key(&a.range).cmp(&range_key(&b.range)))
     });
     locations.dedup_by(|a, b| a.uri.as_str() == b.uri.as_str() && a.range == b.range);
+
+    // includeDeclaration:false — the FILTER half of the flag (final assembly, so it holds no
+    // matter which scan produced the hit): drop any result whose (uri, range) exactly equals a
+    // declaration site. Exact equality is sound — declaration and scan locations for the same
+    // identifier both come from `mapper.span_to_range` over the same span source.
+    if !params.context.include_declaration {
+        locations.retain(|l| {
+            !declaration_locations
+                .iter()
+                .any(|d| d.uri.as_str() == l.uri.as_str() && d.range == l.range)
+        });
+    }
 
     Some(locations)
 }
