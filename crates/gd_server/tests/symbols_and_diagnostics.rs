@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
-    ClientCapabilities, DocumentSymbol, DocumentSymbolClientCapabilities, DocumentSymbolParams,
-    GeneralClientCapabilities, InitializeParams, InitializedParams, Position, PositionEncodingKind,
-    PublishDiagnosticsParams, SymbolInformation, SymbolKind, TextDocumentClientCapabilities,
-    TextDocumentIdentifier, TextDocumentItem, Uri,
+    ClientCapabilities, DiagnosticTag, DocumentSymbol, DocumentSymbolClientCapabilities,
+    DocumentSymbolParams, GeneralClientCapabilities, InitializeParams, InitializedParams, Position,
+    PositionEncodingKind, PublishDiagnosticsParams, SymbolInformation, SymbolKind,
+    TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem, Uri,
 };
 
 fn recv(conn: &Connection) -> Message {
@@ -363,6 +363,124 @@ fn document_symbol_explicit_false_yields_flat() {
         ..Default::default()
     });
     assert_flat_document_symbols(client, handle);
+}
+
+/// Boot advertising `publishDiagnostics.tagSupport` with `Unnecessary` in the value set.
+fn boot_with_tag_support() -> (Connection, std::thread::JoinHandle<()>) {
+    boot_with_capabilities(ClientCapabilities {
+        general: utf8_general(),
+        text_document: Some(TextDocumentClientCapabilities {
+            publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+                tag_support: Some(lsp_types::TagSupport {
+                    value_set: vec![DiagnosticTag::UNNECESSARY, DiagnosticTag::DEPRECATED],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// An unused local under a tag-supporting client: the diagnostic gains `tags: [Unnecessary]`
+/// (editors fade the range) and a `codeDescription` link — while the message stays byte-exact
+/// Godot output and the severity/range are untouched.
+#[test]
+fn unused_variable_diagnostic_carries_unnecessary_tag_when_supported() {
+    let (client, handle) = boot_with_tag_support();
+    let uri: Uri = "file:///test/unused.gd".parse().unwrap();
+    did_open(&client, &uri, "extends Node\nfunc f():\n\tvar x = 1\n");
+
+    let diags = recv_publish_diagnostics(&client);
+    let unused = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    "UNUSED_VARIABLE".to_string(),
+                ))
+        })
+        .unwrap_or_else(|| panic!("UNUSED_VARIABLE must fire; got {:?}", diags.diagnostics));
+    assert_eq!(unused.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
+    assert!(
+        unused
+            .code_description
+            .as_ref()
+            .is_some_and(|cd| cd.href.as_str().ends_with("warning_system.html")),
+        "warning-coded diagnostics link Godot's warning docs; got {:?}",
+        unused.code_description
+    );
+    assert_eq!(
+        unused.severity,
+        Some(lsp_types::DiagnosticSeverity::WARNING)
+    );
+    // The Godot-faithful message is untouched by the tag projection — byte-exact.
+    assert_eq!(
+        unused.message,
+        r#"The local variable "x" is declared but never used in the block. If this is intended, prefix it with an underscore: "_x"."#
+    );
+
+    shutdown(&client, handle);
+}
+
+/// Without `tagSupport`, the same diagnostic carries NO tags (pyright-style gating) — but the
+/// docs link ships ungated (rust-analyzer-style; clients ignore unknown members).
+#[test]
+fn diagnostic_tags_absent_without_client_tag_support() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/unused2.gd".parse().unwrap();
+    did_open(&client, &uri, "extends Node\nfunc f():\n\tvar x = 1\n");
+
+    let diags = recv_publish_diagnostics(&client);
+    let unused = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    "UNUSED_VARIABLE".to_string(),
+                ))
+        })
+        .expect("UNUSED_VARIABLE must fire");
+    assert_eq!(unused.tags, None, "tags are gated on the client capability");
+    assert!(unused.code_description.is_some());
+
+    shutdown(&client, handle);
+}
+
+/// Only the unused/unreachable family is tagged — a NARROWING_CONVERSION under a tag-supporting
+/// client stays untagged.
+#[test]
+fn non_unused_warning_carries_no_unnecessary_tag() {
+    let (client, handle) = boot_with_tag_support();
+    let uri: Uri = "file:///test/narrow.gd".parse().unwrap();
+    did_open(
+        &client,
+        &uri,
+        "extends Node\nfunc f() -> int:\n\tvar y: int = 1.5\n\treturn y\n",
+    );
+
+    let diags = recv_publish_diagnostics(&client);
+    let narrowing = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    "NARROWING_CONVERSION".to_string(),
+                ))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "NARROWING_CONVERSION must fire; got {:?}",
+                diags.diagnostics
+            )
+        });
+    assert_eq!(narrowing.tags, None);
+    assert!(narrowing.code_description.is_some());
+
+    shutdown(&client, handle);
 }
 
 #[test]

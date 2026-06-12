@@ -8,11 +8,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crossbeam_channel::{select, Receiver, Sender};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
-    CallHierarchyServerCapability, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentLinkOptions, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, OneOf, PublishDiagnosticsParams, ServerCapabilities,
-    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    CallHierarchyServerCapability, CodeDescription, Diagnostic, DiagnosticSeverity, DiagnosticTag,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentLinkOptions, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, OneOf,
+    PublishDiagnosticsParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Uri,
 };
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent};
 use rustc_hash::FxHashSet;
@@ -56,17 +57,24 @@ pub(crate) struct ClientCaps {
     /// `.unwrap_or_default()` convention): a client that did not opt in must not receive the
     /// nested shape it declined.
     pub(crate) hierarchical_document_symbols: bool,
+    /// `textDocument.publishDiagnostics.tagSupport.valueSet` contains `Unnecessary` — gates the
+    /// unused/unreachable diagnostic tags (pyright-style: clients without the capability get
+    /// byte-identical pre-tag diagnostics).
+    pub(crate) diagnostic_tag_unnecessary: bool,
 }
 
 impl ClientCaps {
     fn negotiate(caps: &lsp_types::ClientCapabilities) -> Self {
+        let td = caps.text_document.as_ref();
         ClientCaps {
-            hierarchical_document_symbols: caps
-                .text_document
-                .as_ref()
+            hierarchical_document_symbols: td
                 .and_then(|t| t.document_symbol.as_ref())
                 .and_then(|d| d.hierarchical_document_symbol_support)
                 .unwrap_or(false),
+            diagnostic_tag_unnecessary: td
+                .and_then(|t| t.publish_diagnostics.as_ref())
+                .and_then(|p| p.tag_support.as_ref())
+                .is_some_and(|t| t.value_set.contains(&DiagnosticTag::UNNECESSARY)),
         }
     }
 }
@@ -1520,7 +1528,12 @@ fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) 
                 match state.vfs.get(uri.as_str()) {
                     Some(doc) => {
                         let mapper = PositionMapper::new(&doc.rope, state.encoding);
-                        collect_diagnostics(&mapper, &parsed.diagnostics, analyzed.as_deref())
+                        collect_diagnostics(
+                            &mapper,
+                            state.caps,
+                            &parsed.diagnostics,
+                            analyzed.as_deref(),
+                        )
                     }
                     None => Vec::new(),
                 }
@@ -1588,8 +1601,15 @@ fn analyze_gd(
 /// matches the source-position publish order each stream already uses: syntax errors first (parser
 /// emits them in source order), then analyzer diagnostics (the sink sorts by `span.start` at
 /// `finish`). The merged stream is what the editor highlights.
+///
+/// The `tags` / `codeDescription` fields are LSP-projection-only additions: Godot's own output
+/// never serializes them, so message strings, spans, and severities stay byte-identical to the
+/// faithful stream (`.out` conformance untouched). Tags are gated on the client's
+/// `publishDiagnostics.tagSupport` (pyright-style); the docs link ships ungated
+/// (rust-analyzer-style — clients ignore unknown members).
 fn collect_diagnostics(
     mapper: &PositionMapper,
+    caps: ClientCaps,
     syntax: &[gd_syntax::Diagnostic],
     analyzed: Option<&gd_analyze::AnalysisResult>,
 ) -> Vec<Diagnostic> {
@@ -1614,11 +1634,49 @@ fn collect_diagnostics(
                 code: Some(NumberOrString::String(d.code().to_owned())),
                 source: Some("gdls".to_string()),
                 message: d.message().to_owned(),
+                tags: if caps.diagnostic_tag_unnecessary {
+                    unnecessary_tag(d.warning_code())
+                } else {
+                    None
+                },
+                code_description: d.warning_code().map(|_| CodeDescription {
+                    href: godot_warning_docs_uri(),
+                }),
                 ..Default::default()
             });
         }
     }
     out
+}
+
+/// The unused/unreachable warning family editors render FADED via `DiagnosticTag::UNNECESSARY`
+/// (rust-analyzer, clangd, pyright, and tsserver all tag their equivalents). Keyed on the
+/// warning CODE, not the published severity, so a strict-mode-promoted UNUSED_* keeps its tag
+/// (the clangd behavior).
+fn unnecessary_tag(code: Option<gd_analyze::warnings::WarningCode>) -> Option<Vec<DiagnosticTag>> {
+    use gd_analyze::warnings::WarningCode::*;
+    match code? {
+        UnusedVariable
+        | UnusedLocalConstant
+        | UnusedPrivateClassVariable
+        | UnusedParameter
+        | UnusedSignal
+        | UnreachableCode
+        | UnreachablePattern => Some(vec![DiagnosticTag::UNNECESSARY]),
+        _ => None,
+    }
+}
+
+/// Godot's warning-system documentation — the `codeDescription` target for every warning-coded
+/// diagnostic. The page carries no per-code anchors, so one page-level link serves all codes.
+fn godot_warning_docs_uri() -> Uri {
+    static DOCS: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
+    DOCS.get_or_init(|| {
+        "https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/warning_system.html"
+            .parse()
+            .expect("invariant: the static Godot docs URL parses as a Uri")
+    })
+    .clone()
 }
 
 /// `gd_analyze::Severity` was deliberately laid out with the same discriminants as
