@@ -435,8 +435,10 @@ fn serve_inner(
                             "native API: background dump adopted ({classes} classes, {version}); \
                              reloading + republishing open buffers"
                         );
-                        let _progress = server_progress(&state, "Reloading Godot API");
                         if state.workspace.reload_native(&state.options) {
+                            // Begun only on a REAL adoption — a no-op echo must not flash a
+                            // spinner. The republish below is the user-visible bulk anyway.
+                            let _progress = server_progress(&state, "Reloading Godot API");
                             republish_all_open_buffers(&mut state);
                             // The warm-start cache key includes the native DB; re-save so the
                             // NEXT session warm-loads instead of cold-indexing on key mismatch.
@@ -888,8 +890,10 @@ fn handle_watcher(state: &mut ServerState, events: Vec<DebouncedEvent>) {
         // `reload_native` reports whether the live DB actually changed: a torn read of a
         // mid-write dump (kept prior) or the post-adoption echo (identical content) must not
         // re-analyze every open buffer for nothing.
-        let _progress = server_progress(state, "Reloading Godot API");
         if state.workspace.reload_native(&state.options) {
+            // Begun only on a REAL change — a torn-read keep or post-adoption echo must not
+            // flash a spinner. The republish below is the user-visible bulk anyway.
+            let _progress = server_progress(state, "Reloading Godot API");
             republish_all_open_buffers(state);
             // The warm-start cache key includes the native DB — re-save so the next session
             // warm-loads against the new key. (The background-dump completion arm does the

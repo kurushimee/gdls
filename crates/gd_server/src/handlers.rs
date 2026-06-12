@@ -1968,16 +1968,15 @@ fn group_call_ranges<'a, K: PartialEq>(
 /// `Some(vec)` (possibly empty) otherwise.
 pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Vec<Location>> {
     // M7 (#58): honor a client-supplied workDoneToken — references is the genuinely long
-    // request (project-wide candidate analysis). The drop guard ends the arc on every exit
-    // path, including the `?` early returns below.
+    // request (project-wide candidate analysis). `begin` is deferred to the candidate loop: a
+    // request that resolves trivially (no identifier under the cursor, empty candidate set)
+    // sends no progress at all instead of a begin→end flash, and an unbegun reporter's drop
+    // guard sends nothing on the `?` early returns below.
     let mut progress = params
         .work_done_progress_params
         .work_done_token
         .map(|token| {
-            let mut reporter =
-                crate::progress::ProgressReporter::for_client_token(state.sender.clone(), token);
-            reporter.begin("References", None);
-            reporter
+            crate::progress::ProgressReporter::for_client_token(state.sender.clone(), token)
         });
     // WP-RD15: the `(uri, text, mapper, name)` prologue this shares with `implementation` is NOT
     // factored into a helper. A shared 4-tuple extractor would hand `implementation` two values it
@@ -2362,6 +2361,11 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     };
 
     let candidate_total = candidates.len();
+    if let Some(reporter) = progress.as_mut() {
+        if candidate_total > 0 {
+            reporter.begin("References", None);
+        }
+    }
     for (done, (path, cand_uri)) in candidates.into_iter().enumerate() {
         if let Some(reporter) = progress.as_mut() {
             crate::progress::ProgressSink::progress(
@@ -3741,10 +3745,7 @@ pub fn workspace_symbol(
         .work_done_progress_params
         .work_done_token
         .map(|token| {
-            let mut reporter =
-                crate::progress::ProgressReporter::for_client_token(state.sender.clone(), token);
-            reporter.begin("Workspace symbols", None);
-            reporter
+            crate::progress::ProgressReporter::for_client_token(state.sender.clone(), token)
         });
     let query = params.query;
 
@@ -3819,6 +3820,11 @@ pub fn workspace_symbol(
     let mut scored: Vec<(u16, SymbolCandidate)> = Vec::with_capacity(candidates.len().min(256));
     let mut hay_buf: Vec<char> = Vec::new();
     let candidate_total = candidates.len();
+    if let Some(reporter) = progress.as_mut() {
+        if candidate_total > 0 {
+            reporter.begin("Workspace symbols", None);
+        }
+    }
     for (done, cand) in candidates.into_iter().enumerate() {
         if let Some(reporter) = progress.as_mut() {
             crate::progress::ProgressSink::progress(

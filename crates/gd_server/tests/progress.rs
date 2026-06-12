@@ -18,13 +18,9 @@ use lsp_types::{
 /// Boot over the sample project with the given capabilities; do NOT drain anything after the
 /// `initialized` notification (progress tests inspect the raw stream).
 fn boot_raw(
+    p: &common::TempProject,
     capabilities: ClientCapabilities,
-) -> (
-    common::TempProject,
-    Connection,
-    std::thread::JoinHandle<anyhow::Result<()>>,
-) {
-    let p = sample_project();
+) -> (Connection, std::thread::JoinHandle<anyhow::Result<()>>) {
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
 
@@ -48,7 +44,7 @@ fn boot_raw(
         .sender
         .send(notification("initialized", InitializedParams {}))
         .unwrap();
-    (p, client, server_thread)
+    (client, server_thread)
 }
 
 fn window_progress_caps() -> ClientCapabilities {
@@ -83,7 +79,8 @@ fn as_progress(msg: &Message) -> Option<(ProgressToken, &'static str)> {
 /// begin first and end last, all on the create's token — no orphans.
 #[test]
 fn cold_start_progress_is_one_cleanly_paired_token() {
-    let (_p, client, server_thread) = boot_raw(window_progress_caps());
+    let p = sample_project();
+    let (client, server_thread) = boot_raw(&p, window_progress_caps());
 
     let mut create_token: Option<ProgressToken> = None;
     let mut arc: Vec<(ProgressToken, &'static str)> = Vec::new();
@@ -139,7 +136,8 @@ fn cold_start_progress_is_one_cleanly_paired_token() {
 /// whole cold start by driving a normal request and inspecting everything that arrived.
 #[test]
 fn no_capability_means_no_create_and_no_progress() {
-    let (p, client, server_thread) = boot_raw(ClientCapabilities::default());
+    let p = sample_project();
+    let (client, server_thread) = boot_raw(&p, ClientCapabilities::default());
 
     // Give the cold start a beat to finish, then drive a normal round-trip so there's a clear
     // "everything before this response" window to audit.
@@ -194,7 +192,11 @@ fn no_capability_means_no_create_and_no_progress() {
 /// advertised `window.workDoneProgress`.
 #[test]
 fn references_honors_client_work_done_token_without_window_capability() {
-    let (p, client, server_thread) = boot_raw(ClientCapabilities::default());
+    let p = sample_project();
+    // The method-scan must find candidates, or the (deliberately) deferred `begin` never fires
+    // — enemy.gd references `attack` so the request has real per-file work to report.
+    p.write("src/enemy.gd", "extends Hero\n\nfunc flee():\n\tattack()\n");
+    let (client, server_thread) = boot_raw(&p, ClientCapabilities::default());
 
     let uri = file_uri(&p.root.join("src/hero.gd"));
     client
@@ -279,7 +281,8 @@ fn references_honors_client_work_done_token_without_window_capability() {
 /// `progress.rs`), and normal requests keep serving.
 #[test]
 fn rejected_create_degrades_gracefully() {
-    let (p, client, server_thread) = boot_raw(window_progress_caps());
+    let p = sample_project();
+    let (client, server_thread) = boot_raw(&p, window_progress_caps());
 
     // Reject the create the moment it arrives.
     loop {

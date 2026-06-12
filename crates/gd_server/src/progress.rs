@@ -352,13 +352,19 @@ mod tests {
         reporter.begin("Indexing project", None);
         ProgressSink::progress(&mut reporter, 50, Some(200), "parsing scripts");
         let messages = drain(&rx);
-        let Message::Notification(n) = &messages[2] else {
-            panic!("expected the report notification")
-        };
-        let params: ProgressParams = serde_json::from_value(n.params.clone()).unwrap();
-        let ProgressParamsValue::WorkDone(WorkDoneProgress::Report(report)) = params.value else {
-            panic!("expected a report")
-        };
+        let report = messages
+            .iter()
+            .find_map(|m| {
+                let Message::Notification(n) = m else {
+                    return None;
+                };
+                let params: ProgressParams = serde_json::from_value(n.params.clone()).ok()?;
+                match params.value {
+                    ProgressParamsValue::WorkDone(WorkDoneProgress::Report(r)) => Some(r),
+                    _ => None,
+                }
+            })
+            .expect("a report notification");
         assert_eq!(report.percentage, Some(25));
         assert_eq!(report.message.as_deref(), Some("parsing scripts (50/200)"));
     }
