@@ -117,9 +117,15 @@ families a full-project diagnostics sweep exposed right after v1.0.0.
 See [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md) for the M6 scope and
 [`CHANGELOG.md`](CHANGELOG.md) for the milestone history.
 
-Phase 2 (post-v1): `.tscn` node typing for `$`/`%`, `signatureHelp`, `completion`, and `rename` /
-`documentHighlight`. (The persistent warm-start index cache was pulled forward into **M6** — it now
-gates v1.) Roadmap in [`docs/07-milestones-risks.md`](docs/07-milestones-risks.md).
+Phase 2 (post-v1) is the **generic-language-server phase** — milestones **M7–M11**: full
+editor-grade LSP surface (completion, signature help, rename, document highlight, type hierarchy,
+semantic tokens with the standard legend only, inlay hints, code actions, folding/selection
+ranges, pull diagnostics, cancellation preemption, progress reporting) plus `.tscn` node typing
+for `$`/`%`, so any editor — Helix, VS Code, Neovim, Zed, Emacs, Sublime — gets the complete
+feature set with zero gdls-specific client code, and none of the Godot-editor LSP's custom
+protocol. (The persistent warm-start index cache was pulled forward into **M6** — it gated v1.)
+Full spec: [`docs/09-phase-2.md`](docs/09-phase-2.md); roadmap table in
+[`docs/07-milestones-risks.md`](docs/07-milestones-risks.md).
 
 ## Contributing
 

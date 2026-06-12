@@ -284,6 +284,11 @@ clobber each other's trace. That's an opt-in debug feature, not the LSP path; a 
 
 ## 4. Out of scope / decisions (resolved)
 
+> **Superseded note (2026-06-12):** everything deferred to "Phase 2" below is now fully specified —
+> milestones **M7–M11** in [`09-phase-2.md`](09-phase-2.md) (preemption → M7; completion/signatureHelp
+> → M8; rename/documentHighlight/declaration → M9; onTypeFormatting → skipped with rationale;
+> `.tscn` typing → M11). This section is retained as the v1-era decision record.
+
 **Confirmed Phase 2 (per `docs/00 §3`; unchanged):** `.tscn` node typing for `$`/`%` precise types,
 `completion`, `signatureHelp`.
 

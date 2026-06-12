@@ -11,7 +11,7 @@ coupling at 3,000–10,000+ `.gd` scale. Only the frontend is ported — the com
 Godot's module is out of scope (diagnostics only).
 
 Read `docs/00-overview.md` (problem, locked decisions) and `docs/01-architecture.md` first; the full
-spec is `docs/00`…`docs/08`.
+spec is `docs/00`…`docs/09`.
 
 ## Commands
 
@@ -127,8 +127,16 @@ Phase 1 = v1 = **M0–M6**: M0 LSP skeleton · M1 tokenizer + parser · M2 envir
 (memory pressure ladder, perf budgets), observability (`tracing`), differential-oracle harness · **M6
 (the milestone that ships v1)** exposed-capability parity vs Godot's own LSP (`hover`/`definition`/
 `references`/`documentSymbol`/`implementation` gaps) + a persistent warm-start index cache, per
-[`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md). Phase 2 (post-v1): `.tscn` node typing for `$`/`%`,
-`completion`, `signatureHelp`, `rename`/`documentHighlight`.
+[`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md). Phase 2 = **M7–M11** (the generic-language-server
+phase, fully specified in [`docs/09-phase-2.md`](docs/09-phase-2.md)): M7 protocol foundations
+(cancel preemption, progress, configuration, pull diagnostics, doc-comment pipeline) · M8
+`completion` + `signatureHelp` · M9 navigation/refactoring (`rename`, `documentHighlight`,
+`declaration`/`typeDefinition`, `typeHierarchy`, folding/selection) · M10 presentation
+(`semanticTokens` standard-legend-only, `inlayHint`, `documentColor`, `codeAction`) · M11 scenes
+(`.tscn` typing for `$`/`%`, scene-aware completion, `willRenameFiles`, external-formatter bridge).
+Governing principle (issue #30): generic LSP first — Godot-specific data additive, never instead;
+no custom protocol; every feature capability-gated. The Godot-LSP anti-catalog in `docs/09 §3` is
+binding.
 
 **Current:** Phase 1 complete — **v1.0.5 shipped** (2026-06-12). Release notes and the full
 history live in `CHANGELOG.md`; per-milestone exit criteria in `docs/07`. Both conformance
