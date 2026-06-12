@@ -266,6 +266,44 @@ fn structural_fields_are_ignored_at_runtime() {
     shutdown(&client, server_thread);
 }
 
+/// A sparse payload only applies the groups it carries: a section with only `strict` must not
+/// reset non-default `analyzer`/`memory` startup knobs to their defaults (group-level presence
+/// gating). Observable here as: the sparse strict-only payload applies (warning disappears)
+/// while a follow-up disabling the override restores it — and no spurious analyzer/memory
+/// invalidation breaks the round-trip.
+#[test]
+fn sparse_payload_keeps_absent_groups() {
+    let p = sample_project();
+    let (client, server_thread) = boot(&p, ClientCapabilities::default());
+    let uri = file_uri(&p.root.join("unused.gd"));
+    assert!(has_unused(&open_unused(&client, &uri)));
+
+    // Sparse: only `strict` provided — analyzer/memory keep their session values.
+    client
+        .sender
+        .send(notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": { "gdls": { "strict": { "disableWarnings": ["UNUSED_VARIABLE"] } } } }),
+        ))
+        .unwrap();
+    assert!(!has_unused(&recv_publish_for(&client, &uri)));
+
+    // Round-trip back: a sparse payload restoring the default strict config re-enables it.
+    client
+        .sender
+        .send(notification(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": { "gdls": { "strict": {} } } }),
+        ))
+        .unwrap();
+    assert!(
+        has_unused(&recv_publish_for(&client, &uri)),
+        "providing the strict group as its default snapshot restores the default policy"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 /// A no-op payload (identical config) causes no republish — no cache churn for nothing.
 #[test]
 fn unchanged_config_causes_no_republish() {

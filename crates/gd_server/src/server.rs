@@ -838,7 +838,8 @@ fn handle_outbound_response(state: &mut ServerState, resp: Response) {
         OutboundKind::Configuration => {
             if let Some(err) = &resp.error {
                 log::warn!(
-                    "client rejected workspace/configuration ({}); keeping the previous                      configuration",
+                    "client rejected workspace/configuration ({}); keeping the previous \
+                     configuration",
                     err.message
                 );
                 return;
@@ -853,7 +854,8 @@ fn handle_outbound_response(state: &mut ServerState, resp: Response) {
                 .unwrap_or(serde_json::Value::Null);
             if section.is_null() {
                 log::info!(
-                    "workspace/configuration returned no \"gdls\" section; keeping the                      previous configuration"
+                    "workspace/configuration returned no \"gdls\" section; keeping the previous \
+                     configuration"
                 );
                 return;
             }
@@ -882,47 +884,63 @@ fn apply_runtime_config(state: &mut ServerState, raw: &serde_json::Value) {
         }
     };
 
+    // Group-level presence gating: a top-level key ABSENT from the payload means "keep the
+    // current session value" — an editor whose sparse `gdls` section only carries (say)
+    // `strict` must not silently reset non-default `analyzer`/`memory` knobs configured in
+    // `initializationOptions` at startup. A PRESENT group is taken as that group's complete
+    // snapshot (the LSP configuration-section convention).
+    let provided = |key: &str| raw.get(key).is_some();
+
     // Session-structural fields can't re-apply mid-session — each is baked into the workspace
-    // load / watcher / dump topology at startup. Warn per drifted field, keep the old value.
+    // load / watcher / dump topology at startup. Warn per drifted (and provided) field, keep
+    // the old value.
     let old = &state.options;
     let structural: [(&str, bool); 6] = [
-        ("projectRoot", new_options.project_root != old.project_root),
+        (
+            "projectRoot",
+            provided("projectRoot") && new_options.project_root != old.project_root,
+        ),
         (
             "extensionApiPath",
-            new_options.extension_api_path != old.extension_api_path,
+            provided("extensionApiPath")
+                && new_options.extension_api_path != old.extension_api_path,
         ),
         (
             "godotBinaryPath",
-            new_options.godot_binary_path != old.godot_binary_path,
+            provided("godotBinaryPath") && new_options.godot_binary_path != old.godot_binary_path,
         ),
         (
             "autoDumpExtensionApi",
-            new_options.auto_dump_extension_api != old.auto_dump_extension_api,
+            provided("autoDumpExtensionApi")
+                && new_options.auto_dump_extension_api != old.auto_dump_extension_api,
         ),
         (
             "embeddedApiFallback",
-            new_options.embedded_api_fallback != old.embedded_api_fallback,
+            provided("embeddedApiFallback")
+                && new_options.embedded_api_fallback != old.embedded_api_fallback,
         ),
         (
             "stubCacheDir",
-            new_options.stub_cache_dir != old.stub_cache_dir,
+            provided("stubCacheDir") && new_options.stub_cache_dir != old.stub_cache_dir,
         ),
     ];
     for (field, drifted) in structural {
         if drifted {
             log::warn!(
-                "runtime configuration changes `{field}`, which is session-structural —                  keeping the current value (restart gdls to apply it)"
+                "runtime configuration changes `{field}`, which is session-structural — keeping \
+                 the current value (restart gdls to apply it)"
             );
         }
     }
 
-    let strict_changed = new_options.strict != state.options.strict;
-    let analyzer_changed = new_options.analyzer != state.options.analyzer;
-    let memory_changed = new_options.memory != state.options.memory;
+    let strict_changed = provided("strict") && new_options.strict != state.options.strict;
+    let analyzer_changed = provided("analyzer") && new_options.analyzer != state.options.analyzer;
+    let memory_changed = provided("memory") && new_options.memory != state.options.memory;
 
     if strict_changed {
         log::info!(
-            "runtime configuration: strict profile/overrides changed; rebuilding the warning              policy and republishing open buffers"
+            "runtime configuration: strict profile/overrides changed; rebuilding the warning \
+             policy and republishing open buffers"
         );
         state.options.strict = new_options.strict;
         state.workspace.apply_strict(&state.options.strict);
@@ -1745,13 +1763,16 @@ fn dispatch_notification(state: &mut ServerState, note: Notification) {
                     .outbound
                     .insert(id.clone(), OutboundKind::Configuration);
                 let req = Request {
-                    id,
+                    id: id.clone(),
                     method: "workspace/configuration".to_string(),
                     params: serde_json::json!({
                         "items": [{ "section": "gdls" }],
                     }),
                 };
                 if state.sender.send(Message::Request(req)).is_err() {
+                    // Undelivered ⇒ no response will ever correlate; drop the entry rather
+                    // than leak it for the session's lifetime.
+                    state.outbound.remove(&id);
                     log::warn!("workspace/configuration send failed (client disconnected?)");
                 }
             } else if let Ok(p) =
