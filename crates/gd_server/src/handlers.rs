@@ -755,6 +755,7 @@ pub(crate) fn analyze_with_request_token(
         gd_analyze::AnalyzeOptions {
             iter_limit: None,
             cancellation: token.as_ref(),
+            checkpoint_delay: None,
         },
     )
 }

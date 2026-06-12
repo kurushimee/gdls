@@ -125,6 +125,11 @@ pub struct AnalyzeOptions<'a> {
     /// hot loops. `None` (the default) skips the check entirely — zero overhead for the
     /// conformance / unit-test path.
     pub cancellation: Option<&'a CancellationToken>,
+    /// M7 (#57) test governor: sleep this long at every 256-node checkpoint, making an analyze
+    /// pass deterministically slow so the cancellation/staleness wire races are testable. `None`
+    /// (the default, and production) costs one branch per checkpoint. Surfaced through the
+    /// LSP server's `initializationOptions.analyzer.checkpointDelayUs`.
+    pub checkpoint_delay: Option<std::time::Duration>,
 }
 
 /// `analyze` with per-call knobs — see [`AnalyzeOptions`]. Single source of truth for the analyzer
@@ -143,6 +148,7 @@ pub fn analyze_with_options<'a>(
     let mut ctx = AnalysisContext::new(tree, native, xfile, file, script_path, policy);
     ctx.iter_limit = options.iter_limit.unwrap_or(DEFAULT_ITER_LIMIT);
     ctx.cancellation = options.cancellation;
+    ctx.checkpoint_delay = options.checkpoint_delay;
     // EMPTY_FILE (gdscript_parser.cpp:482-489): Godot queues it from `parse()` when the token
     // stream is already at EOF after the leading newline skip — before any analysis, so it is
     // the first warning. `gd_syntax` records the signal; the analyzer owns the warning set.

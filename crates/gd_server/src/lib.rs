@@ -21,6 +21,7 @@ pub mod xfile;
 mod handlers;
 pub mod logging;
 mod native_render;
+mod router;
 mod server;
 mod stubs;
 
