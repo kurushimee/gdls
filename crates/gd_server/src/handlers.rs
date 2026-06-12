@@ -2967,7 +2967,14 @@ pub fn outgoing_calls(
     state: &mut ServerState,
     params: CallHierarchyOutgoingCallsParams,
 ) -> Option<Vec<CallHierarchyOutgoingCall>> {
-    let (uri, fn_name) = decode_call_hierarchy_data(&params.item)?;
+    let (uri, fn_name) = resolve_call_hierarchy_item(state, &params.item)?;
+    // Stub API pages have no project call graph: expanding a stub-anchored item (the
+    // references-view hands native `to` items back verbatim) gets a clean empty list — never
+    // an error, and never an attempt to analyze pseudo-GDScript. Mirrors publish_diagnostics'
+    // suppression gate.
+    if crate::stubs::is_stub_uri(&uri, state.options.stub_cache_dir.as_deref()) {
+        return Some(Vec::new());
+    }
     let path = crate::uri::uri_to_path(&uri)?;
     let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
         Some(t) => t,
@@ -3058,6 +3065,13 @@ pub fn outgoing_calls(
             // call-site range the pre-fix code used.
             None => (uri.clone(), file_start_range(), file_start_range()),
         };
+        // `to` items carry the same {uri, name} blob prepare/incoming items do — the client
+        // hands them back verbatim on expansion ("show outgoing calls of this callee"), and a
+        // data-less item used to dead-end the whole outgoing tree at depth 2.
+        let data = serde_json::json!({
+            "uri": to_uri.as_str(),
+            "name": callee_name,
+        });
         #[allow(deprecated)]
         let to = CallHierarchyItem {
             name: callee_name.clone(),
@@ -3067,7 +3081,7 @@ pub fn outgoing_calls(
             uri: to_uri,
             range: to_range,
             selection_range: to_selection,
-            data: None,
+            data: Some(data),
         };
         out.push(CallHierarchyOutgoingCall {
             to,
@@ -3088,7 +3102,12 @@ pub fn incoming_calls(
     state: &mut ServerState,
     params: CallHierarchyIncomingCallsParams,
 ) -> Option<Vec<CallHierarchyIncomingCall>> {
-    let (target_uri, target_name) = decode_call_hierarchy_data(&params.item)?;
+    let (target_uri, target_name) = resolve_call_hierarchy_item(state, &params.item)?;
+    // Same stub gate as outgoing_calls: a stub-anchored item resolves to an API page no
+    // project code is indexed against — empty, not an error.
+    if crate::stubs::is_stub_uri(&target_uri, state.options.stub_cache_dir.as_deref()) {
+        return Some(Vec::new());
+    }
     let target_path = crate::uri::uri_to_path(&target_uri)?;
     let target_fid = state.workspace.index.file_id(&target_path);
     let enc = state.encoding;
@@ -3387,6 +3406,61 @@ fn member_kind_to_lsp(k: gd_project::MemberKind) -> LspSymbolKind {
         Signal => LspSymbolKind::EVENT,
         Enum => LspSymbolKind::ENUM,
     }
+}
+
+/// Resolve a `CallHierarchyItem` back to `(uri, bare function name)` for the follow-up
+/// handlers. Server-issued `data` wins ([`decode_call_hierarchy_data`], which keeps its
+/// malformed-data logging). Items without data — clients that strip the field, or items
+/// synthesized by another provider — re-resolve rust-analyzer/gopls-style from `item.uri` +
+/// `item.selection_range.start` (the function whose declaration identifier contains that
+/// position), with `item.name` as the lossless floor: every gdls-issued item satisfies
+/// `data.name == item.name`, and GDScript has no overloads, so the bare name identifies the
+/// function within its file.
+fn resolve_call_hierarchy_item(
+    state: &mut ServerState,
+    item: &CallHierarchyItem,
+) -> Option<(Uri, String)> {
+    if let Some(decoded) = decode_call_hierarchy_data(item) {
+        return Some(decoded);
+    }
+    let name =
+        position_function_name(state, &item.uri, item.selection_range.start).unwrap_or_else(|| {
+            log::debug!(
+                "call hierarchy: item `{}` carries no data and its selectionRange resolves no \
+                 function declaration; falling back to the item's own name",
+                item.name
+            );
+            item.name.clone()
+        });
+    Some((item.uri.clone(), name))
+}
+
+/// The name of the function whose declaration IDENTIFIER contains `pos` in `uri`'s current
+/// text (open buffer wins over disk). `None` when the file is unreadable or no declaration
+/// identifier contains the position.
+fn position_function_name(state: &mut ServerState, uri: &Uri, pos: Position) -> Option<String> {
+    let path = crate::uri::uri_to_path(uri)?;
+    let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+        Some(t) => t,
+        None => std::fs::read_to_string(path.as_std_path()).ok()?,
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
+    let rope = Rope::from_str(&text);
+    let byte = PositionMapper::new(&rope, state.encoding).position_to_byte(pos);
+    for id in parsed.tree.iter_ids() {
+        let NodeKind::Function(f) = &parsed.tree.get(id).kind else {
+            continue;
+        };
+        let Some(ident) = f.identifier else {
+            continue;
+        };
+        let span = parsed.tree.get(ident).span;
+        let name = ident_name(&parsed.tree, ident);
+        if !name.is_empty() && span.start <= byte && byte < span.end {
+            return Some(name.to_owned());
+        }
+    }
+    None
 }
 
 /// Decode the `data` field a `prepareCallHierarchy` item carries: `{ "uri": ..., "name": ... }`.
