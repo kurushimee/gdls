@@ -507,6 +507,19 @@ impl<'a> AnalysisContext<'a> {
         symbols: &[String],
         at_node: gd_syntax::ast::NodeId,
     ) {
+        self.push_warning_with_related(code, symbols, at_node, Vec::new());
+    }
+
+    /// [`Self::push_warning`] with attached [`crate::diagnostic::RelatedInfo`] entries — the
+    /// structured twin of a location the message names only in text (the SHADOWED_* family's
+    /// shadowed declaration). Shares the `@warning_ignore` suppression.
+    pub fn push_warning_with_related(
+        &mut self,
+        code: crate::warnings::WarningCode,
+        symbols: &[String],
+        at_node: gd_syntax::ast::NodeId,
+        related: Vec<crate::diagnostic::RelatedInfo>,
+    ) {
         // Suppression mirrors Godot's `apply_pending_warnings` (gdscript_parser.cpp:269-281):
         // drop when the anchor's 1-based start line is in `warning_ignored_lines[code]` — the
         // per-line set [`build_warning_ignored_lines`] expands from each `@warning_ignore`'s
@@ -525,7 +538,8 @@ impl<'a> AnalysisContext<'a> {
             return;
         }
         let level = self.policy.effective_level(code);
-        self.sink.push_warning(code, level, symbols, span, line);
+        self.sink
+            .push_warning_with_related(code, level, symbols, span, line, related);
     }
 
     /// `True` when the diagnostic byte `pos` falls inside any `@warning_ignore_start(code)` /

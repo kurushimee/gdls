@@ -2285,6 +2285,31 @@ fn resolve_parameter(ctx: &mut AnalysisContext, param_id: NodeId) {
     resolve_assignable(ctx, param_id, spec, init, infer, false);
 }
 
+/// clang's note label for the shadowed-declaration related location every SHADOWED_* emission
+/// attaches — the structured, navigable twin of the "at line N" the message bakes into text.
+/// Not a Godot string: Godot never serializes related locations, so the label carries no
+/// fidelity constraint.
+const PREVIOUS_DECL_LABEL: &str = "previous declaration is here";
+
+/// The identifier span of a member-declaration node — the narrow related-location anchor (the
+/// declaration's name token, not the whole node). `None` when the declaration has no
+/// identifier (recovered parse); callers emit the plain warning rather than a junk span.
+fn member_decl_ident_span(
+    ctx: &AnalysisContext,
+    member_node: NodeId,
+) -> Option<gd_syntax::ByteSpan> {
+    let id = match &ctx.node(member_node).kind {
+        NodeKind::Class(c) => c.identifier,
+        NodeKind::Constant(c) => c.identifier,
+        NodeKind::Function(f) => f.identifier,
+        NodeKind::Signal(s) => s.identifier,
+        NodeKind::Variable(v) => v.identifier,
+        NodeKind::Enum(e) => e.identifier,
+        _ => None,
+    }?;
+    Some(ctx.node(id).span)
+}
+
 /// Slice of Godot's `is_shadowing(identifier, "function parameter", true)` (analyzer.cpp:6135-6188).
 /// Looks up `param_id`'s name in the current class's `members_indices`; if found, emits
 /// SHADOWED_VARIABLE with [context, name, member-kind, declaring-line]. Godot's broader walk
@@ -2328,7 +2353,16 @@ fn warn_parameter_shadowing(ctx: &mut AnalysisContext, param_id: NodeId) {
         Member::EnumValue(_) | Member::Group(_) => return,
     };
     let member_line = ctx.node(member_node).loc.start.line.to_string();
-    ctx.push_warning(
+    let related = member_decl_ident_span(ctx, member_node)
+        .map(|span| {
+            vec![crate::diagnostic::RelatedInfo {
+                file: None,
+                span,
+                message: PREVIOUS_DECL_LABEL.to_owned(),
+            }]
+        })
+        .unwrap_or_default();
+    ctx.push_warning_with_related(
         crate::warnings::WarningCode::ShadowedVariable,
         &[
             "function parameter".to_owned(),
@@ -2337,6 +2371,7 @@ fn warn_parameter_shadowing(ctx: &mut AnalysisContext, param_id: NodeId) {
             member_line,
         ],
         identifier_id,
+        related,
     );
 }
 
@@ -4761,6 +4796,8 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
     // built-in type / native class / global class_name. Emit before the in-class shadowing
     // check so the source-position-stable order matches Godot's emit order.
     if let Some(global_desc) = shadowed_global_identifier_description(ctx, &name) {
+        // No related location: the shadowed global is a builtin function / builtin type /
+        // native class description, not a project declaration the analyzer can point at.
         ctx.push_warning(
             crate::warnings::WarningCode::ShadowedGlobalIdentifier,
             &[kind.to_owned(), name.clone(), global_desc],
@@ -4790,10 +4827,20 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
             };
             if let Some(member_node) = member_node {
                 let member_line = ctx.node(member_node).loc.start.line.to_string();
-                ctx.push_warning(
+                let related = member_decl_ident_span(ctx, member_node)
+                    .map(|span| {
+                        vec![crate::diagnostic::RelatedInfo {
+                            file: None,
+                            span,
+                            message: PREVIOUS_DECL_LABEL.to_owned(),
+                        }]
+                    })
+                    .unwrap_or_default();
+                ctx.push_warning_with_related(
                     crate::warnings::WarningCode::ShadowedVariable,
                     &[kind.to_owned(), name, member_kind, member_line],
                     ident_id,
+                    related,
                 );
                 return;
             }
@@ -4825,7 +4872,19 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
                     };
                     let base_name = iface.class_name.as_deref().unwrap_or("").to_owned();
                     let member_line = member.line.to_string();
-                    ctx.push_warning(
+                    // The structured twin of `at line N in the base class "Y"`: the member's
+                    // recorded name token in the declaring base file (zero-width only in
+                    // defensively-built interfaces — skip rather than anchor junk).
+                    let related = if member.name_span.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![crate::diagnostic::RelatedInfo {
+                            file: Some(link.file),
+                            span: member.name_span,
+                            message: PREVIOUS_DECL_LABEL.to_owned(),
+                        }]
+                    };
+                    ctx.push_warning_with_related(
                         crate::warnings::WarningCode::ShadowedVariableBaseClass,
                         &[
                             kind.to_owned(),
@@ -4835,6 +4894,7 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
                             base_name,
                         ],
                         ident_id,
+                        related,
                     );
                     return;
                 }
@@ -4846,6 +4906,9 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
         let mut cur = ctx.native.class_named(&native);
         while let Some(c) = cur {
             if c.methods.iter().any(|m| ctx.native.name_of(m.name) == name) {
+                // No related location: the shadowed declaration is a native method — its only
+                // honest anchor would be a server-side API stub, which the analyzer cannot
+                // materialize.
                 let defining = ctx.native.name_of(c.name).to_owned();
                 ctx.push_warning(
                     crate::warnings::WarningCode::ShadowedVariableBaseClass,

@@ -1525,12 +1525,20 @@ fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) 
                 // Only `.gd` files go through the analyzer — for any other open buffer the syntax
                 // diagnostics carry the publish on their own.
                 let analyzed = analyze_gd(state, &uri, &parsed.tree, &text);
+                // Related-location memo BEFORE the doc borrow: every distinct cross-file target
+                // (a SHADOWED_VARIABLE_BASE_CLASS base script) is read once into a rope for the
+                // encoding-correct projection below. Bounded by the related entries one file's
+                // diagnostics carry — zero for almost every publish.
+                let related_texts = related_location_texts(state, analyzed.as_deref());
                 match state.vfs.get(uri.as_str()) {
                     Some(doc) => {
                         let mapper = PositionMapper::new(&doc.rope, state.encoding);
                         collect_diagnostics(
                             &mapper,
+                            state.encoding,
                             state.caps,
+                            &uri,
+                            &related_texts,
                             &parsed.diagnostics,
                             analyzed.as_deref(),
                         )
@@ -1609,7 +1617,10 @@ fn analyze_gd(
 /// (rust-analyzer-style — clients ignore unknown members).
 fn collect_diagnostics(
     mapper: &PositionMapper,
+    enc: PositionEncoding,
     caps: ClientCaps,
+    request_uri: &Uri,
+    related_texts: &FxHashMap<gd_project::FileId, (Uri, ropey::Rope)>,
     syntax: &[gd_syntax::Diagnostic],
     analyzed: Option<&gd_analyze::AnalysisResult>,
 ) -> Vec<Diagnostic> {
@@ -1642,11 +1653,93 @@ fn collect_diagnostics(
                 code_description: d.warning_code().map(|_| CodeDescription {
                     href: godot_warning_docs_uri(),
                 }),
+                related_information: project_related(
+                    d.related(),
+                    mapper,
+                    enc,
+                    request_uri,
+                    related_texts,
+                ),
                 ..Default::default()
             });
         }
     }
     out
+}
+
+/// Load the text of every DISTINCT cross-file related-location target referenced by `analyzed`'s
+/// diagnostics (open buffer wins over disk). Unreadable or unindexed targets are simply absent —
+/// their entries drop at projection, never the diagnostic itself.
+fn related_location_texts(
+    state: &mut ServerState,
+    analyzed: Option<&gd_analyze::AnalysisResult>,
+) -> FxHashMap<gd_project::FileId, (Uri, ropey::Rope)> {
+    let mut out: FxHashMap<gd_project::FileId, (Uri, ropey::Rope)> = FxHashMap::default();
+    let Some(result) = analyzed else {
+        return out;
+    };
+    for d in &result.diagnostics {
+        for rel in d.related() {
+            let Some(fid) = rel.file else { continue };
+            if out.contains_key(&fid) {
+                continue;
+            }
+            let Some(path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            let Some(uri) = crate::uri::path_to_file_uri(&path) else {
+                continue;
+            };
+            let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+                Some(t) => t,
+                None => match std::fs::read_to_string(path.as_std_path()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::debug!(
+                            "related location target {path} unreadable ({e}); its entries drop"
+                        );
+                        continue;
+                    }
+                },
+            };
+            out.insert(fid, (uri, ropey::Rope::from_str(&text)));
+        }
+    }
+    out
+}
+
+/// Project a diagnostic's [`gd_analyze::RelatedInfo`] entries into LSP
+/// `DiagnosticRelatedInformation`: same-file entries map through the request mapper; cross-file
+/// entries through the memo'd target rope (a missing target drops the ENTRY, never the
+/// diagnostic). `None` when empty, so diagnostics without related locations serialize
+/// byte-identically to before.
+fn project_related(
+    related: &[gd_analyze::RelatedInfo],
+    mapper: &PositionMapper,
+    enc: PositionEncoding,
+    request_uri: &Uri,
+    texts: &FxHashMap<gd_project::FileId, (Uri, ropey::Rope)>,
+) -> Option<Vec<lsp_types::DiagnosticRelatedInformation>> {
+    let mut out = Vec::new();
+    for rel in related {
+        let (uri, range) = match rel.file {
+            None => (request_uri.clone(), mapper.span_to_range(rel.span)),
+            Some(fid) => {
+                let Some((uri, rope)) = texts.get(&fid) else {
+                    continue;
+                };
+                (
+                    uri.clone(),
+                    PositionMapper::new(rope, enc).span_to_range(rel.span),
+                )
+            }
+        };
+        out.push(lsp_types::DiagnosticRelatedInformation {
+            location: lsp_types::Location { uri, range },
+            message: rel.message.clone(),
+        });
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 /// The unused/unreachable warning family editors render FADED via `DiagnosticTag::UNNECESSARY`
