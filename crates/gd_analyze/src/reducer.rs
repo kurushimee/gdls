@@ -1484,9 +1484,10 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // a `signal ping` declared in the cross-file base used to be `Identifier "ping" not
     // declared`. Instance context (`p_base == nullptr` ⇒ type_from_metatype lowers to instance,
     // analyzer.cpp:4030-4034), so all member kinds are reachable. Skipped in callee position:
-    // `reduce_call` resolves bare inherited calls itself (`resolve_callee_file` + the cross-file
-    // CallSig), and typing the callee as a constant Callable here would mis-fire Godot's
-    // `Name "X" is a Callable` error that is reserved for callable-holding variables.
+    // `reduce_call` resolves bare inherited calls itself (the in-file class walk + the
+    // cross-file CallSig chain), and typing the callee as a constant Callable here would
+    // mis-fire Godot's `Name "X" is a Callable` error that is reserved for callable-holding
+    // variables.
     if !ctx.reducing_callee {
         if let Some(sr) = current_class_script_base(ctx) {
             if let Some((dt, fold)) = lookup_script_chain_member(ctx, &sr, &name, false, id) {
@@ -5442,6 +5443,19 @@ fn reduce_identifier_from_base(
             if let Some((member_dt, fold)) =
                 lookup_class_member(ctx, class_id, &name, identifier_id)
             {
+                // Record the resolved in-file attribute read (`self.hp`, an access on a base
+                // typed as this file's own class) — the in-file twin of `record_member_use`'s
+                // cross-file recording, closing the last attribute-read recording gap so
+                // references can ride bindings instead of the raw identifier scan. WP-RD2: an
+                // orphan records `None` ("don't know"), never a placeholder id. Additive
+                // (WP-N1b): no type or diagnostic changes.
+                let site = ctx.node(identifier_id).span;
+                ctx.record_binding(Binding::use_(
+                    ctx.file,
+                    BindingSymbolKind::Member,
+                    name.clone(),
+                    site,
+                ));
                 ctx.set_type(identifier_id, member_dt);
                 if let Some(fv) = fold {
                     ctx.folds.set(identifier_id, fv);

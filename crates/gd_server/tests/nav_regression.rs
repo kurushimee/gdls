@@ -533,6 +533,64 @@ fn inner_class_bare_call_records_owning_class_path() {
     );
 }
 
+/// In-file attribute reads (`self.hp`, and reads through a variable typed as this file's own
+/// class) record a `Binding::Use` at the attribute identifier — the in-file twin of the
+/// cross-file `record_member_use` recording, closing the last attribute-read gap so references
+/// can ride bindings instead of the raw identifier scan.
+#[test]
+fn in_file_attribute_read_records_use_binding() {
+    use gd_analyze::{
+        analyze, Binding, BindingTargetKind, StrictSettings, SyntacticQuery, WarnPolicy,
+    };
+    use gd_project::WarningConfig;
+
+    let source = "class_name OwnClass\nextends Node\nvar hp: int = 0\n\
+                  func a() -> void:\n\tself.hp = 1\n\
+                  func b() -> void:\n\tvar h: OwnClass = self\n\tprint(h.hp)\n";
+    let parse = gd_syntax::parse(source);
+    assert!(
+        parse.diagnostics.is_empty(),
+        "fixture must parse cleanly; got {:?}",
+        parse.diagnostics
+    );
+    let native = gd_types::NativeDb::from_json(MINI_API).expect("mini native db");
+    let mut index = gd_project::Index::new(camino::Utf8PathBuf::from("/proj"));
+    let file = index.set_interface(
+        camino::Utf8Path::new("/proj/src/own.gd"),
+        gd_project::extract_interface(&parse.tree),
+    );
+    index.finish_cold_index();
+    let xfile = SyntacticQuery::new(&index, &native);
+    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let result = analyze(&parse.tree, Some(file), "own.gd", &native, &xfile, &policy);
+
+    let use_spans: Vec<gd_syntax::ByteSpan> = result
+        .bindings()
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Use {
+                target_file,
+                target_kind: BindingTargetKind::Member,
+                target_name,
+                site,
+            } if target_name == "hp" && *target_file == Some(file) => Some(*site),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        use_spans.len() >= 2,
+        "both the `self.hp` write and the `h.hp` read must record Use bindings; got {:?}",
+        result.bindings()
+    );
+    for span in &use_spans {
+        assert_eq!(
+            &source[span.start..span.end],
+            "hp",
+            "each Use binding anchors the attribute identifier itself"
+        );
+    }
+}
+
 /// A BARE call to an INHERITED method attributes its callee to the base that DECLARES it
 /// (dispatch-accurate via the script-chain walk at the consolidated recording site), never
 /// `Unresolved` and never the calling file. Build a real 2-file index so the chain

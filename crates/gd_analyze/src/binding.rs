@@ -60,14 +60,14 @@ pub struct MemberXref {
 }
 
 /// What kind of declaration a [`Binding::Use`] targets. Distinct from [`gd_syntax::SymbolKind`]
-/// (the parser's outline-symbol vocabulary): the analyzer's binding kinds are coarser and only
-/// have variants the M4 reducer can actually emit today.
+/// (the parser's outline-symbol vocabulary): the analyzer's binding kinds are coarser.
 ///
-/// **M4 emits only `Class` and `Member`.** The other variants are reserved for follow-on
-/// recording sites: `reduce_identifier_from_base`'s native-method path could emit `Function`,
-/// `reduce_subscript_attribute`'s enum-value path could emit `EnumValue`, etc. (see WP-N1b's
-/// "additive recording" discipline). The enum stays `#[non_exhaustive]` so a handler match on
-/// it remains correct when new variants land.
+/// Emitted today: `Class` and `Member` from `reduce_identifier` (in-file members, cross-file
+/// `class_name`s, autoloads) and from `reduce_identifier_from_base`'s in-file CLASS branch;
+/// the precise kinds (`Variable` / `Constant` / `Function` / `Signal` / `Enum` / `EnumValue`)
+/// from `record_member_use` for every cross-file script-chain member hit. `Parameter` stays
+/// reserved (locals/params are function-scoped and never cross-file). The enum stays
+/// `#[non_exhaustive]` so a handler match on it remains correct when new variants land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BindingTargetKind {
