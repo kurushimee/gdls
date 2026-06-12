@@ -97,6 +97,11 @@ pub struct Workspace {
     /// session default the bare [`Self::analyze`] caller (which has no per-request context)
     /// picks up.
     analyzer_iter_limit: Option<u32>,
+    /// M7 (#57) session-wide checkpoint sleep, mirrored from
+    /// `initializationOptions.analyzer.checkpointDelayUs` — the test/diagnostic governor that
+    /// makes every analyze pass deterministically slow. Same per-call override semantics as
+    /// [`Self::analyzer_iter_limit`]. `None` in production.
+    analyzer_checkpoint_delay: Option<std::time::Duration>,
     /// Per-file stat snapshot used for warm-start cache saves and stat-based reconcile. Keyed by
     /// normalized path (`gd_project::normalize_path`). Populated during warm-load (stat-diff walk)
     /// and after a cold `Index::build` (stat sweep of all interned files). Updated by
@@ -174,6 +179,10 @@ impl Workspace {
             parse_cache: LruCache::new(cap),
             analysis_cache: LruCache::new(cap),
             analyzer_iter_limit: options.analyzer.iter_limit,
+            analyzer_checkpoint_delay: options
+                .analyzer
+                .checkpoint_delay_us
+                .map(std::time::Duration::from_micros),
             stat_table,
         }
     }
@@ -309,6 +318,10 @@ impl Workspace {
         // ultimate fallback when neither this nor `analyzer.iterLimit` is set.
         if options.iter_limit.is_none() {
             options.iter_limit = self.analyzer_iter_limit;
+        }
+        // Same session-default rule for the M7 (#57) checkpoint-sleep governor.
+        if options.checkpoint_delay.is_none() {
+            options.checkpoint_delay = self.analyzer_checkpoint_delay;
         }
         let hash = fingerprint(text);
         // M5 WP-O1: analyze span. The plan's draft field-set is `file, version, ... elapsed_us,

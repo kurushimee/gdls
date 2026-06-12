@@ -55,6 +55,7 @@ func main() -> void:
         AnalyzeOptions {
             iter_limit: Some(5),
             cancellation: None,
+            checkpoint_delay: None,
         },
     );
     assert!(
@@ -152,6 +153,7 @@ func main() -> void:
         AnalyzeOptions {
             iter_limit: None,
             cancellation: Some(&tok),
+            checkpoint_delay: None,
         },
     );
     assert!(
@@ -184,6 +186,7 @@ fn no_cancellation_token_means_no_cancellation_check_overhead() {
         AnalyzeOptions {
             iter_limit: None,
             cancellation: None,
+            checkpoint_delay: None,
         },
     );
     assert!(

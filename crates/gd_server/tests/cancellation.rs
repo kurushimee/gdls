@@ -1,18 +1,15 @@
-//! M5 WP-O4 — end-to-end `$/cancelRequest` wire test against the in-memory server.
-//!
-//! The architecture is single-threaded today (the LSP loop blocks on the current handler until
-//! it returns), so a cancel notification that arrives DURING a handler's run cannot interrupt it
-//! — the cancel sits in the channel buffer until the handler returns and the loop re-enters
-//! `select!`. The mid-flight-interrupt scenario the M5 plan §6B sketches requires either threaded
-//! handlers (out of scope for Phase B) or queue pile-up (multiple requests pending so a cancel
-//! arrives before a later one is dispatched).
+//! `$/cancelRequest` robustness against the in-memory server: the no-op and malformed-input
+//! edges of the wire contract (M5 WP-O4, retained under the M7 #57 router architecture).
 //!
 //! What these tests cover:
 //! - Unknown-id cancel: server warn-logs, doesn't panic, keeps serving.
 //! - Race after response: client sends cancel for an id whose response has already been sent;
 //!   server warn-logs, doesn't double-respond, keeps serving.
-//! - Pre-cancelled-token analyzer bail: tested separately in `gd_analyze/tests/governor.rs`
-//!   (the token mechanism itself doesn't need the full LSP wire to validate).
+//! - Malformed cancel params: dropped without killing the session.
+//!
+//! The preemption behavior itself — cancel-mid-analysis, cancel-while-queued, stale-by-edit
+//! `ContentModified`, shutdown with in-flight work — lives in `tests/concurrent_dispatch.rs`;
+//! the pre-cancelled-token analyzer bail is in `gd_analyze/tests/governor.rs`.
 
 use std::time::Duration;
 

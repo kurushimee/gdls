@@ -79,6 +79,13 @@ pub struct AnalyzerConfig {
     /// operator can dial it down for a debug session (e.g. force-tripping the governor on a
     /// suspected runaway file) or up for an unusually-large bundled feature file.
     pub iter_limit: Option<u32>,
+    /// M7 (#57) test/diagnostic governor: microseconds to sleep at every 256-node analyzer
+    /// checkpoint, making each analyze pass deterministically slow. This is what lets the
+    /// cancellation/staleness wire races be tested over a real session
+    /// (`tests/concurrent_dispatch.rs`) and lets an operator simulate a pathologically slow
+    /// project. `None` (the default — leave it unset in production) costs one branch per
+    /// checkpoint.
+    pub checkpoint_delay_us: Option<u64>,
 }
 
 /// Memory-hardening knobs surfaced through `initializationOptions.memory`. All fields optional;

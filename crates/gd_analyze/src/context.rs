@@ -292,6 +292,10 @@ pub struct AnalysisContext<'a> {
     /// M5 WP-O4: cooperative cancellation token. Read every 256 nodes inside the reducer /
     /// resolver checkpoints. `None` (the default for tests / fuzz) skips the check entirely.
     pub cancellation: Option<&'a CancellationToken>,
+    /// M7 (#57) test governor: sleep this long at every 256-node checkpoint so an analyze pass
+    /// is deterministically slow — what makes the cancellation/staleness wire races testable.
+    /// `None` (default and production) costs one branch per checkpoint gate.
+    pub checkpoint_delay: Option<std::time::Duration>,
     /// Memoized cross-file `extends`-chain resolutions (`crate::script_chain`). One walk per
     /// distinct [`crate::data_type::ScriptRef`] per analysis pass — `is_type_compatible` and the
     /// member walks would otherwise re-resolve the same base chain per argument/identifier.
@@ -360,6 +364,7 @@ impl<'a> AnalysisContext<'a> {
             iter_count: 0,
             iter_limit: 0,
             cancellation: None,
+            checkpoint_delay: None,
             script_chains: std::cell::RefCell::new(FxHashMap::default()),
             decl_ident_ids: std::cell::OnceCell::new(),
             bailed: false,
@@ -392,6 +397,15 @@ impl<'a> AnalysisContext<'a> {
     pub fn checkpoint(&mut self, span: ByteSpan) -> bool {
         if self.bailed {
             return true;
+        }
+        // M7 (#57) test governor: sleep on the same 256-entry gate the cancellation read uses,
+        // BEFORE that read — so a cancel arriving during the sleep is observed at this very
+        // checkpoint and the cancelled run's latency is ~one delay, while an uncancelled run
+        // pays the delay at every gate. Production (`None`) costs one branch here.
+        if let Some(delay) = self.checkpoint_delay {
+            if self.iter_count & 0xFF == 0 {
+                std::thread::sleep(delay);
+            }
         }
         // Cancellation check FIRST so a pre-cancel (token cancelled before analyze even starts)
         // is respected immediately on the first checkpoint — the alternative (bump first, then
