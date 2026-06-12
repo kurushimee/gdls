@@ -1794,13 +1794,20 @@ fn method_scan_candidate_uris(
     out
 }
 
-/// Group a handler's filtered `Binding::Call` stream into `(key, call-site ranges)` pairs,
-/// preserving first-seen order (small N ⇒ linear find). `key_of` derives the grouping key from each
-/// binding (callee identity for `outgoingCalls`, caller name for `incomingCalls`) and returns `None`
-/// to skip a binding (e.g. a future non-`Call` variant). Shared by both callHierarchy handlers.
+/// Group a handler's filtered `Binding::Call` stream into `(key, fromRanges)` pairs, preserving
+/// first-seen order (small N ⇒ linear find). `key_of` derives the grouping key from each binding
+/// (callee identity for `outgoingCalls`, caller name for `incomingCalls`) and returns `None` to
+/// skip a binding (e.g. a future non-`Call` variant). Shared by both callHierarchy handlers.
+///
+/// `callee_spans` (from [`callee_name_token_spans`] over the same file's tree) narrows each
+/// `call_site` — the WHOLE call expression — to its callee name token before mapping, so a
+/// multi-line call contributes a single-identifier-width range. A call with no identifier-shaped
+/// callee (defensive: `super()`, malformed callees) falls back to the full call span rather
+/// than dropping the range.
 fn group_call_ranges<'a, K: PartialEq>(
     bindings: impl Iterator<Item = &'a Binding>,
     mapper: &PositionMapper,
+    callee_spans: &FxHashMap<ByteSpan, ByteSpan>,
     key_of: impl Fn(&Binding) -> Option<K>,
 ) -> Vec<(K, Vec<Range>)> {
     let mut groups: Vec<(K, Vec<Range>)> = Vec::new();
@@ -1811,7 +1818,8 @@ fn group_call_ranges<'a, K: PartialEq>(
         let Binding::Call { call_site, .. } = binding else {
             continue; // key_of only yields Some for Call bindings; defensive for non_exhaustive
         };
-        let range = mapper.span_to_range(*call_site);
+        let token_span = callee_spans.get(call_site).copied().unwrap_or(*call_site);
+        let range = mapper.span_to_range(token_span);
         if let Some((_, ranges)) = groups.iter_mut().find(|(k, _)| *k == key) {
             ranges.push(range);
         } else {
@@ -2304,6 +2312,29 @@ fn callee_ident_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
     map
 }
 
+/// Call-node span → callee NAME-token span, for BOTH callee shapes: subscript-attribute callees
+/// (`l.helper()` → `helper`, via [`callee_ident_spans`]) and bare identifier callees
+/// (`helper()` → `helper`). Used by `prepare_call_hierarchy` to resolve a cursor on a call-site
+/// callee, and by both callHierarchy follow-up handlers to narrow `Binding::Call.call_site` —
+/// the whole call expression — down to the callee token for `fromRanges` (the conventional
+/// "ranges at which the calls appear": rust-analyzer/gopls/clangd all emit the name token).
+fn callee_name_token_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
+    let mut map = callee_ident_spans(tree);
+    for nid in tree.iter_ids() {
+        let node = tree.get(nid);
+        let NodeKind::Call(call) = &node.kind else {
+            continue;
+        };
+        let Some(callee_id) = call.callee else {
+            continue;
+        };
+        if matches!(tree.get(callee_id).kind, NodeKind::Identifier(_)) {
+            map.insert(node.span, tree.get(callee_id).span);
+        }
+    }
+    map
+}
+
 /// Append a [`Location`] for every [`Binding::Call`] in `result.bindings` where
 /// `callee_file == target_file && callee_name == name`, emitting the **narrow callee-identifier
 /// span** derived from the parse tree (via [`callee_ident_span`]).
@@ -2743,22 +2774,6 @@ pub fn prepare_call_hierarchy(
                 // `Binding::Use` there), prepare needs BOTH callee shapes: a bare in-file call
                 // (`_find_attached_meshes()`) records a `Binding::Call` too, and the cursor on
                 // its identifier must prepare that callee rather than the enclosing function.
-                let build_spans = || {
-                    let mut map = callee_ident_spans(&parsed.tree);
-                    for nid in parsed.tree.iter_ids() {
-                        let node = parsed.tree.get(nid);
-                        let NodeKind::Call(call) = &node.kind else {
-                            continue;
-                        };
-                        let Some(callee_id) = call.callee else {
-                            continue;
-                        };
-                        if matches!(parsed.tree.get(callee_id).kind, NodeKind::Identifier(_)) {
-                            map.insert(node.span, parsed.tree.get(callee_id).span);
-                        }
-                    }
-                    map
-                };
                 let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
                 let target = analyzed.bindings().iter().find_map(|b| match b {
                     Binding::Call {
@@ -2767,7 +2782,8 @@ pub fn prepare_call_hierarchy(
                         call_site,
                         ..
                     } if callee_name == &name => {
-                        let spans = spans.get_or_insert_with(build_spans);
+                        let spans =
+                            spans.get_or_insert_with(|| callee_name_token_spans(&parsed.tree));
                         let ident = spans.get(call_site).copied()?;
                         (ident.start <= byte && byte < ident.end).then_some(*f)
                     }
@@ -2983,9 +2999,11 @@ pub fn outgoing_calls(
     // Group calls by (callee_file, callee_name), preserving first-seen order. `find_outgoing_calls`
     // already filtered to Call bindings whose caller matches `fn_name`.
     type CalleeKey = (Option<gd_project::FileId>, String);
+    let callee_spans = callee_name_token_spans(&parsed.tree);
     let groups: Vec<(CalleeKey, Vec<lsp_types::Range>)> = group_call_ranges(
         find_outgoing_calls(&result, fn_name.as_str()),
         &mapper,
+        &callee_spans,
         |b| match b {
             Binding::Call {
                 callee_file,
@@ -3103,9 +3121,11 @@ pub fn incoming_calls(
 
         // Group by caller_function (the synthetic "<top>" for top-level calls). `find_incoming_calls`
         // already filtered to Call bindings whose callee matches (target_fid, target_name).
+        let callee_spans = callee_name_token_spans(&parsed.tree);
         let groups = group_call_ranges(
             find_incoming_calls(&result, target_fid, &target_name),
             &mapper,
+            &callee_spans,
             |b| match b {
                 Binding::Call {
                     caller_function, ..

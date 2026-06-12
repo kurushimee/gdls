@@ -440,10 +440,15 @@ fn call_hierarchy_prepare_and_outgoing_for_attack() {
          not the call site; got {:?}",
         helper_call.to.selection_range
     );
-    // The call site (line 9) belongs in `from_ranges`, not the item range.
+    // The call site (line 9) belongs in `from_ranges`, not the item range — covering exactly
+    // the callee name token: `\thelper()` → `helper` at cols 1..7, not the whole `helper()`
+    // expression (the rust-analyzer/gopls/clangd fromRanges shape).
     assert!(
-        helper_call.from_ranges.iter().any(|r| r.start.line == 9),
-        "the call site (line 9) must be reported as a from_range; got {:?}",
+        helper_call
+            .from_ranges
+            .iter()
+            .any(|r| { r.start == Position::new(9, 1) && r.end == Position::new(9, 7) }),
+        "the call's from_range must cover exactly the `helper` token at (9,1)..(9,7); got {:?}",
         helper_call.from_ranges
     );
 
@@ -739,10 +744,94 @@ fn call_hierarchy_incoming_for_attack() {
         .unwrap_or_else(|| {
             panic!("attack's incoming calls must include the dotted self-caller `combo`; got {incoming:?}")
         });
+    // `\tself.attack()` → the from_range covers exactly the `attack` token at cols 6..12,
+    // not the receiver-to-paren call expression.
     assert!(
-        combo_call.from_ranges.iter().any(|r| r.start.line == 7),
-        "the `self.attack()` call site (line 7) must be reported as a from_range; got {:?}",
+        combo_call
+            .from_ranges
+            .iter()
+            .any(|r| { r.start == Position::new(7, 6) && r.end == Position::new(7, 12) }),
+        "the `self.attack()` from_range must cover exactly `attack` at (7,6)..(7,12); got {:?}",
         combo_call.from_ranges
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The discriminator line-only asserts can't catch: a MULTI-LINE call's `Binding::Call.call_site`
+/// spans from the receiver to the closing paren two lines down. The fromRange must still be the
+/// single-line callee name token — VS Code's peek widget highlights every fromRange and centers
+/// on their union, so a whole-expression range highlights entire blocks.
+#[test]
+fn call_hierarchy_from_ranges_cover_only_callee_token_multiline() {
+    let project = sample_project();
+    //   line 3: func helper(a: int, b: int) -> void:
+    //   line 6: func attack() -> void:
+    //   line 7: \tself.helper(
+    //   line 8: \t\t1,
+    //   line 9: \t\t2)
+    project.write(
+        "src/hero.gd",
+        "class_name Hero\nextends Node2D\n\nfunc helper(a: int, b: int) -> void:\n\tpass\n\n\
+         func attack() -> void:\n\tself.helper(\n\t\t1,\n\t\t2)\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&project, &client, &["src/hero.gd"]);
+
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let prepare = CallHierarchyPrepareParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: hero_uri.clone(),
+            },
+            position: Position {
+                line: 3,
+                character: 7, // mid-"helper" on its declaration
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    client
+        .sender
+        .send(request(75, "textDocument/prepareCallHierarchy", prepare))
+        .unwrap();
+    let resp = recv_response(&client);
+    let items: Option<Vec<CallHierarchyItem>> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let item = items
+        .and_then(|v| v.into_iter().next())
+        .expect("prepare must return helper's item");
+    assert_eq!(item.name, "helper");
+
+    let incoming = CallHierarchyIncomingCallsParams {
+        item: item.clone(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(76, "callHierarchy/incomingCalls", incoming))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "incoming errored: {:?}", resp.error);
+    let incoming: Option<Vec<CallHierarchyIncomingCall>> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let incoming = incoming.unwrap_or_default();
+    let attack_call = incoming
+        .iter()
+        .find(|c| c.from.name == "attack")
+        .unwrap_or_else(|| panic!("helper's incoming must include `attack`; got {incoming:?}"));
+    // `\tself.helper(` … `\t\t2)` — the fromRange is the `helper` token at (7,6)..(7,12),
+    // NOT a range ending on the closing-paren line 9.
+    assert_eq!(
+        attack_call.from_ranges,
+        vec![lsp_types::Range::new(
+            Position::new(7, 6),
+            Position::new(7, 12)
+        )],
+        "a multi-line call must contribute a single-identifier-width fromRange"
     );
 
     shutdown(&client, server_thread);
