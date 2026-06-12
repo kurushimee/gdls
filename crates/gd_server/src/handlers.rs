@@ -290,6 +290,21 @@ pub fn document_link(state: &mut ServerState, params: DocumentLinkParams) -> Vec
 /// converted to a byte through the per-request [`PositionMapper`] (clamped — out-of-range positions
 /// degrade rather than panic) and the [`ParseTree`] picks the smallest containing node with
 /// [`ParseTree::innermost_node_at`].
+/// Build hover contents in the client's negotiated format (M7 #62): markdown as assembled, or
+/// the plaintext downgrade (`docs::markdown_to_plaintext`) when the client prefers plain text.
+fn hover_contents(state: &ServerState, value: String) -> HoverContents {
+    match state.caps.hover_format {
+        crate::docs::ProseFormat::Markdown => HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        crate::docs::ProseFormat::PlainText => HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::PlainText,
+            value: crate::docs::markdown_to_plaintext(&value),
+        }),
+    }
+}
+
 pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     let tdp = params.text_document_position_params;
     let uri = tdp.text_document.uri.clone();
@@ -308,10 +323,7 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     if let Some(preload_md) = hover_preload_string(state, &parsed.tree, node_id) {
         let leaf_node = parsed.tree.get(node_id);
         return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: preload_md,
-            }),
+            contents: hover_contents(state, preload_md),
             range: Some(mapper.span_to_range(leaf_node.span)),
         });
     }
@@ -324,10 +336,7 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     {
         let leaf_node = parsed.tree.get(node_id);
         return Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: decl_md,
-            }),
+            contents: hover_contents(state, decl_md),
             range: Some(mapper.span_to_range(leaf_node.span)),
         });
     }
@@ -373,10 +382,7 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     }
 
     Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: markdown,
-        }),
+        contents: hover_contents(state, markdown),
         range: Some(mapper.span_to_range(leaf_node.span)),
     })
 }
@@ -944,6 +950,14 @@ fn hover_member_signature(
             let mut md = String::from("```gdscript\n");
             md.push_str(&sig);
             md.push_str("\n```");
+            // M7 (#62): the declaring file's `##` doc for this member, BBCode → GFM.
+            if let Some(doc) = &decl.doc {
+                crate::docs::append_doc(
+                    &mut md,
+                    crate::docs::ProseFormat::Markdown,
+                    &doc.description,
+                );
+            }
             Some(md)
         }
         DtKind::Native if !base_dt.native_type.is_empty() => {
@@ -991,10 +1005,11 @@ fn native_member_hover_md(
         gd_types::NativeMember::Signal(s) => s.description.as_str(),
         _ => "",
     };
-    if !desc.is_empty() {
-        md.push_str("\n\n");
-        md.push_str(desc);
-    }
+    // M7 (#62): dump descriptions are BBCode — converted to GFM here at the hover boundary
+    // (anti-catalog W8: raw BBCode never reaches the wire). The body is assembled as markdown
+    // regardless of the client's format; `hover_contents` applies the plaintext downgrade once,
+    // at the response boundary.
+    crate::docs::append_doc(&mut md, crate::docs::ProseFormat::Markdown, desc);
     md
 }
 
@@ -1323,7 +1338,19 @@ fn hover_declaration_signature(
                 sig = format!("{sig} extends \"{p}\"");
             }
         }
-        return Some(format!("```gdscript\n{sig}\n```"));
+        let mut md = format!("```gdscript\n{sig}\n```");
+        // M7 (#62): the inner class's `##` doc (brief, then long form when distinct).
+        if let Some(doc) = tree.docs.class_docs.get(&decl_id) {
+            crate::docs::append_doc(&mut md, crate::docs::ProseFormat::Markdown, &doc.brief);
+            if doc.description != doc.brief {
+                crate::docs::append_doc(
+                    &mut md,
+                    crate::docs::ProseFormat::Markdown,
+                    &doc.description,
+                );
+            }
+        }
+        return Some(md);
     }
 
     // Locate this file's interface scope: the root Interface, descended through `inner` by the
@@ -1350,6 +1377,7 @@ fn hover_declaration_signature(
             .find(|i| i.class_name.as_deref() == Some(class_name))?;
     }
     let member_decl = iface.members.iter().find(|m| m.name == name)?;
+    let member_doc = member_decl.doc.clone();
     let mut sig = format_member_signature(&name, member_decl)?;
 
     // An untyped `var`/`const` whose initializer the analyzer typed reads better with the
@@ -1369,7 +1397,16 @@ fn hover_declaration_signature(
             }
         }
     }
-    Some(format!("```gdscript\n{sig}\n```"))
+    let mut md = format!("```gdscript\n{sig}\n```");
+    // M7 (#62): the member's own `##` doc prose, BBCode → GFM.
+    if let Some(doc) = member_doc {
+        crate::docs::append_doc(
+            &mut md,
+            crate::docs::ProseFormat::Markdown,
+            &doc.description,
+        );
+    }
+    Some(md)
 }
 
 /// A human-readable label for a resolved [`DataType`] — hover must never surface the
@@ -1415,16 +1452,17 @@ fn human_type_label(state: &ServerState, tree: &ParseTree, dt: &gd_analyze::Data
 }
 
 fn append_class_docs(md: &mut String, class: &NativeClass) {
-    if !class.brief_description.is_empty() {
-        md.push_str("\n\n");
-        md.push_str(&class.brief_description);
-    }
+    // M7 (#62): BBCode → GFM at the boundary (see `native_member_hover_md`).
+    crate::docs::append_doc(
+        md,
+        crate::docs::ProseFormat::Markdown,
+        &class.brief_description,
+    );
     // Godot emits `brief_description` and `description` as two distinct strings even when the
     // class has only a short summary; in the with-docs dump they're often equal. Dedupe so the
     // hover doesn't show the same paragraph twice.
-    if !class.description.is_empty() && class.description != class.brief_description {
-        md.push_str("\n\n");
-        md.push_str(&class.description);
+    if class.description != class.brief_description {
+        crate::docs::append_doc(md, crate::docs::ProseFormat::Markdown, &class.description);
     }
 }
 

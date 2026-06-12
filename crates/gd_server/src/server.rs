@@ -88,6 +88,11 @@ pub(crate) struct ClientCaps {
     /// registration gdls performs (docs/09 §7.1): it is the one capability Helix honors only
     /// dynamically, and the spec forbids registering the same capability statically too.
     pub(crate) dynamic_watched_files: bool,
+    /// `textDocument.hover.contentFormat` (M7 #62): the first kind in the client's preference
+    /// order that gdls supports. Absent ⇒ Markdown — see
+    /// [`crate::docs::ProseFormat`] for why that pragmatic default stands until the M7 exit
+    /// harness captures the real editor profiles.
+    pub(crate) hover_format: crate::docs::ProseFormat,
 }
 
 impl ClientCaps {
@@ -122,6 +127,21 @@ impl ClientCaps {
                 .and_then(|w| w.did_change_watched_files.as_ref())
                 .and_then(|d| d.dynamic_registration)
                 .unwrap_or(false),
+            hover_format: td
+                .and_then(|t| t.hover.as_ref())
+                .and_then(|h| h.content_format.as_ref())
+                .and_then(|formats| {
+                    formats.iter().find_map(|f| match f {
+                        f if *f == lsp_types::MarkupKind::Markdown => {
+                            Some(crate::docs::ProseFormat::Markdown)
+                        }
+                        f if *f == lsp_types::MarkupKind::PlainText => {
+                            Some(crate::docs::ProseFormat::PlainText)
+                        }
+                        _ => None,
+                    })
+                })
+                .unwrap_or_default(),
         }
     }
 }
