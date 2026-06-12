@@ -72,6 +72,12 @@ pub(crate) struct ClientCaps {
     /// capabilities carry no codeDescription/tag fields of their own, so the publishDiagnostics
     /// capabilities are the convention for both (rust-analyzer does the same).
     pub(crate) code_description: bool,
+    /// `window.workDoneProgress` — gates every server-initiated progress token (M7 #58). When
+    /// absent, `window/workDoneProgress/create` is never sent (the spec forbids it) and the
+    /// [`crate::progress::ProgressReporter`] is a no-op. Client-token progress (a
+    /// `workDoneToken` inside request params) is independent of this flag — the token's
+    /// presence is its own opt-in.
+    pub(crate) work_done_progress: bool,
 }
 
 impl ClientCaps {
@@ -89,6 +95,11 @@ impl ClientCaps {
             code_description: td
                 .and_then(|t| t.publish_diagnostics.as_ref())
                 .and_then(|p| p.code_description_support)
+                .unwrap_or(false),
+            work_done_progress: caps
+                .window
+                .as_ref()
+                .and_then(|w| w.work_done_progress)
                 .unwrap_or(false),
         }
     }
@@ -304,7 +315,18 @@ fn serve_inner(
     // response is sent, so a large scan never stalls the handshake (WP-F: start inline). The
     // load itself never spawns Godot (issue #25): it resolves the best CURRENTLY-available
     // native source (cached dump → root file → embedded stock → empty) and serves on that.
-    let workspace = Workspace::load(&root, &options);
+    //
+    // M7 (#58): one progress token spans the whole cold start (load → startup reconcile) — a
+    // single spinner arc in the client. Created before the load so the create + begin are on
+    // the wire while the long walk runs; the router (already spawned) consumes the create's
+    // response, including an error reply that poisons the reporter.
+    let mut startup_progress = crate::progress::ProgressReporter::server_initiated(
+        connection.sender.clone(),
+        &shared,
+        caps.work_done_progress,
+    );
+    startup_progress.begin("Indexing project", None);
+    let workspace = Workspace::load_with_progress(&root, &options, &mut startup_progress);
     // Kick the auto-dump off on a background thread when the cache is stale/missing — the dump
     // (a full Godot boot; up to a 5 min timeout when the binary wedges) must never sit between
     // `initialize` and the first served request. Its completion is a select! arm below: adopt,
@@ -350,7 +372,10 @@ fn serve_inner(
     } else {
         crate::workspace::ReconcileMode::FullStat
     };
-    let report = state.workspace.reconcile_with(reconcile_mode, &open_paths);
+    let report =
+        state
+            .workspace
+            .reconcile_with_progress(reconcile_mode, &open_paths, &mut startup_progress);
     // M5 WP-O1 — preserved verbatim marker (operators & log-greppers depend on this exact label).
     // The reconcile span has already closed at this point (it lives inside Workspace::reconcile),
     // so this event arrives at root scope and stands alone in the trace — exactly the way it
@@ -366,6 +391,11 @@ fn serve_inner(
     // Persist the settled index to the warm-start cache (fire-and-forget; never errors).
     // Called AFTER build + reconcile so the cache reflects a consistent, post-reconcile state.
     state.workspace.save_cache();
+    startup_progress.end(Some(&format!(
+        "indexed {} scripts",
+        state.workspace.index.file_count()
+    )));
+    drop(startup_progress);
 
     // --- Event loop: select! over LSP receiver + the watcher receiver + a liveness ticker. The
     // watcher arm is disabled when `watcher_rx` is None: `unwrap_or(&dummy)` returns the
@@ -406,6 +436,9 @@ fn serve_inner(
                              reloading + republishing open buffers"
                         );
                         if state.workspace.reload_native(&state.options) {
+                            // Begun only on a REAL adoption — a no-op echo must not flash a
+                            // spinner. The republish below is the user-visible bulk anyway.
+                            let _progress = server_progress(&state, "Reloading Godot API");
                             republish_all_open_buffers(&mut state);
                             // The warm-start cache key includes the native DB; re-save so the
                             // NEXT session warm-loads instead of cold-indexing on key mismatch.
@@ -569,7 +602,12 @@ fn serve_inner(
                     if disabled_reconcile_ticks >= 20 {
                         disabled_reconcile_ticks = 0;
                         let open_paths = open_buffer_paths(&state);
-                        let report = state.workspace.reconcile(&open_paths);
+                        let mut progress = server_progress(&state, "Reconciling project");
+                        let report = state.workspace.reconcile_with_progress(
+                            crate::workspace::ReconcileMode::FullStat,
+                            &open_paths,
+                            &mut progress,
+                        );
                         tracing::info!(
                             "watcher_disabled_reconcile added={} modified={} removed={} walked={}",
                             report.added,
@@ -760,6 +798,19 @@ pub(crate) fn react_to_memory_pressure(state: &mut ServerState) {
     }
 }
 
+/// M7 (#58): a begun server-initiated progress reporter for a mid-session phase (re-index,
+/// reconcile). No-op without `window.workDoneProgress`. The caller reports into it and either
+/// ends it with a summary or lets the drop guard close the arc.
+fn server_progress(state: &ServerState, title: &str) -> crate::progress::ProgressReporter {
+    let mut reporter = crate::progress::ProgressReporter::server_initiated(
+        state.sender.clone(),
+        &state.shared,
+        state.caps.work_done_progress,
+    );
+    reporter.begin(title, None);
+    reporter
+}
+
 // ---------------------------------------------------------------------------
 // Watcher event dispatch (WP-W3).
 // ---------------------------------------------------------------------------
@@ -775,7 +826,12 @@ fn handle_watcher(state: &mut ServerState, events: Vec<DebouncedEvent>) {
     let open_paths = open_buffer_paths(state);
     if events.iter().any(|e| e.need_rescan()) {
         log::info!("watcher: need_rescan set; running reconciliation");
-        let report = state.workspace.reconcile(&open_paths);
+        let mut progress = server_progress(state, "Reconciling project");
+        let report = state.workspace.reconcile_with_progress(
+            crate::workspace::ReconcileMode::FullStat,
+            &open_paths,
+            &mut progress,
+        );
         // M5 WP-O1 — preserved verbatim marker (operators & log-greppers depend on this exact
         // label). Migrated to tracing::info! so the watcher-overflow path lights up the same
         // way the cold-start path does in any structured trace consumer.
@@ -824,6 +880,7 @@ fn handle_watcher(state: &mut ServerState, events: Vec<DebouncedEvent>) {
             "watcher: project.godot / GDExtension surface changed; reloading project model + \
              native DB (coalesced once for the batch)"
         );
+        let _progress = server_progress(state, "Reloading Godot API");
         state.workspace.reload_project_and_native(&state.options);
         republish_all_open_buffers(state);
     } else if native_changed {
@@ -834,6 +891,9 @@ fn handle_watcher(state: &mut ServerState, events: Vec<DebouncedEvent>) {
         // mid-write dump (kept prior) or the post-adoption echo (identical content) must not
         // re-analyze every open buffer for nothing.
         if state.workspace.reload_native(&state.options) {
+            // Begun only on a REAL change — a torn-read keep or post-adoption echo must not
+            // flash a spinner. The republish below is the user-visible bulk anyway.
+            let _progress = server_progress(state, "Reloading Godot API");
             republish_all_open_buffers(state);
             // The warm-start cache key includes the native DB — re-save so the next session
             // warm-loads against the new key. (The background-dump completion arm does the
@@ -1142,9 +1202,20 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
             TextDocumentSyncKind::INCREMENTAL,
         )),
         document_symbol_provider: Some(OneOf::Left(true)),
-        workspace_symbol_provider: Some(OneOf::Left(true)),
+        // M7 (#58): the two genuinely long requests advertise workDoneProgress so clients send a
+        // workDoneToken in their params; the other providers stay bare booleans.
+        workspace_symbol_provider: Some(OneOf::Right(lsp_types::WorkspaceSymbolOptions {
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+                work_done_progress: Some(true),
+            },
+            resolve_provider: None,
+        })),
         definition_provider: Some(OneOf::Left(true)),
-        references_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Right(lsp_types::ReferencesOptions {
+            work_done_progress_options: lsp_types::WorkDoneProgressOptions {
+                work_done_progress: Some(true),
+            },
+        })),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),

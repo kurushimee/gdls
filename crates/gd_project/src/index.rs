@@ -147,6 +147,14 @@ impl Index {
     /// a single subdir would otherwise quietly halve the project. Persistent breakage shows up on
     /// the operator's stderr at default log level.
     pub fn build(root: &Utf8Path) -> Self {
+        Self::build_with_progress(root, &mut |_, _| {})
+    }
+
+    /// [`Self::build`] invoking `progress(files_done, files_total)` after each file of the
+    /// parse walk, so the caller can surface cold-index progress (M7 #58 — the LSP layer
+    /// adapts this to `$/progress`; `gd_project` stays free of protocol types). The total is
+    /// known up front (the walk enumerates before parsing), so percentage rendering is exact.
+    pub fn build_with_progress(root: &Utf8Path, progress: &mut dyn FnMut(usize, usize)) -> Self {
         let mut idx = Index::new(root.to_path_buf());
         let scan = gd_files(root);
         if scan.walk_errors > 0 || scan.skipped_non_utf8 > 0 {
@@ -158,7 +166,8 @@ impl Index {
             );
         }
         let mut skipped_unreadable = 0usize;
-        for path in scan.files {
+        let total = scan.files.len();
+        for (done, path) in scan.files.into_iter().enumerate() {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
                     idx.set_interface_from_tree(&path, &gd_syntax::parse(&text).tree);
@@ -170,6 +179,7 @@ impl Index {
                     log::warn!("cold index: skipping unreadable {path}: {e}");
                 }
             }
+            progress(done + 1, total);
         }
         if skipped_unreadable > 0 {
             log::warn!(
