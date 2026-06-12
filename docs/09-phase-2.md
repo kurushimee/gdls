@@ -73,7 +73,7 @@ client must specially handle today, and that a generic gdls client must never ne
 | W11 | `declaration` on a native symbol can open the doc page **inside the Godot editor and steal OS window focus** (`gdscript_text_document.cpp:463-467`) | Responses never have engine/editor side effects. |
 | W12 | `didSave` hot-reloads the script into a running game; `willSaveWaitUntil` clears editor caches instead of returning edits (`gdscript_text_document.cpp:77-118`) | Document sync mutates server state only. |
 | W13 | Advertises Full sync but applies only the **last** content change; unknown `languageId`s are silently dropped; stale diagnostics never cleared on close (`gdscript_language_protocol.cpp:433-496`) | Incremental sync applied exactly (shipped); diagnostics cleared on `didClose` (shipped). |
-| W14 | Diagnostic ranges are whole trimmed lines; `code: -1`; warning names prefixed into the message text (`gdscript_workspace.cpp:578-593`) | Exact source ranges, string `code` = warning name, `tags`/`relatedInformation`/`codeDescription` as metadata (shipped through v1.0.5; `codeDescription` lands M7). |
+| W14 | Diagnostic ranges are whole trimmed lines; `code: -1`; warning names prefixed into the message text (`gdscript_workspace.cpp:578-593`) | Exact source ranges, string `code` = warning name, `tags`/`relatedInformation`/`codeDescription` as metadata (all shipped; per-code `codeDescription` anchors landed in M7 #63). |
 | W15 | Advertised-but-broken capabilities (`documentOnTypeFormattingProvider`, `executeCommandProvider: {commands: []}` → `-32601`) and implemented-but-unadvertised stubs (`foldingRange`/`codeLens`/`colorPresentation` return `[]` while advertised `false`) (`godot_lsp.h:1720-1880`) | Advertise **exactly** what is implemented, nothing else. |
 | W16 | Per-request whole-project text grep + reparse for `references`/`rename`; completion `instantiate()`s the owning PackedScene per request (`gdscript_workspace.cpp:433-487,621-677`) | Index-backed queries; scene knowledge comes from parsing `.tscn` **text** (M11), never engine instantiation. |
 | W17 | Behavior silently varies with editor settings (`use_single_quotes` rewrites completion text, `add_type_hints`, indent size, smart-resolve) | All behavior from `initializationOptions`/`workspace/configuration` with documented defaults. |
@@ -111,16 +111,16 @@ relevant 3.18) appears exactly once.
 | Capability | Disposition | Notes |
 |---|---|---|
 | didOpen/didChange/didClose/didSave (incremental) | ✅ | |
-| publishDiagnostics (push) | ✅ | Tags + relatedInformation gated; `codeDescription` → M7 |
+| publishDiagnostics (push) | ✅ | Tags + relatedInformation + `codeDescription` gated (M7 #63: per-code ProjectSettings anchors) |
 | hover · definition · references · implementation · documentSymbol · workspace/symbol · callHierarchy · documentLink · positionEncoding | ✅ | v1 surface, convention-audited in v1.0.5 |
-| `$/cancelRequest` → true preemption | **M7** | Today: post-hoc `RequestCancelled`. M7: concurrent dispatch, cooperative checkpoints, `ContentModified` for stale results |
-| workDoneProgress (`window/workDoneProgress/create` + `$/progress`) | **M7** | Cold index / warm-start / reconcile progress |
-| workspace/didChangeConfiguration + workspace/configuration | **M7** | Runtime re-config of the `initializationOptions` schema |
-| workspace/didChangeWatchedFiles (dynamic registration) | **M7** | The only dynamic registration gdls performs; Helix's only watch path. Client events merge with the native watcher |
-| Pull diagnostics: `textDocument/diagnostic` | **M7** | Same per-file computation as push; `DiagnosticServerCapabilities` advertised; unchanged-report via result-id |
-| `##` doc-comments + BBCode→Markdown pipeline | **M7** | §7.2; feeds hover now, completion/signatureHelp in M8 |
-| Diagnostic `codeDescription.href` | **M7** | Links each warning code to Godot's warning docs |
-| `window/showMessage` / `logMessage` conventions | **M7** | Audit: startup/config warnings as `showMessage(Warning)` where useful, never log-spam |
+| `$/cancelRequest` → true preemption | ✅ M7 | Router thread + cooperative checkpoints (#57); stale-by-edit → `ContentModified` |
+| workDoneProgress (`window/workDoneProgress/create` + `$/progress`) | ✅ M7 | Cold index / warm-start / reconcile / re-index progress + client tokens on references/workspace-symbol (#58) |
+| workspace/didChangeConfiguration + workspace/configuration | ✅ M7 | Runtime re-config; sparse payloads keep absent groups; structural fields warn + retain (#59) |
+| workspace/didChangeWatchedFiles (dynamic registration) | ✅ M7 | The only dynamic registration gdls performs; Helix's only watch path. Client events merge with the native watcher; duplicate delivery deduped by content fingerprint (#60) |
+| Pull diagnostics: `textDocument/diagnostic` | ✅ M7 | Same per-file computation as push (items byte-identical); unchanged via `version:hash:epoch:generation` resultId (#61) |
+| `##` doc-comments + BBCode→Markdown pipeline | ✅ M7 | §7.2; feeds hover now, completion/signatureHelp in M8 (#62; ratchets untouched) |
+| Diagnostic `codeDescription.href` | ✅ M7 | Capability-gated; per-code ProjectSettings anchors, deprecated trio → overview page (#63) |
+| `window/showMessage` / `logMessage` conventions | ✅ M7 | Malformed runtime config surfaces as `showMessage(Warning)` (#59); startup diagnostics stay stderr logs by design (never log-spam) |
 | textDocument/completion + completionItem/resolve | **M8** | The single biggest gap; conventions in §6-M8 |
 | textDocument/signatureHelp | **M8** | Triggers `(` `,`; retrigger `)`; labelOffset-gated |
 | textDocument/rename + prepareRename | **M9** | `documentChanges` + versioned edits; `{range, placeholder}` prepare |

@@ -155,7 +155,10 @@ def main():
         init_params = {
             "processId": os.getpid(),
             "rootUri": path_to_uri(root) if root else None,
-            "capabilities": {"textDocument": {}, "workspace": {}},
+            # M7 §7.4: a vendored editor profile (tests/fixtures/client_caps/*.json) can be
+            # replayed against a real binary via the session file's "capabilities" key; the
+            # bare default keeps the historical capability-less walk.
+            "capabilities": session.get("capabilities", {"textDocument": {}, "workspace": {}}),
             "initializationOptions": init_options,
         }
         send_frame(stdin, {"jsonrpc": "2.0", "id": init_id, "method": "initialize", "params": init_params})
