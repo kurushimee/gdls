@@ -1,30 +1,23 @@
-//! M5 WP-O4 — server-side `$/cancelRequest` plumbing.
+//! Server-side `$/cancelRequest` plumbing (M5 WP-O4, made preemptive by M7 #57).
 //!
 //! The cancellation primitive is [`gd_analyze::CancellationToken`] (re-exported here for the
 //! server's convenience): a clone-cheap `Arc<AtomicBool>` wrapper. The analyzer's
-//! [`gd_analyze::AnalyzeOptions::cancellation`] field references it; the LSP server's
-//! [`crate::server::ServerState`] owns a per-request token map so the
-//! `$/cancelRequest` notification arm can flip the token for an in-flight request.
+//! [`gd_analyze::AnalyzeOptions::cancellation`] field references it; one token lives inside each
+//! [`crate::router::RequestLifecycle`] in the session's shared in-flight registry, where both
+//! the `$/cancelRequest` path and the stale-by-edit sweep flip it for an in-flight request.
 //!
-//! Wire model — synchronous LSP loop today:
-//! - On every request the [`dispatch_request`](crate::server) function allocates a fresh token,
-//!   inserts it in `state.pending_requests[id]`, dispatches the handler, removes the entry on
-//!   completion, and — when the token has been flipped — replaces the handler's response with a
-//!   [`REQUEST_CANCELLED`] error per LSP 3.17.
-//! - The `$/cancelRequest` notification arm in [`crate::server::dispatch_notification`] looks
-//!   up `state.pending_requests[id]` and calls [`CancellationToken::cancel`]. Unknown ids are
-//!   warn-logged (LSP spec: a cancel for a non-existent id is a no-op).
+//! Wire model — router thread + synchronous worker loop (`crate::router` module doc):
+//! - The router registers every request's lifecycle as it is read off the wire and flips its
+//!   token the moment a `$/cancelRequest` (or a content-mutating notification) arrives — even
+//!   while a handler is mid-run on the worker. The analyzer's
+//!   [`gd_analyze::AnalysisContext::checkpoint`] sees the flip on its 256-node gate and bails.
+//! - The worker's `dispatch_request` reads the interrupt verdict before dispatch (queued
+//!   requests answer without running) and again at completion, replacing the handler's response
+//!   with a [`REQUEST_CANCELLED`] error per LSP 3.17. Unknown ids are warn-logged (LSP spec: a
+//!   cancel for a non-existent id is a no-op).
 //!
-//! Architectural caveat: the LSP main loop is single-threaded today. A cancel notification that
-//! arrives during a handler's run does NOT interrupt that handler; it sits in the channel
-//! buffer until the handler returns and the loop re-enters `select!`. By that point the
-//! handler has already completed. Effective cancellation in this model requires either (a)
-//! queue pile-up — multiple requests pending, cancel arrives for a not-yet-dispatched one —
-//! or (b) the handler itself periodically polls the token while looping (which the analyzer
-//! does via [`gd_analyze::AnalysisContext::checkpoint`], so a slow per-file analyze IS
-//! interruptible if a future architecture moves the analyzer onto a worker thread).
-//!
-//! The LSP 3.17 `code` for cancelled requests is `-32800` ([`REQUEST_CANCELLED`]).
+//! The LSP 3.17 `code` for cancelled requests is `-32800` ([`REQUEST_CANCELLED`]); a result
+//! invalidated by an intervening edit instead returns `ContentModified` (-32801).
 
 pub use gd_analyze::CancellationToken;
 

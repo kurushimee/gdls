@@ -1,6 +1,7 @@
 //! The LSP server: lifecycle handshake, capability advertisement, and the synchronous event loop
 //! that dispatches requests and notifications (`docs/05-lsp-cc-integration.md`).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -25,6 +26,7 @@ use crate::handlers;
 use crate::memory::{Bytes, MemoryBudget};
 use crate::observability::{MemoryPressure, RssSampler};
 use crate::position::{PositionEncoding, PositionMapper};
+use crate::router::{Interrupt, RequestLifecycle, SessionShared};
 use crate::uri::{uri_to_path, CanonicalKey};
 use crate::vfs::Vfs;
 use crate::watcher::{self, FileChange, FileWatcher, Reaction};
@@ -37,6 +39,9 @@ use rustc_hash::FxHashMap;
 // JSON-RPC error codes (LSP uses the JSON-RPC reserved range).
 const ERR_METHOD_NOT_FOUND: i32 = -32601;
 const ERR_INVALID_PARAMS: i32 = -32602;
+/// JSON-RPC `InvalidRequest` (-32600) — returned for requests received after `shutdown`,
+/// per LSP 3.17 §shutdown.
+const ERR_INVALID_REQUEST: i32 = -32600;
 /// LSP 3.17 `ContentModified` (-32801). Used by the WP-H1 Hard-pressure gate as "the server is
 /// intentionally not answering"; per the spec it signals the client to retry — exactly the
 /// behavior we want once peak RSS drops back below Hard.
@@ -106,14 +111,13 @@ pub struct ServerState {
     /// [`RssSampler::peak`] and by the WP-H1 pressure ladder via [`RssSampler::pressure`]'s
     /// rolling window.
     pub(crate) rss: RssSampler,
-    /// M5 WP-O4: per-request cancellation tokens. The [`dispatch_request`] handler
-    /// inserts a fresh token here keyed by the LSP request id BEFORE invoking the handler, and
-    /// removes it once the handler returns. The `$/cancelRequest` notification arm in
-    /// [`dispatch_notification`] looks up the id and calls
-    /// [`CancellationToken::cancel`] on the token; the handler's analyzer pass sees the flip on
-    /// its next checkpoint (every 256 nodes) and bails with a synthetic diagnostic. A cancel
-    /// for an id NOT in this map is a warn-log no-op (LSP 3.17 spec: unknown id is allowed).
-    pub(crate) pending_requests: FxHashMap<RequestId, CancellationToken>,
+    /// M7 (#57): the request-lifecycle registry shared with the router thread. The router
+    /// registers every forwarded request and flips cancel/stale flags as control messages
+    /// arrive; [`dispatch_request`] reads the verdict at its entry (queued-interrupt
+    /// short-circuit) and at its exit (the [`crate::router::SessionShared::finish`]
+    /// linearization point). A cancel for an id NOT in the registry is a warn-log no-op
+    /// (LSP 3.17 spec: unknown id is allowed).
+    pub(crate) shared: Arc<SessionShared>,
     /// M5 WP-O4: the token for the currently-dispatching request. Handler code that wants to
     /// thread cancellation to [`Workspace::analyze_with_options`] reads this. Cloned before
     /// the borrow on `state.workspace` to avoid an aliasing borrow. `Some` only while inside
@@ -218,6 +222,16 @@ fn serve_inner(
         options.strict.profile
     );
 
+    // M7 (#57): split the wire into router + worker (see `crate::router`). Spawned strictly
+    // AFTER `initialize_finish` — the handshake above read `connection.receiver` directly, and
+    // from here on the router is its only consumer; this thread reads the forwarded stream.
+    // Spawning before the (potentially long) workspace load below means `$/cancelRequest` and
+    // content mutations take effect even for requests that queue up while the cold index builds.
+    let shared = Arc::new(SessionShared::default());
+    let (forward_tx, forward_rx) = crossbeam_channel::unbounded::<Message>();
+    let router =
+        crate::router::spawn_router(connection.receiver.clone(), forward_tx, Arc::clone(&shared));
+
     // M5 WP-O2: construct the RSS sampler BEFORE `Workspace::load` so its baseline reading is
     // taken at the server-start memory floor — before the cold-index walk allocates the parse +
     // analysis caches + interface index. Emit the baseline as the first `peak_rss_bytes` event so
@@ -303,7 +317,7 @@ fn serve_inner(
         sender: connection.sender.clone(),
         recorder,
         rss,
-        pending_requests: FxHashMap::default(),
+        shared: Arc::clone(&shared),
         current_token: None,
         budget,
         memory_pressure: MemoryPressure::Normal,
@@ -364,6 +378,9 @@ fn serve_inner(
     // down (MaxFilesWatch / root-loss), the index would otherwise freeze until restart; this counts
     // 3-second ticks so a low-frequency reconcile fallback can re-sync on-disk drift.
     let mut disabled_reconcile_ticks: u32 = 0;
+    // M7 (#57): set by the `shutdown` request; requests received after it answer InvalidRequest
+    // (-32600) per LSP 3.17 until the `exit` notification breaks the loop.
+    let mut shutting_down = false;
 
     loop {
         let watcher_arm = watcher_rx.as_ref().unwrap_or(&dummy);
@@ -393,20 +410,35 @@ fn serve_inner(
                     }
                 }
             },
-            recv(connection.receiver) -> msg => match msg {
+            recv(forward_rx) -> msg => match msg {
                 Ok(Message::Request(req)) => {
                     // WP-P3: record before dispatch so a panicking handler still leaves the
                     // request in the trace (the artifact is the only way to reproduce the panic).
                     if let Some(rec) = state.recorder.as_mut() {
                         rec.record_request(&req);
                     }
-                    if connection.handle_shutdown(&req)? {
-                        break;
-                    }
-                    let resp = dispatch_request(&mut state, req);
+                    // M7 (#57): lsp-server's `Connection::handle_shutdown` is unusable here —
+                    // it recv()s on `connection.receiver` waiting for `exit`, which the router
+                    // now consumes (a guaranteed 30 s hang per shutdown). Spec-equivalent
+                    // handling inline: answer `shutdown` with null and keep looping until the
+                    // `exit` notification breaks the loop.
+                    let resp = if req.method == "shutdown" {
+                        shutting_down = true;
+                        Response::new_ok(req.id, serde_json::Value::Null)
+                    } else if shutting_down {
+                        // Deregister the lifecycle the router opened for it, then refuse.
+                        let _ = state.shared.finish(&req.id);
+                        Response::new_err(
+                            req.id,
+                            ERR_INVALID_REQUEST,
+                            "request received after shutdown".to_string(),
+                        )
+                    } else {
+                        dispatch_request(&mut state, req)
+                    };
                     if let Err(e) = state.sender.send(Message::Response(resp)) {
                         // Send only errors when the receiver is closed. The next select! tick
-                        // will hit the Err(_) arm on the connection.receiver and break.
+                        // will hit the Err(_) arm on the forwarded stream and break.
                         // Once-per-session event; warn so production logs surface it.
                         log::warn!(
                             "response send failed (client likely disconnected): {e}; \
@@ -423,8 +455,8 @@ fn serve_inner(
                     }
                     dispatch_notification(&mut state, note);
                 }
-                Ok(Message::Response(_)) => {} // the server issues no client-bound requests in M0
-                Err(_) => break, // LSP channel closed — peer hung up
+                Ok(Message::Response(_)) => {} // server-initiated request responses: correlated from M7 PR2 on
+                Err(_) => break, // router hung up — connection closed or `exit` already forwarded
             },
             recv(watcher_arm) -> result => match result {
                 Ok(Ok(events)) => handle_watcher(&mut state, events),
@@ -571,6 +603,12 @@ fn serve_inner(
         if let Err(e) = rec.flush(buffers) {
             log::warn!("bench recorder flush failed: {e}");
         }
+    }
+    // M7 (#57): the router has already exited on every path that breaks the loop above (it
+    // forwarded `exit` and broke, or the connection disconnected and ended its iterator) — this
+    // join only reaps the thread, it cannot hang.
+    if router.join().is_err() {
+        log::warn!("router thread panicked during shutdown; session was already ending");
     }
     Ok(())
 }
@@ -1190,17 +1228,30 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
     // this fn's bindings (a `macro_rules!` defined inside a fn can name its locals); only one match
     // arm ever runs, so the single-use moves of `params` and `id` are sound — same as the prior
     // hand-expanded arms.
-    // M5 WP-O4 cancellation plumbing: allocate one token per request, register it in
-    // `pending_requests` so a `$/cancelRequest` notification can find it, stash it in
-    // `current_token` so handlers can read it without extra plumbing, then on handler return
-    // unregister + check whether the token was tripped during the handler's run. A tripped
-    // token replaces the handler's response with a RequestCancelled error response (LSP 3.17).
-    let req_id_for_cancel = id.clone();
-    let token = CancellationToken::new();
-    state
-        .pending_requests
-        .insert(req_id_for_cancel.clone(), token.clone());
-    state.current_token = Some(token.clone());
+    // M7 (#57) interrupt plumbing: look up (or, with no router in front, register) the request's
+    // lifecycle, stash its analyzer token in `current_token` so handlers can read it without
+    // extra plumbing, then on handler return deregister + read the interrupt verdict. A tripped
+    // lifecycle replaces the handler's response with the matching error response (LSP 3.17):
+    // RequestCancelled (-32800) for a client cancel, ContentModified (-32801) for a result
+    // invalidated by an intervening edit.
+    let req_id = id.clone();
+    let lifecycle = state.shared.lifecycle(&req_id);
+    // Queued-interrupt short-circuit: the router registered this request when it was read off
+    // the wire, so a cancel (or a content mutation) that landed while it sat in the forward
+    // queue is already recorded — answer without running the handler. The client's retry, which
+    // arrives after the mutation in wire order, runs against the new text.
+    if let Some(interrupt) = lifecycle.interrupt() {
+        let _ = state.shared.finish(&req_id);
+        tracing::info!(
+            target: "cancel",
+            id = %req_id,
+            method = %method,
+            interrupt = ?interrupt,
+            "request short-circuited before dispatch"
+        );
+        return interrupt_response(interrupt, req_id);
+    }
+    state.current_token = Some(lifecycle.token());
     macro_rules! handle {
         ($h:path) => {{
             let _start = std::time::Instant::now();
@@ -1241,19 +1292,22 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {
         // Re-record the request as cancelled-cum-shed so the per-handler trace still shows the
         // refused request rather than a silent drop. Cleanup is the same as the bottom of the fn
-        // (unregister token, clear current_token), so jump straight to the end via early return.
+        // (deregister via `finish_request`, clear current_token), so jump straight to the end
+        // via early return.
         state.current_token = None;
-        state.pending_requests.remove(&req_id_for_cancel);
         tracing::warn!(
             target: "shed",
-            id = %req_id_for_cancel,
+            id = %req_id,
             method = %method,
             "request shed at Hard memory pressure",
         );
-        return Response::new_err(
-            req_id_for_cancel,
-            ERR_CONTENT_MODIFIED,
-            "server is shedding requests under memory pressure; please retry".to_string(),
+        return finish_request(
+            &state.shared,
+            Response::new_err(
+                req_id,
+                ERR_CONTENT_MODIFIED,
+                "server is shedding requests under memory pressure; please retry".to_string(),
+            ),
         );
     }
     let resp = match method.as_str() {
@@ -1275,32 +1329,48 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             format!("unhandled method: {method}"),
         ),
     };
-    // M5 WP-O4 — unregister the per-request token and, if the token was tripped during the
-    // handler's run, replace the (potentially partial) response with a RequestCancelled error.
+    // M7 (#57) — deregister the request and, if its lifecycle was interrupted during the
+    // handler's run, replace the (potentially partial) response with the matching error.
     // The LSP 3.17 spec lets a cancelled request return either a partial result or this error;
-    // for v1 we always use the error response so a client that respects RequestCancelled doesn't
-    // have to special-case which results may be partial. The `cancellation::CancellationToken`
-    // already pushed `analyzer: request cancelled` into the analyzer's diagnostic stream — the
-    // operator-visible breadcrumb of when the cancel landed.
+    // we always use the error response so a client that respects RequestCancelled doesn't
+    // have to special-case which results may be partial. The lifecycle's token already pushed
+    // `analyzer: request cancelled` into the analyzer's diagnostic stream — the
+    // operator-visible breadcrumb of when the interrupt landed (the partial result it tagged
+    // is discarded along with the rest of the response, and `Workspace::analyze_with_options`
+    // never caches a bailed result).
     state.current_token = None;
-    state.pending_requests.remove(&req_id_for_cancel);
-    apply_cancellation_gate(&token, req_id_for_cancel, resp)
+    finish_request(&state.shared, resp)
 }
 
-/// WP-O4 cancellation gate: if the per-request `token` was tripped during the handler's run,
-/// replace its (possibly partial) response with a `RequestCancelled` (-32800) error per LSP 3.17;
-/// otherwise pass the response through. Extracted from [`dispatch_request`] so the gate is
-/// unit-testable without the mid-flight wire interrupt the single-threaded loop can't produce.
-fn apply_cancellation_gate(
-    token: &CancellationToken,
-    id: lsp_server::RequestId,
-    resp: Response,
-) -> Response {
-    if token.is_cancelled() {
-        tracing::info!(target: "cancel", id = %id, "request_cancelled");
-        Response::new_err(id, REQUEST_CANCELLED, "request cancelled".to_string())
-    } else {
-        resp
+/// M7 (#57) interrupt gate: deregister the response's request from the in-flight registry —
+/// the removal under the registry lock is the staleness linearization point (`crate::router`
+/// module doc) — and, when the lifecycle was interrupted, replace the (possibly partial)
+/// response with the matching LSP 3.17 error. A response whose id was never registered (e.g.
+/// a lifecycle already consumed by the queued-interrupt short-circuit) passes through.
+fn finish_request(shared: &SessionShared, resp: Response) -> Response {
+    let lifecycle = shared.finish(&resp.id);
+    match lifecycle.as_deref().and_then(RequestLifecycle::interrupt) {
+        Some(interrupt) => {
+            tracing::info!(target: "cancel", id = %resp.id, interrupt = ?interrupt, "request interrupted");
+            interrupt_response(interrupt, resp.id)
+        }
+        None => resp,
+    }
+}
+
+/// Project an [`Interrupt`] verdict into its LSP 3.17 error response: `Cancelled` →
+/// `RequestCancelled` (-32800), `Stale` → `ContentModified` (-32801; the client retries against
+/// the new content).
+fn interrupt_response(interrupt: Interrupt, id: RequestId) -> Response {
+    match interrupt {
+        Interrupt::Cancelled => {
+            Response::new_err(id, REQUEST_CANCELLED, "request cancelled".to_string())
+        }
+        Interrupt::Stale => Response::new_err(
+            id,
+            ERR_CONTENT_MODIFIED,
+            "content modified during request; please retry".to_string(),
+        ),
     }
 }
 
@@ -1396,45 +1466,20 @@ fn dispatch_notification(state: &mut ServerState, note: Notification) {
             }
         }
         "$/cancelRequest" => {
-            // M5 WP-O4: client retracting an in-flight (or queued) request. Look up the
-            // matching token in `state.pending_requests` and call `.cancel()`; the next
-            // `AnalysisContext::checkpoint` inside the handler's analyze sees the flip on its
-            // 256-node gate and bails. If the id is not in the map, this is either a stale
-            // cancel (the response was already sent — race condition, spec-allowed no-op) or a
-            // typo from a non-conforming client; warn-log so the operator sees the breadcrumb.
-            match parse_params::<CancelParams>(&method, params) {
-                Ok(p) => {
-                    let id = request_id_from_number_or_string(p.id);
-                    match state.pending_requests.get(&id) {
-                        Some(tok) => {
-                            tok.cancel();
-                            tracing::info!(target: "cancel", id = %id, "cancel_requested");
-                        }
-                        None => log::warn!(
-                            "$/cancelRequest for {id:?}: no in-flight request with that id; \
-                             ignoring (LSP 3.17 §$/cancelRequest: unknown ids are allowed)"
-                        ),
-                    }
-                }
-                Err(()) => log::warn!(
-                    "dropped a $/cancelRequest — params failed to parse; in-flight requests \
-                     will run to completion"
-                ),
+            // M7 (#57): the router already flipped the matching lifecycle the moment this
+            // notification came off the wire (that immediacy IS the preemption — see
+            // `crate::router`); by the time the forwarded copy reaches this arm the request has
+            // often already been answered and deregistered. Re-cancel idempotently as a
+            // belt-and-suspenders backstop, at debug level — the router owns the operator-facing
+            // logging (cancel_requested trace / unknown-id warn).
+            if let Ok(p) = parse_params::<CancelParams>(&method, params) {
+                let id = crate::router::request_id_from_number_or_string(p.id);
+                let found = state.shared.cancel(&id);
+                log::debug!("$/cancelRequest for {id:?} reached the worker (in-flight: {found})");
             }
         }
         "initialized" => log::info!("client reported initialized"),
         other => log::debug!("ignoring notification: {other}"),
-    }
-}
-
-/// Project `lsp_types::NumberOrString` (the on-wire id form for `$/cancelRequest.params.id`) into
-/// `lsp_server::RequestId` (the form `state.pending_requests` is keyed on). The two enums carry
-/// the same I32 / String variants; this is purely a type bridge across the lsp-types ↔ lsp-server
-/// crate boundary.
-fn request_id_from_number_or_string(id: NumberOrString) -> RequestId {
-    match id {
-        NumberOrString::Number(n) => RequestId::from(n),
-        NumberOrString::String(s) => RequestId::from(s),
     }
 }
 
@@ -1810,7 +1855,7 @@ mod tests {
             sender: tx,
             recorder: None,
             rss: RssSampler::new(),
-            pending_requests: FxHashMap::default(),
+            shared: Arc::new(SessionShared::default()),
             current_token: None,
             // The watcher-path tests don't exercise the WP-H1 ladder; a synthetic budget with
             // caps far above what a small tempdir workspace will ever observe keeps the ticker
@@ -1858,7 +1903,7 @@ mod tests {
             sender: tx,
             recorder: None,
             rss,
-            pending_requests: FxHashMap::default(),
+            shared: Arc::new(SessionShared::default()),
             current_token: None,
             budget,
             memory_pressure: MemoryPressure::Normal,
@@ -1939,10 +1984,11 @@ mod tests {
             err.code, ERR_CONTENT_MODIFIED,
             "a shed analyze-using request must return ContentModified (-32801)"
         );
-        // The shed path must clean up the per-request token (no leak into pending_requests).
-        assert!(
-            state.pending_requests.is_empty(),
-            "shed must unregister the token"
+        // The shed path must clean up the request's lifecycle (no leak into the registry).
+        assert_eq!(
+            state.shared.in_flight_len(),
+            0,
+            "shed must deregister the request"
         );
         assert!(
             state.current_token.is_none(),
@@ -2013,28 +2059,36 @@ mod tests {
         );
     }
 
-    /// WP-O4: the cancellation gate maps a tripped per-request token to a RequestCancelled
-    /// (-32800) error response and passes an un-cancelled handler response through untouched. The
-    /// single-threaded loop can't interrupt a handler mid-flight (see `tests/cancellation.rs`'s
-    /// module doc), so this unit-tests the gate directly; the analyzer-level cancel that flips the
-    /// token is covered by `gd_analyze/tests/governor.rs`.
+    /// M7 (#57): the interrupt gate deregisters the request and maps its lifecycle verdict —
+    /// pass-through when clean, RequestCancelled (-32800) on cancel, ContentModified (-32801) on
+    /// stale-by-edit, cancelled winning when both flags are set, and pass-through for an
+    /// unregistered id (its lifecycle was already consumed by the queued-interrupt
+    /// short-circuit). The analyzer-level cancel that flips the embedded token is covered by
+    /// `gd_analyze/tests/governor.rs`; the wire-level races are covered by
+    /// `tests/concurrent_dispatch.rs`.
     #[test]
-    fn cancellation_gate_maps_tripped_token_to_request_cancelled() {
-        let token = CancellationToken::new();
-        let ok = Response::new_ok(
-            lsp_server::RequestId::from(7),
-            serde_json::json!({ "ok": true }),
-        );
-        // Not cancelled → the handler's response passes through.
-        let passed = apply_cancellation_gate(&token, lsp_server::RequestId::from(7), ok.clone());
+    fn finish_request_maps_interrupts_and_passes_clean_responses() {
+        let ok = |id: i32| {
+            Response::new_ok(
+                lsp_server::RequestId::from(id),
+                serde_json::json!({ "ok": true }),
+            )
+        };
+
+        // Clean lifecycle → the handler's response passes through (and is deregistered).
+        let shared = SessionShared::default();
+        let _ = shared.lifecycle(&lsp_server::RequestId::from(7));
+        let passed = finish_request(&shared, ok(7));
         assert!(
             passed.error.is_none(),
-            "an un-cancelled request must keep its handler response"
+            "an uninterrupted request must keep its handler response"
         );
-        // Cancelled → replaced with RequestCancelled (-32800).
-        token.cancel();
-        let cancelled = apply_cancellation_gate(&token, lsp_server::RequestId::from(7), ok);
-        let err = cancelled
+        assert_eq!(shared.in_flight_len(), 0, "finish must deregister");
+
+        // Cancelled → RequestCancelled (-32800).
+        let shared = SessionShared::default();
+        shared.lifecycle(&lsp_server::RequestId::from(8)).cancel();
+        let err = finish_request(&shared, ok(8))
             .error
             .expect("a cancelled request must yield an error response");
         assert_eq!(
@@ -2042,6 +2096,34 @@ mod tests {
             "a cancelled request must return RequestCancelled (-32800)"
         );
         assert!(err.message.contains("cancelled"));
+
+        // Stale-by-edit → ContentModified (-32801).
+        let shared = SessionShared::default();
+        shared
+            .lifecycle(&lsp_server::RequestId::from(9))
+            .mark_stale();
+        let err = finish_request(&shared, ok(9))
+            .error
+            .expect("a stale request must yield an error response");
+        assert_eq!(
+            err.code, ERR_CONTENT_MODIFIED,
+            "a stale request must return ContentModified (-32801)"
+        );
+
+        // Both flags → cancelled wins (the client retracted; it discards the response anyway).
+        let shared = SessionShared::default();
+        let lifecycle = shared.lifecycle(&lsp_server::RequestId::from(10));
+        lifecycle.mark_stale();
+        lifecycle.cancel();
+        let err = finish_request(&shared, ok(10))
+            .error
+            .expect("an interrupted request must yield an error response");
+        assert_eq!(err.code, REQUEST_CANCELLED, "cancelled wins over stale");
+
+        // Unregistered id → pass-through.
+        let shared = SessionShared::default();
+        let unregistered = finish_request(&shared, ok(11));
+        assert!(unregistered.error.is_none());
     }
 
     /// WP-H1 Soft action: when the ladder transitions to Soft, `evict_half` runs on the
@@ -2074,7 +2156,7 @@ mod tests {
             sender: tx,
             recorder: None,
             rss,
-            pending_requests: FxHashMap::default(),
+            shared: Arc::new(SessionShared::default()),
             current_token: None,
             budget,
             memory_pressure: MemoryPressure::Normal,
