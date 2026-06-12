@@ -1835,9 +1835,14 @@ fn warning_docs_uri(code: gd_analyze::warnings::WarningCode) -> Uri {
     };
     match code {
         PropertyUsedAsFunction | ConstantUsedAsFunction | FunctionUsedAsProperty => {
-            "https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/warning_system.html"
-                .parse()
-                .expect("invariant: the static Godot docs URL parses as a Uri")
+            static OVERVIEW: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
+            OVERVIEW
+                .get_or_init(|| {
+                    "https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/warning_system.html"
+                        .parse()
+                        .expect("invariant: the static Godot docs URL parses as a Uri")
+                })
+                .clone()
         }
         _ => {
             // Sphinx renders the RST label's `_` (and the setting path's `/`) as `-` in the

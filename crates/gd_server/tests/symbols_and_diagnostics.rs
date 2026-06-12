@@ -442,7 +442,7 @@ fn document_symbol_details_render_signatures() {
 
 /// Boot advertising the full diagnostics-metadata surface: `publishDiagnostics.tagSupport` with
 /// `Unnecessary` in the value set, plus `codeDescriptionSupport` (M7 #63).
-fn boot_with_tag_support() -> (Connection, std::thread::JoinHandle<()>) {
+fn boot_with_diagnostics_metadata() -> (Connection, std::thread::JoinHandle<()>) {
     boot_with_capabilities(ClientCapabilities {
         general: utf8_general(),
         text_document: Some(TextDocumentClientCapabilities {
@@ -459,12 +459,51 @@ fn boot_with_tag_support() -> (Connection, std::thread::JoinHandle<()>) {
     })
 }
 
+/// The two diagnostics-metadata gates are independent: a client advertising ONLY
+/// `codeDescriptionSupport` (no `tagSupport`) gets the docs link but no tags — a future change
+/// that accidentally couples the two gates fails here.
+#[test]
+fn code_description_gate_is_independent_of_tag_support() {
+    let (client, handle) = boot_with_capabilities(ClientCapabilities {
+        general: utf8_general(),
+        text_document: Some(TextDocumentClientCapabilities {
+            publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+                code_description_support: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let uri: Uri = "file:///test/unused_cd_only.gd".parse().unwrap();
+    did_open(&client, &uri, "extends Node\nfunc f():\n\tvar x = 1\n");
+
+    let diags = recv_publish_diagnostics(&client);
+    let unused = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    "UNUSED_VARIABLE".to_string(),
+                ))
+        })
+        .expect("UNUSED_VARIABLE must fire");
+    assert!(
+        unused.code_description.is_some(),
+        "codeDescriptionSupport alone must enable the docs link"
+    );
+    assert_eq!(unused.tags, None, "tagSupport was not advertised");
+
+    shutdown(&client, handle);
+}
+
 /// An unused local under a tag-supporting client: the diagnostic gains `tags: [Unnecessary]`
 /// (editors fade the range) and a `codeDescription` link — while the message stays byte-exact
 /// Godot output and the severity/range are untouched.
 #[test]
 fn unused_variable_diagnostic_carries_unnecessary_tag_when_supported() {
-    let (client, handle) = boot_with_tag_support();
+    let (client, handle) = boot_with_diagnostics_metadata();
     let uri: Uri = "file:///test/unused.gd".parse().unwrap();
     did_open(&client, &uri, "extends Node\nfunc f():\n\tvar x = 1\n");
 
@@ -536,7 +575,7 @@ fn diagnostic_tags_absent_without_client_tag_support() {
 /// client stays untagged.
 #[test]
 fn non_unused_warning_carries_no_unnecessary_tag() {
-    let (client, handle) = boot_with_tag_support();
+    let (client, handle) = boot_with_diagnostics_metadata();
     let uri: Uri = "file:///test/narrow.gd".parse().unwrap();
     did_open(
         &client,
