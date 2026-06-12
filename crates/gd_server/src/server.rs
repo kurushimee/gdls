@@ -1581,10 +1581,9 @@ fn parse_params<P: serde::de::DeserializeOwned>(
 /// by a content fingerprint, so the same `didChange` doesn't pay the cost twice when
 /// `documentSymbol` and `publishDiagnostics` race on identical buffer text.
 fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) {
-    let computed = compute_diagnostics(state, &uri);
     let params = PublishDiagnosticsParams {
+        diagnostics: diagnostic_items(state, &uri),
         uri,
-        diagnostics: computed.items,
         version,
     };
     let value = serde_json::to_value(params).expect(
@@ -1603,20 +1602,13 @@ fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) 
     }
 }
 
-/// The shared product of push and pull diagnostics (M7 #61): both wire shapes are projections
-/// of this one computation, so their items are byte-identical by construction.
-struct ComputedDiagnostics {
-    items: Vec<Diagnostic>,
-    /// Stable identity of every input the items depend on, or `None` when the report must not
-    /// be pinned by a `previousResultId` round-trip — no open buffer, or analysis shed under
-    /// Hard memory pressure (a degraded, parser-only result the client should re-pull).
-    result_id: Option<String>,
-}
-
 /// Parse + analyze the open buffer for `uri` into the merged diagnostic set — the single
 /// computation behind `textDocument/publishDiagnostics` (push) and `textDocument/diagnostic`
-/// (pull). No open buffer yields the empty set (the `didClose` clear-path).
-fn compute_diagnostics(state: &mut ServerState, uri: &Uri) -> ComputedDiagnostics {
+/// (pull), so the two wire shapes carry byte-identical items by construction. No open buffer
+/// yields the empty set (the `didClose` clear-path). The pull-only `resultId` is deliberately
+/// NOT computed here: the push path would discard it on every didOpen/didChange
+/// ([`result_id_for`] is the pull handler's job, exactly once per pull).
+fn diagnostic_items(state: &mut ServerState, uri: &Uri) -> Vec<Diagnostic> {
     // v1.0.4 (#34): stub buffers never self-diagnose — a materialized native API page need not
     // be analyzable GDScript, only readable as it. Matched against the stubs BASE root (any
     // version/hash: an old-hash stub can stay open across a mid-session dump swap). The caller
@@ -1661,10 +1653,7 @@ fn compute_diagnostics(state: &mut ServerState, uri: &Uri) -> ComputedDiagnostic
             }
         }
     };
-    ComputedDiagnostics {
-        items,
-        result_id: result_id_for(state, uri),
-    }
+    items
 }
 
 /// The pull-diagnostics `resultId` for `uri`'s CURRENT state — cheap (no parse, no analysis):
@@ -1681,8 +1670,9 @@ fn compute_diagnostics(state: &mut ServerState, uri: &Uri) -> ComputedDiagnostic
 /// `.gd` buffer's analysis would be / was shed under Hard memory pressure with no cached result —
 /// a degraded report must never be pinned as `unchanged`.
 fn result_id_for(state: &mut ServerState, uri: &Uri) -> Option<String> {
-    let doc_version = state.vfs.get(uri.as_str()).map(|d| d.version)?;
-    let text = state.vfs.get(uri.as_str()).map(|d| d.text())?;
+    let doc = state.vfs.get(uri.as_str())?;
+    let doc_version = doc.version;
+    let text = doc.text();
     let is_stub = crate::stubs::is_stub_uri(uri, state.options.stub_cache_dir.as_deref());
     let path = uri_to_path(uri);
     let is_gd = !is_stub && path.as_deref().is_some_and(|p| p.extension() == Some("gd"));
@@ -1718,8 +1708,11 @@ fn document_diagnostic(
         UnchangedDocumentDiagnosticReport,
     };
     let uri = params.text_document.uri;
-    if let (Some(previous), Some(current)) = (params.previous_result_id, result_id_for(state, &uri))
-    {
+    // Computed exactly once per pull: it is valid both before and after `diagnostic_items`
+    // below — running the analysis changes none of the id's inputs (version, content
+    // fingerprint, dependency epoch, generation) on this single-threaded path.
+    let current = result_id_for(state, &uri);
+    if let (Some(previous), Some(current)) = (params.previous_result_id, current.clone()) {
         if previous == current {
             return DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Unchanged(
                 RelatedUnchangedDocumentDiagnosticReport {
@@ -1731,13 +1724,12 @@ fn document_diagnostic(
             ));
         }
     }
-    let computed = compute_diagnostics(state, &uri);
     DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(
         RelatedFullDocumentDiagnosticReport {
             related_documents: None,
             full_document_diagnostic_report: FullDocumentDiagnosticReport {
-                result_id: computed.result_id,
-                items: computed.items,
+                items: diagnostic_items(state, &uri),
+                result_id: current,
             },
         },
     ))
