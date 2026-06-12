@@ -20,7 +20,7 @@
 use gd_syntax::ast::{BinaryOp, NodeId, NodeKind, UnaryOp};
 use gd_syntax::token::Literal;
 
-use crate::binding::{Binding, BindingTargetKind as BindingSymbolKind};
+use crate::binding::{Binding, BindingTargetKind as BindingSymbolKind, CalleeTarget};
 use crate::context::AnalysisContext;
 use crate::data_type::{self, DataType, DtKind, TypeSource, VariantType};
 use crate::foldtable::FoldedValue;
@@ -43,52 +43,55 @@ fn caller_function_name(ctx: &AnalysisContext) -> Option<String> {
     }
 }
 
-/// WP-RD6: resolve a bare call `name` to the file that DECLARES the dispatched method by walking
-/// the current file's `extends` chain (this file → base → … → native root) through the cross-file
-/// query. Returns the first file in the chain whose interface declares a `func` named `name` — the
-/// file an unqualified call actually dispatches to — or `None` when the name resolves only to a
-/// native method (the chain reaches a native class) or isn't found on it.
-///
-/// Drives the `Binding::Call.callee_file` policy at the recording site: bare-identifier calls
-/// resolve through the inheritance chain, so a `_ready()` call from `extends Node` runs
-/// `Node._ready`, not a `_ready` in this file. Pre-WP-N1b the recording site tagged every reached
-/// call with `callee_file = Some(ctx.file)`, making `callHierarchy/incomingCalls` of `Node._ready`
-/// miss every site and `outgoingCalls` render a self-pointer; recording the declaring file (or
-/// `None` for native / unresolved) lets the nav handlers attribute calls correctly.
-///
-/// This replaces the prior `current_file_declares_function` name-presence test, which matched a
-/// `func name` ANYWHERE in this file's parse tree — including inner-class methods and unrelated
-/// scopes — and so over-attributed `callee_file` to this file even when the bare call dispatched to
-/// an inherited method. Walking the proper method-resolution chain is dispatch-accurate: a file
-/// that declares `attack` in an inner class while the head-class call dispatches to an inherited
-/// `attack` now attributes to the declaring base, not this file (the `implementation` handler walks
-/// the same `extends` chain via `Index::iter_interfaces`).
-///
-/// WP-RD11 (2) — bench witness, no-op landed. This walks the `extends` chain (O(depth × members))
-/// once per recorded call site; memoizing a per-analyze `name → Option<FileId>` resolution cache
-/// would amortize repeated bare calls to the same method. The Phase-C calibration found the
-/// binding-recording path well under the analyze budget on a large real-world project, so the memo is deferred
-/// per the plan's "lands OR documented bench witness" rule (the cheap `extends`-chain walk RD6
-/// introduced is already far tighter than the prior whole-tree `func`-name scan it replaced).
-fn resolve_callee_file(ctx: &AnalysisContext, name: &str) -> Option<gd_project::FileId> {
-    let start = crate::data_type::ScriptRef {
-        file: ctx.file?,
-        inner: Vec::new(),
-    };
-    let chain = crate::script_chain::resolve_script_chain(ctx, &start);
-    for link in &chain.links {
-        let Some(iface) = crate::script_chain::link_interface(ctx.xfile, link) else {
-            break;
+/// The inner-class name chain from the file's root class down to `class_id` (empty = the root
+/// class itself; [`crate::data_type::ScriptRef::inner`]'s vocabulary) — the owning-class path
+/// recorded on [`crate::binding::CalleeTarget::Script`]. Walks the class-member tree from the
+/// root (the flat arena has no parent pointers): O(classes) per recorded call, noise next to
+/// the resolution that preceded it.
+fn class_inner_path(ctx: &AnalysisContext, class_id: NodeId) -> Vec<String> {
+    fn walk(
+        ctx: &AnalysisContext,
+        current: NodeId,
+        target: NodeId,
+        path: &mut Vec<String>,
+    ) -> bool {
+        if current == target {
+            return true;
+        }
+        let NodeKind::Class(c) = &ctx.node(current).kind else {
+            return false;
         };
-        if iface
-            .members
-            .iter()
-            .any(|m| m.name == name && m.kind == gd_project::MemberKind::Func)
-        {
-            return Some(link.file);
+        for m in &c.members {
+            let gd_syntax::ast::Member::Class(inner_id) = m else {
+                continue;
+            };
+            let name = match &ctx.node(*inner_id).kind {
+                NodeKind::Class(ic) => ic
+                    .identifier
+                    .and_then(|iid| match &ctx.node(iid).kind {
+                        NodeKind::Identifier(i) => Some(i.name.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            path.push(name);
+            if walk(ctx, *inner_id, target, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let mut path = Vec::new();
+    if let Some(root) = ctx.tree.root_id() {
+        if walk(ctx, root, class_id, &mut path) {
+            return path;
         }
     }
-    None
+    // Defensive: a class node unreachable from the root (recovered parse) records the root
+    // path rather than a fabricated one.
+    Vec::new()
 }
 
 // ===================================================================================================
@@ -1481,9 +1484,10 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // a `signal ping` declared in the cross-file base used to be `Identifier "ping" not
     // declared`. Instance context (`p_base == nullptr` ⇒ type_from_metatype lowers to instance,
     // analyzer.cpp:4030-4034), so all member kinds are reachable. Skipped in callee position:
-    // `reduce_call` resolves bare inherited calls itself (`resolve_callee_file` + the cross-file
-    // CallSig), and typing the callee as a constant Callable here would mis-fire Godot's
-    // `Name "X" is a Callable` error that is reserved for callable-holding variables.
+    // `reduce_call` resolves bare inherited calls itself (the in-file class walk + the
+    // cross-file CallSig chain), and typing the callee as a constant Callable here would
+    // mis-fire Godot's `Name "X" is a Callable` error that is reserved for callable-holding
+    // variables.
     if !ctx.reducing_callee {
         if let Some(sr) = current_class_script_base(ctx) {
             if let Some((dt, fold)) = lookup_script_chain_member(ctx, &sr, &name, false, id) {
@@ -3442,29 +3446,11 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             return;
         }
 
-        // Record the call site. Reached only when none of the three early-returns (Object,
-        // builtin constructor, native/GDScript utility) fired — so the dispatch is a real
-        // method call against an in-file or inherited callee, not a native builtin
-        // masquerading with a project-file callee_file. A prior recording site tagged every
-        // reached call with `callee_file = Some(ctx.file)`, which made outgoingCalls render
-        // inherited bare calls (`_ready()` from `extends Node`) as self-pointers and
-        // incomingCalls of the real parent-class callee miss every site. WP-RD6 resolves the call
-        // against the extends chain (`resolve_callee_file`) so it attributes to whichever file
-        // declares the dispatched method (this file OR an inherited base), or `None` for a native /
-        // unresolved callee — dispatch-accurate, not a name-presence guess.
-        let caller = caller_function_name(ctx);
-        let call_span = ctx.node(id).span;
-        // WP-RD6: resolve the bare call against the dispatch (extends) chain — `callee_file` is the
-        // file that actually declares the dispatched `func`, or `None` for a native / unresolved
-        // callee. WP-RD2: an orphan's chain has no interface, so this naturally yields `None` (no
-        // colliding placeholder id), and the nav handlers degrade through the "don't know" path.
-        let callee_file = resolve_callee_file(ctx, &function_name);
-        ctx.record_binding(Binding::call(
-            callee_file,
-            function_name.clone(),
-            call_span,
-            caller,
-        ));
+        // No recording here: bare calls flow on into the common method-resolution below and
+        // record at the SAME site as dotted/super calls, deriving the callee target from the
+        // resolution the dispatch actually used (see the gate ahead of `ctx.set_type`). The
+        // three early-returns above (Object, builtin constructor, native/GDScript utility)
+        // bail before either point — exactly the calls with no project/native method to record.
     }
 
     // --- Method-call setup (analyzer.cpp:3535-3590) ----------------------------------------------
@@ -3664,12 +3650,21 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     let mut found = false;
     let mut sig = CallSig::default();
     let mut in_file_function_id: Option<NodeId> = None;
-    // WP-N1b (xref metadata only): the FileId of the cross-file script that declares the callee,
-    // set when a subscript call resolves through a DtKind::Script base to a Func member in that
-    // script's interface. Kept separate from `in_file_function_id` so the arity-error gate
-    // (~3306: `if in_file_function_id.is_some()`) remains unchanged — cross-file Script calls
-    // still have no arity data, so we must not emit arity diagnostics for them.
-    let mut cross_file_callee: Option<gd_project::FileId> = None;
+    // The class node DECLARING an in-file-resolved callee (the chain link
+    // `lookup_class_function_or_member` found it on) — the owning class recorded on
+    // `CalleeTarget::Script::class_path`.
+    let mut in_file_class_id: Option<NodeId> = None;
+    // WP-N1b (xref metadata only): the cross-file chain link (file + inner-class path) that
+    // declares the callee, set when a call resolves through a DtKind::Script base to a Func
+    // member in that script's interface. Kept separate from `in_file_function_id` so the
+    // arity-error gate (~3306: `if in_file_function_id.is_some()`) remains unchanged —
+    // cross-file Script calls still have no arity data, so we must not emit arity diagnostics
+    // for them.
+    let mut cross_file_callee: Option<crate::data_type::ScriptRef> = None;
+    // The native class a successful `lookup_native_method` ran against — `CalleeTarget::Native`
+    // when neither project arm resolved. Only set on a Some lookup (degrade-don't-lie: a
+    // silent-Variant miss records `Unresolved`, never a guessed class).
+    let mut native_callee: Option<String> = None;
 
     if is_constructor {
         // `X.new()` returns an instance of X (analyzer.cpp's flow ends up there via
@@ -3688,7 +3683,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // In-file class method (`self.method()`, `child.method()`, `Class.method()`).
         if let Some(class_id) = base_type.class_node {
             match lookup_class_function_or_member(ctx, class_id, &function_name) {
-                ClassCallLookup::Function(fn_id) => {
+                ClassCallLookup::Function(fn_id, declaring_class) => {
                     // analyzer.cpp:3614-3618 — super-call on abstract/virtual function.
                     if call.is_super && ctx.abstract_nodes.contains(&fn_id) {
                         ctx.push_error(
@@ -3699,6 +3694,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         );
                     }
                     in_file_function_id = Some(fn_id);
+                    in_file_class_id = Some(declaring_class);
                     sig = function_signature(ctx, fn_id);
                     return_type = Some(sig.return_dt.clone());
                     found = true;
@@ -3719,11 +3715,11 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     // analyzer.cpp's get_function_signature walks base scripts the same way.
                     if let Some(sr) = script_base_of_class(ctx, class_id) {
                         match script_chain_call(ctx, &sr, &function_name) {
-                            ChainCall::Sig(chain_sig, file) => {
+                            ChainCall::Sig(chain_sig, link) => {
                                 sig = *chain_sig;
                                 return_type = Some(sig.return_dt.clone());
                                 found = true;
-                                cross_file_callee = Some(file);
+                                cross_file_callee = Some(link);
                             }
                             ChainCall::Other => {}
                             ChainCall::Missing => {
@@ -3733,13 +3729,14 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                                 // its real signature. Only a genuine native miss keeps the
                                 // silent-Variant degrade (the interface view may be incomplete;
                                 // never risk a phantom not-found).
-                                let native_sig = crate::script_chain::chain_native_root(ctx, &sr)
-                                    .and_then(|root| {
-                                        lookup_native_method(ctx, &root, &function_name)
-                                    });
+                                let root = crate::script_chain::chain_native_root(ctx, &sr);
+                                let native_sig = root.as_ref().and_then(|root| {
+                                    lookup_native_method(ctx, root, &function_name)
+                                });
                                 if let Some(s) = native_sig {
                                     return_type = Some(s.return_dt.clone());
                                     sig = s;
+                                    native_callee = root;
                                 } else {
                                     return_type = Some(DataType::variant());
                                 }
@@ -3760,6 +3757,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                             return_type = Some(s.return_dt.clone());
                             sig = s;
                             found = true;
+                            native_callee = Some(root);
                         }
                     }
                 }
@@ -3771,6 +3769,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             return_type = Some(s.return_dt.clone());
             sig = s;
             found = true;
+            native_callee = Some(base_type.native_type.clone());
         }
     } else if base_type.kind == DtKind::Script {
         // WP-P1 cross-file: a Script base (`extends "f.gd"`, `extends ParentClass` where Parent
@@ -3784,13 +3783,14 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // members from a base script not yet walked, etc.).
         if let Some(script_ref) = base_type.script_type.as_ref() {
             match script_chain_call(ctx, script_ref, &function_name) {
-                ChainCall::Sig(chain_sig, file) => {
+                ChainCall::Sig(chain_sig, link) => {
                     sig = *chain_sig;
                     return_type = Some(sig.return_dt.clone());
                     found = true;
-                    // WP-N1b: record the DECLARING file for call-edge bookkeeping — consumed at
-                    // the Binding::Call recording site below (accurate references filtering).
-                    cross_file_callee = Some(file);
+                    // WP-N1b: record the DECLARING chain link for call-edge bookkeeping —
+                    // consumed at the Binding::Call recording site below (accurate references
+                    // filtering).
+                    cross_file_callee = Some(link);
                 }
                 ChainCall::Other => {
                     // Exists as a non-Func — fall through; the value-callable path fires.
@@ -3801,11 +3801,14 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     // silent degrade ("Unknown stays dynamic"): shallow interfaces may miss
                     // inner-class methods etc., so a phantom "Function not found" is never
                     // acceptable here.
-                    let native_sig = crate::script_chain::chain_native_root(ctx, script_ref)
-                        .and_then(|root| lookup_native_method(ctx, &root, &function_name));
+                    let root = crate::script_chain::chain_native_root(ctx, script_ref);
+                    let native_sig = root
+                        .as_ref()
+                        .and_then(|root| lookup_native_method(ctx, root, &function_name));
                     if let Some(s) = native_sig {
                         return_type = Some(s.return_dt.clone());
                         sig = s;
+                        native_callee = root;
                     } else {
                         return_type = Some(DataType::variant());
                     }
@@ -4246,37 +4249,55 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         call_type = DataType::variant();
     }
 
-    // Record the call site for the dotted (`self.attack()`, `obj.method()`, `MyClass.method()`)
-    // and super (`super.method()` / `super()`) dispatch shapes. The bare-identifier branch
-    // (~line 2849) already recorded its own `Binding::Call` and returned early for the
-    // builtin-constructor / utility cases, so we record here only for the subscript- and
-    // super-callee shapes to avoid double-recording. `function_name` is the callee method name —
-    // the attribute identifier after the dot for a subscript callee, or the post-`super.`
-    // identifier (resp. the enclosing function for a bare `super()`), exactly as the parser fills
-    // `CallNode::function_name`. `callee_file` priority:
-    //   1. `cross_file_callee` — set when the call resolved through a DtKind::Script base to a
-    //      Func in that script's interface (the file that *declares* the method, e.g. lib.gd).
-    //   2. `ctx.file` — when `in_file_function_id` is set (the in-file `Class` lookup resolved
-    //      to a function declared in *this* file, walking `ctx.bases`).
-    //   3. `None` — for native / builtin / enum / not-found callees, and any callee gdls can't
-    //      pin to a project script. Nav handlers degrade through the same name-based matching
-    //      they use for bare inherited calls (`binding.rs:55-69`).
+    // Record the call site for every dispatched callee shape — bare (`helper()`), dotted
+    // (`self.attack()`, `obj.method()`, `MyClass.method()`), and super (`super.method()` /
+    // `super()`). Bare calls used to record at a separate pre-resolution site through a
+    // file-root chain walk (WP-RD6); recording HERE instead derives the callee target from the
+    // resolution the dispatch actually used — dispatch-accurate for inner-class bare calls
+    // (the in-file walk starts at the CURRENT class, not the file root), and a bare name
+    // shadowed by a non-Func member classifies `Unresolved` (value-callable) instead of being
+    // walked past. The pre-resolution early returns (builtin constructors, utility functions,
+    // `Object()`, constructor errors) never reach this point — exactly the calls with no
+    // project/native method dispatch to record.
+    //
+    // `function_name` is the callee method name — the bare identifier, the attribute after the
+    // dot for a subscript callee, or the post-`super.` identifier (resp. the enclosing
+    // function for a bare `super()`), exactly as the parser fills `CallNode::function_name`.
+    // Target priority:
+    //   1. `cross_file_callee` — a DtKind::Script-chain hit: the declaring link's file +
+    //      inner-class path.
+    //   2. `in_file_function_id` — the in-file `Class` walk resolved: this file + the
+    //      DECLARING class's inner path. WP-RD2: an orphan (`ctx.file` None) records
+    //      `Unresolved` rather than a placeholder id.
+    //   3. `native_callee` — a `lookup_native_method` hit: the class the lookup ran against
+    //      (consumers resolve the DECLARING class via `NativeDb::lookup_member`).
+    //   4. `Unresolved` — builtin-value/enum methods, value-callables, misses.
     // Recording is additive (WP-N1b): it sets no type and emits no diagnostic.
-    if is_subscript_callee || call.is_super {
+    if callee_kind || is_subscript_callee || call.is_super {
         let caller = caller_function_name(ctx);
         let call_span = ctx.node(id).span;
-        // WP-RD2: `ctx.file` is `Option`; an orphan records `None` rather than a placeholder id.
-        let callee_file = if let Some(cf) = cross_file_callee {
-            // Cross-file Script call resolved to a declaring file — use it directly.
-            Some(cf)
+        let callee = if let Some(link) = cross_file_callee {
+            CalleeTarget::Script {
+                file: link.file,
+                class_path: link.inner,
+            }
         } else if in_file_function_id.is_some() {
-            // In-file Class call resolved — attribute to the current file.
-            ctx.file
+            match ctx.file {
+                Some(file) => CalleeTarget::Script {
+                    file,
+                    class_path: in_file_class_id
+                        .map(|cid| class_inner_path(ctx, cid))
+                        .unwrap_or_default(),
+                },
+                None => CalleeTarget::Unresolved,
+            }
+        } else if let Some(class) = native_callee {
+            CalleeTarget::Native { class }
         } else {
-            None
+            CalleeTarget::Unresolved
         };
         ctx.record_binding(Binding::call(
-            callee_file,
+            callee,
             function_name.clone(),
             call_span,
             caller,
@@ -4376,7 +4397,9 @@ fn function_signature(ctx: &AnalysisContext, fn_id: NodeId) -> CallSig {
 /// rare but the find-first-wins semantics matter for the corpus's
 /// `constant_used_as_function.gd` / `property_used_as_function.gd` pair.)
 enum ClassCallLookup {
-    Function(NodeId),
+    /// A `func` resolved: its node + the class node DECLARING it (the chain link the walk found
+    /// it on — the owning class `CalleeTarget::Script::class_path` records).
+    Function(NodeId, NodeId),
     NotAFunction,
     NotFound,
 }
@@ -4391,7 +4414,9 @@ fn lookup_class_function_or_member(
         if let NodeKind::Class(c) = &ctx.node(class).kind {
             if let Some(&idx) = c.members_indices.get(name) {
                 return match c.members.get(idx) {
-                    Some(gd_syntax::ast::Member::Function(fid)) => ClassCallLookup::Function(*fid),
+                    Some(gd_syntax::ast::Member::Function(fid)) => {
+                        ClassCallLookup::Function(*fid, class)
+                    }
                     Some(_) => ClassCallLookup::NotAFunction,
                     None => ClassCallLookup::NotFound,
                 };
@@ -4836,9 +4861,10 @@ fn reduce_subscript_attribute(
 
 /// Outcome of a cross-file call-signature walk over a script chain.
 enum ChainCall {
-    /// A Func member resolved: its synthesized [`CallSig`] + the DECLARING file. Boxed — the
-    /// signature dwarfs the unit variants and this enum moves through match arms by value.
-    Sig(Box<CallSig>, gd_project::FileId),
+    /// A Func member resolved: its synthesized [`CallSig`] + the DECLARING chain link (file +
+    /// inner-class path — what `CalleeTarget::Script` records). Boxed — the signature dwarfs
+    /// the unit variants and this enum moves through match arms by value.
+    Sig(Box<CallSig>, crate::data_type::ScriptRef),
     /// The name exists as a non-Func member — the value-callable path owns it.
     Other,
     /// Not in any chain interface.
@@ -4857,7 +4883,7 @@ fn script_chain_call(
 ) -> ChainCall {
     let chain = crate::script_chain::resolve_script_chain(ctx, start);
     let xf = ctx.xfile;
-    let mut hit: Option<(gd_project::FileId, &gd_project::MemberDecl)> = None;
+    let mut hit: Option<(crate::data_type::ScriptRef, &gd_project::MemberDecl)> = None;
     for link in chain.links.iter() {
         let Some(iface) = crate::script_chain::link_interface(xf, link) else {
             continue;
@@ -4866,15 +4892,15 @@ fn script_chain_call(
             if m.kind != gd_project::MemberKind::Func {
                 return ChainCall::Other;
             }
-            hit = Some((link.file, m));
+            hit = Some((link.clone(), m));
             break;
         }
     }
-    let Some((file, member)) = hit else {
+    let Some((link, member)) = hit else {
         return ChainCall::Missing;
     };
     let par_n = member.params.len();
-    let return_dt = resolve_interface_type_expr(ctx, file, &member.ty);
+    let return_dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
     ChainCall::Sig(
         Box::new(CallSig {
             return_dt,
@@ -4885,7 +4911,7 @@ fn script_chain_call(
             is_static: member.flags.is_static,
             is_coroutine: member.flags.is_coroutine,
         }),
-        file,
+        link,
     )
 }
 
@@ -5417,6 +5443,19 @@ fn reduce_identifier_from_base(
             if let Some((member_dt, fold)) =
                 lookup_class_member(ctx, class_id, &name, identifier_id)
             {
+                // Record the resolved in-file attribute read (`self.hp`, an access on a base
+                // typed as this file's own class) — the in-file twin of `record_member_use`'s
+                // cross-file recording, closing the last attribute-read recording gap so
+                // references can ride bindings instead of the raw identifier scan. WP-RD2: an
+                // orphan records `None` ("don't know"), never a placeholder id. Additive
+                // (WP-N1b): no type or diagnostic changes.
+                let site = ctx.node(identifier_id).span;
+                ctx.record_binding(Binding::use_(
+                    ctx.file,
+                    BindingSymbolKind::Member,
+                    name.clone(),
+                    site,
+                ));
                 ctx.set_type(identifier_id, member_dt);
                 if let Some(fv) = fold {
                     ctx.folds.set(identifier_id, fv);
@@ -6360,8 +6399,12 @@ mod tests {
         let mut orphan_bindings = 0usize;
         for b in orphan.bindings() {
             match b {
-                Binding::Call { callee_file, .. } => {
-                    assert_eq!(*callee_file, None, "orphan Call binding must record None");
+                Binding::Call { callee, .. } => {
+                    assert_eq!(
+                        callee.script_file(),
+                        None,
+                        "orphan Call binding must record a non-Script callee (don't know)"
+                    );
                     orphan_bindings += 1;
                 }
                 Binding::Use { target_file, .. } => {
@@ -6377,16 +6420,14 @@ mod tests {
 
         let known = crate::analyze(&tree, Some(FileId::new(1)), "foo.gd", &native, &xfile, &pol);
         let known_attributes_in_file = known.bindings().iter().any(|b| {
-            matches!(
-                b,
-                Binding::Call {
-                    callee_file: Some(_),
-                    ..
-                } | Binding::Use {
-                    target_file: Some(_),
-                    ..
-                }
-            )
+            b.callee_script_file().is_some()
+                || matches!(
+                    b,
+                    Binding::Use {
+                        target_file: Some(_),
+                        ..
+                    }
+                )
         });
         assert!(
             known_attributes_in_file,

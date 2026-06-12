@@ -5,6 +5,73 @@ All notable changes to `gdls` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] — 2026-06-12
+
+The LSP protocol-conventions release. A post-v1.0.4 audit compared every exposed capability
+against the LSP 3.17 spec and the rust-analyzer/gopls/clangd conventions and filed twelve
+issues (#43–#54); this release closes all of them — wrong range shapes, ignored client
+capabilities, dead-end call-hierarchy items, fabricated locations, missing display metadata,
+and the references raw-scan over-reporting (#54, pulled forward from Phase 2). Godot message
+strings, spans, and severities are untouched throughout: both conformance ratchets hold at
+parser 186/186 and analyzer 300/300.
+
+### Changed — ranges anchor the symbol name token (#44, #46, #48)
+- **Cross-file `definition` returns the member's name token**, not the whole declaration node
+  editors would select: `MemberDecl` records `name_span` at interface-extraction time (index
+  cache format **v4** — old caches rebuild cold once on upgrade), validated against live text
+  with a re-locate-on-drift fallback. Native-stub jumps land on the member's name token too
+  (`RenderedStub` records per-member column extents; on-disk stub text unchanged).
+- **`workspace/symbol` results carry real name-token ranges** instead of zero-width points at
+  column 0 — each winner file is read once post-cap for the encoding-correct mapping, falling
+  back to the old point only when validation fails. No result carries `start == end`.
+- **callHierarchy `fromRanges` cover the callee name token** instead of the whole call
+  expression — multi-line calls no longer highlight entire blocks, and clicking an incoming
+  call lands on the method name, not the receiver.
+
+### Added — client capabilities honored (#43, #45, #47, #52)
+- **`documentSymbol` downgrades to flat `SymbolInformation[]`** for clients without
+  `hierarchicalDocumentSymbolSupport` (absent ⇒ flat, the rust-analyzer convention) — Helix
+  explicitly declines the nested shape it was receiving.
+- **`references` honors `includeDeclaration: false` as a filter**: declaration name tokens are
+  removed at final assembly instead of leaking through the identifier scan.
+- **The empty `workspace/symbol` query returns all symbols** (spec: "Clients may send an empty
+  string here to request all symbols") — classes first, capped at 256 — so symbol pickers open
+  populated.
+- **UNUSED_*/UNREACHABLE_* diagnostics carry `DiagnosticTag.Unnecessary`** (editors fade dead
+  code), gated on the client's `publishDiagnostics.tagSupport`; every warning-coded diagnostic
+  links Godot's warning-system docs via `codeDescription`.
+
+### Fixed — call hierarchy correctness (#49, #50, #51)
+- **Outgoing `to` items are expandable**: they carry the same `{uri, name}` data blob
+  prepare/incoming items do (expansion used to die with `null` at depth 2), and data-less items
+  re-resolve from `uri` + `selectionRange` (the rust-analyzer/gopls shape).
+- **Native callees anchor into their API stubs** at the member's name token — the fabricated
+  `to` item claiming the callee was declared at (0,0) of the *caller's own file* is gone, and
+  unresolvable callees are omitted entirely. Expanding a stub-anchored item answers with a
+  clean empty list.
+- **`detail` is populated everywhere**: documentSymbol outlines render member signatures
+  through the same byte-stable formatters hover pins (classes carry their `extends` clause),
+  and call-hierarchy items carry their `res://` script path (native items the declaring class)
+  so same-named `_ready` callers stay distinguishable.
+
+### Added — navigable diagnostics (#53)
+- **SHADOWED_VARIABLE / SHADOWED_VARIABLE_BASE_CLASS publish `relatedInformation`** pointing at
+  the shadowed declaration's name token — navigable even when the base class lives in another
+  file, where the message's "at line N" was dead text. Message strings stay byte-identical.
+
+### Changed — references precision (#54)
+- **`Binding::Call` classifies its callee as a `CalleeTarget`** — `Script { file, class_path }`
+  (the owning class within the file), `Native { class }`, or `Unresolved` — derived at one
+  consolidated recording site from the resolution the dispatch actually used (bare calls in
+  inner classes now attribute dispatch-accurately).
+- **In-file attribute reads (`self.hp`) record `Binding::Use`**, closing the last
+  attribute-read recording gap (cross-file reads already recorded precise kinds).
+- **References on resolved member targets are binding-backed**: two unrelated `var speed`s in
+  different classes no longer report each other's sites, typed cross-file accesses through
+  body-local vars are now found (a recall fix), and local/parameter targets stay inside their
+  function. The documented "over-approximate, never under-report" raw scan survives only where
+  resolution genuinely can't decide (class/enum/type names, unanalyzable buffers).
+
 ## [1.0.4] — 2026-06-12
 
 The native-surface completeness release. v1.0.3's real-project capability walks showed

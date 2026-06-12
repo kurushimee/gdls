@@ -17,6 +17,24 @@ pub enum Severity {
     Warning = 2,
 }
 
+/// A secondary location attached to a diagnostic — the analyzer-side shape of LSP's
+/// `DiagnosticRelatedInformation` (e.g. the shadowed declaration a SHADOWED_* warning names in
+/// its message text, made navigable). Rides ALONGSIDE the Godot-exact message: the `.out`
+/// conformance renderer reads only severity/code/message/span/line, so attaching entries can
+/// never move the ratchet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelatedInfo {
+    /// `None` = the analyzed file itself; `Some(fid)` = a cross-file declaration (e.g. the
+    /// SHADOWED_VARIABLE_BASE_CLASS base script). The server resolves the id to a URI.
+    pub file: Option<gd_project::FileId>,
+    /// Byte span within the target file's text. Cross-file spans come from the indexed
+    /// interface — exactly as stale as the "at line N" already baked into the message; the
+    /// server's projection clamps.
+    pub span: ByteSpan,
+    /// The human label (clang's note convention: "previous declaration is here").
+    pub message: String,
+}
+
 /// One emitted diagnostic for a file. Fields are crate-private — construct through
 /// [`DiagnosticSink::push_error`] / [`DiagnosticSink::push_error_with_line`] /
 /// [`DiagnosticSink::push_warning`] (or [`Diagnostic::new_error`] / [`Diagnostic::new_warning`]
@@ -43,6 +61,9 @@ pub struct Diagnostic {
     /// (e.g. `match_with_subscript.gd`'s subscript-Index pattern, analyzer.cpp:2466 with
     /// `expr == nullptr`).
     pub(crate) line: Option<u32>,
+    /// Secondary locations the message names in text (e.g. SHADOWED_*'s shadowed declaration) —
+    /// see [`RelatedInfo`]. Empty for most diagnostics; invisible to the `.out` renderer.
+    pub(crate) related: Vec<RelatedInfo>,
 }
 
 impl Diagnostic {
@@ -56,6 +77,7 @@ impl Diagnostic {
             message: message.into(),
             warning_code: None,
             line: None,
+            related: Vec::new(),
         }
     }
 
@@ -68,6 +90,7 @@ impl Diagnostic {
             message: message.into(),
             warning_code: None,
             line: Some(line),
+            related: Vec::new(),
         }
     }
 
@@ -87,6 +110,7 @@ impl Diagnostic {
             message: message.into(),
             warning_code: Some(code),
             line: None,
+            related: Vec::new(),
         }
     }
 
@@ -125,6 +149,11 @@ impl Diagnostic {
     /// output (the conformance harness) should prefer it when `Some`.
     pub fn line(&self) -> Option<u32> {
         self.line
+    }
+
+    /// Secondary locations attached to this diagnostic — see [`RelatedInfo`].
+    pub fn related(&self) -> &[RelatedInfo] {
+        &self.related
     }
 }
 
@@ -167,6 +196,20 @@ impl DiagnosticSink {
         span: ByteSpan,
         anchor_line: u32,
     ) -> bool {
+        self.push_warning_with_related(code, level, symbols, span, anchor_line, Vec::new())
+    }
+
+    /// [`Self::push_warning`] with attached [`RelatedInfo`] entries — the structured twin of a
+    /// location the message names in text (the SHADOWED_* family's shadowed declaration).
+    pub fn push_warning_with_related(
+        &mut self,
+        code: WarningCode,
+        level: WarnLevel,
+        symbols: &[String],
+        span: ByteSpan,
+        anchor_line: u32,
+        related: Vec<RelatedInfo>,
+    ) -> bool {
         let severity = match level {
             WarnLevel::Ignore => return false,
             WarnLevel::Warn => Severity::Warning,
@@ -179,6 +222,7 @@ impl DiagnosticSink {
             warnings::format_warning(code, symbols),
         );
         warning.line = Some(anchor_line);
+        warning.related = related;
         self.diagnostics.push(warning);
         true
     }

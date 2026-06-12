@@ -36,13 +36,13 @@ pub mod warnings;
 
 pub use binding::{
     find_incoming_calls, find_outgoing_calls, find_use_bindings, Binding, BindingTargetKind,
-    MemberName, MemberXref,
+    CalleeTarget, MemberName, MemberXref,
 };
 pub use cancellation::CancellationToken;
 pub use context::{AnalysisContext, AnalysisResult};
 pub use cross_file::{CrossFileQuery, NoCrossFile, SyntacticQuery};
 pub use data_type::{DataType, DtKind, MethodSig, ScriptRef, TypeSource, VariantType};
-pub use diagnostic::{Diagnostic, DiagnosticSink, Severity};
+pub use diagnostic::{Diagnostic, DiagnosticSink, RelatedInfo, Severity};
 pub use foldtable::{FoldTable, FoldedValue};
 pub use typetable::TypeTable;
 pub use warn_policy::{StrictProfile, StrictSettings, WarnPolicy};

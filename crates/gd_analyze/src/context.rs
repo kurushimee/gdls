@@ -55,26 +55,29 @@ pub struct AnalysisResult {
     /// identifier / member-access ([`Binding::Use`]).
     ///
     /// Recording sites in `reducer.rs`:
-    /// - [`Binding::Call`] in `reduce_call`, after the Object / builtin-constructor /
-    ///   utility-function early returns — so `Vector2()`, `print()`, etc. are NOT recorded
-    ///   with a bogus `callee_file = ctx.file`. `callee_file` is `None` when the file
-    ///   doesn't declare a function with that name, so inherited bare calls (`_ready()`
-    ///   from `extends Node`) don't tag the caller's file as the declaring file.
-    /// - [`Binding::Use`] (`BindingTargetKind::Member`) in `reduce_identifier` for in-file
-    ///   class-member resolution.
-    /// - [`Binding::Use`] (`BindingTargetKind::Class`) in `reduce_identifier` for cross-file
-    ///   `class_name` resolution.
+    /// - [`Binding::Call`] at `reduce_call`'s single post-resolution gate (bare, dotted, and
+    ///   super shapes alike), classifying the callee as a [`crate::binding::CalleeTarget`]
+    ///   derived from the resolution the dispatch actually used. The Object /
+    ///   builtin-constructor / utility-function early returns bail first, so `Vector2()`,
+    ///   `print()`, etc. are never recorded.
+    /// - [`Binding::Use`] (`BindingTargetKind::Member` / `Class`) in `reduce_identifier` for
+    ///   in-file class-member and cross-file `class_name` resolution (autoload sentinels
+    ///   included).
+    /// - [`Binding::Use`] with PRECISE kinds (`Variable` / `Constant` / `Function` / `Signal` /
+    ///   `Enum` / `EnumValue`) via `record_member_use` for every `lookup_script_chain_member`
+    ///   hit — cross-file attribute reads (`obj.hp` through a script-typed base) and bare
+    ///   inherited members alike.
+    /// - [`Binding::Use`] (`BindingTargetKind::Member`) at `reduce_identifier_from_base`'s
+    ///   in-file CLASS-branch hit (`self.hp`, attribute reads on a base typed as this file's
+    ///   own class) — the in-file twin of `record_member_use`.
     ///
-    /// `reduce_identifier_from_base` and `reduce_subscript_attribute` do NOT record bindings
-    /// today (deliberate scope cut — the over-resolution they'd need to record bindings for
-    /// native method/property access conflicts with the analyzer's "degrade rather than
-    /// fail" rule). Following on as new variants land per the [`Binding`] enum's
-    /// `#[non_exhaustive]` discipline.
+    /// Deliberately NOT recorded: attribute reads on native / builtin / enum bases (the
+    /// over-resolution they'd need conflicts with the analyzer's "degrade rather than fail"
+    /// rule — recording a guessed target would let nav lie).
     ///
-    /// Consumed by the LSP nav handlers in `gd_server`: `textDocument/references` matches `Use`
-    /// bindings by bare `target_name` (`handlers::push_binding_locations`) — `target_kind` is
-    /// recorded but NOT yet consulted; the kind-aware `Binding::matches_use` path is reserved for
-    /// M5. `callHierarchy/{incoming,outgoing}Calls` filter `Call` by callee / caller. Recording is
+    /// Consumed by the LSP nav handlers in `gd_server`: `textDocument/references` projects `Use`
+    /// bindings (`handlers::push_binding_locations` and the file-filtered member path);
+    /// `callHierarchy/{incoming,outgoing}Calls` filter `Call` by callee / caller. Recording is
     /// additive — never changes any other field.
     ///
     /// **WP-RD1: private.** Read via [`Self::bindings`]; the only write path is
@@ -507,6 +510,19 @@ impl<'a> AnalysisContext<'a> {
         symbols: &[String],
         at_node: gd_syntax::ast::NodeId,
     ) {
+        self.push_warning_with_related(code, symbols, at_node, Vec::new());
+    }
+
+    /// [`Self::push_warning`] with attached [`crate::diagnostic::RelatedInfo`] entries — the
+    /// structured twin of a location the message names only in text (the SHADOWED_* family's
+    /// shadowed declaration). Shares the `@warning_ignore` suppression.
+    pub fn push_warning_with_related(
+        &mut self,
+        code: crate::warnings::WarningCode,
+        symbols: &[String],
+        at_node: gd_syntax::ast::NodeId,
+        related: Vec<crate::diagnostic::RelatedInfo>,
+    ) {
         // Suppression mirrors Godot's `apply_pending_warnings` (gdscript_parser.cpp:269-281):
         // drop when the anchor's 1-based start line is in `warning_ignored_lines[code]` — the
         // per-line set [`build_warning_ignored_lines`] expands from each `@warning_ignore`'s
@@ -525,7 +541,8 @@ impl<'a> AnalysisContext<'a> {
             return;
         }
         let level = self.policy.effective_level(code);
-        self.sink.push_warning(code, level, symbols, span, line);
+        self.sink
+            .push_warning_with_related(code, level, symbols, span, line, related);
     }
 
     /// `True` when the diagnostic byte `pos` falls inside any `@warning_ignore_start(code)` /

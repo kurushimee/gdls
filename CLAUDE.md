@@ -132,26 +132,29 @@ Phase 1 = v1 = **M0–M6**: M0 LSP skeleton · M1 tokenizer + parser · M2 envir
 [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md). Phase 2 (post-v1): `.tscn` node typing for `$`/`%`,
 `completion`, `signatureHelp`, `rename`/`documentHighlight`.
 
-**Current:** Phase 1 complete — **v1.0.4 shipped** (release notes in `CHANGELOG.md`). v1.0.4 is
-the native-surface completeness release (#32–#35 + adjacent gaps #37–#41, one PR of
-per-work-package commits): native member/class **hover** renders real declaration lines via the
-shared `native_render` formatter pinned to `gdscript_workspace.cpp` detail formats (builtin +
-`@GlobalScope` utility arms included); **`definition`** on native classes/members materializes
-readable API stubs under the user-level cache (`stubs/v{N}-{hash}/Class.gd`, atomic
-write-if-absent, GC'd once per session) and jumps into them once project resolution misses;
-`workspace/symbol` anchors `class_name` declarations (ClassEntry records the line/identifier
-span, cache format v3); the analyzer restores upstream's class-loop → native-check
-fall-through plus `type_from_type_ref`'s enum/bitfield arms; **`UNSAFE_PROPERTY_ACCESS` now
-fires** (`gdscript_analyzer.cpp:4880-4886`), provenance-gated per `docs/02` §11b so it never
-lies on incomplete class surfaces — conformance holds **300/300 with the warning live**.
-v1.0.3 before it was the warning-completeness release (#28/#29: 19 silent emission sites
-ported function-for-function, `@warning_ignore` annotation→target-header spans, navigation
-fixes from the real-project capability walk). Both conformance ratchets hold at **1.0**:
+**Current:** Phase 1 complete — **v1.0.5 shipped** (release notes in `CHANGELOG.md`). v1.0.5 is
+the LSP protocol-conventions release: the post-v1.0.4 exposed-capability audit (spec +
+rust-analyzer/gopls/clangd comparison) filed twelve issues (#43–#54, one PR of
+per-work-package commits) and all twelve closed. Ranges anchor the symbol **name token**
+everywhere — cross-file `definition` (`MemberDecl.name_span`, index cache **v4**: one-time
+cold rebuild), `workspace/symbol` (no more zero-width column-0 points), callHierarchy
+`fromRanges`, and stub jumps; client capabilities are honored (`documentSymbol` downgrades to
+flat without `hierarchicalDocumentSymbolSupport`, `references` treats
+`includeDeclaration: false` as a filter, the empty `workspace/symbol` query returns all
+symbols, UNUSED_*/UNREACHABLE_* carry `DiagnosticTag.Unnecessary` gated on `tagSupport` +
+`codeDescription` docs links); call hierarchy is fully walkable (to-items carry `data` +
+uri/selectionRange re-resolution, native callees anchor into the API stubs — the fabricated
+caller-file (0,0) arm is deleted, unresolvable callees are omitted — and `detail` renders
+signatures / `res://` paths); SHADOWED_* warnings publish `relatedInformation` at the shadowed
+declaration (messages byte-identical); and **references precision** landed in full (#54 pulled
+forward from Phase 2): `Binding::Call` classifies a `CalleeTarget` (Script + owning class
+path / Native / Unresolved, one consolidated recording site), in-file attribute reads record
+`Binding::Use`, and resolved member targets scan binding-backed with the raw-scan floor
+surviving only where resolution can't decide. Both conformance ratchets hold at **1.0**:
 parser **186/186**, analyzer **300/300**. CI is green (`cargo fmt --check`, `cargo lint`,
-`cargo test --workspace`); three-layer fuzz gate (`parse` + `analyze` + `index_invariants`;
-the analyze target revived and re-wired in #41). Standing release gate: the
-`scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both acceptance projects (a nav-row
-walk is NOT a diagnostics gate; error baselines must hold — warning counts re-based in v1.0.4,
-and the sweep now takes `--strict` + a warning histogram), with the private project swept
-**on Windows with the Windows binary**. Per-milestone exit criteria: `docs/07`; the full
-history: `CHANGELOG.md`.
+`cargo test --workspace`); three-layer fuzz gate (`parse` + `analyze` + `index_invariants`).
+Standing release gate: the `scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both
+acceptance projects (a nav-row walk is NOT a diagnostics gate; error baselines must hold —
+warning counts re-based in v1.0.4, and the sweep takes `--strict` + a warning histogram), with
+the private project swept **on Windows with the Windows binary**. Per-milestone exit criteria:
+`docs/07`; the full history: `CHANGELOG.md`.

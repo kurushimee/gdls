@@ -1,7 +1,8 @@
 //! LSP request handlers.
 
 use gd_analyze::{
-    find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, BindingTargetKind, DtKind,
+    find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, BindingTargetKind,
+    CalleeTarget, DtKind,
 };
 use gd_syntax::ast::{
     ClassNode, ConstantNode, FunctionNode, LiteralNode, Member, NodeId, NodeKind, ParseTree,
@@ -30,16 +31,26 @@ use crate::uri::{path_to_file_uri, uri_to_path, CanonicalKey};
 /// [`lsp_types::DocumentSymbol`] tree — kinds plus byte→position ranges, with the full declaration as
 /// `range` and the identifier as `selection_range`. Reads the shared cached parse (the same one
 /// `publishDiagnostics` uses), so an edit is parsed once.
+///
+/// The nested shape is opt-in: clients advertise
+/// `textDocument.documentSymbol.hierarchicalDocumentSymbolSupport`, and one that didn't (Helix
+/// sends an explicit `false`) must get the flat 3.16 `SymbolInformation[]` fallback instead —
+/// rust-analyzer/gopls/clangd all downgrade the same way (absent ⇒ flat).
 pub fn document_symbol(
     state: &mut ServerState,
     params: DocumentSymbolParams,
 ) -> DocumentSymbolResponse {
+    let hierarchical = state.caps.hierarchical_document_symbols;
     let uri = params.text_document.uri;
     // Single VFS lookup: hold `doc` across the parse and reuse its already-built rope for the
     // mapper (disjoint `&state.vfs` / `&mut state.workspace` borrows compose). Avoids both the
     // redundant hash lookup and re-allocating a rope we already hold.
     let Some(doc) = state.vfs.get(uri.as_str()) else {
-        return DocumentSymbolResponse::Nested(Vec::new());
+        return if hierarchical {
+            DocumentSymbolResponse::Nested(Vec::new())
+        } else {
+            DocumentSymbolResponse::Flat(Vec::new())
+        };
     };
     let text = doc.text();
     let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
@@ -57,7 +68,7 @@ pub fn document_symbol(
         .unwrap_or("")
         .to_string();
 
-    let symbols = parsed
+    let mut symbols: Vec<lsp_types::DocumentSymbol> = parsed
         .symbols
         .iter()
         .map(|s| {
@@ -68,7 +79,57 @@ pub fn document_symbol(
             lsp
         })
         .collect();
-    DocumentSymbolResponse::Nested(symbols)
+    // `detail` from a request-time interface extraction over the SAME parse tree — matches the
+    // open buffer exactly (no index staleness) and renders through the byte-stable formatters
+    // hover already pins. Flat responses drop it naturally (SymbolInformation has no field).
+    let iface = gd_project::extract_interface(&parsed.tree);
+    annotate_symbol_details(&mut symbols, &iface);
+    if hierarchical {
+        DocumentSymbolResponse::Nested(symbols)
+    } else {
+        DocumentSymbolResponse::Flat(flatten_symbols(&symbols, &uri))
+    }
+}
+
+/// The `extends` clause rendered for a class symbol's `detail` — what reference servers show
+/// dimmed next to the class name in the outline.
+fn extends_detail(extends: &gd_project::Extends) -> Option<String> {
+    match extends {
+        gd_project::Extends::None => None,
+        gd_project::Extends::Path(p) => Some(format!("extends \"{p}\"")),
+        gd_project::Extends::Names(names) => Some(format!("extends {}", names.join("."))),
+    }
+}
+
+/// Post-pass pairing the built LSP symbol tree with its [`gd_project::Interface`]: every symbol
+/// at one level IS the class `iface` describes (the A1 root wrapper, or a recursive inner-class
+/// symbol) — its `detail` is the extends clause; member children pair by name against
+/// `iface.members` (GDScript has no overloads, so first-match is exact) and render via
+/// [`format_member_signature`]; CLASS children recurse into the matching `iface.inner`. Symbols
+/// with no interface counterpart (enum values, named enums) keep `detail: None`.
+fn annotate_symbol_details(
+    symbols: &mut [lsp_types::DocumentSymbol],
+    iface: &gd_project::Interface,
+) {
+    for sym in symbols {
+        sym.detail = extends_detail(&iface.extends);
+        let Some(children) = sym.children.as_mut() else {
+            continue;
+        };
+        for child in children {
+            if child.kind == LspSymbolKind::CLASS {
+                if let Some(inner) = iface
+                    .inner
+                    .iter()
+                    .find(|i| i.class_name.as_deref() == Some(child.name.as_str()))
+                {
+                    annotate_symbol_details(std::slice::from_mut(child), inner);
+                }
+            } else if let Some(decl) = iface.members.iter().find(|m| m.name == child.name) {
+                child.detail = format_member_signature(&child.name, decl);
+            }
+        }
+    }
 }
 
 /// Map `gd_syntax`'s frontend symbol kind to LSP's. GDScript signals surface as `EVENT` (the LSP
@@ -85,6 +146,44 @@ fn symbol_kind(kind: gd_syntax::SymbolKind) -> LspSymbolKind {
         Enum => LspSymbolKind::ENUM,
         EnumMember => LspSymbolKind::ENUM_MEMBER,
     }
+}
+
+/// The 3.16-compat projection for clients without `hierarchicalDocumentSymbolSupport`: a
+/// preorder walk emitting [`SymbolInformation`] with the symbol's FULL `range` (the spec's
+/// reveal contract for the flat shape) and `containerName` = the parent symbol's name — the
+/// flatten shape all three reference servers ship.
+#[allow(
+    deprecated,
+    reason = "lsp_types::SymbolInformation::deprecated is a (deprecated) non-optional field we must set"
+)]
+fn flatten_symbols(symbols: &[lsp_types::DocumentSymbol], uri: &Uri) -> Vec<SymbolInformation> {
+    fn walk(
+        out: &mut Vec<SymbolInformation>,
+        symbols: &[lsp_types::DocumentSymbol],
+        uri: &Uri,
+        container: Option<&str>,
+    ) {
+        for sym in symbols {
+            #[allow(deprecated)]
+            out.push(SymbolInformation {
+                name: sym.name.clone(),
+                kind: sym.kind,
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri: uri.clone(),
+                    range: sym.range,
+                },
+                container_name: container.map(str::to_owned),
+            });
+            if let Some(children) = &sym.children {
+                walk(out, children, uri, Some(&sym.name));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&mut out, symbols, uri, None);
+    out
 }
 
 #[allow(
@@ -383,7 +482,7 @@ pub fn definition(
     // (1.6) Cross-file dotted method call (`obj.method()` through a typed var): the attribute
     // identifier inside a call callee records no `Binding::Use` (the reducer's attribute paths
     // are a deliberate recording scope cut — see `AnalysisResult::bindings`), but `reduce_call`
-    // recorded a `Binding::Call` whose `callee_file` names the declaring script. Project the
+    // recorded a `Binding::Call` whose callee target names the declaring script. Project the
     // call binding whose callee-identifier span contains the cursor — the same projection the
     // references handler's call-site click uses (M6-E) — and jump to the declaration. Hover
     // already resolves these through the type table; definition returning null here was the
@@ -395,14 +494,15 @@ pub fn definition(
             let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
             a.bindings().iter().find_map(|b| match b {
                 Binding::Call {
-                    callee_file: Some(f),
+                    callee,
                     callee_name,
                     call_site,
                     ..
                 } if callee_name == &name => {
+                    let f = callee.script_file()?;
                     let spans = spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
                     let ident = spans.get(call_site).copied()?;
-                    (ident.start <= node_byte && node_byte < ident.end).then_some(*f)
+                    (ident.start <= node_byte && node_byte < ident.end).then_some(f)
                 }
                 _ => None,
             })
@@ -498,7 +598,14 @@ fn native_definition(
             name,
             stub_root.as_deref(),
         )?;
-        return stub_location(&path, stub.class_line);
+        // `name.len()` is a byte count, but ensure_class_stub only materializes
+        // identifier-shaped (ASCII) class names — see stub_token_location's encoding note.
+        return stub_token_location(
+            &path,
+            stub.class_line,
+            stub.class_name_col,
+            name.len() as u32,
+        );
     }
 
     // 2. Subscript attribute over a Native-typed base: resolve the member to its declaring
@@ -570,7 +677,7 @@ fn native_definition(
 }
 
 /// Materialize the stub of the class DECLARING `member` (found by the chain walk from `class`)
-/// and anchor at the member's rendered line.
+/// and anchor at the member's NAME token on its rendered line.
 fn native_member_stub_location(
     state: &ServerState,
     class: &str,
@@ -582,16 +689,19 @@ fn native_member_stub_location(
     let declaring = db.name_of(decl.name).to_owned();
     let (path, stub) =
         crate::stubs::ensure_class_stub(&state.stub_cache, db, &declaring, stub_root)?;
-    stub_location(&path, *stub.member_lines.get(member)?)
+    let anchor = *stub.member_lines.get(member)?;
+    stub_token_location(&path, anchor.line, anchor.name_col, anchor.name_len)
 }
 
-/// A zero-width Location at the start of `line` (0-based) in the stub at `path`.
-fn stub_location(path: &camino::Utf8Path, line: u32) -> Option<Location> {
+/// A Location covering a name token on `line` (0-based) of the stub at `path`. The columns are
+/// byte offsets within the line, valid under ANY negotiated position encoding: stub declaration
+/// lines open with fixed ASCII prefixes and engine names are ASCII identifiers (see
+/// [`crate::stubs::MemberAnchor`]).
+fn stub_token_location(path: &camino::Utf8Path, line: u32, col: u32, len: u32) -> Option<Location> {
     let uri = path_to_file_uri(path)?;
-    let pos = Position::new(line, 0);
     Some(Location {
         uri,
-        range: lsp_types::Range::new(pos, pos),
+        range: lsp_types::Range::new(Position::new(line, col), Position::new(line, col + len)),
     })
 }
 
@@ -1453,27 +1563,22 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 ///   method call site; the cursor lands on the `helper` attribute Identifier).
 ///
 /// A bare attribute **property read** (`node.position`, `self.hp`) is *not* a call callee and
-/// returns `false` so it falls through to the raw-identifier scan in `references`. This matters for
-/// recall: the method/signal code path filters to `Binding::Call` records (via
-/// [`push_callee_ident_locations`]), and the analyzer records no binding for a property attribute
-/// read — so routing property reads through it would silently drop every read occurrence. Letting
-/// them use the raw scan restores correct (over-approximating, never under-reporting) recall, which
-/// is the v1 stance for property/field references.
+/// returns `false`, routing it to the non-method classification ([`NonMethodTarget`]): resolved
+/// member reads ride the binding-backed precise path; only unresolvable reads keep the raw-scan
+/// floor.
 ///
-/// The declaration arm deliberately matches a `Function`/`Signal` identifier at *any* class depth —
-/// inner-class methods (`class Foo:` … `func helper():`) included. `Binding::Call` records carry a
-/// `callee_file` but no owning-class path, so a root-class and an inner-class method sharing one
-/// name in one file are indistinguishable at call-site granularity: both declaration clicks take
-/// the project-wide scan and their result sets may mix the two methods' call sites. That is the
-/// same over-approximating, never under-reporting stance as above — routing inner declarations to
-/// the raw-identifier scan instead would *drop* their cross-file call sites (the `name_referencers`
-/// index only sees interface-level names) while still mixing in-file textual matches. Splitting
-/// them cleanly needs the owning class recorded on `Binding::Call` — a post-v1 refinement.
+/// The declaration arm deliberately matches a `Function`/`Signal` identifier at *any* class
+/// depth — inner-class methods (`class Foo:` … `func helper():`) included. The references
+/// method path still filters call sites at FILE granularity, so a root-class and an inner-class
+/// method sharing one name in one file may mix their call-site sets — the bounded residue of
+/// the over-approximating stance. (`CalleeTarget::Script` now records the owning `class_path`;
+/// threading it through the method path's target resolution — which would need the cursor
+/// side's owning class too — is the remaining refinement.)
 ///
-/// Used to decide whether `textDocument/references` uses the project-wide text scan (correct for
-/// method/signal targets reached through body-local typed vars) or the faster `name_referencers`
-/// index (correct for class/type/variable/property targets). Purely structural (O(#nodes), no
-/// analyzer involvement); works identically whether the cursor is on the declaration or a call site.
+/// Used to decide whether `textDocument/references` takes the method path (call-site
+/// projection + project-wide text scan) or the non-method classification. Purely structural
+/// (O(#nodes), no analyzer involvement); works identically whether the cursor is on the
+/// declaration or a call site.
 fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
     // Single pass: short-circuit on a func/signal declaration; otherwise remember the subscript
     // that owns this attribute identifier and collect every `Call` callee node, then decide.
@@ -1517,23 +1622,29 @@ fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
 /// logged at `warn` so operators can see "definition vanished because the file became unreadable"
 /// rather than silently degrading to "no definition found."
 /// Location of `name`'s declaration in `fid`'s head interface (any member kind, incl. named
-/// enums and unnamed-enum hoists — they all carry a `MemberDecl` with a span). Built against the
-/// target file's current text (open buffer wins over disk), like
-/// [`find_global_class_definition`]. Inner-class members aren't head-interface visible and
-/// degrade to `None` (the documented inner-class stance).
+/// enums and unnamed-enum hoists — they all carry a `MemberDecl` with a span), anchored on the
+/// declaration's NAME token (`MemberDecl::name_span`) so cross-file jumps share the in-file
+/// arm's identifier-span shape — never the whole declaration node, which editors would select.
+/// Built against the target file's current text (open buffer wins over disk), with the
+/// [`find_global_class_definition`] validation discipline: the indexed span is accepted only
+/// while its bytes still spell the member name; on drift (open-buffer edits / watcher lag) the
+/// identifier is re-located in a live parse, degrading to the whole-declaration span only when
+/// the member vanished from the live tree — never dropping a previously-working jump.
+/// Inner-class members aren't head-interface visible and degrade to `None` (the documented
+/// inner-class stance).
 fn member_decl_location(
     state: &mut ServerState,
     fid: gd_project::FileId,
     name: &str,
 ) -> Option<Location> {
-    let span = state
+    let (name_span, decl_span) = state
         .workspace
         .index
         .interface(fid)?
         .members
         .iter()
         .find(|m| m.name == name)
-        .map(|m| m.span)?;
+        .map(|m| (m.name_span, m.span))?;
     let path = state.workspace.index.path(fid)?.to_path_buf();
     let uri = path_to_file_uri(&path)?;
     let uri_str = uri.as_str().to_owned();
@@ -1553,9 +1664,19 @@ fn member_decl_location(
     };
     let rope = ropey::Rope::from_str(&text);
     let mapper = PositionMapper::new(&rope, state.encoding);
+    if text.get(name_span.start..name_span.end) == Some(name) {
+        return Some(Location {
+            uri,
+            range: mapper.span_to_range(name_span),
+        });
+    }
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    if let Some(loc) = find_in_file_definition(&parsed.tree, name, &uri, &mapper) {
+        return Some(loc);
+    }
     Some(Location {
         uri,
-        range: mapper.span_to_range(span),
+        range: mapper.span_to_range(decl_span),
     })
 }
 
@@ -1768,13 +1889,20 @@ fn method_scan_candidate_uris(
     out
 }
 
-/// Group a handler's filtered `Binding::Call` stream into `(key, call-site ranges)` pairs,
-/// preserving first-seen order (small N ⇒ linear find). `key_of` derives the grouping key from each
-/// binding (callee identity for `outgoingCalls`, caller name for `incomingCalls`) and returns `None`
-/// to skip a binding (e.g. a future non-`Call` variant). Shared by both callHierarchy handlers.
+/// Group a handler's filtered `Binding::Call` stream into `(key, fromRanges)` pairs, preserving
+/// first-seen order (small N ⇒ linear find). `key_of` derives the grouping key from each binding
+/// (callee identity for `outgoingCalls`, caller name for `incomingCalls`) and returns `None` to
+/// skip a binding (e.g. a future non-`Call` variant). Shared by both callHierarchy handlers.
+///
+/// `callee_spans` (from [`callee_name_token_spans`] over the same file's tree) narrows each
+/// `call_site` — the WHOLE call expression — to its callee name token before mapping, so a
+/// multi-line call contributes a single-identifier-width range. A call with no identifier-shaped
+/// callee (defensive: `super()`, malformed callees) falls back to the full call span rather
+/// than dropping the range.
 fn group_call_ranges<'a, K: PartialEq>(
     bindings: impl Iterator<Item = &'a Binding>,
     mapper: &PositionMapper,
+    callee_spans: &FxHashMap<ByteSpan, ByteSpan>,
     key_of: impl Fn(&Binding) -> Option<K>,
 ) -> Vec<(K, Vec<Range>)> {
     let mut groups: Vec<(K, Vec<Range>)> = Vec::new();
@@ -1785,7 +1913,8 @@ fn group_call_ranges<'a, K: PartialEq>(
         let Binding::Call { call_site, .. } = binding else {
             continue; // key_of only yields Some for Call bindings; defensive for non_exhaustive
         };
-        let range = mapper.span_to_range(*call_site);
+        let token_span = callee_spans.get(call_site).copied().unwrap_or(*call_site);
+        let range = mapper.span_to_range(token_span);
         if let Some((_, ranges)) = groups.iter_mut().find(|(k, _)| *k == key) {
             ranges.push(range);
         } else {
@@ -1801,29 +1930,38 @@ fn group_call_ranges<'a, K: PartialEq>(
 /// server to resolve project-wide references for the symbol denoted by the given text document
 /// position." Returns `Location[]` or `null`. Source: <https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_references>.
 ///
-/// Algorithm (per the M4 plan §6 + `docs/03 §7.1`, updated for M6-E):
-///   1. Resolve cursor → identifier name.
+/// Algorithm (per the M4 plan §6 + `docs/03 §7.1`, updated for M6-E and the precision rework):
+///   1. Resolve cursor → identifier name, then classify the target:
+///      - **Method/signal targets** (structural check) keep the M6-E shape: call-site
+///        projection filtered by the callee's declaring file where resolved, raw scan where
+///        not.
+///      - **Non-method targets** classify via [`NonMethodTarget`]: a Use binding at the cursor
+///        or a root-class member declaration ⇒ a resolved MEMBER target; an enclosing-function
+///        local/parameter ⇒ a LOCAL target; everything else (class/enum/type names, autoloads,
+///        unresolvable buffers) ⇒ the raw-scan residue.
 ///   2. Choose candidate files:
-///      - **Method/signal targets** (M6-E) and **autoload singleton names** (M6-D): project-wide
-///        textual scan matching Godot's `gdscript_workspace.cpp:472` two-phase strategy — enumerate
-///        ALL project files from the index, read text (VFS/disk; no analysis), keep only files whose
-///        text contains `name` as a substring. This catches callers that reach the method through a
-///        body-local typed var (`var l: Lib = Lib.new(); l.helper()`) that wouldn't appear in
-///        `name_referencers`, and autoload names (`Global`) which appear only in function bodies,
-///        never in interface-level annotations.
-///      - **Class/type/variable targets**: `Index::name_referencers(name)` fast-path (interface-pass
-///        filter); these can only be reached through interface-level type annotations.
+///      - Method/signal/autoload targets AND resolved member targets: project-wide textual
+///        scan matching Godot's `gdscript_workspace.cpp:472` two-phase strategy — enumerate
+///        ALL project files, read text (VFS/disk; no analysis), keep files whose text contains
+///        `name`. This catches accesses through body-local typed vars
+///        (`var l: Lib = Lib.new(); l.helper()` / `l.speed`) that never appear in
+///        `name_referencers`.
+///      - Local targets: none (locals cannot be referenced cross-file).
+///      - Residue targets: `Index::name_referencers(name)` fast-path (interface-pass filter).
 ///   3. For each candidate (plus the current buffer): lazy-parse, lazy-analyze, then collect
-///      occurrences two ways and de-dupe: (a) the parser-level identifier scan
-///      (`push_identifier_locations`) — every `Identifier` node named `name`, covering call-site
-///      callees, `extends Foo`, `class_name`, and identifier-typed annotations at the precise
-///      identifier range; (b) the analyzer's `Binding::Use` records (`push_binding_locations`) for
-///      resolved member/identifier uses (a strict-subset cross-check that de-dupes exactly against
-///      the identifier scan). `Binding::Call` is intentionally NOT projected — its span is the whole
-///      call expression, and the identifier scan already emits the callee at the correct narrower
-///      range, so projecting both double-reported every call site.
-///   4. If `params.context.include_declaration`, prepend the declaration site
-///      (`find_in_file_definition` / `find_global_class_definition` from the M3 definition path).
+///      and de-dupe per the classification: resolved member targets project ONLY
+///      `Binding::Use` records filtered by `(declaring file, name)`
+///      (`push_use_binding_locations_for`) — the raw scan's cross-class bleed is exactly what
+///      this removes; local targets scan identifiers within the enclosing function; residue
+///      targets keep both the loose binding scan and the raw identifier scan
+///      (`push_identifier_locations` — `extends Foo`, `class_name`, annotations). The
+///      never-under-report floor thus survives exactly where resolution can't decide.
+///      `Binding::Call` is intentionally NOT projected on non-method paths — its span is the
+///      whole call expression, and callee identifiers ride the scans above.
+///   4. Resolve the declaration site unconditionally (`find_in_file_definition` /
+///      `find_global_class_definition` from the M3 definition path):
+///      `includeDeclaration: true` prepends it; `false` FILTERS any scan hit on it at final
+///      assembly.
 ///
 /// Returns `None` when the cursor doesn't land on an identifier (LSP wire = null). Returns
 /// `Some(vec)` (possibly empty) otherwise.
@@ -1924,12 +2062,13 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         {
             let cur_result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
             // Look for a Binding::Call whose callee identifier span (in the parse tree)
-            // contains the cursor byte. If found (call-site click), target_file = callee_file.
-            // The shared callee-span map (`callee_spans`, hoisted above) is built lazily on the
-            // first matching binding and reused by push_callee_ident_locations below.
+            // contains the cursor byte. If found (call-site click), target_file = the callee's
+            // Script-declaring file. The shared callee-span map (`callee_spans`, hoisted above)
+            // is built lazily on the first matching binding and reused by
+            // push_callee_ident_locations below.
             cur_result.bindings().iter().find_map(|b| {
                 if let Binding::Call {
-                    callee_file,
+                    callee,
                     callee_name,
                     call_site,
                     ..
@@ -1940,7 +2079,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                             callee_spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
                         if let Some(ident_span) = spans.get(call_site).copied() {
                             if ident_span.start <= byte && byte < ident_span.end {
-                                return Some(*callee_file);
+                                return Some(callee.script_file());
                             }
                         }
                     }
@@ -1952,11 +2091,11 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         };
         // Distinguish the two None origins that the old `.flatten().or(current_fid)` conflated —
         // collapsing them dropped every cross-file reference for native subscript calls
-        // (e.g. `node.queue_free()`, whose Binding::Call carries callee_file: None):
+        // (e.g. `node.queue_free()`, whose Binding::Call classifies a non-Script callee):
         //   Some(Some(f)) — call-site click on a resolved callee: the declaring file is `f`.
         //   Some(None)    — call-site click on a NATIVE/unresolved callee: keep target_file None so
         //                   the scan falls back to push_identifier_locations (raw text scan) rather
-        //                   than filtering on a callee_file that no Binding::Call carries.
+        //                   than filtering on a Script file no Binding::Call carries.
         //   None          — no Binding::Call at the cursor (declaration-site click): the current
         //                   file declares the method, so target_file = current_fid.
         match target_file_from_binding {
@@ -1967,18 +2106,48 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         None
     };
 
-    // include_declaration: prepend the declaration site when requested.
+    // Classify NON-method targets BEFORE declaration resolution — a LOCAL target's declaration
+    // lives inside its function, and resolving it through the class-member table would return a
+    // same-named member's declaration instead. See [`NonMethodTarget`]: a resolved member scans
+    // binding-backed, a local scans its enclosing function, and only the unresolved residue
+    // keeps the raw-scan floor.
+    let mut non_method_target = NonMethodTarget::Unresolved;
+    if !is_method_or_signal && !is_autoload {
+        if let Some(p) = current_path
+            .as_ref()
+            .filter(|p| p.extension() == Some("gd"))
+        {
+            let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+            let node_span = parsed.tree.get(node_id).span;
+            non_method_target = classify_non_method_target(
+                &parsed.tree,
+                &result,
+                node_span,
+                byte,
+                &name,
+                current_fid,
+            );
+        }
+    }
+
+    // Resolve the declaration site(s) UNCONDITIONALLY — `includeDeclaration` is a filter, not
+    // just a prepend: when `true` the declaration joins the result up front, and when `false`
+    // any scan hit on the declaration's own name token must be REMOVED at final assembly (the
+    // raw identifier scan below emits every matching token, declaration included; reference
+    // servers implement the flag as exactly this filter).
+    //
     // For method/signal targets, the declaring file may be different from the current file
     // (cross-file call-site click). When target_file is known and differs from the current file,
     // read the declaring file and use find_in_file_definition on its tree to get the narrow
     // identifier span (not MemberDecl.span, which is the whole func node).
-    if params.context.include_declaration {
+    let declaration_locations: Vec<Location> = {
+        let mut decls = Vec::new();
         let decl_found = if is_method_or_signal {
             if let Some(tf) = target_file {
                 if current_fid.is_some_and(|cf| cf == tf) {
                     // Declaration-site click: the current file IS the declaring file.
                     if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-                        locations.push(loc);
+                        decls.push(loc);
                         true
                     } else {
                         false
@@ -2009,7 +2178,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                             )
                         });
                     if let Some(loc) = decl_loc {
-                        locations.push(loc);
+                        decls.push(loc);
                         true
                     } else {
                         false
@@ -2027,26 +2196,39 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             // autoload script's start-of-file location (mirrors the M6-D definition handler).
             if is_autoload {
                 if let Some(loc) = find_autoload_definition(state, &name) {
-                    locations.push(loc);
+                    decls.push(loc);
+                }
+            } else if let NonMethodTarget::Local(fn_span) = &non_method_target {
+                // A local's declaration is its own identifier inside the enclosing function —
+                // find_in_file_definition would wrongly return a same-named class member's.
+                if let Some(loc) =
+                    local_declaration_location(&parsed.tree, *fn_span, &name, &uri, &mapper)
+                {
+                    decls.push(loc);
                 }
             } else if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-                locations.push(loc);
+                decls.push(loc);
             } else if let Some(loc) = find_global_class_definition(state, &name) {
-                locations.push(loc);
+                decls.push(loc);
             }
         }
+        decls
+    };
+    if params.context.include_declaration {
+        locations.extend(declaration_locations.iter().cloned());
     }
 
-    // Always scan the current file's bindings — name_referencers is the interface-level filter
-    // (cross-file dependents), not the self-references set. The body of the current file may
-    // contain many uses of `name` that name_referencers won't surface.
+    // Always scan the current file — name_referencers is the interface-level filter (cross-file
+    // dependents), not the self-references set. The body of the current file may contain many
+    // uses of `name` that name_referencers won't surface. The analysis is the cached result the
+    // classification above already computed.
     if let Some(p) = current_path
         .as_ref()
         .filter(|p| p.extension() == Some("gd"))
     {
         let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
-        push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
         if is_method_or_signal {
+            push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
             // For method/signal targets: use callee-filtered call projection instead of raw
             // identifier scan to avoid false positives from identically-named declarations.
             // Only project when target_file is Some — if None (native/unresolved), fall back
@@ -2066,12 +2248,39 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
             }
         } else {
-            // Non-method targets: raw identifier scan picks up `extends Foo`, type annotations,
-            // `class_name`, and other parser-level refs the reducer doesn't record. Cross-file
-            // candidates below already get this scan; without it here, in-file extends/type/
-            // class_name references to `name` would be silently under-reported. The dedup pass
-            // at the end collapses any overlap with the binding scan.
-            push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
+            match &non_method_target {
+                NonMethodTarget::Member(tf) => {
+                    // Binding-backed: every recorded use resolving to (declaring file, name) —
+                    // bare member uses, `self.x` writes/reads, typed attribute accesses. The
+                    // raw scan is NOT run here; its cross-class bleed is the bug this closes.
+                    push_use_binding_locations_for(
+                        &mut locations,
+                        &result,
+                        *tf,
+                        &name,
+                        &uri,
+                        &mapper,
+                    );
+                }
+                NonMethodTarget::Local(fn_span) => {
+                    push_identifier_locations_within(
+                        &mut locations,
+                        &parsed.tree,
+                        &name,
+                        *fn_span,
+                        &uri,
+                        &mapper,
+                    );
+                }
+                NonMethodTarget::Unresolved => {
+                    // Residue floor (incl. autoload + Class/Enum targets): the binding scan
+                    // plus the raw identifier scan, which picks up `extends Foo`, type
+                    // annotations, `class_name`, and other parser-level refs the reducer
+                    // doesn't record. The dedup pass collapses overlap.
+                    push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
+                    push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
+                }
+            }
         }
     }
 
@@ -2099,29 +2308,44 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     let candidates: Vec<(camino::Utf8PathBuf, Uri)> = if is_method_or_signal || is_autoload {
         method_scan_candidate_uris(state, &name, current_fid, "references")
     } else {
-        // Fast-path for class/type/variable names: only files whose interface mentions `name` can
-        // reference it; `name_referencers` already has that set. (Autoloads are excluded — they
-        // take the project-wide textual scan above since they never appear in interface sets.)
-        let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
-        for fid in state.workspace.index.name_referencers(&name) {
-            candidate_fids.insert(fid);
-        }
-        let mut out = Vec::new();
-        for fid in candidate_fids {
-            let Some(p) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
-                continue;
-            };
-            if current_path.as_deref().is_some_and(|e| normalize_eq(e, &p)) {
-                continue;
+        match &non_method_target {
+            // Resolved member: the same project-wide textual fan-out method targets use —
+            // also a RECALL fix: `a.speed` through a body-local typed var never names `speed`
+            // in the accessor's interface, so the old `name_referencers` set missed those
+            // files entirely.
+            NonMethodTarget::Member(_) => {
+                method_scan_candidate_uris(state, &name, current_fid, "references")
             }
-            match path_to_file_uri(&p) {
-                Some(uri) => out.push((p, uri)),
-                None => log::warn!(
-                    "references: dropping candidate {p} — path_to_file_uri rejected the path"
-                ),
+            // Locals can never be referenced from another file — no fan-out at all.
+            NonMethodTarget::Local(_) => Vec::new(),
+            NonMethodTarget::Unresolved => {
+                // Fast-path for class/type names: only files whose interface mentions `name`
+                // can reference it; `name_referencers` already has that set. (Autoloads are
+                // excluded — they take the project-wide textual scan above since they never
+                // appear in interface sets.)
+                let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
+                for fid in state.workspace.index.name_referencers(&name) {
+                    candidate_fids.insert(fid);
+                }
+                let mut out = Vec::new();
+                for fid in candidate_fids {
+                    let Some(p) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+                        continue;
+                    };
+                    if current_path.as_deref().is_some_and(|e| normalize_eq(e, &p)) {
+                        continue;
+                    }
+                    match path_to_file_uri(&p) {
+                        Some(uri) => out.push((p, uri)),
+                        None => log::warn!(
+                            "references: dropping candidate {p} — path_to_file_uri rejected \
+                             the path"
+                        ),
+                    }
+                }
+                out
             }
         }
-        out
     };
 
     for (path, cand_uri) in candidates {
@@ -2132,8 +2356,8 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         };
         let rope = Rope::from_str(&text);
         let cand_mapper = PositionMapper::new(&rope, enc);
-        push_binding_locations(&mut locations, &cand_result, &name, &cand_uri, &cand_mapper);
         if is_method_or_signal {
+            push_binding_locations(&mut locations, &cand_result, &name, &cand_uri, &cand_mapper);
             // For method/signal targets: use callee-filtered call projection (accurate) rather
             // than raw identifier scan (which would pick up unrelated same-named declarations
             // like `func helper():` in other.gd). When target_file is None (native/unresolved),
@@ -2160,9 +2384,40 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 );
             }
         } else {
-            // Non-method targets: identifier scan picks up `extends Foo` and other parser-level
-            // refs the reducer doesn't record. De-dupes happen below.
-            push_identifier_locations(&mut locations, &parsed.tree, &name, &cand_uri, &cand_mapper);
+            match &non_method_target {
+                NonMethodTarget::Member(tf) => {
+                    // Binding-backed only — a candidate's same-named member of a DIFFERENT
+                    // class records a different declaring file and is filtered out here.
+                    push_use_binding_locations_for(
+                        &mut locations,
+                        &cand_result,
+                        *tf,
+                        &name,
+                        &cand_uri,
+                        &cand_mapper,
+                    );
+                }
+                // Local targets fan out no candidates (unreachable; kept exhaustive).
+                NonMethodTarget::Local(_) => {}
+                NonMethodTarget::Unresolved => {
+                    // Residue floor: identifier scan picks up `extends Foo` and other
+                    // parser-level refs the reducer doesn't record. De-dupes happen below.
+                    push_binding_locations(
+                        &mut locations,
+                        &cand_result,
+                        &name,
+                        &cand_uri,
+                        &cand_mapper,
+                    );
+                    push_identifier_locations(
+                        &mut locations,
+                        &parsed.tree,
+                        &name,
+                        &cand_uri,
+                        &cand_mapper,
+                    );
+                }
+            }
         }
     }
 
@@ -2179,15 +2434,243 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     });
     locations.dedup_by(|a, b| a.uri.as_str() == b.uri.as_str() && a.range == b.range);
 
+    // includeDeclaration:false — the FILTER half of the flag (final assembly, so it holds no
+    // matter which scan produced the hit): drop any result whose (uri, range) exactly equals a
+    // declaration site. Exact equality is sound — declaration and scan locations for the same
+    // identifier both come from `mapper.span_to_range` over the same span source.
+    if !params.context.include_declaration {
+        locations.retain(|l| {
+            !declaration_locations
+                .iter()
+                .any(|d| d.uri.as_str() == l.uri.as_str() && d.range == l.range)
+        });
+    }
+
     Some(locations)
+}
+
+/// How `references` should scan for a NON-method cursor target — resolved before any scan runs,
+/// so precision rides the binding layer where resolution succeeded and the raw-scan floor
+/// survives exactly where it can't decide.
+enum NonMethodTarget {
+    /// The cursor's symbol is a member DECLARED in this file: scan `Binding::Use` records
+    /// filtered by `(declaring file, name)` — two unrelated `var speed`s in different classes
+    /// stop reporting each other's sites.
+    Member(gd_project::FileId),
+    /// A local/parameter of the enclosing function (its span): scan identifiers within that
+    /// function only — locals can never be referenced cross-file, so the old project-wide scan
+    /// was pure over-report.
+    Local(ByteSpan),
+    /// Couldn't resolve — the documented "over-approximate, never under-report" residue floor
+    /// (raw identifier scan). Class/Enum/EnumValue targets classify here DELIBERATELY:
+    /// `extends Foo`, `class_name`, and type annotations are resolver-level references with no
+    /// bindings, so a binding-only scan would under-report them.
+    Unresolved,
+}
+
+/// Classify a non-method cursor target (see [`NonMethodTarget`]). Resolution sources, in order:
+/// a `Binding::Use` at the exact cursor span (attribute reads, bare member uses — inheriting
+/// the analyzer's resolution by construction), the root class's own member declarations (a
+/// declaration click), and the enclosing function's local declarations.
+fn classify_non_method_target(
+    tree: &ParseTree,
+    result: &AnalysisResult,
+    node_span: ByteSpan,
+    byte: usize,
+    name: &str,
+    current_fid: Option<gd_project::FileId>,
+) -> NonMethodTarget {
+    for b in result.bindings() {
+        if let Binding::Use {
+            target_file: Some(f),
+            target_kind,
+            target_name,
+            site,
+        } = b
+        {
+            // Kind guard: only Class/Enum/EnumValue are excluded (their references live in
+            // annotations/extends/match-patterns the reducer doesn't record — binding-only
+            // would under-report them). Function/Signal/Variable/Constant/Member DELIBERATELY
+            // pass: a function or signal reaching here is a NON-call-position reference
+            // (`var f = obj.method`, `obj.sig` reads — call positions took the method path),
+            // and record_member_use's precise kinds resolve exactly those. Parameter never
+            // reaches here today (locals/params record no Use) — if it ever does, it belongs
+            // with the passing set, not the exclusions.
+            if *site == node_span
+                && target_name == name
+                && !matches!(
+                    target_kind,
+                    BindingTargetKind::Class
+                        | BindingTargetKind::Enum
+                        | BindingTargetKind::EnumValue
+                )
+            {
+                return NonMethodTarget::Member(*f);
+            }
+        }
+    }
+    if let Some(fid) = current_fid {
+        if let Some(root) = tree.root() {
+            if let NodeKind::Class(class) = &root.kind {
+                for m in &class.members {
+                    // Class/Enum declaration clicks keep the union path (their references
+                    // live in annotations/extends the reducer doesn't record).
+                    if matches!(m, Member::Class(_) | Member::Enum(_)) {
+                        continue;
+                    }
+                    if let Some(decl) = member_named(tree, m, name) {
+                        if let Some(ident) = declaration_identifier(tree, decl) {
+                            if tree.get(ident).span == node_span {
+                                return NonMethodTarget::Member(fid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(fn_span) = enclosing_function_declaring(tree, byte, name) {
+        return NonMethodTarget::Local(fn_span);
+    }
+    NonMethodTarget::Unresolved
+}
+
+/// The span of the smallest function containing `byte`, iff that function declares `name` as a
+/// parameter or a body-local var/const. A class-level member can never pass the span filter
+/// (declarations outside the function body), so a member target never mis-classifies as local.
+///
+/// Two bounded arena passes (find the enclosing function, then scan its contained nodes) — the
+/// flat arena has no parent pointers or per-subtree iteration, so this is the same O(#nodes)
+/// family as the sibling cursor walks (`innermost_node_at`, `is_member_or_attribute_ident`)
+/// and runs at most once per references request.
+fn enclosing_function_declaring(tree: &ParseTree, byte: usize, name: &str) -> Option<ByteSpan> {
+    let mut best: Option<ByteSpan> = None;
+    for id in tree.iter_ids() {
+        if let NodeKind::Function(_) = &tree.get(id).kind {
+            let span = tree.get(id).span;
+            if span.start <= byte
+                && byte < span.end
+                && best.is_none_or(|s| span.end - span.start < s.end - s.start)
+            {
+                best = Some(span);
+            }
+        }
+    }
+    let fn_span = best?;
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if node.span.start < fn_span.start || node.span.end > fn_span.end {
+            continue;
+        }
+        let ident = match &node.kind {
+            NodeKind::Parameter(p) => p.identifier,
+            NodeKind::Variable(v) => v.identifier,
+            NodeKind::Constant(c) => c.identifier,
+            _ => None,
+        };
+        if ident.is_some_and(|iid| ident_name(tree, iid) == name) {
+            return Some(fn_span);
+        }
+    }
+    None
+}
+
+/// Append a [`Location`] for every [`Binding::Use`] that resolved to the member `name` DECLARED
+/// in `target_file` — the precise, binding-backed references path for resolved member targets.
+/// The raw identifier scan is deliberately NOT run alongside this: its project-wide cross-class
+/// bleed is exactly what the binding filter removes.
+fn push_use_binding_locations_for(
+    out: &mut Vec<Location>,
+    result: &AnalysisResult,
+    target_file: gd_project::FileId,
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
+    for binding in result.bindings() {
+        if let Binding::Use {
+            target_file: Some(tf),
+            target_name,
+            site,
+            ..
+        } = binding
+        {
+            if *tf == target_file && target_name == name {
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(*site),
+                });
+            }
+        }
+    }
+}
+
+/// The declaration [`Location`] of the local/parameter `name` inside `scope` (the enclosing
+/// function's span): the first `Parameter`/`Variable`/`Constant` identifier of that name in
+/// arena order — the local-target analog of [`find_in_file_definition`].
+fn local_declaration_location(
+    tree: &ParseTree,
+    scope: ByteSpan,
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) -> Option<Location> {
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if node.span.start < scope.start || node.span.end > scope.end {
+            continue;
+        }
+        let ident = match &node.kind {
+            NodeKind::Parameter(p) => p.identifier,
+            NodeKind::Variable(v) => v.identifier,
+            NodeKind::Constant(c) => c.identifier,
+            _ => None,
+        };
+        if let Some(iid) = ident {
+            if ident_name(tree, iid) == name {
+                return Some(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(tree.get(iid).span),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// [`push_identifier_locations`] restricted to identifiers inside `scope` — the function-scoped
+/// references path for locals/parameters. A same-named member ACCESS inside the same function
+/// still matches (bounded over-approximation); the cross-function and cross-file bleed is gone.
+fn push_identifier_locations_within(
+    out: &mut Vec<Location>,
+    tree: &ParseTree,
+    name: &str,
+    scope: ByteSpan,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if node.span.start < scope.start || node.span.end > scope.end {
+            continue;
+        }
+        if let NodeKind::Identifier(i) = &node.kind {
+            if i.name == name {
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(node.span),
+                });
+            }
+        }
+    }
 }
 
 /// Append a [`Location`] for every [`Binding::Use`] in `result.bindings` whose `target_name` is
 /// `name`. [`Binding::Call`] is deliberately excluded (see the body comment): the callee-identifier
 /// occurrence of every call is already covered by [`push_identifier_locations`] at the correct,
-/// narrower range. The kind filter is intentionally loose for v1 — over-reporting hits for distinct
-/// same-named symbols is preferable to under-reporting, and `Index.name_referencers` already
-/// narrowed the candidate set before we got here.
+/// narrower range. The name-only filter belongs to the UNRESOLVED-target residue path (and the
+/// method path's loose current-file scan) — resolved member targets take
+/// [`push_use_binding_locations_for`]'s file-filtered projection instead.
 fn push_binding_locations(
     out: &mut Vec<Location>,
     result: &AnalysisResult,
@@ -2278,6 +2761,29 @@ fn callee_ident_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
     map
 }
 
+/// Call-node span → callee NAME-token span, for BOTH callee shapes: subscript-attribute callees
+/// (`l.helper()` → `helper`, via [`callee_ident_spans`]) and bare identifier callees
+/// (`helper()` → `helper`). Used by `prepare_call_hierarchy` to resolve a cursor on a call-site
+/// callee, and by both callHierarchy follow-up handlers to narrow `Binding::Call.call_site` —
+/// the whole call expression — down to the callee token for `fromRanges` (the conventional
+/// "ranges at which the calls appear": rust-analyzer/gopls/clangd all emit the name token).
+fn callee_name_token_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
+    let mut map = callee_ident_spans(tree);
+    for nid in tree.iter_ids() {
+        let node = tree.get(nid);
+        let NodeKind::Call(call) = &node.kind else {
+            continue;
+        };
+        let Some(callee_id) = call.callee else {
+            continue;
+        };
+        if matches!(tree.get(callee_id).kind, NodeKind::Identifier(_)) {
+            map.insert(node.span, tree.get(callee_id).span);
+        }
+    }
+    map
+}
+
 /// Append a [`Location`] for every [`Binding::Call`] in `result.bindings` where
 /// `callee_file == target_file && callee_name == name`, emitting the **narrow callee-identifier
 /// span** derived from the parse tree (via [`callee_ident_span`]).
@@ -2288,9 +2794,9 @@ fn callee_ident_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
 /// declared in `target_file`. Only subscript-attribute call sites are emitted here; bare and
 /// `super` call sites are intentionally absent — but NOT dropped from references. The dispatcher
 /// pre-reduces a bare callee (and a subscript callee's base) as an identifier, recording a
-/// `Binding::Use` at that narrow span which [`push_binding_locations`] reports. (Bare calls DO carry
-/// `callee_file == Some(declaring_file)` via `resolve_callee_file`/WP-RD6 — recall for them rides
-/// that `Use` binding, not this call projection; see `references_finds_bare_same_file_call` and
+/// `Binding::Use` at that narrow span which [`push_binding_locations`] reports. (Bare calls DO
+/// classify their declaring script on `CalleeTarget::Script` — recall for them rides that `Use`
+/// binding, not this call projection; see `references_finds_bare_same_file_call` and
 /// `references_finds_signal_emit_and_connect_sites`.)
 ///
 /// Caller must ensure `target_file` is `Some` before calling; the `None` guard lives in
@@ -2314,13 +2820,13 @@ fn push_callee_ident_locations(
 ) {
     for binding in result.bindings() {
         if let Binding::Call {
-            callee_file: Some(cf),
+            callee,
             callee_name,
             call_site,
             ..
         } = binding
         {
-            if *cf == target_file && callee_name == name {
+            if callee.script_file() == Some(target_file) && callee_name == name {
                 let spans = callee_spans.get_or_insert_with(|| callee_ident_spans(tree));
                 if let Some(span) = spans.get(call_site).copied() {
                     out.push(Location {
@@ -2717,33 +3223,19 @@ pub fn prepare_call_hierarchy(
                 // `Binding::Use` there), prepare needs BOTH callee shapes: a bare in-file call
                 // (`_find_attached_meshes()`) records a `Binding::Call` too, and the cursor on
                 // its identifier must prepare that callee rather than the enclosing function.
-                let build_spans = || {
-                    let mut map = callee_ident_spans(&parsed.tree);
-                    for nid in parsed.tree.iter_ids() {
-                        let node = parsed.tree.get(nid);
-                        let NodeKind::Call(call) = &node.kind else {
-                            continue;
-                        };
-                        let Some(callee_id) = call.callee else {
-                            continue;
-                        };
-                        if matches!(parsed.tree.get(callee_id).kind, NodeKind::Identifier(_)) {
-                            map.insert(node.span, parsed.tree.get(callee_id).span);
-                        }
-                    }
-                    map
-                };
                 let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
                 let target = analyzed.bindings().iter().find_map(|b| match b {
                     Binding::Call {
-                        callee_file: Some(f),
+                        callee,
                         callee_name,
                         call_site,
                         ..
                     } if callee_name == &name => {
-                        let spans = spans.get_or_insert_with(build_spans);
+                        let f = callee.script_file()?;
+                        let spans =
+                            spans.get_or_insert_with(|| callee_name_token_spans(&parsed.tree));
                         let ident = spans.get(call_site).copied()?;
-                        (ident.start <= byte && byte < ident.end).then_some(*f)
+                        (ident.start <= byte && byte < ident.end).then_some(f)
                     }
                     _ => None,
                 });
@@ -2766,7 +3258,7 @@ pub fn prepare_call_hierarchy(
                             name,
                             kind: LspSymbolKind::FUNCTION,
                             tags: None,
-                            detail: None,
+                            detail: script_detail(state, &path),
                             uri: callee_uri,
                             range,
                             selection_range,
@@ -2812,19 +3304,32 @@ pub fn prepare_call_hierarchy(
     let ident_range = mapper.span_to_range(parsed.tree.get(ident_id).span);
 
     let data = serde_json::json!({ "uri": uri.as_str(), "name": fn_name });
+    let detail = uri_to_path(&uri).and_then(|p| script_detail(state, &p));
 
     #[allow(deprecated)]
     let item = CallHierarchyItem {
         name: fn_name,
         kind: LspSymbolKind::FUNCTION,
         tags: None,
-        detail: None,
+        detail,
         uri,
         range: fn_range,
         selection_range: ident_range,
         data: Some(data),
     };
     Some(vec![item])
+}
+
+/// gopls-style container disambiguator for call-hierarchy items' `detail`: the script's
+/// `res://` path (same-named GDScript lifecycle callers — `_ready` in every script — are
+/// otherwise indistinguishable in the tree), falling back to the file basename for
+/// out-of-root paths.
+fn script_detail(state: &ServerState, path: &camino::Utf8Path) -> Option<String> {
+    state
+        .workspace
+        .project
+        .path_to_res(path)
+        .or_else(|| path.file_name().map(str::to_owned))
 }
 
 /// Find a function declaration by bare name anywhere in `tree` (root class methods or inner-class
@@ -2850,9 +3355,11 @@ fn function_decl_spans(
 }
 
 /// A zero-width LSP range at file start. The documented degrade for a [`CallHierarchyItem`] whose
-/// symbol declaration can't be located (native/unresolved callee, the `<top>` caller, or an
-/// unreadable file): LSP requires *a* location, and pointing at `(0,0)` is honest ("somewhere in
-/// this file") rather than the wrong-but-specific call-site range the pre-fix code shipped.
+/// symbol declaration can't be located (the synthetic `<top>` caller, or an unreadable file):
+/// LSP requires *a* location, and pointing at `(0,0)` is honest ("somewhere in this file")
+/// rather than the wrong-but-specific call-site range the pre-fix code shipped. Native and
+/// unresolved OUTGOING callees never reach this — they anchor into their API stub or are
+/// omitted entirely.
 fn file_start_range() -> Range {
     let zero = Position {
         line: 0,
@@ -2925,7 +3432,14 @@ pub fn outgoing_calls(
     state: &mut ServerState,
     params: CallHierarchyOutgoingCallsParams,
 ) -> Option<Vec<CallHierarchyOutgoingCall>> {
-    let (uri, fn_name) = decode_call_hierarchy_data(&params.item)?;
+    let (uri, fn_name) = resolve_call_hierarchy_item(state, &params.item)?;
+    // Stub API pages have no project call graph: expanding a stub-anchored item (the
+    // references-view hands native `to` items back verbatim) gets a clean empty list — never
+    // an error, and never an attempt to analyze pseudo-GDScript. Mirrors publish_diagnostics'
+    // suppression gate.
+    if crate::stubs::is_stub_uri(&uri, state.options.stub_cache_dir.as_deref()) {
+        return Some(Vec::new());
+    }
     let path = crate::uri::uri_to_path(&uri)?;
     let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
         Some(t) => t,
@@ -2954,76 +3468,116 @@ pub fn outgoing_calls(
     let mapper = PositionMapper::new(&rope, enc);
     let result = analyze_with_request_token(state, &key, &path, &parsed.tree, &text);
 
-    // Group calls by (callee_file, callee_name), preserving first-seen order. `find_outgoing_calls`
-    // already filtered to Call bindings whose caller matches `fn_name`.
-    type CalleeKey = (Option<gd_project::FileId>, String);
+    // Group calls by (callee target, callee_name), preserving first-seen order.
+    // `find_outgoing_calls` already filtered to Call bindings whose caller matches `fn_name`.
+    type CalleeKey = (CalleeTarget, String);
+    let callee_spans = callee_name_token_spans(&parsed.tree);
     let groups: Vec<(CalleeKey, Vec<lsp_types::Range>)> = group_call_ranges(
         find_outgoing_calls(&result, fn_name.as_str()),
         &mapper,
+        &callee_spans,
         |b| match b {
             Binding::Call {
-                callee_file,
+                callee,
                 callee_name,
                 ..
-            } => Some((*callee_file, callee_name.clone())),
+            } => Some((callee.clone(), callee_name.clone())),
             _ => None,
         },
     );
 
+    let stub_root = state.options.stub_cache_dir.clone();
     let mut out = Vec::with_capacity(groups.len());
-    for ((callee_file, callee_name), ranges) in groups {
-        let (to_uri, to_range, to_selection) = match callee_file {
-            Some(fid) => match state.workspace.index.path(fid).map(|p| p.to_path_buf()) {
-                Some(path) => match path_to_file_uri(&path) {
-                    Some(u) => {
-                        // The `to` item locates the callee's DECLARATION (LSP 3.17), not the call
-                        // site — load the callee's file and resolve `func callee_name`'s spans.
-                        let (range, selection) =
-                            resolve_fn_item_ranges(state, &path, &u, &callee_name);
-                        (u, range, selection)
-                    }
+    for ((callee, callee_name), ranges) in groups {
+        let (to_uri, to_range, to_selection, to_detail) = match callee {
+            CalleeTarget::Script { file: fid, .. } => {
+                match state.workspace.index.path(fid).map(|p| p.to_path_buf()) {
+                    Some(path) => match path_to_file_uri(&path) {
+                        Some(u) => {
+                            // The `to` item locates the callee's DECLARATION (LSP 3.17), not the
+                            // call site — load the callee's file and resolve `func callee_name`'s
+                            // spans.
+                            let (range, selection) =
+                                resolve_fn_item_ranges(state, &path, &u, &callee_name);
+                            let detail = script_detail(state, &path);
+                            (u, range, selection, detail)
+                        }
+                        None => {
+                            log::debug!(
+                                "outgoingCalls: dropping callee {callee_name} — \
+                                 path_to_file_uri({path}) rejected the path"
+                            );
+                            continue;
+                        }
+                    },
                     None => {
-                        log::debug!(
-                            "outgoingCalls: dropping callee {callee_name} — \
-                             path_to_file_uri({path}) rejected the path"
+                        // A CalleeTarget::Script carried a fid the Index has no path for. This
+                        // is NOT an Index-internal invariant — Index::verify() validates the
+                        // Index's own structures (interfaces / registry / depgraph /
+                        // name_referencers), never the `Binding`s held in an AnalysisResult —
+                        // so it can't catch this. It's a stale-analysis-cache artifact: the
+                        // binding out-lived the file's removal / quarantine and hasn't been
+                        // flushed from the analysis cache yet (a reconcile re-analyzes and
+                        // re-stamps the bindings). The on-call's first question is
+                        // "which fid?" — log loudly.
+                        log::warn!(
+                            "outgoingCalls: callee {callee_name} bindings reference \
+                             FileId({fid:?}) but Index::path returned None — a binding \
+                             out-lived its file's removal/quarantine. The analysis cache is \
+                             stale; re-run `gdls diagnose --reconcile` to re-analyze and \
+                             re-stamp the bindings.",
+                            fid = fid
                         );
                         continue;
                     }
-                },
-                None => {
-                    // A Binding::Call.callee_file was Some(fid) but the Index has no path for
-                    // fid. This is NOT an Index-internal invariant — Index::verify() validates
-                    // the Index's own structures (interfaces / registry / depgraph /
-                    // name_referencers), never the `Binding`s held in an AnalysisResult — so it
-                    // can't catch this. It's a stale-analysis-cache artifact: the binding
-                    // out-lived the file's removal / quarantine and hasn't been flushed from the
-                    // analysis cache yet (a reconcile re-analyzes and re-stamps the bindings).
-                    // The on-call's first question is "which fid?" — log loudly.
-                    log::warn!(
-                        "outgoingCalls: callee {callee_name} bindings reference FileId({fid:?}) \
-                         but Index::path returned None — a binding out-lived its file's \
-                         removal/quarantine. The analysis cache is stale; re-run \
-                         `gdls diagnose --reconcile` to re-analyze and re-stamp the bindings.",
-                        fid = fid
-                    );
-                    continue;
                 }
-            },
-            // Native / unresolved callee: no project declaration to point at. Degrade to the
-            // caller's URI with a zero-width range at file start (LSP requires a location), NOT the
-            // call-site range the pre-fix code used.
-            None => (uri.clone(), file_start_range(), file_start_range()),
+            }
+            // Native callee: anchor the `to` item into the DECLARING class's API stub at the
+            // member's name token — the "real external declaration" rust-analyzer/gopls point
+            // at for std-lib callees. `detail` names the declaring class (the stub the item
+            // opens into). Stub materialization failure (no cache root, IO error) omits the
+            // entry rather than fabricating a location.
+            CalleeTarget::Native { class } => {
+                let declaring = {
+                    let db = &state.workspace.native;
+                    db.lookup_member(&class, &callee_name)
+                        .map(|(decl, _)| db.name_of(decl.name).to_owned())
+                };
+                match native_member_stub_location(state, &class, &callee_name, stub_root.as_deref())
+                {
+                    Some(loc) => (loc.uri, loc.range, loc.range, declaring),
+                    None => {
+                        log::debug!(
+                            "outgoingCalls: omitting native callee {callee_name} — the {class} \
+                             stub could not be materialized"
+                        );
+                        continue;
+                    }
+                }
+            }
+            // Unresolved callee: no project or native declaration to point at — OMIT the entry
+            // (the rust-analyzer/gopls convention for nav-less callees). Never the pre-fix
+            // fabrication of the caller's uri with a (0,0) anchor, which claimed the callee was
+            // declared at the top of the calling script.
+            CalleeTarget::Unresolved => continue,
         };
+        // `to` items carry the same {uri, name} blob prepare/incoming items do — the client
+        // hands them back verbatim on expansion ("show outgoing calls of this callee"), and a
+        // data-less item used to dead-end the whole outgoing tree at depth 2.
+        let data = serde_json::json!({
+            "uri": to_uri.as_str(),
+            "name": callee_name,
+        });
         #[allow(deprecated)]
         let to = CallHierarchyItem {
             name: callee_name.clone(),
             kind: LspSymbolKind::FUNCTION,
             tags: None,
-            detail: None,
+            detail: to_detail,
             uri: to_uri,
             range: to_range,
             selection_range: to_selection,
-            data: None,
+            data: Some(data),
         };
         out.push(CallHierarchyOutgoingCall {
             to,
@@ -3044,7 +3598,12 @@ pub fn incoming_calls(
     state: &mut ServerState,
     params: CallHierarchyIncomingCallsParams,
 ) -> Option<Vec<CallHierarchyIncomingCall>> {
-    let (target_uri, target_name) = decode_call_hierarchy_data(&params.item)?;
+    let (target_uri, target_name) = resolve_call_hierarchy_item(state, &params.item)?;
+    // Same stub gate as outgoing_calls: a stub-anchored item resolves to an API page no
+    // project code is indexed against — empty, not an error.
+    if crate::stubs::is_stub_uri(&target_uri, state.options.stub_cache_dir.as_deref()) {
+        return Some(Vec::new());
+    }
     let target_path = crate::uri::uri_to_path(&target_uri)?;
     let target_fid = state.workspace.index.file_id(&target_path);
     let enc = state.encoding;
@@ -3077,9 +3636,11 @@ pub fn incoming_calls(
 
         // Group by caller_function (the synthetic "<top>" for top-level calls). `find_incoming_calls`
         // already filtered to Call bindings whose callee matches (target_fid, target_name).
+        let callee_spans = callee_name_token_spans(&parsed.tree);
         let groups = group_call_ranges(
             find_incoming_calls(&result, target_fid, &target_name),
             &mapper,
+            &callee_spans,
             |b| match b {
                 Binding::Call {
                     caller_function, ..
@@ -3109,7 +3670,7 @@ pub fn incoming_calls(
                 name: caller_name.clone(),
                 kind: LspSymbolKind::FUNCTION,
                 tags: None,
-                detail: None,
+                detail: script_detail(state, &path),
                 uri: cand_uri.clone(),
                 range: from_range,
                 selection_range: from_selection,
@@ -3139,6 +3700,11 @@ pub fn incoming_calls(
 /// normalization. Class-name hits sort before member-name hits when scores tie, matching the
 /// docs/03 §7.4 design. Results capped at 256 to bound LSP latency on 10k+ symbol projects.
 ///
+/// The empty query is a real request, not a degenerate one — spec: "Clients may send an empty
+/// string here to request all symbols." (Helix's picker opens with it.) It skips the matcher
+/// and scores every candidate uniformly; the class-before-member tie-break and the 256 cap
+/// shape the list.
+///
 /// Builds the flat candidate list on demand (no precomputed flat index per docs/03 §7.4): the
 /// registry + per-file interface tables iterate in O(N) once per request. Re-running the query as
 /// the user types is the same cost — adequate for v1; M5 can revisit if soak tests reveal it as
@@ -3148,38 +3714,40 @@ pub fn workspace_symbol(
     params: WorkspaceSymbolParams,
 ) -> Option<WorkspaceSymbolResponse> {
     let query = params.query;
-    if query.is_empty() {
-        return Some(WorkspaceSymbolResponse::Flat(Vec::new()));
-    }
 
     // WP-RD7 micro-op — bench witness, no-op landed. The flat-candidate list below is rebuilt from
     // `iter_interfaces` on every `workspace/symbol` request; precomputing it on `Index` mutation
     // (and only re-deriving the changed files' rows) would trade per-request CPU for memory + an
     // invalidation hook. The Phase-C calibration on a large real-world project measured this within
     // budget, so the precompute is deferred per the plan's "lands OR documented bench witness" rule.
-    // Build the flat candidate list. Each entry is (name, kind, container, path, line, is_class).
-    type Candidate = (
-        String,
-        LspSymbolKind,
-        Option<String>,
-        camino::Utf8PathBuf,
-        u32,
-        bool,
-    );
-    let mut candidates: Vec<Candidate> = Vec::new();
+    // Build the flat candidate list.
+    struct SymbolCandidate {
+        name: String,
+        kind: LspSymbolKind,
+        container: Option<String>,
+        path: camino::Utf8PathBuf,
+        /// 1-based declaration line — the zero-width fallback anchor when `name_span` fails
+        /// live-text validation.
+        line: u32,
+        is_class: bool,
+        /// The recorded name-identifier span (`ClassEntry::name_span` / `MemberDecl::name_span`).
+        name_span: ByteSpan,
+    }
+    let mut candidates: Vec<SymbolCandidate> = Vec::new();
 
     // Class-name registry entries — top-level class declarations across the project, anchored at
     // the `class_name` identifier's recorded line (#33; line 1 only as the registry's defensive
     // default).
     for (name, entry) in state.workspace.index.registry().entries() {
-        candidates.push((
-            name.to_string(),
-            LspSymbolKind::CLASS,
-            None,
-            entry.path.clone(),
-            entry.line,
-            true,
-        ));
+        candidates.push(SymbolCandidate {
+            name: name.to_string(),
+            kind: LspSymbolKind::CLASS,
+            container: None,
+            path: entry.path.clone(),
+            line: entry.line,
+            is_class: true,
+            name_span: entry.name_span,
+        });
     }
     // Per-file interface members — every Const / Var / Func / Signal / Enum reachable at file
     // scope. Inner classes' members aren't surfaced; M4 limitation, documented for future
@@ -3191,14 +3759,15 @@ pub fn workspace_symbol(
         let container = iface.class_name.clone();
         for member in &iface.members {
             let kind = member_kind_to_lsp(member.kind);
-            candidates.push((
-                member.name.clone(),
+            candidates.push(SymbolCandidate {
+                name: member.name.clone(),
                 kind,
-                container.clone(),
-                path.clone(),
-                member.line,
-                false,
-            ));
+                container: container.clone(),
+                path: path.clone(),
+                line: member.line,
+                is_class: false,
+                name_span: member.name_span,
+            });
         }
     }
 
@@ -3214,23 +3783,29 @@ pub fn workspace_symbol(
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut needle_buf: Vec<char> = Vec::new();
     let needle = Utf32Str::new(&query, &mut needle_buf);
-    let mut scored: Vec<(u16, Candidate)> = Vec::with_capacity(candidates.len().min(256));
+    let mut scored: Vec<(u16, SymbolCandidate)> = Vec::with_capacity(candidates.len().min(256));
     let mut hay_buf: Vec<char> = Vec::new();
     for cand in candidates {
         // nucleo asserts non-empty input. An empty haystack here would be a registry /
         // interface bug — log loudly so the operator can investigate the bad entry.
-        if cand.0.is_empty() {
+        if cand.name.is_empty() {
             log::warn!(
                 "workspace_symbol: empty-name candidate at {path} (line {line}); this should be \
                  impossible — Index registry / Interface members carry a name. Investigate the \
                  emit site.",
-                path = cand.3,
-                line = cand.4
+                path = cand.path,
+                line = cand.line
             );
             continue;
         }
+        // Empty query = request for all symbols (see the doc comment): every candidate gets a
+        // uniform score, and the matcher (which asserts on its inputs) is never consulted.
+        if query.is_empty() {
+            scored.push((0, cand));
+            continue;
+        }
         hay_buf.clear();
-        let hay = Utf32Str::new(&cand.0, &mut hay_buf);
+        let hay = Utf32Str::new(&cand.name, &mut hay_buf);
         if let Some(score) = matcher.fuzzy_match_greedy(hay, needle) {
             scored.push((score, cand));
         }
@@ -3241,8 +3816,8 @@ pub fn workspace_symbol(
     // anchor in nucleo-ranked search). Docstring above promises an LSP-latency cap; the
     // earlier `sort + truncate` did O(N log N) and didn't deliver it on 10k+ symbol
     // projects.
-    let cmp = |a: &(u16, Candidate), b: &(u16, Candidate)| {
-        b.0.cmp(&a.0).then_with(|| b.1 .5.cmp(&a.1 .5))
+    let cmp = |a: &(u16, SymbolCandidate), b: &(u16, SymbolCandidate)| {
+        b.0.cmp(&a.0).then_with(|| b.1.is_class.cmp(&a.1.is_class))
     };
     if scored.len() > 256 {
         let _ = scored.select_nth_unstable_by(255, cmp);
@@ -3250,37 +3825,74 @@ pub fn workspace_symbol(
     }
     scored.sort_by(cmp);
 
+    // Real name-token ranges need each winner file's text for the encoding-correct
+    // byte→character mapping (the spec reads the range to reveal/select the symbol; a
+    // zero-width point at column 0 lands the caret on leading syntax). Bounded by the 256
+    // cap: each distinct winner file is loaded ONCE (open buffer wins over disk, the
+    // member_decl_location pattern), one rope per file, and every recorded name span maps
+    // through it — accepted only while its bytes still spell the symbol's name (the
+    // find_global_class_definition validation discipline). Validation or read failure falls
+    // back to the pre-#46 zero-width point at the declaration line's start: never drop the
+    // symbol over a stale anchor.
+    //
+    // Worst-case latency (an all-cold empty-query picker open): ≤256 small sequential reads —
+    // strictly inside the per-request envelope `references` already pays for its Godot-parity
+    // project-wide text scan (which reads EVERY project file). If soak flags this, the named
+    // mitigations are per-line slicing (only the span's line is needed per symbol) or an LRU
+    // rope cache on ServerState; index-time columns are NOT one (characters are
+    // encoding-negotiated per session).
+    let enc = state.encoding;
+    let mut texts: FxHashMap<camino::Utf8PathBuf, Option<(String, ropey::Rope)>> =
+        FxHashMap::default();
     #[allow(deprecated)]
     let symbols: Vec<SymbolInformation> = scored
         .into_iter()
-        .filter_map(|(_score, (name, kind, container, path, line, _))| {
-            let uri = match path_to_file_uri(&path) {
+        .filter_map(|(_score, cand)| {
+            let uri = match path_to_file_uri(&cand.path) {
                 Some(u) => u,
                 None => {
                     log::debug!(
                         "workspace_symbol: dropping {name} at {path} — path_to_file_uri \
-                         rejected the path; the symbol is invisible to the client"
+                         rejected the path; the symbol is invisible to the client",
+                        name = cand.name,
+                        path = cand.path,
                     );
                     return None;
                 }
             };
-            let pos = Position {
-                line: line.saturating_sub(1),
-                character: 0,
-            };
-            Some(SymbolInformation {
-                name,
-                kind,
-                tags: None,
-                deprecated: None,
-                location: Location {
-                    uri,
-                    range: Range {
+            let entry = texts.entry(cand.path.clone()).or_insert_with(|| {
+                let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+                    Some(t) => t,
+                    None => std::fs::read_to_string(cand.path.as_std_path()).ok()?,
+                };
+                let rope = ropey::Rope::from_str(&text);
+                Some((text, rope))
+            });
+            let range = match entry {
+                Some((text, rope))
+                    if text.get(cand.name_span.start..cand.name_span.end)
+                        == Some(cand.name.as_str()) =>
+                {
+                    PositionMapper::new(rope, enc).span_to_range(cand.name_span)
+                }
+                _ => {
+                    let pos = Position {
+                        line: cand.line.saturating_sub(1),
+                        character: 0,
+                    };
+                    Range {
                         start: pos,
                         end: pos,
-                    },
-                },
-                container_name: container,
+                    }
+                }
+            };
+            Some(SymbolInformation {
+                name: cand.name,
+                kind: cand.kind,
+                tags: None,
+                deprecated: None,
+                location: Location { uri, range },
+                container_name: cand.container,
             })
         })
         .collect();
@@ -3297,6 +3909,61 @@ fn member_kind_to_lsp(k: gd_project::MemberKind) -> LspSymbolKind {
         Signal => LspSymbolKind::EVENT,
         Enum => LspSymbolKind::ENUM,
     }
+}
+
+/// Resolve a `CallHierarchyItem` back to `(uri, bare function name)` for the follow-up
+/// handlers. Server-issued `data` wins ([`decode_call_hierarchy_data`], which keeps its
+/// malformed-data logging). Items without data — clients that strip the field, or items
+/// synthesized by another provider — re-resolve rust-analyzer/gopls-style from `item.uri` +
+/// `item.selection_range.start` (the function whose declaration identifier contains that
+/// position), with `item.name` as the lossless floor: every gdls-issued item satisfies
+/// `data.name == item.name`, and GDScript has no overloads, so the bare name identifies the
+/// function within its file.
+fn resolve_call_hierarchy_item(
+    state: &mut ServerState,
+    item: &CallHierarchyItem,
+) -> Option<(Uri, String)> {
+    if let Some(decoded) = decode_call_hierarchy_data(item) {
+        return Some(decoded);
+    }
+    let name =
+        position_function_name(state, &item.uri, item.selection_range.start).unwrap_or_else(|| {
+            log::debug!(
+                "call hierarchy: item `{}` carries no data and its selectionRange resolves no \
+                 function declaration; falling back to the item's own name",
+                item.name
+            );
+            item.name.clone()
+        });
+    Some((item.uri.clone(), name))
+}
+
+/// The name of the function whose declaration IDENTIFIER contains `pos` in `uri`'s current
+/// text (open buffer wins over disk). `None` when the file is unreadable or no declaration
+/// identifier contains the position.
+fn position_function_name(state: &mut ServerState, uri: &Uri, pos: Position) -> Option<String> {
+    let path = crate::uri::uri_to_path(uri)?;
+    let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+        Some(t) => t,
+        None => std::fs::read_to_string(path.as_std_path()).ok()?,
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
+    let rope = Rope::from_str(&text);
+    let byte = PositionMapper::new(&rope, state.encoding).position_to_byte(pos);
+    for id in parsed.tree.iter_ids() {
+        let NodeKind::Function(f) = &parsed.tree.get(id).kind else {
+            continue;
+        };
+        let Some(ident) = f.identifier else {
+            continue;
+        };
+        let span = parsed.tree.get(ident).span;
+        let name = ident_name(&parsed.tree, ident);
+        if !name.is_empty() && span.start <= byte && byte < span.end {
+            return Some(name.to_owned());
+        }
+    }
+    None
 }
 
 /// Decode the `data` field a `prepareCallHierarchy` item carries: `{ "uri": ..., "name": ... }`.

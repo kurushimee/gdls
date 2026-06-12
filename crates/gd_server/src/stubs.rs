@@ -110,12 +110,26 @@ pub(crate) fn is_stub_uri(uri: &lsp_types::Uri, override_root: Option<&str>) -> 
 #[derive(Default)]
 pub(crate) struct StubCache(RefCell<FxHashMap<String, (u64, Rc<RenderedStub>)>>);
 
-/// A rendered API page: the text, the 0-based line of the class header, and the 0-based line of
-/// every member keyed by name (enum values included) — the definition anchors.
+/// One member's anchor within a rendered page: its 0-based line plus the byte extent of the
+/// name token within that line. Every declaration line opens with a fixed ASCII prefix
+/// (`"func "`, `"var "`, …) and engine member names are ASCII identifiers, so the byte columns
+/// are valid character offsets under ANY negotiated position encoding — no mapper needed.
+#[derive(Clone, Copy)]
+pub(crate) struct MemberAnchor {
+    pub line: u32,
+    pub name_col: u32,
+    pub name_len: u32,
+}
+
+/// A rendered API page: the text, the 0-based line of the class header (plus the byte column of
+/// the class name on it), and every member's [`MemberAnchor`] keyed by name (enum values
+/// included) — the definition anchors.
 pub(crate) struct RenderedStub {
     pub text: String,
     pub class_line: u32,
-    pub member_lines: FxHashMap<String, u32>,
+    /// Byte column of the class name on [`Self::class_line`] (after `"class_name "`).
+    pub class_name_col: u32,
+    pub member_lines: FxHashMap<String, MemberAnchor>,
 }
 
 /// Render `class`'s API page. Deterministic: header docs as `##` comments, `class_name` +
@@ -130,6 +144,22 @@ pub(crate) fn render(db: &NativeDb, class: &NativeClass) -> RenderedStub {
         text.push_str(s);
         text.push('\n');
         *line += 1;
+    };
+    // Each declaration line opens with a fixed ASCII prefix, so the name token's byte extent is
+    // `prefix.len()..prefix.len()+name.len()`. Asserted at every insert so a renderer format
+    // change (say, a future `static func`) fails tests here instead of silently mis-anchoring
+    // definition jumps into the page.
+    let anchor = |line: u32, decl: &str, prefix: &str, name: &str| {
+        debug_assert_eq!(
+            decl.get(prefix.len()..prefix.len() + name.len()),
+            Some(name),
+            "stub anchor drift: {decl:?} does not open with {prefix:?} + {name:?}"
+        );
+        MemberAnchor {
+            line,
+            name_col: prefix.len() as u32,
+            name_len: name.len() as u32,
+        }
     };
 
     let class_name = db.name_of(class.name).to_owned();
@@ -154,53 +184,54 @@ pub(crate) fn render(db: &NativeDb, class: &NativeClass) -> RenderedStub {
 
     for k in &class.constants {
         section(&mut text, &mut line);
-        member_lines.insert(db.name_of(k.name).to_owned(), line);
+        let name = db.name_of(k.name).to_owned();
         let decl = native_render::member_decl(db, &class_name, &NativeMember::Constant(k));
+        member_lines.insert(name.clone(), anchor(line, &decl, "const ", &name));
         push(&mut text, &mut line, &decl);
     }
     for e in &class.enums {
         section(&mut text, &mut line);
-        member_lines.insert(db.name_of(e.name).to_owned(), line);
-        push(
-            &mut text,
-            &mut line,
-            &format!("enum {} {{", db.name_of(e.name)),
-        );
-        for (name, value) in &e.values {
-            member_lines.insert(db.name_of(*name).to_owned(), line);
-            push(
-                &mut text,
-                &mut line,
-                &format!("\t{} = {value},", db.name_of(*name)),
-            );
+        let name = db.name_of(e.name).to_owned();
+        let decl = format!("enum {name} {{");
+        member_lines.insert(name.clone(), anchor(line, &decl, "enum ", &name));
+        push(&mut text, &mut line, &decl);
+        for (vname, value) in &e.values {
+            let vname = db.name_of(*vname).to_owned();
+            let decl = format!("\t{vname} = {value},");
+            member_lines.insert(vname.clone(), anchor(line, &decl, "\t", &vname));
+            push(&mut text, &mut line, &decl);
         }
         push(&mut text, &mut line, "}");
     }
     for p in &class.properties {
         section(&mut text, &mut line);
         push_doc(&mut text, &mut line, &p.description);
-        member_lines.insert(db.name_of(p.name).to_owned(), line);
+        let name = db.name_of(p.name).to_owned();
         let decl = native_render::member_decl(db, &class_name, &NativeMember::Property(p));
+        member_lines.insert(name.clone(), anchor(line, &decl, "var ", &name));
         push(&mut text, &mut line, &decl);
     }
     for s in &class.signals {
         section(&mut text, &mut line);
         push_doc(&mut text, &mut line, &s.description);
-        member_lines.insert(db.name_of(s.name).to_owned(), line);
+        let name = db.name_of(s.name).to_owned();
         let decl = native_render::member_decl(db, &class_name, &NativeMember::Signal(s));
+        member_lines.insert(name.clone(), anchor(line, &decl, "signal ", &name));
         push(&mut text, &mut line, &decl);
     }
     for m in &class.methods {
         section(&mut text, &mut line);
         push_doc(&mut text, &mut line, &m.description);
-        member_lines.insert(db.name_of(m.name).to_owned(), line);
+        let name = db.name_of(m.name).to_owned();
         let decl = native_render::member_decl(db, &class_name, &NativeMember::Method(m));
+        member_lines.insert(name.clone(), anchor(line, &decl, "func ", &name));
         push(&mut text, &mut line, &decl);
     }
 
     RenderedStub {
         text,
         class_line,
+        class_name_col: "class_name ".len() as u32,
         member_lines,
     }
 }
@@ -362,7 +393,9 @@ mod tests {
                                             {"name": "MODE_B", "value": 1}]}],
                      "properties": [{"name": "width", "type": "int",
                                      "setter": "set_width", "getter": "get_width",
-                                     "description": "Pixel width."}],
+                                     "description": "Pixel width."},
+                                    {"name": "v", "type": "int",
+                                     "setter": "set_v", "getter": "get_v"}],
                      "signals": [{"name": "resized"}],
                      "methods": [{"name": "grow", "is_const": false, "is_static": false,
                                   "is_vararg": false, "is_virtual": false, "hash": 1,
@@ -385,17 +418,43 @@ mod tests {
         let lines: Vec<&str> = a.text.lines().collect();
         assert_eq!(lines[a.class_line as usize], "class_name Widget");
         assert_eq!(lines[a.class_line as usize + 1], "extends Object");
-        let at = |name: &str| lines[a.member_lines[name] as usize];
+        assert_eq!(
+            &lines[a.class_line as usize][a.class_name_col as usize..],
+            "Widget",
+            "class_name_col anchors the class name token"
+        );
+        let at = |name: &str| lines[a.member_lines[name].line as usize];
         assert_eq!(at("MAX_DEPTH"), "const MAX_DEPTH = 8");
         assert_eq!(at("Mode"), "enum Mode {");
         assert_eq!(at("MODE_B"), "\tMODE_B = 1,");
         assert_eq!(at("width"), "var width: int");
         assert!(
-            lines[a.member_lines["width"] as usize - 1].contains("## Pixel width."),
+            lines[a.member_lines["width"].line as usize - 1].contains("## Pixel width."),
             "member doc precedes the declaration"
         );
         assert_eq!(at("resized"), "signal resized()");
         assert_eq!(at("grow"), "func grow(by: int = 1) -> void");
+        // The column extents slice exactly the name token out of each declaration line — the
+        // anchor definition jumps land on. The one-letter property `v` pins the fixed-prefix
+        // computation: a naive `line.find(name)` would match the `v` inside `"var "`.
+        for name in [
+            "MAX_DEPTH",
+            "Mode",
+            "MODE_B",
+            "width",
+            "v",
+            "resized",
+            "grow",
+        ] {
+            let m = &a.member_lines[name];
+            assert_eq!(
+                &lines[m.line as usize][m.name_col as usize..(m.name_col + m.name_len) as usize],
+                name,
+                "anchor of `{name}` must slice exactly its name token"
+            );
+        }
+        assert_eq!(at("v"), "var v: int");
+        assert_eq!(a.member_lines["v"].name_col, 4);
         assert!(
             a.text.starts_with("## A clickable thing.\n"),
             "class docs head the page: {:?}",

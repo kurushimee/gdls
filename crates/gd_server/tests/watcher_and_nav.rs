@@ -31,8 +31,8 @@ use lsp_types::{
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
     InitializedParams, Location, Position, ReferenceContext, ReferenceParams, SymbolInformation,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, WorkDoneProgressParams,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    SymbolKind, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    WorkDoneProgressParams, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 
 fn init_and_open(project: &common::TempProject, client: &Connection, relative_files: &[&str]) {
@@ -161,6 +161,78 @@ fn references_finds_cross_file_class_usage() {
         locations.len(),
         2,
         "expected the declaration + one cross-file reference, no duplicates; got {locations:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// `includeDeclaration: false` is a FILTER, not a no-op prepend: the raw identifier scan emits
+/// the declaration's own name token, so the handler must drop it. VS Code's compact-references
+/// flow does count arithmetic on exactly this distinction (query true, re-query false, compare).
+#[test]
+fn references_include_declaration_false_excludes_class_name_decl() {
+    let project = sample_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&project, &client, &["src/hero.gd", "src/enemy.gd"]);
+
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let send = |id: i32, line: u32, character: u32, uri: &lsp_types::Uri, include: bool| {
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line, character },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: include,
+            },
+        };
+        client
+            .sender
+            .send(request(id, "textDocument/references", params))
+            .unwrap();
+        let resp = recv_response(&client);
+        assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+        let locations: Option<Vec<Location>> =
+            serde_json::from_value(resp.result.unwrap()).unwrap();
+        locations.unwrap_or_default()
+    };
+
+    // Declaration-site click with false: ONLY the enemy.gd use site comes back — the
+    // `class_name Hero` token itself is filtered.
+    let locations = send(15, 0, 12, &hero_uri, false);
+    assert_eq!(
+        locations.len(),
+        1,
+        "includeDeclaration:false must return only use sites; got {locations:?}"
+    );
+    assert!(locations[0].uri.as_str().contains("enemy.gd"));
+    assert_eq!(
+        (
+            locations[0].range.start.line,
+            locations[0].range.start.character,
+            locations[0].range.end.character
+        ),
+        (0, 8, 12)
+    );
+
+    // Use-site click (enemy.gd's `extends Hero`) with false: the declaring file's
+    // `class_name Hero` token must be absent too.
+    let enemy_uri = file_uri(&project.root.join("src/enemy.gd"));
+    let locations = send(16, 0, 10, &enemy_uri, false);
+    assert!(
+        !locations
+            .iter()
+            .any(|l| l.uri.as_str().ends_with("hero.gd") && l.range.start == Position::new(0, 11)),
+        "the hero.gd declaration token must be filtered; got {locations:?}"
+    );
+    assert!(
+        locations
+            .iter()
+            .any(|l| l.uri.as_str().contains("enemy.gd")),
+        "the enemy.gd use site itself stays; got {locations:?}"
     );
 
     shutdown(&client, server_thread);
@@ -409,6 +481,9 @@ fn call_hierarchy_prepare_and_outgoing_for_attack() {
     );
     let item = items.into_iter().next().unwrap();
     assert_eq!(item.name, "attack");
+    // `detail` carries the gopls-style res:// container so same-named callers from different
+    // scripts stay distinguishable in the tree.
+    assert_eq!(item.detail.as_deref(), Some("res://src/hero.gd"));
 
     // outgoingCalls — expect `helper` to appear.
     let outgoing_params = CallHierarchyOutgoingCallsParams {
@@ -431,6 +506,7 @@ fn call_hierarchy_prepare_and_outgoing_for_attack() {
         .unwrap_or_else(|| {
             panic!("expected `helper` in attack's outgoing calls; got {outgoing:?}")
         });
+    assert_eq!(helper_call.to.detail.as_deref(), Some("res://src/hero.gd"));
     // The `to` item locates the callee's DECLARATION (LSP 3.17), not the call site.
     // `func helper` is declared on line 5; the call `helper()` is on line 9. Pre-fix BOTH `range`
     // and `selection_range` pointed at the call site (line 9) — the contract violation this closes.
@@ -440,10 +516,15 @@ fn call_hierarchy_prepare_and_outgoing_for_attack() {
          not the call site; got {:?}",
         helper_call.to.selection_range
     );
-    // The call site (line 9) belongs in `from_ranges`, not the item range.
+    // The call site (line 9) belongs in `from_ranges`, not the item range — covering exactly
+    // the callee name token: `\thelper()` → `helper` at cols 1..7, not the whole `helper()`
+    // expression (the rust-analyzer/gopls/clangd fromRanges shape).
     assert!(
-        helper_call.from_ranges.iter().any(|r| r.start.line == 9),
-        "the call site (line 9) must be reported as a from_range; got {:?}",
+        helper_call
+            .from_ranges
+            .iter()
+            .any(|r| { r.start == Position::new(9, 1) && r.end == Position::new(9, 7) }),
+        "the call's from_range must cover exactly the `helper` token at (9,1)..(9,7); got {:?}",
         helper_call.from_ranges
     );
 
@@ -739,10 +820,94 @@ fn call_hierarchy_incoming_for_attack() {
         .unwrap_or_else(|| {
             panic!("attack's incoming calls must include the dotted self-caller `combo`; got {incoming:?}")
         });
+    // `\tself.attack()` → the from_range covers exactly the `attack` token at cols 6..12,
+    // not the receiver-to-paren call expression.
     assert!(
-        combo_call.from_ranges.iter().any(|r| r.start.line == 7),
-        "the `self.attack()` call site (line 7) must be reported as a from_range; got {:?}",
+        combo_call
+            .from_ranges
+            .iter()
+            .any(|r| { r.start == Position::new(7, 6) && r.end == Position::new(7, 12) }),
+        "the `self.attack()` from_range must cover exactly `attack` at (7,6)..(7,12); got {:?}",
         combo_call.from_ranges
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The discriminator line-only asserts can't catch: a MULTI-LINE call's `Binding::Call.call_site`
+/// spans from the receiver to the closing paren two lines down. The fromRange must still be the
+/// single-line callee name token — VS Code's peek widget highlights every fromRange and centers
+/// on their union, so a whole-expression range highlights entire blocks.
+#[test]
+fn call_hierarchy_from_ranges_cover_only_callee_token_multiline() {
+    let project = sample_project();
+    //   line 3: func helper(a: int, b: int) -> void:
+    //   line 6: func attack() -> void:
+    //   line 7: \tself.helper(
+    //   line 8: \t\t1,
+    //   line 9: \t\t2)
+    project.write(
+        "src/hero.gd",
+        "class_name Hero\nextends Node2D\n\nfunc helper(a: int, b: int) -> void:\n\tpass\n\n\
+         func attack() -> void:\n\tself.helper(\n\t\t1,\n\t\t2)\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&project, &client, &["src/hero.gd"]);
+
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let prepare = CallHierarchyPrepareParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: hero_uri.clone(),
+            },
+            position: Position {
+                line: 3,
+                character: 7, // mid-"helper" on its declaration
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    client
+        .sender
+        .send(request(75, "textDocument/prepareCallHierarchy", prepare))
+        .unwrap();
+    let resp = recv_response(&client);
+    let items: Option<Vec<CallHierarchyItem>> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let item = items
+        .and_then(|v| v.into_iter().next())
+        .expect("prepare must return helper's item");
+    assert_eq!(item.name, "helper");
+
+    let incoming = CallHierarchyIncomingCallsParams {
+        item: item.clone(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(76, "callHierarchy/incomingCalls", incoming))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "incoming errored: {:?}", resp.error);
+    let incoming: Option<Vec<CallHierarchyIncomingCall>> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let incoming = incoming.unwrap_or_default();
+    let attack_call = incoming
+        .iter()
+        .find(|c| c.from.name == "attack")
+        .unwrap_or_else(|| panic!("helper's incoming must include `attack`; got {incoming:?}"));
+    // `\tself.helper(` … `\t\t2)` — the fromRange is the `helper` token at (7,6)..(7,12),
+    // NOT a range ending on the closing-paren line 9.
+    assert_eq!(
+        attack_call.from_ranges,
+        vec![lsp_types::Range::new(
+            Position::new(7, 6),
+            Position::new(7, 12)
+        )],
+        "a multi-line call must contribute a single-identifier-width fromRange"
     );
 
     shutdown(&client, server_thread);
@@ -1062,8 +1227,12 @@ fn nav_handlers_clamp_out_of_range_position() {
 // Nav: workspace/symbol edge cases
 // ----------------------------------------------------------------------------
 
+/// Spec: "Clients may send an empty string here to request all symbols." Helix's picker opens
+/// with exactly this request — an empty list means a blank picker until the user types. The
+/// member tier's relative order is hash-map iteration order, so the asserts stay at presence /
+/// first-kind / cap strength.
 #[test]
-fn workspace_symbol_empty_query_returns_empty() {
+fn workspace_symbol_empty_query_returns_all_symbols() {
     let project = sample_project();
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
@@ -1089,8 +1258,61 @@ fn workspace_symbol_empty_query_returns_empty() {
         None => Vec::new(),
     };
     assert!(
-        symbols.is_empty(),
-        "empty workspace/symbol query should return zero results"
+        !symbols.is_empty(),
+        "empty workspace/symbol query requests ALL symbols (spec), got none"
+    );
+    assert!(symbols.len() <= 256, "the 256 cap bounds the empty query");
+    assert_eq!(
+        symbols[0].kind,
+        SymbolKind::CLASS,
+        "classes sort before members in the uniform-score tier"
+    );
+    for name in ["Hero", "hp", "attack"] {
+        assert!(
+            symbols.iter().any(|s| s.name == name),
+            "`{name}` must appear in the all-symbols listing"
+        );
+    }
+
+    shutdown(&client, server_thread);
+}
+
+/// The empty-query listing stays bounded on symbol-heavy projects: 300 members in one file must
+/// come back as exactly 256 results (the latency cap), not the full set.
+#[test]
+fn workspace_symbol_empty_query_caps_at_256() {
+    let project = sample_project();
+    let mut big = String::from("extends Node\n");
+    for i in 0..300 {
+        big.push_str(&format!("var m{i} = 0\n"));
+    }
+    project.write("src/big.gd", &big);
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&project, &client, &[]);
+
+    let params = WorkspaceSymbolParams {
+        query: String::new(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(91, "workspace/symbol", params))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "empty query errored");
+    let response: Option<WorkspaceSymbolResponse> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let symbols: Vec<SymbolInformation> = match response {
+        Some(WorkspaceSymbolResponse::Flat(s)) => s,
+        other => panic!("expected Flat, got {other:?}"),
+    };
+    assert_eq!(
+        symbols.len(),
+        256,
+        "more than 256 candidates must truncate to exactly the cap"
     );
 
     shutdown(&client, server_thread);

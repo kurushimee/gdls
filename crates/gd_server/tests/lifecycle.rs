@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
-    ClientCapabilities, DidOpenTextDocumentParams, DocumentSymbolParams, GeneralClientCapabilities,
-    InitializeParams, InitializeResult, InitializedParams, PositionEncodingKind,
-    PublishDiagnosticsParams, TextDocumentIdentifier, TextDocumentItem, Uri,
+    ClientCapabilities, DidOpenTextDocumentParams, DocumentSymbolClientCapabilities,
+    DocumentSymbolParams, GeneralClientCapabilities, InitializeParams, InitializeResult,
+    InitializedParams, PositionEncodingKind, PublishDiagnosticsParams,
+    TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem, Uri,
 };
 
 /// Receive one message from the server, failing the test rather than hanging if none arrives.
@@ -48,7 +49,9 @@ fn m0_lifecycle_diagnostics_and_symbols() {
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
 
-    // 1) initialize — offer UTF-16 + UTF-8; the server should prefer UTF-8.
+    // 1) initialize — offer UTF-16 + UTF-8 (the server should prefer UTF-8) and advertise
+    //    hierarchical documentSymbol support so step 4 gets the nested shape (the flat
+    //    downgrade for clients without the capability is covered in symbols_and_diagnostics.rs).
     let init = InitializeParams {
         capabilities: ClientCapabilities {
             general: Some(GeneralClientCapabilities {
@@ -56,6 +59,13 @@ fn m0_lifecycle_diagnostics_and_symbols() {
                     PositionEncodingKind::UTF16,
                     PositionEncodingKind::UTF8,
                 ]),
+                ..Default::default()
+            }),
+            text_document: Some(TextDocumentClientCapabilities {
+                document_symbol: Some(DocumentSymbolClientCapabilities {
+                    hierarchical_document_symbol_support: Some(true),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -151,11 +161,13 @@ fn m0_lifecycle_diagnostics_and_symbols() {
     // A1 changed documentSymbol: now returns a single root Class wrapping members. For an unnamed
     // script ("extends Node" with no class_name), the root name is the file basename "a.gd"
     // (filled by the handler) and children is absent (no members declared). The selectionRange is
-    // zero-width at (0,0) since there's no class_name declaration to point at.
+    // zero-width at (0,0) since there's no class_name declaration to point at. The root's
+    // `detail` renders the extends clause.
     assert_eq!(
         resp.result,
         Some(serde_json::json!([{
             "name": "a.gd",
+            "detail": "extends Node",
             "kind": 5,
             "range": {"start": {"line": 0, "character": 0}, "end": {"line": 1, "character": 0}},
             "selectionRange": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 0}}

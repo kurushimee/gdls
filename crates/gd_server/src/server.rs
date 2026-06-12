@@ -8,11 +8,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crossbeam_channel::{select, Receiver, Sender};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
-    CallHierarchyServerCapability, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
-    DocumentLinkOptions, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, OneOf, PublishDiagnosticsParams, ServerCapabilities,
-    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    CallHierarchyServerCapability, CodeDescription, Diagnostic, DiagnosticSeverity, DiagnosticTag,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    DidSaveTextDocumentParams, DocumentLinkOptions, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, OneOf,
+    PublishDiagnosticsParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Uri,
 };
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent};
 use rustc_hash::FxHashSet;
@@ -47,9 +48,42 @@ const ERR_CONTENT_MODIFIED: i32 = -32801;
 /// the actionable error promptly while a single `symlink_metadata` every 3 s is a non-event for CPU.
 const WATCHER_LIVENESS_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Client capabilities gdls branches on, captured once at `initialize` (the position encoding
+/// negotiates separately into [`ServerState::encoding`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ClientCaps {
+    /// `textDocument.documentSymbol.hierarchicalDocumentSymbolSupport`. Absent ⇒ `false` ⇒ the
+    /// flat 3.16 `SymbolInformation[]` documentSymbol shape (rust-analyzer's
+    /// `.unwrap_or_default()` convention): a client that did not opt in must not receive the
+    /// nested shape it declined.
+    pub(crate) hierarchical_document_symbols: bool,
+    /// `textDocument.publishDiagnostics.tagSupport.valueSet` contains `Unnecessary` — gates the
+    /// unused/unreachable diagnostic tags (pyright-style: clients without the capability get
+    /// byte-identical pre-tag diagnostics).
+    pub(crate) diagnostic_tag_unnecessary: bool,
+}
+
+impl ClientCaps {
+    fn negotiate(caps: &lsp_types::ClientCapabilities) -> Self {
+        let td = caps.text_document.as_ref();
+        ClientCaps {
+            hierarchical_document_symbols: td
+                .and_then(|t| t.document_symbol.as_ref())
+                .and_then(|d| d.hierarchical_document_symbol_support)
+                .unwrap_or(false),
+            diagnostic_tag_unnecessary: td
+                .and_then(|t| t.publish_diagnostics.as_ref())
+                .and_then(|p| p.tag_support.as_ref())
+                .is_some_and(|t| t.value_set.contains(&DiagnosticTag::UNNECESSARY)),
+        }
+    }
+}
+
 /// All mutable server state for one session.
 pub struct ServerState {
     pub(crate) encoding: PositionEncoding,
+    /// Client capabilities captured at `initialize` — see [`ClientCaps`].
+    pub(crate) caps: ClientCaps,
     /// Parsed `initializationOptions`. Consumed by [`Workspace::load`] at startup to seed the
     /// native API path and the strict-mode policy; retained on the server state so the
     /// filesystem watcher can call [`Workspace::reload_project_and_native`] and
@@ -167,6 +201,7 @@ fn serve_inner(
     let init: InitializeParams = serde_json::from_value(init_value)?;
 
     let encoding = PositionEncoding::negotiate(&init.capabilities);
+    let caps = ClientCaps::negotiate(&init.capabilities);
     let options = InitializationOptions::parse(init.initialization_options.as_ref());
     let root = resolve_root(&options, &init);
 
@@ -261,6 +296,7 @@ fn serve_inner(
     warn_if_cold_index_exceeds_budget(post_cold_index_rss, &budget);
     let mut state = ServerState {
         encoding,
+        caps,
         options,
         workspace,
         vfs: Vfs::default(),
@@ -1489,10 +1525,23 @@ fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) 
                 // Only `.gd` files go through the analyzer — for any other open buffer the syntax
                 // diagnostics carry the publish on their own.
                 let analyzed = analyze_gd(state, &uri, &parsed.tree, &text);
+                // Related-location memo BEFORE the doc borrow: every distinct cross-file target
+                // (a SHADOWED_VARIABLE_BASE_CLASS base script) is read once into a rope for the
+                // encoding-correct projection below. Bounded by the related entries one file's
+                // diagnostics carry — zero for almost every publish.
+                let related_texts = related_location_texts(state, analyzed.as_deref());
                 match state.vfs.get(uri.as_str()) {
                     Some(doc) => {
                         let mapper = PositionMapper::new(&doc.rope, state.encoding);
-                        collect_diagnostics(&mapper, &parsed.diagnostics, analyzed.as_deref())
+                        collect_diagnostics(
+                            &mapper,
+                            state.encoding,
+                            state.caps,
+                            &uri,
+                            &related_texts,
+                            &parsed.diagnostics,
+                            analyzed.as_deref(),
+                        )
                     }
                     None => Vec::new(),
                 }
@@ -1560,8 +1609,18 @@ fn analyze_gd(
 /// matches the source-position publish order each stream already uses: syntax errors first (parser
 /// emits them in source order), then analyzer diagnostics (the sink sorts by `span.start` at
 /// `finish`). The merged stream is what the editor highlights.
+///
+/// The `tags` / `codeDescription` fields are LSP-projection-only additions: Godot's own output
+/// never serializes them, so message strings, spans, and severities stay byte-identical to the
+/// faithful stream (`.out` conformance untouched). Tags are gated on the client's
+/// `publishDiagnostics.tagSupport` (pyright-style); the docs link ships ungated
+/// (rust-analyzer-style — clients ignore unknown members).
 fn collect_diagnostics(
     mapper: &PositionMapper,
+    enc: PositionEncoding,
+    caps: ClientCaps,
+    request_uri: &Uri,
+    related_texts: &FxHashMap<gd_project::FileId, (Uri, ropey::Rope)>,
     syntax: &[gd_syntax::Diagnostic],
     analyzed: Option<&gd_analyze::AnalysisResult>,
 ) -> Vec<Diagnostic> {
@@ -1586,11 +1645,131 @@ fn collect_diagnostics(
                 code: Some(NumberOrString::String(d.code().to_owned())),
                 source: Some("gdls".to_string()),
                 message: d.message().to_owned(),
+                tags: if caps.diagnostic_tag_unnecessary {
+                    unnecessary_tag(d.warning_code())
+                } else {
+                    None
+                },
+                code_description: d.warning_code().map(|_| CodeDescription {
+                    href: godot_warning_docs_uri(),
+                }),
+                related_information: project_related(
+                    d.related(),
+                    mapper,
+                    enc,
+                    request_uri,
+                    related_texts,
+                ),
                 ..Default::default()
             });
         }
     }
     out
+}
+
+/// Load the text of every DISTINCT cross-file related-location target referenced by `analyzed`'s
+/// diagnostics (open buffer wins over disk). Unreadable or unindexed targets are simply absent —
+/// their entries drop at projection, never the diagnostic itself.
+fn related_location_texts(
+    state: &mut ServerState,
+    analyzed: Option<&gd_analyze::AnalysisResult>,
+) -> FxHashMap<gd_project::FileId, (Uri, ropey::Rope)> {
+    let mut out: FxHashMap<gd_project::FileId, (Uri, ropey::Rope)> = FxHashMap::default();
+    let Some(result) = analyzed else {
+        return out;
+    };
+    for d in &result.diagnostics {
+        for rel in d.related() {
+            let Some(fid) = rel.file else { continue };
+            if out.contains_key(&fid) {
+                continue;
+            }
+            let Some(path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            let Some(uri) = crate::uri::path_to_file_uri(&path) else {
+                continue;
+            };
+            let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+                Some(t) => t,
+                None => match std::fs::read_to_string(path.as_std_path()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::debug!(
+                            "related location target {path} unreadable ({e}); its entries drop"
+                        );
+                        continue;
+                    }
+                },
+            };
+            out.insert(fid, (uri, ropey::Rope::from_str(&text)));
+        }
+    }
+    out
+}
+
+/// Project a diagnostic's [`gd_analyze::RelatedInfo`] entries into LSP
+/// `DiagnosticRelatedInformation`: same-file entries map through the request mapper; cross-file
+/// entries through the memo'd target rope (a missing target drops the ENTRY, never the
+/// diagnostic). `None` when empty, so diagnostics without related locations serialize
+/// byte-identically to before.
+fn project_related(
+    related: &[gd_analyze::RelatedInfo],
+    mapper: &PositionMapper,
+    enc: PositionEncoding,
+    request_uri: &Uri,
+    texts: &FxHashMap<gd_project::FileId, (Uri, ropey::Rope)>,
+) -> Option<Vec<lsp_types::DiagnosticRelatedInformation>> {
+    let mut out = Vec::new();
+    for rel in related {
+        let (uri, range) = match rel.file {
+            None => (request_uri.clone(), mapper.span_to_range(rel.span)),
+            Some(fid) => {
+                let Some((uri, rope)) = texts.get(&fid) else {
+                    continue;
+                };
+                (
+                    uri.clone(),
+                    PositionMapper::new(rope, enc).span_to_range(rel.span),
+                )
+            }
+        };
+        out.push(lsp_types::DiagnosticRelatedInformation {
+            location: lsp_types::Location { uri, range },
+            message: rel.message.clone(),
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The unused/unreachable warning family editors render FADED via `DiagnosticTag::UNNECESSARY`
+/// (rust-analyzer, clangd, pyright, and tsserver all tag their equivalents). Keyed on the
+/// warning CODE, not the published severity, so a strict-mode-promoted UNUSED_* keeps its tag
+/// (the clangd behavior).
+fn unnecessary_tag(code: Option<gd_analyze::warnings::WarningCode>) -> Option<Vec<DiagnosticTag>> {
+    use gd_analyze::warnings::WarningCode::*;
+    match code? {
+        UnusedVariable
+        | UnusedLocalConstant
+        | UnusedPrivateClassVariable
+        | UnusedParameter
+        | UnusedSignal
+        | UnreachableCode
+        | UnreachablePattern => Some(vec![DiagnosticTag::UNNECESSARY]),
+        _ => None,
+    }
+}
+
+/// Godot's warning-system documentation — the `codeDescription` target for every warning-coded
+/// diagnostic. The page carries no per-code anchors, so one page-level link serves all codes.
+fn godot_warning_docs_uri() -> Uri {
+    static DOCS: std::sync::OnceLock<Uri> = std::sync::OnceLock::new();
+    DOCS.get_or_init(|| {
+        "https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/warning_system.html"
+            .parse()
+            .expect("invariant: the static Godot docs URL parses as a Uri")
+    })
+    .clone()
 }
 
 /// `gd_analyze::Severity` was deliberately laid out with the same discriminants as
@@ -1624,6 +1803,7 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<Message>();
         let state = ServerState {
             encoding: PositionEncoding::Utf16,
+            caps: ClientCaps::default(),
             options,
             workspace,
             vfs: Vfs::default(),
@@ -1671,6 +1851,7 @@ mod tests {
         rss.sample_now("test_baseline");
         let state = ServerState {
             encoding: PositionEncoding::Utf16,
+            caps: ClientCaps::default(),
             options,
             workspace,
             vfs: Vfs::default(),
@@ -1886,6 +2067,7 @@ mod tests {
         let budget = MemoryBudget::from_caps_mb(1, u64::MAX / (1024 * 1024 * 2));
         let mut state = ServerState {
             encoding: PositionEncoding::Utf16,
+            caps: ClientCaps::default(),
             options,
             workspace,
             vfs: Vfs::default(),

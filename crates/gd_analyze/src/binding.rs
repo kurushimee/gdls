@@ -60,14 +60,14 @@ pub struct MemberXref {
 }
 
 /// What kind of declaration a [`Binding::Use`] targets. Distinct from [`gd_syntax::SymbolKind`]
-/// (the parser's outline-symbol vocabulary): the analyzer's binding kinds are coarser and only
-/// have variants the M4 reducer can actually emit today.
+/// (the parser's outline-symbol vocabulary): the analyzer's binding kinds are coarser.
 ///
-/// **M4 emits only `Class` and `Member`.** The other variants are reserved for follow-on
-/// recording sites: `reduce_identifier_from_base`'s native-method path could emit `Function`,
-/// `reduce_subscript_attribute`'s enum-value path could emit `EnumValue`, etc. (see WP-N1b's
-/// "additive recording" discipline). The enum stays `#[non_exhaustive]` so a handler match on
-/// it remains correct when new variants land.
+/// Emitted today: `Class` and `Member` from `reduce_identifier` (in-file members, cross-file
+/// `class_name`s, autoloads) and from `reduce_identifier_from_base`'s in-file CLASS branch;
+/// the precise kinds (`Variable` / `Constant` / `Function` / `Signal` / `Enum` / `EnumValue`)
+/// from `record_member_use` for every cross-file script-chain member hit. `Parameter` stays
+/// reserved (locals/params are function-scoped and never cross-file). The enum stays
+/// `#[non_exhaustive]` so a handler match on it remains correct when new variants land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum BindingTargetKind {
@@ -82,6 +82,41 @@ pub enum BindingTargetKind {
     Member,
 }
 
+/// What a resolved call site dispatches to — the callee classification the reducer derives from
+/// the resolution the call actually used. A CLOSED concept (project script / engine class /
+/// don't-know): `Unresolved` is the catch-all, so no `#[non_exhaustive]`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CalleeTarget {
+    /// A project script declares the callee. `class_path` is the inner-class chain WITHIN the
+    /// file ([`crate::data_type::ScriptRef::inner`]'s vocabulary; empty = the file's root
+    /// class) — the owning class, so same-named methods in one file stop sharing call-site
+    /// sets.
+    Script {
+        file: FileId,
+        class_path: Vec<String>,
+    },
+    /// The callee bound to a native engine method. `class` is the class the signature lookup
+    /// ran against (the chain's native root, or the subscript base's resolved native type);
+    /// consumers resolve the DECLARING class via `NativeDb::lookup_member`, which walks
+    /// `inherits`.
+    Native { class: String },
+    /// The callee couldn't be pinned: value-callables, dynamic dispatch through
+    /// `Variant`/`Callable`, lambdas, builtin-value methods, trimmed-DB misses.
+    Unresolved,
+}
+
+impl CalleeTarget {
+    /// The declaring project file for a [`Self::Script`] callee, `None` otherwise — the
+    /// file-level view most nav handlers filter on.
+    #[must_use]
+    pub fn script_file(&self) -> Option<FileId> {
+        match self {
+            CalleeTarget::Script { file, .. } => Some(*file),
+            _ => None,
+        }
+    }
+}
+
 /// One per-occurrence resolution record. Pushed onto [`AnalysisResult::bindings`] by the reducer
 /// (WP-N1b) at every resolved call site and identifier/member use. `#[non_exhaustive]` so a
 /// future `Binding::Define` variant (declaration sites) doesn't break handler matches.
@@ -90,10 +125,8 @@ pub enum BindingTargetKind {
 pub enum Binding {
     /// A call site that the analyzer resolved to a concrete callee.
     Call {
-        /// The file declaring the callee. `None` for native methods, builtins, lambdas, dynamic
-        /// dispatch through `Variant` / `Callable`, and any other callee gdls can't pin to a
-        /// project script.
-        callee_file: Option<FileId>,
+        /// What the call dispatches to — see [`CalleeTarget`].
+        callee: CalleeTarget,
         /// The callee identifier as written (or the resolved qualified name where the analyzer
         /// knows it). Used as the primary key for `callHierarchy/incomingCalls`.
         callee_name: String,
@@ -102,7 +135,7 @@ pub enum Binding {
         /// Bare identifier of the enclosing function (e.g. `attack`, **never** `Hero::attack`),
         /// or `None` for top-level / outside-fn calls. Drives `outgoingCalls` grouping. NOT
         /// class-qualified in v1: two same-named methods in different classes share a *caller* key
-        /// here (the *callee* side is dispatch-resolved by `reducer.rs::resolve_callee_file`).
+        /// here (the *callee* side is dispatch-resolved — see [`CalleeTarget::Script`]).
         caller_function: Option<String>,
     },
     /// An identifier or member-access that the analyzer resolved to a named declaration. Surfaced
@@ -124,7 +157,7 @@ impl Binding {
     /// debug) is checked: `caller_function` is the enclosing function's **bare** identifier
     /// (`attack`, never the class-qualified `Hero::attack`), since `outgoingCalls` groups on it.
     pub(crate) fn call(
-        callee_file: Option<FileId>,
+        callee: CalleeTarget,
         callee_name: String,
         call_site: ByteSpan,
         caller_function: Option<String>,
@@ -135,7 +168,7 @@ impl Binding {
              got {caller_function:?}"
         );
         Binding::Call {
-            callee_file,
+            callee,
             callee_name,
             call_site,
             caller_function,
@@ -171,14 +204,25 @@ impl Binding {
         )
     }
 
+    /// The Script-declaring file of a [`Self::Call`]'s callee — `None` for Native/Unresolved
+    /// callees and for non-Call bindings. The file-level view nav handlers filter on.
+    #[must_use]
+    pub fn callee_script_file(&self) -> Option<FileId> {
+        match self {
+            Binding::Call { callee, .. } => callee.script_file(),
+            _ => None,
+        }
+    }
+
     /// True when this binding is a [`Self::Call`] whose callee matches the given (file, name).
-    /// `callee_file = None` is allowed and matches when `file` is `None`. Used by
-    /// `incomingCalls`.
+    /// `file = None` matches every NON-project callee (`Native` and `Unresolved` alike) —
+    /// preserving the pre-`CalleeTarget` `callee_file: None` matching that `incomingCalls`'
+    /// degrade paths rely on.
     pub fn matches_callee(&self, file: Option<FileId>, name: &str) -> bool {
         matches!(
             self,
-            Binding::Call { callee_file, callee_name, .. }
-            if *callee_file == file && callee_name == name
+            Binding::Call { callee, callee_name, .. }
+            if callee.script_file() == file && callee_name == name
         )
     }
 
@@ -265,7 +309,7 @@ mod tests {
     #[should_panic(expected = "must be a BARE identifier")]
     fn binding_call_rejects_qualified_caller() {
         let _ = Binding::call(
-            None,
+            CalleeTarget::Unresolved,
             "attack".into(),
             ByteSpan { start: 0, end: 6 },
             Some("Hero::combo".into()),
@@ -299,23 +343,30 @@ mod tests {
         assert_eq!(hits.len(), 1);
     }
 
+    fn script(file: u32) -> CalleeTarget {
+        CalleeTarget::Script {
+            file: FileId::new(file),
+            class_path: Vec::new(),
+        }
+    }
+
     #[test]
     fn find_outgoing_calls_groups_by_caller() {
         let result = empty(vec![
             Binding::Call {
-                callee_file: Some(FileId::new(2)),
+                callee: script(2),
                 callee_name: "flee".into(),
                 call_site: ByteSpan { start: 0, end: 6 },
                 caller_function: Some("attack".into()),
             },
             Binding::Call {
-                callee_file: None,
+                callee: CalleeTarget::Unresolved,
                 callee_name: "print".into(),
                 call_site: ByteSpan { start: 10, end: 15 },
                 caller_function: Some("attack".into()),
             },
             Binding::Call {
-                callee_file: Some(FileId::new(2)),
+                callee: script(2),
                 callee_name: "flee".into(),
                 call_site: ByteSpan { start: 20, end: 26 },
                 caller_function: Some("other".into()),
@@ -329,22 +380,35 @@ mod tests {
     fn find_incoming_calls_filters_by_callee() {
         let result = empty(vec![
             Binding::Call {
-                callee_file: Some(FileId::new(2)),
+                callee: script(2),
                 callee_name: "flee".into(),
                 call_site: ByteSpan { start: 0, end: 6 },
                 caller_function: Some("attack".into()),
             },
             Binding::Call {
-                callee_file: None,
+                callee: CalleeTarget::Unresolved,
                 callee_name: "print".into(),
                 call_site: ByteSpan { start: 10, end: 15 },
+                caller_function: Some("attack".into()),
+            },
+            Binding::Call {
+                callee: CalleeTarget::Native {
+                    class: "Node".into(),
+                },
+                callee_name: "queue_free".into(),
+                call_site: ByteSpan { start: 20, end: 30 },
                 caller_function: Some("attack".into()),
             },
         ]);
         let into_flee: Vec<&Binding> =
             find_incoming_calls(&result, Some(FileId::new(2)), "flee").collect();
         assert_eq!(into_flee.len(), 1);
+        // `None` matches every NON-project callee — Unresolved and Native alike (the
+        // pre-CalleeTarget degrade semantics incomingCalls relies on).
         let into_print: Vec<&Binding> = find_incoming_calls(&result, None, "print").collect();
         assert_eq!(into_print.len(), 1);
+        let into_queue_free: Vec<&Binding> =
+            find_incoming_calls(&result, None, "queue_free").collect();
+        assert_eq!(into_queue_free.len(), 1);
     }
 }

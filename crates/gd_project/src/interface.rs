@@ -97,6 +97,14 @@ pub struct MemberDecl {
     /// Byte range of the declaration. **Excluded from [`Interface::signature_hash`]** so that a
     /// body-only edit (which shifts later members' spans) does not look like an interface change.
     pub span: ByteSpan,
+    /// Byte range of the declaration's NAME identifier — narrower than [`Self::span`], which
+    /// covers the whole declaration node. Anchors `workspace/symbol` results and cross-file
+    /// `definition` jumps on the name token instead of the full declaration. Extraction always
+    /// records the identifier node's span (a member without an identifier is never extracted);
+    /// zero-width only in defensively-constructed values, so consumers must validate against the
+    /// live text and fall back to [`Self::span`]. **Excluded from [`Interface::signature_hash`]**
+    /// like [`Self::span`].
+    pub name_span: ByteSpan,
     /// 1-based source line of the declaration. Drives diagnostics like
     /// SHADOWED_VARIABLE_BASE_CLASS that include the member's line in the message
     /// (`"already-declared variable at line N"`).
@@ -198,7 +206,7 @@ impl Interface {
             m.params.hash(h);
             m.required_params.hash(h);
             m.flags.hash(h);
-            // m.span is intentionally NOT hashed.
+            // m.span / m.name_span are intentionally NOT hashed.
         }
         for inner in &self.inner {
             inner.signature_hash().hash(h);
@@ -338,7 +346,8 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     let NodeKind::Variable(v) = &node.kind else {
         return None;
     };
-    let name = ident_name(tree, v.identifier)?;
+    let ident_id = v.identifier?;
+    let name = ident_name(tree, Some(ident_id))?;
     let kind = if v.property != PropertyStyle::None {
         MemberKind::Property
     } else {
@@ -365,6 +374,7 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
             ..MemberFlags::default()
         },
         span: node.span,
+        name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
     })
 }
@@ -374,7 +384,8 @@ fn const_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     let NodeKind::Constant(c) = &node.kind else {
         return None;
     };
-    let name = ident_name(tree, c.identifier)?;
+    let ident_id = c.identifier?;
+    let name = ident_name(tree, Some(ident_id))?;
     let mut ty = type_expr(tree, c.datatype_specifier);
     if matches!(ty, TypeExpr::None) {
         ty = initializer_type_expr(tree, c.initializer);
@@ -388,6 +399,7 @@ fn const_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         required_params: 0,
         flags: MemberFlags::default(),
         span: node.span,
+        name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
     })
 }
@@ -397,7 +409,8 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     let NodeKind::Function(f) = &node.kind else {
         return None;
     };
-    let name = ident_name(tree, f.identifier)?;
+    let ident_id = f.identifier?;
+    let name = ident_name(tree, Some(ident_id))?;
     let (params, param_names): (Vec<TypeExpr>, Vec<String>) = f
         .parameters
         .iter()
@@ -434,6 +447,7 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
             ..MemberFlags::default()
         },
         span: node.span,
+        name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
     })
 }
@@ -443,7 +457,8 @@ fn signal_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     let NodeKind::Signal(s) = &node.kind else {
         return None;
     };
-    let name = ident_name(tree, s.identifier)?;
+    let ident_id = s.identifier?;
+    let name = ident_name(tree, Some(ident_id))?;
     let (params, param_names): (Vec<TypeExpr>, Vec<String>) = s
         .parameters
         .iter()
@@ -467,6 +482,7 @@ fn signal_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         required_params,
         flags: MemberFlags::default(),
         span: node.span,
+        name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
     })
 }
@@ -478,7 +494,8 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     };
     // A nameless `enum { … }` is hoisted by the parser to individual `EnumValue` members instead, so
     // a `Member::Enum` always carries a name.
-    let name = ident_name(tree, e.identifier)?;
+    let ident_id = e.identifier?;
+    let name = ident_name(tree, Some(ident_id))?;
     Some(MemberDecl {
         name,
         kind: MemberKind::Enum,
@@ -488,6 +505,7 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         required_params: 0,
         flags: MemberFlags::default(),
         span: node.span,
+        name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
     })
 }
@@ -556,7 +574,9 @@ fn enum_value_member(tree: &ParseTree, value: &EnumValue) -> Option<MemberDecl> 
         param_names: Vec::new(),
         required_params: 0,
         flags: MemberFlags::default(),
+        // A hoisted enum value IS its identifier — declaration span and name span coincide.
         span: node.span,
+        name_span: node.span,
         line: node.loc.start.line,
     })
 }
@@ -842,6 +862,44 @@ mod tests {
         assert_eq!(by("State").kind, MemberKind::Enum);
         // The named enum's values are reachable as `State.IDLE`, not as standalone members.
         assert!(i.members.iter().all(|m| m.name != "IDLE"));
+    }
+
+    #[test]
+    fn member_name_spans_cover_their_identifiers() {
+        let src = "extends Node\n\
+                   const MAX := 10\n\
+                   var speed: float = 1.0\n\
+                   var hp: int: get = _get_hp\n\
+                   signal hit(amount: int)\n\
+                   func move(dir: Vector2) -> void:\n\tpass\n\
+                   enum State { IDLE, RUN }\n\
+                   enum { LOOSE }\n\
+                   class Inner extends Resource:\n\tvar x: int\n";
+        let i = iface(src);
+        assert!(!i.members.is_empty());
+        for m in i.members.iter().chain(i.inner[0].members.iter()) {
+            assert_eq!(
+                &src[m.name_span.start..m.name_span.end],
+                m.name,
+                "name_span of `{}` must slice exactly its identifier",
+                m.name
+            );
+            assert!(
+                m.span.start <= m.name_span.start && m.name_span.end <= m.span.end,
+                "name_span of `{}` must sit inside the declaration span",
+                m.name
+            );
+        }
+    }
+
+    #[test]
+    fn name_span_is_excluded_from_signature_hash() {
+        // Shifting a member down a line moves its name_span but must not look like an interface
+        // change to dependents (the MemberDecl::span rule).
+        let a = iface("extends Node\nvar hp := 1\n");
+        let b = iface("extends Node\n# moved\n\nvar hp := 1\n");
+        assert_ne!(a.members[0].name_span, b.members[0].name_span);
+        assert_eq!(a.signature_hash(), b.signature_hash());
     }
 
     #[test]

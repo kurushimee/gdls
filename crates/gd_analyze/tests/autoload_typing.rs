@@ -51,6 +51,7 @@ impl AutoloadQuery {
             required_params: 1,
             flags: Default::default(),
             span: Default::default(),
+            name_span: Default::default(),
             line: 1,
         };
         let iface = Interface {

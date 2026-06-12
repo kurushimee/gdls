@@ -6,9 +6,10 @@ use std::time::Duration;
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
-    ClientCapabilities, DocumentSymbol, DocumentSymbolParams, GeneralClientCapabilities,
-    InitializeParams, InitializedParams, Position, PositionEncodingKind, PublishDiagnosticsParams,
-    SymbolKind, TextDocumentIdentifier, TextDocumentItem, Uri,
+    ClientCapabilities, DiagnosticTag, DocumentSymbol, DocumentSymbolClientCapabilities,
+    DocumentSymbolParams, GeneralClientCapabilities, InitializeParams, InitializedParams, Position,
+    PositionEncodingKind, PublishDiagnosticsParams, SymbolInformation, SymbolKind,
+    TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem, Uri,
 };
 
 fn recv(conn: &Connection) -> Message {
@@ -42,22 +43,18 @@ fn notification(method: &str, params: serde_json::Value) -> Message {
     })
 }
 
-/// Boot a server over an in-memory connection and complete the `initialize`/`initialized` handshake,
-/// negotiating UTF-8 so LSP character offsets equal byte offsets for the ASCII test documents.
-fn boot() -> (Connection, std::thread::JoinHandle<()>) {
+/// Boot a server over an in-memory connection and complete the `initialize`/`initialized`
+/// handshake with the given client capabilities.
+fn boot_with_capabilities(
+    capabilities: ClientCapabilities,
+) -> (Connection, std::thread::JoinHandle<()>) {
     let (server, client) = Connection::memory();
     let handle = std::thread::spawn(move || {
         gd_server::serve(server).expect("serve() returned an error");
     });
 
     let init = InitializeParams {
-        capabilities: ClientCapabilities {
-            general: Some(GeneralClientCapabilities {
-                position_encodings: Some(vec![PositionEncodingKind::UTF8]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
+        capabilities,
         ..Default::default()
     };
     client
@@ -79,6 +76,30 @@ fn boot() -> (Connection, std::thread::JoinHandle<()>) {
         .unwrap();
 
     (client, handle)
+}
+
+/// UTF-8 so LSP character offsets equal byte offsets for the ASCII test documents.
+fn utf8_general() -> Option<GeneralClientCapabilities> {
+    Some(GeneralClientCapabilities {
+        position_encodings: Some(vec![PositionEncodingKind::UTF8]),
+        ..Default::default()
+    })
+}
+
+/// [`boot_with_capabilities`] with UTF-8 + hierarchical documentSymbol support — the nested
+/// outline shape the documentSymbol tests assert (mirrors VS Code's capabilities).
+fn boot() -> (Connection, std::thread::JoinHandle<()>) {
+    boot_with_capabilities(ClientCapabilities {
+        general: utf8_general(),
+        text_document: Some(TextDocumentClientCapabilities {
+            document_symbol: Some(DocumentSymbolClientCapabilities {
+                hierarchical_document_symbol_support: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 fn did_open(client: &Connection, uri: &Uri, text: &str) {
@@ -237,6 +258,302 @@ fn document_symbol_projects_nested_outline_with_kinds() {
     // `selection_range` is the identifier; `range` encloses it. `signal hit` → name at col 7 on the
     // line that follows the `@warning_ignore` annotation (line 3 of the source, 0-indexed).
     assert_eq!(members[0].selection_range.start, Position::new(3, 7));
+
+    shutdown(&client, handle);
+}
+
+/// Drive a documentSymbol request against a server booted WITHOUT hierarchical support and
+/// assert the flat 3.16 `SymbolInformation[]` shape: preorder root-first, full ranges, the
+/// parent symbol as `containerName`. Deserializing as `Vec<SymbolInformation>` is the shape
+/// discriminator — a nested `DocumentSymbol[]` response would fail serde on the missing
+/// `location` field.
+fn assert_flat_document_symbols(client: Connection, handle: std::thread::JoinHandle<()>) {
+    let uri: Uri = "file:///test/flat.gd".parse().unwrap();
+    let src = concat!(
+        "extends Node\n",
+        "\n",
+        "@warning_ignore(\"unused_signal\")\n",
+        "signal hit(damage)\n",
+        "\n",
+        "enum State { IDLE, RUN }\n",
+        "\n",
+        "func _ready():\n",
+        "\tpass\n",
+        "\n",
+        "class Inner:\n",
+        "\tvar x := 0\n",
+    );
+    did_open(&client, &uri, src);
+    let _ = recv_publish_diagnostics(&client);
+
+    client
+        .sender
+        .send(request(
+            2,
+            "textDocument/documentSymbol",
+            serde_json::to_value(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none());
+    let symbols: Vec<SymbolInformation> =
+        serde_json::from_value(resp.result.expect("documentSymbol result"))
+            .expect("a client without hierarchical support must receive SymbolInformation[]");
+
+    let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["flat.gd", "hit", "State", "IDLE", "RUN", "_ready", "Inner", "x"],
+        "preorder walk: root first, children after their parents"
+    );
+    let container_of = |name: &str| -> Option<&str> {
+        symbols
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("`{name}` missing"))
+            .container_name
+            .as_deref()
+    };
+    assert_eq!(container_of("flat.gd"), None, "the root has no container");
+    assert_eq!(container_of("hit"), Some("flat.gd"));
+    assert_eq!(container_of("IDLE"), Some("State"));
+    assert_eq!(container_of("x"), Some("Inner"));
+    assert!(
+        symbols.iter().all(|s| s.location.uri == uri),
+        "every flat symbol locates in the requested document"
+    );
+    let hit = symbols.iter().find(|s| s.name == "hit").unwrap();
+    assert_eq!(hit.kind, SymbolKind::EVENT);
+    assert_eq!(
+        hit.location.range.start,
+        Position::new(3, 0),
+        "flat locations carry the symbol's FULL range (declaration start), the 3.16 reveal shape"
+    );
+
+    shutdown(&client, handle);
+}
+
+#[test]
+fn document_symbol_flat_when_client_lacks_hierarchical_support() {
+    // No documentSymbol capability at all: absent ⇒ flat (the rust-analyzer `.unwrap_or_default()`
+    // convention — a client that never opted in must not get the nested shape).
+    let (client, handle) = boot_with_capabilities(ClientCapabilities {
+        general: utf8_general(),
+        ..Default::default()
+    });
+    assert_flat_document_symbols(client, handle);
+}
+
+#[test]
+fn document_symbol_explicit_false_yields_flat() {
+    let (client, handle) = boot_with_capabilities(ClientCapabilities {
+        general: utf8_general(),
+        text_document: Some(TextDocumentClientCapabilities {
+            document_symbol: Some(DocumentSymbolClientCapabilities {
+                hierarchical_document_symbol_support: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert_flat_document_symbols(client, handle);
+}
+
+/// Symbol `detail` renders each member's declaration shape through the same byte-stable
+/// formatters hover pins (issue #51): outlines show signatures dimmed next to the names, and
+/// the class symbols carry their extends clause.
+#[test]
+fn document_symbol_details_render_signatures() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/details.gd".parse().unwrap();
+    let src = concat!(
+        "extends Node\n",
+        "\n",
+        "@warning_ignore(\"unused_signal\")\n",
+        "signal hit(damage: int)\n",
+        "\n",
+        "const MAX := 100\n",
+        "\n",
+        "var speed: float = 1.0\n",
+        "\n",
+        "func helper(a: int) -> bool:\n",
+        "\treturn a > 0\n",
+        "\n",
+        "class Inner extends RefCounted:\n",
+        "\tvar x := 0\n",
+    );
+    did_open(&client, &uri, src);
+    let _ = recv_publish_diagnostics(&client);
+
+    client
+        .sender
+        .send(request(
+            3,
+            "textDocument/documentSymbol",
+            serde_json::to_value(DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none());
+    let symbols: Vec<DocumentSymbol> =
+        serde_json::from_value(resp.result.expect("documentSymbol result")).unwrap();
+    let root = &symbols[0];
+    assert_eq!(root.detail.as_deref(), Some("extends Node"));
+
+    let members = root.children.as_deref().unwrap_or_default();
+    let detail_of = |name: &str| -> Option<&str> {
+        members
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("`{name}` missing from outline"))
+            .detail
+            .as_deref()
+    };
+    assert_eq!(detail_of("hit"), Some("signal hit(damage: int)"));
+    assert_eq!(detail_of("MAX"), Some("const MAX: int"));
+    assert_eq!(detail_of("speed"), Some("var speed: float"));
+    assert_eq!(detail_of("helper"), Some("func helper(a: int) -> bool"));
+    let inner = members
+        .iter()
+        .find(|s| s.name == "Inner")
+        .expect("Inner class in outline");
+    assert_eq!(inner.detail.as_deref(), Some("extends RefCounted"));
+    assert_eq!(
+        inner.children.as_deref().unwrap_or_default()[0]
+            .detail
+            .as_deref(),
+        Some("var x: int"),
+        "inner-class members pair with the inner interface"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// Boot advertising `publishDiagnostics.tagSupport` with `Unnecessary` in the value set.
+fn boot_with_tag_support() -> (Connection, std::thread::JoinHandle<()>) {
+    boot_with_capabilities(ClientCapabilities {
+        general: utf8_general(),
+        text_document: Some(TextDocumentClientCapabilities {
+            publish_diagnostics: Some(lsp_types::PublishDiagnosticsClientCapabilities {
+                tag_support: Some(lsp_types::TagSupport {
+                    value_set: vec![DiagnosticTag::UNNECESSARY, DiagnosticTag::DEPRECATED],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// An unused local under a tag-supporting client: the diagnostic gains `tags: [Unnecessary]`
+/// (editors fade the range) and a `codeDescription` link — while the message stays byte-exact
+/// Godot output and the severity/range are untouched.
+#[test]
+fn unused_variable_diagnostic_carries_unnecessary_tag_when_supported() {
+    let (client, handle) = boot_with_tag_support();
+    let uri: Uri = "file:///test/unused.gd".parse().unwrap();
+    did_open(&client, &uri, "extends Node\nfunc f():\n\tvar x = 1\n");
+
+    let diags = recv_publish_diagnostics(&client);
+    let unused = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    "UNUSED_VARIABLE".to_string(),
+                ))
+        })
+        .unwrap_or_else(|| panic!("UNUSED_VARIABLE must fire; got {:?}", diags.diagnostics));
+    assert_eq!(unused.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
+    assert!(
+        unused
+            .code_description
+            .as_ref()
+            .is_some_and(|cd| cd.href.as_str().ends_with("warning_system.html")),
+        "warning-coded diagnostics link Godot's warning docs; got {:?}",
+        unused.code_description
+    );
+    assert_eq!(
+        unused.severity,
+        Some(lsp_types::DiagnosticSeverity::WARNING)
+    );
+    // The Godot-faithful message is untouched by the tag projection — byte-exact.
+    assert_eq!(
+        unused.message,
+        r#"The local variable "x" is declared but never used in the block. If this is intended, prefix it with an underscore: "_x"."#
+    );
+
+    shutdown(&client, handle);
+}
+
+/// Without `tagSupport`, the same diagnostic carries NO tags (pyright-style gating) — but the
+/// docs link ships ungated (rust-analyzer-style; clients ignore unknown members).
+#[test]
+fn diagnostic_tags_absent_without_client_tag_support() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/unused2.gd".parse().unwrap();
+    did_open(&client, &uri, "extends Node\nfunc f():\n\tvar x = 1\n");
+
+    let diags = recv_publish_diagnostics(&client);
+    let unused = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    "UNUSED_VARIABLE".to_string(),
+                ))
+        })
+        .expect("UNUSED_VARIABLE must fire");
+    assert_eq!(unused.tags, None, "tags are gated on the client capability");
+    assert!(unused.code_description.is_some());
+
+    shutdown(&client, handle);
+}
+
+/// Only the unused/unreachable family is tagged — a NARROWING_CONVERSION under a tag-supporting
+/// client stays untagged.
+#[test]
+fn non_unused_warning_carries_no_unnecessary_tag() {
+    let (client, handle) = boot_with_tag_support();
+    let uri: Uri = "file:///test/narrow.gd".parse().unwrap();
+    did_open(
+        &client,
+        &uri,
+        "extends Node\nfunc f() -> int:\n\tvar y: int = 1.5\n\treturn y\n",
+    );
+
+    let diags = recv_publish_diagnostics(&client);
+    let narrowing = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code
+                == Some(lsp_types::NumberOrString::String(
+                    "NARROWING_CONVERSION".to_string(),
+                ))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "NARROWING_CONVERSION must fire; got {:?}",
+                diags.diagnostics
+            )
+        });
+    assert_eq!(narrowing.tags, None);
+    assert!(narrowing.code_description.is_some());
 
     shutdown(&client, handle);
 }

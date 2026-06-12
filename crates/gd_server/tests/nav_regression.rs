@@ -1,5 +1,5 @@
 //! Regression tests for navigation-surface correctness bugs — workspace/symbol URI encoding and
-//! call-hierarchy `callee_file` attribution — found while hardening the M4 nav features.
+//! call-hierarchy callee attribution — found while hardening the M4 nav features.
 //!
 //! Each test pins a specific bug so a future regression (re-introduction of the same class of
 //! bug) fails the suite rather than silently under-reporting through the LSP.
@@ -13,9 +13,9 @@
 //!     `uri.rs`'s own `#[cfg(test)] mod tests`. The raw-vs-percent-encoded key drift is now a
 //!     compile-time impossibility via the `uri::CanonicalKey` newtype (the old `cache_keys`
 //!     dual-probe is gone).
-//!   - **callee_file inherited**: `inherited_bare_call_records_callee_file_none` parses a
-//!     file that calls `_ready()` (inherited from `Node`) and asserts the recorded
-//!     `Binding::Call.callee_file` is `None`, not `Some(ctx.file)`.
+//!   - **inherited-callee classification**: `inherited_bare_call_records_non_script_callee`
+//!     parses a file that calls `_ready()` (inherited from `Node`) and asserts the recorded
+//!     `Binding::Call` callee never classifies as a Script callee of the calling file.
 //!   - **class-entry line** (#33): `workspace_symbol_anchors_class_at_declaration_line` pins
 //!     that a `class_name` on line ≥ 2 anchors at its declaration, not file top — the registry
 //!     used to store no line and the handler hardcoded line 1.
@@ -194,24 +194,121 @@ fn workspace_symbol_anchors_class_at_declaration_line() {
         knight.location.range.start.line, 2,
         "class_name on source line 3 must render LSP line 2, not the file top"
     );
+    // The range covers exactly the `Knight` identifier (`class_name Knight` → cols 11..17),
+    // not a zero-width point at column 0.
+    assert_eq!(knight.location.range.start.character, 11);
+    assert_eq!(knight.location.range.end.character, 17);
+    assert_eq!(knight.location.range.end.line, 2);
+
+    shutdown(&client, server_thread);
+    drop(dir);
+}
+
+/// Every `workspace/symbol` result's range must cover the symbol's NAME token (the spec reads
+/// the range to reveal/select the hit; a zero-width point at column 0 lands the caret on
+/// leading syntax like `var ` or indentation). One fixture per member kind, each sliced back
+/// out of the source line by the returned character extent.
+#[test]
+fn workspace_symbol_ranges_cover_the_name_token() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let root =
+        camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("temp dir is UTF-8");
+
+    let src = "class_name Arsenal\n\
+               extends Node2D\n\
+               const MAX_AMMO := 30\n\
+               var speed: float = 1.0\n\
+               signal fired(power: int)\n\
+               func reload(clip: int) -> bool:\n\
+               \treturn clip > 0\n\
+               enum Mode { SAFE, BURST }\n";
+    std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+    std::fs::write(root.join("extension_api.json"), MINI_API).unwrap();
+    std::fs::write(root.join("arsenal.gd"), src).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+
+    let init = InitializeParams {
+        initialization_options: Some(serde_json::json!({
+            "projectRoot": root.as_str(),
+            "autoDumpExtensionApi": false,
+            "extensionApiPath": root.join("extension_api.json").as_str(),
+        })),
+        ..Default::default()
+    };
+    client.sender.send(request(1, "initialize", init)).unwrap();
+    let _ = recv(&client);
+    client
+        .sender
+        .send(notification("initialized", InitializedParams {}))
+        .unwrap();
+
+    let lines: Vec<&str> = src.lines().collect();
+    for (id, name) in ["Arsenal", "MAX_AMMO", "speed", "fired", "reload", "Mode"]
+        .iter()
+        .enumerate()
+    {
+        client
+            .sender
+            .send(request(
+                id as i32 + 2,
+                "workspace/symbol",
+                WorkspaceSymbolParams {
+                    query: name.to_string(),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        let resp = recv(&client);
+        let Message::Response(r) = resp else {
+            panic!("expected Response, got {resp:?}");
+        };
+        let result: WorkspaceSymbolResponse =
+            serde_json::from_value(r.result.expect("ok result")).expect("response shape");
+        let WorkspaceSymbolResponse::Flat(symbols) = result else {
+            panic!("expected Flat shape");
+        };
+        let hit = symbols
+            .iter()
+            .find(|s| s.name == *name)
+            .unwrap_or_else(|| panic!("`{name}` must be visible in workspace/symbol"));
+        let range = hit.location.range;
+        assert_ne!(
+            range.start, range.end,
+            "`{name}`: no result may carry a zero-width range"
+        );
+        assert_eq!(
+            range.start.line, range.end.line,
+            "`{name}`: single-line token"
+        );
+        // The fixture is ASCII, so character offsets equal byte offsets within the line.
+        let line = lines[range.start.line as usize];
+        assert_eq!(
+            &line[range.start.character as usize..range.end.character as usize],
+            *name,
+            "`{name}`: the range must slice exactly the name token out of {line:?}"
+        );
+    }
 
     shutdown(&client, server_thread);
     drop(dir);
 }
 
 // ============================================================================
-// callee_file None for non-lexically-anchored bare calls
+// Non-Script callee classification for non-lexically-anchored bare calls
 // ============================================================================
 
 /// A bare call to `_ready()` from `extends Node` dispatches to `Node._ready` — a native method
-/// on a class declared in `extension_api.json`, not in this file. The pre-fix recording site
-/// unconditionally tagged every reached call with `callee_file = Some(ctx.file)`, so
-/// `callHierarchy/incomingCalls` of `Node._ready` missed every site and `outgoingCalls`
-/// rendered the call as an in-file self-pointer. The fix routes through
-/// `current_file_declares_function` in `reducer.rs`: when the file doesn't declare the
-/// callee name, record `None`.
+/// on a class declared in `extension_api.json`, not in this file. The original recording bug
+/// tagged every reached call with this file as the callee, so `callHierarchy/incomingCalls` of
+/// `Node._ready` missed every site and `outgoingCalls` rendered the call as an in-file
+/// self-pointer. The consolidated recording site derives the callee target from the resolution
+/// the dispatch actually used: under MINI_API's method-less dump the native lookup misses, so
+/// the call classifies `Unresolved` (never `Script{this file}`); with a methods-bearing dump it
+/// classifies `Native` (companion test below).
 #[test]
-fn inherited_bare_call_records_callee_file_none() {
+fn inherited_bare_call_records_non_script_callee() {
     use gd_analyze::{analyze, Binding, StrictSettings, SyntacticQuery, WarnPolicy};
     use gd_project::WarningConfig;
 
@@ -236,53 +333,86 @@ fn inherited_bare_call_records_callee_file_none() {
     let ready_call = result.bindings().iter().find_map(|b| match b {
         Binding::Call {
             callee_name,
-            callee_file,
+            callee,
             ..
-        } if callee_name == "_ready" => Some(*callee_file),
+        } if callee_name == "_ready" => Some(callee.clone()),
         _ => None,
     });
+    let callee = ready_call.expect("a Binding::Call must be recorded for the bare `_ready()`");
+    assert_eq!(
+        callee.script_file(),
+        None,
+        "an inherited native bare call must never classify as a Script callee of this file; \
+         got {callee:?}"
+    );
+}
 
-    match ready_call {
-        Some(None) => {
-            // Expected: _ready is on Node (native), the analyzer correctly recorded None so
-            // the nav handlers degrade through the native / unresolved path.
-        }
-        Some(Some(fid)) => panic!(
-            "regression: inherited bare call `_ready()` recorded callee_file = Some({fid:?}). \
-             It should be None — _ready is declared on Node (native), not in this file. \
-             See `reducer.rs::current_file_declares_function`."
-        ),
-        None => {
-            // The reducer might also legitimately reach an early-return path that skips the
-            // recording entirely (e.g., a future reshape moves `_ready` resolution into the
-            // Object-method branch). Failing closed here would couple the regression test to
-            // an implementation detail; a follow-on Binding::Call with the wrong callee_file
-            // would still fail the Some(Some(_)) arm above. Surface the result as an
-            // informative skip so future readers know why the test "passes".
-            eprintln!(
-                "warning: no Binding::Call recorded for _ready; reducer may have reshaped the \
-                 path. Bindings produced: {:?}",
-                result.bindings()
-            );
-        }
-    }
+/// The same bare `_ready()` under a dump that DOES carry `Node._ready` classifies
+/// `CalleeTarget::Native` with the class the lookup ran against — what the stub-anchored
+/// outgoingCalls leg consumes.
+#[test]
+fn bare_native_call_with_methods_dump_records_native_target() {
+    use gd_analyze::{analyze, Binding, CalleeTarget, StrictSettings, SyntacticQuery, WarnPolicy};
+    use gd_project::WarningConfig;
+
+    const METHODS_API: &str = r#"{
+        "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+        "classes": [
+            {"name": "Object", "is_instantiable": true},
+            {"name": "Node", "inherits": "Object", "is_instantiable": true,
+             "methods": [{"name": "_ready", "is_const": false, "is_static": false,
+                          "is_vararg": false, "is_virtual": true, "hash": 1, "arguments": []}]}
+        ]
+    }"#;
+    let source = "extends Node\n\nfunc start() -> void:\n\t_ready()\n";
+    let parse = gd_syntax::parse(source);
+    let native = gd_types::NativeDb::from_json(METHODS_API).expect("methods-bearing db");
+    let mut index = gd_project::Index::new(camino::Utf8PathBuf::from("/proj"));
+    let file = index.set_interface(
+        camino::Utf8Path::new("/proj/src/foo.gd"),
+        gd_project::extract_interface(&parse.tree),
+    );
+    index.finish_cold_index();
+    let xfile = SyntacticQuery::new(&index, &native);
+    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+
+    let result = analyze(&parse.tree, Some(file), "foo.gd", &native, &xfile, &policy);
+    let callee = result
+        .bindings()
+        .iter()
+        .find_map(|b| match b {
+            Binding::Call {
+                callee_name,
+                callee,
+                ..
+            } if callee_name == "_ready" => Some(callee.clone()),
+            _ => None,
+        })
+        .expect("a Binding::Call must be recorded for the bare `_ready()`");
+    assert_eq!(
+        callee,
+        CalleeTarget::Native {
+            class: "Node".to_string()
+        },
+        "a resolved native bare call classifies Native with the lookup class"
+    );
 }
 
 // ============================================================================
-// Follow-up: callee_file None on the DOTTED / SUPER site
+// Non-Script classification on the DOTTED / SUPER shapes
 // ============================================================================
 //
-// `inherited_bare_call_records_callee_file_none` (above) covers the BARE recording site
-// (`reducer.rs` ~2849). There is a SECOND recording site for dotted (`self.f()`, `obj.f()`,
-// `C.f()`) and super (`super.f()`) callees (`reducer.rs` ~3557), with its own `callee_file`
-// logic (`in_file_function_id.is_some()`). Its Some-branch is covered (`self.attack()` resolving
-// in-file, in `watcher_and_nav.rs`); these two pin its None-branch so the same class of bug fixed
-// for bare calls (wrongly stamping `Some(ctx.file)`, which mis-renders `outgoingCalls` as an
-// in-file self-pointer) cannot silently reappear on the dotted/super shapes.
+// All callee shapes (bare, dotted `self.f()` / `obj.f()` / `C.f()`, and super) now record at
+// ONE consolidated site that derives the target from the resolution the dispatch used. The
+// Script branch is covered (`self.attack()` resolving in-file, in `watcher_and_nav.rs`, and
+// `inherited_bare_call_attributes_to_declaring_base` below); these two pin the non-Script
+// branch so the original bug class (stamping this file as the callee, which mis-renders
+// `outgoingCalls` as an in-file self-pointer) cannot silently reappear on the dotted/super
+// shapes.
 
-/// Analyze a standalone `.gd` `source` and report whether the first recorded `Binding::Call` for
-/// `callee_name` resolved in-file: `Some(true)` = `callee_file = Some(_)`, `Some(false)` =
-/// `callee_file = None`, outer `None` = no such call binding recorded.
+/// Analyze a standalone `.gd` `source` and report whether the first recorded `Binding::Call`
+/// for `callee_name` classified a Script callee: `Some(true)` = `CalleeTarget::Script`,
+/// `Some(false)` = Native/Unresolved, outer `None` = no such call binding recorded.
 fn recorded_call_is_in_file(source: &str, callee_name: &str) -> Option<bool> {
     use gd_analyze::{analyze, Binding, StrictSettings, SyntacticQuery, WarnPolicy};
     use gd_project::WarningConfig;
@@ -305,47 +435,165 @@ fn recorded_call_is_in_file(source: &str, callee_name: &str) -> Option<bool> {
     result.bindings().iter().find_map(|b| match b {
         Binding::Call {
             callee_name: n,
-            callee_file,
+            callee,
             ..
-        } if n == callee_name => Some(callee_file.is_some()),
+        } if n == callee_name => Some(callee.script_file().is_some()),
         _ => None,
     })
 }
 
-/// A dotted call to a NATIVE method (`self._ready()` → `Node._ready`) is not an in-file function,
-/// so the dotted site must record `callee_file = None`. `Some(true)` here would be the regression.
+/// A dotted call to a NATIVE method (`self._ready()` → `Node._ready`) is not an in-file
+/// function, so it must never classify a Script callee. `Some(true)` here would be the
+/// regression.
 #[test]
-fn dotted_native_call_records_callee_file_none() {
+fn dotted_native_call_records_non_script_callee() {
     assert_eq!(
         recorded_call_is_in_file(
             "extends Node\n\nfunc start() -> void:\n\tself._ready()\n",
             "_ready"
         ),
         Some(false),
-        "dotted native call `self._ready()` must record callee_file = None \
+        "dotted native call `self._ready()` must classify a non-Script callee \
          (Some(true) = wrongly resolved in-file; None = no Binding::Call recorded at all)"
     );
 }
 
 /// `super._ready()` dispatches to the PARENT (native `Node._ready` for `extends Node`), never an
 /// in-file function. The site handles `call.is_super` explicitly but was unexercised at the
-/// binding level; pin `callee_file = None`.
+/// binding level; pin the non-Script classification.
 #[test]
-fn super_native_call_records_callee_file_none() {
+fn super_native_call_records_non_script_callee() {
     assert_eq!(
         recorded_call_is_in_file(
             "extends Node\n\nfunc start() -> void:\n\tsuper._ready()\n",
             "_ready"
         ),
         Some(false),
-        "super native call `super._ready()` must record callee_file = None \
+        "super native call `super._ready()` must classify a non-Script callee \
          (Some(true) = wrongly resolved in-file; None = no Binding::Call recorded at all)"
     );
 }
 
-/// WP-RD6: a BARE call to an INHERITED method now attributes `callee_file` to the base that
-/// DECLARES it (dispatch-accurate via `resolve_callee_file`'s extends-chain walk), not `None` —
-/// the prior name-presence test could not express this. Build a real 2-file index so the chain
+/// The consolidated recording site walks the in-file lookup from the CURRENT class, so a bare
+/// call inside an inner class records the inner class as the owning `class_path` — the
+/// disambiguator that stops same-named methods in one file from sharing call-site sets.
+#[test]
+fn inner_class_bare_call_records_owning_class_path() {
+    use gd_analyze::{analyze, Binding, CalleeTarget, StrictSettings, SyntacticQuery, WarnPolicy};
+    use gd_project::WarningConfig;
+
+    let source = "extends Node\n\
+                  func helper() -> void:\n\tpass\n\
+                  func go_root() -> void:\n\thelper()\n\
+                  class Inner:\n\
+                  \tfunc helper() -> void:\n\t\tpass\n\
+                  \tfunc go() -> void:\n\t\thelper()\n";
+    let parse = gd_syntax::parse(source);
+    assert!(
+        parse.diagnostics.is_empty(),
+        "fixture must parse cleanly; got {:?}",
+        parse.diagnostics
+    );
+    let native = gd_types::NativeDb::from_json(MINI_API).expect("mini native db");
+    let mut index = gd_project::Index::new(camino::Utf8PathBuf::from("/proj"));
+    let file = index.set_interface(
+        camino::Utf8Path::new("/proj/src/foo.gd"),
+        gd_project::extract_interface(&parse.tree),
+    );
+    index.finish_cold_index();
+    let xfile = SyntacticQuery::new(&index, &native);
+    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let result = analyze(&parse.tree, Some(file), "foo.gd", &native, &xfile, &policy);
+
+    let callees: Vec<CalleeTarget> = result
+        .bindings()
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Call {
+                callee_name,
+                callee,
+                ..
+            } if callee_name == "helper" => Some(callee.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        callees.contains(&CalleeTarget::Script {
+            file,
+            class_path: Vec::new()
+        }),
+        "the root-class bare call records the root class_path; got {callees:?}"
+    );
+    assert!(
+        callees.contains(&CalleeTarget::Script {
+            file,
+            class_path: vec!["Inner".to_string()]
+        }),
+        "the inner-class bare call records its owning class path; got {callees:?}"
+    );
+}
+
+/// In-file attribute reads (`self.hp`, and reads through a variable typed as this file's own
+/// class) record a `Binding::Use` at the attribute identifier — the in-file twin of the
+/// cross-file `record_member_use` recording, closing the last attribute-read gap so references
+/// can ride bindings instead of the raw identifier scan.
+#[test]
+fn in_file_attribute_read_records_use_binding() {
+    use gd_analyze::{
+        analyze, Binding, BindingTargetKind, StrictSettings, SyntacticQuery, WarnPolicy,
+    };
+    use gd_project::WarningConfig;
+
+    let source = "class_name OwnClass\nextends Node\nvar hp: int = 0\n\
+                  func a() -> void:\n\tself.hp = 1\n\
+                  func b() -> void:\n\tvar h: OwnClass = self\n\tprint(h.hp)\n";
+    let parse = gd_syntax::parse(source);
+    assert!(
+        parse.diagnostics.is_empty(),
+        "fixture must parse cleanly; got {:?}",
+        parse.diagnostics
+    );
+    let native = gd_types::NativeDb::from_json(MINI_API).expect("mini native db");
+    let mut index = gd_project::Index::new(camino::Utf8PathBuf::from("/proj"));
+    let file = index.set_interface(
+        camino::Utf8Path::new("/proj/src/own.gd"),
+        gd_project::extract_interface(&parse.tree),
+    );
+    index.finish_cold_index();
+    let xfile = SyntacticQuery::new(&index, &native);
+    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let result = analyze(&parse.tree, Some(file), "own.gd", &native, &xfile, &policy);
+
+    let use_spans: Vec<gd_syntax::ByteSpan> = result
+        .bindings()
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Use {
+                target_file,
+                target_kind: BindingTargetKind::Member,
+                target_name,
+                site,
+            } if target_name == "hp" && *target_file == Some(file) => Some(*site),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        use_spans.len() >= 2,
+        "both the `self.hp` write and the `h.hp` read must record Use bindings; got {:?}",
+        result.bindings()
+    );
+    for span in &use_spans {
+        assert_eq!(
+            &source[span.start..span.end],
+            "hp",
+            "each Use binding anchors the attribute identifier itself"
+        );
+    }
+}
+
+/// A BARE call to an INHERITED method attributes its callee to the base that DECLARES it
+/// (dispatch-accurate via the script-chain walk at the consolidated recording site), never
+/// `Unresolved` and never the calling file. Build a real 2-file index so the chain
 /// `Derived extends Base` is resolvable; `go()`'s bare `shared()` dispatches to `Base.shared`.
 #[test]
 fn inherited_bare_call_attributes_to_declaring_base() {
@@ -383,16 +631,19 @@ fn inherited_bare_call_attributes_to_declaring_base() {
     let shared_call = result.bindings().iter().find_map(|b| match b {
         Binding::Call {
             callee_name,
-            callee_file,
+            callee,
             ..
-        } if callee_name == "shared" => Some(*callee_file),
+        } if callee_name == "shared" => Some(callee.clone()),
         _ => None,
     });
     assert_eq!(
         shared_call,
-        Some(Some(base_fid)),
-        "an inherited bare call `shared()` must attribute callee_file to the declaring Base \
-         (WP-RD6 dispatch resolution), not None and not the calling Derived file"
+        Some(gd_analyze::CalleeTarget::Script {
+            file: base_fid,
+            class_path: Vec::new()
+        }),
+        "an inherited bare call `shared()` must attribute its callee to the declaring Base \
+         (dispatch resolution), not Unresolved and not the calling Derived file"
     );
 }
 

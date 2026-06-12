@@ -597,3 +597,221 @@ fn references_on_native_subscript_call_finds_cross_file_uses() {
 
     shutdown(&client, server_thread);
 }
+
+/// includeDeclaration:false on a NON-method target (the raw-identifier-scan path where the
+/// declaration token used to leak through unconditionally): a class-level `var` declaration
+/// click returns only the reads; with `true` the declaration appears exactly once.
+#[test]
+fn references_include_declaration_false_excludes_member_var_decl() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    // Line 1: `var hp: int = 0` — declaration `hp` at cols 4..6.
+    // Lines 3/5: `\tself.hp = …` — reads at cols 6..8.
+    p.write(
+        "obj.gd",
+        "extends Node\nvar hp: int = 0\nfunc a() -> void:\n\tself.hp = 1\nfunc b() -> void:\n\tself.hp = 2\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["obj.gd"]);
+
+    let uri = file_uri(&p.root.join("obj.gd"));
+    let send = |id: i32, include: bool| -> Vec<Location> {
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position {
+                    line: 1,
+                    character: 4,
+                },
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: include,
+            },
+        };
+        client
+            .sender
+            .send(request(id, "textDocument/references", params))
+            .unwrap();
+        let resp = common::recv_response(&client);
+        assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+        serde_json::from_value::<Option<Vec<Location>>>(resp.result.unwrap())
+            .unwrap()
+            .unwrap_or_default()
+    };
+
+    let decl_start = Position {
+        line: 1,
+        character: 4,
+    };
+    let without = send(20, false);
+    assert!(
+        !without.iter().any(|l| l.range.start == decl_start),
+        "the declaration's own name token must be filtered with includeDeclaration:false; \
+         got {without:?}"
+    );
+    for line in [3u32, 5] {
+        assert!(
+            without
+                .iter()
+                .any(|l| l.range.start == Position { line, character: 6 }),
+            "the line-{line} read must stay; got {without:?}"
+        );
+    }
+
+    let with = send(21, true);
+    assert_eq!(
+        with.iter().filter(|l| l.range.start == decl_start).count(),
+        1,
+        "with includeDeclaration:true the declaration appears exactly once; got {with:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The references-precision acceptance: two unrelated classes each declare `var speed`, a third
+/// file holds typed accesses to both. References on one class's `speed` returns only ITS sites —
+/// the raw identifier scan used to report both classes' occurrences project-wide.
+#[test]
+fn references_on_member_excludes_unrelated_same_named_member() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    // a.gd line 2: `var speed: float = 1.0` — decl `speed` at cols 4..9; line 4 read at cols 13..18.
+    p.write(
+        "a.gd",
+        "class_name AClass\nextends Node\nvar speed: float = 1.0\nfunc fa() -> float:\n\treturn self.speed\n",
+    );
+    p.write(
+        "b.gd",
+        "class_name BClass\nextends Node\nvar speed: float = 2.0\nfunc fb() -> float:\n\treturn self.speed\n",
+    );
+    // c.gd accesses BOTH through typed locals: line 3 `\treturn a.speed + b.speed`.
+    p.write(
+        "c.gd",
+        "extends Node\nfunc fc() -> float:\n\tvar a: AClass = AClass.new()\n\tvar b: BClass = BClass.new()\n\treturn a.speed + b.speed\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["a.gd", "b.gd", "c.gd"]);
+
+    let a_uri = file_uri(&p.root.join("a.gd"));
+    let b_uri = file_uri(&p.root.join("b.gd"));
+    let c_uri = file_uri(&p.root.join("c.gd"));
+
+    // Cursor on a.gd's `speed` DECLARATION (line 2, col 5).
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: a_uri.clone() },
+            position: Position {
+                line: 2,
+                character: 5,
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+        context: ReferenceContext {
+            include_declaration: true,
+        },
+    };
+    client
+        .sender
+        .send(request(30, "textDocument/references", params))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    assert!(
+        !locs.iter().any(|l| l.uri == b_uri),
+        "BClass's unrelated `speed` must NOT appear; got {locs:?}"
+    );
+    assert!(
+        locs.iter()
+            .any(|l| l.uri == a_uri && l.range.start == Position::new(4, 13)),
+        "a.gd's own `self.speed` read must appear; got {locs:?}"
+    );
+    // The typed cross-file access: c.gd line 4 `\treturn a.speed + b.speed` — `a.speed`'s
+    // attribute at cols 10..15 belongs to AClass; `b.speed`'s at cols 20..25 must not.
+    assert!(
+        locs.iter()
+            .any(|l| l.uri == c_uri && l.range.start == Position::new(4, 10)),
+        "c.gd's typed `a.speed` access must appear (the recall fix); got {locs:?}"
+    );
+    assert!(
+        !locs
+            .iter()
+            .any(|l| l.uri == c_uri && l.range.start == Position::new(4, 20)),
+        "c.gd's `b.speed` access belongs to BClass and must NOT appear; got {locs:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A local variable shares its name with a class member and another function's local: references
+/// on the local stay inside ITS function — locals can never be referenced cross-file or
+/// cross-function, so the old project-wide scan was pure over-report.
+#[test]
+fn references_on_local_variable_stays_in_function() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    // line 1: member `var charge: int = 0`
+    // lines 3-4 (`func fa`): local `charge` declared (3, cols 5..11) and read (4, cols 7..13).
+    // lines 6-7 (`func fb`): an unrelated local `charge`.
+    p.write(
+        "loc.gd",
+        "extends Node\nvar charge: int = 0\nfunc fa() -> int:\n\tvar charge = 1\n\treturn charge\nfunc fb() -> int:\n\tvar charge = 2\n\treturn charge\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["loc.gd"]);
+
+    let uri = file_uri(&p.root.join("loc.gd"));
+    // Cursor on fa's local declaration (line 3, col 6).
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position {
+                line: 3,
+                character: 6,
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+        context: ReferenceContext {
+            include_declaration: true,
+        },
+    };
+    client
+        .sender
+        .send(request(31, "textDocument/references", params))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    assert!(
+        locs.iter()
+            .all(|l| l.range.start.line == 3 || l.range.start.line == 4),
+        "references on fa's local must stay inside fa (lines 3-4); got {locs:?}"
+    );
+    assert!(
+        locs.iter().any(|l| l.range.start.line == 4),
+        "the local's read on line 4 must appear; got {locs:?}"
+    );
+    assert!(
+        !locs.iter().any(|l| l.range.start.line == 1),
+        "the same-named class MEMBER on line 1 must not appear; got {locs:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
