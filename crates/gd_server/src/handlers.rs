@@ -1,7 +1,8 @@
 //! LSP request handlers.
 
 use gd_analyze::{
-    find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, BindingTargetKind, DtKind,
+    find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, BindingTargetKind,
+    CalleeTarget, DtKind,
 };
 use gd_syntax::ast::{
     ClassNode, ConstantNode, FunctionNode, LiteralNode, Member, NodeId, NodeKind, ParseTree,
@@ -3028,9 +3029,11 @@ fn function_decl_spans(
 }
 
 /// A zero-width LSP range at file start. The documented degrade for a [`CallHierarchyItem`] whose
-/// symbol declaration can't be located (native/unresolved callee, the `<top>` caller, or an
-/// unreadable file): LSP requires *a* location, and pointing at `(0,0)` is honest ("somewhere in
-/// this file") rather than the wrong-but-specific call-site range the pre-fix code shipped.
+/// symbol declaration can't be located (the synthetic `<top>` caller, or an unreadable file):
+/// LSP requires *a* location, and pointing at `(0,0)` is honest ("somewhere in this file")
+/// rather than the wrong-but-specific call-site range the pre-fix code shipped. Native and
+/// unresolved OUTGOING callees never reach this — they anchor into their API stub or are
+/// omitted entirely.
 fn file_start_range() -> Range {
     let zero = Position {
         line: 0,
@@ -3139,9 +3142,9 @@ pub fn outgoing_calls(
     let mapper = PositionMapper::new(&rope, enc);
     let result = analyze_with_request_token(state, &key, &path, &parsed.tree, &text);
 
-    // Group calls by (Script-declaring file, callee_name), preserving first-seen order.
+    // Group calls by (callee target, callee_name), preserving first-seen order.
     // `find_outgoing_calls` already filtered to Call bindings whose caller matches `fn_name`.
-    type CalleeKey = (Option<gd_project::FileId>, String);
+    type CalleeKey = (CalleeTarget, String);
     let callee_spans = callee_name_token_spans(&parsed.tree);
     let groups: Vec<(CalleeKey, Vec<lsp_types::Range>)> = group_call_ranges(
         find_outgoing_calls(&result, fn_name.as_str()),
@@ -3152,56 +3155,85 @@ pub fn outgoing_calls(
                 callee,
                 callee_name,
                 ..
-            } => Some((callee.script_file(), callee_name.clone())),
+            } => Some((callee.clone(), callee_name.clone())),
             _ => None,
         },
     );
 
+    let stub_root = state.options.stub_cache_dir.clone();
     let mut out = Vec::with_capacity(groups.len());
-    for ((callee_file, callee_name), ranges) in groups {
-        let (to_uri, to_range, to_selection, to_detail) = match callee_file {
-            Some(fid) => match state.workspace.index.path(fid).map(|p| p.to_path_buf()) {
-                Some(path) => match path_to_file_uri(&path) {
-                    Some(u) => {
-                        // The `to` item locates the callee's DECLARATION (LSP 3.17), not the call
-                        // site — load the callee's file and resolve `func callee_name`'s spans.
-                        let (range, selection) =
-                            resolve_fn_item_ranges(state, &path, &u, &callee_name);
-                        let detail = script_detail(state, &path);
-                        (u, range, selection, detail)
-                    }
+    for ((callee, callee_name), ranges) in groups {
+        let (to_uri, to_range, to_selection, to_detail) = match callee {
+            CalleeTarget::Script { file: fid, .. } => {
+                match state.workspace.index.path(fid).map(|p| p.to_path_buf()) {
+                    Some(path) => match path_to_file_uri(&path) {
+                        Some(u) => {
+                            // The `to` item locates the callee's DECLARATION (LSP 3.17), not the
+                            // call site — load the callee's file and resolve `func callee_name`'s
+                            // spans.
+                            let (range, selection) =
+                                resolve_fn_item_ranges(state, &path, &u, &callee_name);
+                            let detail = script_detail(state, &path);
+                            (u, range, selection, detail)
+                        }
+                        None => {
+                            log::debug!(
+                                "outgoingCalls: dropping callee {callee_name} — \
+                                 path_to_file_uri({path}) rejected the path"
+                            );
+                            continue;
+                        }
+                    },
                     None => {
-                        log::debug!(
-                            "outgoingCalls: dropping callee {callee_name} — \
-                             path_to_file_uri({path}) rejected the path"
+                        // A CalleeTarget::Script carried a fid the Index has no path for. This
+                        // is NOT an Index-internal invariant — Index::verify() validates the
+                        // Index's own structures (interfaces / registry / depgraph /
+                        // name_referencers), never the `Binding`s held in an AnalysisResult —
+                        // so it can't catch this. It's a stale-analysis-cache artifact: the
+                        // binding out-lived the file's removal / quarantine and hasn't been
+                        // flushed from the analysis cache yet (a reconcile re-analyzes and
+                        // re-stamps the bindings). The on-call's first question is
+                        // "which fid?" — log loudly.
+                        log::warn!(
+                            "outgoingCalls: callee {callee_name} bindings reference \
+                             FileId({fid:?}) but Index::path returned None — a binding \
+                             out-lived its file's removal/quarantine. The analysis cache is \
+                             stale; re-run `gdls diagnose --reconcile` to re-analyze and \
+                             re-stamp the bindings.",
+                            fid = fid
                         );
                         continue;
                     }
-                },
-                None => {
-                    // A Binding::Call.callee_file was Some(fid) but the Index has no path for
-                    // fid. This is NOT an Index-internal invariant — Index::verify() validates
-                    // the Index's own structures (interfaces / registry / depgraph /
-                    // name_referencers), never the `Binding`s held in an AnalysisResult — so it
-                    // can't catch this. It's a stale-analysis-cache artifact: the binding
-                    // out-lived the file's removal / quarantine and hasn't been flushed from the
-                    // analysis cache yet (a reconcile re-analyzes and re-stamps the bindings).
-                    // The on-call's first question is "which fid?" — log loudly.
-                    log::warn!(
-                        "outgoingCalls: callee {callee_name} bindings reference FileId({fid:?}) \
-                         but Index::path returned None — a binding out-lived its file's \
-                         removal/quarantine. The analysis cache is stale; re-run \
-                         `gdls diagnose --reconcile` to re-analyze and re-stamp the bindings.",
-                        fid = fid
-                    );
-                    continue;
                 }
-            },
-            // Native / unresolved callee: no project declaration to point at. Degrade to the
-            // caller's URI with a zero-width range at file start (LSP requires a location), NOT the
-            // call-site range the pre-fix code used. No detail either — never label the
-            // fabricated anchor as if it were a resolved location.
-            None => (uri.clone(), file_start_range(), file_start_range(), None),
+            }
+            // Native callee: anchor the `to` item into the DECLARING class's API stub at the
+            // member's name token — the "real external declaration" rust-analyzer/gopls point
+            // at for std-lib callees. `detail` names the declaring class (the stub the item
+            // opens into). Stub materialization failure (no cache root, IO error) omits the
+            // entry rather than fabricating a location.
+            CalleeTarget::Native { class } => {
+                let declaring = {
+                    let db = &state.workspace.native;
+                    db.lookup_member(&class, &callee_name)
+                        .map(|(decl, _)| db.name_of(decl.name).to_owned())
+                };
+                match native_member_stub_location(state, &class, &callee_name, stub_root.as_deref())
+                {
+                    Some(loc) => (loc.uri, loc.range, loc.range, declaring),
+                    None => {
+                        log::debug!(
+                            "outgoingCalls: omitting native callee {callee_name} — the {class} \
+                             stub could not be materialized"
+                        );
+                        continue;
+                    }
+                }
+            }
+            // Unresolved callee: no project or native declaration to point at — OMIT the entry
+            // (the rust-analyzer/gopls convention for nav-less callees). Never the pre-fix
+            // fabrication of the caller's uri with a (0,0) anchor, which claimed the callee was
+            // declared at the top of the calling script.
+            CalleeTarget::Unresolved => continue,
         };
         // `to` items carry the same {uri, name} blob prepare/incoming items do — the client
         // hands them back verbatim on expansion ("show outgoing calls of this callee"), and a
