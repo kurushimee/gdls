@@ -181,9 +181,10 @@ parse scenes (Phase 2), so:
 - Implementation: `gd_analyze::DataType::deferred_node` (`is_pseudo_type = true`, `native_type = "Node"`,
   `is_read_only = true`). Member-access reduction routes through the pseudo-type guard and yields
   `Variant` rather than emitting unknown-member errors.
-- **Phase 2** replaces this with precise scene-derived typing (parse the attached `.tscn`, map node
+- **Phase 2 (M11)** replaces this with precise scene-derived typing (parse the attached `.tscn`, map node
   names → node types → instanced-scene `class_name`s), at which point `$`/`%` diagnostics converge with
-  Godot. See `07-milestones-risks.md`.
+  Godot — while unresolvable paths stay permissive, preserving the no-false-positive guarantee. See
+  `09-phase-2.md` §6-M11 and `07-milestones-risks.md`.
 
 ## 11b. Native-surface provenance gating (deliberate deviation, v1.0.2)
 

@@ -16,9 +16,9 @@ see the parity note below the table.)
 | Hover / type info | `textDocument/hover` | ✅ M3 | Resolved type + signature + doc prose (see "Hover doc-string source" below). |
 | Find implementations | `textDocument/implementation` | ✅ M4 | Subtypes / overrides via the class graph. Wired in M4. |
 | Call hierarchy | `textDocument/prepareCallHierarchy` (+ incoming/outgoing) | ✅ M4 | From the call graph built during analysis. Wired in M4. |
-| Signature help | `textDocument/signatureHelp` | ❌ Phase 2 | Not documented as consumed by CC. |
-| Completion | `textDocument/completion` | ❌ Phase 2 | Not documented as consumed by CC. |
-| Rename / formatting / code actions / semantic tokens | — | ❌ | Out of scope. |
+| Signature help | `textDocument/signatureHelp` | ❌ Phase 2 (M8) | Not documented as consumed by CC; editors need it. See `09-phase-2.md`. |
+| Completion | `textDocument/completion` | ❌ Phase 2 (M8) | Not documented as consumed by CC; editors need it. See `09-phase-2.md`. |
+| Rename / formatting / code actions / semantic tokens | — | ❌ v1 | Out of scope *for v1*; now specified as Phase 2 M9/M10 (formatting: external-bridge only, M11) in `09-phase-2.md`. |
 
 > **Parity note (M6).** A ✅ above means the capability is *exposed and wired*, not that it already
 > matches Godot's own LSP on every input. Five have parity gaps that **M6** closes before v1 is tagged:
@@ -40,10 +40,11 @@ Doc prose for `textDocument/hover` resolves through this priority order:
    capture story.
 3. **Absent** — if neither tier carries prose, hover shows the type signature alone.
 
-**Project-class (user-defined) doc prose is deferred to Phase 2.** GDScript's `##` doc-comment
-syntax is discarded by the M1 lexer (no `##`-token retention); restoring it requires either lexer
-work or a sidecar doc extractor, and that work is naturally bundled with Phase 2's `.tscn` /
-`$Node` typing. Until then, hover on a project class shows the resolved type only.
+**Project-class (user-defined) doc prose is deferred to Phase 2 — now scheduled as M7.** GDScript's
+`##` doc-comment syntax is discarded by the M1 lexer (no `##`-token retention); restoring it
+requires either lexer work or a sidecar doc extractor. It lands in **M7** as part of the shared
+documentation pipeline (`09-phase-2.md` §7.2 — one BBCode→Markdown converter feeding hover, then
+completion/signatureHelp in M8). Until then, hover on a project class shows the resolved type only.
 
 ### M4 nav handler semantics
 
