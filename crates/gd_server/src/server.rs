@@ -884,7 +884,8 @@ fn handle_outbound_response(state: &mut ServerState, resp: Response) {
         }
         OutboundKind::RegisterWatchedFiles => match &resp.error {
             Some(err) => log::warn!(
-                "client rejected client/registerCapability for didChangeWatchedFiles ({});                  running on the native watcher alone",
+                "client rejected client/registerCapability for didChangeWatchedFiles ({}); \
+                 running on the native watcher alone",
                 err.message
             ),
             None => log::debug!("client acknowledged the didChangeWatchedFiles registration"),
