@@ -7,6 +7,14 @@ use std::num::NonZeroUsize;
 use serde::Deserialize;
 
 /// Options passed by the client under `initializationOptions`.
+///
+/// M7 (#59) — runtime re-config: `workspace/didChangeConfiguration` (or the
+/// `workspace/configuration` pull) re-reads this same schema mid-session, but only the
+/// **runtime-reloadable** subset applies: `strict.*`, `analyzer.*`, `memory.*`. The remaining
+/// fields are **session-structural** (`projectRoot`, `extensionApiPath`, `godotBinaryPath`,
+/// `autoDumpExtensionApi`, `embeddedApiFallback`, `stubCacheDir`): each is baked into
+/// `Workspace::load` / watcher arming / background-dump topology at startup, so a runtime
+/// payload that changes one keeps the old value and logs a "requires restart" warning.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct InitializationOptions {
@@ -70,7 +78,7 @@ impl Default for InitializationOptions {
 
 /// Per-call analyzer knobs surfaced through `initializationOptions.analyzer`. Optional; the
 /// defaults preserve M3 behaviour.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AnalyzerConfig {
     /// M5 WP-O3: per-file fixpoint iteration budget. `None` → use the analyzer's default
@@ -95,7 +103,7 @@ pub struct AnalyzerConfig {
 /// [`bench/budget.toml`](super::memory::MemoryBudget::resolve)'s reference numbers, and
 /// the budget itself layers on top of a baked-in default so the ladder is always well-defined
 /// even on a fresh clone with no bench file.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MemoryConfig {
     /// M5 WP-H2: bound on the per-Workspace `parse_cache` + `analysis_cache`. `None` → the WP-H2
@@ -140,7 +148,7 @@ impl MemoryConfig {
 }
 
 /// Strict-mode configuration (`docs/04-diagnostics-strict-mode.md` §3).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct StrictConfig {
     pub profile: StrictProfile,
@@ -171,6 +179,14 @@ impl InitializationOptions {
             }),
             None => Self::default(),
         }
+    }
+
+    /// M7 (#59): parse a RUNTIME re-configuration payload (`workspace/didChangeConfiguration` /
+    /// the `workspace/configuration` pull). Unlike [`Self::parse`], malformed input is an `Err`
+    /// — the runtime contract is **keep the previous configuration** (plus a logged warning and
+    /// a `window/showMessage`), never a silent reset to defaults mid-session.
+    pub fn parse_runtime(value: &serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(value.clone())
     }
 }
 
