@@ -3165,6 +3165,11 @@ pub fn incoming_calls(
 /// normalization. Class-name hits sort before member-name hits when scores tie, matching the
 /// docs/03 §7.4 design. Results capped at 256 to bound LSP latency on 10k+ symbol projects.
 ///
+/// The empty query is a real request, not a degenerate one — spec: "Clients may send an empty
+/// string here to request all symbols." (Helix's picker opens with it.) It skips the matcher
+/// and scores every candidate uniformly; the class-before-member tie-break and the 256 cap
+/// shape the list.
+///
 /// Builds the flat candidate list on demand (no precomputed flat index per docs/03 §7.4): the
 /// registry + per-file interface tables iterate in O(N) once per request. Re-running the query as
 /// the user types is the same cost — adequate for v1; M5 can revisit if soak tests reveal it as
@@ -3174,9 +3179,6 @@ pub fn workspace_symbol(
     params: WorkspaceSymbolParams,
 ) -> Option<WorkspaceSymbolResponse> {
     let query = params.query;
-    if query.is_empty() {
-        return Some(WorkspaceSymbolResponse::Flat(Vec::new()));
-    }
 
     // WP-RD7 micro-op — bench witness, no-op landed. The flat-candidate list below is rebuilt from
     // `iter_interfaces` on every `workspace/symbol` request; precomputing it on `Index` mutation
@@ -3259,6 +3261,12 @@ pub fn workspace_symbol(
                 path = cand.path,
                 line = cand.line
             );
+            continue;
+        }
+        // Empty query = request for all symbols (see the doc comment): every candidate gets a
+        // uniform score, and the matcher (which asserts on its inputs) is never consulted.
+        if query.is_empty() {
+            scored.push((0, cand));
             continue;
         }
         hay_buf.clear();

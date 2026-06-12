@@ -31,8 +31,8 @@ use lsp_types::{
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
     InitializedParams, Location, Position, ReferenceContext, ReferenceParams, SymbolInformation,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, WorkDoneProgressParams,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    SymbolKind, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    WorkDoneProgressParams, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 
 fn init_and_open(project: &common::TempProject, client: &Connection, relative_files: &[&str]) {
@@ -1062,8 +1062,12 @@ fn nav_handlers_clamp_out_of_range_position() {
 // Nav: workspace/symbol edge cases
 // ----------------------------------------------------------------------------
 
+/// Spec: "Clients may send an empty string here to request all symbols." Helix's picker opens
+/// with exactly this request — an empty list means a blank picker until the user types. The
+/// member tier's relative order is hash-map iteration order, so the asserts stay at presence /
+/// first-kind / cap strength.
 #[test]
-fn workspace_symbol_empty_query_returns_empty() {
+fn workspace_symbol_empty_query_returns_all_symbols() {
     let project = sample_project();
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
@@ -1089,8 +1093,61 @@ fn workspace_symbol_empty_query_returns_empty() {
         None => Vec::new(),
     };
     assert!(
-        symbols.is_empty(),
-        "empty workspace/symbol query should return zero results"
+        !symbols.is_empty(),
+        "empty workspace/symbol query requests ALL symbols (spec), got none"
+    );
+    assert!(symbols.len() <= 256, "the 256 cap bounds the empty query");
+    assert_eq!(
+        symbols[0].kind,
+        SymbolKind::CLASS,
+        "classes sort before members in the uniform-score tier"
+    );
+    for name in ["Hero", "hp", "attack"] {
+        assert!(
+            symbols.iter().any(|s| s.name == name),
+            "`{name}` must appear in the all-symbols listing"
+        );
+    }
+
+    shutdown(&client, server_thread);
+}
+
+/// The empty-query listing stays bounded on symbol-heavy projects: 300 members in one file must
+/// come back as exactly 256 results (the latency cap), not the full set.
+#[test]
+fn workspace_symbol_empty_query_caps_at_256() {
+    let project = sample_project();
+    let mut big = String::from("extends Node\n");
+    for i in 0..300 {
+        big.push_str(&format!("var m{i} = 0\n"));
+    }
+    project.write("src/big.gd", &big);
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&project, &client, &[]);
+
+    let params = WorkspaceSymbolParams {
+        query: String::new(),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(91, "workspace/symbol", params))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "empty query errored");
+    let response: Option<WorkspaceSymbolResponse> =
+        serde_json::from_value(resp.result.unwrap()).unwrap();
+    let symbols: Vec<SymbolInformation> = match response {
+        Some(WorkspaceSymbolResponse::Flat(s)) => s,
+        other => panic!("expected Flat, got {other:?}"),
+    };
+    assert_eq!(
+        symbols.len(),
+        256,
+        "more than 256 candidates must truncate to exactly the cap"
     );
 
     shutdown(&client, server_thread);
