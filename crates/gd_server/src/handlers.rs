@@ -2488,6 +2488,14 @@ fn classify_non_method_target(
             site,
         } = b
         {
+            // Kind guard: only Class/Enum/EnumValue are excluded (their references live in
+            // annotations/extends/match-patterns the reducer doesn't record — binding-only
+            // would under-report them). Function/Signal/Variable/Constant/Member DELIBERATELY
+            // pass: a function or signal reaching here is a NON-call-position reference
+            // (`var f = obj.method`, `obj.sig` reads — call positions took the method path),
+            // and record_member_use's precise kinds resolve exactly those. Parameter never
+            // reaches here today (locals/params record no Use) — if it ever does, it belongs
+            // with the passing set, not the exclusions.
             if *site == node_span
                 && target_name == name
                 && !matches!(
@@ -2530,6 +2538,11 @@ fn classify_non_method_target(
 /// The span of the smallest function containing `byte`, iff that function declares `name` as a
 /// parameter or a body-local var/const. A class-level member can never pass the span filter
 /// (declarations outside the function body), so a member target never mis-classifies as local.
+///
+/// Two bounded arena passes (find the enclosing function, then scan its contained nodes) — the
+/// flat arena has no parent pointers or per-subtree iteration, so this is the same O(#nodes)
+/// family as the sibling cursor walks (`innermost_node_at`, `is_member_or_attribute_ident`)
+/// and runs at most once per references request.
 fn enclosing_function_declaring(tree: &ParseTree, byte: usize, name: &str) -> Option<ByteSpan> {
     let mut best: Option<ByteSpan> = None;
     for id in tree.iter_ids() {
@@ -3821,6 +3834,13 @@ pub fn workspace_symbol(
     // find_global_class_definition validation discipline). Validation or read failure falls
     // back to the pre-#46 zero-width point at the declaration line's start: never drop the
     // symbol over a stale anchor.
+    //
+    // Worst-case latency (an all-cold empty-query picker open): ≤256 small sequential reads —
+    // strictly inside the per-request envelope `references` already pays for its Godot-parity
+    // project-wide text scan (which reads EVERY project file). If soak flags this, the named
+    // mitigations are per-line slicing (only the span's line is needed per symbol) or an LRU
+    // rope cache on ServerState; index-time columns are NOT one (characters are
+    // encoding-negotiated per session).
     let enc = state.encoding;
     let mut texts: FxHashMap<camino::Utf8PathBuf, Option<(String, ropey::Rope)>> =
         FxHashMap::default();
