@@ -121,6 +121,18 @@ impl Workspace {
     /// this load) and is adopted mid-session via [`Self::reload_native`], so direct callers
     /// (`gdls diagnose`, every test) and the session startup are equally process-free.
     pub fn load(root: &Utf8Path, options: &InitializationOptions) -> Self {
+        Self::load_with_progress(root, options, &mut crate::progress::NoopSink)
+    }
+
+    /// [`Self::load`] reporting per-file progress into `sink` (M7 #58) — the cold-index parse
+    /// walk reports with a known total; the warm-start stat-diff walk reports indeterminately
+    /// (WalkDir streams, no total up front). Direct callers with nothing to show
+    /// ([`Self::load`]: tests, `gdls diagnose`) pass the no-op sink.
+    pub(crate) fn load_with_progress(
+        root: &Utf8Path,
+        options: &InitializationOptions,
+        sink: &mut dyn crate::progress::ProgressSink,
+    ) -> Self {
         // M5 WP-O1: cold_index span. Captures the full bootstrap — project model + native DB +
         // eager interface index + warn policy — so a hierarchical-profiler dump nests anything
         // that crosses the threshold under it. Fields are recorded with `Empty` and filled in
@@ -147,11 +159,13 @@ impl Workspace {
                     "cache: warm-start candidate found; stat-diffing {} cached files",
                     loaded.files.len()
                 );
-                warm_index_from_cache(loaded, root)
+                warm_index_from_cache(loaded, root, sink)
             }
             None => {
                 // Cold build — then sweep all interned files to populate the stat table.
-                let idx = Index::build(root);
+                let idx = Index::build_with_progress(root, &mut |done, total| {
+                    sink.progress(done, Some(total), "parsing scripts");
+                });
                 let stats = build_stat_table_from_index(&idx);
                 (idx, stats)
             }
@@ -724,6 +738,17 @@ impl Workspace {
         mode: ReconcileMode,
         open_paths: &FxHashSet<Utf8PathBuf>,
     ) -> ReconciliationReport {
+        self.reconcile_with_progress(mode, open_paths, &mut crate::progress::NoopSink)
+    }
+
+    /// [`Self::reconcile_with`] reporting per-file walk progress into `sink` (M7 #58) —
+    /// indeterminate (the walk streams; no total up front), throttled by the reporter.
+    pub(crate) fn reconcile_with_progress(
+        &mut self,
+        mode: ReconcileMode,
+        open_paths: &FxHashSet<Utf8PathBuf>,
+        sink: &mut dyn crate::progress::ProgressSink,
+    ) -> ReconciliationReport {
         // M5 WP-O1: reconcile span. Both the cold-start post-load reconcile and the watcher's
         // `need_rescan` overflow path flow through here. The 6 counters in the on-close fields
         // mirror the `cold_index_reconciled` marker line below — the marker line stays for
@@ -799,6 +824,7 @@ impl Workspace {
             let path = gd_project::normalize_path(p);
             walked += 1;
             walked_paths.insert(path.clone());
+            sink.progress(walked, None, "reconciling scripts");
 
             // Open buffer wins over disk (docs/01, `vfs.rs`): skip the disk-driven reindex for a
             // file the editor has open. It stays in `walked_paths` (above) so the removal pass
@@ -1001,6 +1027,7 @@ fn build_cache_key(native: &NativeDb, root: &Utf8Path) -> cache::CacheKey {
 fn warm_index_from_cache(
     loaded: gd_project::cache::LoadedCache,
     root: &Utf8Path,
+    sink: &mut dyn crate::progress::ProgressSink,
 ) -> (Index, FxHashMap<Utf8PathBuf, FileStat>) {
     let gd_project::cache::LoadedCache { mut index, files } = loaded;
 
@@ -1057,6 +1084,8 @@ fn warm_index_from_cache(
         }
         let path = gd_project::normalize_path(p);
         walked_paths.insert(path.clone());
+        // Indeterminate progress (WalkDir streams; no total up front) — the reporter throttles.
+        sink.progress(walked_paths.len(), None, "checking cached files");
 
         // Stat from the walk entry, not a fresh `fs::metadata`: on Windows the DirEntry's
         // metadata is populated from the directory enumeration itself (zero extra syscalls —

@@ -85,8 +85,8 @@ impl RequestLifecycle {
     }
 }
 
-/// State shared between the router thread and the event loop. Lock discipline: the `in_flight`
-/// mutex guards only tiny map operations and flag sweeps — never held across a channel send and
+/// State shared between the router thread and the event loop. Lock discipline: each mutex
+/// guards only tiny map operations and flag sweeps — never held across a channel send and
 /// never nested with another lock.
 #[derive(Debug, Default)]
 pub(crate) struct SessionShared {
@@ -94,6 +94,17 @@ pub(crate) struct SessionShared {
     /// covers messages that bypass the router); removed by the worker under this lock immediately
     /// before the response is chosen + sent (the staleness linearization point — see module doc).
     in_flight: Mutex<FxHashMap<RequestId, Arc<RequestLifecycle>>>,
+    /// M7 (#58): outstanding server→client `window/workDoneProgress/create` requests — outgoing
+    /// request id → the owning [`crate::progress::ProgressReporter`]'s poison flag. The router
+    /// consumes the matching `Message::Response` (clients answer create with `null` on success):
+    /// an error response sets the flag so the reporter suppresses all further `$/progress` for
+    /// that token. The router is the right place because the response can arrive while the
+    /// worker is busy (e.g. mid-cold-index, exactly when the create is sent).
+    outgoing_creates: Mutex<FxHashMap<RequestId, Arc<AtomicBool>>>,
+    /// M7 (#58): allocator for server→client request ids. A dedicated `"gdls-out-{n}"` string
+    /// namespace, so an outgoing id can never collide with a client-chosen (typically numeric)
+    /// request id in any log or trace.
+    next_outgoing_id: std::sync::atomic::AtomicU64,
 }
 
 impl SessionShared {
@@ -144,6 +155,49 @@ impl SessionShared {
     #[cfg(test)]
     pub(crate) fn in_flight_len(&self) -> usize {
         self.lock().len()
+    }
+
+    /// Allocate a fresh server→client request id in the `"gdls-out-{n}"` namespace.
+    pub(crate) fn next_outgoing_id(&self) -> RequestId {
+        let n = self
+            .next_outgoing_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        RequestId::from(format!("gdls-out-{n}"))
+    }
+
+    /// Register an outstanding `window/workDoneProgress/create` and hand back the poison flag
+    /// the router sets when the client answers it with an error.
+    pub(crate) fn register_outgoing_create(&self, id: RequestId) -> Arc<AtomicBool> {
+        let flag = Arc::new(AtomicBool::new(false));
+        self.outgoing_creates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, Arc::clone(&flag));
+        flag
+    }
+
+    /// Correlate a client response to an outstanding create: error ⇒ poison the reporter. `true`
+    /// when the id belonged to a create (so the router can skip forwarding a fully-handled
+    /// response).
+    fn resolve_outgoing_create(&self, resp: &lsp_server::Response) -> bool {
+        let Some(flag) = self
+            .outgoing_creates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&resp.id)
+        else {
+            return false;
+        };
+        if let Some(err) = &resp.error {
+            log::warn!(
+                "client rejected window/workDoneProgress/create ({}): {}; suppressing further \
+                 $/progress for that token",
+                resp.id,
+                err.message
+            );
+            flag.store(true, Ordering::Release);
+        }
+        true
     }
 }
 
@@ -213,7 +267,14 @@ pub(crate) fn spawn_router(
                         }
                         _ => {}
                     },
-                    Message::Response(_) => {}
+                    Message::Response(resp) => {
+                        // A create response is fully handled here (poison-or-drop) — the worker
+                        // has nothing to do with it, and it must be consumed even while the
+                        // worker is busy with the cold index.
+                        if shared.resolve_outgoing_create(resp) {
+                            continue;
+                        }
+                    }
                 }
                 let is_exit = matches!(&msg, Message::Notification(n) if n.method == "exit");
                 if forward.send(msg).is_err() {

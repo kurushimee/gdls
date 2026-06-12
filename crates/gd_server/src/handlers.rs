@@ -1967,6 +1967,18 @@ fn group_call_ranges<'a, K: PartialEq>(
 /// Returns `None` when the cursor doesn't land on an identifier (LSP wire = null). Returns
 /// `Some(vec)` (possibly empty) otherwise.
 pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Vec<Location>> {
+    // M7 (#58): honor a client-supplied workDoneToken — references is the genuinely long
+    // request (project-wide candidate analysis). The drop guard ends the arc on every exit
+    // path, including the `?` early returns below.
+    let mut progress = params
+        .work_done_progress_params
+        .work_done_token
+        .map(|token| {
+            let mut reporter =
+                crate::progress::ProgressReporter::for_client_token(state.sender.clone(), token);
+            reporter.begin("References", None);
+            reporter
+        });
     // WP-RD15: the `(uri, text, mapper, name)` prologue this shares with `implementation` is NOT
     // factored into a helper. A shared 4-tuple extractor would hand `implementation` two values it
     // never uses (`text`, and the per-request `mapper` — it works off the resolved class, not the
@@ -2349,7 +2361,16 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         }
     };
 
-    for (path, cand_uri) in candidates {
+    let candidate_total = candidates.len();
+    for (done, (path, cand_uri)) in candidates.into_iter().enumerate() {
+        if let Some(reporter) = progress.as_mut() {
+            crate::progress::ProgressSink::progress(
+                reporter,
+                done + 1,
+                Some(candidate_total),
+                "analyzing candidates",
+            );
+        }
         let Some((text, parsed, cand_result)) =
             load_candidate_analysis(state, &path, &cand_uri, "references")
         else {
@@ -3714,6 +3735,17 @@ pub fn workspace_symbol(
     state: &mut ServerState,
     params: WorkspaceSymbolParams,
 ) -> Option<WorkspaceSymbolResponse> {
+    // M7 (#58): honor a client-supplied workDoneToken — at 10k-file scale the candidate build +
+    // fuzzy scan is the other request worth a spinner. The drop guard ends the arc on exit.
+    let mut progress = params
+        .work_done_progress_params
+        .work_done_token
+        .map(|token| {
+            let mut reporter =
+                crate::progress::ProgressReporter::for_client_token(state.sender.clone(), token);
+            reporter.begin("Workspace symbols", None);
+            reporter
+        });
     let query = params.query;
 
     // WP-RD7 micro-op — bench witness, no-op landed. The flat-candidate list below is rebuilt from
@@ -3786,7 +3818,16 @@ pub fn workspace_symbol(
     let needle = Utf32Str::new(&query, &mut needle_buf);
     let mut scored: Vec<(u16, SymbolCandidate)> = Vec::with_capacity(candidates.len().min(256));
     let mut hay_buf: Vec<char> = Vec::new();
-    for cand in candidates {
+    let candidate_total = candidates.len();
+    for (done, cand) in candidates.into_iter().enumerate() {
+        if let Some(reporter) = progress.as_mut() {
+            crate::progress::ProgressSink::progress(
+                reporter,
+                done + 1,
+                Some(candidate_total),
+                "matching symbols",
+            );
+        }
         // nucleo asserts non-empty input. An empty haystack here would be a registry /
         // interface bug — log loudly so the operator can investigate the bad entry.
         if cand.name.is_empty() {
