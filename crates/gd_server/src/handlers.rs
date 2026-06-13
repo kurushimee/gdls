@@ -14,10 +14,11 @@ use gd_types::native_db::NativeClass;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    DocumentLink, DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location,
-    MarkupContent, MarkupKind, Position, Range, ReferenceParams, SymbolInformation,
-    SymbolKind as LspSymbolKind, Uri, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams, DocumentLink,
+    DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location, MarkupContent, MarkupKind,
+    Position, Range, ReferenceParams, SymbolInformation, SymbolKind as LspSymbolKind, Uri,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ropey::Rope;
@@ -2521,6 +2522,317 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     }
 
     Some(locations)
+}
+
+/// `textDocument/documentHighlight` (#67): the **in-file subset** of [`references`], tagged with
+/// [`DocumentHighlightKind`] per occurrence.
+///
+/// Reuses `references`'s cursor→symbol resolution **verbatim** ([`cursor_identifier`],
+/// [`is_member_or_attribute_ident`], [`classify_non_method_target`]/[`NonMethodTarget`]) — this is
+/// NOT a new token scan and NOT a text-grep. It then drops every cross-file path: highlight fires on
+/// cursor-rest (a hot interactive request), so there is no project-wide candidate fan-out and no
+/// `workDoneProgress` reporter — only the request file's own occurrences are collected, exactly the
+/// set `references` gathers for the current buffer.
+///
+/// Read/Write derivation (the one bit `references` doesn't need): [`Binding::Use`] carries no
+/// access-mode field, so a per-request **write-set** of identifier/attribute [`Range`]s is built by
+/// walking the parse tree once ([`assignment_write_ranges`] — every `Assignment` LHS, any operator
+/// incl. compound `+=`, plus each initializing `var` declaration). A collected site whose range is
+/// in that set is [`DocumentHighlightKind::WRITE`]; every other site is
+/// [`DocumentHighlightKind::READ`]. Range-equality across the two passes is sound because both
+/// derive from the same per-request [`PositionMapper`] over the same buffer (the same invariant
+/// `references`'s own `dedup_by` / declaration filter rely on). `Text` is never emitted: with the
+/// AST in hand every occurrence classifies as read or write.
+///
+/// Returns `None` (LSP wire `null`) when the cursor doesn't land on an identifier; `Some(vec)`
+/// (possibly empty) otherwise — mirroring `references`'s degrade contract.
+pub fn document_highlight(
+    state: &mut ServerState,
+    params: DocumentHighlightParams,
+) -> Option<Vec<DocumentHighlight>> {
+    let tdp = params.text_document_position_params;
+    let uri = tdp.text_document.uri.clone();
+    let text = state.vfs.get(uri.as_str()).map(|d| d.text())?;
+    let key = CanonicalKey::for_uri(&uri);
+    let parsed = state.workspace.parse(&key, &text);
+
+    let enc = state.encoding;
+    // Own the Rope so the mapper doesn't borrow from state.vfs — frees us to call mutating state
+    // methods (lazy-analyze) below. Mirrors `references`.
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, enc);
+    let byte = mapper.position_to_byte(tdp.position);
+    let node_id = parsed.tree.innermost_node_at(byte)?;
+    let name = cursor_identifier(&parsed.tree, node_id)?;
+
+    // Collect this file's occurrences (no cross-file fan-out), then dedup by range BEFORE
+    // classifying so a single occurrence never yields two highlights with conflicting kinds.
+    let mut sites = collect_in_file_highlight_sites(state, &key, &uri, &text, &parsed, byte, &name);
+    let range_key = |r: &Range| (r.start.line, r.start.character, r.end.line, r.end.character);
+    sites.sort_by_key(|loc| range_key(&loc.range));
+    sites.dedup_by(|a, b| a.range == b.range);
+
+    // Write-set: the LHS identifier/attribute ranges of every assignment plus every initializing
+    // `var` declaration. A collected site in this set is a Write; everything else is a Read.
+    let write_ranges = assignment_write_ranges(&parsed.tree, &mapper);
+    let highlights = sites
+        .into_iter()
+        .map(|loc| DocumentHighlight {
+            range: loc.range,
+            kind: Some(if write_ranges.contains(&loc.range) {
+                DocumentHighlightKind::WRITE
+            } else {
+                DocumentHighlightKind::READ
+            }),
+        })
+        .collect();
+    Some(highlights)
+}
+
+/// The current-file occurrences of the cursor symbol — the in-file half of [`references`]'s scan,
+/// run through the identical resolution + collection helpers but with the cross-file candidate loop
+/// removed. Returns [`Location`]s (with `uri` == the request file); the caller converts them to
+/// [`DocumentHighlight`]s after deduping and classifying.
+///
+/// The declaration site is **always** included (documentHighlight has no `includeDeclaration` flag —
+/// the declaring identifier is itself an in-file occupant the editor highlights). For a local target
+/// it is omitted here because [`push_identifier_locations_within`] already emits the `var`/param
+/// identifier in scope (appending it again would double the decl; the dedup runs in the caller).
+fn collect_in_file_highlight_sites(
+    state: &mut ServerState,
+    key: &CanonicalKey,
+    uri: &Uri,
+    text: &str,
+    parsed: &gd_syntax::ParseResult,
+    byte: usize,
+    name: &str,
+) -> Vec<Location> {
+    let enc = state.encoding;
+    let rope = Rope::from_str(text);
+    let mapper = PositionMapper::new(&rope, enc);
+    let node_id = match parsed.tree.innermost_node_at(byte) {
+        Some(id) => id,
+        None => return Vec::new(),
+    };
+    let node_span = parsed.tree.get(node_id).span;
+
+    let current_path = crate::uri::uri_to_path(uri);
+    let current_fid = current_path
+        .as_deref()
+        .and_then(|p| state.workspace.index.file_id(p));
+
+    // Same role detection as `references`: a method/signal callee (declaration click or call-site
+    // attribute click) takes the call-projection path; everything else takes the non-method
+    // classification. Purely structural — no analyzer call.
+    let is_method_or_signal = is_member_or_attribute_ident(&parsed.tree, node_id);
+
+    // An autoload singleton name resolves to the autoload script's FileId only when the analyzer
+    // pinned THIS span to it — a local/param/member named the same shadows the singleton. Matches
+    // `references`'s `is_autoload` gate (without the cross-file consequence, since we never fan
+    // out).
+    let autoload_fid = state
+        .workspace
+        .project
+        .autoload_script_path(name)
+        .and_then(|p| state.workspace.index.resolve_res_path(&p));
+    let is_autoload = autoload_fid.is_some_and(|fid| {
+        let Some(p) = current_path
+            .as_ref()
+            .filter(|p| p.extension() == Some("gd"))
+        else {
+            return false;
+        };
+        let result = analyze_with_request_token(state, key, p, &parsed.tree, text);
+        result.bindings().iter().any(|b| {
+            matches!(b,
+                Binding::Use { site, target_file: Some(f), .. }
+                    if *site == node_span && *f == fid
+            )
+        })
+    });
+
+    // For a method/signal target, resolve the declaring file (call-site click → the callee's
+    // Script file; declaration click → the current file) so the call projection filters to genuine
+    // call sites of THIS method, not identically-named methods. `None` (native/unresolved) falls
+    // back to the raw identifier scan, never under-reporting.
+    let mut callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+    let target_file: Option<gd_project::FileId> = if is_method_or_signal {
+        let target_file_from_binding = if let Some(p) = current_path
+            .as_ref()
+            .filter(|p| p.extension() == Some("gd"))
+        {
+            let cur_result = analyze_with_request_token(state, key, p, &parsed.tree, text);
+            cur_result.bindings().iter().find_map(|b| {
+                if let Binding::Call {
+                    callee,
+                    callee_name,
+                    call_site,
+                    ..
+                } = b
+                {
+                    if callee_name == name {
+                        let spans =
+                            callee_spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
+                        if let Some(ident_span) = spans.get(call_site).copied() {
+                            if ident_span.start <= byte && byte < ident_span.end {
+                                return Some(callee.script_file());
+                            }
+                        }
+                    }
+                }
+                None
+            })
+        } else {
+            None
+        };
+        match target_file_from_binding {
+            Some(cf) => cf,
+            None => current_fid,
+        }
+    } else {
+        None
+    };
+
+    // Non-method classification (resolved member / local / unresolved residue) — resolved BEFORE
+    // any scan so precision rides the binding layer where resolution succeeded and the raw-scan
+    // floor survives where it can't decide. Identical to `references`.
+    let mut non_method_target = NonMethodTarget::Unresolved;
+    if !is_method_or_signal && !is_autoload {
+        if let Some(p) = current_path
+            .as_ref()
+            .filter(|p| p.extension() == Some("gd"))
+        {
+            let result = analyze_with_request_token(state, key, p, &parsed.tree, text);
+            non_method_target = classify_non_method_target(
+                &parsed.tree,
+                &result,
+                node_span,
+                byte,
+                name,
+                current_fid,
+            );
+        }
+    }
+
+    let mut locations: Vec<Location> = Vec::new();
+
+    // Declaration site — always part of the highlight set (no includeDeclaration flag). Locals are
+    // handled by the within-scope identifier scan below (which already emits the decl token), so
+    // they're excluded here to avoid a duplicate the caller would then have to dedup.
+    if is_autoload {
+        if let Some(loc) = find_autoload_definition(state, name) {
+            locations.push(loc);
+        }
+    } else if let NonMethodTarget::Local(_) = &non_method_target {
+        // decl emitted by push_identifier_locations_within below.
+    } else if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, &mapper) {
+        locations.push(loc);
+    } else if let Some(loc) = find_global_class_definition(state, name) {
+        // Only keep an in-file declaration — a global class declared in ANOTHER file is not an
+        // in-file occurrence and must not leak across the file boundary.
+        if loc.uri == *uri {
+            locations.push(loc);
+        }
+    }
+
+    // Current-file occurrence scan — exactly `references`'s current-file block, with no candidate
+    // fan-out afterwards.
+    if let Some(p) = current_path
+        .as_ref()
+        .filter(|p| p.extension() == Some("gd"))
+    {
+        let result = analyze_with_request_token(state, key, p, &parsed.tree, text);
+        if is_method_or_signal {
+            push_binding_locations(&mut locations, &result, name, uri, &mapper);
+            if let Some(tf) = target_file {
+                push_callee_ident_locations(
+                    &mut locations,
+                    &result,
+                    &parsed.tree,
+                    tf,
+                    name,
+                    uri,
+                    &mapper,
+                    &mut callee_spans,
+                );
+            } else {
+                push_identifier_locations(&mut locations, &parsed.tree, name, uri, &mapper);
+            }
+        } else {
+            match &non_method_target {
+                NonMethodTarget::Member(tf) => {
+                    push_use_binding_locations_for(
+                        &mut locations,
+                        &result,
+                        *tf,
+                        name,
+                        uri,
+                        &mapper,
+                    );
+                }
+                NonMethodTarget::Local(fn_span) => {
+                    push_identifier_locations_within(
+                        &mut locations,
+                        &parsed.tree,
+                        name,
+                        *fn_span,
+                        uri,
+                        &mapper,
+                    );
+                }
+                NonMethodTarget::Unresolved => {
+                    push_binding_locations(&mut locations, &result, name, uri, &mapper);
+                    push_identifier_locations(&mut locations, &parsed.tree, name, uri, &mapper);
+                }
+            }
+        }
+    }
+
+    locations
+}
+
+/// The set of LSP [`Range`]s that denote a **write** in `tree`: the LHS of every assignment (a
+/// plain `Identifier` for a local/bare member, or the trailing `.attr` of a `self.x`/`obj.x`
+/// subscript), plus the identifier of every initializing `var` declaration. Any assignment operator
+/// counts — a compound `+=`/`-=`/… reads-then-writes, which LSP/Godot still render as a write.
+///
+/// Built once per `documentHighlight` request and consulted by membership: a collected occurrence
+/// whose range is in this set is a write, every other occurrence a read. Ranges (not byte spans) so
+/// the lookup composes directly with the collected [`Location`]s, both produced by the same
+/// per-request [`PositionMapper`].
+fn assignment_write_ranges(tree: &ParseTree, mapper: &PositionMapper) -> FxHashSet<Range> {
+    let mut out: FxHashSet<Range> = FxHashSet::default();
+    for id in tree.iter_ids() {
+        match &tree.get(id).kind {
+            NodeKind::Assignment(a) => {
+                let Some(assignee) = a.assignee else { continue };
+                // The write target's NAME token: a bare/local assignee is the Identifier itself; a
+                // `self.hp = …` / `obj.x = …` assignee is a Subscript whose `.attribute` identifier
+                // is the member being written.
+                let ident = match &tree.get(assignee).kind {
+                    NodeKind::Identifier(_) => Some(assignee),
+                    NodeKind::Subscript(s) => match s.access {
+                        Some(SubscriptAccess::Attribute(attr)) => attr,
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(iid) = ident {
+                    out.insert(mapper.span_to_range(tree.get(iid).span));
+                }
+            }
+            // An initializing declaration (`var x = …`) writes `x` at its declaration token. A bare
+            // `var x` with no initializer is a pure declaration (Godot zero-inits, but there is no
+            // user-written value) — it falls through to the `_` arm so it stays a Read occurrence.
+            NodeKind::Variable(v) if v.initializer.is_some() => {
+                if let Some(iid) = v.identifier {
+                    out.insert(mapper.span_to_range(tree.get(iid).span));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// How `references` should scan for a NON-method cursor target — resolved before any scan runs,
