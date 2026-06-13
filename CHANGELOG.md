@@ -44,6 +44,35 @@ milestones land on `main` and release together once the phase matures.
 - The warm-start cache format bumped (v4 → v5) for the doc-carrying `Interface` shape — one
   cold re-index per project on first launch after upgrading, self-healing.
 
+## [1.0.7] — 2026-06-13
+
+Follow-ups to the v1.0.6 utility-as-Callable hotfix, surfaced by its review (#92). Cut from
+v1.0.6 plus these fixes only — the unreleased Phase 2 work on `main` stays unreleased, per the
+Phase 2 release deferral.
+
+### Fixed
+- **Bare Variant utilities resolve to a constant `Callable` under any native-API state**, including
+  an empty database (#92): the v1.0.6 arm gated Variant utilities on the ingested
+  `extension_api.json` table, so when no dump was available (embedded fallback disabled, or a
+  decompress failure) bare `print` / `floor` still fell through to
+  `Identifier "X" not declared in the current scope.`. Resolution now mirrors Godot's compile-time
+  `Variant::has_utility_function` through a database-independent registry of the 114 Variant
+  utilities, so the fix holds regardless of how — or whether — the native API was loaded.
+- **Duplicate same-utility dictionary keys are now reported** (#92): `{print: 1, print: 2}` emits
+  Godot's `Key "@GlobalScope::print" was already used in this dictionary (at line N).` (and
+  `@GDScript::len` for the GDScript-only family), matching the engine; previously the duplicate
+  folded to an opaque value and went unreported. Distinct keys and non-utility constants are
+  unaffected.
+
+### Changed
+- The constant-`Callable` type is now built by a single `make_callable_type` helper mirroring
+  Godot's `gdscript_analyzer.cpp`, replacing eight inline copies (#92) — groundwork for the
+  Phase 2 signatureHelp `MethodInfo` wiring. No behavior change.
+
+Both conformance ratchets hold at 1.0; a new ingest guard pins the full 114-name Variant utility
+set against the embedded dump, and the duplicate-key messages are oracle-verified against
+godot 4.6.3-stable.
+
 ## [1.0.6] — 2026-06-13
 
 Hotfix for a false-positive error reported from real-project use (#88). Cut from v1.0.5 plus
