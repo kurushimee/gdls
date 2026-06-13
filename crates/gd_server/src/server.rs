@@ -463,7 +463,25 @@ fn serve_inner(
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
         }),
     };
-    connection.initialize_finish(init_id, serde_json::to_value(result)?)?;
+    // M9 (#69): advertise `typeHierarchyProvider`. lsp-types 0.97.0 models the type-hierarchy
+    // request/param/item types AND the *client* capability, but omits the *server* capability
+    // field from `ServerCapabilities` (no `type_hierarchy_provider`, no extras/flatten escape
+    // hatch but `experimental`). `typeHierarchyProvider` is a standard LSP 3.17 key a spec
+    // client reads to enable the feature — putting it under `experimental` would gate it off for
+    // every real editor (and lie about W15), so we inject the *real* key into the already-
+    // serialized capabilities object instead of bumping the pinned dependency. Boolean form is
+    // the simplest of the `boolean | options | registration-options` shapes the spec allows.
+    let mut result_value = serde_json::to_value(result)?;
+    if let Some(caps) = result_value
+        .get_mut("capabilities")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        caps.insert(
+            "typeHierarchyProvider".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    connection.initialize_finish(init_id, result_value)?;
     log::info!(
         "gdls ready (root={root}, encoding={encoding:?}, strict={:?})",
         options.strict.profile
@@ -1995,6 +2013,16 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // per requested position. Both are parse-priced (NOT in the Hard-pressure shed set above).
         "textDocument/foldingRange" => handle!(handlers::folding_range),
         "textDocument/selectionRange" => handle!(handlers::selection_range),
+        // M9 (#69): typeHierarchy. `prepareTypeHierarchy` resolves the class under the cursor to
+        // one `TypeHierarchyItem` carrying a compact `data` blob (the type's identity); the
+        // follow-ups walk the extends graph one level from that blob — `supertypes` UP (parent
+        // project class / native base), `subtypes` DOWN (direct project subclasses). All three are
+        // index/parse-priced (registry + interface + native DB, like `implementation`), so none is
+        // in the Hard-pressure `analyze_using` shed set above. `serde_json::to_value(None)` → the
+        // LSP `null` wire shape when the cursor resolves to no class / the blob names no type.
+        "textDocument/prepareTypeHierarchy" => handle!(handlers::prepare_type_hierarchy),
+        "typeHierarchy/supertypes" => handle!(handlers::type_hierarchy_supertypes),
+        "typeHierarchy/subtypes" => handle!(handlers::type_hierarchy_subtypes),
         // M7 (#61): pull diagnostics. NOT in the Hard-pressure shed list above — `analyze_gd`
         // self-degrades to parser-only + cached results there, exactly like the push path, so
         // pull and push stay byte-identical under pressure too.

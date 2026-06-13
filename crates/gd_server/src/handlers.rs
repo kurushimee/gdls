@@ -17,8 +17,9 @@ use lsp_types::{
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams, DocumentLink,
     DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location, MarkupContent, MarkupKind,
-    Position, Range, ReferenceParams, SymbolInformation, SymbolKind as LspSymbolKind, Uri,
-    WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    Position, Range, ReferenceParams, SymbolInformation, SymbolKind as LspSymbolKind,
+    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Uri, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 // `Goto{Declaration,TypeDefinition}{Params,Response}` are `lsp_types` aliases of the matching
 // `GotoDefinition*` types and live under the `request` submodule (not re-exported at the crate
@@ -4050,6 +4051,376 @@ pub fn implementation(
     }
 
     Some(GotoDefinitionResponse::Array(locations))
+}
+
+// =============================================================================================
+// M9 (#69): textDocument/prepareTypeHierarchy + typeHierarchy/{supertypes,subtypes}.
+//
+// A class-tree navigator over the same structures `implementation` already walks: the
+// `class_name` registry, the per-file `Interface::extends`, and the native `inherits` chain.
+// `prepare` resolves the class under the cursor to ONE `TypeHierarchyItem`; the two follow-ups
+// re-resolve that item from its `data` blob (never from a cursor) and walk ONE level — up
+// (`supertypes`) or down (`subtypes`). The blob is what makes expansion survive past depth 2
+// (the #50 call-hierarchy lesson): every returned item carries its own blob so the client can
+// expand it again with no document position.
+// =============================================================================================
+
+/// The identity of a type, round-tripped through a [`TypeHierarchyItem::data`] blob so
+/// `supertypes`/`subtypes` re-resolve the type WITHOUT a cursor (the #50 lesson — expansion must
+/// survive past depth 2). Serialized compactly (anti-catalog W9 — only the minimal identity in
+/// `data`): a project script is `{"fid": <FileId as u32>}`, a native engine class is
+/// `{"native": "<ClassName>"}`.
+#[derive(Clone, Debug)]
+enum TypeRef {
+    /// A project `.gd` file, keyed on its (1-based) [`FileId`](gd_project::FileId).
+    Script(gd_project::FileId),
+    /// A native engine class, keyed on its name in the [`NativeDb`](gd_types::native_db::NativeDb).
+    Native(String),
+}
+
+impl TypeRef {
+    /// Encode into the compact `data` JSON blob.
+    fn to_data(&self) -> serde_json::Value {
+        match self {
+            TypeRef::Script(fid) => serde_json::json!({ "fid": fid.get() }),
+            TypeRef::Native(name) => serde_json::json!({ "native": name }),
+        }
+    }
+
+    /// Decode a `data` blob produced by [`Self::to_data`]. A blob with neither key (or a
+    /// malformed one) yields `None` — the handler then degrades to the LSP `null` response rather
+    /// than guessing (never crash, never lie).
+    fn from_data(data: Option<&serde_json::Value>) -> Option<Self> {
+        let data = data?;
+        if let Some(fid) = data.get("fid").and_then(serde_json::Value::as_u64) {
+            // `FileId::new` panics on 0; the index never mints 0, but a hand-forged blob could
+            // carry it, so guard rather than trust the wire.
+            let raw = u32::try_from(fid).ok()?;
+            if raw == 0 {
+                return None;
+            }
+            return Some(TypeRef::Script(gd_project::FileId::new(raw)));
+        }
+        if let Some(name) = data.get("native").and_then(serde_json::Value::as_str) {
+            return Some(TypeRef::Native(name.to_owned()));
+        }
+        None
+    }
+}
+
+/// Build the [`TypeHierarchyItem`] for a project script `fid`: name from its `class_name` (or the
+/// file stem for an unnamed script), `uri`/`range`/`selectionRange` anchored at the class-name
+/// identifier (the #48 name-token lesson — `selectionRange` is the identifier; `range` is set to
+/// the same span, which trivially satisfies the LSP `range ⊇ selectionRange` containment rule),
+/// and a `data` blob re-encoding the `fid` so the item re-resolves with no cursor.
+fn script_hierarchy_item(
+    state: &mut ServerState,
+    fid: gd_project::FileId,
+) -> Option<TypeHierarchyItem> {
+    let path = state.workspace.index.path(fid)?.to_path_buf();
+    let uri = path_to_file_uri(&path)?;
+    let name = state
+        .workspace
+        .index
+        .interface(fid)
+        .and_then(|i| i.class_name.clone())
+        .unwrap_or_else(|| path.file_stem().unwrap_or("script").to_owned());
+    // Anchor on the class-name identifier when the script has one; else the file start (the
+    // file-target convention shared with `script_decl_location`).
+    let range = match script_decl_location(state, fid) {
+        Some(loc) => loc.range,
+        None => file_start_range(),
+    };
+    Some(TypeHierarchyItem {
+        name,
+        kind: LspSymbolKind::CLASS,
+        tags: None,
+        detail: None,
+        uri,
+        range,
+        selection_range: range,
+        data: Some(TypeRef::Script(fid).to_data()),
+    })
+}
+
+/// Build the [`TypeHierarchyItem`] for a native engine class: anchored at its stub `class_name`
+/// header (the same stub machinery `definition`/`typeDefinition` use, via the phase-3
+/// [`native_class_header_location`] helper — anti-catalog W4: natives anchored at a real stub
+/// `Location`, never a synthetic one). `range`/`selectionRange` are both the header token span.
+/// Returns `None` for a name the DB doesn't know — `native_class_header_location` →
+/// `ensure_class_stub` re-checks `class_named` internally and yields `None` (no stub written) for
+/// a non-class name, so this degrades to no item without a separate guard (never a guess).
+fn native_hierarchy_item(state: &ServerState, class: &str) -> Option<TypeHierarchyItem> {
+    let loc = native_class_header_location(state, class)?;
+    Some(TypeHierarchyItem {
+        name: class.to_owned(),
+        kind: LspSymbolKind::CLASS,
+        tags: None,
+        detail: None,
+        uri: loc.uri,
+        range: loc.range,
+        selection_range: loc.range,
+        data: Some(TypeRef::Native(class.to_owned()).to_data()),
+    })
+}
+
+/// Build the [`TypeHierarchyItem`] for an already-resolved [`TypeRef`] — the shared item-builder
+/// the supertypes/subtypes walks emit through, so every produced item carries its own re-resolving
+/// `data` blob.
+fn hierarchy_item(state: &mut ServerState, ty: &TypeRef) -> Option<TypeHierarchyItem> {
+    match ty {
+        TypeRef::Script(fid) => script_hierarchy_item(state, *fid),
+        TypeRef::Native(name) => native_hierarchy_item(state, name),
+    }
+}
+
+/// Resolve the parent named in a project script's `extends` clause to a [`TypeRef`], ONE level up.
+/// Mirrors the per-hop resolution `Index::extends_chain_files` performs internally, but yields the
+/// parent's identity (script `FileId` / native name) rather than walking the whole chain:
+///   - `extends Foo` / `extends A.B` → the LAST identifier (`Foo`/`B`) resolved against the
+///     `class_name` registry (→ `Script`) then the native DB (→ `Native`);
+///   - `extends "res://base.gd"` → the path resolved through the index (→ `Script`);
+///   - no `extends` → Godot implies `RefCounted`, a native base.
+///
+/// `None` when the parent can't be resolved (an unknown name / an unindexed path) — the walk then
+/// stops rather than inventing a parent.
+fn project_extends_parent(state: &ServerState, fid: gd_project::FileId) -> Option<TypeRef> {
+    let iface = state.workspace.index.interface(fid)?;
+    match &iface.extends {
+        gd_project::Extends::None => Some(TypeRef::Native("RefCounted".to_owned())),
+        gd_project::Extends::Path(res_path) => state
+            .workspace
+            .index
+            .resolve_res_path(res_path)
+            .map(TypeRef::Script),
+        gd_project::Extends::Names(parts) => {
+            let head = parts.last()?;
+            resolve_type_name(state, head)
+        }
+    }
+}
+
+/// Resolve a bare type NAME to a [`TypeRef`]: a project `class_name` (registry) shadows a native
+/// class of the same name, matching the analyzer's precedence (`class_name` before native in
+/// `resolve_name`). `None` for a name that is neither.
+fn resolve_type_name(state: &ServerState, name: &str) -> Option<TypeRef> {
+    if let Some(entry) = state.workspace.index.registry().get(name) {
+        if let Some(fid) = state.workspace.index.file_id(&entry.path) {
+            return Some(TypeRef::Script(fid));
+        }
+    }
+    if state.workspace.native.class_named(name).is_some() {
+        return Some(TypeRef::Native(name.to_owned()));
+    }
+    None
+}
+
+/// `true` when project file `iface` directly extends the type `ty` (ONE hop, no transitive walk) —
+/// the per-candidate predicate [`type_hierarchy_subtypes`] applies to every interface for the
+/// direct-children-only walk. It encodes the **same** parent-matching rule as [`implementation`]'s
+/// BFS body (last `extends` identifier → registry/native; or a `res://` path → the index), but is
+/// deliberately a separate predicate rather than a shared extraction: `implementation` matches each
+/// candidate against a *growing set* of known names/files (the transitive fixpoint), whereas this
+/// matches against a *single* resolved [`TypeRef`]. Sharing one helper would force `implementation`
+/// to restructure its set-membership test, so — exactly as `implementation` declines to share its
+/// cursor prologue with `references` — `implementation`'s loop is left untouched and stays
+/// byte-identical (the `implementation_overrides` regression suite proves it).
+///   - `extends Foo`/`extends A.Foo` matches a `Script` parent by the parent's `class_name`, or a
+///     `Native` parent by the engine class name (the last `extends` identifier);
+///   - `extends "res://x.gd"` matches a `Script` parent by resolving the path through the index.
+fn extends_matches(state: &ServerState, iface: &gd_project::Interface, ty: &TypeRef) -> bool {
+    match &iface.extends {
+        gd_project::Extends::Names(parts) => {
+            let Some(last) = parts.last() else {
+                return false;
+            };
+            // The parent name resolves the same way the cursor's type does; comparing resolved
+            // `TypeRef`s (rather than raw strings) means a project `class_name` and a native class
+            // that happen to share a name never cross-match.
+            resolve_type_name(state, last).is_some_and(|parent| match (&parent, ty) {
+                (TypeRef::Script(a), TypeRef::Script(b)) => a == b,
+                (TypeRef::Native(a), TypeRef::Native(b)) => a == b,
+                _ => false,
+            })
+        }
+        gd_project::Extends::Path(res_path) => match ty {
+            TypeRef::Script(target) => {
+                state.workspace.index.resolve_res_path(res_path) == Some(*target)
+            }
+            TypeRef::Native(_) => false,
+        },
+        // A script with no `extends` implicitly extends `RefCounted` (Godot's implied base — see
+        // `project_extends_parent`), so it IS a direct subtype of the native `RefCounted`. Matching
+        // it here makes the supertypes/subtypes round-trip symmetric: a bare `class_name` reached by
+        // walking up to `RefCounted` reappears when `RefCounted`'s subtypes are expanded.
+        gd_project::Extends::None => matches!(ty, TypeRef::Native(n) if n == "RefCounted"),
+    }
+}
+
+/// `textDocument/prepareTypeHierarchy`: resolve the class under the cursor and return ONE
+/// [`TypeHierarchyItem`] the client passes to `typeHierarchy/{supertypes,subtypes}`. Per LSP 3.17,
+/// returns `TypeHierarchyItem[]` or `null`.
+///
+/// Resolution order (precise, never a guess):
+///   1. the cursor identifier as a project `class_name` (registry) — the everyday `class Foo`
+///      navigator entry, anchored at `Foo`'s declaration;
+///   2. else as a native engine class name (`Node`) — anchored at its stub header;
+///   3. else, if the cursor sits on the CURRENT file's own root class (a `class_name` site already
+///      covered by 1, or an UNNAMED script clicked on its `class`/`extends` header), the current
+///      file itself — so an unnamed script is still a hierarchy entry (the spec's unnamed-fid path).
+///
+/// Index/parse-priced only (registry + interface + native DB — no analyzer), like `implementation`.
+pub fn prepare_type_hierarchy(
+    state: &mut ServerState,
+    params: TypeHierarchyPrepareParams,
+) -> Option<Vec<TypeHierarchyItem>> {
+    let tdp = params.text_document_position_params;
+    let uri = tdp.text_document.uri.clone();
+    let text = state.vfs.get(uri.as_str()).map(|d| d.text())?;
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    let byte = mapper.position_to_byte(tdp.position);
+    let node_id = parsed.tree.innermost_node_at(byte)?;
+    let name = cursor_identifier(&parsed.tree, node_id)?;
+
+    // (1)/(2): the cursor names a project class or a native class. `resolve_type_name` applies the
+    // analyzer's class_name-before-native precedence.
+    if let Some(ty) = resolve_type_name(state, &name) {
+        return hierarchy_item(state, &ty).map(|item| vec![item]);
+    }
+
+    // (3): unnamed-script fallback — the cursor is on the current file's root class header (its
+    // `class`/`extends`/identifier region) but the name resolved to no registered/native class.
+    // Treat the current file as the subject so an unnamed script (or one whose header identifier
+    // isn't itself a global class_name) is still navigable. Gated on the cursor actually sitting
+    // inside the root class node's header span — a click on an arbitrary unresolved identifier
+    // deeper in the file must NOT return the whole file (that would be a guess).
+    if cursor_on_root_class_header(&parsed.tree, byte) {
+        let fid = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p))?;
+        return script_hierarchy_item(state, fid).map(|item| vec![item]);
+    }
+
+    None
+}
+
+/// `true` when `byte` lies on the root class node's own header: its `class_name` identifier span,
+/// or (for an unnamed script with no identifier) the head of the root class node, before its first
+/// member. Used to gate the unnamed-script `prepareTypeHierarchy` fallback so it fires only on a
+/// genuine "navigate THIS class" click, never on an arbitrary identifier in the body.
+fn cursor_on_root_class_header(tree: &ParseTree, byte: usize) -> bool {
+    let Some(root_id) = tree.root_id() else {
+        return false;
+    };
+    let NodeKind::Class(root) = &tree.get(root_id).kind else {
+        return false;
+    };
+    // Named root: the cursor is on the `class_name` identifier.
+    if let Some(ident) = root.identifier {
+        let s = tree.get(ident).span;
+        if s.start <= byte && byte < s.end {
+            return true;
+        }
+    }
+    // Unnamed (or cursor off the identifier): accept the region before the first member — the
+    // `extends …` header line. The first member's span start bounds the header; with no members,
+    // the whole (tiny) class node is header.
+    let first_member_start = root
+        .members
+        .iter()
+        .filter_map(member_node_id)
+        .map(|id| tree.get(id).span.start)
+        .min();
+    let root_span = tree.get(root_id).span;
+    match first_member_start {
+        Some(end) => root_span.start <= byte && byte < end,
+        None => root_span.start <= byte && byte < root_span.end,
+    }
+}
+
+/// The [`NodeId`] backing a [`Member`], for span queries. Group/category markers carry no node.
+fn member_node_id(member: &Member) -> Option<NodeId> {
+    Some(match member {
+        Member::Class(id)
+        | Member::Variable(id)
+        | Member::Constant(id)
+        | Member::Function(id)
+        | Member::Signal(id)
+        | Member::Enum(id) => *id,
+        Member::EnumValue(v) => v.identifier?,
+        Member::Group(_) => return None,
+    })
+}
+
+/// `typeHierarchy/supertypes`: from the item's `data` blob, walk the `extends` chain UP exactly
+/// one level. Per LSP 3.17, returns `TypeHierarchyItem[]` or `null`. Each returned item carries
+/// its OWN `data` blob, so the client expands again (`supertypes` of a supertype) with no cursor —
+/// the depth>2 guarantee.
+///
+///   - a project script → its `extends` parent (another project script, or a native base, or the
+///     implied `RefCounted` for a script with no `extends`), via [`project_extends_parent`];
+///   - a native class → its `inherits` parent (one hop up `NativeDb`), anchored at that class's
+///     stub header. `Object` (no `inherits`) yields an empty list — the top of the chain.
+///
+/// GDScript single-inheritance means at most one parent, so the returned vec is 0- or 1-long.
+pub fn type_hierarchy_supertypes(
+    state: &mut ServerState,
+    params: TypeHierarchySupertypesParams,
+) -> Option<Vec<TypeHierarchyItem>> {
+    let ty = TypeRef::from_data(params.item.data.as_ref())?;
+    let parent = match ty {
+        TypeRef::Script(fid) => project_extends_parent(state, fid),
+        TypeRef::Native(name) => state
+            .workspace
+            .native
+            .class_named(&name)
+            .and_then(|c| c.inherits)
+            .map(|sym| TypeRef::Native(state.workspace.native.name_of(sym).to_owned())),
+    };
+    // Always return a (possibly empty) array, never `null`: the cursor RESOLVED to a type here
+    // (the blob decoded); "this type has no parent" is an empty list, distinct from "no type".
+    let mut items = Vec::new();
+    if let Some(parent) = parent {
+        if let Some(item) = hierarchy_item(state, &parent) {
+            items.push(item);
+        }
+    }
+    Some(items)
+}
+
+/// `typeHierarchy/subtypes`: from the item's `data` blob, list the project files that DIRECTLY
+/// extend this type — ONE level down (NOT the transitive closure `implementation` returns). Per
+/// LSP 3.17, returns `TypeHierarchyItem[]` or `null`. Each item carries its own `data` blob for
+/// further expansion (the depth>2 guarantee).
+///
+/// Walks the same `index.iter_interfaces()` enumeration as [`implementation`] and applies the same
+/// parent-matching rule (via [`extends_matches`]), but minus the transitive BFS AND the method-name
+/// filter: every project file whose `extends` resolves to this type, direct children only.
+/// (Symmetric with `supertypes`, which also walks one level. `implementation` keeps its own
+/// transitive fixpoint loop untouched — `extends_matches` is a parallel predicate, not a rewrite of
+/// it — so `implementation` stays byte-identical; the `implementation_overrides` suite proves it.)
+pub fn type_hierarchy_subtypes(
+    state: &mut ServerState,
+    params: TypeHierarchySubtypesParams,
+) -> Option<Vec<TypeHierarchyItem>> {
+    let ty = TypeRef::from_data(params.item.data.as_ref())?;
+    // Collect direct-child FileIds first (immutable borrow of the index), then build items (which
+    // needs `&mut state`) — so the borrow of `iter_interfaces` is dropped before `hierarchy_item`.
+    let children: Vec<gd_project::FileId> = state
+        .workspace
+        .index
+        .iter_interfaces()
+        .filter(|(_, iface)| extends_matches(state, iface, &ty))
+        .map(|(fid, _)| fid)
+        .collect();
+    let mut items = Vec::with_capacity(children.len());
+    for fid in children {
+        if let Some(item) = script_hierarchy_item(state, fid) {
+            items.push(item);
+        }
+    }
+    Some(items)
 }
 
 // =============================================================================================
