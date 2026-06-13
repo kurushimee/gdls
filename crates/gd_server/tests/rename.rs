@@ -1175,3 +1175,72 @@ fn rename_succeeds_on_project_member_named_like_utility() {
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_project_method_is_click_site_independent() {
+    // BLOCKER-4 regression (re-review): the rename edit set must be the SAME regardless of which
+    // occurrence the cursor is on. A bare `helper()` call site previously yielded a NARROWER
+    // `references` set (missing the `self.helper()` sibling) than a declaration click → a mutating
+    // rename silently left a dangling call to the old name. Canonicalizing the cursor to the
+    // declaration makes the set complete from ANY click. Here: rename from the bare call site AND
+    // from the declaration; the two edit sets must be EQUAL and cover all THREE occurrences.
+    // helper decl: line 1 cols 5..11; bare call: line 4 cols 1..7; self.helper: line 5 cols 6..12.
+    let src =
+        "extends Node\nfunc helper() -> void:\n\tpass\nfunc go() -> void:\n\thelper()\n\tself.helper()\n";
+
+    // From the BARE call site (line 4, col 1).
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    client
+        .sender
+        .send(request(
+            73,
+            "textDocument/rename",
+            rename_params(&main_uri, 4, 1, "renamed"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "bare-call-site rename must succeed: {:?}",
+        resp.error
+    );
+    let bare = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    shutdown(&client, server);
+
+    // From the DECLARATION (line 1, col 5).
+    let (client2, server2, main_uri2, _project2) = boot_native_member(src);
+    client2
+        .sender
+        .send(request(
+            74,
+            "textDocument/rename",
+            rename_params(&main_uri2, 1, 5, "renamed"),
+        ))
+        .unwrap();
+    let resp2 = recv_response(&client2);
+    assert!(
+        resp2.error.is_none(),
+        "declaration rename must succeed: {:?}",
+        resp2.error
+    );
+    let decl = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp2.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    shutdown(&client2, server2);
+
+    // Click-site-INDEPENDENT: identical edit RANGES (the two boots use distinct temp-dir URIs, so
+    // compare ranges, not paths — both files are the single `main.gd`), covering all three sites.
+    let bare_ranges: Vec<lsp_types::Range> = bare.set.iter().map(|(_, r)| *r).collect();
+    let decl_ranges: Vec<lsp_types::Range> = decl.set.iter().map(|(_, r)| *r).collect();
+    assert_eq!(
+        bare_ranges, decl_ranges,
+        "rename edit set must be click-site-independent (bare call vs declaration); bare={bare_ranges:?} decl={decl_ranges:?}"
+    );
+    assert_eq!(
+        bare_ranges.len(),
+        3,
+        "rename of `helper` must edit all 3 occurrences (decl + bare call + self.helper), got {bare_ranges:?}"
+    );
+}

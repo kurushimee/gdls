@@ -5784,11 +5784,34 @@ pub fn rename(
         return Err(refusal);
     }
 
-    // (5) Reuse `references` (declaration + every reference) for the edit set — index/binding-backed
+    // (5) Canonicalize the cursor to the symbol's DECLARATION before collecting the edit set. The
+    // `references` set is click-site-dependent for a method: a click on a BARE `helper()` call can
+    // yield a NARROWER set than a click on the declaration (it may miss the `self.helper()`-qualified
+    // siblings). For a read that is a cosmetic panel gap; for a MUTATING rename it silently drops
+    // occurrences → a dangling call to the old name → broken code. The declaration is the canonical,
+    // complete anchor, so resolve it via `definition` and collect from THERE — making the edit set
+    // click-site-INDEPENDENT. Falls back to the cursor when the target is already its own declaration
+    // (definition → None / non-scalar), where the cursor set is itself complete.
+    let edit_tdp = match definition(
+        state,
+        GotoDefinitionParams {
+            text_document_position_params: tdp.clone(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+        },
+    ) {
+        Some(GotoDefinitionResponse::Scalar(loc)) => TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: loc.uri },
+            position: loc.range.start,
+        },
+        _ => tdp.clone(),
+    };
+
+    // (6) Reuse `references` (declaration + every reference) for the edit set — index/binding-backed
     // resolution, never a text grep. `include_declaration: true` so the declaration token is edited
     // too. The resulting (uri, range) set IS the edited set by construction.
     let ref_params = ReferenceParams {
-        text_document_position: tdp.clone(),
+        text_document_position: edit_tdp,
         context: ReferenceContext {
             include_declaration: true,
         },
