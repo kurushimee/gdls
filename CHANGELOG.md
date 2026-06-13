@@ -5,6 +5,29 @@ All notable changes to `gdls` are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] — 2026-06-13
+
+Hotfix for a false-positive error reported from real-project use (#88). Cut from v1.0.5 plus
+this fix only — the unreleased Phase 2 work on `main` stays unreleased, per the Phase 2
+release deferral.
+
+### Fixed
+- **Bare utility-function references no longer error with `Identifier "X" not declared in the
+  current scope.`** (#88): Godot 4.x exposes utility functions as first-class Callables, so
+  `print.call_deferred(msg)`, `arr.map(floor)`, `var f := absi`, and `clamp.bind(0, 1)` are all
+  legal — the `reduce_identifier` arm that resolves them (analyzer.cpp:4641-4652) was unported
+  and every Variant utility referenced outside callee position false-positived. The arm now
+  reduces both utility families (Variant + GDScript-only) to a constant `Callable`, matching
+  Godot's `make_callable_type` shape.
+- GDScript-only utilities (`len`, `range`, …) referenced bare previously escaped the error but
+  carried **no type**; they now get the same constant `Callable` (hover/inference fixed).
+- `const PRINTER = print` is accepted (the reference folds as a constant, mirroring Godot's
+  `reduced_value = Callable(...)`), and `print = 5` now fails with Godot's exact
+  `Cannot assign a new value to a constant.` instead of the bogus not-declared error.
+
+Both conformance ratchets hold at 1.0; the differential-oracle harness gains a
+utility-as-Callable fixture (19/19 at jaccard 1.0 against godot 4.6.3-stable).
+
 ## [1.0.5] — 2026-06-12
 
 The LSP protocol-conventions release. A post-v1.0.4 audit compared every exposed capability
