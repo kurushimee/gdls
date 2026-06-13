@@ -65,12 +65,17 @@ fn ident_info(src: &str, name: &str) -> (DataType, bool) {
 }
 
 /// The issue's minimal repro: `print.call_deferred(message)` is a builtin-method call on the
-/// constant Callable `print` reduces to — godot accepts it with zero diagnostics.
+/// constant Callable `print` reduces to — godot accepts it with zero diagnostics. The type
+/// assertion keeps the test discriminating: the trimmed fixture DB lacks `call_deferred`, so
+/// an unknown method on ANY base would also be silently permissive — zero errors alone would
+/// hold even if `print` mis-resolved.
 #[test]
 fn print_call_deferred_is_clean() {
     let src =
         "extends Node\n\n\nfunc test(message: String) -> void:\n\tprint.call_deferred(message)\n";
     assert_eq!(errors(src), Vec::<String>::new());
+    let (dt, _) = ident_info(src, "print");
+    assert_eq!(dt.builtin_type, VariantType::Callable);
 }
 
 /// A bare Variant-utility reference carries Godot's `make_callable_type` shape: hard BUILTIN
@@ -108,7 +113,8 @@ fn gdscript_only_utility_gets_callable_type() {
     let (dt, reduced) = ident_info(src, "len");
     assert_eq!(dt.kind, DtKind::Builtin);
     assert_eq!(dt.builtin_type, VariantType::Callable);
-    assert!(dt.is_constant && reduced);
+    assert!(dt.is_constant, "GDScript-only utility must be constant");
+    assert!(reduced, "GDScript-only utility must fold");
 }
 
 /// The latent edge from #88's follow-up comment: `const PRINTER = print` is legal in 4.6.3
@@ -122,14 +128,18 @@ fn const_assigned_utility_callable_is_clean() {
 }
 
 /// Assignment to a utility name hits the constant gate — godot 4.6.3:
-/// `Cannot assign a new value to a constant.` (oracle-pinned), NOT "not declared".
+/// `Cannot assign a new value to a constant.` (oracle-pinned for BOTH families), NOT
+/// "not declared".
 #[test]
 fn assigning_to_utility_is_constant_error() {
-    let src = "extends Node\n\n\nfunc test() -> void:\n\tprint = 5\n";
-    assert_eq!(
-        errors(src),
-        vec!["Cannot assign a new value to a constant.".to_owned()]
-    );
+    for stmt in ["print = 5", "len = 5"] {
+        let src = format!("extends Node\n\n\nfunc test() -> void:\n\t{stmt}\n");
+        assert_eq!(
+            errors(&src),
+            vec!["Cannot assign a new value to a constant.".to_owned()],
+            "for `{stmt}`"
+        );
+    }
 }
 
 /// Control: a genuinely undeclared identifier in the same shape still errors.
