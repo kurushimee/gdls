@@ -14,13 +14,15 @@ use gd_types::native_db::NativeClass;
 use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
-    DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams, DocumentLink,
-    DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location, MarkupContent, MarkupKind,
-    OneOf, Position, Range, ReferenceParams, SymbolInformation, SymbolKind as LspSymbolKind,
-    TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WorkspaceLocation, WorkspaceSymbol, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    DocumentChanges, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    DocumentLink, DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location,
+    MarkupContent, MarkupKind, OneOf, OptionalVersionedTextDocumentIdentifier, Position,
+    PrepareRenameResponse, Range, ReferenceContext, ReferenceParams, RenameParams,
+    SymbolInformation, SymbolKind as LspSymbolKind, TextDocumentEdit, TextDocumentPositionParams,
+    TextEdit, TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
+    TypeHierarchySupertypesParams, Uri, WorkDoneProgressParams, WorkspaceEdit, WorkspaceLocation,
+    WorkspaceSymbol, WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 // `Goto{Declaration,TypeDefinition}{Params,Response}` are `lsp_types` aliases of the matching
 // `GotoDefinition*` types and live under the `request` submodule (not re-exported at the crate
@@ -5368,4 +5370,462 @@ fn decode_call_hierarchy_data(item: &CallHierarchyItem) -> Option<(Uri, String)>
         }
     };
     Some((uri, name))
+}
+
+// =================================================================================================
+// M9 (#66): textDocument/prepareRename + textDocument/rename — workspace-wide semantic rename.
+//
+// The whole discipline is **refuse rather than corrupt**: a rename either edits the EXACT set
+// `references` resolves (declaration + every reference, binding/index-backed — never a text grep,
+// W16), or it refuses with a typed request error and ZERO edits. Every gate runs BEFORE any edit
+// is assembled. Refusals carry a human-readable message (the corruption firewall is that the
+// client SEES the refusal rather than receiving a silent null or a partial edit).
+// =================================================================================================
+
+/// A typed refusal of a syntactically-valid request (M9 #66 rename/prepareRename). The dispatch
+/// `handle_fallible!` arm projects it into a `Response::new_err(code, message)`. `code` is a
+/// JSON-RPC / LSP error code (`ERR_REQUEST_FAILED` for a non-editable native/stub target,
+/// `ERR_INVALID_PARAMS` for an invalid new name); `message` is the human-readable reason.
+pub(crate) struct RequestRefusal {
+    pub(crate) code: i32,
+    pub(crate) message: String,
+}
+
+impl RequestRefusal {
+    /// A target that is not an editable project source — a native engine symbol or a generated API
+    /// stub. LSP 3.17 `RequestFailed` (-32803): the request was well-formed, it just cannot succeed.
+    fn not_editable(message: impl Into<String>) -> Self {
+        RequestRefusal {
+            code: crate::server::ERR_REQUEST_FAILED,
+            message: message.into(),
+        }
+    }
+
+    /// An invalid `new_name` (empty / not an identifier / a keyword / colliding). The rename spec
+    /// says return a `ResponseError` with an appropriate message; `ERR_INVALID_PARAMS` (-32602) is
+    /// the conventional code for a request the server understood but whose parameter is unusable.
+    fn invalid_name(message: impl Into<String>) -> Self {
+        RequestRefusal {
+            code: crate::server::ERR_INVALID_PARAMS,
+            message: message.into(),
+        }
+    }
+}
+
+/// `true` iff `name` is a valid GDScript identifier that is NOT a keyword — the rename validity
+/// rule, derived MECHANICALLY from the lexer (faithful-port discipline) rather than a hand-rolled
+/// `[A-Za-z_]\w*` regex: tokenize the candidate and require it to be exactly one
+/// [`gd_syntax::TokenKind::Identifier`] with no lexer errors.
+///
+/// Why this is the correct, conservative rule (every case the criterion names falls out of it):
+///   - empty string → tokenizes to just `Newline?`/`Eof` → no `Identifier` → rejected.
+///   - `1bad` → `Literal` + `Identifier` (two content tokens) → rejected.
+///   - `has space` → two `Identifier` tokens → rejected.
+///   - `func` / `if` → the keyword kinds `Func`/`If` (not `Identifier`) → rejected — this is the
+///     "not a keyword" half, inherited from the lexer's `keyword_kind` table for free.
+///   - `true` / `false` / `null` → `Literal` tokens → rejected (reserved literals, not renameable).
+///   - `match` / `when` / `PI` → the engine-API keyword kinds `Match`/`When`/`ConstPi`: gdls
+///     requires the STRICT `Identifier` kind, so these are rejected too — the safe choice for a
+///     rename target (they are keywords in declaration position).
+///   - any non-ASCII confusable / leading whitespace → a lexer error or a stray `Indent`/`Dedent`
+///     content token → rejected.
+fn is_valid_rename_identifier(name: &str) -> bool {
+    // A leading/trailing-whitespace candidate must never slip through on a trimmed match — reject
+    // it outright (it would also emit an `Indent` token below, but this is the explicit guard).
+    if name.is_empty() || name != name.trim() {
+        return false;
+    }
+    let (tokens, errors) = gd_syntax::tokenize(name);
+    if !errors.is_empty() {
+        return false;
+    }
+    // Drop the synthetic line-structure tokens the lexer appends (`Newline`/`Indent`/`Dedent`/
+    // `Eof`); a clean identifier leaves exactly one content token of kind `Identifier`.
+    let content: Vec<gd_syntax::TokenKind> = tokens
+        .iter()
+        .map(|t| t.kind)
+        .filter(|k| {
+            !matches!(
+                k,
+                gd_syntax::TokenKind::Newline
+                    | gd_syntax::TokenKind::Indent
+                    | gd_syntax::TokenKind::Dedent
+                    | gd_syntax::TokenKind::Eof
+            )
+        })
+        .collect();
+    matches!(content.as_slice(), [gd_syntax::TokenKind::Identifier])
+}
+
+/// The corruption firewall: refuse a rename whose target is NOT an editable project source. Three
+/// POSITIVE signals (any one refuses) — deliberately NOT "filter `references` output for stub
+/// URIs", which is a no-op (stub pages are never indexed, so `references` can never return one):
+///   1. the request file itself is a materialized stub (`is_stub_uri`) — the user opened an API
+///      page and tried to rename a symbol inside it;
+///   2. the cursor name IS a native engine class (`native.class_named`) — even when stub
+///      materialization is unavailable, so [`definition`] would return `None`;
+///   3. [`definition`] resolves the cursor symbol into a stub page — this is what catches a NATIVE
+///      MEMBER access from a project file (`node.queue_free()`): `references` would happily return
+///      every `queue_free` occurrence project-wide, so without this gate a rename would mass-edit
+///      calls to an engine method. The declaring site lands in the stub cache → refuse.
+///
+/// Returns `Some(refusal)` to refuse, `None` when the target is an editable project symbol (a
+/// project class_name / member / local — those flow on to validation + edit assembly).
+fn rename_native_or_stub_refusal(
+    state: &mut ServerState,
+    uri: &Uri,
+    name: &str,
+    position: Position,
+) -> Option<RequestRefusal> {
+    // Own the stub root so the immutable `state.options` borrow doesn't straddle the mutable
+    // `definition(state, ..)` call in step (3).
+    let stub_root = state.options.stub_cache_dir.clone();
+    // (1) The request file is a stub page.
+    if crate::stubs::is_stub_uri(uri, stub_root.as_deref()) {
+        return Some(RequestRefusal::not_editable(
+            "Cannot rename inside a generated API stub",
+        ));
+    }
+    // (2) The cursor name is a native engine class.
+    if state.workspace.native.class_named(name).is_some() {
+        return Some(RequestRefusal::not_editable(format!(
+            "Cannot rename the native symbol `{name}`"
+        )));
+    }
+    // (3) The symbol resolves (via the definition pipeline) into a stub page — the native-member
+    // case. Reuse `definition` verbatim so the native-vs-project decision is the analyzer's, not a
+    // re-implementation. A project symbol resolves to a project file (not a stub) and passes.
+    let def_params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: lsp_types::PartialResultParams::default(),
+    };
+    if let Some(GotoDefinitionResponse::Scalar(loc)) = definition(state, def_params) {
+        if crate::stubs::is_stub_uri(&loc.uri, stub_root.as_deref()) {
+            return Some(RequestRefusal::not_editable(format!(
+                "Cannot rename the native symbol `{name}`"
+            )));
+        }
+    }
+    None
+}
+
+/// `textDocument/prepareRename` (#66): pre-flight a rename at the cursor. Resolves the symbol under
+/// the cursor via the SAME path `references`/`definition` use ([`cursor_identifier`]), so prepare
+/// and the rename agree on what is renameable by construction.
+///
+/// Outcomes:
+///   - cursor not on an identifier → `Ok(None)` (LSP `null`): there is nothing to rename, but this
+///     is not an error.
+///   - native engine symbol / generated stub target → `Err(refusal)`: a typed request error with a
+///     human message (NOT a silent null — the client must SEE the refusal).
+///   - otherwise → `Ok(Some(...))`: the identifier token's range, with a placeholder (the current
+///     name) when the client advertised `rename.prepareSupport`, else a bare range (so the rename
+///     keybinding still works for a client that did not opt into placeholder support — the
+///     `PrepareRenameResponse::Range` variant the spec provides for exactly this).
+pub fn prepare_rename(
+    state: &mut ServerState,
+    params: TextDocumentPositionParams,
+) -> Result<Option<PrepareRenameResponse>, RequestRefusal> {
+    let uri = params.text_document.uri.clone();
+    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
+        return Ok(None);
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    let byte = mapper.position_to_byte(params.position);
+    let Some(node_id) = parsed.tree.innermost_node_at(byte) else {
+        return Ok(None);
+    };
+    let Some(name) = cursor_identifier(&parsed.tree, node_id) else {
+        return Ok(None);
+    };
+
+    // Corruption firewall — refuse a native/stub target with a typed error before answering.
+    if let Some(refusal) = rename_native_or_stub_refusal(state, &uri, &name, params.position) {
+        return Err(refusal);
+    }
+
+    let range = mapper.span_to_range(parsed.tree.get(node_id).span);
+    if state.caps.rename_prepare_support {
+        Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
+            range,
+            placeholder: name,
+        }))
+    } else {
+        Ok(Some(PrepareRenameResponse::Range(range)))
+    }
+}
+
+/// `textDocument/rename` (#66): workspace-wide semantic rename of the symbol under the cursor.
+///
+/// Order is the whole point — every check runs BEFORE any edit is assembled, so a refusal produces
+/// ZERO edits (refuse rather than corrupt):
+///   1. cursor must land on an identifier (else `Ok(None)` → LSP `null`).
+///   2. native/stub gate ([`rename_native_or_stub_refusal`]) → `Err` for a non-editable target.
+///   3. `new_name` is a valid GDScript identifier and not a keyword
+///      ([`is_valid_rename_identifier`]) → `Err` otherwise.
+///   4. `new_name` does not collide with an existing member/local in the affected scope
+///      ([`rename_collision`]) → `Err` otherwise.
+///   5. ONLY now: reuse [`references`] (`include_declaration: true`) to collect the declaration +
+///      every reference site, and assemble the [`WorkspaceEdit`] — one [`TextEdit`] per site,
+///      range = identifier token, `new_text = new_name`. The edited set EQUALS what `references`
+///      returns for the same symbol (no independent resolution, no grep).
+///
+/// `WorkspaceEdit` shape is gated on `workspace.workspaceEdit.documentChanges`: when advertised,
+/// versioned `documentChanges` (each [`TextDocumentEdit`] carries its file's current open-buffer
+/// version, or `None` for an unopened file); otherwise the legacy `changes` URI→edits map. Exactly
+/// one of the two fields is populated.
+pub fn rename(
+    state: &mut ServerState,
+    params: RenameParams,
+) -> Result<Option<WorkspaceEdit>, RequestRefusal> {
+    let tdp = params.text_document_position;
+    let new_name = params.new_name;
+    let uri = tdp.text_document.uri.clone();
+    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
+        return Ok(None);
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    let byte = mapper.position_to_byte(tdp.position);
+    let Some(node_id) = parsed.tree.innermost_node_at(byte) else {
+        return Ok(None);
+    };
+    let Some(old_name) = cursor_identifier(&parsed.tree, node_id) else {
+        return Ok(None);
+    };
+
+    // (2) Corruption firewall: refuse a native/stub target (same gate as prepare).
+    if let Some(refusal) = rename_native_or_stub_refusal(state, &uri, &old_name, tdp.position) {
+        return Err(refusal);
+    }
+
+    // (3) The new name must be a valid identifier and not a keyword.
+    if !is_valid_rename_identifier(&new_name) {
+        return Err(RequestRefusal::invalid_name(format!(
+            "`{new_name}` is not a valid GDScript identifier for a rename"
+        )));
+    }
+
+    // A no-op rename (same name) is vacuously valid — return an empty edit rather than running the
+    // collision check against the symbol's own declaration (which would always "collide").
+    if new_name == old_name {
+        return Ok(Some(empty_workspace_edit(state)));
+    }
+
+    // (4) The new name must not collide with an existing member/local in the affected scope.
+    if let Some(refusal) = rename_collision(state, &parsed.tree, byte, node_id, &new_name) {
+        return Err(refusal);
+    }
+
+    // (5) Reuse `references` (declaration + every reference) for the edit set — index/binding-backed
+    // resolution, never a text grep. `include_declaration: true` so the declaration token is edited
+    // too. The resulting (uri, range) set IS the edited set by construction.
+    let ref_params = ReferenceParams {
+        text_document_position: tdp.clone(),
+        context: ReferenceContext {
+            include_declaration: true,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: lsp_types::PartialResultParams::default(),
+    };
+    let locations = references(state, ref_params).unwrap_or_default();
+
+    Ok(Some(build_workspace_edit(state, locations, &new_name)))
+}
+
+/// An empty [`WorkspaceEdit`] in whichever shape the client negotiated (a no-op rename). Keeps the
+/// shape consistent with a real edit so a client that switches on `documentChanges` vs `changes`
+/// sees the field it expects (empty), not a bare `null`.
+// See `build_workspace_edit` — `HashMap<Uri, _>` is the mandated `changes` shape; the empty map
+// here has no keys at all, so `clippy::mutable_key_type` is doubly moot.
+#[allow(clippy::mutable_key_type)]
+fn empty_workspace_edit(state: &ServerState) -> WorkspaceEdit {
+    if state.caps.workspace_edit_document_changes {
+        WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(Vec::new())),
+            ..Default::default()
+        }
+    } else {
+        WorkspaceEdit {
+            changes: Some(std::collections::HashMap::new()),
+            ..Default::default()
+        }
+    }
+}
+
+/// Group `locations` (the `references` set) by URI into one [`TextEdit`] per site
+/// (`new_text = new_name`, range = the identifier token), then project into the negotiated
+/// [`WorkspaceEdit`] shape:
+///   - `workspace.workspaceEdit.documentChanges` advertised → versioned `documentChanges`: one
+///     [`TextDocumentEdit`] per file, its [`OptionalVersionedTextDocumentIdentifier`] carrying the
+///     file's CURRENT open-buffer version (pulled from the VFS) or `None` for an unopened file (the
+///     optional-versioned id's documented "content on disk is master" case). Zero stale-version
+///     edits: the version is read live here, at assembly time.
+///   - otherwise → the legacy `changes` URI→edits map (no version).
+///
+/// Exactly one field is populated; the other is `None`.
+// `lsp_types::Uri` carries interior mutability (it caches its parsed components in a `Cell`), which
+// trips `clippy::mutable_key_type` when used as a `HashMap` key — but `WorkspaceEdit.changes` IS
+// `HashMap<Uri, Vec<TextEdit>>` by the LSP wire shape, and we never mutate a key after insertion,
+// so the lint's hazard (a key whose hash changes under us) cannot occur here.
+#[allow(clippy::mutable_key_type)]
+fn build_workspace_edit(
+    state: &ServerState,
+    locations: Vec<Location>,
+    new_name: &str,
+) -> WorkspaceEdit {
+    // Group by URI string, preserving first-seen order for deterministic output.
+    let mut order: Vec<Uri> = Vec::new();
+    let mut by_uri: FxHashMap<String, Vec<TextEdit>> = FxHashMap::default();
+    for loc in locations {
+        let edit = TextEdit {
+            range: loc.range,
+            new_text: new_name.to_string(),
+        };
+        let key = loc.uri.as_str().to_string();
+        if let Some(edits) = by_uri.get_mut(&key) {
+            edits.push(edit);
+        } else {
+            order.push(loc.uri.clone());
+            by_uri.insert(key, vec![edit]);
+        }
+    }
+
+    if state.caps.workspace_edit_document_changes {
+        let edits: Vec<TextDocumentEdit> = order
+            .into_iter()
+            .map(|uri| {
+                // Pull the CURRENT version from the open buffer; `None` when the file isn't open
+                // (the OptionalVersioned id allows it — "the content on disk is the master").
+                let version = state.vfs.get(uri.as_str()).map(|d| d.version);
+                let text_edits = by_uri
+                    .remove(uri.as_str())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(OneOf::Left)
+                    .collect();
+                TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier { uri, version },
+                    edits: text_edits,
+                }
+            })
+            .collect();
+        WorkspaceEdit {
+            document_changes: Some(DocumentChanges::Edits(edits)),
+            ..Default::default()
+        }
+    } else {
+        let mut changes: std::collections::HashMap<Uri, Vec<TextEdit>> =
+            std::collections::HashMap::with_capacity(order.len());
+        for uri in order {
+            let text_edits = by_uri.remove(uri.as_str()).unwrap_or_default();
+            changes.insert(uri, text_edits);
+        }
+        WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }
+    }
+}
+
+/// Refuse a rename whose `new_name` would collide with an existing declaration in the SAME scope as
+/// the symbol being renamed — index/binding-backed, scoped to exactly what the criterion names
+/// ("a name colliding with an existing member in scope"), not a full scope-resolution engine.
+///
+/// Two scopes, mirroring the `references` classification:
+///   - a class member (the cursor classifies as a member, OR a method/signal declaration) →
+///     collision iff the current file's root class already declares `new_name` as a member.
+///   - an enclosing-function local/parameter → collision iff that function already declares
+///     `new_name` as a param/var/const.
+///
+/// A target that resolves to neither (an unresolved residue) is not collision-checked here — there
+/// is no scope to check against; the edit assembly still uses the binding-backed `references` set.
+fn rename_collision(
+    _state: &mut ServerState,
+    tree: &ParseTree,
+    byte: usize,
+    node_id: NodeId,
+    new_name: &str,
+) -> Option<RequestRefusal> {
+    // Local/parameter scope FIRST: a cursor inside a function on its own param/var/const is a
+    // local target (locals shadow members), so its collision scope is the function, not the class.
+    // The enclosing-function walk only matches when `byte` is inside a function that declares the
+    // OLD name as a local — exactly the `NonMethodTarget::Local` precondition.
+    let old_name = cursor_identifier(tree, node_id);
+    if let Some(old) = old_name.as_deref() {
+        if enclosing_function_declaring(tree, byte, old).is_some() {
+            if function_declares_local(tree, byte, new_name) {
+                return Some(RequestRefusal::invalid_name(format!(
+                    "Cannot rename to `{new_name}`: `{new_name}` is already declared in this scope"
+                )));
+            }
+            // A local target: its scope is the function; the class-member check below would be the
+            // wrong scope, so stop here.
+            return None;
+        }
+    }
+    // Member scope: a method/signal declaration, an attribute access, or a root-member declaration
+    // click → collision iff the current file's root class already declares `new_name`.
+    let is_member_role =
+        is_member_or_attribute_ident(tree, node_id) || node_is_root_member(tree, node_id);
+    if is_member_role && root_class_declares(tree, new_name) {
+        return Some(RequestRefusal::invalid_name(format!(
+            "Cannot rename to `{new_name}`: a member named `{new_name}` already exists in this class"
+        )));
+    }
+    None
+}
+
+/// `true` iff `node_id` is the identifier of a root-class member declaration (a declaration-site
+/// click on `var x` / `func f` / `signal s` / `const C` / `enum E` / `class Inner`).
+fn node_is_root_member(tree: &ParseTree, node_id: NodeId) -> bool {
+    let Some(root_id) = tree.root_id() else {
+        return false;
+    };
+    let NodeKind::Class(root) = &tree.get(root_id).kind else {
+        return false;
+    };
+    root.members.iter().any(|m| {
+        member_decl_id(m)
+            .and_then(|decl| declaration_identifier(tree, decl))
+            .is_some_and(|iid| iid == node_id)
+    })
+}
+
+/// The declaration `NodeId` backing a [`Member`], for the root-member identifier walk.
+fn member_decl_id(member: &Member) -> Option<NodeId> {
+    use gd_syntax::ast::Member::*;
+    match member {
+        Class(id) | Constant(id) | Function(id) | Signal(id) | Variable(id) | Enum(id) => Some(*id),
+        EnumValue(_) | Group(_) => None,
+    }
+}
+
+/// `true` iff the current file's ROOT class declares a member named `name` — the member-collision
+/// predicate. Walks the root class's own members only (inner-class and inherited members are a
+/// different scope; an inherited collision is a shadow, which GDScript permits).
+fn root_class_declares(tree: &ParseTree, name: &str) -> bool {
+    let Some(root_id) = tree.root_id() else {
+        return false;
+    };
+    let NodeKind::Class(root) = &tree.get(root_id).kind else {
+        return false;
+    };
+    root.members
+        .iter()
+        .any(|m| member_named(tree, m, name).is_some())
+}
+
+/// `true` iff the smallest function containing `byte` declares `name` as a parameter or a
+/// body-local var/const — the local-collision predicate. Reuses the exact shape of
+/// [`enclosing_function_declaring`] (the `references` local-classification walk).
+fn function_declares_local(tree: &ParseTree, byte: usize, name: &str) -> bool {
+    enclosing_function_declaring(tree, byte, name).is_some()
 }
