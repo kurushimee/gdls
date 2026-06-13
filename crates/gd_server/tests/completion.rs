@@ -775,6 +775,294 @@ fn gating_kind_clamped_to_value_set() {
     shutdown(&client, server_thread);
 }
 
+/// Consolidated capability-gating MATRIX: every M8 completion gate × {present, absent} in one
+/// table-driven place, asserting BOTH projections. The scattered per-gate `gating_*` tests above
+/// each exercise one gate in depth (and stay as focused regressions); this row table is the single
+/// spot that proves the whole gate set is covered both ways — and it closes the one direction none
+/// of the per-gate tests nor the `editor_profiles.rs` walk reach (all three vendored profiles have
+/// `commitCharactersSupport` off): a client that DOES advertise commit characters receives them.
+///
+/// Each row flips the gates via [`caps`] and declares the expected projection of every gate for a
+/// `Hero.` member access — the callable `attack` (snippet/insertReplace/commit), the documented
+/// property `hp` (kind clamp + documentation format on resolve). The signatureHelp gates
+/// (`labelOffsetSupport`, `activeParameter`) are NOT here: that handler lives on the stacked
+/// `feat/m8-signaturehelp` branch, so its matrix rows join this table on that branch.
+#[test]
+fn gating_matrix_every_gate_both_ways() {
+    /// One row of the gate matrix: the client capabilities + the projection each gate must produce.
+    struct Case {
+        name: &'static str,
+        caps: ClientCapabilities,
+        /// `attack`'s `insertTextFormat == Snippet` and its newText carries `$0`.
+        expect_snippet: bool,
+        /// the edit is an `InsertReplaceEdit` (vs a plain `TextEdit`).
+        expect_insert_replace: bool,
+        /// items carry `commitCharacters`.
+        expect_commit: bool,
+        /// the property `hp` keeps its `PROPERTY` kind (vs clamped to `None`).
+        expect_property_kind: bool,
+        /// resolve renders `hp`'s doc as Markdown (vs PlainText).
+        expect_markdown_docs: bool,
+    }
+
+    // A value-set that includes PROPERTY (10), so the kind-clamp gate is driven by its PRESENCE,
+    // independent of the other gates; and one that excludes it (METHOD-only) for the clamp.
+    let with_property = vec![CompletionItemKind::METHOD, CompletionItemKind::PROPERTY];
+    let method_only = vec![CompletionItemKind::METHOD];
+
+    let cases = vec![
+        // Baseline: every gate ON (snippet, insertReplace, commit, markdown docs, PROPERTY kept).
+        Case {
+            name: "all-present",
+            caps: caps(
+                true,
+                true,
+                true,
+                Some(vec![MarkupKind::Markdown]),
+                Some(with_property.clone()),
+            ),
+            expect_snippet: true,
+            expect_insert_replace: true,
+            expect_commit: true,
+            expect_property_kind: true,
+            expect_markdown_docs: true,
+        },
+        // snippet OFF (others held on).
+        Case {
+            name: "snippet-absent",
+            caps: caps(
+                false,
+                true,
+                true,
+                Some(vec![MarkupKind::Markdown]),
+                Some(with_property.clone()),
+            ),
+            expect_snippet: false,
+            expect_insert_replace: true,
+            expect_commit: true,
+            expect_property_kind: true,
+            expect_markdown_docs: true,
+        },
+        // insertReplace OFF.
+        Case {
+            name: "insert-replace-absent",
+            caps: caps(
+                true,
+                false,
+                true,
+                Some(vec![MarkupKind::Markdown]),
+                Some(with_property.clone()),
+            ),
+            expect_snippet: true,
+            expect_insert_replace: false,
+            expect_commit: true,
+            expect_property_kind: true,
+            expect_markdown_docs: true,
+        },
+        // commitCharacters OFF — the direction NO per-gate test nor the profile walk reaches in ON
+        // form; the baseline row above is the ON form, this is the OFF form.
+        Case {
+            name: "commit-absent",
+            caps: caps(
+                true,
+                true,
+                false,
+                Some(vec![MarkupKind::Markdown]),
+                Some(with_property.clone()),
+            ),
+            expect_snippet: true,
+            expect_insert_replace: true,
+            expect_commit: false,
+            expect_property_kind: true,
+            expect_markdown_docs: true,
+        },
+        // documentationFormat PlainText (the markdown-OFF projection).
+        Case {
+            name: "doc-format-plaintext",
+            caps: caps(
+                true,
+                true,
+                true,
+                Some(vec![MarkupKind::PlainText]),
+                Some(with_property.clone()),
+            ),
+            expect_snippet: true,
+            expect_insert_replace: true,
+            expect_commit: true,
+            expect_property_kind: true,
+            expect_markdown_docs: false,
+        },
+        // completionItemKind excludes PROPERTY — the clamp-to-None projection.
+        Case {
+            name: "kind-clamped",
+            caps: caps(
+                true,
+                true,
+                true,
+                Some(vec![MarkupKind::Markdown]),
+                Some(method_only.clone()),
+            ),
+            expect_snippet: true,
+            expect_insert_replace: true,
+            expect_commit: true,
+            expect_property_kind: false,
+            expect_markdown_docs: true,
+        },
+        // Every gate ABSENT (a client that opted into completion but advertised no item caps): the
+        // all-downgraded projection — bare name, plain edit, no commit, plaintext docs. PROPERTY
+        // survives because an absent `completionItemKind.valueSet` falls back to the LSP-default set
+        // (1..=18), which includes PROPERTY (10).
+        Case {
+            name: "all-absent",
+            caps: caps(false, false, false, None, None),
+            expect_snippet: false,
+            expect_insert_replace: false,
+            expect_commit: false,
+            expect_property_kind: true,
+            expect_markdown_docs: false,
+        },
+    ];
+
+    // A documented same-file `Hero` (declaring file == requesting file, the Phase-3 resolve
+    // constraint) with a callable `attack` and a `##`-documented property `hp`, accessed via `h.`.
+    let src = "class_name Hero\nextends Node\n\n## Bold [b]points[/b] here.\nvar hp: int = 10\n\nfunc attack() -> void:\n\tpass\n\nfunc use(h: Hero) -> void:\n\th.\n";
+
+    for case in cases {
+        let p = TempProject::new();
+        p.write(
+            "project.godot",
+            "config_version=5\n\n[application]\n\nconfig/name=\"T\"\n",
+        );
+        p.write("extension_api.json", common::MINI_API);
+        let uri = file_uri(&p.root.join("src/hero.gd"));
+        let (client, server_thread) = boot(&p, case.caps.clone(), &uri, src);
+
+        // `\th.` is on line 10 (0-based) → column 3.
+        let raw = complete_raw(&client, 80, &uri, Position::new(10, 3));
+        let list: CompletionList = serde_json::from_value(raw)
+            .unwrap_or_else(|e| panic!("{}: a CompletionList: {e}", case.name));
+        let attack = list
+            .items
+            .iter()
+            .find(|i| i.label == "attack")
+            .unwrap_or_else(|| panic!("{}: attack present", case.name));
+        let hp = list
+            .items
+            .iter()
+            .find(|i| i.label == "hp")
+            .unwrap_or_else(|| panic!("{}: hp present", case.name))
+            .clone();
+
+        // (1) snippet projection.
+        assert_eq!(
+            attack.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET),
+            case.expect_snippet,
+            "{}: snippet projection",
+            case.name
+        );
+        // (2) insertReplace projection + (1') the snippet's `$0` lives under the selected edit arm.
+        match attack
+            .text_edit
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}: a textEdit", case.name))
+        {
+            CompletionTextEdit::InsertAndReplace(e) => {
+                assert!(
+                    case.expect_insert_replace,
+                    "{}: got InsertReplaceEdit",
+                    case.name
+                );
+                assert_eq!(
+                    e.new_text.contains("$0"),
+                    case.expect_snippet,
+                    "{}: $0 in newText iff snippet",
+                    case.name
+                );
+            }
+            CompletionTextEdit::Edit(e) => {
+                assert!(
+                    !case.expect_insert_replace,
+                    "{}: got a plain TextEdit",
+                    case.name
+                );
+                assert_eq!(
+                    e.new_text.contains("$0"),
+                    case.expect_snippet,
+                    "{}: $0 in newText iff snippet",
+                    case.name
+                );
+            }
+        }
+        // (3) commitCharacters projection.
+        assert_eq!(
+            attack.commit_characters.is_some(),
+            case.expect_commit,
+            "{}: commitCharacters projection",
+            case.name
+        );
+        // (4) kind-clamp projection — PROPERTY kept or dropped to None.
+        assert_eq!(
+            hp.kind == Some(CompletionItemKind::PROPERTY),
+            case.expect_property_kind,
+            "{}: PROPERTY kind projection",
+            case.name
+        );
+        if !case.expect_property_kind {
+            assert_eq!(
+                hp.kind, None,
+                "{}: clamped kind is None, not a number",
+                case.name
+            );
+        }
+
+        // (5) documentationFormat projection — resolve `hp` and check the rendered MarkupKind.
+        client
+            .sender
+            .send(request(81, "completionItem/resolve", &hp))
+            .unwrap();
+        let resp = recv_response(&client);
+        let resolved: CompletionItem = serde_json::from_value(resp.result.unwrap())
+            .unwrap_or_else(|e| panic!("{}: resolve result: {e}", case.name));
+        match resolved
+            .documentation
+            .unwrap_or_else(|| panic!("{}: documentation filled", case.name))
+        {
+            lsp_types::Documentation::MarkupContent(mc) => {
+                if case.expect_markdown_docs {
+                    assert_eq!(
+                        mc.kind,
+                        MarkupKind::Markdown,
+                        "{}: markdown docs",
+                        case.name
+                    );
+                    assert!(
+                        mc.value.contains("**points**"),
+                        "{}: BBCode renders as markdown emphasis: {:?}",
+                        case.name,
+                        mc.value
+                    );
+                } else {
+                    assert_eq!(
+                        mc.kind,
+                        MarkupKind::PlainText,
+                        "{}: plaintext docs",
+                        case.name
+                    );
+                    assert!(
+                        mc.value.contains("points") && !mc.value.contains("**"),
+                        "{}: BBCode stripped for plaintext: {:?}",
+                        case.name,
+                        mc.value
+                    );
+                }
+            }
+            other => panic!("{}: expected MarkupContent, got {other:?}", case.name),
+        }
+
+        shutdown(&client, server_thread);
+    }
+}
+
 /// A `textDocument/completion` at a non-`.gd` URI (or with nothing to complete) returns a
 /// well-formed empty `CompletionList`, never an error or a bare array.
 #[test]

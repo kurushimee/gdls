@@ -24,6 +24,7 @@ gd_syntax = { path = "../crates/gd_syntax" }
 gd_analyze = { path = "../crates/gd_analyze" }
 gd_project = { path = "../crates/gd_project" }
 gd_types = { path = "../crates/gd_types" }
+gd_server = { path = "../crates/gd_server" }
 
 # Own workspace root → not absorbed by the parent gdls workspace.
 [workspace]
@@ -45,6 +46,13 @@ bench = false
 [[bin]]
 name = "index_invariants"
 path = "fuzz_targets/index_invariants.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "complete_context"
+path = "fuzz_targets/complete_context.rs"
 test = false
 doc = false
 bench = false

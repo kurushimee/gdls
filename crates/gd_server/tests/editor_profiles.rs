@@ -17,6 +17,22 @@
 //! - `workspace/didChangeConfiguration` triggers a `workspace/configuration` pull iff
 //!   `workspace.configuration`.
 //!
+//! M8 (#64) extends the walk with the **`textDocument/completion`** gated projections, also derived
+//! per profile from its own `textDocument.completion` flags (so a new capture extends the walk
+//! automatically):
+//! - `completionItem.snippetSupport` → a callable inserts a `($0)` snippet vs a bare name;
+//! - `completionItem.insertReplaceSupport` → an `InsertReplaceEdit` vs a plain `TextEdit`;
+//! - `completionItem.commitCharactersSupport` → items carry commit characters vs none;
+//! - `completionItem.documentationFormat` → `completionItem/resolve` renders Markdown vs PlainText
+//!   docs (absent ⇒ the conservative PlainText downgrade — NOT hover's Markdown default);
+//! - `completionItemKind.valueSet` → a server kind outside the negotiated set (here a signal's
+//!   `EVENT` = 23, outside the LSP-default 1..=18) is clamped to `None` rather than sent as a number.
+//!
+//! `textDocument/signatureHelp` (M8 #65) is **deliberately not driven here**: that handler and its
+//! capability live on the stacked `feat/m8-signaturehelp` branch, not this completion branch, so it
+//! is unregistered and would return method-not-found — its six-profile walk extends this file on
+//! that branch (the stacked geometry means these completion additions are already present there).
+//!
 //! Every milestone from M8 on extends this list with its own gated projections.
 
 mod common;
@@ -36,6 +52,29 @@ var speed := 1.0
 
 func f():
 \tvar unused = 1
+";
+
+/// A self-contained file for the M8 completion-projection walk, kept SEPARATE from
+/// [`DOCUMENTED_SRC`] so its members never shift the hover/`UNUSED_VARIABLE` positions the M7
+/// assertions pin. Single-file (the Phase-3 resolve doc lookup needs the member's declaring file to
+/// equal the requesting file — see `tests/completion.rs::resolve_fills_docs_…`), with one of every
+/// gate-relevant member: a `##`-documented **property** (`hp`), a **signal** (`hit` → `EVENT` = 23,
+/// outside the LSP-default kind set, the cross-profile clamp discriminator), and a **method**
+/// (`attack` → callable, exercises the snippet gate). The trailing `c.` is the member-access site.
+const COMPLETION_PROBE_SRC: &str = "\
+class_name Consumer
+extends Node
+
+## Hit points in [b]units[/b].
+var hp: int = 10
+
+signal hit
+
+func attack() -> void:
+\tpass
+
+func use(c: Consumer) -> void:
+\tc.
 ";
 
 fn profiles() -> Vec<(String, serde_json::Value)> {
@@ -110,6 +149,8 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
 
     let p = sample_project();
     p.write("src/probe.gd", DOCUMENTED_SRC);
+    // The M8 completion-projection probe, on disk before boot so it is in the eager-interface index.
+    p.write("src/consumer.gd", COMPLETION_PROBE_SRC);
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
     let init = InitializeParams {
@@ -289,7 +330,212 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
         "{name}: workspace/configuration pull iff advertised"
     );
 
+    // M8 (#64): the completion gated-projection walk against the self-contained probe file.
+    check_completion_projection(name, profile, &p, &client);
+
     common::shutdown(&client, server_thread);
+}
+
+/// Drive `textDocument/completion` (+ a `completionItem/resolve` round-trip) for one profile and
+/// assert every M8 completion gate's projection, derived from the profile's OWN
+/// `textDocument.completion` JSON flags — so this never hard-codes per-editor expectations. The
+/// server is the same booted session as [`check_profile`]; only the probe file is new.
+fn check_completion_projection(
+    name: &str,
+    profile: &serde_json::Value,
+    p: &common::TempProject,
+    client: &Connection,
+) {
+    // What the profile advertises (the source of truth for what to expect), via the same `flag()` /
+    // raw-JSON probes the rest of this walk uses.
+    let want_snippet = flag(
+        profile,
+        &[
+            "textDocument",
+            "completion",
+            "completionItem",
+            "snippetSupport",
+        ],
+    );
+    let want_insert_replace = flag(
+        profile,
+        &[
+            "textDocument",
+            "completion",
+            "completionItem",
+            "insertReplaceSupport",
+        ],
+    );
+    let want_commit = flag(
+        profile,
+        &[
+            "textDocument",
+            "completion",
+            "completionItem",
+            "commitCharactersSupport",
+        ],
+    );
+    // documentationFormat: first of {markdown, plaintext}; ABSENT ⇒ the conservative PlainText
+    // downgrade (NOT hover's Markdown default — `CompletionCaps::negotiate`).
+    let doc_formats = profile["textDocument"]["completion"]["completionItem"]
+        ["documentationFormat"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        });
+    let want_markdown_docs = doc_formats
+        .as_ref()
+        .and_then(|fmts| fmts.iter().find(|f| *f == "markdown" || *f == "plaintext"))
+        .map(|first| first == "markdown")
+        .unwrap_or(false);
+    // completionItemKind.valueSet: the kinds the client can render. Absent ⇒ the LSP-default set
+    // (1..=18). EVENT (a signal's kind) is 23 — present iff the client enumerated a set reaching it.
+    let kind_set: Option<Vec<i64>> = profile["textDocument"]["completion"]["completionItemKind"]
+        ["valueSet"]
+        .as_array()
+        .map(|a| a.iter().filter_map(serde_json::Value::as_i64).collect());
+    let event_supported = match &kind_set {
+        Some(set) => set.contains(&23), // CompletionItemKind::EVENT
+        None => false,                  // default 1..=18 excludes EVENT
+    };
+
+    // Drive completion at the `c.` member-access site (line 12, after the `.` ⇒ column 3).
+    let probe_uri = file_uri(&p.root.join("src/consumer.gd"));
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: probe_uri.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 1,
+                    text: COMPLETION_PROBE_SRC.to_string(),
+                },
+            },
+        ))
+        .unwrap();
+    client
+        .sender
+        .send(request(
+            20,
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": probe_uri.as_str() },
+                "position": { "line": 12, "character": 3 },
+            }),
+        ))
+        .unwrap();
+    let raw = response_result(name, client, 20);
+    // Anti-catalog W18: a completion is a `CompletionList` object with `items`, never a bare array.
+    let items = raw["items"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{name}: completion is a CompletionList with items, got {raw}"))
+        .clone();
+    let find = |label: &str| -> serde_json::Value {
+        items
+            .iter()
+            .find(|i| i["label"] == label)
+            .unwrap_or_else(|| panic!("{name}: member `{label}` offered; items={items:?}"))
+            .clone()
+    };
+    let attack = find("attack");
+    let hp = find("hp");
+    let hit = find("hit");
+
+    // (1) snippetSupport: a callable inserts a `($0)` snippet (insertTextFormat == Snippet == 2)
+    // iff the client opted in, else a bare name and no insertTextFormat.
+    let attack_format = attack["insertTextFormat"].as_i64();
+    let attack_new_text = attack["textEdit"]["newText"]
+        .as_str()
+        .or_else(|| attack["textEdit"]["replace"].as_str())
+        .or_else(|| attack["insertText"].as_str())
+        .unwrap_or("");
+    if want_snippet {
+        assert_eq!(
+            attack_format,
+            Some(2),
+            "{name}: snippetSupport ⇒ a callable's insertTextFormat is Snippet(2)"
+        );
+        // The newText lives under whichever edit arm the insertReplace gate selected.
+        let nt = attack["textEdit"]["newText"]
+            .as_str()
+            .unwrap_or(attack_new_text);
+        assert!(
+            nt.contains("$0"),
+            "{name}: snippet newText carries the $0 tab-stop: {nt:?}"
+        );
+    } else {
+        assert_eq!(
+            attack_format, None,
+            "{name}: no snippetSupport ⇒ insertTextFormat absent (plain text)"
+        );
+        let nt = attack["textEdit"]["newText"].as_str().unwrap_or("");
+        assert!(
+            !nt.contains("$0"),
+            "{name}: no snippetSupport ⇒ no $0 in newText: {nt:?}"
+        );
+    }
+
+    // (2) insertReplaceSupport: the textEdit is an InsertReplaceEdit (has `insert` + `replace`) iff
+    // advertised, else a plain TextEdit (has `range` + `newText`).
+    let is_insert_replace =
+        attack["textEdit"].get("insert").is_some() && attack["textEdit"].get("replace").is_some();
+    assert_eq!(
+        is_insert_replace, want_insert_replace,
+        "{name}: insertReplaceSupport ⇒ InsertReplaceEdit, else a plain TextEdit"
+    );
+
+    // (3) commitCharactersSupport: items carry commitCharacters iff advertised.
+    let any_commit = items.iter().any(|i| !i["commitCharacters"].is_null());
+    assert_eq!(
+        any_commit, want_commit,
+        "{name}: commitCharacters present on items iff commitCharactersSupport"
+    );
+
+    // (4) completionItemKind clamp: the signal `hit` is EVENT (23). Outside the default 1..=18 set
+    // it is dropped to `None` (kind absent); a client enumerating a set that reaches 23 keeps it.
+    // The method `attack` is METHOD (2) — always inside any reasonable set — so its kind survives.
+    assert!(
+        !attack["kind"].is_null(),
+        "{name}: METHOD (2) is inside every kind set, so attack keeps its kind"
+    );
+    assert_eq!(
+        !hit["kind"].is_null(),
+        event_supported,
+        "{name}: signal EVENT(23) kept iff the negotiated valueSet reaches it, else clamped to None"
+    );
+
+    // (5) documentationFormat: resolve the documented property `hp`; its documentation MarkupKind
+    // follows the gate (Markdown renders `[b]…[/b]` as `**…**`; PlainText strips the BBCode).
+    client
+        .sender
+        .send(request(21, "completionItem/resolve", &hp))
+        .unwrap();
+    let resolved = response_result(name, client, 21);
+    let doc_kind = resolved["documentation"]["kind"].as_str().unwrap_or("");
+    let doc_value = resolved["documentation"]["value"].as_str().unwrap_or("");
+    if want_markdown_docs {
+        assert_eq!(
+            doc_kind, "markdown",
+            "{name}: markdown-preferring client ⇒ markdown docs"
+        );
+        assert!(
+            doc_value.contains("**units**"),
+            "{name}: BBCode [b] renders as markdown emphasis: {doc_value:?}"
+        );
+    } else {
+        assert_eq!(
+            doc_kind, "plaintext",
+            "{name}: no/plaintext documentationFormat ⇒ plaintext docs"
+        );
+        assert!(
+            doc_value.contains("units") && !doc_value.contains("**"),
+            "{name}: BBCode stripped for plaintext: {doc_value:?}"
+        );
+    }
 }
 
 fn request_hover(name: &str, client: &Connection, id: i32, uri: &Uri) -> (String, String) {
