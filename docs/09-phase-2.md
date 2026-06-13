@@ -316,11 +316,12 @@ inventory and this machine's gaps). Deferred interactive items accumulate here p
   the six editors. Three capability profiles (helix/neovim/zed) are walked headlessly in
   `tests/editor_profiles.rs`; **vscode/eglot/sublime remain machine-capture gaps** (not
   installed — see `client_caps/README.md`), so their completion/signatureHelp projections are
-  the deferred items here. The Godot-editor completion differential (member/identifier/type
-  contexts) was run headlessly and agreed 99.6% on member access — but a *human* feel-check of
-  ranking/snippet ergonomics in real editing is still the end-of-phase trial. Script-parent
-  `OVERRIDE_METHOD` completion stubs ship native-only (script-parent stubs are renderable from
-  `Interface.param_names` — a deliberate, documented follow-up, not a blocker).
+  the deferred items here (tracked: #98). The Godot-editor completion differential (member/
+  identifier/type contexts) was run headlessly and agreed 99.6% on member access — but a *human*
+  feel-check of ranking/snippet ergonomics in real editing is still the end-of-phase trial.
+  Post-M8 polish/completeness follow-ups are filed as #96 (completion contexts — incl. the
+  native-only `OVERRIDE_METHOD` stubs, renderable from `Interface.param_names`), #97 (signatureHelp
+  — lambdas, script-method docs, constructor overload args), and #99 (perf-budget recalibration).
 
 ## 8. Phase 2 exit criteria
 

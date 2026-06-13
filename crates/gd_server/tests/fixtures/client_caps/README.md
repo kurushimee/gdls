@@ -33,4 +33,4 @@ user's only check is a single end-of-Phase-2 trial in real work.
 | `sublime.json` | — | ⬜ blocked: Sublime Text is not installed on this machine |
 
 Blocked rows are capability gaps of THIS machine, not user tasks — re-attempt whenever the
-tooling appears. The walk meanwhile runs over every vendored profile.
+tooling appears. The walk meanwhile runs over every vendored profile. Tracked: #98.
