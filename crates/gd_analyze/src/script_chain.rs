@@ -56,7 +56,7 @@ pub(crate) fn chain_native_root(ctx: &AnalysisContext, start: &ScriptRef) -> Opt
 /// query rather than the context so callers holding `&mut AnalysisContext` can keep the returned
 /// borrow alive across `push_warning`/`set_type` calls (the `&'x` ties to the analysis-long query
 /// lifetime, not to the context borrow).
-pub(crate) fn link_interface<'x>(
+pub fn link_interface<'x>(
     xfile: &'x dyn CrossFileQuery,
     link: &ScriptRef,
 ) -> Option<&'x gd_project::Interface> {

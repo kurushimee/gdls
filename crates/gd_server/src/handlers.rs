@@ -27,6 +27,11 @@ use crate::position::PositionMapper;
 use crate::server::ServerState;
 use crate::uri::{path_to_file_uri, uri_to_path, CanonicalKey};
 
+// M8 (#64): the completion + resolve handlers live in `crate::completion` (a sizable module of
+// their own) but dispatch addresses them as `handlers::completion` / `handlers::completion_item_resolve`
+// alongside every other request handler — re-export so the dispatch table stays one uniform path.
+pub(crate) use crate::completion::{completion, completion_item_resolve};
+
 /// `textDocument/documentSymbol`: project the `gd_syntax` symbol outline into LSP's nested
 /// [`lsp_types::DocumentSymbol`] tree — kinds plus byte→position ranges, with the full declaration as
 /// `range` and the identifier as `selection_range`. Reads the shared cached parse (the same one
@@ -719,7 +724,7 @@ fn stub_token_location(path: &camino::Utf8Path, line: u32, col: u32, len: u32) -
 /// [`gd_analyze::AnalyzeOptions::cancellation`] field via [`analyze_with_request_token`], so a
 /// `$/cancelRequest` for this request id flips the token mid-analyze and the analyzer bails on
 /// its next 256-node checkpoint.
-fn analyze_if_gd(
+pub(crate) fn analyze_if_gd(
     state: &mut ServerState,
     uri: &Uri,
     tree: &ParseTree,

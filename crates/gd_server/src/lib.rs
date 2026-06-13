@@ -8,6 +8,7 @@
 pub mod api_dump;
 pub mod bench;
 pub mod cancellation;
+pub mod completion_context;
 pub mod config;
 pub mod memory;
 pub mod observability;
@@ -18,6 +19,7 @@ pub mod watcher;
 pub mod workspace;
 pub mod xfile;
 
+mod completion;
 mod docs;
 mod handlers;
 pub mod logging;

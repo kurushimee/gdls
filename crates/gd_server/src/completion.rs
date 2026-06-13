@@ -1,0 +1,1909 @@
+//! `textDocument/completion` + `completionItem/resolve` (M8, issue #64 — Phase 3).
+//!
+//! This is the LSP *handler* layer over the Phase 2 context engine
+//! ([`crate::completion_context::classify`]) and the Phase 1 enumeration APIs
+//! ([`gd_analyze::enumerate`]). It is `gd_server` glue, NOT a faithful frontend port: Godot's
+//! `gdscript_editor.cpp` is the *semantic* reference ("what to suggest where"), and idiomatic Rust
+//! is fine here (`THINKING.md`). This phase renders only the two highest-value contexts —
+//! **IDENTIFIER** (the bare-name in-scope set) and **ATTRIBUTE** (`expr.<cursor>` member access);
+//! every other [`CompletionKind`] returns an empty (but well-formed) list, deferred to Phase 4.
+//!
+//! # Generic-LSP contract (anti-catalog W18, `docs/09 §3`)
+//!
+//! - The response is always a [`CompletionList`], **never a bare array** — the type is fixed at the
+//!   handler signature so the array mistake is unrepresentable.
+//! - Every item carries a single-line [`lsp_types::TextEdit`] over the typed-prefix span (so the
+//!   client replaces exactly the word under the cursor), a **fixed-width** `sort_text` (gopls
+//!   `%05d` style, so a lexicographic client sort equals the rank order), a `filter_text` aligned
+//!   to the item name, and a `kind` clamped to the client's `completionItemKind.valueSet`.
+//! - `documentation`/`detail` are left `None` and filled lazily by [`completion_item_resolve`]; the
+//!   `data` field is a **compact, self-sufficient key** ([`CompletionData`]) — a file + symbol path,
+//!   never the request params.
+//!
+//! # Capability gating (every projection names its gate)
+//!
+//! - Snippet placeholders (`($0)`) only when the client advertises `completionItem.snippetSupport`
+//!   AND `initializationOptions.completion.snippets` is on; otherwise a bare-name plain-text edit.
+//! - `InsertReplaceEdit` only when `completionItem.insertReplaceSupport`; otherwise a plain
+//!   `TextEdit`.
+//! - `commitCharacters` only when `completionItem.commitCharactersSupport`, and even then suppressed
+//!   for the string-valued annotation-argument context (a `.`/`(` commit mid-string is a wart);
+//!   member / identifier / type / keyword items keep them.
+
+use lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionTextEdit,
+    Documentation, InsertReplaceEdit, InsertTextFormat, MarkupContent, MarkupKind, Position, Range,
+    TextEdit,
+};
+use serde::{Deserialize, Serialize};
+
+use gd_analyze::enumerate::{self, MemberItem, MemberItemKind, MemberOwner};
+use gd_analyze::{AnalysisResult, DataType, DtKind};
+use gd_syntax::ast::{NodeId, ParseTree};
+use gd_syntax::ByteSpan;
+
+use crate::completion_context::{classify, CompletionKind};
+use crate::config::{CallArgumentStyle, CompletionConfig};
+use crate::docs::ProseFormat;
+use crate::position::PositionMapper;
+use crate::server::{CompletionCaps, ServerState};
+use crate::uri::CanonicalKey;
+
+/// The default `CompletionItemKind` set a client supports when it advertises no
+/// `completionItemKind.valueSet`: the original-protocol range `Text`(1)..=`Reference`(18). Per LSP
+/// 3.17 an absent value-set means exactly this range — NOT "all kinds" and NOT "none", so clamping
+/// against it (rather than an empty set) is what keeps a minimal client from losing every icon.
+fn default_kind_value_set() -> [CompletionItemKind; 18] {
+    [
+        CompletionItemKind::TEXT,
+        CompletionItemKind::METHOD,
+        CompletionItemKind::FUNCTION,
+        CompletionItemKind::CONSTRUCTOR,
+        CompletionItemKind::FIELD,
+        CompletionItemKind::VARIABLE,
+        CompletionItemKind::CLASS,
+        CompletionItemKind::INTERFACE,
+        CompletionItemKind::MODULE,
+        CompletionItemKind::PROPERTY,
+        CompletionItemKind::UNIT,
+        CompletionItemKind::VALUE,
+        CompletionItemKind::ENUM,
+        CompletionItemKind::KEYWORD,
+        CompletionItemKind::SNIPPET,
+        CompletionItemKind::COLOR,
+        CompletionItemKind::FILE,
+        CompletionItemKind::REFERENCE,
+    ]
+}
+
+/// An empty, well-formed list — the response for every context this phase does not render and for
+/// the "no analysis / nothing here" paths. `is_incomplete: false` tells the client the set is
+/// complete for the current prefix (it need not re-query on the next keystroke beyond re-filtering).
+fn empty_list() -> CompletionList {
+    CompletionList {
+        is_incomplete: false,
+        items: Vec::new(),
+    }
+}
+
+/// `textDocument/completion`: classify the cursor, then render IDENTIFIER + ATTRIBUTE contexts as a
+/// [`CompletionList`]. Mirrors the [`crate::handlers::hover`] preamble (VFS rope → cached parse →
+/// `analyze_if_gd` → [`PositionMapper`] → `position_to_byte`). Returns an empty list — never an
+/// error — for a missing buffer, a non-`.gd` file, a deferred/unhandled context, or an unresolved
+/// base type ("never crash, never lie": missing analysis is silence, not a failure).
+#[must_use]
+pub fn completion(state: &mut ServerState, params: CompletionParams) -> CompletionList {
+    let tdp = params.text_document_position;
+    let uri = tdp.text_document.uri.clone();
+    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
+        return empty_list();
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    // The token stream `classify` needs (the standalone lexer output for the same source).
+    let (tokens, _lex_errors) = gd_syntax::tokenize(&text);
+    // Analyze for the ATTRIBUTE arm's base-type resolution; `None` for a non-`.gd` buffer. The
+    // IDENTIFIER arm degrades gracefully without it (locals + class members + globals don't need a
+    // resolved type), so a `None` here still yields a useful list.
+    let analyzed = crate::handlers::analyze_if_gd(state, &uri, &parsed.tree, &text);
+
+    let Some(doc) = state.vfs.get(uri.as_str()) else {
+        return empty_list();
+    };
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+    let byte = mapper.position_to_byte(tdp.position);
+
+    let ctx = classify(&parsed.tree, &tokens, byte);
+    // The single-line replace range = the typed-prefix span (empty ⇒ a zero-width range at the
+    // cursor, so the client inserts without deleting). Built once and shared by every item.
+    let edit_range = prefix_range(&mapper, ctx.prefix, tdp.position);
+
+    let render = RenderCtx {
+        caps: &state.caps.completion,
+        config: &state.options.completion,
+        edit_range,
+        index: &state.workspace.index,
+        suppress_commit: suppress_commit_for(&ctx.kind),
+    };
+
+    let items = match &ctx.kind {
+        CompletionKind::Attribute { base } => attribute_items(
+            state,
+            &parsed.tree,
+            analyzed.as_deref(),
+            *base,
+            &tokens,
+            byte,
+            &render,
+        ),
+        CompletionKind::Identifier => {
+            identifier_items(state, &parsed.tree, analyzed.as_deref(), byte, &render)
+        }
+        // --- Phase 4 contexts ---
+        CompletionKind::Annotation => annotation_items(&render),
+        CompletionKind::AnnotationArguments {
+            annotation_name,
+            arg_index,
+        } => annotation_argument_items(state, annotation_name.as_deref(), *arg_index, &render),
+        // Type positions. `void` only for the `-> ` return slot; `extends` excludes
+        // builtins/enums/void (a class only); the rest list the full type set.
+        CompletionKind::TypeName => type_name_items(
+            state,
+            &parsed.tree,
+            analyzed.as_deref(),
+            TypePos::Type,
+            &render,
+        ),
+        CompletionKind::TypeNameOrVoid => type_name_items(
+            state,
+            &parsed.tree,
+            analyzed.as_deref(),
+            TypePos::OrVoid,
+            &render,
+        ),
+        CompletionKind::InheritType => type_name_items(
+            state,
+            &parsed.tree,
+            analyzed.as_deref(),
+            TypePos::Inherit,
+            &render,
+        ),
+        CompletionKind::TypeAttribute { base } => type_attribute_items(
+            state,
+            &parsed.tree,
+            analyzed.as_deref(),
+            *base,
+            &tokens,
+            byte,
+            &render,
+        ),
+        CompletionKind::CallArguments {
+            callee,
+            callee_name,
+            arg_index,
+        } => call_argument_items(
+            state,
+            &parsed.tree,
+            analyzed.as_deref(),
+            *callee,
+            callee_name.as_deref(),
+            *arg_index,
+            byte,
+            &render,
+        ),
+        CompletionKind::Subscript => subscript_items(
+            state,
+            &parsed.tree,
+            analyzed.as_deref(),
+            &tokens,
+            byte,
+            &render,
+        ),
+        CompletionKind::Assign => assign_items(
+            state,
+            &parsed.tree,
+            analyzed.as_deref(),
+            &tokens,
+            byte,
+            &render,
+        ),
+        CompletionKind::SuperMethod => {
+            super_method_items(state, &parsed.tree, analyzed.as_deref(), &render)
+        }
+        CompletionKind::PropertyMethod => {
+            property_method_items(state, &parsed.tree, analyzed.as_deref(), &render)
+        }
+        CompletionKind::OverrideMethod => {
+            override_method_items(state, &parsed.tree, analyzed.as_deref(), &render)
+        }
+        // Deferred (`$`/`%`/path) and None: a well-formed empty list — never a wrong guess.
+        CompletionKind::Deferred(_) | CompletionKind::None => Vec::new(),
+    };
+
+    CompletionList {
+        is_incomplete: false,
+        items,
+    }
+}
+
+/// Everything an item-builder needs that does not change between items in one request.
+struct RenderCtx<'a> {
+    caps: &'a CompletionCaps,
+    config: &'a CompletionConfig,
+    /// The single-line range every item's `TextEdit` replaces (the typed-prefix span).
+    edit_range: Range,
+    /// The project index — maps a declaring [`gd_project::FileId`] to its URI for the resolve key.
+    index: &'a gd_project::Index,
+    /// Whether to drop commit characters for this whole request — set for the string-valued
+    /// annotation-argument context, where a `.`/`(` commit mid-string is a UX wart. One request is
+    /// one [`CompletionKind`], so a per-request flag is exact (see [`suppress_commit_for`]).
+    suppress_commit: bool,
+}
+
+impl RenderCtx<'_> {
+    /// The URI of a declaring file id (carry-forward (b)'s owner key), or `None` when the index has
+    /// no path for it / the path can't be rendered as a `file://` URI.
+    fn file_uri(&self, file: gd_project::FileId) -> Option<String> {
+        let path = self.index.path(file)?;
+        crate::uri::path_to_file_uri(path).map(|u| u.as_str().to_string())
+    }
+}
+
+// ===================================================================================================
+// ATTRIBUTE — `expr.<cursor>` member access.
+// ===================================================================================================
+
+/// Render member completions for `base.<cursor>`. Resolve the base expression's [`DataType`] from
+/// the analysis (the `base` node id when the AST preserved it, else the smallest typed node ending
+/// at the dot), then dispatch through [`enumerate::members_of_type`]. An unresolved base ⇒ empty
+/// (offer nothing rather than a wrong set) — including the top-level `local.` case where
+/// `base: None` and no typed node is recoverable, an honest Phase-3 gap.
+fn attribute_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    base: Option<NodeId>,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let Some(analyzed) = analyzed else {
+        return Vec::new();
+    };
+    let Some(dt) = resolve_base_type(tree, analyzed, base, tokens, byte) else {
+        return Vec::new();
+    };
+    // `Color.` / `Vector2.` — a builtin **meta-type** (the type itself, not an instance). Godot's
+    // `COMPLETION_BUILT_IN_TYPE_CONSTANT_OR_STATIC_METHOD`: only that type's constants + STATIC
+    // methods, never its instance methods (offering `Color.lerp` as a static would be a "never lie"
+    // breach). The context engine routes this through `Attribute`; `is_meta_type` is the split.
+    if dt.kind == DtKind::Builtin && dt.is_meta_type {
+        return builtin_static_items(state, dt, render);
+    }
+    let members = enumerate_members(state, tree, dt);
+    members
+        .into_iter()
+        .enumerate()
+        .map(|(rank, m)| member_item(&m, rank, render))
+        .collect()
+}
+
+/// Enumerate the members of a resolved type through the project-backed cross-file query.
+/// `members_of_type` never calls `autoload_file`, so the autoload map is empty (the shape
+/// `xfile.rs`'s own tests use). The `Rc<AnalysisResult>` the caller holds keeps the analysis alive
+/// independently of these shared borrows.
+fn enumerate_members(state: &ServerState, tree: &ParseTree, dt: &DataType) -> Vec<MemberItem> {
+    let xfile = crate::xfile::WorkspaceXFileQuery::new(
+        &state.workspace.index,
+        &state.workspace.native,
+        &state.workspace.analysis_cache,
+        rustc_hash::FxHashMap::default(),
+    );
+    enumerate::members_of_type(dt, &state.workspace.native, &xfile, tree)
+}
+
+/// `Color.<cursor>` — the builtin type's **constants + static methods** (Godot
+/// `COMPLETION_BUILT_IN_TYPE_CONSTANT_OR_STATIC_METHOD`, `gdscript_editor.cpp:3488`). Instance
+/// members are dropped (`is_static` filter on methods); constants/enums are kept. A static method is
+/// `callable` so it gets the call-paren snippet under the same gates as any other call.
+fn builtin_static_items(
+    state: &ServerState,
+    dt: &DataType,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let name = gd_analyze::data_type::variant_type_name(dt.builtin_type);
+    let Some(members) = enumerate::builtin_members(&state.workspace.native, name) else {
+        return Vec::new();
+    };
+    members
+        .into_iter()
+        .filter(|m| match m.kind {
+            // Static methods only — never an instance method as a static.
+            MemberItemKind::Method => m.is_static,
+            // Constants / named enums / enum values are type-scoped: keep them.
+            MemberItemKind::Constant | MemberItemKind::Enum | MemberItemKind::EnumValue => true,
+            // A builtin has no signals/inner-classes; properties are instance-only — drop.
+            _ => false,
+        })
+        .enumerate()
+        .map(|(rank, m)| member_item(&m, rank, render))
+        .collect()
+}
+
+/// Resolve the [`DataType`] to enumerate members of for an ATTRIBUTE context. Prefers the captured
+/// `base` node id; when the AST didn't preserve it (`None`), falls back to the smallest typed node
+/// whose span ends at the cursor's dot — covering `base.partial` shapes where the base survived as
+/// some other node. Returns a set type only (`is_set()`), never `Unresolved`/`Resolving`.
+fn resolve_base_type<'a>(
+    tree: &ParseTree,
+    analyzed: &'a AnalysisResult,
+    base: Option<NodeId>,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+) -> Option<&'a DataType> {
+    if let Some(id) = base {
+        let dt = analyzed.types.get(id);
+        if dt.is_set() {
+            return Some(dt);
+        }
+    }
+    // Fallback: the base expression is whatever typed node ends just before the dot. Find the dot
+    // by walking back from the cursor over the partial word, then pick the smallest typed node
+    // ending at the dot's start.
+    let dot_start = nearest_dot_start(tokens, byte)?;
+    smallest_typed_ending_at(tree, analyzed, dot_start)
+}
+
+/// The byte offset of the `.` nearest to (and at or before) the cursor — the end of the base
+/// expression in `base.<cursor>` / `base.partial`. `None` when no dot precedes the cursor on the
+/// member-access path.
+fn nearest_dot_start(tokens: &[gd_syntax::token::Token], byte: usize) -> Option<usize> {
+    use gd_syntax::token::TokenKind;
+    tokens
+        .iter()
+        .rev()
+        .filter(|t| t.span.end <= byte)
+        .find(|t| t.kind == TokenKind::Period)
+        .map(|t| t.span.start)
+}
+
+/// The smallest-span node whose span **ends exactly** at `end` and carries a resolved type — the
+/// base expression in `base.<cursor>` (its span ends at the dot). Linear over the arena, like
+/// hover's `smallest_typed_containing`; adequate for a one-shot completion request.
+fn smallest_typed_ending_at<'a>(
+    tree: &ParseTree,
+    analyzed: &'a AnalysisResult,
+    end: usize,
+) -> Option<&'a DataType> {
+    let mut best: Option<(NodeId, usize)> = None;
+    for id in tree.iter_ids() {
+        let span = tree.get(id).span;
+        if span.end == end && analyzed.types.get(id).is_set() {
+            let width = span.end - span.start;
+            match best {
+                Some((_, bw)) if width > bw => {}
+                _ => best = Some((id, width)),
+            }
+        }
+    }
+    best.map(|(id, _)| analyzed.types.get(id))
+}
+
+/// Build one `CompletionItem` from an enumerated [`MemberItem`] at rank `rank`. `detail` stays
+/// `None` (resolve fills it); the member's source-derived `detail` rides along in the
+/// [`CompletionData`] so resolve doesn't re-enumerate. `data.owner` carries the **declaring** class
+/// / file (carry-forward (b)) so resolve fetches the long-form documentation deterministically —
+/// from the native DB for a native member, or from the declaring file's interface for a script
+/// member (which may differ from the requesting buffer when it is inherited).
+fn member_item(m: &MemberItem, rank: usize, render: &RenderCtx) -> CompletionItem {
+    let kind = member_kind(m.kind);
+    let data = CompletionData::Member {
+        owner: data_owner(&m.owner, render),
+        name: m.name.clone(),
+        detail: m.detail.clone(),
+    };
+    let callable = matches!(m.kind, MemberItemKind::Method);
+    build_item(&m.name, kind, callable, data, rank, render)
+}
+
+/// Translate an enumeration [`MemberOwner`] into the serializable resolve key
+/// [`CompletionDataOwner`]: a native member keeps its declaring class name; a script member's
+/// declaring [`gd_project::FileId`] is rendered to that file's URI (so resolve is a direct lookup,
+/// no nondeterministic name-only search); an unknown owner falls back to the requesting buffer.
+fn data_owner(owner: &MemberOwner, render: &RenderCtx) -> CompletionDataOwner {
+    match owner {
+        MemberOwner::Native(class) => CompletionDataOwner::NativeClass {
+            class: class.clone(),
+        },
+        MemberOwner::Script(file) => match render.file_uri(*file) {
+            Some(uri) => CompletionDataOwner::ScriptFile { uri },
+            None => CompletionDataOwner::Unknown,
+        },
+        MemberOwner::Unknown => CompletionDataOwner::Unknown,
+    }
+}
+
+// ===================================================================================================
+// IDENTIFIER — the bare-name in-scope set.
+// ===================================================================================================
+
+/// Render the bare-identifier completion set: locals + parameters (innermost-first), then the
+/// implicit-self class members through the `extends` chain (incl. inherited natives), then the
+/// globals — GDScript/`@GlobalScope` utilities, global enum values, global constants, autoload
+/// singletons, the project `class_name` registry, and native class names. Ordering follows Godot's
+/// `complete_code` priority (locals shadow members shadow globals); `sort_text` encodes it.
+///
+/// De-duplicates by name keeping the first (highest-priority) occurrence, so a local shadowing a
+/// class member appears once, ranked as the local.
+fn identifier_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    byte: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    let mut rank: usize = 0;
+    let push = |name: &str,
+                kind: CompletionItemKind,
+                callable: bool,
+                data: CompletionData,
+                items: &mut Vec<CompletionItem>,
+                seen: &mut rustc_hash::FxHashSet<String>,
+                rank: &mut usize| {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
+        items.push(build_item(name, kind, callable, data, *rank, render));
+        *rank += 1;
+    };
+
+    // (1) Locals + parameters in the cursor's scope (innermost-first, declaration order). Both
+    // locals and parameters render as `VARIABLE` (LSP has no dedicated parameter kind).
+    for local in tree.locals_in_scope_at(byte) {
+        push(
+            &local.name,
+            CompletionItemKind::VARIABLE,
+            false,
+            CompletionData::Local,
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+
+    // (2) Class members through the implicit `self` extends chain (incl. inherited natives). The
+    // finished analysis has rewritten the in-file class to a `Script` ref, so enumerate that type
+    // when we can find it — the type pinned on the file's root class node.
+    if let Some(analyzed) = analyzed {
+        for m in self_chain_members(state, tree, analyzed) {
+            let callable = matches!(m.kind, MemberItemKind::Method);
+            push(
+                &m.name,
+                member_kind(m.kind),
+                callable,
+                CompletionData::Member {
+                    owner: data_owner(&m.owner, render),
+                    name: m.name.clone(),
+                    detail: m.detail.clone(),
+                },
+                &mut items,
+                &mut seen,
+                &mut rank,
+            );
+        }
+    }
+
+    // (3) Globals — order mirrors Godot's tail: utilities, then enum values, then constants, then
+    // autoloads, then class_name registry, then native class names.
+    let native = &state.workspace.native;
+    for util in native.utilities() {
+        let name = native.name_of(util.name).to_string();
+        push(
+            &name,
+            CompletionItemKind::FUNCTION,
+            true,
+            CompletionData::Global { name: name.clone() },
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+    for (_enum_name, value_name, _v) in native.global_enum_values() {
+        let name = value_name.to_string();
+        push(
+            &name,
+            CompletionItemKind::ENUM_MEMBER,
+            false,
+            CompletionData::Global { name: name.clone() },
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+    for (name, _v) in native.global_constants() {
+        let name = name.to_string();
+        push(
+            &name,
+            CompletionItemKind::CONSTANT,
+            false,
+            CompletionData::Global { name: name.clone() },
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+    for autoload in &state.workspace.project.autoloads {
+        push(
+            &autoload.name,
+            CompletionItemKind::VARIABLE,
+            false,
+            CompletionData::Local,
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+    // Project `class_name` registry — sorted for determinism (the registry is an `FxHashMap`, so
+    // `entries()` iterates in nondeterministic file-discovery order, unlike every sibling tier).
+    let mut registry_names: Vec<&str> = state
+        .workspace
+        .index
+        .registry()
+        .entries()
+        .map(|(n, _)| n)
+        .collect();
+    registry_names.sort_unstable();
+    for name in registry_names {
+        let name = name.to_string();
+        push(
+            &name,
+            CompletionItemKind::CLASS,
+            false,
+            CompletionData::NativeClass {
+                class: name.clone(),
+            },
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+    // (4) Native engine class names (`Node`, `Timer`, …) — carry-forward (a), M8 Phase 4. Godot's
+    // `get_global_map()` includes the native class set in the bare-identifier completion. Lowest
+    // priority (after locals, members, and the project registry), via the name-sorted
+    // `native_db::class_names()` iterator added in this phase.
+    for class in state.workspace.native.class_names() {
+        let class = class.to_string();
+        push(
+            &class,
+            CompletionItemKind::CLASS,
+            false,
+            CompletionData::NativeClass {
+                class: class.clone(),
+            },
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+
+    items
+}
+
+/// The implicit-`self` member set for IDENTIFIER completion: the members of the type the analyzer
+/// pinned on the file's root class node, enumerated through its `extends` chain. Empty when the
+/// root class has no resolved type yet (e.g. an empty native DB).
+fn self_chain_members(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: &AnalysisResult,
+) -> Vec<MemberItem> {
+    let Some(root_id) = tree.root_id() else {
+        return Vec::new();
+    };
+    // The root node of a parsed `.gd` is its implicit class; guard the kind defensively.
+    if !matches!(tree.get(root_id).kind, gd_syntax::ast::NodeKind::Class(_)) {
+        return Vec::new();
+    }
+    let dt = analyzed.types.get(root_id);
+    if !dt.is_set() {
+        return Vec::new();
+    }
+    let xfile = crate::xfile::WorkspaceXFileQuery::new(
+        &state.workspace.index,
+        &state.workspace.native,
+        &state.workspace.analysis_cache,
+        rustc_hash::FxHashMap::default(),
+    );
+    enumerate::members_of_type(dt, &state.workspace.native, &xfile, tree)
+}
+
+// ===================================================================================================
+// ANNOTATION — `@<cursor>` (the annotation list) and `@export_range(<cursor>` (its argument words).
+// ===================================================================================================
+
+/// `@<cursor>` — the annotation name list (Godot `COMPLETION_ANNOTATION`,
+/// `gdscript_editor.cpp:3468`, which iterates `get_annotation_list` = the parser's
+/// `valid_annotations` registry). The leading `@` is stripped from the label (the `@` is already
+/// typed); an annotation that takes arguments gets a trailing `(` appended (matching
+/// `gdscript_editor.cpp:3473`). The single source of truth is
+/// [`gd_syntax::parser::REGISTERED_ANNOTATIONS`]; sorted by name for deterministic ranking.
+fn annotation_items(render: &RenderCtx) -> Vec<CompletionItem> {
+    let mut names: Vec<(&str, bool)> = gd_syntax::parser::REGISTERED_ANNOTATIONS
+        .iter()
+        .map(|&(name, args)| (name.trim_start_matches('@'), args))
+        .collect();
+    names.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (name, takes_args))| {
+            // An annotation taking arguments inserts `name(`; the label keeps the bare name so the
+            // typed prefix (after `@`) still filters. Not a snippet — the `(` is a plain hint.
+            let insert = if takes_args {
+                format!("{name}(")
+            } else {
+                name.to_string()
+            };
+            build_item_with(
+                ItemText {
+                    label: name,
+                    filter: name,
+                },
+                CompletionItemKind::KEYWORD,
+                ItemInsert {
+                    plain: insert,
+                    snippet: None,
+                },
+                CompletionData::Keyword,
+                rank,
+                render,
+            )
+        })
+        .collect()
+}
+
+/// `@export_range(<cursor>` / `@rpc(<cursor>` / `@warning_ignore(<cursor>` — the per-annotation
+/// special argument words (Godot's `_find_annotation_arguments`, `gdscript_editor.cpp:913`). Only
+/// the non-editor cases are served (W17 skips the `@export_tool_button` icon list and the
+/// `@export_custom` theme-enum args). Each word inserts a quoted string (these are string
+/// arguments). `arg_index` gates the slider/easing/rpc words to the slots Godot offers them at.
+fn annotation_argument_items(
+    state: &ServerState,
+    annotation_name: Option<&str>,
+    arg_index: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let Some(name) = annotation_name else {
+        return Vec::new();
+    };
+    // The special words for this (annotation, argument-index) pair, derived mechanically from
+    // `_find_annotation_arguments`. Editor-only icon/theme cases are intentionally omitted (W17).
+    let words: Vec<String> = match name {
+        // `min, max, step, extra_hints…` — the slider words live at the `extra_hints` slots (3/4/5).
+        "@export_range" if matches!(arg_index, 3..=5) => vec![
+            "or_greater".into(),
+            "or_less".into(),
+            "prefer_slider".into(),
+            "hide_control".into(),
+        ],
+        "@export_exp_easing" if matches!(arg_index, 0..=1) => {
+            vec!["attenuation".into(), "inout".into()]
+        }
+        // `@rpc` modes at the first three slots (mode / sync / transfer_mode).
+        "@rpc" if matches!(arg_index, 0..=2) => vec![
+            "call_local".into(),
+            "call_remote".into(),
+            "any_peer".into(),
+            "authority".into(),
+            "reliable".into(),
+            "unreliable".into(),
+            "unreliable_ordered".into(),
+        ],
+        // `@warning_ignore*` → the non-deprecated warning code names, lowercased
+        // (`gdscript_editor.cpp:1007`; deprecated codes are skipped — they are never produced).
+        "@warning_ignore" | "@warning_ignore_start" | "@warning_ignore_restore" => {
+            warning_code_words()
+        }
+        // `@export_node_path(<type>)` → `Node` + every Node subclass / Node-derived global class.
+        "@export_node_path" => node_path_type_words(state),
+        // Any other annotation/slot: no special words (a generic string argument).
+        _ => Vec::new(),
+    };
+    words
+        .into_iter()
+        .enumerate()
+        .map(|(rank, word)| {
+            // Annotation arguments are string literals: insert the word double-quoted (canonical,
+            // W17 — no editor quote-style coupling). The label/filter stay the bare word.
+            let quoted = format!("\"{word}\"");
+            build_item_with(
+                ItemText {
+                    label: &word,
+                    filter: &word,
+                },
+                CompletionItemKind::VALUE,
+                ItemInsert {
+                    plain: quoted,
+                    snippet: None,
+                },
+                CompletionData::Keyword,
+                rank,
+                render,
+            )
+        })
+        .collect()
+}
+
+/// The non-deprecated warning code names, lowercased — the `@warning_ignore` argument set. Godot
+/// stops at `FIRST_DEPRECATED_WARNING` (the deprecated codes are never produced), which in gdls'
+/// [`gd_analyze::warnings`] table is the `PropertyUsedAsFunction` index; the live set is the names
+/// before it. Already in code order (deterministic).
+fn warning_code_words() -> Vec<String> {
+    use gd_analyze::warnings::{WarningCode, ALL, WARN_NAMES};
+    ALL.iter()
+        .zip(WARN_NAMES.iter())
+        .take_while(|(code, _)| **code != WarningCode::PropertyUsedAsFunction)
+        .map(|(_, name)| name.to_lowercase())
+        .collect()
+}
+
+/// `@export_node_path(<type>)` → `Node` plus every Node-derived native class and Node-derived
+/// project `class_name` (Godot offers `Node` + `ClassDB::get_inheriters_from_class("Node")` +
+/// Node-rooted global classes). Sorted, deterministic.
+fn node_path_type_words(state: &ServerState) -> Vec<String> {
+    let native = &state.workspace.native;
+    let mut out: Vec<String> = Vec::new();
+    if native.class_named("Node").is_some() {
+        out.push("Node".to_string());
+    }
+    for class in native.class_names() {
+        if class != "Node" && native.is_subclass_of_named(class, "Node") {
+            out.push(class.to_string());
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+// ===================================================================================================
+// TYPE positions — TypeName / TypeNameOrVoid / InheritType (available types) and TypeAttribute.
+// ===================================================================================================
+
+/// Which type position is being completed — governs whether `void` and the builtin/enum/Variant
+/// set are offered, mirroring Godot's `_list_available_types(p_inherit_only)` + the `void` prepend.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypePos {
+    /// `var x: <cursor>` / `Array[<cursor>` / `x as <cursor>` — the full type set, no `void`.
+    Type,
+    /// `-> <cursor>` return position — the full type set **plus** `void`.
+    OrVoid,
+    /// `extends <cursor>` — a class only: native classes + project `class_name`, **no**
+    /// builtins / enums / `void` / `Variant` (`_list_available_types(true)`, minus the builtins
+    /// gdls deliberately excludes per the M8 acceptance criterion).
+    Inherit,
+}
+
+/// The available-types set for a type position (Godot `_list_available_types`,
+/// `gdscript_editor.cpp:1049`): builtins + `Variant` + native classes + project `class_name`
+/// registry (+ `void` only for `-> `). `extends` ([`TypePos::Inherit`]) is restricted to classes.
+/// De-duplicated by name; ordering is `void`?, builtins, Variant, native classes, then the
+/// registry — each tier internally sorted for determinism.
+fn type_name_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    pos: TypePos,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let native = &state.workspace.native;
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    let mut rank: usize = 0;
+    let mut push = |name: &str, kind: CompletionItemKind, data: CompletionData| {
+        if seen.insert(name.to_string()) {
+            items.push(keyword_item(name, kind, data, rank, render));
+            rank += 1;
+        }
+    };
+
+    // `void` only at a return position.
+    if pos == TypePos::OrVoid {
+        push("void", CompletionItemKind::KEYWORD, CompletionData::Keyword);
+    }
+
+    // Builtins + `Variant` — excluded for `extends` (a class can't extend a builtin/Variant).
+    if pos != TypePos::Inherit {
+        for b in native.builtin_names() {
+            push(
+                b,
+                CompletionItemKind::CLASS,
+                CompletionData::NativeClass {
+                    class: b.to_string(),
+                },
+            );
+        }
+        push(
+            "Variant",
+            CompletionItemKind::CLASS,
+            CompletionData::Keyword,
+        );
+    }
+
+    // Native engine classes.
+    for class in native.class_names() {
+        push(
+            class,
+            CompletionItemKind::CLASS,
+            CompletionData::NativeClass {
+                class: class.to_string(),
+            },
+        );
+    }
+
+    // Project `class_name` registry (user-declared global classes) — sorted for determinism (the
+    // registry `FxHashMap` iterates in nondeterministic order, unlike the sibling tiers above).
+    let mut registry_names: Vec<&str> = state
+        .workspace
+        .index
+        .registry()
+        .entries()
+        .map(|(n, _)| n)
+        .collect();
+    registry_names.sort_unstable();
+    for name in registry_names {
+        push(
+            name,
+            CompletionItemKind::CLASS,
+            CompletionData::NativeClass {
+                class: name.to_string(),
+            },
+        );
+    }
+
+    // In-file types declared on the current class (inner classes always; named enums only when not
+    // an `extends` position) — `_list_available_types`' current-class walk.
+    for m in self_chain_type_members(state, tree, analyzed, pos) {
+        let kind = match m.kind {
+            MemberItemKind::Enum => CompletionItemKind::ENUM,
+            _ => CompletionItemKind::CLASS,
+        };
+        push(
+            &m.name,
+            kind,
+            CompletionData::Member {
+                owner: data_owner(&m.owner, render),
+                name: m.name.clone(),
+                detail: m.detail.clone(),
+            },
+        );
+    }
+
+    items
+}
+
+/// The type-like members (inner classes, named enums, type constants) of the current class's
+/// `extends` chain — the in-file slice of `_list_available_types`. Named enums are dropped for an
+/// `extends` position (`p_inherit_only`). Empty without analysis.
+fn self_chain_type_members(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    pos: TypePos,
+) -> Vec<MemberItem> {
+    let Some(analyzed) = analyzed else {
+        return Vec::new();
+    };
+    self_chain_members(state, tree, analyzed)
+        .into_iter()
+        .filter(|m| match m.kind {
+            MemberItemKind::Class => true,
+            MemberItemKind::Enum => pos != TypePos::Inherit,
+            _ => false,
+        })
+        .collect()
+}
+
+/// `var x: Foo.<cursor>` — the nested types / enums / constants of the type `Foo` (Godot
+/// `COMPLETION_TYPE_ATTRIBUTE`, `gdscript_editor.cpp:3642`), NOT `Foo`'s instance members. Keep only
+/// the type-scoped member kinds.
+///
+/// The base type is resolved in two steps: first the ATTRIBUTE path (a typed node ending at the
+/// dot); failing that — the common case, since the analyzer pins the *final* resolved type on the
+/// whole `Type` node, not a per-segment type ending at the dot — the base **token name** before the
+/// dot is resolved directly (a native class / a project `class_name`). This best-effort covers
+/// `Class.<cursor>`; a multi-segment `Outer.Inner.<cursor>` whose intermediate type isn't a typed
+/// node is the documented limit (it falls through to empty rather than a wrong set).
+fn type_attribute_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    base: Option<NodeId>,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let members = type_attribute_members(state, tree, analyzed, base, tokens, byte);
+    members
+        .into_iter()
+        // Type-scoped members only: inner classes, named enums, and constants (incl. enum values).
+        .filter(|m| {
+            matches!(
+                m.kind,
+                MemberItemKind::Class
+                    | MemberItemKind::Enum
+                    | MemberItemKind::Constant
+                    | MemberItemKind::EnumValue
+            )
+        })
+        .enumerate()
+        .map(|(rank, m)| member_item(&m, rank, render))
+        .collect()
+}
+
+/// The members to enumerate for a `Foo.<cursor>` type-attribute base — via the typed-node path, then
+/// the base-token-name fallback. Empty when neither resolves.
+fn type_attribute_members(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    base: Option<NodeId>,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+) -> Vec<MemberItem> {
+    // Path 1: a typed node ending at the dot (when the AST/analysis preserved the base type).
+    if let Some(analyzed) = analyzed {
+        if let Some(dt) = resolve_base_type(tree, analyzed, base, tokens, byte) {
+            return enumerate_members(state, tree, dt);
+        }
+    }
+    // Path 2: resolve the base token name before the dot directly. The type chain's segment type
+    // isn't pinned ending-at-the-dot, so read the name and look it up as a native class / a project
+    // `class_name`.
+    let Some(dot_start) = nearest_dot_start(tokens, byte) else {
+        return Vec::new();
+    };
+    let Some(name) = base_name_before(tokens, dot_start) else {
+        return Vec::new();
+    };
+    let native = &state.workspace.native;
+    if native.class_named(&name).is_some() {
+        return enumerate::native_class_members(native, &name);
+    }
+    // A project `class_name` → enumerate the declaring file's script type's members.
+    if let Some(entry) = state.workspace.index.registry().get(&name) {
+        if let Some(fid) = state.workspace.index.file_id(&entry.path) {
+            let dt = DataType {
+                kind: DtKind::Script,
+                type_source: gd_analyze::TypeSource::AnnotatedExplicit,
+                script_type: Some(gd_analyze::ScriptRef {
+                    file: fid,
+                    inner: Vec::new(),
+                }),
+                ..Default::default()
+            };
+            return enumerate_members(state, tree, &dt);
+        }
+    }
+    Vec::new()
+}
+
+/// The identifier text of the token immediately before the dot at `dot_start` (the base name in
+/// `Base.<cursor>` / `Base.partial`), if it is a simple name token. `None` otherwise.
+fn base_name_before(tokens: &[gd_syntax::token::Token], dot_start: usize) -> Option<String> {
+    use gd_syntax::token::TokenKind;
+    tokens
+        .iter()
+        .rev()
+        .filter(|t| {
+            t.span.end <= dot_start
+                && !matches!(
+                    t.kind,
+                    TokenKind::Newline
+                        | TokenKind::Indent
+                        | TokenKind::Dedent
+                        | TokenKind::Eof
+                        | TokenKind::Error
+                )
+        })
+        .find_map(|t| {
+            (t.kind == TokenKind::Identifier || t.kind.is_identifier())
+                .then(|| t.source.to_string())
+        })
+}
+
+// ===================================================================================================
+// CALL_ARGUMENTS — enum/bitfield candidates for an enum-typed parameter (else identifier fallback).
+// ===================================================================================================
+
+/// Inside a call's argument list. When the active parameter (callee + `arg_index`) is enum- or
+/// bitfield-typed — resolvable from a native method's argument info — suggest that enum's constants
+/// (Godot's `_find_enumeration_candidates` analog). Otherwise fall back to the bare-identifier set
+/// (Godot's `_find_identifiers` tail), so a generic call argument still completes. Node-path /
+/// file-path argument strings are deferred (M11).
+#[allow(clippy::too_many_arguments)] // dispatch fan-out: the classified call-site payload + render ctx
+fn call_argument_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    callee: Option<NodeId>,
+    callee_name: Option<&str>,
+    arg_index: usize,
+    byte: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    // Try the enum-candidate refinement first; fall back to identifiers when the parameter type
+    // isn't a resolvable enum/bitfield.
+    if let Some(analyzed) = analyzed {
+        if let Some(candidates) =
+            call_arg_enum_candidates(state, tree, analyzed, callee, callee_name, arg_index)
+        {
+            return candidates
+                .into_iter()
+                .enumerate()
+                .map(|(rank, name)| {
+                    keyword_item(
+                        &name,
+                        CompletionItemKind::ENUM_MEMBER,
+                        CompletionData::Global { name: name.clone() },
+                        rank,
+                        render,
+                    )
+                })
+                .collect();
+        }
+    }
+    // Generic call argument → the full in-scope identifier set (reuse the IDENTIFIER renderer).
+    identifier_items(state, tree, analyzed, byte, render)
+}
+
+/// The enum/bitfield constant names for the active call argument, or `None` when the parameter is
+/// not a resolvable enum (caller falls back to identifiers). Resolves the callee to a **native**
+/// method via the base type the callee is accessed on (`obj.method(` → type of `obj`; a bare
+/// `method(` → the implicit-self type), reads the parameter at `arg_index`, and — when its
+/// [`gd_types::TypeRef`] is an enum/bitfield — enumerates that enum's values.
+fn call_arg_enum_candidates(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: &AnalysisResult,
+    callee: Option<NodeId>,
+    callee_name: Option<&str>,
+    arg_index: usize,
+) -> Option<Vec<String>> {
+    let method_name = callee_name?;
+    // The class the method is resolved on: the callee's base (for `base.method(`), else the
+    // implicit-self class (for a bare `method(`).
+    let class = call_arg_receiver_class(state, tree, analyzed, callee)?;
+    let native = &state.workspace.native;
+    let (_decl, member) = native.lookup_member(&class, method_name)?;
+    let gd_types::NativeMember::Method(m) = member else {
+        return None;
+    };
+    let param = m.params.get(arg_index)?;
+    let (scope, name) = match &param.ty {
+        gd_types::TypeRef::Enum { scope, name } | gd_types::TypeRef::Bitfield { scope, name } => {
+            (scope.map(|s| native.name_of(s)), native.name_of(*name))
+        }
+        _ => return None,
+    };
+    let values = native.enum_constants(scope, name);
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.into_iter().map(str::to_string).collect())
+    }
+}
+
+/// The native class a call's method is resolved on. `base.method(` → the resolved native type of
+/// `base` (recovered from the callee identifier's enclosing `Subscript`'s base); a bare `method(`
+/// (no captured callee, or a non-attribute callee) → the implicit-self class's native type. `None`
+/// when no native receiver can be determined.
+fn call_arg_receiver_class(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: &AnalysisResult,
+    callee: Option<NodeId>,
+) -> Option<String> {
+    // `base.method(` — the callee identifier's enclosing attribute Subscript carries the base.
+    if let Some(callee_id) = callee {
+        if let Some(base_dt) = attribute_callee_base_type(tree, analyzed, callee_id) {
+            return native_class_of(base_dt);
+        }
+    }
+    // Bare `method(` — resolve against the implicit-self type (the file's root class), chasing its
+    // native root so a script `self` still finds inherited native methods.
+    let root_id = tree.root_id()?;
+    let dt = analyzed.types.get(root_id);
+    native_class_of(dt).or_else(|| {
+        let sr = dt.script_type.as_ref()?;
+        let xfile = crate::xfile::WorkspaceXFileQuery::new(
+            &state.workspace.index,
+            &state.workspace.native,
+            &state.workspace.analysis_cache,
+            rustc_hash::FxHashMap::default(),
+        );
+        enumerate::script_chain_native_root(&xfile, &state.workspace.native, sr)
+    })
+}
+
+/// The native type name a base [`DataType`] denotes for a call receiver — directly for a `Native`
+/// kind, otherwise `None` (a `Script`/`Builtin` receiver's enum-param resolution is out of scope —
+/// the caller chases the script's native root separately).
+fn native_class_of(dt: &DataType) -> Option<String> {
+    (dt.kind == DtKind::Native && !dt.native_type.is_empty()).then(|| dt.native_type.clone())
+}
+
+/// The resolved type of the **base** of an attribute call: given the callee identifier node of
+/// `base.method(`, find its enclosing `Subscript{Attribute}` and return the base expression's type.
+/// `None` for a bare callee (no enclosing attribute access).
+fn attribute_callee_base_type<'a>(
+    tree: &ParseTree,
+    analyzed: &'a AnalysisResult,
+    callee_id: NodeId,
+) -> Option<&'a DataType> {
+    use gd_syntax::ast::{NodeKind, SubscriptAccess};
+    // The callee identifier's enclosing parent is the attribute Subscript whose base we type.
+    for id in tree.iter_ids() {
+        if let NodeKind::Subscript(s) = &tree.get(id).kind {
+            if matches!(s.access, Some(SubscriptAccess::Attribute(Some(a))) if a == callee_id) {
+                let base = s.base?;
+                let dt = analyzed.types.get(base);
+                return dt.is_set().then_some(dt);
+            }
+        }
+    }
+    None
+}
+
+// ===================================================================================================
+// SUBSCRIPT / ASSIGN — refinements over the identifier set.
+// ===================================================================================================
+
+/// `d[<cursor>` — dictionary keys when the base is a known constant dict (a folded value), else the
+/// bare-identifier set (Godot `COMPLETION_SUBSCRIPT`, `gdscript_editor.cpp:3608`, whose dict-key
+/// arm needs a reduced constant value). The folded-dict-key refinement is deferred to the identifier
+/// fallback here — the key set needs constant-folding the base, which gdls does for `const` dicts
+/// only; until that is threaded, the identifier set is the safe non-lying answer.
+fn subscript_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    _tokens: &[gd_syntax::token::Token],
+    byte: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    identifier_items(state, tree, analyzed, byte, render)
+}
+
+/// `x = <cursor>` / `x += <cursor>` — enum members when the assignee is enum-typed (Godot
+/// `COMPLETION_ASSIGN` → `_find_enumeration_candidates`), else the full in-scope identifier set.
+/// The assignee's type comes from the smallest typed node ending at the `=`.
+fn assign_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    if let Some(analyzed) = analyzed {
+        if let Some(values) = assign_enum_candidates(state, tree, analyzed, tokens, byte) {
+            return values
+                .into_iter()
+                .enumerate()
+                .map(|(rank, name)| {
+                    keyword_item(
+                        &name,
+                        CompletionItemKind::ENUM_MEMBER,
+                        CompletionData::Global { name: name.clone() },
+                        rank,
+                        render,
+                    )
+                })
+                .collect();
+        }
+    }
+    identifier_items(state, tree, analyzed, byte, render)
+}
+
+/// The enum constant names for an `x = ` assignee that is enum-typed, or `None` (caller falls back
+/// to identifiers). The assignee is the expression ending at the assignment operator; its type is
+/// taken from the smallest typed node ending there. Only a native-rooted enum type resolves to a
+/// candidate list (the value names of `DataType::enum_values`).
+fn assign_enum_candidates(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: &AnalysisResult,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+) -> Option<Vec<String>> {
+    let _ = state;
+    // The assignee is the token immediately before the assignment operator; its span END is where
+    // the assignee node ends (anchoring on the operator's start would miss the gap of whitespace
+    // before `=` — the assignee node ends at the *name*, not at the operator).
+    let assignee_end = assignee_token_end(tokens, byte)?;
+    let dt = smallest_typed_ending_at(tree, analyzed, assignee_end)?;
+    if dt.kind != DtKind::Enum || dt.enum_values.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = dt.enum_values.keys().cloned().collect();
+    names.sort_unstable();
+    Some(names)
+}
+
+/// The byte offset where the **assignee** expression ends in `assignee = <cursor>` — the end of the
+/// token immediately before the assignment operator nearest at-or-before the cursor. `None` when no
+/// assignment operator precedes the cursor, or it has no preceding token (a malformed `= x`).
+fn assignee_token_end(tokens: &[gd_syntax::token::Token], byte: usize) -> Option<usize> {
+    use gd_syntax::token::TokenKind::*;
+    let op_idx = tokens
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, t)| t.span.end <= byte)
+        .find(|(_, t)| {
+            matches!(
+                t.kind,
+                Equal
+                    | PlusEqual
+                    | MinusEqual
+                    | StarEqual
+                    | StarStarEqual
+                    | SlashEqual
+                    | PercentEqual
+                    | LessLessEqual
+                    | GreaterGreaterEqual
+                    | AmpersandEqual
+                    | PipeEqual
+                    | CaretEqual
+            )
+        })
+        .map(|(i, _)| i)?;
+    // The assignee token sits just before the operator (skipping layout).
+    tokens[..op_idx]
+        .iter()
+        .rev()
+        .find(|t| !matches!(t.kind, Newline | Indent | Dedent | Eof))
+        .map(|t| t.span.end)
+}
+
+// ===================================================================================================
+// SUPER_METHOD / PROPERTY_METHOD — the class's own / parent methods.
+// ===================================================================================================
+
+/// `super.<cursor>` — the **parent** class's methods (Godot `COMPLETION_SUPER_METHOD`,
+/// `gdscript_editor.cpp:3843`, `_find_identifiers_in_class(p_parent_only = true, only_functions)`).
+/// Enumerated from the implicit-self type's **parent** chain ([`enumerate::script_parent_members`]),
+/// so a method the current class overrides is still offered (its parent declares it — the very
+/// method `super.method()` targets) and a brand-new own method is correctly absent. Restricted to
+/// the `Method` kind.
+fn super_method_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let Some(analyzed) = analyzed else {
+        return Vec::new();
+    };
+    let Some(sr) = self_script_ref(tree, analyzed) else {
+        return Vec::new();
+    };
+    let xfile = crate::xfile::WorkspaceXFileQuery::new(
+        &state.workspace.index,
+        &state.workspace.native,
+        &state.workspace.analysis_cache,
+        rustc_hash::FxHashMap::default(),
+    );
+    enumerate::script_parent_members(&xfile, &state.workspace.native, &sr)
+        .into_iter()
+        .filter(|m| matches!(m.kind, MemberItemKind::Method))
+        .enumerate()
+        .map(|(rank, m)| member_item(&m, rank, render))
+        .collect()
+}
+
+/// The implicit-`self` type's [`gd_analyze::ScriptRef`] — the file's root class as a script ref
+/// (the analyzer rewrites an in-file class to a `Script` type before the result escapes). `None`
+/// when the root has no resolved script type.
+fn self_script_ref(tree: &ParseTree, analyzed: &AnalysisResult) -> Option<gd_analyze::ScriptRef> {
+    let root_id = tree.root_id()?;
+    let dt = analyzed.types.get(root_id);
+    if dt.kind != DtKind::Script {
+        return None;
+    }
+    dt.script_type.clone()
+}
+
+/// `var x: int:\n\tget = <cursor>` / `set = <cursor>` — the class's own non-static methods (Godot
+/// `COMPLETION_PROPERTY_METHOD`, `gdscript_editor.cpp:3550`), the getter/setter binds a method by
+/// name. Enumerated from the implicit-self class, restricted to methods.
+fn property_method_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let Some(analyzed) = analyzed else {
+        return Vec::new();
+    };
+    self_chain_members(state, tree, analyzed)
+        .into_iter()
+        .filter(|m| matches!(m.kind, MemberItemKind::Method))
+        .enumerate()
+        .map(|(rank, m)| {
+            // The accessor binds a bare method name (no call parens) — never a snippet.
+            keyword_item(
+                &m.name,
+                CompletionItemKind::METHOD,
+                CompletionData::Member {
+                    owner: data_owner(&m.owner, render),
+                    name: m.name.clone(),
+                    detail: m.detail.clone(),
+                },
+                rank,
+                render,
+            )
+        })
+        .collect()
+}
+
+// ===================================================================================================
+// OVERRIDE_METHOD — `func <cursor>` in a class body: overridable virtuals with a signature stub.
+// ===================================================================================================
+
+/// `func <cursor>` at class-body statement start — the overridable parent **virtuals**, each
+/// rendered as a full signature stub (Godot `COMPLETION_OVERRIDE_METHOD`,
+/// `gdscript_editor.cpp:3681`).
+///
+/// **Scope (Phase 4):** only the native tail's `is_virtual` methods (`_ready`, `_process`,
+/// `_input`, … — the overridable set people actually use) are offered, with their real
+/// `(params) -> Ret` signature from the native DB. Script-parent method overrides are a documented
+/// limitation this phase: the cross-file [`gd_project::Interface`] records a member's parameter
+/// *types* but not their *names*, so a faithful `func name(param: T):` stub can't be rendered — and
+/// offering `name():` with the wrong arity would be a "never lie" breach.
+///
+/// **A virtual the class already overrides is skipped** (Godot's `has_function(...) continue`,
+/// `gdscript_editor.cpp:3744`). `self_chain_members` yields the chain **name-first** (the in-file
+/// override's own `_ready` before the native `Node._ready`), but it does **not** dedup its native
+/// tail against the script members, so both can appear. A first-wins name-dedup here makes the
+/// own/inherited-script method shadow the same-named native virtual, which the native-only filter
+/// then drops — so an already-overridden `_ready` is not re-offered while a fresh `_process` is.
+fn override_method_items(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let Some(analyzed) = analyzed else {
+        return Vec::new();
+    };
+    let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    self_chain_members(state, tree, analyzed)
+        .into_iter()
+        // First-wins name-dedup across the whole chain (incl. the native tail): an own/inherited
+        // script method shadows the native virtual of the same name (the already-overridden skip).
+        .filter(|m| seen.insert(m.name.clone()))
+        .filter(|m| {
+            // Native virtual methods only. `is_virtual` is set only for native members; a script /
+            // in-file method has `is_virtual = false`, so it (and any native virtual it shadowed
+            // above) is excluded — exactly the already-overridden and own-method skips.
+            matches!(m.kind, MemberItemKind::Method)
+                && matches!(m.owner, MemberOwner::Native(_))
+                && m.is_virtual
+        })
+        .enumerate()
+        .map(|(rank, m)| override_stub_item(&m, rank, render))
+        .collect()
+}
+
+/// One override-method stub item. The label is `name(params) -> Ret:` (the Godot
+/// `COMPLETION_OVERRIDE_METHOD` display, built from the native member's `detail` signature); the
+/// insert is the same signature with a snippet body (`…:\n\t$0`) when the snippet gates pass, else
+/// just the signature line. `filter_text` is the bare name so the typed `func <prefix>` still
+/// filters. The caller offers only native virtuals, whose `detail` is always `(params) -> Ret`.
+fn override_stub_item(m: &MemberItem, rank: usize, render: &RenderCtx) -> CompletionItem {
+    // The native virtual's `detail` is `(params) -> Return`; build `name(params) -> Ret:`. A
+    // defensive `name():` fallback covers a (not-expected) missing detail.
+    let signature = match &m.detail {
+        Some(d) if d.starts_with('(') => format!("{}{}:", m.name, d),
+        _ => format!("{}():", m.name),
+    };
+    // Snippet body: drop the cursor into an indented body. Canonical one-tab indent (W17).
+    let snippet = (render.caps.snippet_support && render.config.snippets)
+        .then(|| format!("{signature}\n\t$0"));
+    build_item_with(
+        ItemText {
+            label: &signature,
+            filter: &m.name,
+        },
+        CompletionItemKind::METHOD,
+        ItemInsert {
+            plain: signature.clone(),
+            snippet,
+        },
+        CompletionData::Keyword,
+        rank,
+        render,
+    )
+}
+
+// ===================================================================================================
+// Item construction — the shared W18 projection (textEdit, sortText, filterText, kind, gating).
+// ===================================================================================================
+
+/// The text an item inserts, resolved by the caller: a plain replacement plus, when the item is a
+/// snippet, the `$…`-bearing snippet form (gated separately so a non-snippet client still gets
+/// `plain`). Built by [`name_insert`] (the common bare-name / call-paren case) or directly for the
+/// special inserts (override stub, annotation `(`, a quoted key).
+struct ItemInsert {
+    /// What a non-snippet client inserts (and the `label`/`filter_text` base unless overridden).
+    plain: String,
+    /// The snippet form (with tab-stops), used only when the client advertises `snippetSupport`
+    /// AND `completion.snippets` is on. `None` ⇒ never a snippet (a keyword, a plain type name).
+    snippet: Option<String>,
+}
+
+/// The label-vs-insert split for an item whose label differs from its inserted text (an override
+/// stub labels `_ready() -> void:` but inserts the body; an `@export_range(` labels with the `(`).
+/// `filter_text` is what the client filters the typed prefix against (the bare name).
+struct ItemText<'a> {
+    label: &'a str,
+    filter: &'a str,
+}
+
+/// Build the `CompletionItem` for `name`, applying every capability gate. `callable` requests a
+/// snippet call-paren insertion (subject to the snippet gates). `rank` becomes the fixed-width
+/// `sort_text` so a lexicographic client sort reproduces the server's priority order. The common
+/// case; threads through [`build_item_with`] so every context shares one gating path.
+fn build_item(
+    name: &str,
+    kind: CompletionItemKind,
+    callable: bool,
+    data: CompletionData,
+    rank: usize,
+    render: &RenderCtx,
+) -> CompletionItem {
+    let insert = name_insert(name, callable, render);
+    build_item_with(
+        ItemText {
+            label: name,
+            filter: name,
+        },
+        kind,
+        insert,
+        data,
+        rank,
+        render,
+    )
+}
+
+/// The bare-name / call-paren insert for `name`: a snippet `name($0)` when `callable` and the
+/// snippet gates pass, else a plain `name`. The single place the snippet-call gate is decided.
+fn name_insert(name: &str, callable: bool, render: &RenderCtx) -> ItemInsert {
+    // Snippet placeholders only when the client supports them AND the user left them on AND the item
+    // is callable AND the chosen style isn't `NameOnly`.
+    let want_snippet = callable
+        && render.caps.snippet_support
+        && render.config.snippets
+        && render.config.call_argument_style != CallArgumentStyle::NameOnly;
+    ItemInsert {
+        plain: name.to_string(),
+        snippet: want_snippet.then(|| snippet_text(name, render.config.call_argument_style)),
+    }
+}
+
+/// The shared item projection: clamp the kind, pick the snippet-vs-plain text under the gates, wrap
+/// it in an `InsertReplaceEdit`/`TextEdit` per capability, and stamp the fixed-width `sort_text`.
+/// Every context routes through here so capability gating stays uniform (the Phase-4 constraint).
+fn build_item_with(
+    text: ItemText,
+    kind: CompletionItemKind,
+    insert: ItemInsert,
+    data: CompletionData,
+    rank: usize,
+    render: &RenderCtx,
+) -> CompletionItem {
+    let kind = clamp_kind(kind, render.caps);
+    // Use the snippet text only when the client advertises snippetSupport AND the user left snippets
+    // on; otherwise the plain replacement (even if a snippet form was offered).
+    let snippet_ok = render.caps.snippet_support && render.config.snippets;
+    let (new_text, insert_text_format) = match insert.snippet {
+        Some(s) if snippet_ok => (s, Some(InsertTextFormat::SNIPPET)),
+        _ => (insert.plain, None),
+    };
+
+    // The edit: an InsertReplaceEdit when the client supports it (insert == replace == the prefix
+    // span here, since a new-identifier completion replaces exactly the typed word), else a plain
+    // TextEdit. The `new_text` carries the snippet (or bare name) either way; `insert_text_format`
+    // governs interpretation.
+    let text_edit = if render.caps.insert_replace_support {
+        CompletionTextEdit::InsertAndReplace(InsertReplaceEdit {
+            new_text,
+            insert: render.edit_range,
+            replace: render.edit_range,
+        })
+    } else {
+        CompletionTextEdit::Edit(TextEdit {
+            range: render.edit_range,
+            new_text,
+        })
+    };
+
+    CompletionItem {
+        label: text.label.to_string(),
+        kind,
+        // Fixed-width rank: a lexicographic client sort == the priority order (gopls convention).
+        sort_text: Some(format!("{rank:05}")),
+        // Filter against the bare name (the snippet's placeholders must not pollute filtering).
+        filter_text: Some(text.filter.to_string()),
+        text_edit: Some(text_edit),
+        insert_text_format,
+        // Commit characters (`.`/`(`) only when the client supports them AND this context isn't a
+        // string-valued one (annotation arguments), where a punctuation commit mid-string would be
+        // surprising. Member / identifier / type / keyword items keep them.
+        commit_characters: commit_chars(render.caps, render.suppress_commit),
+        // Lazy: documentation + detail are filled by `completionItem/resolve`.
+        detail: None,
+        documentation: None,
+        data: serde_json::to_value(&data).ok(),
+        ..Default::default()
+    }
+}
+
+/// A plain keyword/type-name item — no snippet, never callable (`get`/`set`/`void`, a type name).
+/// Routes through [`build_item_with`] so gating (kind clamp, edit shape) stays uniform.
+fn keyword_item(
+    name: &str,
+    kind: CompletionItemKind,
+    data: CompletionData,
+    rank: usize,
+    render: &RenderCtx,
+) -> CompletionItem {
+    build_item_with(
+        ItemText {
+            label: name,
+            filter: name,
+        },
+        kind,
+        ItemInsert {
+            plain: name.to_string(),
+            snippet: None,
+        },
+        data,
+        rank,
+        render,
+    )
+}
+
+/// The call-paren snippet for a callable, per the configured style. `ParensWithCursor` ⇒
+/// `name($0)` (cursor between the parens); `Parens` ⇒ `name()` (cursor after). `NameOnly` never
+/// reaches here (its gate falls to the bare-name branch).
+fn snippet_text(name: &str, style: CallArgumentStyle) -> String {
+    match style {
+        CallArgumentStyle::ParensWithCursor => format!("{name}($0)"),
+        CallArgumentStyle::Parens => format!("{name}()"),
+        // Unreachable under the `want_snippet` gate, but render a safe bare name if it ever is.
+        CallArgumentStyle::NameOnly => name.to_string(),
+    }
+}
+
+/// The commit characters for an item, or `None` when the client can't handle them. Member/identifier
+/// completions accept `.` (chain another access) and `(` (call). Suppressed entirely without the
+/// `commitCharactersSupport` capability (LSP: a server must not send them otherwise), and when
+/// `suppress` is set — the string-valued annotation-argument context, where committing on `.`/`(`
+/// mid-string is a UX wart.
+fn commit_chars(caps: &CompletionCaps, suppress: bool) -> Option<Vec<String>> {
+    if caps.commit_characters_support && !suppress {
+        Some(vec![".".to_string(), "(".to_string()])
+    } else {
+        None
+    }
+}
+
+/// Whether a completion request's items should drop commit characters, by context. Only the
+/// string-valued annotation-argument words (`@export_range("or_greater"` …) qualify: a `.`/`(`
+/// commit would land inside the quoted string. Every other context this phase serves is
+/// member-/identifier-/type-/keyword-shaped, where `.` and `(` are reasonable commits.
+fn suppress_commit_for(kind: &CompletionKind) -> bool {
+    matches!(kind, CompletionKind::AnnotationArguments { .. })
+}
+
+/// Clamp a server-chosen kind to the client's `completionItemKind.valueSet` (or the LSP-default
+/// 1..=18 set when the client advertised none). A kind outside the supported set becomes `None` —
+/// the item still completes, it just shows without a type-specific icon — rather than a number the
+/// client promised it can't render.
+fn clamp_kind(kind: CompletionItemKind, caps: &CompletionCaps) -> Option<CompletionItemKind> {
+    match &caps.kind_value_set {
+        Some(set) => set.contains(&kind).then_some(kind),
+        None => default_kind_value_set().contains(&kind).then_some(kind),
+    }
+}
+
+/// Map an enumeration [`MemberItemKind`] to its LSP [`CompletionItemKind`]. Signals map to `EVENT`
+/// (the closest standard kind), enum *values* to `ENUM_MEMBER`. Several of these (`EVENT`,
+/// `CONSTANT`, `ENUM_MEMBER`) fall outside the original 1..=18 range, so a minimal client may clamp
+/// them away — intended.
+fn member_kind(kind: MemberItemKind) -> CompletionItemKind {
+    match kind {
+        MemberItemKind::Method => CompletionItemKind::METHOD,
+        MemberItemKind::Property => CompletionItemKind::PROPERTY,
+        MemberItemKind::Signal => CompletionItemKind::EVENT,
+        MemberItemKind::Constant => CompletionItemKind::CONSTANT,
+        MemberItemKind::Enum => CompletionItemKind::ENUM,
+        MemberItemKind::EnumValue => CompletionItemKind::ENUM_MEMBER,
+        MemberItemKind::Class => CompletionItemKind::CLASS,
+    }
+}
+
+/// The single-line replace [`Range`] an item's `TextEdit` targets: the typed-prefix span when the
+/// cursor sits in a partial word, else a zero-width range at the cursor (a pure insertion). Built
+/// from the byte span via the [`PositionMapper`] so it is encoding-correct.
+fn prefix_range(mapper: &PositionMapper, prefix: Option<ByteSpan>, cursor: Position) -> Range {
+    match prefix {
+        Some(span) => mapper.span_to_range(span),
+        None => Range::new(cursor, cursor),
+    }
+}
+
+// ===================================================================================================
+// `data` — the compact, self-sufficient resolve key (W18: never the request params).
+// ===================================================================================================
+
+/// The payload round-tripped on `CompletionItem.data` between completion and resolve. Compact and
+/// self-sufficient: it carries only what resolve needs to re-find the symbol's documentation and
+/// detail — a tag plus a symbol path — and deliberately **not** the request position/params
+/// (anti-catalog W18). Untagged variants would be ambiguous, so it is internally tagged on `"k"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "k", rename_all = "snake_case")]
+enum CompletionData {
+    /// A member of an enumerated type (`expr.member`, or an implicit-`self` member). `owner` is the
+    /// **declaring** class/file (carry-forward (b)) so resolve fetches the long-form doc from the
+    /// right source — the native DB for a native member, the declaring file's interface for a
+    /// script member (which may differ from the requesting buffer when inherited). `detail` is the
+    /// source-derived signature carried over so resolve need not re-enumerate.
+    Member {
+        owner: CompletionDataOwner,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// A global symbol resolved by name against the native DB (a utility / global constant / global
+    /// enum value).
+    Global { name: String },
+    /// A native class name or a project `class_name` (resolve renders its brief/description).
+    NativeClass { class: String },
+    /// A local / parameter / autoload — nothing to resolve (no doc source), but carried so the round
+    /// trip is total and resolve has an explicit no-op branch rather than an unknown-tag fallthrough.
+    Local,
+    /// A keyword / type-name / annotation-word item with no doc source (`get`/`set`/`void`/an
+    /// annotation name / an override stub). A no-op for resolve, like [`CompletionData::Local`].
+    Keyword,
+}
+
+/// The **declaring** owner of a member item, encoded as a serializable resolve key (carry-forward
+/// (b)). Either a native class name (resolve via [`gd_types::NativeDb::lookup_member`]) or a
+/// declaring file's URI (resolve via that file's interface — **not** the requesting buffer, which
+/// was the Phase-3 bug for inherited / cross-file members). `Unknown` ⇒ no doc source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "o", rename_all = "snake_case")]
+enum CompletionDataOwner {
+    /// Declared on a native (engine / builtin) class.
+    NativeClass { class: String },
+    /// Declared in a project GDScript file (the declaring file's URI).
+    ScriptFile { uri: String },
+    /// No recoverable declarer — resolve has no doc to add.
+    Unknown,
+}
+
+// ===================================================================================================
+// `completionItem/resolve` — fill documentation + detail lazily; leave ranking/edit fields intact.
+// ===================================================================================================
+
+/// `completionItem/resolve`: decode the item's [`CompletionData`] and fill `documentation` +
+/// `detail`, mutating the incoming item **in place**. Per the LSP spec the ranking/insertion fields
+/// (`sort_text`, `filter_text`, `insert_text`, `text_edit`) are the server's earlier promise — they
+/// are left byte-for-byte unchanged. An absent / unparseable `data`, or a symbol that can no longer
+/// be found, returns the item with its docs simply not filled (never an error).
+#[must_use]
+pub fn completion_item_resolve(
+    state: &mut ServerState,
+    mut item: CompletionItem,
+) -> CompletionItem {
+    let Some(data) = item.data.as_ref().and_then(|v| {
+        serde_json::from_value::<CompletionData>(v.clone())
+            .map_err(|e| {
+                log::debug!("completionItem/resolve: undecodable data ({e}); leaving item as-is")
+            })
+            .ok()
+    }) else {
+        return item;
+    };
+
+    let format = state.caps.completion.documentation_format;
+    let (detail, documentation) = resolve_doc(state, &data, format);
+    if item.detail.is_none() {
+        item.detail = detail;
+    }
+    if let Some(doc) = documentation {
+        item.documentation = Some(doc);
+    }
+    item
+}
+
+/// Look up the `(detail, documentation)` for a resolved item. Detail prefers the signature carried
+/// in `data` (a `Member`'s source-derived type); documentation is the BBCode description rendered
+/// to the client's negotiated prose flavor. Either may be `None` when no source is available.
+fn resolve_doc(
+    state: &ServerState,
+    data: &CompletionData,
+    format: ProseFormat,
+) -> (Option<String>, Option<Documentation>) {
+    match data {
+        // No doc source — keywords / locals / annotation words.
+        CompletionData::Local | CompletionData::Keyword => (None, None),
+        CompletionData::Member {
+            owner,
+            name,
+            detail,
+        } => {
+            let documentation = resolve_member_doc(state, owner, name, format);
+            (detail.clone(), documentation)
+        }
+        CompletionData::Global { name } => resolve_global_doc(state, name, format),
+        CompletionData::NativeClass { class } => resolve_class_doc(state, class, format),
+    }
+}
+
+/// Documentation for an enumerated member, fetched from its **declaring** owner (carry-forward (b),
+/// M8 Phase 4): a native member's BBCode description from the native DB, or a script member's `##`
+/// doc comment from the **declaring** file's interface (not the requesting buffer — that was the
+/// Phase-3 bug for inherited / cross-file members). Deterministic: the owner is a precise class /
+/// file key, never a nondeterministic name-only search. `None` when no doc source exists.
+fn resolve_member_doc(
+    state: &ServerState,
+    owner: &CompletionDataOwner,
+    name: &str,
+    format: ProseFormat,
+) -> Option<Documentation> {
+    match owner {
+        CompletionDataOwner::NativeClass { class } => {
+            resolve_native_member_doc(state, class, name, format)
+        }
+        CompletionDataOwner::ScriptFile { uri } => {
+            resolve_script_member_doc(state, uri, name, format)
+        }
+        CompletionDataOwner::Unknown => None,
+    }
+}
+
+/// A native member's long-form BBCode description, from the declaring class via
+/// [`gd_types::NativeDb::lookup_member`] / [`gd_types::NativeDb::lookup_builtin_member`]. The
+/// `Property`/`Method`/`Signal` variants carry a per-member description; `Enum`/`Constant`/
+/// `EnumValue` carry none in the dump (returns `None`). Tried as a class member first, then a
+/// builtin member (`Color.RED` resolves through the builtin path).
+fn resolve_native_member_doc(
+    state: &ServerState,
+    class: &str,
+    name: &str,
+    format: ProseFormat,
+) -> Option<Documentation> {
+    let db = &state.workspace.native;
+    let member = db
+        .lookup_member(class, name)
+        .map(|(_, m)| m)
+        .or_else(|| db.lookup_builtin_member(class, name).map(|(_, m)| m))?;
+    let description = native_member_description(member)?;
+    if description.is_empty() {
+        return None;
+    }
+    Some(prose_doc(format, description))
+}
+
+/// The BBCode description carried by a [`gd_types::NativeMember`], if its variant has one.
+fn native_member_description(member: gd_types::NativeMember<'_>) -> Option<&str> {
+    use gd_types::NativeMember;
+    match member {
+        NativeMember::Property(p) => Some(&p.description),
+        NativeMember::Method(m) => Some(&m.description),
+        NativeMember::Signal(s) => Some(&s.description),
+        // The dump carries no per-member description for enums / constants / enum values.
+        NativeMember::Enum(_) | NativeMember::Constant(_) | NativeMember::EnumValue { .. } => None,
+    }
+}
+
+/// A script member's `##` doc comment, from the **declaring** file's interface (the file the
+/// `CompletionDataOwner::ScriptFile` URI names). `None` when the file isn't indexed, the member
+/// isn't found, or it carries no doc.
+fn resolve_script_member_doc(
+    state: &ServerState,
+    uri: &str,
+    name: &str,
+    format: ProseFormat,
+) -> Option<Documentation> {
+    let uri = uri.parse::<lsp_types::Uri>().ok()?;
+    let path = crate::uri::uri_to_path(&uri)?;
+    let fid = state.workspace.index.file_id(&path)?;
+    let iface = state.workspace.index.interface(fid)?;
+    let decl = iface.members.iter().find(|m| m.name == name)?;
+    let doc = decl.doc.as_ref()?;
+    if doc.description.is_empty() {
+        return None;
+    }
+    Some(prose_doc(format, &doc.description))
+}
+
+/// Documentation + detail for a global symbol (utility / constant). Utilities render their
+/// `(params) -> Return` signature as detail; the dump carries no per-utility description, so
+/// documentation stays `None`.
+fn resolve_global_doc(
+    state: &ServerState,
+    name: &str,
+    _format: ProseFormat,
+) -> (Option<String>, Option<Documentation>) {
+    let native = &state.workspace.native;
+    if let Some(util) = native.utilities().find(|u| native.name_of(u.name) == name) {
+        let params: Vec<String> = util
+            .params
+            .iter()
+            .map(|p| {
+                format!(
+                    "{}: {}",
+                    native.name_of(p.name),
+                    native.display_type(&p.ty, None)
+                )
+            })
+            .collect();
+        let detail = format!(
+            "({}) -> {}",
+            params.join(", "),
+            native.display_type(&util.return_type, None)
+        );
+        return (Some(detail), None);
+    }
+    (None, None)
+}
+
+/// Documentation for a native class / project `class_name`: its `brief_description`, then the
+/// long-form `description` when distinct, rendered to the client's prose flavor.
+fn resolve_class_doc(
+    state: &ServerState,
+    class: &str,
+    format: ProseFormat,
+) -> (Option<String>, Option<Documentation>) {
+    let Some(c) = state.workspace.native.class_named(class) else {
+        return (None, None);
+    };
+    let mut body = String::new();
+    crate::docs::append_doc(&mut body, format, &c.brief_description);
+    if c.description != c.brief_description {
+        crate::docs::append_doc(&mut body, format, &c.description);
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        (None, None)
+    } else {
+        (None, Some(prose_doc_raw(format, body)))
+    }
+}
+
+/// Render a BBCode doc string to the client's negotiated prose flavor as LSP [`Documentation`].
+fn prose_doc(format: ProseFormat, bbcode: &str) -> Documentation {
+    prose_doc_raw(format, &crate::docs::bbcode_to(format, bbcode))
+}
+
+/// Wrap already-rendered prose as [`Documentation`] with the matching markup kind.
+fn prose_doc_raw(format: ProseFormat, rendered: &str) -> Documentation {
+    let kind = match format {
+        ProseFormat::Markdown => MarkupKind::Markdown,
+        ProseFormat::PlainText => MarkupKind::PlainText,
+    };
+    Documentation::MarkupContent(MarkupContent {
+        kind,
+        value: rendered.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests;

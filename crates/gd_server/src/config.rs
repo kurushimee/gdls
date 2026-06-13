@@ -55,6 +55,12 @@ pub struct InitializationOptions {
     /// (default: the user-level gdls cache — `%LOCALAPPDATA%\gdls` / `~/.cache/gdls`). The
     /// in-process integration tests point this at a tempdir; end users normally leave it unset.
     pub stub_cache_dir: Option<String>,
+    /// M8 (#64): `textDocument/completion` rendering knobs (snippet placeholders, the call-argument
+    /// placeholder style). Anti-catalog W17 forbids coupling to the editor's own settings, so these
+    /// are the documented `initializationOptions` defaults gdls picks instead. Read live on each
+    /// completion request (a render-time concern), so unlike `strict`/`analyzer`/`memory` it is not
+    /// part of the runtime-reload set — the startup value stands for the session.
+    pub completion: CompletionConfig,
 }
 
 /// Manual so `parse(None)`, `parse(Some({}))`, and a missing single field all agree —
@@ -72,8 +78,53 @@ impl Default for InitializationOptions {
             analyzer: AnalyzerConfig::default(),
             memory: MemoryConfig::default(),
             stub_cache_dir: None,
+            completion: CompletionConfig::default(),
         }
     }
+}
+
+/// M8 (#64): completion rendering knobs surfaced through `initializationOptions.completion`. All
+/// fields have defaults, so an absent `completion` section (the common case) yields the gopls-style
+/// behaviour: call snippets with a `$0` final tab-stop, only emitted when the client advertises
+/// `completionItem.snippetSupport`. The defaults are deliberate (anti-catalog W17: gdls owns the
+/// canonical style rather than reading the editor's settings).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CompletionConfig {
+    /// Whether to emit snippet placeholders (`($0)`, `(${1:x}, ${2:y})`) for callable completions
+    /// at all. Gated a SECOND time by the client's `completionItem.snippetSupport`: this knob lets
+    /// a user who finds the auto-inserted parens noisy turn them off even on a snippet-capable
+    /// client. Default **true** (the gopls/rust-analyzer default — accepting a function inserts its
+    /// call parens and drops the cursor inside).
+    pub snippets: bool,
+    /// How a callable's call parentheses are rendered when `snippets` (and the client capability)
+    /// are on. Default [`CallArgumentStyle::ParensWithCursor`] — gopls-style `($0)` so accepting
+    /// `foo` yields `foo()` with the cursor between the parens.
+    pub call_argument_style: CallArgumentStyle,
+}
+
+impl Default for CompletionConfig {
+    fn default() -> Self {
+        CompletionConfig {
+            snippets: true,
+            call_argument_style: CallArgumentStyle::default(),
+        }
+    }
+}
+
+/// The placeholder rendering for a callable completion's call parentheses (M8 #64). Only consulted
+/// when snippets are enabled on both sides; the plain-text fallback (no snippet support) always
+/// inserts a bare name with no parens, independent of this setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CallArgumentStyle {
+    /// `name($0)` — insert the call parens with the final tab-stop between them (gopls default).
+    #[default]
+    ParensWithCursor,
+    /// `name()` — insert empty call parens with no tab-stop (the cursor lands after the `)`).
+    Parens,
+    /// `name` — insert only the bare name; the user types the `(` themselves.
+    NameOnly,
 }
 
 /// Per-call analyzer knobs surfaced through `initializationOptions.analyzer`. Optional; the
@@ -200,6 +251,46 @@ mod tests {
         assert!(opts.project_root.is_none());
         assert_eq!(opts.strict.profile, StrictProfile::Godot);
         assert!(opts.memory.soft_cap_mb.is_none());
+        // M8 (#64): completion defaults — snippets on, gopls-style parens.
+        assert!(opts.completion.snippets);
+        assert_eq!(
+            opts.completion.call_argument_style,
+            CallArgumentStyle::ParensWithCursor
+        );
+    }
+
+    #[test]
+    fn parse_completion_knobs_round_trip() {
+        let v = serde_json::json!({
+            "completion": { "snippets": false, "callArgumentStyle": "nameOnly" }
+        });
+        let opts = InitializationOptions::parse(Some(&v));
+        assert!(!opts.completion.snippets);
+        assert_eq!(
+            opts.completion.call_argument_style,
+            CallArgumentStyle::NameOnly
+        );
+    }
+
+    /// A malformed `completion` group falls back to the FULL default (snippets on), never failing
+    /// `initialize` — the same "never crash, never lie" contract the other groups hold.
+    #[test]
+    fn malformed_completion_falls_back_to_defaults() {
+        for case in [
+            serde_json::json!({ "completion": "not-an-object" }),
+            serde_json::json!({ "completion": { "callArgumentStyle": "bogus" } }),
+            serde_json::json!({ "completion": { "snippets": 7 } }),
+        ] {
+            let opts = InitializationOptions::parse(Some(&case));
+            assert!(
+                opts.completion.snippets,
+                "case {case:?} should default completion"
+            );
+            assert_eq!(
+                opts.completion.call_argument_style,
+                CallArgumentStyle::ParensWithCursor
+            );
+        }
     }
 
     #[test]

@@ -55,7 +55,11 @@ const WATCHER_LIVENESS_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Client capabilities gdls branches on, captured once at `initialize` (the position encoding
 /// negotiates separately into [`ServerState::encoding`]).
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Not `Copy`: the M8 (#64) completion gates carry owned `Vec`s (the supported
+/// `completionItemKind` set, the `resolveSupport`/`itemDefaults` property lists), so the struct
+/// is `Clone`-only. Handlers read its fields behind a shared `&state.caps` borrow.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ClientCaps {
     /// `textDocument.documentSymbol.hierarchicalDocumentSymbolSupport`. Absent ⇒ `false` ⇒ the
     /// flat 3.16 `SymbolInformation[]` documentSymbol shape (rust-analyzer's
@@ -93,6 +97,49 @@ pub(crate) struct ClientCaps {
     /// [`crate::docs::ProseFormat`] for why that pragmatic default stands until the M7 exit
     /// harness captures the real editor profiles.
     pub(crate) hover_format: crate::docs::ProseFormat,
+    /// The M8 (#64) completion gates, captured under `textDocument.completion`. Grouped in a
+    /// sub-struct so the completion handler reads `state.caps.completion.<gate>` and the rest of
+    /// [`ClientCaps`] stays a flat list of feature booleans.
+    pub(crate) completion: CompletionCaps,
+}
+
+/// The `textDocument.completion` client capabilities gdls projects each item against (M8 #64).
+/// Every field has a documented absent-default so a Godot-unaware / minimal client still gets a
+/// well-formed (if downgraded) `CompletionList` — generic-LSP-first (#30).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompletionCaps {
+    /// `completionItem.snippetSupport` — when false, callable items insert a bare name (no
+    /// `($0)`/`${1:}` placeholders) and `insertTextFormat` stays `PlainText`.
+    pub(crate) snippet_support: bool,
+    /// `completionItem.insertReplaceSupport` — when false, the item carries a plain
+    /// [`lsp_types::TextEdit`] (the `Edit` arm) instead of an [`lsp_types::InsertReplaceEdit`].
+    pub(crate) insert_replace_support: bool,
+    /// `completionItem.commitCharactersSupport` — when false, items never carry
+    /// `commitCharacters` (and even when true they are suppressed in string / new-identifier
+    /// contexts).
+    pub(crate) commit_characters_support: bool,
+    /// `completionItem.documentationFormat` — the first kind gdls supports, reusing the
+    /// [`crate::docs::ProseFormat`] negotiation `hover.contentFormat` uses. Absent ⇒ Markdown.
+    /// Consumed by `completionItem/resolve` when it renders the lazy documentation.
+    pub(crate) documentation_format: crate::docs::ProseFormat,
+    /// `completionItem.resolveSupport.properties` — the property names the client will pull lazily
+    /// via `completionItem/resolve`. gdls advertises `resolve_provider`, defers `documentation` +
+    /// `detail`, and records the list so a future field can be gated on its membership. Empty when
+    /// the client sent no `resolveSupport`. Captured-for-future-use this phase (the resolve set is
+    /// fixed at documentation+detail).
+    #[allow(dead_code)]
+    pub(crate) resolve_properties: Vec<String>,
+    /// `completionList.itemDefaults` — the `CompletionList.itemDefaults` keys the client honors.
+    /// Recorded for a later phase that hoists shared `CommitCharacters`/`editRange` defaults onto
+    /// the list; this phase renders each item fully and leaves `itemDefaults` empty. Empty when
+    /// absent. Captured-for-future-use this phase.
+    #[allow(dead_code)]
+    pub(crate) list_item_defaults: Vec<String>,
+    /// `completionItemKind.valueSet` — the [`lsp_types::CompletionItemKind`]s the client can
+    /// render. `None` ⇒ the LSP default set (`Text`..=`Reference`, i.e. 1..=18); a server kind
+    /// outside the negotiated set is dropped to `None` (the item still completes, just without an
+    /// icon) rather than sent as an unknown number.
+    pub(crate) kind_value_set: Option<Vec<lsp_types::CompletionItemKind>>,
 }
 
 impl ClientCaps {
@@ -130,18 +177,66 @@ impl ClientCaps {
             hover_format: td
                 .and_then(|t| t.hover.as_ref())
                 .and_then(|h| h.content_format.as_ref())
-                .and_then(|formats| {
-                    formats.iter().find_map(|f| match f {
-                        f if *f == lsp_types::MarkupKind::Markdown => {
-                            Some(crate::docs::ProseFormat::Markdown)
-                        }
-                        f if *f == lsp_types::MarkupKind::PlainText => {
-                            Some(crate::docs::ProseFormat::PlainText)
-                        }
-                        _ => None,
-                    })
-                })
+                .map(|formats| prose_format_from(formats))
                 .unwrap_or_default(),
+            completion: CompletionCaps::negotiate(td),
+        }
+    }
+}
+
+/// The first [`crate::docs::ProseFormat`] gdls supports in a client's preference-ordered
+/// `MarkupKind` list (Markdown preferred, PlainText accepted, anything else skipped). Shared by
+/// `hover.contentFormat` (M7 #62) and `completionItem.documentationFormat` (M8 #64) so both honor
+/// the same negotiation; an empty / all-unknown list falls back to the caller's `unwrap_or_default`
+/// (Markdown).
+fn prose_format_from(formats: &[lsp_types::MarkupKind]) -> crate::docs::ProseFormat {
+    formats
+        .iter()
+        .find_map(|f| match f {
+            f if *f == lsp_types::MarkupKind::Markdown => Some(crate::docs::ProseFormat::Markdown),
+            f if *f == lsp_types::MarkupKind::PlainText => {
+                Some(crate::docs::ProseFormat::PlainText)
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+impl CompletionCaps {
+    /// Walk `textDocument.completion`, mirroring the optional-path `.and_then`/`.unwrap_or`
+    /// convention the rest of [`ClientCaps::negotiate`] uses. An absent `completion` capability (a
+    /// client that never opted into completion) yields the all-default struct — every gate off,
+    /// plaintext docs (the conservative downgrade), the LSP-default kind set.
+    fn negotiate(td: Option<&lsp_types::TextDocumentClientCapabilities>) -> Self {
+        let completion = td.and_then(|t| t.completion.as_ref());
+        let item = completion.and_then(|c| c.completion_item.as_ref());
+        CompletionCaps {
+            snippet_support: item.and_then(|i| i.snippet_support).unwrap_or(false),
+            insert_replace_support: item.and_then(|i| i.insert_replace_support).unwrap_or(false),
+            commit_characters_support: item
+                .and_then(|i| i.commit_characters_support)
+                .unwrap_or(false),
+            // Per phase-3 criterion 4 ("No documentationFormat → plaintext docs") the completion
+            // documentation default is the conservative downgrade — PlainText — NOT hover's
+            // Markdown default: a client that didn't enumerate documentation formats can always
+            // render plaintext, and resolve attaching un-asked-for markdown could surface raw `**`.
+            // A client that DID enumerate formats gets its preferred supported one via
+            // `prose_format_from`.
+            documentation_format: item
+                .and_then(|i| i.documentation_format.as_ref())
+                .map(|formats| prose_format_from(formats))
+                .unwrap_or(crate::docs::ProseFormat::PlainText),
+            resolve_properties: item
+                .and_then(|i| i.resolve_support.as_ref())
+                .map(|r| r.properties.clone())
+                .unwrap_or_default(),
+            list_item_defaults: completion
+                .and_then(|c| c.completion_list.as_ref())
+                .and_then(|l| l.item_defaults.clone())
+                .unwrap_or_default(),
+            kind_value_set: completion
+                .and_then(|c| c.completion_item_kind.as_ref())
+                .and_then(|k| k.value_set.clone()),
         }
     }
 }
@@ -1540,6 +1635,28 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+        // M8 (#64): completion. Trigger characters are the NON-identifier characters that should
+        // auto-pop the list (`.` member access, `$`/`%` node paths — currently the deferred-node
+        // policy, `"` resource/string contexts, `@` annotations); identifier characters never go
+        // here (the client triggers on those itself). `resolve_provider: true` defers
+        // documentation/detail to a `completionItem/resolve` round-trip (lazy — the list stays
+        // cheap). `label_details_support: true` lets resolve attach the structured label detail in
+        // a later phase.
+        completion_provider: Some(lsp_types::CompletionOptions {
+            resolve_provider: Some(true),
+            trigger_characters: Some(vec![
+                ".".to_string(),
+                "$".to_string(),
+                "%".to_string(),
+                "\"".to_string(),
+                "@".to_string(),
+            ]),
+            all_commit_characters: None,
+            work_done_progress_options: Default::default(),
+            completion_item: Some(lsp_types::CompletionOptionsCompletionItem {
+                label_details_support: Some(true),
+            }),
+        }),
         document_link_provider: Some(DocumentLinkOptions {
             resolve_provider: Some(false),
             work_done_progress_options: Default::default(),
@@ -1702,6 +1819,12 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             | "textDocument/references"
             | "callHierarchy/incomingCalls"
             | "callHierarchy/outgoingCalls"
+            // M8 (#64): `completion` runs `analyze_if_gd` to resolve the base expression's type
+            // (the ATTRIBUTE arm) — analysis-priced, so it sheds at Hard with ContentModified
+            // exactly like hover. `completionItem/resolve` is deliberately NOT here: it only reads
+            // the native DB / cached interface and never starts a fresh analyze, so shedding it
+            // would reclaim nothing.
+            | "textDocument/completion"
     );
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {
         // Re-record the request as cancelled-cum-shed so the per-handler trace still shows the
@@ -1737,6 +1860,11 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         "callHierarchy/incomingCalls" => handle!(handlers::incoming_calls),
         "callHierarchy/outgoingCalls" => handle!(handlers::outgoing_calls),
         "workspace/symbol" => handle!(handlers::workspace_symbol),
+        // M8 (#64): completion + its lazy resolve. `completion` returns a `CompletionList`
+        // (never a bare array — W18); `resolve` fills documentation/detail and leaves the
+        // ranking/edit fields untouched.
+        "textDocument/completion" => handle!(handlers::completion),
+        "completionItem/resolve" => handle!(handlers::completion_item_resolve),
         // M7 (#61): pull diagnostics. NOT in the Hard-pressure shed list above — `analyze_gd`
         // self-degrades to parser-only + cached results there, exactly like the push path, so
         // pull and push stay byte-identical under pressure too.
@@ -2079,7 +2207,7 @@ fn diagnostic_items(state: &mut ServerState, uri: &Uri) -> Vec<Diagnostic> {
                         collect_diagnostics(
                             &mapper,
                             state.encoding,
-                            state.caps,
+                            &state.caps,
                             uri,
                             &related_texts,
                             &parsed.diagnostics,
@@ -2221,7 +2349,7 @@ fn analyze_gd(
 fn collect_diagnostics(
     mapper: &PositionMapper,
     enc: PositionEncoding,
-    caps: ClientCaps,
+    caps: &ClientCaps,
     request_uri: &Uri,
     related_texts: &FxHashMap<gd_project::FileId, (Uri, ropey::Rope)>,
     syntax: &[gd_syntax::Diagnostic],
@@ -2618,6 +2746,41 @@ mod tests {
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
             "definition is index-only and must not be shed at Hard pressure; got {:?}",
+            resp.error
+        );
+
+        // M8 (#64): `completion` IS analyze-using (it resolves the base expression's type), so it
+        // sheds with ContentModified at Hard pressure exactly like hover.
+        let completion = Request {
+            id: lsp_server::RequestId::from(4),
+            method: "textDocument/completion".to_string(),
+            params: serde_json::json!({
+                "textDocument": { "uri": "file:///test/a.gd" },
+                "position": { "line": 0, "character": 0 }
+            }),
+        };
+        let resp = dispatch_request(&mut state, completion);
+        assert_eq!(
+            resp.error.as_ref().map(|e| e.code),
+            Some(ERR_CONTENT_MODIFIED),
+            "completion is analyze-using and must be shed at Hard pressure; got {:?}",
+            resp.error
+        );
+
+        // M8 (#64): `completionItem/resolve` is NOT analyze-using — it only reads the native DB /
+        // cached interface, so it must stay served at Hard pressure (shedding it would reclaim
+        // nothing). A resolve with no `data` returns the item unchanged: success, not -32801.
+        let resolve = Request {
+            id: lsp_server::RequestId::from(5),
+            method: "completionItem/resolve".to_string(),
+            params: serde_json::json!({ "label": "x" }),
+        };
+        let resp = dispatch_request(&mut state, resolve);
+        assert_ne!(
+            resp.error.as_ref().map(|e| e.code),
+            Some(ERR_CONTENT_MODIFIED),
+            "completionItem/resolve is not analyze-using and must not be shed at Hard pressure; \
+             got {:?}",
             resp.error
         );
     }

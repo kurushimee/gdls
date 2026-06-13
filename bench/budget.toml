@@ -63,6 +63,36 @@ p99_ms = 0.2
 p50_ms = 11.1
 p99_ms = 17.2
 
+[completion]
+# textDocument/completion (M8 #64). ESTIMATED, NOT measured on the 2338-file calibration project
+# above -- this branch's only available fixture is the 3-file ~/dev/godot-test-project, whose
+# member-enumeration has no cross-file fan-out and would NOT be comparable to the rows above (same
+# machine + same large project is the whole point of this file). The operator's calibration walk
+# (the bench replay driver + scripts/summarize-spans.py on the large project) MUST recalibrate this.
+#
+# Basis for the estimate: completion is analysis-priced -- it runs `analyze_if_gd` to resolve the
+# base expression's type "exactly like hover" (server.rs dispatch; it is in the Hard-pressure shed
+# list), then enumerates + renders the resolved type's full member set. So it sits in the
+# warm_analyze / hover family on the analyze leg, plus member-enumeration + item-build on top of
+# hover's single-binding lookup. p50 tracks warm_analyze's cache-hit case; p99 adds the
+# enumeration/render cost over a large or import-heavy receiver to warm_analyze's full-pass p99.
+p50_ms = 0.3   # estimate: ~warm_analyze p50 (0.1) + member enumeration/render
+p99_ms = 6.0   # estimate: ~warm_analyze p99 (4.2) + enumeration over a wide member set
+
+[signature_help]
+# textDocument/signatureHelp (M8 #65). ESTIMATED and UNMEASURABLE on this branch:
+# `feat/m8-completion-signaturehelp` carries completion only; the signatureHelp handler, its
+# `signatureHelpProvider` capability, and `signature_help.rs` live on the stacked
+# `feat/m8-signaturehelp` branch. There is nothing to drive or time here. This row MUST be
+# recalibrated by the operator's bench walk once that branch's hardening pass runs.
+#
+# Basis for the estimate: signatureHelp is also analysis-priced (it resolves the call receiver's
+# type to pick the active signature/parameter), so it is in the same warm_analyze/hover family as
+# completion but renders a single signature rather than the whole member set -- expected to be at or
+# below completion's cost. Placeholder mirrors completion pending real measurement.
+p50_ms = 0.3   # estimate: analysis-priced, ~completion (single-signature render)
+p99_ms = 6.0   # estimate: ~completion p99; recalibrate on the signatureHelp branch
+
 [memory]
 # Peak resident-set observed during the calibration walk via the WP-O2 RssSampler. baseline is
 # the reading at server start; peak is the maximum since baseline (sysinfo RSS).

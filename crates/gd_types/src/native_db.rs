@@ -313,6 +313,99 @@ impl NativeDb {
         self.utilities.len()
     }
 
+    /// Enumerate every `@GlobalScope` utility function, **sorted by name**. The by-name
+    /// [`Self::utility`] lookup is the targeted complement; this is the enumeration M8 completion
+    /// lists for the IDENTIFIER context's "GDScript utilities" tier. The backing store is an
+    /// [`FxHashMap`] (iteration order is nondeterministic), so the result is sorted to give
+    /// completion a stable order to rank against. Count equals [`Self::utility_count`].
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    pub fn utilities(&self) -> impl Iterator<Item = &UtilityFn> + '_ {
+        let mut all: Vec<&UtilityFn> = self.utilities.values().collect();
+        all.sort_by(|a, b| self.name_of(a.name).cmp(self.name_of(b.name)));
+        all.into_iter()
+    }
+
+    /// Enumerate every `@GlobalScope` constant as `(name, value)`, **sorted by name**. Note the
+    /// `extension_api.json` `global_constants` array is empty on stock dumps — Godot exposes
+    /// `OK`, `KEY_ESCAPE`, … as values of the `Error` / `Key` *global enums*, reachable through
+    /// [`Self::global_enum_values`] / [`Self::global_enum_value`]. This iterator stays for the
+    /// (rare) custom dump that does populate the array, and to mirror the by-name
+    /// [`Self::global_constant`] lookup. Sorted for the same determinism reason as
+    /// [`Self::utilities`].
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    pub fn global_constants(&self) -> impl Iterator<Item = (&str, i64)> + '_ {
+        let mut all: Vec<(&str, i64)> = self
+            .global_constants
+            .iter()
+            .map(|(s, v)| (self.name_of(*s), *v))
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(b.0));
+        all.into_iter()
+    }
+
+    /// Enumerate every `@GlobalScope` enum (`Error`, `Key`, `Side`, …), **sorted by name**. The
+    /// by-name [`Self::global_enum`] lookup is the targeted complement; this is the enumeration
+    /// M8 completion lists for the IDENTIFIER context's "global enums" tier. Sorted for
+    /// determinism (see [`Self::utilities`]).
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    pub fn global_enums(&self) -> impl Iterator<Item = &NativeEnum> + '_ {
+        let mut all: Vec<&NativeEnum> = self.global_enums.values().collect();
+        all.sort_by(|a, b| self.name_of(a.name).cmp(self.name_of(b.name)));
+        all.into_iter()
+    }
+
+    /// Enumerate every `@GlobalScope` enum *value* as `(value_name, owning_enum_name, value)`,
+    /// **sorted by value name**. This is the flat bare-identifier set Godot's IDENTIFIER
+    /// completion surfaces for the "global constants" tier — `OK` (of `Error`), `KEY_ESCAPE`
+    /// (of `Key`), `SIDE_LEFT` (of `Side`), … — the reverse of [`Self::global_enum_value`]'s
+    /// single lookup. Two enums could in principle declare the same bare value name; both rows
+    /// are yielded (completion dedups/ranks). Sorted for determinism (see [`Self::utilities`]).
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    pub fn global_enum_values(&self) -> impl Iterator<Item = (&str, &str, i64)> + '_ {
+        let mut all: Vec<(&str, &str, i64)> = self
+            .global_enums
+            .values()
+            .flat_map(|ne| {
+                let owner = self.name_of(ne.name);
+                ne.values
+                    .iter()
+                    .map(move |(sym, val)| (self.name_of(*sym), owner, *val))
+            })
+            .collect();
+        all.sort_by(|a, b| a.0.cmp(b.0));
+        all.into_iter()
+    }
+
+    /// Enumerate every native class **name**, **sorted**. The by-name [`Self::class_named`] lookup
+    /// is the targeted complement; this is the enumeration M8 completion lists in the IDENTIFIER and
+    /// TYPE contexts (`Node`, `Timer`, …, the engine class set Godot's `get_global_map()` /
+    /// `_list_available_types` surface). The backing store is an [`FxHashMap`] (nondeterministic
+    /// iteration), so the result is sorted to give completion a stable order to rank against.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    pub fn class_names(&self) -> impl Iterator<Item = &str> + '_ {
+        let mut all: Vec<&str> = self
+            .classes
+            .values()
+            .map(|c| self.name_of(c.name))
+            .collect();
+        all.sort_unstable();
+        all.into_iter()
+    }
+
+    /// Enumerate every builtin type **name**, **sorted** (`Vector2`, `Color`, `Array`, …). The
+    /// complement of [`Self::builtin_named`]; sorted for the same determinism reason as
+    /// [`Self::class_names`].
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    pub fn builtin_names(&self) -> impl Iterator<Item = &str> + '_ {
+        let mut all: Vec<&str> = self
+            .builtins
+            .values()
+            .map(|b| self.name_of(b.name))
+            .collect();
+        all.sort_unstable();
+        all.into_iter()
+    }
+
     pub fn header(&self) -> &api::Header {
         &self.header
     }
@@ -393,6 +486,38 @@ impl NativeDb {
         None
     }
 
+    /// Enumerate the **value names** of an enum, **sorted**, for M8 call-argument / assignment
+    /// enum-candidate completion (`ClassDB::get_enum_constants` / `_find_enumeration_candidates`).
+    /// `scope` is the owning class for a class-scoped enum (`Input.MouseMode` → `Some("Input")`),
+    /// or `None` for a `@GlobalScope` enum (`Error`). A class-scoped enum is looked up on the
+    /// class **and inherited** up the `inherits` chain (an enum-typed param can name a base
+    /// class's enum). Empty when the enum is unknown. Names only — completion adds the qualifier.
+    #[must_use]
+    pub fn enum_constants(&self, scope: Option<&str>, enum_name: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        match scope {
+            None => {
+                if let Some(ne) = self.global_enum(enum_name) {
+                    out.extend(ne.values.iter().map(|(s, _)| self.name_of(*s)));
+                }
+            }
+            Some(class) => {
+                let target = self.interner.get(enum_name);
+                let mut cur = self.class_named(class);
+                for _ in 0..64 {
+                    let Some(nc) = cur else { break };
+                    if let Some(ne) = target.and_then(|t| nc.enums.iter().find(|e| e.name == t)) {
+                        out.extend(ne.values.iter().map(|(s, _)| self.name_of(*s)));
+                        break;
+                    }
+                    cur = nc.inherits.and_then(|s| self.classes.get(&s));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// A `@GlobalScope` constant's value.
     pub fn global_constant(&self, name: &str) -> Option<i64> {
         self.interner
@@ -456,6 +581,52 @@ impl NativeDb {
             &bt.constants,
         )
         .map(|m| (bt, m))
+    }
+
+    /// Collect **every member** reachable on `class` — its own plus all inherited up the
+    /// `inherits` chain — the enumeration counterpart of the by-name [`Self::lookup_member`]
+    /// walk (it serves `Class.<cursor>` / instance member completion). Returns each member
+    /// alongside the class that **declares** it.
+    ///
+    /// **Shadowing / dedup rule (derived shadows base, by name):** the chain is walked
+    /// derived-first (the named class, then each `inherits` parent). The **first** class to
+    /// expose a given member name wins; a same-named member on any base class is skipped — the
+    /// exact override semantics [`Self::lookup_member`] produces by stopping at its first hit.
+    /// Within one class, members appear in dump order, grouped property → method → signal →
+    /// enum → constant → enum value (mirroring [`member_of`]'s probe order so a one-by-one
+    /// `lookup_member` and this enumeration agree on which entry a name resolves to). A named
+    /// enum and its values are distinct names: the enum *itself* (e.g. `MouseMode`) and each of
+    /// its values (e.g. `MOUSE_MODE_CAPTURED`) are separate entries.
+    ///
+    /// A hand-edited dump's `inherits` cycle is bounded the same way as [`Self::lookup_member`]
+    /// (a fixed depth cap) — it yields a finite list instead of hanging (never crash, never
+    /// hang).
+    #[must_use]
+    pub fn all_members<'a>(&'a self, class: &str) -> Vec<(&'a NativeClass, NativeMember<'a>)> {
+        let mut out: Vec<(&'a NativeClass, NativeMember<'a>)> = Vec::new();
+        let mut seen: rustc_hash::FxHashSet<Sym> = rustc_hash::FxHashSet::default();
+        let mut cur = self.class_named(class);
+        // Same cap as `lookup_member`: real chains are ~10 deep; the bound turns a malformed
+        // cyclic `inherits` into a finite result rather than an unbounded walk.
+        for _ in 0..64 {
+            let Some(nc) = cur else { break };
+            collect_class_members(nc, &mut seen, &mut out);
+            cur = nc.inherits.and_then(|s| self.classes.get(&s));
+        }
+        out
+    }
+
+    /// [`Self::all_members`]'s builtin analog: every member of `builtin` (`Vector2`, `Array`,
+    /// …). Builtins have **no inheritance chain** (and no signals — `members` plays the property
+    /// role), so this is a single class's members in the same property → method → enum →
+    /// constant → enum-value grouping. `None` when the builtin name is unknown.
+    #[must_use]
+    pub fn builtin_members<'a>(&'a self, builtin: &str) -> Option<Vec<NativeMember<'a>>> {
+        let bt = self.builtin_named(builtin)?;
+        let mut seen: rustc_hash::FxHashSet<Sym> = rustc_hash::FxHashSet::default();
+        let mut out: Vec<(&'a BuiltinType, NativeMember<'a>)> = Vec::new();
+        collect_builtin_members(bt, &mut seen, &mut out);
+        Some(out.into_iter().map(|(_, m)| m).collect())
     }
 
     /// Render a [`TypeRef`] the way the editor surfaces type names: `Array[int]`,
@@ -710,6 +881,99 @@ fn member_of<'a>(
     None
 }
 
+/// Push every member of one native class into `out`, in [`member_of`]'s probe order
+/// (property → method → signal → enum → constant → enum value), skipping any name already in
+/// `seen`. `seen` carries across classes so a derived class's member shadows a base class's
+/// same-named one (the enumeration twin of [`NativeDb::lookup_member`]'s first-hit stop).
+fn collect_class_members<'a>(
+    nc: &'a NativeClass,
+    seen: &mut rustc_hash::FxHashSet<Sym>,
+    out: &mut Vec<(&'a NativeClass, NativeMember<'a>)>,
+) {
+    for p in &nc.properties {
+        if seen.insert(p.name) {
+            out.push((nc, NativeMember::Property(p)));
+        }
+    }
+    for m in &nc.methods {
+        if seen.insert(m.name) {
+            out.push((nc, NativeMember::Method(m)));
+        }
+    }
+    for s in &nc.signals {
+        if seen.insert(s.name) {
+            out.push((nc, NativeMember::Signal(s)));
+        }
+    }
+    for e in &nc.enums {
+        if seen.insert(e.name) {
+            out.push((nc, NativeMember::Enum(e)));
+        }
+    }
+    for k in &nc.constants {
+        if seen.insert(k.name) {
+            out.push((nc, NativeMember::Constant(k)));
+        }
+    }
+    for e in &nc.enums {
+        for (name, value) in &e.values {
+            if seen.insert(*name) {
+                out.push((
+                    nc,
+                    NativeMember::EnumValue {
+                        owner: e,
+                        name: *name,
+                        value: *value,
+                    },
+                ));
+            }
+        }
+    }
+}
+
+/// [`collect_class_members`]'s builtin analog: builtins carry no signals (the `None` slot in
+/// [`member_of`]) and `members` plays the property role.
+fn collect_builtin_members<'a>(
+    bt: &'a BuiltinType,
+    seen: &mut rustc_hash::FxHashSet<Sym>,
+    out: &mut Vec<(&'a BuiltinType, NativeMember<'a>)>,
+) {
+    for p in &bt.members {
+        if seen.insert(p.name) {
+            out.push((bt, NativeMember::Property(p)));
+        }
+    }
+    for m in &bt.methods {
+        if seen.insert(m.name) {
+            out.push((bt, NativeMember::Method(m)));
+        }
+    }
+    for e in &bt.enums {
+        if seen.insert(e.name) {
+            out.push((bt, NativeMember::Enum(e)));
+        }
+    }
+    for k in &bt.constants {
+        if seen.insert(k.name) {
+            out.push((bt, NativeMember::Constant(k)));
+        }
+    }
+    for e in &bt.enums {
+        for (name, value) in &e.values {
+            if seen.insert(*name) {
+                out.push((
+                    bt,
+                    NativeMember::EnumValue {
+                        owner: e,
+                        name: *name,
+                        value: *value,
+                    },
+                ));
+            }
+        }
+    }
+}
+
 fn hash_str(s: &str) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     s.hash(&mut h);
@@ -726,5 +990,296 @@ mod tests {
         assert!(db.is_empty());
         assert!(db.class_named("Node").is_none());
         assert!(!db.is_subclass_of_named("Node", "Object"));
+    }
+
+    /// The vendored trimmed dump (`Node` inherits `Object`); the same fixture `gd_analyze`'s
+    /// cross-file tests load. Portable: in-crate, no absolute paths.
+    fn trimmed_db() -> NativeDb {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/trimmed_api.json");
+        NativeDb::load(path.to_str().expect("utf-8 path"))
+            .unwrap_or_else(|e| panic!("load trimmed native DB fixture: {e}"))
+    }
+
+    /// The member-name set of one `NativeMember`, for cross-checking enumeration against
+    /// one-by-one `lookup_member`.
+    fn member_name(db: &NativeDb, m: &NativeMember) -> String {
+        match m {
+            NativeMember::Property(p) => db.name_of(p.name).to_owned(),
+            NativeMember::Method(m) => db.name_of(m.name).to_owned(),
+            NativeMember::Signal(s) => db.name_of(s.name).to_owned(),
+            NativeMember::Enum(e) => db.name_of(e.name).to_owned(),
+            NativeMember::Constant(k) => db.name_of(k.name).to_owned(),
+            NativeMember::EnumValue { name, .. } => db.name_of(*name).to_owned(),
+        }
+    }
+
+    #[test]
+    fn all_members_of_node_includes_inherited_object_members() {
+        let db = trimmed_db();
+        let members = db.all_members("Node");
+        assert!(!members.is_empty(), "Node has members");
+        // Plausible count: Node + its base chain up to Object carries well over 50 names in the
+        // trimmed dump (the real dump is far larger); the upper bound just catches a runaway.
+        assert!(
+            members.len() > 50 && members.len() < 5000,
+            "Node member count {} is implausible",
+            members.len()
+        );
+
+        let names: std::collections::HashSet<String> =
+            members.iter().map(|(_, m)| member_name(&db, m)).collect();
+        // Node's own members.
+        assert!(names.contains("get_parent"), "Node::get_parent enumerated");
+        assert!(names.contains("queue_free"), "Node::queue_free enumerated");
+        assert!(names.contains("name"), "Node::name property enumerated");
+        assert!(
+            names.contains("process_mode"),
+            "Node::process_mode enumerated"
+        );
+        // Inherited from Object (proves the chain walk).
+        assert!(
+            names.contains("get_class"),
+            "inherited Object::get_class enumerated"
+        );
+
+        // Every enumerated name resolves via the by-name walk to the SAME member kind — the
+        // enumeration and the one-by-one lookup agree.
+        for (decl, m) in &members {
+            let looked = db
+                .lookup_member("Node", &member_name(&db, m))
+                .unwrap_or_else(|| panic!("lookup_member finds {}", member_name(&db, m)));
+            assert_eq!(
+                std::mem::discriminant(m),
+                std::mem::discriminant(&looked.1),
+                "kind of {} agrees between enumerate and lookup",
+                member_name(&db, m)
+            );
+            assert_eq!(
+                db.name_of(decl.name),
+                db.name_of(looked.0.name),
+                "declaring class of {} agrees (derived shadows base)",
+                member_name(&db, m)
+            );
+        }
+
+        // No duplicate names (the dedup held).
+        assert_eq!(names.len(), members.len(), "enumeration is name-unique");
+    }
+
+    #[test]
+    fn all_members_dedup_is_derived_shadows_base() {
+        // `Derived::shared` shadows `Base::shared`; the chain walk yields the DERIVED one and
+        // never the base's, matching `lookup_member`'s first-hit stop.
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Base", "is_instantiable": true,
+                     "methods": [{"name": "shared", "is_const": false, "is_static": false,
+                                  "is_vararg": false, "is_virtual": false, "hash": 1,
+                                  "return_value": {"type": "int"}}],
+                     "properties": [{"name": "only_base", "type": "int", "setter": "", "getter": ""}]},
+                    {"name": "Derived", "inherits": "Base", "is_instantiable": true,
+                     "methods": [{"name": "shared", "is_const": false, "is_static": false,
+                                  "is_vararg": false, "is_virtual": false, "hash": 2,
+                                  "return_value": {"type": "String"}}]}
+                ]
+            }"#,
+        )
+        .expect("shadowing dump");
+        let members = db.all_members("Derived");
+        let shared: Vec<&NativeMember> = members
+            .iter()
+            .filter(|(_, m)| member_name(&db, m) == "shared")
+            .map(|(_, m)| m)
+            .collect();
+        assert_eq!(
+            shared.len(),
+            1,
+            "shared appears once (derived shadows base)"
+        );
+        let NativeMember::Method(m) = shared[0] else {
+            panic!("shared is a method");
+        };
+        // The DERIVED override returns String; the base returned int. The chain kept the derived.
+        assert!(
+            matches!(m.return_type, TypeRef::Named(s) if db.name_of(s) == "String"),
+            "the derived override (String return) shadows the base (int return)"
+        );
+        // The base-only member still comes through (inheritance, not replacement).
+        assert!(
+            members
+                .iter()
+                .any(|(_, m)| member_name(&db, m) == "only_base"),
+            "base-only members are inherited"
+        );
+    }
+
+    #[test]
+    fn builtin_members_enumerated() {
+        let db = trimmed_db();
+        let members = db
+            .builtin_members("Vector2")
+            .expect("Vector2 builtin exists");
+        let names: std::collections::HashSet<String> =
+            members.iter().map(|m| member_name(&db, m)).collect();
+        assert!(names.contains("x"), "Vector2.x member enumerated");
+        assert!(names.contains("y"), "Vector2.y member enumerated");
+        // Every enumerated builtin member resolves by-name to the same kind.
+        for m in &members {
+            let (_, looked) = db
+                .lookup_builtin_member("Vector2", &member_name(&db, m))
+                .expect("builtin member resolves by name");
+            assert_eq!(
+                std::mem::discriminant(m),
+                std::mem::discriminant(&looked),
+                "{} kind agrees",
+                member_name(&db, m)
+            );
+        }
+        assert!(db.builtin_members("NotAType").is_none());
+    }
+
+    /// An inline dump with two utilities and the `Error` / `Key` global enums — the portable way
+    /// to pin `print`/`randi` (utilities) and `OK`/`KEY_ESCAPE` (global-enum values), neither of
+    /// which the trimmed fixture carries in full (and which the stock dump exposes through enums,
+    /// not the empty `global_constants` array).
+    fn mini_globals_db() -> NativeDb {
+        NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "utility_functions": [
+                    {"name": "print", "category": "general", "is_vararg": true, "hash": 1,
+                     "arguments": []},
+                    {"name": "randi", "category": "random", "is_vararg": false, "hash": 2,
+                     "return_type": "int"}
+                ],
+                "global_enums": [
+                    {"name": "Error", "is_bitfield": false,
+                     "values": [{"name": "OK", "value": 0}, {"name": "FAILED", "value": 1}]},
+                    {"name": "Key", "is_bitfield": false,
+                     "values": [{"name": "KEY_NONE", "value": 0},
+                                {"name": "KEY_ESCAPE", "value": 4194305}]}
+                ]
+            }"#,
+        )
+        .expect("mini globals dump")
+    }
+
+    #[test]
+    fn utilities_enumerable_and_count_matches() {
+        let db = mini_globals_db();
+        let names: Vec<&str> = db.utilities().map(|u| db.name_of(u.name)).collect();
+        assert!(names.contains(&"print"), "print is a utility");
+        assert!(names.contains(&"randi"), "randi is a utility");
+        assert_eq!(
+            db.utilities().count(),
+            db.utility_count(),
+            "enumeration count equals utility_count()"
+        );
+        // Sorted (deterministic) order.
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted, "utilities() yields a name-sorted order");
+    }
+
+    #[test]
+    fn class_and_builtin_names_enumerated_sorted() {
+        let db = trimmed_db();
+        let classes: Vec<&str> = db.class_names().collect();
+        assert!(classes.contains(&"Node"), "Node enumerated: {classes:?}");
+        assert!(classes.contains(&"Object"), "Object enumerated");
+        let mut sorted = classes.clone();
+        sorted.sort_unstable();
+        assert_eq!(classes, sorted, "class_names() is name-sorted");
+
+        let builtins: Vec<&str> = db.builtin_names().collect();
+        assert!(builtins.contains(&"Color"), "Color builtin enumerated");
+        assert!(builtins.contains(&"Vector2"), "Vector2 builtin enumerated");
+        let mut bsorted = builtins.clone();
+        bsorted.sort_unstable();
+        assert_eq!(builtins, bsorted, "builtin_names() is name-sorted");
+
+        // Empty DB yields nothing, never panics.
+        let empty = NativeDb::empty();
+        assert_eq!(empty.class_names().count(), 0);
+        assert_eq!(empty.builtin_names().count(), 0);
+    }
+
+    #[test]
+    fn enum_constants_global_and_scoped() {
+        // Global enum (`Error`) values via `enum_constants(None, "Error")`.
+        let db = mini_globals_db();
+        let mut err = db.enum_constants(None, "Error");
+        err.sort_unstable();
+        assert_eq!(
+            err,
+            vec!["FAILED", "OK"],
+            "global Error enum values, sorted"
+        );
+        assert!(
+            db.enum_constants(None, "NotAnEnum").is_empty(),
+            "unknown enum → empty"
+        );
+
+        // Class-scoped enum, including inherited up the chain.
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Base", "is_instantiable": true,
+                     "enums": [{"name": "Mode", "is_bitfield": false,
+                                "values": [{"name": "MODE_A", "value": 0},
+                                           {"name": "MODE_B", "value": 1}]}]},
+                    {"name": "Derived", "inherits": "Base", "is_instantiable": true}
+                ]
+            }"#,
+        )
+        .expect("scoped enum dump");
+        // Looked up on the declaring class.
+        assert_eq!(
+            db.enum_constants(Some("Base"), "Mode"),
+            vec!["MODE_A", "MODE_B"]
+        );
+        // Inherited: `Derived` reaches `Base.Mode` up the `inherits` chain.
+        assert_eq!(
+            db.enum_constants(Some("Derived"), "Mode"),
+            vec!["MODE_A", "MODE_B"],
+            "a class-scoped enum is found up the inherits chain"
+        );
+    }
+
+    #[test]
+    fn global_enum_values_enumerable() {
+        let db = mini_globals_db();
+        let vals: std::collections::HashMap<&str, (&str, i64)> = db
+            .global_enum_values()
+            .map(|(name, owner, v)| (name, (owner, v)))
+            .collect();
+        assert_eq!(
+            vals.get("OK"),
+            Some(&("Error", 0)),
+            "OK is a value of the Error global enum"
+        );
+        assert_eq!(
+            vals.get("KEY_ESCAPE").map(|(o, _)| *o),
+            Some("Key"),
+            "KEY_ESCAPE is a value of the Key global enum"
+        );
+        // Cross-check against the single reverse lookup the analyzer already uses.
+        assert_eq!(db.global_enum_value("OK"), Some(("Error".to_owned(), 0)));
+
+        // The enums themselves enumerate too.
+        let enum_names: Vec<&str> = db.global_enums().map(|e| db.name_of(e.name)).collect();
+        assert_eq!(
+            enum_names,
+            vec!["Error", "Key"],
+            "global enums, name-sorted"
+        );
+
+        // `global_constants` is genuinely empty on this (and the stock) dump — the iterator is
+        // present and correct, it just has nothing to yield.
+        assert_eq!(db.global_constants().count(), 0);
     }
 }

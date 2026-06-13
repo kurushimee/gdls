@@ -16,7 +16,7 @@ pub mod token;
 
 pub use ast::ParseTree;
 pub use doc_comments::{ClassDoc, DocTable, MemberDoc};
-pub use lexer::{LexError, Lexer};
+pub use lexer::{tokenize, LexError, Lexer};
 pub use span::{ByteSpan, LineCol, LineColRange};
 pub use token::{Literal, Token, TokenKind};
 
