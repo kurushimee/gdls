@@ -5457,20 +5457,31 @@ fn is_valid_rename_identifier(name: &str) -> bool {
     matches!(content.as_slice(), [gd_syntax::TokenKind::Identifier])
 }
 
-/// The corruption firewall: refuse a rename whose target is NOT an editable project source. Three
-/// POSITIVE signals (any one refuses) — deliberately NOT "filter `references` output for stub
-/// URIs", which is a no-op (stub pages are never indexed, so `references` can never return one):
-///   1. the request file itself is a materialized stub (`is_stub_uri`) — the user opened an API
-///      page and tried to rename a symbol inside it;
-///   2. the cursor name IS a native engine class (`native.class_named`) — even when stub
-///      materialization is unavailable, so [`definition`] would return `None`;
-///   3. [`definition`] resolves the cursor symbol into a stub page — this is what catches a NATIVE
-///      MEMBER access from a project file (`node.queue_free()`): `references` would happily return
-///      every `queue_free` occurrence project-wide, so without this gate a rename would mass-edit
-///      calls to an engine method. The declaring site lands in the stub cache → refuse.
+/// The corruption firewall — **fail-CLOSED**: refuse a rename unless the cursor target positively
+/// resolves to an editable PROJECT symbol. An earlier fail-OPEN version only enumerated specific
+/// native categories (classes + stubbed members) and silently let through builtins (`Vector2`),
+/// `@GlobalScope` enum values (`SIDE_LEFT`/`OK`/`KEY_ESCAPE`), global utilities (`print`), and
+/// native constants — each of which `references` then mass-edited via a raw current-file scan
+/// (every occurrence of the engine name), corrupting source with `error: None`. The inverted gate
+/// closes that whole class of holes at once.
 ///
-/// Returns `Some(refusal)` to refuse, `None` when the target is an editable project symbol (a
-/// project class_name / member / local — those flow on to validation + edit assembly).
+/// Refusal signals (any one refuses):
+///   1. the request file itself is a materialized stub (`is_stub_uri`) — the user opened an API
+///      page and tried to rename a symbol inside it.
+///   2. the cursor name resolves to ANY engine symbol in the native DB —
+///      `class_named` / `builtin_named` / `singleton_type` / `global_enum_value` / `utility` /
+///      `global_constant`. This is the positive native catch for symbols [`definition`] has no arm
+///      for (builtins, global enum values, utilities) and so would let pass.
+///   3. [`definition`] resolves the cursor symbol into a stub page — catches a NATIVE MEMBER access
+///      through dotted access (`node.queue_free()`), whose declaring site lands in the stub cache.
+///   4. fail-closed residue: a NON-method target that classifies as [`NonMethodTarget::Unresolved`]
+///      with NO project declaration (`find_in_file_definition` / `find_global_class_definition`
+///      both miss) cannot be confirmed an editable project symbol → refuse rather than raw-scan it.
+///      A project class_name / member / function-local all have a project declaration (or classify
+///      as `Member`/`Local`) and pass; only the genuinely-unresolvable residue is refused.
+///
+/// Returns `Some(refusal)` to refuse, `None` when the target is an editable project symbol (project
+/// class_name / member / local / signal — those flow on to validation + edit assembly).
 fn rename_native_or_stub_refusal(
     state: &mut ServerState,
     uri: &Uri,
@@ -5478,7 +5489,7 @@ fn rename_native_or_stub_refusal(
     position: Position,
 ) -> Option<RequestRefusal> {
     // Own the stub root so the immutable `state.options` borrow doesn't straddle the mutable
-    // `definition(state, ..)` call in step (3).
+    // `definition(state, ..)` / analyze calls below.
     let stub_root = state.options.stub_cache_dir.clone();
     // (1) The request file is a stub page.
     if crate::stubs::is_stub_uri(uri, stub_root.as_deref()) {
@@ -5486,15 +5497,16 @@ fn rename_native_or_stub_refusal(
             "Cannot rename inside a generated API stub",
         ));
     }
-    // (2) The cursor name is a native engine class.
-    if state.workspace.native.class_named(name).is_some() {
+    // (2) The cursor name resolves to an engine symbol of ANY kind. `definition` has no arm for
+    // builtins / global enum values / utilities, so they must be caught here positively or they
+    // would slip through to the raw current-file scan.
+    if rename_name_is_engine_symbol(state, name) {
         return Some(RequestRefusal::not_editable(format!(
             "Cannot rename the native symbol `{name}`"
         )));
     }
     // (3) The symbol resolves (via the definition pipeline) into a stub page — the native-member
-    // case. Reuse `definition` verbatim so the native-vs-project decision is the analyzer's, not a
-    // re-implementation. A project symbol resolves to a project file (not a stub) and passes.
+    // case. Reuse `definition` verbatim so the native-vs-project decision is the analyzer's.
     let def_params = GotoDefinitionParams {
         text_document_position_params: TextDocumentPositionParams {
             text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
@@ -5503,14 +5515,110 @@ fn rename_native_or_stub_refusal(
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: lsp_types::PartialResultParams::default(),
     };
-    if let Some(GotoDefinitionResponse::Scalar(loc)) = definition(state, def_params) {
+    if let Some(GotoDefinitionResponse::Scalar(loc)) = definition(state, def_params.clone()) {
         if crate::stubs::is_stub_uri(&loc.uri, stub_root.as_deref()) {
             return Some(RequestRefusal::not_editable(format!(
                 "Cannot rename the native symbol `{name}`"
             )));
         }
     }
+    // (4) Fail-closed residue: confirm the target is a project symbol, else refuse. A method/signal
+    // ROLE is exempt here — it resolves through the references method path, and a native method in
+    // that role was already caught by (2)/(3); a project method has an in-file declaration. For a
+    // NON-method target, require a positive project signal: an in-file member declaration, a
+    // project `class_name`, a function-local, or a `Member`-classified use. Anything else is the
+    // unresolvable residue (`extends UnknownThing`, an unknown global) that we must not raw-scan.
+    if !rename_target_has_project_anchor(state, uri, name, position) {
+        return Some(RequestRefusal::not_editable(format!(
+            "Cannot rename `{name}`: it does not resolve to an editable project symbol"
+        )));
+    }
     None
+}
+
+/// `true` iff `name` is any engine symbol the native DB knows — a class, a builtin type, a
+/// singleton, a `@GlobalScope` enum value, a `@GlobalScope` utility, or a `@GlobalScope` constant.
+/// The positive-native half of the fail-closed gate (signal 2). Pure DB lookups, no analysis.
+fn rename_name_is_engine_symbol(state: &ServerState, name: &str) -> bool {
+    let db = &state.workspace.native;
+    db.class_named(name).is_some()
+        || db.builtin_named(name).is_some()
+        || db.singleton_type(name).is_some()
+        || db.global_enum_value(name).is_some()
+        || db.utility(name).is_some()
+        || db.global_constant(name).is_some()
+}
+
+/// `true` iff the cursor target positively resolves to an editable PROJECT declaration — the
+/// fail-closed gate's signal 4. A method/signal ROLE (declaration click or dotted call) is treated
+/// as anchored (native methods were already refused by signals 2/3; project methods have an in-file
+/// declaration). Otherwise require one of: an in-file root-class member declaration, a project
+/// `class_name`, an enclosing-function local/param, or a `Member`-classified analyzer use at the
+/// cursor span. The genuinely-unresolvable residue (unknown identifiers, `extends UnknownThing`)
+/// returns `false` → the caller refuses.
+///
+/// KNOWN LIMITATION (deliberate, fail-closed side effect — track as a follow-up issue): a *project*
+/// `@GlobalScope`-style enum VALUE (`enum E { NORTH }`; cursor on `NORTH`) and an autoload singleton
+/// NAME both lack a project anchor here — `classify_non_method_target` excludes `EnumValue`, and
+/// `member_named` matches an enum's own name, not its values — so they now REFUSE where the prior
+/// fail-open path raw-scanned and edited them. This is the refuse-rather-than-corrupt stance
+/// (renaming an enum value by raw text scan is exactly the W16 grep-rename), not a regression to fix
+/// by widening the gate (which would reopen the native-enum-value hole). Enum TYPE names and
+/// members rename normally.
+fn rename_target_has_project_anchor(
+    state: &mut ServerState,
+    uri: &Uri,
+    name: &str,
+    position: Position,
+) -> bool {
+    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
+        return false;
+    };
+    let key = CanonicalKey::for_uri(uri);
+    let parsed = state.workspace.parse(&key, &text);
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    let byte = mapper.position_to_byte(position);
+    let Some(node_id) = parsed.tree.innermost_node_at(byte) else {
+        return false;
+    };
+
+    // Method/signal role → anchored (see fn doc).
+    if is_member_or_attribute_ident(&parsed.tree, node_id) {
+        return true;
+    }
+    // In-file root-class member declaration / use resolvable in this file.
+    if find_in_file_definition(&parsed.tree, name, uri, &mapper).is_some() {
+        return true;
+    }
+    // Enclosing-function local or parameter.
+    if enclosing_function_declaring(&parsed.tree, byte, name).is_some() {
+        return true;
+    }
+    // A project `class_name` (declared in any project file).
+    if find_global_class_definition(state, name).is_some() {
+        return true;
+    }
+    // A `Member`-classified analyzer use at the cursor span (cross-file member read/write through a
+    // typed var — `other.speed`): the analyzer resolved it to a declaring project file.
+    let current_path = crate::uri::uri_to_path(uri);
+    let current_fid = current_path
+        .as_deref()
+        .and_then(|p| state.workspace.index.file_id(p));
+    if let Some(p) = current_path
+        .as_deref()
+        .filter(|p| p.extension() == Some("gd"))
+    {
+        let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+        let node_span = parsed.tree.get(node_id).span;
+        if matches!(
+            classify_non_method_target(&parsed.tree, &result, node_span, byte, name, current_fid),
+            NonMethodTarget::Member(_) | NonMethodTarget::Local(_)
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 /// `textDocument/prepareRename` (#66): pre-flight a rename at the cursor. Resolves the symbol under
@@ -5614,9 +5722,31 @@ pub fn rename(
     }
 
     // A no-op rename (same name) is vacuously valid — return an empty edit rather than running the
-    // collision check against the symbol's own declaration (which would always "collide").
+    // collision checks against the symbol's own declaration (which would always "collide").
     if new_name == old_name {
         return Ok(Some(empty_workspace_edit(state)));
+    }
+
+    // (3b) New-name GLOBAL collision (independent of the old-name fail-closed gate): when the
+    // cursor target is a project `class_name` (a class-level rename), the new name must not clash
+    // with a NATIVE class / builtin / singleton (renaming `class_name Hero` → `Node` would declare
+    // `class_name Node`, shadowing the engine class) NOR with an already-registered project
+    // `class_name` in ANOTHER file (two files declaring the same global class). Both produce a
+    // global-registry collision the same-file [`rename_collision`] below cannot see.
+    let renaming_project_class = state.workspace.index.registry().contains(&old_name);
+    if renaming_project_class {
+        if rename_name_is_engine_symbol(state, &new_name) {
+            return Err(RequestRefusal::invalid_name(format!(
+                "Cannot rename to `{new_name}`: it is a native engine type"
+            )));
+        }
+        // Another file already declares this `class_name`. (The symbol being renamed is `old_name`,
+        // so `new_name == old_name` was already returned above — any hit here is a genuine clash.)
+        if state.workspace.index.registry().contains(&new_name) {
+            return Err(RequestRefusal::invalid_name(format!(
+                "Cannot rename to `{new_name}`: a project class named `{new_name}` already exists"
+            )));
+        }
     }
 
     // (4) The new name must not collide with an existing member/local in the affected scope.

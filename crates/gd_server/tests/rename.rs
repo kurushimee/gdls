@@ -324,6 +324,72 @@ fn cross_file_rename_edits_equal_references_documentchanges_shape() {
     shutdown(&client, server);
 }
 
+#[test]
+fn cross_file_member_rename_succeeds_and_equals_references() {
+    // A cross-file MEMBER rename (the harder half of criterion 2, and the path the fail-closed gate
+    // could subtly break — it is admitted via classify→Member, signal #5). `var speed` is declared
+    // in `lib.gd` (class_name Lib) and read through a typed var in `a.gd` (`l.speed`). Renaming
+    // `speed` at its declaration must edit BOTH files and the edited set must EQUAL `references`.
+    let project = common::sample_project();
+    project.write(
+        "src/lib.gd",
+        "class_name Lib\nextends Node\n\nvar speed: int = 5\n",
+    );
+    project.write(
+        "src/a.gd",
+        "extends Node\n\nfunc run() -> void:\n\tvar l: Lib = Lib.new()\n\tl.speed = 9\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/lib.gd", "src/a.gd"],
+        2,
+    );
+    let lib_uri = file_uri(&project.root.join("src/lib.gd"));
+    let a_uri = file_uri(&project.root.join("src/a.gd"));
+
+    // `var speed: int = 5` is line 3 of lib.gd; `speed` at column 4.
+    let ref_set = references_set(&client, 10, &lib_uri, 3, 4);
+    assert!(
+        ref_set.iter().any(|(u, _)| *u == lib_uri.as_str()),
+        "references must include the lib.gd declaration: {ref_set:?}"
+    );
+    assert!(
+        ref_set.iter().any(|(u, _)| *u == a_uri.as_str()),
+        "references must include the a.gd use site: {ref_set:?}"
+    );
+
+    client
+        .sender
+        .send(request(
+            11,
+            "textDocument/rename",
+            rename_params(&lib_uri, 3, 4, "velocity"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "cross-file member rename must succeed: {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    assert_eq!(
+        view.set, ref_set,
+        "cross-file member edited set must equal the references set"
+    );
+    assert!(
+        view.new_texts.iter().all(|t| t == "velocity"),
+        "every edit writes the new name, got {:?}",
+        view.new_texts
+    );
+
+    shutdown(&client, server);
+}
+
 // `lsp_types::Uri` trips `clippy::mutable_key_type` as a HashMap key (it caches parsed components
 // in a `Cell`); the `changes` map IS `HashMap<Uri, _>` by the LSP wire shape, and we only read it.
 #[allow(clippy::mutable_key_type)]
@@ -685,10 +751,36 @@ const NODE_WITH_METHOD_API: &str = r#"{
     ]
 }"#;
 
-/// Boot a project whose `main.gd` calls a native method both ways, with a real stub cache dir so the
-/// definition→stub gate step has somewhere to materialize. Returns (client, server thread, main uri).
-fn boot_native_member(
+/// A richer native dump for the fail-closed-gate tests: `Object ← Node`, the `Vector2` builtin, a
+/// `@GlobalScope` `Side` enum (value `SIDE_LEFT`), an `Error` enum (value `OK`), and the `print`
+/// utility. These are exactly the engine-symbol categories the OLD fail-open gate let through — a
+/// rename clicked on any of them must now refuse.
+const RICH_NATIVE_API: &str = r#"{
+    "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
+    "global_enums": [
+        {"name": "Side", "values": [{"name": "SIDE_LEFT", "value": 0}, {"name": "SIDE_RIGHT", "value": 2}]},
+        {"name": "Error", "values": [{"name": "OK", "value": 0}, {"name": "FAILED", "value": 1}]}
+    ],
+    "utility_functions": [
+        {"name": "print", "category": "general", "is_vararg": true, "arguments": []}
+    ],
+    "builtin_classes": [
+        {"name": "Vector2", "members": [{"name": "x", "type": "float"}, {"name": "y", "type": "float"}]}
+    ],
+    "classes": [
+        {"name": "Object", "is_instantiable": true},
+        {"name": "Node", "inherits": "Object", "is_instantiable": true,
+         "methods": [{"name": "queue_free", "is_const": false, "is_static": false,
+                      "is_vararg": false, "is_virtual": false, "hash": 1, "arguments": []}]}
+    ]
+}"#;
+
+/// Boot a project whose `main.gd` exercises a native target, with a real stub cache dir so the
+/// definition→stub gate step has somewhere to materialize. `api` is the `extension_api.json` body.
+/// Returns (client, server thread, main uri, project).
+fn boot_native_member_with_api(
     src: &str,
+    api: &str,
 ) -> (
     Connection,
     std::thread::JoinHandle<anyhow::Result<()>>,
@@ -697,7 +789,7 @@ fn boot_native_member(
 ) {
     let project = TempProject::new();
     project.write("project.godot", "config_version=5\n");
-    project.write("extension_api.json", NODE_WITH_METHOD_API);
+    project.write("extension_api.json", api);
     project.write("main.gd", src);
     let stub_cache = project.root.join("stub-cache");
 
@@ -736,6 +828,18 @@ fn boot_native_member(
         .unwrap();
     while common::try_recv(&client, std::time::Duration::from_millis(400)).is_some() {}
     (client, handle, main_uri, project)
+}
+
+/// The native-member fixture (the original two tests' rig): `Node` with `queue_free`.
+fn boot_native_member(
+    src: &str,
+) -> (
+    Connection,
+    std::thread::JoinHandle<anyhow::Result<()>>,
+    Uri,
+    TempProject,
+) {
+    boot_native_member_with_api(src, NODE_WITH_METHOD_API)
 }
 
 /// Send a rename and assert it refused for the NATIVE reason specifically: `error.is_some()`, zero
@@ -797,4 +901,171 @@ fn rename_refuses_native_member_typed_attribute_call() {
     // Line 3 is `\tn.queue_free()`; `queue_free` starts after `\tn.` → column 3.
     assert_rename_refused_native(&client, 61, &main_uri, 3, 3);
     shutdown(&client, server);
+}
+
+// =================================================================================================
+// BLOCKER-1 regression: the fail-OPEN holes the inverted (fail-closed) gate must now close. Each of
+// these was proven to emit a corrupting edit with `error: None` under the old gate — a click on a
+// builtin type, a @GlobalScope enum value, or a global utility, all of which `references` then
+// raw-scanned in the current file. The fixed gate refuses each with -32803 + zero edits.
+// =================================================================================================
+
+#[test]
+fn rename_refuses_builtin_typed_cursor() {
+    // `var v: Vector2 = Vector2()` clicked on the `Vector2` TYPE annotation. `Vector2` is a builtin
+    // (it lives in `builtin_named`, NOT `class_named` — the exact hole the old gate missed).
+    let src = "extends Node\nfunc go() -> void:\n\tvar v: Vector2 = Vector2()\n";
+    let (client, server, main_uri, _project) = boot_native_member_with_api(src, RICH_NATIVE_API);
+    // Line 2 `\tvar v: Vector2 ...`: tab(col0) + `var v: `(cols1-7) → `Vector2` at col 8.
+    assert_rename_refused_native(&client, 70, &main_uri, 2, 8);
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_refuses_global_enum_value() {
+    // `var d = SIDE_LEFT` clicked on `SIDE_LEFT` — a @GlobalScope enum value (`global_enum_value`),
+    // which `definition()` has no arm for, so the old gate passed and `references` edited the
+    // engine constant in-file.
+    let src = "extends Node\nfunc go() -> void:\n\tvar d = SIDE_LEFT\n";
+    let (client, server, main_uri, _project) = boot_native_member_with_api(src, RICH_NATIVE_API);
+    // Line 2 `\tvar d = SIDE_LEFT`: tab(col0) + `var d = `(cols1-8) → `SIDE_LEFT` at col 9.
+    assert_rename_refused_native(&client, 71, &main_uri, 2, 9);
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_refuses_global_utility() {
+    // `print("hi")` clicked on `print` — a @GlobalScope utility (`utility`). A bare callee that
+    // classifies as Unresolved, so the old gate passed and `references` raw-scanned `print` in-file.
+    let src = "extends Node\nfunc go() -> void:\n\tprint(\"hi\")\n";
+    let (client, server, main_uri, _project) = boot_native_member_with_api(src, RICH_NATIVE_API);
+    // Line 2 `\tprint("hi")`: tab(col0) → `print` at col 1.
+    assert_rename_refused_native(&client, 72, &main_uri, 2, 1);
+    shutdown(&client, server);
+}
+
+// =================================================================================================
+// BLOCKER-2 regression: the NEW NAME side. Renaming a project `class_name` to an engine type or to
+// an already-registered project `class_name` is a global-registry collision the same-file member
+// check cannot see — both must refuse with -32602 + zero edits.
+// =================================================================================================
+
+/// Assert a rename refused with the INVALID-NAME code (-32602), zero edits — the new-name-side
+/// (BLOCKER-2) refusal, distinct from the native-target -32803 refusal.
+fn assert_rename_refused_invalid_name(
+    client: &Connection,
+    id: i32,
+    uri: &Uri,
+    line: u32,
+    ch: u32,
+    new_name: &str,
+) {
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/rename",
+            rename_params(uri, line, ch, new_name),
+        ))
+        .unwrap();
+    let resp = recv_response(client);
+    assert!(
+        resp.error.is_some(),
+        "rename to {new_name:?} must refuse (result={:?})",
+        resp.result
+    );
+    assert!(
+        resp.result.is_none(),
+        "a refused rename must carry ZERO edits, got {:?}",
+        resp.result
+    );
+    assert_eq!(
+        resp.error.unwrap().code,
+        -32602,
+        "new-name collision must use InvalidParams (-32602)"
+    );
+}
+
+#[test]
+fn rename_class_to_native_type_refused() {
+    // `class_name Hero` → `Node` (an engine class): would declare `class_name Node`, colliding with
+    // the engine class. Refuse on the NEW-NAME side (-32602), zero edits.
+    let src = "class_name Hero\nextends Node\n\nfunc attack() -> void:\n\tpass\n";
+    let (client, server, main_uri, _project) = boot_native_member_with_api(src, RICH_NATIVE_API);
+    // `class_name Hero`: `Hero` at col 11.
+    assert_rename_refused_invalid_name(&client, 80, &main_uri, 0, 11, "Node");
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_class_to_existing_project_class_refused() {
+    // `class_name Hero` → `Villain`, where `Villain` is ALREADY a project `class_name` in another
+    // file: two files would declare the same global class. Refuse on the NEW-NAME side (-32602).
+    let api = RICH_NATIVE_API;
+    let project = TempProject::new();
+    project.write("project.godot", "config_version=5\n");
+    project.write("extension_api.json", api);
+    project.write(
+        "hero.gd",
+        "class_name Hero\nextends Node\n\nfunc attack() -> void:\n\tpass\n",
+    );
+    project.write("villain.gd", "class_name Villain\nextends Node\n");
+    let stub_cache = project.root.join("stub-cache");
+
+    let (server, client) = Connection::memory();
+    let handle = std::thread::spawn(move || gd_server::serve(server));
+    let init = InitializeParams {
+        initialization_options: Some(serde_json::json!({
+            "projectRoot": project.root.as_str(),
+            "extensionApiPath": project.root.join("extension_api.json").as_str(),
+            "autoDumpExtensionApi": false,
+            "stubCacheDir": stub_cache.as_str(),
+        })),
+        capabilities: serde_json::from_value(caps_full()).unwrap(),
+        ..Default::default()
+    };
+    client.sender.send(request(1, "initialize", init)).unwrap();
+    let _ = recv_response(&client);
+    client
+        .sender
+        .send(notification("initialized", InitializedParams {}))
+        .unwrap();
+    let hero_uri = file_uri(&project.root.join("hero.gd"));
+    let hero_text = std::fs::read_to_string(project.root.join("hero.gd").as_std_path()).unwrap();
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: hero_uri.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 1,
+                    text: hero_text,
+                },
+            },
+        ))
+        .unwrap();
+    while common::try_recv(&client, std::time::Duration::from_millis(400)).is_some() {}
+
+    // `class_name Hero`: `Hero` at col 11. Rename → `Villain` (already a project class_name).
+    assert_rename_refused_invalid_name(&client, 81, &hero_uri, 0, 11, "Villain");
+
+    // Sanity: renaming to a FREE class name still succeeds (the registry check is not over-broad).
+    client
+        .sender
+        .send(request(
+            82,
+            "textDocument/rename",
+            rename_params(&hero_uri, 0, 11, "Paladin"),
+        ))
+        .unwrap();
+    let ok = recv_response(&client);
+    assert!(
+        ok.error.is_none(),
+        "renaming a class to a free name must still succeed: {:?}",
+        ok.error
+    );
+
+    shutdown(&client, handle);
 }
