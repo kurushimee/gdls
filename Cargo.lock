@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "gd_analyze"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "camino",
  "gd_project",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "gd_project"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "camino",
  "dunce",
@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "gd_server"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "anyhow",
  "camino",
@@ -221,7 +221,7 @@ dependencies = [
 
 [[package]]
 name = "gd_syntax"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "serde",
  "unicode-ident",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "gd_types"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "roxmltree",
  "rustc-hash",

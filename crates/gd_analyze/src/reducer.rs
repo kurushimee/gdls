@@ -1632,19 +1632,57 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
+    // 9b. Utility function referenced as a first-class Callable (analyzer.cpp:4641-4652): a
+    //    bare `print` / `len` / `floor` reduces to a constant Callable — `print.call_deferred(m)`,
+    //    `arr.map(floor)`, `var f := absi`, `const PRINTER = print`. Godot's arm checks
+    //    `Variant::has_utility_function || GDScriptUtilityFunctions::function_exists`; gdls
+    //    mirrors with the NativeDb utility table (Variant utilities, extension_api.json) plus
+    //    the hard-coded GDScript-only table (`gd_utility_return_type`). Godot also folds
+    //    `Callable(memnew(GDScriptUtilityCallable(name)))` into `reduced_value` and types via
+    //    `make_callable_type(method_info)`; gdls can't materialize a Callable value or carry a
+    //    MethodInfo, so an `Opaque(Callable)` fold stands in for `reduced_value`: it makes a
+    //    const initialized from a utility propagate constancy to that const's own references
+    //    (the local/member Constant arms copy the initializer's fold), and it routes invalid
+    //    operator use through Godot's reduced-operand template (`Invalid operands to operator
+    //    +, Callable and int.` — the type-only tail would emit the wrong message). The
+    //    constant-Callable shape matches the in-file member-function arm
+    //    (`lookup_class_member`'s Function arm); `is_constant` fires the constant-assignment
+    //    error for `print = 5` / `len = 5`, exactly as Godot. Skipped in callee position: a direct `print(x)`
+    //    dispatches by name through `reduce_call`'s utility arms (analyzer.cpp:3481/3517 — the
+    //    `utility_return` lookup below), and in Godot a direct call's identifier callee never
+    //    reaches this arm at all. Placed after the autoload arm because Godot checks autoloads
+    //    (analyzer.cpp:4570) before utilities (4641) — a project autoload named like a utility
+    //    shadows it — and no utility name can collide with anything steps 4-8 resolve.
+    if !ctx.reducing_callee
+        && (ctx.native.utility(&name).is_some() || gd_utility_return_type(&name).is_some())
+    {
+        ctx.folds
+            .set(id, FoldedValue::Opaque(VariantType::Callable));
+        ctx.set_type(
+            id,
+            DataType {
+                type_source: TypeSource::AnnotatedExplicit,
+                kind: DtKind::Builtin,
+                builtin_type: VariantType::Callable,
+                is_constant: true,
+                ..Default::default()
+            },
+        );
+        return;
+    }
+
     // 10. analyzer.cpp:4658-4660 — `Identifier "X" not declared in the current scope.` fires as
     //    the last fallthrough after all lookup paths are exhausted. gdls hasn't ported global
     //    enums, autoloads, or native properties fully, so we gate on: identifier has no type
     //    set, not a call callee, not self/super, not a plausible native member (walked via the
-    //    class's native base chain), not a known GDScript utility, and not starting with an
-    //    uppercase letter (likely a native class or global enum not in the trimmed DB).
+    //    class's native base chain), and not starting with an uppercase letter (likely a native
+    //    class or global enum not in the trimmed DB).
     if !ctx.reducing_callee && name != "self" && name != "super" {
         let dt = ctx.get_type(id);
         if !dt.is_set() {
             let is_native_member = is_plausible_native_member(ctx, &name);
             let is_global_like = name.starts_with(|c: char| c.is_ascii_uppercase());
-            let is_gd_utility = gd_utility_return_type(&name).is_some();
-            if !is_native_member && !is_global_like && !is_gd_utility {
+            if !is_native_member && !is_global_like {
                 ctx.push_error(
                     format!(r#"Identifier "{name}" not declared in the current scope."#),
                     id,
