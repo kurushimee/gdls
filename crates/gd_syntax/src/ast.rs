@@ -664,6 +664,72 @@ impl ParseTree {
         }
         best.map(|(id, _)| id)
     }
+
+    /// The innermost [`SuiteNode`] (block) whose span contains `byte` — the
+    /// [`Self::innermost_node_at`] restriction to `NodeKind::Suite`, used by M8 completion to find
+    /// the block a cursor sits in so it can enumerate the locals in scope there
+    /// ([`Self::locals_in_scope_at`]). Same half-open `start <= byte < end` / smallest-span /
+    /// latest-emitted-on-ties convention as [`Self::innermost_node_at`]. `None` when no block
+    /// contains the byte (e.g. the cursor is at class scope, or past the last node at
+    /// end-of-input — completion's cursor layer probes `byte` and `byte-1` to cover that edge).
+    pub fn innermost_suite_at(&self, byte: usize) -> Option<NodeId> {
+        let mut best: Option<(NodeId, u32)> = None;
+        for (i, n) in self.nodes.iter().enumerate() {
+            if matches!(n.kind, NodeKind::Suite(_)) && n.span.start <= byte && byte < n.span.end {
+                let width = (n.span.end - n.span.start) as u32;
+                match best {
+                    Some((_, best_width)) if width > best_width => {}
+                    _ => best = Some((NodeId(i as u32), width)),
+                }
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    /// Enumerate every local **in scope** at `byte`: the innermost enclosing block's locals plus
+    /// all locals of its `parent_block` ancestors, innermost-first. Because the parser records a
+    /// function's **parameters**, `for` loop variables, and `match` pattern binds as
+    /// [`SuiteNode::locals`] too (each with its [`LocalKind`]), this single `parent_block` walk
+    /// yields the *full* in-scope set — locals, params, for-vars, and pattern-binds — without a
+    /// separate [`FunctionNode::parameters`] pass.
+    ///
+    /// Two scoping rules are applied so the result is what is actually reachable at the cursor,
+    /// matching Godot's lexical scoping:
+    /// - **Not yet declared:** a local is included only if its declaration **ends at or before**
+    ///   `byte` (`source.span.end <= byte`). A `var later = …` further down the same block — or a
+    ///   variable mid-way through its own initializer (`var x = <cursor>`) — is therefore excluded,
+    ///   exactly as it is unreferenceable there. Parameters and outer-block locals always satisfy
+    ///   this (they textually precede the inner block).
+    /// - **Shadowing:** an inner binding shadows an outer one of the same name. The walk is
+    ///   innermost-first and keeps the **first** occurrence of each name, so the inner binding
+    ///   wins.
+    ///
+    /// Returns borrowed [`Local`]s in innermost-first, declaration order. Empty when `byte` is not
+    /// inside any block. Read-only and allocation-light — the M8 completion handler reconstructs
+    /// scope from the AST here because the analyzer's transient scope stack is discarded after a
+    /// pass.
+    pub fn locals_in_scope_at(&self, byte: usize) -> Vec<&Local> {
+        let mut out: Vec<&Local> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut cur = self.innermost_suite_at(byte);
+        while let Some(id) = cur {
+            let NodeKind::Suite(s) = &self.get(id).kind else {
+                break;
+            };
+            for local in &s.locals {
+                // Skip not-yet-declared bindings (declaration must complete before the cursor).
+                if self.get(local.source).span.end > byte {
+                    continue;
+                }
+                // Inner shadows outer: keep the first (innermost) occurrence of each name.
+                if seen.insert(local.name.as_str()) {
+                    out.push(local);
+                }
+            }
+            cur = s.parent_block;
+        }
+        out
+    }
 }
 
 impl std::ops::Index<NodeId> for ParseTree {
