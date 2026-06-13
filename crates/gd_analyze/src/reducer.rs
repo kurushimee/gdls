@@ -1640,11 +1640,14 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     //    the hard-coded GDScript-only table (`gd_utility_return_type`). Godot also folds
     //    `Callable(memnew(GDScriptUtilityCallable(name)))` into `reduced_value` and types via
     //    `make_callable_type(method_info)`; gdls can't materialize a Callable value or carry a
-    //    MethodInfo, so an `Opaque(Callable)` fold keeps the constancy (what makes
-    //    `const PRINTER = print` a constant initializer) and the constant-Callable shape matches
-    //    the in-file member-function arm (`lookup_class_member`'s Function arm). The
-    //    `is_constant` flag is what fires `Cannot assign a new value to a constant.` for
-    //    `print = 5`, exactly as Godot does. Skipped in callee position: a direct `print(x)`
+    //    MethodInfo, so an `Opaque(Callable)` fold stands in for `reduced_value`: it makes a
+    //    const initialized from a utility propagate constancy to that const's own references
+    //    (the local/member Constant arms copy the initializer's fold), and it routes invalid
+    //    operator use through Godot's reduced-operand template (`Invalid operands to operator
+    //    +, Callable and int.` — the type-only tail would emit the wrong message). The
+    //    constant-Callable shape matches the in-file member-function arm
+    //    (`lookup_class_member`'s Function arm); `is_constant` fires the constant-assignment
+    //    error for `print = 5` / `len = 5`, exactly as Godot. Skipped in callee position: a direct `print(x)`
     //    dispatches by name through `reduce_call`'s utility arms (analyzer.cpp:3481/3517 — the
     //    `utility_return` lookup below), and in Godot a direct call's identifier callee never
     //    reaches this arm at all. Placed after the autoload arm because Godot checks autoloads
