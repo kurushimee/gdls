@@ -2540,8 +2540,9 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
 /// incl. compound `+=`, plus each initializing `var` declaration). A collected site whose range is
 /// in that set is [`DocumentHighlightKind::WRITE`]; every other site is
 /// [`DocumentHighlightKind::READ`]. Range-equality across the two passes is sound because both
-/// derive from the same per-request [`PositionMapper`] over the same buffer (the same invariant
-/// `references`'s own `dedup_by` / declaration filter rely on). `Text` is never emitted: with the
+/// derive from per-request [`PositionMapper`]s over the same buffer text and encoding, so a span
+/// maps to an identical [`Range`] either way (the same invariant `references`'s own `dedup_by` /
+/// declaration filter rely on). `Text` is never emitted: with the
 /// AST in hand every occurrence classifies as read or write.
 ///
 /// Returns `None` (LSP wire `null`) when the cursor doesn't land on an identifier; `Some(vec)`

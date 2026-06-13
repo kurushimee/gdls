@@ -314,6 +314,13 @@ fn document_highlight_is_scoped_to_request_file() {
         Some(DocumentHighlightKind::READ),
         "the `self.hp` read must be Read; got {hls:?}"
     );
+    // Exact count: a.gd has precisely two in-file `hp` occurrences (the decl + the `self.hp` read).
+    // Asserting the count guards against silent over-collection (e.g. a cross-file leak surfacing).
+    assert_eq!(
+        hls.len(),
+        2,
+        "a.gd must have exactly 2 in-file `hp` occurrences (decl + self.hp read); got {hls:?}"
+    );
 
     // Scoping: documentHighlight returns ranges only — they carry no URI, so the proof of in-file
     // scoping is that the cross-file `a.hp` access in c.gd (line 3, col 10) is NOT among them. That
@@ -346,6 +353,82 @@ fn document_highlight_is_scoped_to_request_file() {
     assert!(
         hls_c.iter().any(|h| h.range.start == Position::new(3, 10)),
         "documentHighlight on c.gd's `a.hp` must highlight that access in c.gd; got {hls_c:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Member Read/Write — the analyzer-dependent path with no raw-scan fallback (member uses collect
+/// only via the binding `Use` records). `self.hp = 5` (attribute-assignee Write), bare `hp += 1`
+/// (compound Write), and `return self.hp` (Read) must each classify correctly when the cursor is on
+/// the member declaration. Complements the local-var case in `..._local_var_read_write_decl`.
+#[test]
+fn document_highlight_member_read_write() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    // Line 0: `class_name BClass`
+    // Line 1: `extends Node`
+    // Line 2: `var hp: int = 0`     — member decl `hp` at cols 4..6, initialized → WRITE
+    // Line 3: `func setit() -> void:`
+    // Line 4: `\tself.hp = 5`        — attribute write target `hp` at cols 6..8 (`\tself.`=6) → WRITE
+    // Line 5: `\thp += 1`            — bare compound-assign LHS `hp` at cols 1..3 → WRITE
+    // Line 6: `func getit() -> int:`
+    // Line 7: `\treturn self.hp`     — read `hp` at cols 13..15 (`\treturn self.`=13) → READ
+    p.write(
+        "b.gd",
+        "class_name BClass\nextends Node\nvar hp: int = 0\nfunc setit() -> void:\n\tself.hp = 5\n\thp += 1\nfunc getit() -> int:\n\treturn self.hp\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["b.gd"]);
+
+    let uri = file_uri(&p.root.join("b.gd"));
+    // Click on the member declaration `var hp` (line 2, col 5).
+    client
+        .sender
+        .send(request(
+            40,
+            "textDocument/documentHighlight",
+            highlight_params(&uri, 2, 5),
+        ))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "documentHighlight errored: {:?}",
+        resp.error
+    );
+    let hls: Vec<DocumentHighlight> =
+        serde_json::from_value(resp.result.expect("documentHighlight result")).unwrap();
+
+    let kind_at = |line: u32, character: u32| -> DocumentHighlightKind {
+        hls.iter()
+            .find(|h| h.range.start == Position { line, character })
+            .unwrap_or_else(|| panic!("no highlight at ({line},{character}); got {hls:?}"))
+            .kind
+            .unwrap_or_else(|| panic!("highlight at ({line},{character}) has no kind; got {hls:?}"))
+    };
+    assert_eq!(
+        kind_at(2, 4),
+        DocumentHighlightKind::WRITE,
+        "the initializing member decl `var hp` must be Write; got {hls:?}"
+    );
+    assert_eq!(
+        kind_at(4, 6),
+        DocumentHighlightKind::WRITE,
+        "the `self.hp = 5` attribute write target must be Write; got {hls:?}"
+    );
+    assert_eq!(
+        kind_at(5, 1),
+        DocumentHighlightKind::WRITE,
+        "the bare `hp += 1` compound-assignment target must be Write; got {hls:?}"
+    );
+    assert_eq!(
+        kind_at(7, 13),
+        DocumentHighlightKind::READ,
+        "the `return self.hp` read must be Read; got {hls:?}"
     );
 
     shutdown(&client, server_thread);
