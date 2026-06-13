@@ -22,8 +22,50 @@ pub enum FoldedValue {
     /// analyzer.cpp:4059-4067; this subset has no vector/color representations). Carries the
     /// value's [`VariantType`] so error paths can still name the operand's kind. Participates in
     /// `is_reduced` (constancy gates) but never in value-dependent folding: binary ops validate by
-    /// type instead of evaluating, and dup-key checks treat an unknown value as never-equal.
-    Opaque(VariantType),
+    /// type instead of evaluating.
+    ///
+    /// The second field is `Some` only for a bare utility-function reference — the constant
+    /// `Callable` Godot folds as `Callable(GDScriptUtilityCallable(name))`. Carrying that identity
+    /// lets same-utility dictionary keys (`{print: 1, print: 2}`) be recognized as the same key,
+    /// while every other opaque constant (`None`) still compares as never-equal (its value is
+    /// genuinely unknown, so it can't be *proven* a duplicate).
+    Opaque(VariantType, Option<UtilityCallableId>),
+}
+
+/// The identity of a utility function referenced as a first-class `Callable` — its name and the
+/// scope `Variant::stringify` qualifies it under. Two references to the same utility carry equal
+/// ids, which is what makes `{print: 1, print: 2}` a provable duplicate-key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UtilityCallableId {
+    pub name: String,
+    pub scope: UtilityScope,
+}
+
+impl UtilityCallableId {
+    /// The callable's text form (`GDScriptUtilityCallable::get_as_text`): `@GlobalScope::print`,
+    /// `@GDScript::len`. This is the `%s` the duplicate-key diagnostic names.
+    pub fn as_text(&self) -> String {
+        format!("{}::{}", self.scope.as_str(), self.name)
+    }
+}
+
+/// Which scope a utility callable's text form is qualified under
+/// (`GDScriptUtilityCallable::Type`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UtilityScope {
+    /// A `Variant` utility (`print`, `floor`, …) → `@GlobalScope::<name>`.
+    GlobalScope,
+    /// A GDScript-only utility (`len`, `range`, …) → `@GDScript::<name>`.
+    GDScript,
+}
+
+impl UtilityScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            UtilityScope::GlobalScope => "@GlobalScope",
+            UtilityScope::GDScript => "@GDScript",
+        }
+    }
 }
 
 /// `NodeId` → its folded constant value, if the expression reduced to one.

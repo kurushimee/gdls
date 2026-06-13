@@ -23,7 +23,7 @@ use gd_syntax::token::Literal;
 use crate::binding::{Binding, BindingTargetKind as BindingSymbolKind, CalleeTarget};
 use crate::context::AnalysisContext;
 use crate::data_type::{self, DataType, DtKind, TypeSource, VariantType};
-use crate::foldtable::FoldedValue;
+use crate::foldtable::{FoldedValue, UtilityCallableId, UtilityScope};
 use crate::resolver::type_from_metatype;
 
 /// Bare identifier of the enclosing concrete (non-lambda) function, for recording
@@ -329,7 +329,7 @@ pub fn type_from_variant(value: &FoldedValue) -> DataType {
             FoldedValue::Int(_) => VariantType::Int,
             FoldedValue::Float(_) => VariantType::Float,
             FoldedValue::String(_) => VariantType::String,
-            FoldedValue::Opaque(vt) => *vt,
+            FoldedValue::Opaque(vt, _) => *vt,
         },
         ..Default::default()
     }
@@ -470,8 +470,8 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
             let lv = ctx.folds.get(l).cloned();
             let rv = ctx.folds.get(r).cloned();
             if let (Some(lv), Some(rv)) = (lv, rv) {
-                let has_opaque = matches!(lv, FoldedValue::Opaque(_))
-                    || matches!(rv, FoldedValue::Opaque(_))
+                let has_opaque = matches!(lv, FoldedValue::Opaque(..))
+                    || matches!(rv, FoldedValue::Opaque(..))
                     // Constant `"fmt %s" % x` — the format itself isn't evaluated (Godot folds
                     // it; gdls has no formatter), so route through the type tail's str_format
                     // arm and keep constancy via the Opaque result stamp.
@@ -573,7 +573,8 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
     // folds the real value; the invalid arm returns a Variant-kinded result, so the Builtin
     // gate below excludes it).
     if opaque_operand_types.is_some() && result.kind == DtKind::Builtin {
-        ctx.folds.set(id, FoldedValue::Opaque(result.builtin_type));
+        ctx.folds
+            .set(id, FoldedValue::Opaque(result.builtin_type, None));
     }
     ctx.set_type(id, result);
 }
@@ -924,7 +925,7 @@ fn eval_binary(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedV
     // An `Opaque` operand has no materialized value to evaluate — `reduce_binary_op` routes those
     // to the type-only path before calling here; this guard keeps the function total (and keeps
     // the booleanize-based logic arms below from fabricating a value).
-    if matches!(a, Opaque(_)) || matches!(b, Opaque(_)) {
+    if matches!(a, Opaque(..)) || matches!(b, Opaque(..)) {
         return None;
     }
     // Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) — Variant registers comparisons for many type
@@ -1067,7 +1068,7 @@ pub(crate) fn booleanize(v: &FoldedValue) -> bool {
         String(s) => !s.is_empty(),
         // Unreachable in practice: `eval_binary` rejects Opaque operands before its
         // booleanize-driven logic arms run. Total for safety; never trust an unknown value.
-        Opaque(_) => false,
+        Opaque(..) => false,
     }
 }
 
@@ -1081,7 +1082,7 @@ fn folded_variant_type(v: &FoldedValue) -> VariantType {
         FoldedValue::Int(_) => VariantType::Int,
         FoldedValue::Float(_) => VariantType::Float,
         FoldedValue::String(_) => VariantType::String,
-        FoldedValue::Opaque(vt) => *vt,
+        FoldedValue::Opaque(vt, _) => *vt,
     }
 }
 
@@ -1260,10 +1261,16 @@ fn fold_lua_dict_key(ctx: &mut AnalysisContext, key_id: NodeId) {
 /// `StringName/String/NodePath` are coalesced into `FoldedValue::String` so they compare equal,
 /// matching `errors/dictionary_string_stringname_equivalent.gd`.
 fn folded_value_eq(a: &FoldedValue, b: &FoldedValue) -> bool {
-    // An `Opaque` constant's value is unknown — it can never be *proven* a duplicate, so it never
-    // compares equal (`{Vector3.UP: 1, Vector3.DOWN: 2}` must not flag a phantom dup-key; Godot
-    // compares the real folded vectors).
-    if matches!(a, FoldedValue::Opaque(_)) || matches!(b, FoldedValue::Opaque(_)) {
+    // Two references to the same utility function fold to the same constant Callable
+    // (`Callable(GDScriptUtilityCallable(name))`, compared by name in Godot), so same-utility keys
+    // ARE a provable duplicate — `{print: 1, print: 2}`.
+    if let (FoldedValue::Opaque(_, Some(ua)), FoldedValue::Opaque(_, Some(ub))) = (a, b) {
+        return ua == ub;
+    }
+    // Any other `Opaque` constant's value is unknown — it can never be *proven* a duplicate, so it
+    // never compares equal (`{Vector3.UP: 1, Vector3.DOWN: 2}` must not flag a phantom dup-key;
+    // Godot compares the real folded vectors).
+    if matches!(a, FoldedValue::Opaque(..)) || matches!(b, FoldedValue::Opaque(..)) {
         return false;
     }
     a == b
@@ -1279,9 +1286,12 @@ fn folded_key_display(v: &FoldedValue) -> String {
         FoldedValue::Int(i) => i.to_string(),
         FoldedValue::Float(f) => f.to_string(),
         FoldedValue::String(s) => s.clone(),
-        // Unreachable: `folded_value_eq` never matches an Opaque key, so the dup-key error can't
-        // name one. Total for safety — render the kind, the only thing we know.
-        FoldedValue::Opaque(vt) => data_type::variant_type_name(*vt).to_owned(),
+        // A utility callable stringifies as its scoped name (`@GlobalScope::print`,
+        // `@GDScript::len`) — the one Opaque `folded_value_eq` can prove a duplicate, so the one
+        // the dup-key error can actually name.
+        FoldedValue::Opaque(_, Some(util)) => util.as_text(),
+        // Any other Opaque is never matched as a dup key; render the kind for safety.
+        FoldedValue::Opaque(vt, None) => data_type::variant_type_name(*vt).to_owned(),
     }
 }
 
@@ -1643,11 +1653,13 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     //    superset guard for any name the static list might miss. Godot also folds
     //    `Callable(memnew(GDScriptUtilityCallable(name)))` into `reduced_value` and types via
     //    `make_callable_type(method_info)`; gdls can't materialize a Callable value or carry a
-    //    MethodInfo, so an `Opaque(Callable)` fold stands in for `reduced_value`: it makes a
-    //    const initialized from a utility propagate constancy to that const's own references
-    //    (the local/member Constant arms copy the initializer's fold), and it routes invalid
-    //    operator use through Godot's reduced-operand template (`Invalid operands to operator
-    //    +, Callable and int.` — the type-only tail would emit the wrong message). The
+    //    MethodInfo, so an `Opaque(Callable, Some(UtilityCallableId))` fold stands in for
+    //    `reduced_value` — opaque value, but carrying the callable's name+scope identity so
+    //    same-utility dictionary keys (`{print: 1, print: 2}`) are still recognized as duplicates.
+    //    It makes a const initialized from a utility propagate constancy to that const's own
+    //    references (the local/member Constant arms copy the initializer's fold), and it routes
+    //    invalid operator use through Godot's reduced-operand template (`Invalid operands to
+    //    operator +, Callable and int.` — the type-only tail would emit the wrong message). The
     //    constant-Callable shape matches the in-file member-function arm
     //    (`lookup_class_member`'s Function arm); `is_constant` fires the constant-assignment
     //    error for `print = 5` / `len = 5`, exactly as Godot. Skipped in callee position: a direct `print(x)`
@@ -1661,8 +1673,25 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             || gd_types::is_variant_utility(&name)
             || gd_utility_return_type(&name).is_some())
     {
-        ctx.folds
-            .set(id, FoldedValue::Opaque(VariantType::Callable));
+        // Fold the callable's identity (Godot's `reduced_value = Callable(GDScriptUtilityCallable
+        // (name))`), so same-utility dictionary keys are recognized as duplicates. The scope
+        // mirrors that callable's constructor: GDScript-only utilities (`gd_utility_return_type`)
+        // are checked first and qualify as `@GDScript`; the Variant family is `@GlobalScope`.
+        let scope = if gd_utility_return_type(&name).is_some() {
+            UtilityScope::GDScript
+        } else {
+            UtilityScope::GlobalScope
+        };
+        ctx.folds.set(
+            id,
+            FoldedValue::Opaque(
+                VariantType::Callable,
+                Some(UtilityCallableId {
+                    name: name.clone(),
+                    scope,
+                }),
+            ),
+        );
         ctx.set_type(id, make_callable_type());
         return;
     }
@@ -3384,7 +3413,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             // fold keeps the constancy, so `match v:\n\tVector2(-1, -1):` stays a legal
             // constant pattern and `const X = Color(1, 1, 1)` stays a constant initializer.
             if call.arguments.iter().all(|&a| ctx.folds.is_reduced(a)) {
-                ctx.folds.set(id, FoldedValue::Opaque(bt));
+                ctx.folds.set(id, FoldedValue::Opaque(bt, None));
             }
             ctx.set_type(id, call_type);
             return;
@@ -5394,7 +5423,8 @@ fn reduce_identifier_from_base(
                 // an `Opaque` fold instead — downstream `is_reduced` gates still see a constant
                 // expression, while value-dependent paths (binary fold, dup-key) know there is no
                 // trustworthy value behind it.
-                ctx.folds.set(identifier_id, FoldedValue::Opaque(const_bt));
+                ctx.folds
+                    .set(identifier_id, FoldedValue::Opaque(const_bt, None));
                 return;
             }
 
@@ -6728,7 +6758,7 @@ mod tests {
                 assert!(
                     matches!(
                         result.folds.get(id),
-                        Some(FoldedValue::Opaque(VariantType::Vector3))
+                        Some(FoldedValue::Opaque(VariantType::Vector3, None))
                     ),
                     "valid op over opaque constants must stay a (kind-known) constant"
                 );

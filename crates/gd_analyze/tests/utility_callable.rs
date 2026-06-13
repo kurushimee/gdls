@@ -263,3 +263,60 @@ fn undeclared_identifier_still_errors_under_absent_db() {
         vec![r#"Identifier "blah" not declared in the current scope."#.to_owned()]
     );
 }
+
+// --- Same-utility dictionary keys ----------------------------------------------------------------
+// A bare utility folds to a constant Callable carrying its identity, so two same-utility keys are a
+// provable duplicate. Every message + line below is oracle-pinned against godot 4.6.3-stable
+// `--headless --check-only`.
+
+/// `{print: 1, print: 2}` — both keys are the Variant utility `print`, reported with the callable's
+/// `@GlobalScope::print` text form (the duplicate key is silent before utilities fold).
+#[test]
+fn duplicate_variant_utility_key_errors() {
+    let src = "extends Node\n\n\nfunc test() -> void:\n\tvar d := {print: 1, print: 2}\n";
+    assert_eq!(
+        errors(src),
+        vec![
+            r#"Key "@GlobalScope::print" was already used in this dictionary (at line 5)."#
+                .to_owned()
+        ]
+    );
+}
+
+/// The GDScript-only family qualifies under `@GDScript` (`{len: 1, len: 2}`), matching
+/// `GDScriptUtilityCallable`'s constructor precedence.
+#[test]
+fn duplicate_gdscript_utility_key_errors() {
+    let src = "extends Node\n\n\nfunc test() -> void:\n\tvar d := {len: 1, len: 2}\n";
+    assert_eq!(
+        errors(src),
+        vec![r#"Key "@GDScript::len" was already used in this dictionary (at line 5)."#.to_owned()]
+    );
+}
+
+/// Distinct utilities are distinct keys — the identity match must not over-fire.
+#[test]
+fn distinct_utility_keys_are_clean() {
+    let src = "extends Node\n\n\nfunc test() -> void:\n\tvar d := {print: 1, abs: 2}\n";
+    assert_eq!(errors(src), Vec::<String>::new());
+}
+
+/// Regression: a non-utility opaque constant (`Vector3.UP`) still compares never-equal, so distinct
+/// builtin-constant keys do not false-positive — the documented Opaque policy is preserved.
+#[test]
+fn distinct_builtin_constant_keys_are_clean() {
+    let src =
+        "extends Node\n\n\nfunc test() -> void:\n\tvar d := {Vector3.UP: 1, Vector3.DOWN: 2}\n";
+    assert_eq!(errors(src), Vec::<String>::new());
+}
+
+/// `folded_variant_type` still reports Callable for a utility callable, so an invalid operator use
+/// routes through Godot's reduced-operand template, not the type-only tail.
+#[test]
+fn utility_callable_operator_error_names_callable() {
+    let src = "extends Node\n\n\nfunc test() -> void:\n\tvar x := print + 1\n";
+    assert_eq!(
+        errors(src),
+        vec!["Invalid operands to operator +, Callable and int.".to_owned()]
+    );
+}

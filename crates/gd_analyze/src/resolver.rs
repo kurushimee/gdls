@@ -5330,7 +5330,7 @@ fn resolve_assert(ctx: &mut AnalysisContext, assert_id: NodeId) {
         if let Some(folded) = ctx.folds.get(c).cloned() {
             use crate::foldtable::FoldedValue;
             use crate::warnings::WarningCode;
-            if !matches!(folded, FoldedValue::Opaque(_)) {
+            if !matches!(folded, FoldedValue::Opaque(..)) {
                 if crate::reducer::booleanize(&folded) {
                     ctx.push_warning(WarningCode::AssertAlwaysTrue, &[], c);
                 } else {
