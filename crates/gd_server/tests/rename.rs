@@ -1244,3 +1244,45 @@ fn rename_project_method_is_click_site_independent() {
         "rename of `helper` must edit all 3 occurrences (decl + bare call + self.helper), got {bare_ranges:?}"
     );
 }
+
+#[test]
+fn rename_local_shadowing_member_targets_the_local_not_the_member() {
+    // BLOCKER-5 regression (re-review): canonicalizing to `definition()` is member-FIRST, so renaming
+    // a local/param that SHADOWS a member used to jump to the member and rename the WRONG symbol
+    // project-wide (editing the member's other-method uses, leaving the local broken). The fix skips
+    // canonicalization for locals/params. Renaming the LOCAL `total` must edit ONLY its
+    // function-scoped sites (the `var total` decl + `total += 1`), NEVER the member `total` (its decl
+    // on line 1 or its use in `g()` on line 6).
+    let src = "extends Node\nvar total: int = 0\nfunc f() -> void:\n\tvar total = 5\n\ttotal += 1\nfunc g() -> void:\n\ttotal = 9\n";
+    // member `total`: line 1 col 4; local decl: line 3 col 5; local use: line 4 col 1; member use: line 6 col 1.
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the LOCAL declaration (`var total`, line 3, col 5). Rename → `subtotal`.
+    client
+        .sender
+        .send(request(
+            75,
+            "textDocument/rename",
+            rename_params(&main_uri, 3, 5, "subtotal"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "local rename must succeed: {:?}",
+        resp.error
+    );
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    let lines: Vec<u32> = view.set.iter().map(|(_, r)| r.start.line).collect();
+    // ONLY the local's sites (lines 3, 4) — never the shadowed member's (lines 1, 6).
+    assert!(
+        lines.contains(&3) && lines.contains(&4),
+        "renaming the local must edit its decl (line 3) + use (line 4); got lines {lines:?}"
+    );
+    assert!(
+        !lines.contains(&1) && !lines.contains(&6),
+        "renaming the local must NOT touch the shadowed member (lines 1, 6) — wrong-symbol corruption; got lines {lines:?}"
+    );
+    shutdown(&client, server);
+}

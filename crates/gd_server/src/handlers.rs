@@ -5792,19 +5792,30 @@ pub fn rename(
     // complete anchor, so resolve it via `definition` and collect from THERE — making the edit set
     // click-site-INDEPENDENT. Falls back to the cursor when the target is already its own declaration
     // (definition → None / non-scalar), where the cursor set is itself complete.
-    let edit_tdp = match definition(
-        state,
-        GotoDefinitionParams {
-            text_document_position_params: tdp.clone(),
-            work_done_progress_params: WorkDoneProgressParams::default(),
-            partial_result_params: lsp_types::PartialResultParams::default(),
-        },
-    ) {
-        Some(GotoDefinitionResponse::Scalar(loc)) => TextDocumentPositionParams {
-            text_document: lsp_types::TextDocumentIdentifier { uri: loc.uri },
-            position: loc.range.start,
-        },
-        _ => tdp.clone(),
+    // Skip canonicalization for a function-local / parameter: they are function-scoped and
+    // click-site-SYMMETRIC (no method-style bare-vs-`self.`-qualified asymmetry), so the cursor set
+    // is already complete — and `definition()` is member-FIRST, so canonicalizing a local that
+    // SHADOWS a member (`func set_value(value): …` over `var value`) would jump to the member and
+    // rename the WRONG symbol project-wide, leaving the local broken. Only methods / members (which
+    // carry the bare-vs-qualified asymmetry) need the declaration anchor.
+    let is_local_or_param = enclosing_function_declaring(&parsed.tree, byte, &old_name).is_some();
+    let edit_tdp = if is_local_or_param {
+        tdp.clone()
+    } else {
+        match definition(
+            state,
+            GotoDefinitionParams {
+                text_document_position_params: tdp.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
+            },
+        ) {
+            Some(GotoDefinitionResponse::Scalar(loc)) => TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: loc.uri },
+                position: loc.range.start,
+            },
+            _ => tdp.clone(),
+        }
     };
 
     // (6) Reuse `references` (declaration + every reference) for the edit set — index/binding-backed
