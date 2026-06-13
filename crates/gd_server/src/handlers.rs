@@ -32,6 +32,11 @@ use crate::uri::{path_to_file_uri, uri_to_path, CanonicalKey};
 // alongside every other request handler — re-export so the dispatch table stays one uniform path.
 pub(crate) use crate::completion::{completion, completion_item_resolve};
 
+// M8 (#65): the signatureHelp handler lives in `crate::signature_help` (its own module, like
+// `crate::completion`) but dispatch addresses it as `handlers::signature_help` alongside every
+// other request handler — re-export so the dispatch table stays one uniform path.
+pub(crate) use crate::signature_help::signature_help;
+
 /// `textDocument/documentSymbol`: project the `gd_syntax` symbol outline into LSP's nested
 /// [`lsp_types::DocumentSymbol`] tree — kinds plus byte→position ranges, with the full declaration as
 /// `range` and the identifier as `selection_range`. Reads the shared cached parse (the same one

@@ -27,6 +27,7 @@ mod native_render;
 mod progress;
 mod router;
 mod server;
+mod signature_help;
 mod stubs;
 
 pub use server::{run, run_with_recorder, serve, serve_with_injected_watcher, serve_with_recorder};

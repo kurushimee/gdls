@@ -309,7 +309,13 @@ fn is_keyword_token(kind: TokenKind) -> bool {
 /// from the anchor, tracking depth so already-closed pairs are skipped. Returns the token index of
 /// the unclosed opener and which bracket it is, or `None` if the cursor is not inside any bracket.
 /// String literals are single tokens, so brackets inside strings are invisible to this scan (#65).
-fn enclosing_open_bracket(tokens: &[Token], anchor: Option<usize>) -> Option<(usize, TokenKind)> {
+///
+/// `pub(crate)` so `signatureHelp` (M8 #65) reuses the exact same call-site scan as call-argument
+/// completion — "which call am I in" is this primitive, not a re-implemented bracket scan.
+pub(crate) fn enclosing_open_bracket(
+    tokens: &[Token],
+    anchor: Option<usize>,
+) -> Option<(usize, TokenKind)> {
     use TokenKind::*;
     let start = anchor?;
     // Independent depth counters per bracket family so `([)` mismatches don't cross-cancel.
@@ -351,7 +357,10 @@ fn enclosing_open_bracket(tokens: &[Token], anchor: Option<usize>) -> Option<(us
 /// Count depth-0 commas between the token at `open_idx` (an opening bracket, exclusive) and the
 /// cursor — the argument index. Nested brackets and any commas inside them are skipped; layout
 /// tokens are ignored; string literals are single tokens so in-string commas never count (#65).
-fn arg_index_after(tokens: &[Token], open_idx: usize, byte: usize) -> usize {
+///
+/// `pub(crate)` so `signatureHelp` (M8 #65) derives `activeParameter` from the same comma count as
+/// call-argument completion.
+pub(crate) fn arg_index_after(tokens: &[Token], open_idx: usize, byte: usize) -> usize {
     use TokenKind::*;
     let mut commas = 0usize;
     let mut depth = 0i32;
