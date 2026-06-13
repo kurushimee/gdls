@@ -13,6 +13,7 @@ pub mod doc_xml;
 pub mod intern;
 pub mod native_db;
 pub mod type_ref;
+pub mod utility_functions;
 
 pub use doc_xml::{parse_class as parse_doc_class, DocXmlError};
 pub use intern::{Interner, Sym};
@@ -21,3 +22,4 @@ pub use native_db::{
     NativeEnum, NativeMember, Param, Property, Signal, UtilityFn,
 };
 pub use type_ref::{decode as decode_type, TypeRef};
+pub use utility_functions::{is_variant_utility, VARIANT_UTILITY_FUNCTIONS};

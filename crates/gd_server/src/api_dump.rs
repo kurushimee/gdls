@@ -691,8 +691,9 @@ mod tests {
     }
 
     /// CI guard on the vendored asset: the embedded stock dump must decompress, parse, carry
-    /// `Generic` provenance, and contain the everyday classes whose absence caused the v1.0.1
-    /// first-run false-positive storm (issue #24).
+    /// `Generic` provenance, contain the everyday classes whose absence caused the v1.0.1
+    /// first-run false-positive storm (issue #24), and ingest the full Variant utility set so the
+    /// canonical registry and the dump can never silently drift apart.
     #[test]
     fn embedded_stock_db_loads() {
         let db = embedded_stock_db().expect("embedded stock dump must ingest");
@@ -703,6 +704,23 @@ mod tests {
                 "embedded stock dump is missing {class}"
             );
         }
+        // Every canonical Variant utility must survive the ingest path
+        // (extension_api `utility_functions` → `NativeDb::utility`)...
+        for name in gd_types::VARIANT_UTILITY_FUNCTIONS {
+            assert!(
+                db.utility(name).is_some(),
+                "embedded stock dump did not ingest Variant utility {name}"
+            );
+        }
+        // ...and the dump must carry no more than the registry names (count parity ⇒ the two sets
+        // are equal, so a drift in either direction trips this guard). The dump's
+        // `utility_functions` section is the Variant family only — GDScript-only utilities live in
+        // the analyzer's hard-coded table, not the dump — so this count covers exactly the registry.
+        assert_eq!(
+            db.utility_count(),
+            gd_types::VARIANT_UTILITY_FUNCTIONS.len(),
+            "embedded dump Variant-utility count drifted from the canonical registry"
+        );
     }
 
     /// `run_dump` behavior against fake "godot" binaries (issue #25). Shell-script fixtures, so
