@@ -141,14 +141,17 @@ binding.
 **Current:** Phase 1 complete — **v1.0.7 shipped** (2026-06-13; the utility-as-Callable
 follow-ups #92, tagged on `release/v1.0.7` = v1.0.6 + #92, so the unreleased Phase 2 work on
 `main` stayed unreleased — #91's code was already in v1.0.6; v1.0.6 itself was the #88 hotfix off
-v1.0.5); Phase 2 underway: **M7 (protocol foundations) complete** — all seven issues
-(#57–#63) merged 2026-06-13, milestone closed. Per-milestone interactive checks are batched into ONE end-of-Phase-2 trial by the user
+v1.0.5); Phase 2 underway: **M7 (protocol foundations) and M8 (editing core — `completion` +
+`signatureHelp`) complete** — M7's seven issues (#57–#63) and M8's #64/#65 merged 2026-06-13,
+both milestones closed (M8 via PRs #94 completion + #95 signatureHelp, adversarially reviewed;
+a Godot-headless-LSP differential showed 99.6% completion agreement on member access).
+Per-milestone interactive checks are batched into ONE end-of-Phase-2 trial by the user
 in real work (capability captures are Claude's, headless — inventory + gaps in
 `crates/gd_server/tests/fixtures/client_caps/README.md`; deferred feel-check items in
 `docs/09 §7.4`). Phase 2 ships no per-milestone releases (deferred until the phase matures). Release notes and the full history live in
 `CHANGELOG.md`; per-milestone exit criteria in `docs/07`. Both conformance ratchets hold at
-**1.0** with empty known-failures lists; CI is green on both legs with the three-layer fuzz
-gate (`parse` + `analyze` + `index_invariants`). Standing release gate: the
+**1.0** with empty known-failures lists; CI is green on both legs with the four-layer fuzz
+gate (`parse` + `analyze` + `index_invariants` + `complete_context`). Standing release gate: the
 `scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both acceptance projects, run
 comparatively against the previous release binary (`--strict` + warning histogram; error
 baselines must hold; a nav-row walk is NOT a diagnostics gate), with the private project swept

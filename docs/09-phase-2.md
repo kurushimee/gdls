@@ -311,6 +311,16 @@ inventory and this machine's gaps). Deferred interactive items accumulate here p
 - **M7:** cancellation under editor load with no stuck UI; cold-index progress spinner
   visibility; `##` doc prose rendering in hover across editors; pull-vs-push diagnostics
   agreement observed live.
+- **M8:** completion popup feel (trigger timing, ranking, snippet placeholder navigation) and
+  `signatureHelp` popup behavior (active-parameter tracking, retrigger) in real editing across
+  the six editors. Three capability profiles (helix/neovim/zed) are walked headlessly in
+  `tests/editor_profiles.rs`; **vscode/eglot/sublime remain machine-capture gaps** (not
+  installed — see `client_caps/README.md`), so their completion/signatureHelp projections are
+  the deferred items here. The Godot-editor completion differential (member/identifier/type
+  contexts) was run headlessly and agreed 99.6% on member access — but a *human* feel-check of
+  ranking/snippet ergonomics in real editing is still the end-of-phase trial. Script-parent
+  `OVERRIDE_METHOD` completion stubs ship native-only (script-parent stubs are renderable from
+  `Interface.param_names` — a deliberate, documented follow-up, not a blocker).
 
 ## 8. Phase 2 exit criteria
 
