@@ -1389,24 +1389,43 @@ impl Lexer {
     }
 }
 
+/// Drive the lexer standalone to a flat token list, for callers that need the raw token stream
+/// without the parser (the lexer is otherwise parser-driven — `docs/01`). Runs with
+/// `multiline_mode = false`, so newline/indent/dedent tokens are **emitted** (not suppressed); a
+/// consumer doing a bracket-depth scan simply skips them. Every `LITERAL` token (including string
+/// literals) is a single token carrying its decoded value, so a downstream scan never breaks on a
+/// `)`/`,` inside a string.
+///
+/// Always terminates: [`Lexer::scan`] returns [`TokenKind::Eof`] at end-of-input (and on a long
+/// `\`-continuation run it loops rather than recurses), so the returned vector always ends with
+/// exactly one `Eof`. The companion [`Vec<LexError>`] mirrors what the parser would have collected.
+///
+/// This is **additive** — it does not touch the ported scan loop; M8 completion-context detection
+/// (`gd_server`) is its first consumer.
+#[must_use]
+pub fn tokenize(source: &str) -> (Vec<Token>, Vec<LexError>) {
+    let mut lx = Lexer::new(source);
+    let mut tokens = Vec::new();
+    loop {
+        let t = lx.scan();
+        let is_eof = t.kind == TokenKind::Eof;
+        tokens.push(t);
+        if is_eof {
+            break;
+        }
+    }
+    (tokens, lx.errors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Drive the lexer to completion (standalone, `multiline_mode = false`). Suitable for code with
-    /// no parser-driven multiline constructs.
+    /// no parser-driven multiline constructs. Thin wrapper over the public [`tokenize`] so the
+    /// existing token-shape tests below also exercise the exported entry point.
     fn lex(src: &str) -> (Vec<Token>, Vec<LexError>) {
-        let mut lx = Lexer::new(src);
-        let mut tokens = Vec::new();
-        loop {
-            let t = lx.scan();
-            let is_eof = t.kind == TokenKind::Eof;
-            tokens.push(t);
-            if is_eof {
-                break;
-            }
-        }
-        (tokens, lx.errors)
+        tokenize(src)
     }
 
     fn kinds(src: &str) -> Vec<TokenKind> {
@@ -1594,5 +1613,63 @@ mod tests {
         ] {
             let _ = lex(src);
         }
+    }
+
+    // --- The public `tokenize` entry (M8 completion consumer). ---
+
+    #[test]
+    fn tokenize_always_ends_in_exactly_one_eof() {
+        for src in [
+            "",
+            "var x = 1",
+            "print(",
+            "func f(\n\t",
+            "((((",
+            "\"unterminated",
+        ] {
+            let (toks, _errs) = tokenize(src);
+            assert_eq!(
+                toks.last().map(|t| t.kind),
+                Some(TokenKind::Eof),
+                "tokenize({src:?}) must end in Eof"
+            );
+            // Exactly one Eof, and it is last.
+            let eofs = toks.iter().filter(|t| t.kind == TokenKind::Eof).count();
+            assert_eq!(eofs, 1, "tokenize({src:?}) emitted {eofs} Eof tokens");
+        }
+    }
+
+    #[test]
+    fn tokenize_keeps_string_literal_as_one_token() {
+        // A `)`/`,` inside a string must NOT surface as punctuation — the whole quote is one token,
+        // so a downstream bracket-depth scan over `tokenize` output never breaks on in-string
+        // brackets (the #65 mandate that M8 completion relies on).
+        let (toks, _errs) = tokenize("print(\"a, b)c\", 1)");
+        let kinds: Vec<_> = toks.iter().map(|t| t.kind).collect();
+        use TokenKind::*;
+        assert_eq!(
+            kinds,
+            vec![
+                Identifier,
+                ParenthesisOpen,
+                Literal, // "a, b)c" — single token, the `,`/`)` inside are invisible
+                Comma,
+                Literal, // 1
+                ParenthesisClose,
+                Newline,
+                Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenize_emits_newlines_not_suppressed() {
+        // `multiline_mode = false`: a newline inside parens is emitted (the parser would suppress
+        // it, but the standalone consumer wants it and skips it). Pins that contract.
+        let (toks, _errs) = tokenize("max(\n1)");
+        assert!(
+            toks.iter().any(|t| t.kind == TokenKind::Newline),
+            "newline inside parens should be emitted in standalone mode"
+        );
     }
 }
