@@ -5497,16 +5497,26 @@ fn rename_native_or_stub_refusal(
             "Cannot rename inside a generated API stub",
         ));
     }
-    // (2) The cursor name resolves to an engine symbol of ANY kind. `definition` has no arm for
-    // builtins / global enum values / utilities, so they must be caught here positively or they
-    // would slip through to the raw current-file scan.
+    // (2) POSITIVE project anchor → ALLOW. A project local / parameter / member / method / class
+    // shadows any engine name (analyzer precedence: local→param→member→native), so the anchor check
+    // runs BEFORE the engine-name refusal below — otherwise a project var named `max`/`min`/`abs`
+    // (all native utilities) would be wrongly refused. `rename_target_has_project_anchor` only admits
+    // a positively-resolved project target (a native method on an untyped/script-typed base does NOT
+    // anchor — its `Binding::Call` callee has no project `script_file`).
+    if rename_target_has_project_anchor(state, uri, name, position) {
+        return None;
+    }
+    // Not project-anchored → REFUSE; pick the most specific message.
+    // (3) The cursor name is an engine symbol the native DB knows (class / builtin / singleton /
+    // global enum value / utility / constant). `definition` has no arm for most of these, so the
+    // positive name lookup is what catches builtins / enum values / utilities.
     if rename_name_is_engine_symbol(state, name) {
         return Some(RequestRefusal::not_editable(format!(
             "Cannot rename the native symbol `{name}`"
         )));
     }
-    // (3) The symbol resolves (via the definition pipeline) into a stub page — the native-member
-    // case. Reuse `definition` verbatim so the native-vs-project decision is the analyzer's.
+    // (4) The symbol resolves (via the definition pipeline) into a stub page — the native-member
+    // (dotted access on a Native-typed base) case. Reuse `definition` verbatim.
     let def_params = GotoDefinitionParams {
         text_document_position_params: TextDocumentPositionParams {
             text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
@@ -5522,18 +5532,11 @@ fn rename_native_or_stub_refusal(
             )));
         }
     }
-    // (4) Fail-closed residue: confirm the target is a project symbol, else refuse. A method/signal
-    // ROLE is exempt here — it resolves through the references method path, and a native method in
-    // that role was already caught by (2)/(3); a project method has an in-file declaration. For a
-    // NON-method target, require a positive project signal: an in-file member declaration, a
-    // project `class_name`, a function-local, or a `Member`-classified use. Anything else is the
-    // unresolvable residue (`extends UnknownThing`, an unknown global) that we must not raw-scan.
-    if !rename_target_has_project_anchor(state, uri, name, position) {
-        return Some(RequestRefusal::not_editable(format!(
-            "Cannot rename `{name}`: it does not resolve to an editable project symbol"
-        )));
-    }
-    None
+    // (5) Genuinely unresolvable residue — an unknown identifier, `extends UnknownThing`, or a
+    // native method on an untyped/script-typed base (which would otherwise raw-scan project-wide).
+    Some(RequestRefusal::not_editable(format!(
+        "Cannot rename `{name}`: it does not resolve to an editable project symbol"
+    )))
 }
 
 /// `true` iff `name` is any engine symbol the native DB knows — a class, a builtin type, a
@@ -5583,11 +5586,8 @@ fn rename_target_has_project_anchor(
         return false;
     };
 
-    // Method/signal role → anchored (see fn doc).
-    if is_member_or_attribute_ident(&parsed.tree, node_id) {
-        return true;
-    }
-    // In-file root-class member declaration / use resolvable in this file.
+    // In-file root-class member declaration / use (covers methods + vars declared in THIS file —
+    // a method-declaration click anchors here, not via the call probe below).
     if find_in_file_definition(&parsed.tree, name, uri, &mapper).is_some() {
         return true;
     }
@@ -5599,24 +5599,54 @@ fn rename_target_has_project_anchor(
     if find_global_class_definition(state, name).is_some() {
         return true;
     }
-    // A `Member`-classified analyzer use at the cursor span (cross-file member read/write through a
-    // typed var — `other.speed`): the analyzer resolved it to a declaring project file.
+    // Analyze once for the call-callee + cross-file-member anchors below.
     let current_path = crate::uri::uri_to_path(uri);
-    let current_fid = current_path
-        .as_deref()
-        .and_then(|p| state.workspace.index.file_id(p));
-    if let Some(p) = current_path
+    let Some(p) = current_path
         .as_deref()
         .filter(|p| p.extension() == Some("gd"))
-    {
-        let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
-        let node_span = parsed.tree.get(node_id).span;
-        if matches!(
-            classify_non_method_target(&parsed.tree, &result, node_span, byte, name, current_fid),
-            NonMethodTarget::Member(_) | NonMethodTarget::Local(_)
-        ) {
-            return true;
+    else {
+        return false;
+    };
+    let current_fid = state.workspace.index.file_id(p);
+    let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+
+    // A call whose callee resolves to a PROJECT Script file (bare `m()` or dotted `x.m()`) — mirror
+    // the `references` target_file resolution: `callee.script_file()` is `Some` ONLY for a project
+    // Script callee; it is `None` for a native/unresolved callee (`node.queue_free()` on an untyped
+    // OR script-typed base), which must NOT anchor — otherwise `references` raw-scans the engine
+    // method name PROJECT-WIDE. (Replaces the old blanket `is_member_or_attribute_ident` exemption,
+    // which let every dotted call through and mass-edited native methods on non-Native-typed bases.)
+    let callee_spans = callee_ident_spans(&parsed.tree);
+    let call_anchored = result.bindings().iter().any(|b| {
+        if let Binding::Call {
+            callee,
+            callee_name,
+            call_site,
+            ..
+        } = b
+        {
+            if callee_name == name {
+                if let Some(ident_span) = callee_spans.get(call_site).copied() {
+                    if ident_span.start <= byte && byte < ident_span.end {
+                        return callee.script_file().is_some();
+                    }
+                }
+            }
         }
+        false
+    });
+    if call_anchored {
+        return true;
+    }
+
+    // A `Member`/`Local`-classified analyzer use at the cursor span (cross-file member read/write
+    // through a typed var — `other.speed`): the analyzer resolved it to a declaring project file.
+    let node_span = parsed.tree.get(node_id).span;
+    if matches!(
+        classify_non_method_target(&parsed.tree, &result, node_span, byte, name, current_fid),
+        NonMethodTarget::Member(_) | NonMethodTarget::Local(_)
+    ) {
+        return true;
     }
     false
 }

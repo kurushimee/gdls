@@ -1069,3 +1069,109 @@ fn rename_class_to_existing_project_class_refused() {
 
     shutdown(&client, handle);
 }
+
+// =================================================================================================
+// BLOCKER-3 regression (re-review of the first fix): a native method on a NON-Native-typed base
+// (`n.queue_free()` where `n` is untyped/Variant or script-typed) slipped the first fix's blanket
+// method-role exemption and was raw-scanned project-wide. The positive call-callee anchor (the
+// Binding::Call callee must resolve to a project Script file) closes it. Plus the over-refusal
+// regression: a project symbol named like a @GlobalScope utility (`max`/`min`) must still rename —
+// the project anchor is checked BEFORE the engine-name refusal, so it shadows the native name.
+// =================================================================================================
+
+#[test]
+fn rename_refuses_native_method_untyped_base() {
+    // `func go(n): n.queue_free()` — `n` is UNTYPED, so `definition` returns None (no Native type to
+    // anchor) and signal 3 never fires. The first fix's blanket method-role `true` then waved this
+    // through and `references` raw-scanned `queue_free` project-wide. The positive call-callee anchor
+    // (callee has no project `script_file`) now refuses: ZERO edits, -32803.
+    let src = "extends Node\nfunc go(n) -> void:\n\tn.queue_free()\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Line 2 `\tn.queue_free()`; `queue_free` after `\tn.` → column 3.
+    client
+        .sender
+        .send(request(
+            70,
+            "textDocument/rename",
+            rename_params(&main_uri, 2, 3, "release_me"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_some() && resp.result.is_none(),
+        "a native method on an untyped base must refuse with ZERO edits (no project-wide raw-scan); \
+         got result={:?}",
+        resp.result
+    );
+    assert_eq!(
+        resp.error.unwrap().code,
+        -32803,
+        "an unrenameable (non-project) target refuses with RequestFailed (-32803)"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_succeeds_on_project_local_named_like_utility() {
+    // A project LOCAL named `max` — `db.utility("max")` is Some, so the first fix's context-free
+    // signal-2 wrongly refused it. The fixed gate checks the project anchor (enclosing-function
+    // local) FIRST, so the local shadows the native utility name and renames normally.
+    let src = "extends Node\nfunc go() -> void:\n\tvar max := 5\n\tmax += 1\n\tprint(max)\n";
+    let (client, server, main_uri, _project) = boot_native_member_with_api(src, RICH_NATIVE_API);
+    // `var max` on line 2, col 5. Rename → `limit`.
+    client
+        .sender
+        .send(request(
+            71,
+            "textDocument/rename",
+            rename_params(&main_uri, 2, 5, "limit"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "a project local named `max` must rename (project anchor shadows the utility name): {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit =
+        serde_json::from_value(resp.result.expect("rename returns a WorkspaceEdit")).unwrap();
+    let view = flatten_edit(&edit);
+    assert!(
+        view.set.len() >= 2 && view.new_texts.iter().all(|t| t == "limit"),
+        "rename of local `max` must edit its decl + uses to `limit`, got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_succeeds_on_project_member_named_like_utility() {
+    // A project MEMBER named `min` (also a utility) must STILL rename — anchored via the in-file
+    // member declaration, before the engine-name refusal.
+    let src = "extends Node\nvar min: int = 0\nfunc go() -> void:\n\tmin += 1\n";
+    let (client, server, main_uri, _project) = boot_native_member_with_api(src, RICH_NATIVE_API);
+    // `var min` on line 1, col 4. Rename → `floor_value`.
+    client
+        .sender
+        .send(request(
+            72,
+            "textDocument/rename",
+            rename_params(&main_uri, 1, 4, "floor_value"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "a project member named `min` must rename (in-file member anchor): {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit =
+        serde_json::from_value(resp.result.expect("rename returns a WorkspaceEdit")).unwrap();
+    let view = flatten_edit(&edit);
+    assert!(
+        view.set.len() >= 2 && view.new_texts.iter().all(|t| t == "floor_value"),
+        "rename of member `min` must edit its decl + use, got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
