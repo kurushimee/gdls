@@ -649,3 +649,43 @@ fn prepare_on_unnamed_script_header_returns_the_file_item() {
 
     shutdown(&client, handle);
 }
+
+#[test]
+fn refcounted_supertype_subtype_roundtrip_is_symmetric() {
+    // A bare `class_name Plain` with no `extends` implicitly extends `RefCounted`. The
+    // supertypes↔subtypes round-trip must be symmetric: walking UP from Plain reaches RefCounted,
+    // and expanding RefCounted's subtypes (from its data blob alone) must list Plain AGAIN.
+    // Regression for the PR #103 review: `extends_matches` previously returned false for
+    // `Extends::None`, so a no-`extends` script vanished when expanding `RefCounted`'s subtypes.
+    let project = NativeProject::new(&[("plain.gd", "class_name Plain\n")]);
+    let (client, handle, _) = boot(&project);
+    let uri = project.uri("plain.gd");
+    did_open(&client, &uri, "class_name Plain\n");
+
+    // `class_name Plain` → identifier `Plain` at cols 11..16.
+    let plain = prepare_one(&client, &uri, Position::new(0, 11));
+    assert_eq!(plain.name, "Plain");
+
+    // supertypes(Plain) → [RefCounted] (the implied native base).
+    let supers = supertypes_of(&client, &plain).expect("supertypes never null for a resolved item");
+    assert_eq!(
+        supers.len(),
+        1,
+        "Plain's implied supertype is RefCounted, got {supers:?}"
+    );
+    let refcounted = &supers[0];
+    assert_eq!(refcounted.name, "RefCounted");
+    assert_eq!(
+        refcounted.data.as_ref().and_then(|d| d.get("native")),
+        Some(&serde_json::Value::String("RefCounted".to_string())),
+    );
+
+    // Round-trip: subtypes(RefCounted) — driven by its data blob alone — must include Plain again.
+    let subs = subtypes_of(&client, refcounted).expect("subtypes never null for a resolved item");
+    assert!(
+        subs.iter().any(|i| i.name == "Plain" && i.uri == uri),
+        "subtypes(RefCounted) must include the no-`extends` Plain (symmetric round-trip), got {subs:?}"
+    );
+
+    shutdown(&client, handle);
+}

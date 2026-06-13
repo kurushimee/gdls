@@ -4249,7 +4249,11 @@ fn extends_matches(state: &ServerState, iface: &gd_project::Interface, ty: &Type
             }
             TypeRef::Native(_) => false,
         },
-        gd_project::Extends::None => false,
+        // A script with no `extends` implicitly extends `RefCounted` (Godot's implied base — see
+        // `project_extends_parent`), so it IS a direct subtype of the native `RefCounted`. Matching
+        // it here makes the supertypes/subtypes round-trip symmetric: a bare `class_name` reached by
+        // walking up to `RefCounted` reappears when `RefCounted`'s subtypes are expanded.
+        gd_project::Extends::None => matches!(ty, TypeRef::Native(n) if n == "RefCounted"),
     }
 }
 
