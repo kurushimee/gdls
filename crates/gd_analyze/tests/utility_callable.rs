@@ -182,3 +182,84 @@ fn local_shadowing_wins_over_utility() {
         "the int local must shadow the utility Callable"
     );
 }
+
+// --- Absent-DB provenance ------------------------------------------------------------------------
+// With NO native dump (`ApiProvenance::Absent`), `Variant::has_utility_function` is still
+// compile-time true in Godot, so a bare Variant utility must STILL reduce to a constant Callable
+// rather than fall through to `Identifier "X" not declared`. The DB-independent registry
+// (`gd_types::is_variant_utility`) is what makes this hold with no dump present.
+
+/// Error-severity messages analyzing `src` against an empty (Absent) DB.
+fn errors_absent(src: &str) -> Vec<String> {
+    let tree = gd_syntax::parse(src).tree;
+    let result = analyze(
+        &tree,
+        None,
+        "t.gd",
+        &NativeDb::empty(),
+        &NoCrossFile,
+        &policy(),
+    );
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == Severity::Error)
+        .map(|d| d.message().to_owned())
+        .collect()
+}
+
+/// Type + folded flag of the last typed occurrence of `name`, analyzed against an empty DB.
+fn ident_info_absent(src: &str, name: &str) -> (DataType, bool) {
+    let tree = gd_syntax::parse(src).tree;
+    let result = analyze(
+        &tree,
+        None,
+        "t.gd",
+        &NativeDb::empty(),
+        &NoCrossFile,
+        &policy(),
+    );
+    let mut found = (DataType::default(), false);
+    for node_id in tree.iter_ids() {
+        if let NodeKind::Identifier(ident) = &tree.get(node_id).kind {
+            if ident.name == name {
+                let dt = result.types.get(node_id);
+                if dt.is_set() {
+                    found = (dt.clone(), result.folds.is_reduced(node_id));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// The empty-DB gap: a Variant utility absent from the (empty) DB still reduces to a constant,
+/// reduced Callable — `print`/`floor` no longer false-positive `not declared` without a dump.
+#[test]
+fn variant_utility_resolves_under_absent_db() {
+    let floor_src = "extends Node\n\n\nfunc test() -> void:\n\tvar f := floor\n\tf.call(1.5)\n";
+    assert_eq!(errors_absent(floor_src), Vec::<String>::new());
+
+    let print_src =
+        "extends Node\n\n\nfunc test() -> void:\n\tvar c: Callable = print\n\tc.call(\"x\")\n";
+    assert_eq!(errors_absent(print_src), Vec::<String>::new());
+    let (dt, reduced) = ident_info_absent(print_src, "print");
+    assert_eq!(dt.kind, DtKind::Builtin);
+    assert_eq!(dt.builtin_type, VariantType::Callable);
+    assert!(
+        dt.is_constant,
+        "utility Callable must be constant under an Absent DB"
+    );
+    assert!(reduced, "utility Callable must fold under an Absent DB");
+}
+
+/// The fix is scoped to known utilities: a genuinely-undeclared lowercase identifier still errors
+/// even with no DB — step-10 is not blanket-suppressed under Absent provenance.
+#[test]
+fn undeclared_identifier_still_errors_under_absent_db() {
+    let src = "extends Node\n\n\nfunc test() -> void:\n\tblah.call_deferred(1)\n";
+    assert_eq!(
+        errors_absent(src),
+        vec![r#"Identifier "blah" not declared in the current scope."#.to_owned()]
+    );
+}

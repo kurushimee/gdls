@@ -1635,9 +1635,12 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // 9b. Utility function referenced as a first-class Callable (analyzer.cpp:4641-4652): a
     //    bare `print` / `len` / `floor` reduces to a constant Callable — `print.call_deferred(m)`,
     //    `arr.map(floor)`, `var f := absi`, `const PRINTER = print`. Godot's arm checks
-    //    `Variant::has_utility_function || GDScriptUtilityFunctions::function_exists`; gdls
-    //    mirrors with the NativeDb utility table (Variant utilities, extension_api.json) plus
-    //    the hard-coded GDScript-only table (`gd_utility_return_type`). Godot also folds
+    //    `Variant::has_utility_function || GDScriptUtilityFunctions::function_exists`. Both engine
+    //    checks are compile-time, independent of any dump; gdls mirrors the Variant family with the
+    //    DB-independent `gd_types::is_variant_utility` registry (so a bare `print` resolves even
+    //    under an empty `Absent` DB, not just when the NativeDb dump carries it) plus the hard-coded
+    //    GDScript-only table (`gd_utility_return_type`). The `ctx.native.utility` probe stays as a
+    //    superset guard for any name the static list might miss. Godot also folds
     //    `Callable(memnew(GDScriptUtilityCallable(name)))` into `reduced_value` and types via
     //    `make_callable_type(method_info)`; gdls can't materialize a Callable value or carry a
     //    MethodInfo, so an `Opaque(Callable)` fold stands in for `reduced_value`: it makes a
@@ -1654,7 +1657,9 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     //    (analyzer.cpp:4570) before utilities (4641) — a project autoload named like a utility
     //    shadows it — and no utility name can collide with anything steps 4-8 resolve.
     if !ctx.reducing_callee
-        && (ctx.native.utility(&name).is_some() || gd_utility_return_type(&name).is_some())
+        && (ctx.native.utility(&name).is_some()
+            || gd_types::is_variant_utility(&name)
+            || gd_utility_return_type(&name).is_some())
     {
         ctx.folds
             .set(id, FoldedValue::Opaque(VariantType::Callable));
