@@ -114,6 +114,16 @@ pub(crate) struct ClientCaps {
     /// `startCharacter`/`endCharacter` and folds whole lines, so `foldingRange` omits the column
     /// fields entirely (whole-line ranges). Absent ⇒ `false` ⇒ ranges carry their columns.
     pub(crate) folding_line_folding_only: bool,
+    /// `workspace.symbol.resolveSupport` (M9 #71) — when present the client will issue
+    /// `workspaceSymbol/resolve` to fill lazily-deferred properties (the `location.range`), so
+    /// `workspace/symbol` returns the 3.17 `WorkspaceSymbol[]` shape with a location-sans-range +
+    /// a compact `data` blob (path + name span) and defers the precise range to resolve. Absent ⇒
+    /// `false` ⇒ the byte-identical flat 3.16 `SymbolInformation[]` path with eager full ranges
+    /// (every client accepts it). Read as presence-of-`resolveSupport` (matching how
+    /// `completionItem.resolveSupport` is captured): the spec's `resolveSupport` is itself the
+    /// opt-in, its `properties` list (usually `["location.range"]`) merely names what gdls already
+    /// defers, so a non-`None` value is the gate.
+    pub(crate) symbol_resolve_support: bool,
 }
 
 /// The `textDocument.completion` client capabilities gdls projects each item against (M8 #64).
@@ -225,6 +235,16 @@ impl ClientCaps {
                 .and_then(|t| t.folding_range.as_ref())
                 .and_then(|f| f.line_folding_only)
                 .unwrap_or(false),
+            // M9 (#71): the presence of `workspace.symbol.resolveSupport` is the opt-in for the
+            // 3.17 partial `WorkspaceSymbol[]` shape — same `is_some()` reading
+            // `completionItem.resolveSupport` gets (the `properties` list names what is deferred,
+            // not whether resolve is supported).
+            symbol_resolve_support: caps
+                .workspace
+                .as_ref()
+                .and_then(|w| w.symbol.as_ref())
+                .and_then(|s| s.resolve_support.as_ref())
+                .is_some(),
         }
     }
 }
@@ -1709,11 +1729,14 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         // M7 (#58): the two genuinely long requests advertise workDoneProgress so clients send a
         // workDoneToken in their params; the other providers stay bare booleans.
+        // M9 (#71): `resolve_provider: Some(true)` advertises `workspaceSymbol/resolve` — a client
+        // with `workspace.symbol.resolveSupport` then receives the partial `WorkspaceSymbol[]`
+        // shape (location sans full range) and pulls each precise range lazily via resolve.
         workspace_symbol_provider: Some(OneOf::Right(lsp_types::WorkspaceSymbolOptions {
             work_done_progress_options: lsp_types::WorkDoneProgressOptions {
                 work_done_progress: Some(true),
             },
-            resolve_provider: None,
+            resolve_provider: Some(true),
         })),
         definition_provider: Some(OneOf::Left(true)),
         // M9 (#68): declaration === definition (GDScript has no separate declare/define construct,
@@ -2000,6 +2023,12 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         "callHierarchy/incomingCalls" => handle!(handlers::incoming_calls),
         "callHierarchy/outgoingCalls" => handle!(handlers::outgoing_calls),
         "workspace/symbol" => handle!(handlers::workspace_symbol),
+        // M9 (#71): the lazy companion of `workspace/symbol`. When the client advertised
+        // `workspace.symbol.resolveSupport`, the query returned `WorkspaceSymbol[]` with a
+        // location-sans-range; `resolve` reads the item's `data` (path + name span), touches that
+        // one file, and fills the precise `Location`. Index-/parse-priced (one file), so it is NOT
+        // in the Hard-pressure shed set above — mirroring `completionItem/resolve`'s exclusion.
+        "workspaceSymbol/resolve" => handle!(handlers::workspace_symbol_resolve),
         // M8 (#64): completion + its lazy resolve. `completion` returns a `CompletionList`
         // (never a bare array — W18); `resolve` fills documentation/detail and leaves the
         // ranking/edit fields untouched.

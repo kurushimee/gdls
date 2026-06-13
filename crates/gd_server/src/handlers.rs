@@ -17,9 +17,10 @@ use lsp_types::{
     DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams, DocumentLink,
     DocumentLinkParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location, MarkupContent, MarkupKind,
-    Position, Range, ReferenceParams, SymbolInformation, SymbolKind as LspSymbolKind,
+    OneOf, Position, Range, ReferenceParams, SymbolInformation, SymbolKind as LspSymbolKind,
     TypeHierarchyItem, TypeHierarchyPrepareParams, TypeHierarchySubtypesParams,
-    TypeHierarchySupertypesParams, Uri, WorkspaceSymbolParams, WorkspaceSymbolResponse,
+    TypeHierarchySupertypesParams, Uri, WorkspaceLocation, WorkspaceSymbol, WorkspaceSymbolParams,
+    WorkspaceSymbolResponse,
 };
 // `Goto{Declaration,TypeDefinition}{Params,Response}` are `lsp_types` aliases of the matching
 // `GotoDefinition*` types and live under the `request` submodule (not re-exported at the crate
@@ -5090,6 +5091,47 @@ pub fn workspace_symbol(
     }
     scored.sort_by(cmp);
 
+    // M9 (#71): when the client advertised `workspace.symbol.resolveSupport`, return the 3.17
+    // partial `WorkspaceSymbol[]` shape — a location WITHOUT the precise range plus a compact
+    // self-sufficient `data` blob (the symbol's file path + recorded name span). This touches ZERO
+    // files: each winner maps to a `WorkspaceLocation { uri }` and the per-file text load that the
+    // flat path below pays for is deferred to `workspaceSymbol/resolve`, which reads one file. The
+    // `data` blob is the resolve key (anti-catalog W18: extensions ride `data`, never the request
+    // params); it carries the byte span so resolve never re-derives it from the (possibly edited)
+    // text. A candidate whose path won't form a URI is dropped here exactly as in the flat path.
+    if state.caps.symbol_resolve_support {
+        let symbols: Vec<WorkspaceSymbol> = scored
+            .into_iter()
+            .filter_map(|(_score, cand)| {
+                let uri = match path_to_file_uri(&cand.path) {
+                    Some(u) => u,
+                    None => {
+                        log::debug!(
+                            "workspace_symbol: dropping {name} at {path} — path_to_file_uri \
+                             rejected the path; the symbol is invisible to the client",
+                            name = cand.name,
+                            path = cand.path,
+                        );
+                        return None;
+                    }
+                };
+                Some(WorkspaceSymbol {
+                    name: cand.name,
+                    kind: cand.kind,
+                    tags: None,
+                    container_name: cand.container,
+                    location: OneOf::Right(WorkspaceLocation { uri }),
+                    data: Some(serde_json::json!({
+                        "path": cand.path.as_str(),
+                        "start": cand.name_span.start,
+                        "end": cand.name_span.end,
+                    })),
+                })
+            })
+            .collect();
+        return Some(WorkspaceSymbolResponse::Nested(symbols));
+    }
+
     // Real name-token ranges need each winner file's text for the encoding-correct
     // byte→character mapping (the spec reads the range to reveal/select the symbol; a
     // zero-width point at column 0 lands the caret on leading syntax). Bounded by the 256
@@ -5162,6 +5204,79 @@ pub fn workspace_symbol(
         })
         .collect();
     Some(WorkspaceSymbolResponse::Flat(symbols))
+}
+
+/// `workspaceSymbol/resolve`: fill the precise `location.range` deferred by the partial
+/// [`WorkspaceSymbol`] that [`workspace_symbol`] returned under `workspace.symbol.resolveSupport`.
+///
+/// The item's `data` blob is the self-sufficient key (`{path, start, end}` — anti-catalog W18:
+/// the extension rides `data`, never re-derived from request params). This reads that one file
+/// (open buffer first, then disk — the `member_decl_location` precedence), builds a
+/// [`PositionMapper`] over the session encoding, and maps the recorded name span to a `Range`,
+/// returning the symbol with `location: OneOf::Left(Location { uri, range })`.
+///
+/// **Never crash, never lie.** Missing / malformed `data`, a path that won't form a URI, or a file
+/// that can't be read all return the item *unchanged* (its location stays the uri-only form) — a
+/// resolve failure must never drop the symbol or panic. The mapped range is accepted only while
+/// the span's bytes still spell the symbol's name (the same validate-or-fallback the eager flat
+/// path applies, so a resolved range EQUALS the eager range for an unchanged file and degrades to
+/// the same zero-width point under a stale span rather than pointing at moved text).
+pub fn workspace_symbol_resolve(
+    state: &mut ServerState,
+    mut params: WorkspaceSymbol,
+) -> Option<WorkspaceSymbol> {
+    // Extract the `{path, start, end}` resolve key. Any shape failure ⇒ return the item unchanged.
+    let (path, start, end) = match &params.data {
+        Some(data) => {
+            let path = data.get("path").and_then(|v| v.as_str());
+            let start = data.get("start").and_then(|v| v.as_u64());
+            let end = data.get("end").and_then(|v| v.as_u64());
+            match (path, start, end) {
+                (Some(p), Some(s), Some(e)) => {
+                    (camino::Utf8PathBuf::from(p), s as usize, e as usize)
+                }
+                _ => return Some(params),
+            }
+        }
+        None => return Some(params),
+    };
+
+    let Some(uri) = path_to_file_uri(&path) else {
+        return Some(params);
+    };
+
+    // Load the file text: open buffer wins over disk (same precedence as the eager path's range
+    // resolution). A read failure leaves the item's uri-only location intact.
+    let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+        Some(t) => t,
+        None => match std::fs::read_to_string(path.as_std_path()) {
+            Ok(t) => t,
+            Err(_) => return Some(params),
+        },
+    };
+
+    let span = ByteSpan { start, end };
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    // Validate the recorded span still spells the symbol's name before trusting it — mirrors the
+    // flat path's `text.get(..) == Some(name)` guard so the resolved range matches the eager range
+    // exactly (and falls back identically when the span is stale). `PositionMapper` clamps an
+    // out-of-range span regardless, so this is a fidelity guard, not a panic guard.
+    let range = if text.get(span.start..span.end) == Some(params.name.as_str()) {
+        mapper.span_to_range(span)
+    } else {
+        // Stale span: fall back to the same zero-width point the eager path uses — the declaration
+        // line is not in `data`, so clamp the recorded start byte to a position instead (the
+        // closest stable anchor without re-deriving the line). Never point at moved text.
+        let pos = mapper.byte_to_position(span.start.min(text.len()));
+        Range {
+            start: pos,
+            end: pos,
+        }
+    };
+
+    params.location = OneOf::Left(Location { uri, range });
+    Some(params)
 }
 
 fn member_kind_to_lsp(k: gd_project::MemberKind) -> LspSymbolKind {
