@@ -1683,6 +1683,12 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 work_done_progress: Some(true),
             },
         })),
+        // M9 (#67): documentHighlight — the in-file subset of references, with Read/Write kinds.
+        // It runs on cursor-rest (a hot request) over the current file only, so it carries no
+        // workDoneProgress (no project-wide fan-out to report) — a plain options struct.
+        document_highlight_provider: Some(OneOf::Right(lsp_types::DocumentHighlightOptions {
+            work_done_progress_options: Default::default(),
+        })),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
@@ -1877,6 +1883,10 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         method.as_str(),
         "textDocument/hover"
             | "textDocument/references"
+            // M9 (#67): documentHighlight lazy-analyzes the current file for the same cursor→symbol
+            // classification references uses (resolved member vs local vs autoload) — analysis-
+            // priced, so it sheds at Hard memory pressure with ContentModified like references.
+            | "textDocument/documentHighlight"
             | "callHierarchy/incomingCalls"
             | "callHierarchy/outgoingCalls"
             // M8 (#64): `completion` runs `analyze_if_gd` to resolve the base expression's type
@@ -1919,6 +1929,9 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         "textDocument/hover" => handle!(handlers::hover),
         "textDocument/definition" => handle!(handlers::definition),
         "textDocument/references" => handle!(handlers::references),
+        // M9 (#67): documentHighlight. Returns `DocumentHighlight[]` for the symbol under the
+        // cursor scoped to the request file (or `null` when the cursor isn't on an identifier).
+        "textDocument/documentHighlight" => handle!(handlers::document_highlight),
         "textDocument/implementation" => handle!(handlers::implementation),
         "textDocument/prepareCallHierarchy" => handle!(handlers::prepare_call_hierarchy),
         "callHierarchy/incomingCalls" => handle!(handlers::incoming_calls),
