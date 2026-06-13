@@ -5265,9 +5265,11 @@ pub fn workspace_symbol_resolve(
     let range = if text.get(span.start..span.end) == Some(params.name.as_str()) {
         mapper.span_to_range(span)
     } else {
-        // Stale span: fall back to the same zero-width point the eager path uses — the declaration
-        // line is not in `data`, so clamp the recorded start byte to a position instead (the
-        // closest stable anchor without re-deriving the line). Never point at moved text.
+        // Stale span (the file changed since the query and the recorded bytes no longer spell the
+        // name): clamp the recorded START byte to a position as the closest stable anchor. This is
+        // a degraded best-effort, NOT identical to the eager path's fallback (which anchors at the
+        // declaration line at col 0 — `data` carries no line to reproduce that). It never points at
+        // moved text — never crash, never lie.
         let pos = mapper.byte_to_position(span.start.min(text.len()));
         Range {
             start: pos,
