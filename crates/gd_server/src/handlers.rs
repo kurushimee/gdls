@@ -2,7 +2,7 @@
 
 use gd_analyze::{
     find_incoming_calls, find_outgoing_calls, AnalysisResult, Binding, BindingTargetKind,
-    CalleeTarget, DtKind,
+    CalleeTarget, DataType, DtKind,
 };
 use gd_syntax::ast::{
     ClassNode, ConstantNode, FunctionNode, LiteralNode, Member, NodeId, NodeKind, ParseTree,
@@ -19,6 +19,14 @@ use lsp_types::{
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, Location, MarkupContent, MarkupKind,
     Position, Range, ReferenceParams, SymbolInformation, SymbolKind as LspSymbolKind, Uri,
     WorkspaceSymbolParams, WorkspaceSymbolResponse,
+};
+// `Goto{Declaration,TypeDefinition}{Params,Response}` are `lsp_types` aliases of the matching
+// `GotoDefinition*` types and live under the `request` submodule (not re-exported at the crate
+// root), so they're imported here separately. The aliasing is what lets `declaration` forward its
+// params to `definition` with no field translation.
+use lsp_types::request::{
+    GotoDeclarationParams, GotoDeclarationResponse, GotoTypeDefinitionParams,
+    GotoTypeDefinitionResponse,
 };
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ropey::Rope;
@@ -585,6 +593,119 @@ pub fn definition(
         .map(GotoDefinitionResponse::Scalar)
 }
 
+/// `textDocument/declaration`: in GDScript a declaration and a definition are the same construct —
+/// there is no forward-declare/define split (no header/impl, no `extern`), so the declaration of a
+/// symbol IS its definition. This handler is therefore a thin wrapper that returns exactly what
+/// [`definition`] returns for the same cursor. `GotoDeclarationParams`/`GotoDeclarationResponse`
+/// are `lsp_types` aliases of the `GotoDefinition*` types, so the params/response pass straight
+/// through with no field translation. (Mirrors how rust-analyzer/clangd treat `declaration` for
+/// languages without a separate declaration form.)
+pub fn declaration(
+    state: &mut ServerState,
+    params: GotoDeclarationParams,
+) -> Option<GotoDeclarationResponse> {
+    definition(state, params)
+}
+
+/// `textDocument/typeDefinition`: jump from the symbol under the cursor to the declaration site of
+/// its *type* (not its own declaration — that is [`definition`]). E.g. on `e` in `var e := Enemy.new()`
+/// this lands on `class_name Enemy`, whereas `definition` lands on the `var e` line.
+///
+/// Pipeline (mirrors [`hover`]'s borrow order so the analyzer borrow drops before the helper takes
+/// `&mut state`): resolve the cursor's `DataType` via [`smallest_typed_containing`] →
+/// [`AnalysisResult::types`], **clone** it (releasing the `analyzed` borrow), then map it to a
+/// declaring [`Location`] with [`type_decl_location`]. Builtin / Variant / Enum / unresolved types
+/// have no declaring source to point at → `None` (LSP `null`); we never guess (W10).
+pub fn type_definition(
+    state: &mut ServerState,
+    params: GotoTypeDefinitionParams,
+) -> Option<GotoTypeDefinitionResponse> {
+    let tdp = params.text_document_position_params;
+    let uri = tdp.text_document.uri.clone();
+    let text = state.vfs.get(uri.as_str()).map(|d| d.text())?;
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+
+    let doc = state.vfs.get(uri.as_str())?;
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+    let byte = mapper.position_to_byte(tdp.position);
+
+    // Clone the DataType so the `analyzed` borrow is released before `type_decl_location` reborrows
+    // `state` (the script arm parses the target file; the native arm reads the stub cache). The
+    // owned `parsed`/`analyzed` Rcs don't block that reborrow — only `doc`/`mapper`, both dead here.
+    let dt = analyzed
+        .as_deref()
+        .and_then(|a| smallest_typed_containing(&parsed.tree, byte, a).map(|id| a.types.get(id)))?
+        .clone();
+
+    type_decl_location(state, &dt).map(GotoTypeDefinitionResponse::Scalar)
+}
+
+/// Map a resolved [`DataType`] to the [`Location`] that DECLARES that type — the reusable core of
+/// [`type_definition`] (phase-4 `typeHierarchy` anchors supertypes through this same path). Three
+/// outcomes, by [`DtKind`]:
+///   - [`DtKind::Script`] → the external script's `class_name` site (or its file head if it has no
+///     `class_name`), via [`script_decl_location`] keyed on the [`ScriptRef`](gd_analyze::ScriptRef)'s file.
+///   - [`DtKind::Native`] → that engine class's stub header, via [`native_class_header_location`].
+///   - everything else (`Builtin`/`Variant`/`Enum`/`Resolving`/`Unresolved`) → `None`: these name no
+///     single declaring document to jump to, and guessing would violate "never lie" (W10).
+///
+/// [`DtKind::Class`] (an in-file inner class) is rewritten to `Script` before analysis results
+/// escape `analyze`, so it never reaches here — it lands in the catch-all `None` arm rather than
+/// being special-cased (matching the upstream invariant noted on `DtKind::Class`).
+fn type_decl_location(state: &mut ServerState, dt: &DataType) -> Option<Location> {
+    match dt.kind {
+        DtKind::Script => script_decl_location(state, dt.script_type.as_ref()?.file),
+        DtKind::Native if !dt.native_type.is_empty() => {
+            native_class_header_location(state, &dt.native_type)
+        }
+        _ => None,
+    }
+}
+
+/// The `class_name` declaration site of the external script `fid` — the `Script`-kind arm of
+/// [`type_decl_location`]. Keyed on a [`FileId`](gd_project::FileId) the caller already holds
+/// (unlike [`find_global_class_definition`], which resolves a name through the `class_name`
+/// registry first); kept separate so that name-keyed fast path stays untouched.
+///
+/// Prefers the open buffer's cached parse (an edited buffer outranks the index), else reads disk.
+/// Anchors at the root class's identifier span; a script with no `class_name` (no root identifier)
+/// falls back to a `(0,0)` whole-file [`Location`] — the existing convention for file targets
+/// (`find_res_path_definition` / `find_autoload_definition`).
+fn script_decl_location(state: &mut ServerState, fid: gd_project::FileId) -> Option<Location> {
+    let path = state.workspace.index.path(fid)?.to_path_buf();
+    let uri = path_to_file_uri(&path)?;
+    let uri_str = uri.as_str().to_owned();
+    let text = if let Some(text) = state.vfs.get(&uri_str).map(|d| d.text()) {
+        text
+    } else {
+        match std::fs::read_to_string(path.as_std_path()) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!(
+                    "could not read {path} for type definition: {e}; jump degrades to no-result"
+                );
+                return None;
+            }
+        }
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let Some(ident_span) = root_class_identifier_span(&parsed.tree) else {
+        // No `class_name` → no identifier to anchor; point at the file head (the file-target
+        // convention) so the jump still lands in the declaring script.
+        return Some(Location {
+            uri,
+            range: file_start_range(),
+        });
+    };
+    let rope = ropey::Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    Some(Location {
+        uri,
+        range: mapper.span_to_range(ident_span),
+    })
+}
+
 /// The native arm of [`definition`] — three cursor shapes, all anchoring into a stub
 /// materialized by [`crate::stubs::ensure_class_stub`]:
 ///   1. the identifier IS a native class name → the stub's `class_name` header;
@@ -607,22 +728,13 @@ fn native_definition(
 ) -> Option<Location> {
     let stub_root = state.options.stub_cache_dir.clone();
 
-    // 1. Native class name.
+    // 1. Native class name → that class's stub header. The `class_named` guard makes this a
+    //    terminal arm (a real class name never falls through to the attribute / bare-call arms,
+    //    preserving the original early-return even when stub materialization fails). The header
+    //    anchoring itself is shared with `type_definition`'s Native arm (both point at a native
+    //    class's `class_name` line) via `native_class_header_location`.
     if state.workspace.native.class_named(name).is_some() {
-        let (path, stub) = crate::stubs::ensure_class_stub(
-            &state.stub_cache,
-            &state.workspace.native,
-            name,
-            stub_root.as_deref(),
-        )?;
-        // `name.len()` is a byte count, but ensure_class_stub only materializes
-        // identifier-shaped (ASCII) class names — see stub_token_location's encoding note.
-        return stub_token_location(
-            &path,
-            stub.class_line,
-            stub.class_name_col,
-            name.len() as u32,
-        );
+        return native_class_header_location(state, name);
     }
 
     // 2. Subscript attribute over a Native-typed base: resolve the member to its declaring
@@ -708,6 +820,30 @@ fn native_member_stub_location(
         crate::stubs::ensure_class_stub(&state.stub_cache, db, &declaring, stub_root)?;
     let anchor = *stub.member_lines.get(member)?;
     stub_token_location(&path, anchor.line, anchor.name_col, anchor.name_len)
+}
+
+/// Materialize `class`'s stub and anchor at its `class_name` header token — the native analog of a
+/// project script's `class_name` declaration site. Shared by [`native_definition`]'s class-name arm
+/// (cursor IS the class name) and [`type_definition`]'s `Native` arm (cursor is a symbol whose
+/// resolved type is this native class). Takes `&ServerState`: `ensure_class_stub` only reads the
+/// stub cache + native DB, so no analysis (hence no `&mut`) is needed here.
+///
+/// `ensure_class_stub` re-checks `class_named` internally, so a non-class name returns `None`
+/// without a stub being written. `class.len()` is a byte count, safe as a UTF-16/32 column too:
+/// `ensure_class_stub` only materializes identifier-shaped (ASCII) class names.
+fn native_class_header_location(state: &ServerState, class: &str) -> Option<Location> {
+    let (path, stub) = crate::stubs::ensure_class_stub(
+        &state.stub_cache,
+        &state.workspace.native,
+        class,
+        state.options.stub_cache_dir.as_deref(),
+    )?;
+    stub_token_location(
+        &path,
+        stub.class_line,
+        stub.class_name_col,
+        class.len() as u32,
+    )
 }
 
 /// A Location covering a name token on `line` (0-based) of the stub at `path`. The columns are

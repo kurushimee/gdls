@@ -9,12 +9,13 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crossbeam_channel::{select, Receiver, Sender};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
-    CallHierarchyServerCapability, CodeDescription, Diagnostic, DiagnosticSeverity, DiagnosticTag,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentLinkOptions, FoldingRangeProviderCapability,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    OneOf, PublishDiagnosticsParams, SelectionRangeProviderCapability, ServerCapabilities,
-    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    CallHierarchyServerCapability, CodeDescription, DeclarationCapability, Diagnostic,
+    DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentLinkOptions,
+    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, OneOf, PublishDiagnosticsParams,
+    SelectionRangeProviderCapability, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TypeDefinitionProviderCapability, Uri,
 };
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent};
 use rustc_hash::FxHashSet;
@@ -1697,6 +1698,13 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
             resolve_provider: None,
         })),
         definition_provider: Some(OneOf::Left(true)),
+        // M9 (#68): declaration === definition (GDScript has no separate declare/define construct,
+        // so the handler delegates straight to `definition`). typeDefinition jumps to the declaring
+        // site of the symbol's TYPE (project `class_name` site / native stub header, else null).
+        // Both are plain `Simple(true)` providers with no client-capability path to gate on —
+        // advertised unconditionally like `definition`/`implementation`.
+        declaration_provider: Some(DeclarationCapability::Simple(true)),
+        type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Right(lsp_types::ReferencesOptions {
             work_done_progress_options: lsp_types::WorkDoneProgressOptions {
                 work_done_progress: Some(true),
@@ -1923,6 +1931,11 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             // (the `base.method(` arm), exactly like completion's ATTRIBUTE path — analysis-priced,
             // so it sheds at Hard with ContentModified too.
             | "textDocument/signatureHelp"
+            // M9 (#68): `typeDefinition` runs `analyze_if_gd` to resolve the cursor symbol's type
+            // before mapping it to a declaring Location — analysis-priced, so it sheds at Hard like
+            // hover. `declaration` is intentionally absent: it delegates to `definition`, which is
+            // index-/parse-only and stays served under pressure.
+            | "textDocument/typeDefinition"
     );
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {
         // Re-record the request as cancelled-cum-shed so the per-handler trace still shows the
@@ -1952,6 +1965,12 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // serializes to `null`, which is what the wire wants.
         "textDocument/hover" => handle!(handlers::hover),
         "textDocument/definition" => handle!(handlers::definition),
+        // M9 (#68): declaration === definition (no separate declare/define in GDScript), so this
+        // delegates to the same handler and returns byte-identical targets. typeDefinition resolves
+        // the cursor symbol's type and jumps to that type's declaring site (or `null` for
+        // Builtin/Variant/unresolved). `serde_json::to_value(None)` → `null`, the LSP wire shape.
+        "textDocument/declaration" => handle!(handlers::declaration),
+        "textDocument/typeDefinition" => handle!(handlers::type_definition),
         "textDocument/references" => handle!(handlers::references),
         // M9 (#67): documentHighlight. Returns `DocumentHighlight[]` for the symbol under the
         // cursor scoped to the request file (or `null` when the cursor isn't on an identifier).
