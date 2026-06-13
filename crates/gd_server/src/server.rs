@@ -101,6 +101,9 @@ pub(crate) struct ClientCaps {
     /// sub-struct so the completion handler reads `state.caps.completion.<gate>` and the rest of
     /// [`ClientCaps`] stays a flat list of feature booleans.
     pub(crate) completion: CompletionCaps,
+    /// The M8 (#65) signatureHelp gates, captured under `textDocument.signatureHelp`. Grouped in a
+    /// sub-struct like [`CompletionCaps`] so the handler reads `state.caps.signature_help.<gate>`.
+    pub(crate) signature_help: SignatureHelpCaps,
 }
 
 /// The `textDocument.completion` client capabilities gdls projects each item against (M8 #64).
@@ -142,6 +145,27 @@ pub(crate) struct CompletionCaps {
     pub(crate) kind_value_set: Option<Vec<lsp_types::CompletionItemKind>>,
 }
 
+/// The `textDocument.signatureHelp` client capabilities gdls projects each signature against
+/// (M8 #65). Every field has a documented absent-default so a Godot-unaware / minimal client still
+/// gets a well-formed (if downgraded) `SignatureHelp` — generic-LSP-first (#30).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SignatureHelpCaps {
+    /// `signatureInformation.documentationFormat` — the first kind gdls supports, reusing the
+    /// [`crate::docs::ProseFormat`] negotiation `hover.contentFormat` uses. Absent ⇒ PlainText (the
+    /// same conservative downgrade [`CompletionCaps::documentation_format`] takes: a client that
+    /// didn't enumerate formats can always render plaintext, and attaching un-asked-for markdown
+    /// could surface raw `**`).
+    pub(crate) documentation_format: crate::docs::ProseFormat,
+    /// `signatureInformation.parameterInformation.labelOffsetSupport` — when true, each
+    /// [`lsp_types::ParameterInformation`] carries `[start, end)` offsets into the signature label;
+    /// when false, a substring label (which must be a literal substring of the signature label).
+    pub(crate) label_offset_support: bool,
+    /// `signatureInformation.activeParameterSupport` — when true, a per-signature
+    /// [`lsp_types::SignatureInformation::active_parameter`] may be set; when false, only the
+    /// top-level [`lsp_types::SignatureHelp::active_parameter`] is sent (the pre-3.16 shape).
+    pub(crate) active_parameter_support: bool,
+}
+
 impl ClientCaps {
     fn negotiate(caps: &lsp_types::ClientCapabilities) -> Self {
         let td = caps.text_document.as_ref();
@@ -180,6 +204,7 @@ impl ClientCaps {
                 .map(|formats| prose_format_from(formats))
                 .unwrap_or_default(),
             completion: CompletionCaps::negotiate(td),
+            signature_help: SignatureHelpCaps::negotiate(td),
         }
     }
 }
@@ -237,6 +262,32 @@ impl CompletionCaps {
             kind_value_set: completion
                 .and_then(|c| c.completion_item_kind.as_ref())
                 .and_then(|k| k.value_set.clone()),
+        }
+    }
+}
+
+impl SignatureHelpCaps {
+    /// Walk `textDocument.signatureHelp`, mirroring [`CompletionCaps::negotiate`]'s optional-path
+    /// convention. An absent `signatureHelp` capability yields the all-default struct — plaintext
+    /// docs (the conservative downgrade), no label offsets, no per-signature activeParameter.
+    fn negotiate(td: Option<&lsp_types::TextDocumentClientCapabilities>) -> Self {
+        let info = td
+            .and_then(|t| t.signature_help.as_ref())
+            .and_then(|s| s.signature_information.as_ref());
+        SignatureHelpCaps {
+            // PlainText default for the same reason `CompletionCaps` uses it (see that field):
+            // a client that didn't enumerate documentation formats can always render plaintext.
+            documentation_format: info
+                .and_then(|i| i.documentation_format.as_ref())
+                .map(|formats| prose_format_from(formats))
+                .unwrap_or(crate::docs::ProseFormat::PlainText),
+            label_offset_support: info
+                .and_then(|i| i.parameter_information.as_ref())
+                .and_then(|p| p.label_offset_support)
+                .unwrap_or(false),
+            active_parameter_support: info
+                .and_then(|i| i.active_parameter_support)
+                .unwrap_or(false),
         }
     }
 }
@@ -1657,6 +1708,15 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 label_details_support: Some(true),
             }),
         }),
+        // M8 (#65): signatureHelp. `(` opens an argument list and `,` advances to the next
+        // argument — both should (re)compute the hint; `)` closes a call, so it only RE-triggers
+        // (updates/closes an already-showing hint) rather than opening one. Mirrors Godot's editor
+        // and rust-analyzer's trigger set.
+        signature_help_provider: Some(lsp_types::SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: Some(vec![")".to_string()]),
+            work_done_progress_options: Default::default(),
+        }),
         document_link_provider: Some(DocumentLinkOptions {
             resolve_provider: Some(false),
             work_done_progress_options: Default::default(),
@@ -1825,6 +1885,10 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             // the native DB / cached interface and never starts a fresh analyze, so shedding it
             // would reclaim nothing.
             | "textDocument/completion"
+            // M8 (#65): `signatureHelp` runs `analyze_if_gd` to resolve the call receiver's type
+            // (the `base.method(` arm), exactly like completion's ATTRIBUTE path — analysis-priced,
+            // so it sheds at Hard with ContentModified too.
+            | "textDocument/signatureHelp"
     );
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {
         // Re-record the request as cancelled-cum-shed so the per-handler trace still shows the
@@ -1865,6 +1929,9 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // ranking/edit fields untouched.
         "textDocument/completion" => handle!(handlers::completion),
         "completionItem/resolve" => handle!(handlers::completion_item_resolve),
+        // M8 (#65): signatureHelp. Returns `SignatureHelp` (or `null` when the cursor is in no
+        // call). `serde_json::to_value(None)` serializes to `null`, which is what the wire wants.
+        "textDocument/signatureHelp" => handle!(handlers::signature_help),
         // M7 (#61): pull diagnostics. NOT in the Hard-pressure shed list above — `analyze_gd`
         // self-degrades to parser-only + cached results there, exactly like the push path, so
         // pull and push stay byte-identical under pressure too.
@@ -2764,6 +2831,24 @@ mod tests {
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
             "completion is analyze-using and must be shed at Hard pressure; got {:?}",
+            resp.error
+        );
+
+        // M8 (#65): `signatureHelp` IS analyze-using (it resolves the call receiver's type), so it
+        // sheds with ContentModified at Hard pressure exactly like completion.
+        let signature_help = Request {
+            id: lsp_server::RequestId::from(6),
+            method: "textDocument/signatureHelp".to_string(),
+            params: serde_json::json!({
+                "textDocument": { "uri": "file:///test/a.gd" },
+                "position": { "line": 0, "character": 0 }
+            }),
+        };
+        let resp = dispatch_request(&mut state, signature_help);
+        assert_eq!(
+            resp.error.as_ref().map(|e| e.code),
+            Some(ERR_CONTENT_MODIFIED),
+            "signatureHelp is analyze-using and must be shed at Hard pressure; got {:?}",
             resp.error
         );
 
