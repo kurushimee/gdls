@@ -384,7 +384,12 @@ pub(crate) fn arg_index_after(tokens: &[Token], open_idx: usize, byte: usize) ->
 /// child→parent map. Ties on identical width are broken toward the latest-emitted node, mirroring
 /// `innermost_node_at`'s convention (a child is pushed after its parent, so this picks the closest
 /// ancestor). `None` when nothing strictly contains it.
-fn smallest_node_strictly_containing(tree: &ParseTree, inner: NodeId) -> Option<NodeId> {
+///
+/// M9 (#70): `pub(crate)` so `handlers::selection_range` reuses this exact "nearest strictly-
+/// enclosing ancestor" step to build its `SelectionRange` ancestor chain (repeated calls walk
+/// innermost → root). Because it excludes equal-span nodes, the chain is strictly increasing — no
+/// duplicate or looping range.
+pub(crate) fn smallest_node_strictly_containing(tree: &ParseTree, inner: NodeId) -> Option<NodeId> {
     let target = tree.get(inner).span;
     let mut best: Option<(NodeId, usize)> = None;
     for id in tree.iter_ids() {

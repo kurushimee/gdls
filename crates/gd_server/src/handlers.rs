@@ -2836,6 +2836,355 @@ fn assignment_write_ranges(tree: &ParseTree, mapper: &PositionMapper) -> FxHashS
     out
 }
 
+// ---------------------------------------------------------------------------------------------------
+// M9 (#70): foldingRange + selectionRange — pure parse-priced projections of the AST + the lexer's
+// comment side-channel. No analyzer, no cross-file fan-out; served even at Hard memory pressure.
+// ---------------------------------------------------------------------------------------------------
+
+/// `textDocument/foldingRange`: the foldable regions of one document. Three sources, all from the
+/// shared cached parse (no analysis):
+///   * **compound AST blocks** (kind `Region`) — `class`/`func`/`if`+`else`/`for`/`while` and each
+///     `match` arm, anchored on the construct's header line so collapsing hides the body. The inner
+///     `Suite` is deliberately *skipped*: every GDScript suite has a compound parent, so folding the
+///     suite too would emit a second overlapping fold on the same block;
+///   * **comment runs** (kind `Comment`) — ≥2 consecutive own-line `#` comment lines collapse to one
+///     fold (inline trailing comments are excluded — they aren't a standalone block);
+///   * **`#region` / `#endregion`** (kind `Region`) — a string-prefix scan over each comment pairs
+///     markers with a stack (so nested regions fold independently; an unmatched marker is dropped).
+///
+/// Respects the client's `textDocument.foldingRange` hints: `rangeLimit` truncates the
+/// deterministically-sorted result, and `lineFoldingOnly` drops the `startCharacter`/`endCharacter`
+/// columns (whole-line folds). Out-of-range / degenerate (single-line) folds are never emitted, and
+/// a malformed/partial parse still folds whatever did parse — it never panics.
+pub fn folding_range(
+    state: &mut ServerState,
+    params: lsp_types::FoldingRangeParams,
+) -> Option<Vec<lsp_types::FoldingRange>> {
+    let uri = params.text_document.uri;
+    let doc = state.vfs.get(uri.as_str())?;
+    let text = doc.text();
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+
+    let line_folding_only = state.caps.folding_line_folding_only;
+    let mut ranges: Vec<lsp_types::FoldingRange> = Vec::new();
+
+    // (1) Compound AST blocks. Each carries `node.span`; fold header-line → last-content-line.
+    // The implicit root `Class` (the whole-file module wrapper Godot always synthesizes) is
+    // skipped: editors don't fold the top-level script as one region, and it would shadow the
+    // file. An explicit inner `class Foo:` still folds (it isn't the root).
+    let root = parsed.tree.root_id();
+    for id in parsed.tree.iter_ids() {
+        if Some(id) == root {
+            continue;
+        }
+        if !is_foldable_block(&parsed.tree.get(id).kind) {
+            continue;
+        }
+        if let Some(fr) = block_fold(
+            parsed.tree.get(id).span,
+            &mapper,
+            lsp_types::FoldingRangeKind::Region,
+        ) {
+            ranges.push(fr);
+        }
+    }
+
+    // (2) + (3) Comment runs and `#region`/`#endregion`, from the lexer side-channel.
+    ranges.extend(comment_folds(&parsed.comments, &text, &mapper));
+
+    // Deterministic order (line, then end-line, then a stable kind tag) so `rangeLimit` truncation
+    // and the wire output are reproducible; dedup coincident folds (e.g. a region marker pair whose
+    // span happens to match a comment-run, or two constructs sharing extents).
+    ranges.sort_by_key(|r| (r.start_line, r.end_line, fold_kind_rank(&r.kind)));
+    ranges.dedup_by(|a, b| {
+        a.start_line == b.start_line && a.end_line == b.end_line && a.kind == b.kind
+    });
+
+    // `lineFoldingOnly`: the client ignores columns — drop them for whole-line folds.
+    if line_folding_only {
+        for r in &mut ranges {
+            r.start_character = None;
+            r.end_character = None;
+        }
+    }
+
+    // `rangeLimit`: a hint — keep the first N of the sorted set.
+    if let Some(limit) = state.caps.folding_range_limit {
+        ranges.truncate(limit as usize);
+    }
+
+    Some(ranges)
+}
+
+/// Whether a node kind is a foldable compound block (`foldingRange` source (1)). Mirrors the spec's
+/// "fold the func/class/loop/branch body": the header-bearing compound statements plus each `match`
+/// arm. `Suite` is intentionally absent (its compound parent already covers the block).
+fn is_foldable_block(kind: &NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Class(_)
+            | NodeKind::Function(_)
+            | NodeKind::If(_)
+            | NodeKind::For(_)
+            | NodeKind::While(_)
+            | NodeKind::Match(_)
+            | NodeKind::MatchBranch(_)
+    )
+}
+
+/// Project a block's byte span to a [`lsp_types::FoldingRange`], or `None` if it would be a
+/// single-line (degenerate) fold. `end_line` uses the column-0 rule: a span that ends exactly at a
+/// line start (i.e. it absorbed a trailing newline) folds up to the *previous* line, so the
+/// blank/dedent line after the block stays visible; the usual block-body span ends at the last
+/// token (column ≠ 0) and folds to that line directly. This never indexes a non-codepoint-boundary
+/// byte (unlike `span.end - 1`), keeping the "never crash" guarantee on the UTF-16/32 mapper paths.
+fn block_fold(
+    span: ByteSpan,
+    mapper: &PositionMapper,
+    kind: lsp_types::FoldingRangeKind,
+) -> Option<lsp_types::FoldingRange> {
+    let start = mapper.byte_to_position(span.start);
+    let end = mapper.byte_to_position(span.end);
+    let end_line = if end.character == 0 {
+        end.line.saturating_sub(1)
+    } else {
+        end.line
+    };
+    if start.line >= end_line {
+        return None;
+    }
+    Some(lsp_types::FoldingRange {
+        start_line: start.line,
+        start_character: Some(start.character),
+        end_line,
+        end_character: Some(end.character),
+        kind: Some(kind),
+        collapsed_text: None,
+    })
+}
+
+/// Build the comment-run + `#region`/`#endregion` folds from the lexer's comment side-channel.
+///
+/// The map is keyed by 1-based line (unordered), each [`gd_syntax::CommentData`] carrying the
+/// comment's byte span and a `new_line` flag (true ⇒ the comment owns its line; false ⇒ it trails
+/// code). Two passes over the line-sorted comments:
+///   * **runs** — maximal blocks of ≥2 *consecutive own-line* lines whose comment is NOT a region
+///     marker collapse to one `Comment` fold (start line's `#` → end line's content);
+///   * **regions** — a stack pairs each `#region` with the next `#endregion` (nested regions fold
+///     independently); an unmatched `#region`/`#endregion` is dropped.
+fn comment_folds(
+    comments: &std::collections::HashMap<u32, gd_syntax::CommentData>,
+    text: &str,
+    mapper: &PositionMapper,
+) -> Vec<lsp_types::FoldingRange> {
+    let mut out: Vec<lsp_types::FoldingRange> = Vec::new();
+    // Line-sorted view: (1-based line, span, new_line, region-marker).
+    let mut lines: Vec<(u32, ByteSpan, bool, RegionMarker)> = comments
+        .iter()
+        .map(|(&line, c)| {
+            (
+                line,
+                c.span,
+                c.new_line,
+                region_marker(comment_text(text, c.span)),
+            )
+        })
+        .collect();
+    lines.sort_by_key(|&(line, ..)| line);
+
+    // (a) Comment runs: contiguous own-line, non-region-marker comment lines, length ≥ 2.
+    let mut i = 0;
+    while i < lines.len() {
+        let runnable = |t: &(u32, ByteSpan, bool, RegionMarker)| t.2 && t.3 == RegionMarker::None;
+        if !runnable(&lines[i]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j + 1 < lines.len() && runnable(&lines[j + 1]) && lines[j + 1].0 == lines[j].0 + 1 {
+            j += 1;
+        }
+        if j > i {
+            // span from the first comment's `#` to the last comment's end.
+            let span = ByteSpan::new(lines[i].1.start, lines[j].1.end);
+            if let Some(fr) = comment_run_fold(&mapper.span_to_range(span)) {
+                out.push(fr);
+            }
+        }
+        i = j + 1;
+    }
+
+    // (b) `#region` / `#endregion` pairs, stack-matched in line order. Only own-line comments
+    // (`new_line`) are region markers — an inline trailing comment (`var x = 1  # region foo`) is
+    // not a fold marker by VS Code / Godot convention.
+    let mut stack: Vec<(u32, ByteSpan)> = Vec::new();
+    for &(line, span, new_line, marker) in &lines {
+        if !new_line {
+            continue;
+        }
+        match marker {
+            RegionMarker::Begin => stack.push((line, span)),
+            RegionMarker::End => {
+                if let Some((_open_line, open_span)) = stack.pop() {
+                    // Fold from the `#region` line down to the `#endregion` line.
+                    let region = ByteSpan::new(open_span.start, span.end);
+                    if let Some(fr) =
+                        block_fold(region, mapper, lsp_types::FoldingRangeKind::Region)
+                    {
+                        out.push(fr);
+                    }
+                }
+            }
+            RegionMarker::None => {}
+        }
+    }
+    out
+}
+
+/// A `#region` / `#endregion` marker classification of a comment's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegionMarker {
+    Begin,
+    End,
+    None,
+}
+
+/// Classify a comment's source text as a `#region` / `#endregion` marker (Godot / VS Code folding
+/// convention). The scan tolerates leading whitespace after `#` and an optional trailing label
+/// (`#region Foo`); `#endregion` is checked before `#region` so the shared `#r…`/`#e…` prefixes
+/// don't misfire. Anything else is [`RegionMarker::None`] — including `##` doc comments, since only
+/// exactly one leading `#` is stripped (a `##region` line is doc prose, not a fold marker).
+fn region_marker(comment: &str) -> RegionMarker {
+    // Strip exactly one leading `#` and surrounding spaces, then match the keyword head. Stripping
+    // only one `#` means a `##`-doc-comment line (`## region …`) keeps a leading `#` and falls to
+    // `None` rather than minting a spurious region from documentation text.
+    let body = comment.strip_prefix('#').unwrap_or(comment).trim_start();
+    let head = body.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+    if head == "endregion" {
+        RegionMarker::End
+    } else if head == "region" {
+        RegionMarker::Begin
+    } else {
+        RegionMarker::None
+    }
+}
+
+/// Slice a comment's source text from its byte span (clamped — the span comes from the same source
+/// the parse ran on, so it is in-bounds, but clamp defensively for the "never crash" guarantee).
+fn comment_text(text: &str, span: ByteSpan) -> &str {
+    let start = span.start.min(text.len());
+    let end = span.end.min(text.len());
+    text.get(start..end).unwrap_or("")
+}
+
+/// Project a comment-run (already mapped to `range`) to a `Comment` fold, dropping a single-line
+/// (degenerate) run. The run's end span is the last comment's text end (column > 0), so — unlike a
+/// block — no column-0 decrement applies; the end line IS the last comment line.
+fn comment_run_fold(range: &Range) -> Option<lsp_types::FoldingRange> {
+    if range.start.line >= range.end.line {
+        return None;
+    }
+    Some(lsp_types::FoldingRange {
+        start_line: range.start.line,
+        start_character: Some(range.start.character),
+        end_line: range.end.line,
+        end_character: Some(range.end.character),
+        kind: Some(lsp_types::FoldingRangeKind::Comment),
+        collapsed_text: None,
+    })
+}
+
+/// A stable tie-break rank for the fold sort so equal `(start_line, end_line)` folds order
+/// deterministically by kind (and `dedup` sees identical-kind neighbors adjacently).
+fn fold_kind_rank(kind: &Option<lsp_types::FoldingRangeKind>) -> u8 {
+    match kind {
+        Some(lsp_types::FoldingRangeKind::Comment) => 0,
+        Some(lsp_types::FoldingRangeKind::Imports) => 1,
+        Some(lsp_types::FoldingRangeKind::Region) => 2,
+        None => 3,
+    }
+}
+
+/// `textDocument/selectionRange`: for each requested cursor position, the "smart-select" ancestor
+/// chain — the innermost AST node covering the position, then its nearest strictly-enclosing
+/// ancestor, and so on to the root — as a `parent`-linked [`lsp_types::SelectionRange`] (innermost
+/// first). Each parent range **strictly** contains its child (the helper excludes equal-span nodes),
+/// so the chain is strictly increasing with no duplicate/looping range.
+///
+/// The result is index-aligned with `params.positions` (one entry per position, never dropped): a
+/// position over no node (empty/partial parse, or past end-of-input) still yields a degenerate
+/// single-point range at the clamped position, so the client can rely on `result[i]` ↔
+/// `positions[i]`. Parse-priced; never panics.
+pub fn selection_range(
+    state: &mut ServerState,
+    params: lsp_types::SelectionRangeParams,
+) -> Option<Vec<lsp_types::SelectionRange>> {
+    let uri = params.text_document.uri;
+    let doc = state.vfs.get(uri.as_str())?;
+    let text = doc.text();
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+
+    let out = params
+        .positions
+        .iter()
+        .map(|&pos| {
+            let byte = mapper.position_to_byte(pos);
+            selection_chain_at(&parsed.tree, byte, &mapper).unwrap_or_else(|| {
+                // Never drop a position: a degenerate point range keeps result/position alignment.
+                // Round-trip the byte back to a position so an out-of-range request is answered at
+                // the *clamped* spot (clamp-don't-lie) rather than echoing the bogus coordinates.
+                let clamped = mapper.byte_to_position(byte);
+                lsp_types::SelectionRange {
+                    range: Range {
+                        start: clamped,
+                        end: clamped,
+                    },
+                    parent: None,
+                }
+            })
+        })
+        .collect();
+    Some(out)
+}
+
+/// Build the `parent`-linked [`lsp_types::SelectionRange`] ancestor chain for `byte`: start at the
+/// innermost node, walk up via [`crate::completion_context::smallest_node_strictly_containing`]
+/// (the same nearest-strictly-enclosing-ancestor step completion uses) until nothing larger
+/// contains it, then thread the spans into a child→parent linked list. `None` when no node covers
+/// `byte`. A loop guard (bounded by the node count) makes a malformed tree's span relationships
+/// unable to spin.
+fn selection_chain_at(
+    tree: &ParseTree,
+    byte: usize,
+    mapper: &PositionMapper,
+) -> Option<lsp_types::SelectionRange> {
+    let innermost = tree.innermost_node_at(byte)?;
+    // Collect node ids innermost → outermost.
+    let mut chain: Vec<NodeId> = vec![innermost];
+    let mut cur = innermost;
+    let mut guard = tree.len();
+    while let Some(parent) = crate::completion_context::smallest_node_strictly_containing(tree, cur)
+    {
+        chain.push(parent);
+        cur = parent;
+        guard = guard.saturating_sub(1);
+        if guard == 0 {
+            break;
+        }
+    }
+    // Thread from outermost back to innermost so each link points at its parent.
+    let mut node: Option<Box<lsp_types::SelectionRange>> = None;
+    for &id in chain.iter().rev() {
+        node = Some(Box::new(lsp_types::SelectionRange {
+            range: mapper.span_to_range(tree.get(id).span),
+            parent: node,
+        }));
+    }
+    node.map(|b| *b)
+}
+
 /// How `references` should scan for a NON-method cursor target — resolved before any scan runs,
 /// so precision rides the binding layer where resolution succeeded and the raw-scan floor
 /// survives exactly where it can't decide.
