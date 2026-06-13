@@ -138,9 +138,10 @@ Governing principle (issue #30): generic LSP first — Godot-specific data addit
 no custom protocol; every feature capability-gated. The Godot-LSP anti-catalog in `docs/09 §3` is
 binding.
 
-**Current:** Phase 1 complete — **v1.0.5 shipped** (2026-06-12); Phase 2 underway: **M7
-(protocol foundations) complete** — all seven issues (#57–#63) merged 2026-06-13, milestone
-closed. Per-milestone interactive checks are batched into ONE end-of-Phase-2 trial by the user
+**Current:** Phase 1 complete — **v1.0.6 shipped** (2026-06-13; hotfix #88, tagged on
+`release/v1.0.6` = v1.0.5 + the fix only, so the unreleased Phase 2 work on `main` stayed
+unreleased); Phase 2 underway: **M7 (protocol foundations) complete** — all seven issues
+(#57–#63) merged 2026-06-13, milestone closed. Per-milestone interactive checks are batched into ONE end-of-Phase-2 trial by the user
 in real work (capability captures are Claude's, headless — inventory + gaps in
 `crates/gd_server/tests/fixtures/client_caps/README.md`; deferred feel-check items in
 `docs/09 §7.4`). Phase 2 ships no per-milestone releases (deferred until the phase matures). Release notes and the full history live in
