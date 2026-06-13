@@ -443,3 +443,58 @@ fn nested_regions_fold_independently() {
     );
     shutdown(&client, server_thread);
 }
+
+/// Region markers are own-line single-`#` only: a `##`-doc-comment line (`## region …`) is prose,
+/// not a fold marker, and an inline trailing `# region` comment is not a marker either. Only the
+/// real own-line `#region`/`#endregion` pair folds. (Regression for PR #101 review findings.)
+#[test]
+fn doc_and_inline_region_markers_do_not_fold() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    // Line 0: `extends Node`
+    // Line 1: (blank)
+    // Line 2: `## region NotAFold`   ← `##` doc comment, NOT a region marker
+    // Line 3: `var a := 1`
+    // Line 4: `## endregion`         ← `##` doc comment, NOT a region marker
+    // Line 5: (blank)
+    // Line 6: `var b := 1  # region inline`   ← inline (not own-line), NOT a marker
+    // Line 7: `var c := 2  # endregion`       ← inline, NOT a marker
+    // Line 8: (blank)
+    // Line 9: `#region Real`         ← own-line single-`#` → DOES fold
+    // Line 10: `func helper() -> int:`
+    // Line 11: `\treturn 1`
+    // Line 12: `#endregion`
+    let src = "extends Node\n\n## region NotAFold\nvar a := 1\n## endregion\n\nvar b := 1  # region inline\nvar c := 2  # endregion\n\n#region Real\nfunc helper() -> int:\n\treturn 1\n#endregion\n";
+    init_and_open_caps(
+        &p,
+        &client,
+        &[("markers.gd", src)],
+        ClientCapabilities::default(),
+    );
+    let uri = file_uri(&p.root.join("markers.gd"));
+    let folds = request_folds(&client, 10, &uri);
+
+    let region_at = |start: u32| {
+        folds
+            .iter()
+            .any(|f| f.start_line == start && f.kind.as_ref() == Some(&FoldingRangeKind::Region))
+    };
+    // The real own-line region folds 9..12.
+    assert!(
+        folds.iter().any(|f| f.start_line == 9
+            && f.end_line == 12
+            && f.kind.as_ref() == Some(&FoldingRangeKind::Region)),
+        "the real own-line #region pair must fold 9..12; got {folds:?}"
+    );
+    // The `##` doc-comment "region" (line 2) and the inline "region" (line 6) must NOT mint folds.
+    assert!(
+        !region_at(2),
+        "a `## region` doc comment must not start a fold region; got {folds:?}"
+    );
+    assert!(
+        !region_at(6),
+        "an inline `# region` comment must not start a fold region; got {folds:?}"
+    );
+    shutdown(&client, server_thread);
+}

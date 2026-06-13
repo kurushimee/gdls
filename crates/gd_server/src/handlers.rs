@@ -2935,10 +2935,10 @@ fn is_foldable_block(kind: &NodeKind) -> bool {
 
 /// Project a block's byte span to a [`lsp_types::FoldingRange`], or `None` if it would be a
 /// single-line (degenerate) fold. `end_line` uses the column-0 rule: a span that ends exactly at a
-/// line start (the trailing-newline case — the common one for block bodies) folds up to the
-/// *previous* line, so the blank/dedent line after the block stays visible. This never indexes a
-/// non-codepoint-boundary byte (unlike `span.end - 1`), keeping the "never crash" guarantee on the
-/// UTF-16/32 mapper paths.
+/// line start (i.e. it absorbed a trailing newline) folds up to the *previous* line, so the
+/// blank/dedent line after the block stays visible; the usual block-body span ends at the last
+/// token (column ≠ 0) and folds to that line directly. This never indexes a non-codepoint-boundary
+/// byte (unlike `span.end - 1`), keeping the "never crash" guarantee on the UTF-16/32 mapper paths.
 fn block_fold(
     span: ByteSpan,
     mapper: &PositionMapper,
@@ -3015,9 +3015,14 @@ fn comment_folds(
         i = j + 1;
     }
 
-    // (b) `#region` / `#endregion` pairs, stack-matched in line order.
+    // (b) `#region` / `#endregion` pairs, stack-matched in line order. Only own-line comments
+    // (`new_line`) are region markers — an inline trailing comment (`var x = 1  # region foo`) is
+    // not a fold marker by VS Code / Godot convention.
     let mut stack: Vec<(u32, ByteSpan)> = Vec::new();
-    for &(line, span, _new_line, marker) in &lines {
+    for &(line, span, new_line, marker) in &lines {
+        if !new_line {
+            continue;
+        }
         match marker {
             RegionMarker::Begin => stack.push((line, span)),
             RegionMarker::End => {
@@ -3048,10 +3053,13 @@ enum RegionMarker {
 /// Classify a comment's source text as a `#region` / `#endregion` marker (Godot / VS Code folding
 /// convention). The scan tolerates leading whitespace after `#` and an optional trailing label
 /// (`#region Foo`); `#endregion` is checked before `#region` so the shared `#r…`/`#e…` prefixes
-/// don't misfire. Anything else is [`RegionMarker::None`].
+/// don't misfire. Anything else is [`RegionMarker::None`] — including `##` doc comments, since only
+/// exactly one leading `#` is stripped (a `##region` line is doc prose, not a fold marker).
 fn region_marker(comment: &str) -> RegionMarker {
-    // Strip the leading `#`(s) and surrounding spaces, then match the keyword head.
-    let body = comment.trim_start_matches('#').trim_start();
+    // Strip exactly one leading `#` and surrounding spaces, then match the keyword head. Stripping
+    // only one `#` means a `##`-doc-comment line (`## region …`) keeps a leading `#` and falls to
+    // `None` rather than minting a spurious region from documentation text.
+    let body = comment.strip_prefix('#').unwrap_or(comment).trim_start();
     let head = body.split(|c: char| c.is_whitespace()).next().unwrap_or("");
     if head == "endregion" {
         RegionMarker::End
