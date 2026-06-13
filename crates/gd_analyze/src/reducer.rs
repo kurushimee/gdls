@@ -1663,16 +1663,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     {
         ctx.folds
             .set(id, FoldedValue::Opaque(VariantType::Callable));
-        ctx.set_type(
-            id,
-            DataType {
-                type_source: TypeSource::AnnotatedExplicit,
-                kind: DtKind::Builtin,
-                builtin_type: VariantType::Callable,
-                is_constant: true,
-                ..Default::default()
-            },
-        );
+        ctx.set_type(id, make_callable_type());
         return;
     }
 
@@ -1990,16 +1981,7 @@ fn lookup_class_member(
                 // `errors/function_used_as_property.gd`. The full MethodInfo wiring lives in
                 // the make_callable_type slice; the constant-Callable shape on its own
                 // suffices for the assignment-rejection arm.
-                gd_syntax::ast::Member::Function(_) => Some((
-                    DataType {
-                        type_source: TypeSource::AnnotatedExplicit,
-                        kind: DtKind::Builtin,
-                        builtin_type: VariantType::Callable,
-                        is_constant: true,
-                        ..Default::default()
-                    },
-                    None,
-                )),
+                gd_syntax::ast::Member::Function(_) => Some((make_callable_type(), None)),
                 gd_syntax::ast::Member::Constant(cid) => {
                     let dt = ctx.get_type(cid).clone();
                     let fold = constant_initializer_of(ctx, cid)
@@ -2014,6 +1996,19 @@ fn lookup_class_member(
         }
     }
     None
+}
+
+/// Build a constant-Callable type, the result of a bare reference to a callable member or utility
+/// (`make_callable_type`, gdscript_analyzer.cpp:85). Parameterless because gdls's `DataType` carries
+/// no `MethodInfo` yet — the eventual signatureHelp wiring threads one through this single seam.
+fn make_callable_type() -> DataType {
+    DataType {
+        type_source: TypeSource::AnnotatedExplicit,
+        kind: DtKind::Builtin,
+        builtin_type: VariantType::Callable,
+        is_constant: true,
+        ..Default::default()
+    }
 }
 
 /// Build a native-class metatype, the result of `Identifier "Node"` (analyzer.cpp:4543).
@@ -5218,14 +5213,7 @@ fn lookup_script_chain_member(
                 }
                 // Constant Callable — parity with the in-file Class arm; the full signature
                 // lives with reduce_call's cross-file CallSig path.
-                let mut dt = DataType {
-                    type_source: TypeSource::AnnotatedExplicit,
-                    kind: DtKind::Builtin,
-                    builtin_type: VariantType::Callable,
-                    is_constant: true,
-                    ..Default::default()
-                };
-                dt.is_meta_type = false;
+                let dt = make_callable_type();
                 record_member_use(ctx, link, BindingSymbolKind::Function, name, bind_site);
                 return Some((dt, None));
             }
@@ -5462,15 +5450,7 @@ fn reduce_identifier_from_base(
                 .iter()
                 .any(|m| ctx.native.name_of(m.name) == name)
             {
-                let mut t = DataType {
-                    type_source: TypeSource::AnnotatedExplicit,
-                    kind: DtKind::Builtin,
-                    builtin_type: VariantType::Callable,
-                    is_constant: true,
-                    ..Default::default()
-                };
-                t.is_meta_type = false;
-                ctx.set_type(identifier_id, t);
+                ctx.set_type(identifier_id, make_callable_type());
                 return;
             }
         }
@@ -5536,15 +5516,7 @@ fn reduce_identifier_from_base(
         // signature lives with `reduce_call`; until then a Callable type is sufficient to clear
         // the "Cannot find member new" path.
         if is_constructor {
-            let mut t = DataType {
-                type_source: TypeSource::AnnotatedExplicit,
-                kind: DtKind::Builtin,
-                builtin_type: VariantType::Callable,
-                is_constant: true,
-                ..Default::default()
-            };
-            t.is_meta_type = false;
-            ctx.set_type(identifier_id, t);
+            ctx.set_type(identifier_id, make_callable_type());
             return;
         }
         // Not found anywhere. When the chain crossed a file boundary the interface view may be
@@ -5572,15 +5544,7 @@ fn reduce_identifier_from_base(
     // shallow extracts and a gap in them must never become an error.
     if base.kind == DtKind::Script {
         if is_constructor {
-            let mut t = DataType {
-                type_source: TypeSource::AnnotatedExplicit,
-                kind: DtKind::Builtin,
-                builtin_type: VariantType::Callable,
-                is_constant: true,
-                ..Default::default()
-            };
-            t.is_meta_type = false;
-            ctx.set_type(identifier_id, t);
+            ctx.set_type(identifier_id, make_callable_type());
             return;
         }
         // The script_classes member walk (analyzer.cpp:4188-4260) over the FULL extends chain:
@@ -5705,15 +5669,7 @@ fn try_native_member(
     // 2. Method (analyzer.cpp:4327-4332). gdls returns the callable type (Variant + sig);
     //    the full make_callable_type lives with reduce_call.
     if native_method_exists(ctx, native_name, name) {
-        let mut t = DataType {
-            type_source: TypeSource::AnnotatedExplicit,
-            kind: DtKind::Builtin,
-            builtin_type: VariantType::Callable,
-            is_constant: true,
-            ..Default::default()
-        };
-        t.is_meta_type = false;
-        ctx.set_type(identifier_id, t);
+        ctx.set_type(identifier_id, make_callable_type());
         return true;
     }
     // 3. Signal (analyzer.cpp:4333-4338).
@@ -5758,15 +5714,7 @@ fn try_native_member(
     //    in Godot's ClassDB but the trimmed dump omits it; synthesize a Callable so we
     //    don't false-positive "Cannot find member new" on every legitimate `X.new()`.
     if is_constructor {
-        let mut t = DataType {
-            type_source: TypeSource::AnnotatedExplicit,
-            kind: DtKind::Builtin,
-            builtin_type: VariantType::Callable,
-            is_constant: true,
-            ..Default::default()
-        };
-        t.is_meta_type = false;
-        ctx.set_type(identifier_id, t);
+        ctx.set_type(identifier_id, make_callable_type());
         return true;
     }
     false
