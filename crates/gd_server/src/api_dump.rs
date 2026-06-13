@@ -713,7 +713,9 @@ mod tests {
             );
         }
         // ...and the dump must carry no more than the registry names (count parity ⇒ the two sets
-        // are equal, so a drift in either direction trips this guard).
+        // are equal, so a drift in either direction trips this guard). The dump's
+        // `utility_functions` section is the Variant family only — GDScript-only utilities live in
+        // the analyzer's hard-coded table, not the dump — so this count covers exactly the registry.
         assert_eq!(
             db.utility_count(),
             gd_types::VARIANT_UTILITY_FUNCTIONS.len(),

@@ -1686,10 +1686,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             id,
             FoldedValue::Opaque(
                 VariantType::Callable,
-                Some(UtilityCallableId {
-                    name: name.clone(),
-                    scope,
-                }),
+                Some(UtilityCallableId { name, scope }),
             ),
         );
         ctx.set_type(id, make_callable_type());

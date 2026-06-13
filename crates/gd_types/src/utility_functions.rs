@@ -135,6 +135,9 @@ pub const VARIANT_UTILITY_FUNCTIONS: &[&str] = &[
 /// Whether `name` is a Variant utility function — the DB-independent mirror of
 /// `Variant::has_utility_function`. Used so a bare utility reference resolves to a constant
 /// `Callable` under any [`crate::ApiProvenance`], including `Absent`.
+///
+/// A linear scan over 114 short `&str`s — deliberately simple, and only reached for an identifier
+/// that every earlier name-resolution step already missed, so it is not on a hot path.
 #[must_use]
 pub fn is_variant_utility(name: &str) -> bool {
     VARIANT_UTILITY_FUNCTIONS.contains(&name)
