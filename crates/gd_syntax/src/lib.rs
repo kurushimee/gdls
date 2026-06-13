@@ -16,7 +16,7 @@ pub mod token;
 
 pub use ast::ParseTree;
 pub use doc_comments::{ClassDoc, DocTable, MemberDoc};
-pub use lexer::{tokenize, LexError, Lexer};
+pub use lexer::{tokenize, CommentData, LexError, Lexer};
 pub use span::{ByteSpan, LineCol, LineColRange};
 pub use token::{Literal, Token, TokenKind};
 
@@ -64,6 +64,13 @@ pub struct ParseResult {
     pub tree: ParseTree,
     pub diagnostics: Vec<Diagnostic>,
     pub symbols: Vec<DocumentSymbol>,
+    /// M9 (#70): the lexer's recorded comments, keyed by 1-based line — the same
+    /// [`CommentData`] side-channel `doc_comments::associate` consumes (the M7 #62 mirror of
+    /// Godot's `GDScriptTokenizer::CommentData`; the token stream never sees them, so both
+    /// fidelity ratchets are unaffected). Surfaced here, **additively**, so `gd_server`'s
+    /// `foldingRange` can fold comment runs and `#region`/`#endregion` pairs without re-lexing.
+    /// Empty for sources without comments.
+    pub comments: std::collections::HashMap<u32, CommentData>,
 }
 
 /// Parse a GDScript source file into a (possibly partial) tree, its syntax diagnostics, and a
@@ -79,10 +86,14 @@ pub fn parse(source: &str) -> ParseResult {
     // ratchets) never sees them.
     tree.docs = doc_comments::associate(source, &tree, &comments);
     let symbols = parser::document_symbols(&tree);
+    // M9 (#70): hand the same comment side-channel through to the result so `foldingRange` can
+    // see comment runs / `#region` markers. `associate` borrowed `&comments`, so it is intact to
+    // move here — purely additive, the parser/tokenizer never observe it.
     ParseResult {
         tree,
         diagnostics,
         symbols,
+        comments,
     }
 }
 

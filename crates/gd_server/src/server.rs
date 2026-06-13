@@ -11,10 +11,10 @@ use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
     CallHierarchyServerCapability, CodeDescription, Diagnostic, DiagnosticSeverity, DiagnosticTag,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentLinkOptions, HoverProviderCapability,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, OneOf,
-    PublishDiagnosticsParams, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri,
+    DidSaveTextDocumentParams, DocumentLinkOptions, FoldingRangeProviderCapability,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    OneOf, PublishDiagnosticsParams, SelectionRangeProviderCapability, ServerCapabilities,
+    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent};
 use rustc_hash::FxHashSet;
@@ -104,6 +104,15 @@ pub(crate) struct ClientCaps {
     /// The M8 (#65) signatureHelp gates, captured under `textDocument.signatureHelp`. Grouped in a
     /// sub-struct like [`CompletionCaps`] so the handler reads `state.caps.signature_help.<gate>`.
     pub(crate) signature_help: SignatureHelpCaps,
+    /// `textDocument.foldingRange.rangeLimit` (M9 #70) — the maximum number of folding ranges the
+    /// client prefers per document. A hint, not a hard cap (the spec lets the server choose how to
+    /// honor it): `foldingRange` sorts its folds deterministically, then truncates to this many.
+    /// `None` ⇒ no limit (return every fold).
+    pub(crate) folding_range_limit: Option<u32>,
+    /// `textDocument.foldingRange.lineFoldingOnly` (M9 #70) — when true the client ignores
+    /// `startCharacter`/`endCharacter` and folds whole lines, so `foldingRange` omits the column
+    /// fields entirely (whole-line ranges). Absent ⇒ `false` ⇒ ranges carry their columns.
+    pub(crate) folding_line_folding_only: bool,
 }
 
 /// The `textDocument.completion` client capabilities gdls projects each item against (M8 #64).
@@ -205,6 +214,16 @@ impl ClientCaps {
                 .unwrap_or_default(),
             completion: CompletionCaps::negotiate(td),
             signature_help: SignatureHelpCaps::negotiate(td),
+            // M9 (#70): foldingRange projection hints. Same optional-path `.and_then`/`.unwrap_or`
+            // convention as the flags above — an absent `foldingRange` capability yields no limit
+            // and full (columned) ranges.
+            folding_range_limit: td
+                .and_then(|t| t.folding_range.as_ref())
+                .and_then(|f| f.range_limit),
+            folding_line_folding_only: td
+                .and_then(|t| t.folding_range.as_ref())
+                .and_then(|f| f.line_folding_only)
+                .unwrap_or(false),
         }
     }
 }
@@ -1723,6 +1742,11 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
             retrigger_characters: Some(vec![")".to_string()]),
             work_done_progress_options: Default::default(),
         }),
+        // M9 (#70): foldingRange + selectionRange. Both are pure parse-priced projections (AST
+        // spans + the comment side-channel → ranges) with no project fan-out, so they advertise as
+        // bare booleans and are served even at Hard memory pressure (not in `analyze_using`).
+        folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+        selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
         document_link_provider: Some(DocumentLinkOptions {
             resolve_provider: Some(false),
             work_done_progress_options: Default::default(),
@@ -1945,6 +1969,11 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // M8 (#65): signatureHelp. Returns `SignatureHelp` (or `null` when the cursor is in no
         // call). `serde_json::to_value(None)` serializes to `null`, which is what the wire wants.
         "textDocument/signatureHelp" => handle!(handlers::signature_help),
+        // M9 (#70): foldingRange returns `FoldingRange[]` (compound-node blocks, comment runs, and
+        // `#region`/`#endregion` pairs); selectionRange returns one `SelectionRange` ancestor chain
+        // per requested position. Both are parse-priced (NOT in the Hard-pressure shed set above).
+        "textDocument/foldingRange" => handle!(handlers::folding_range),
+        "textDocument/selectionRange" => handle!(handlers::selection_range),
         // M7 (#61): pull diagnostics. NOT in the Hard-pressure shed list above — `analyze_gd`
         // self-degrades to parser-only + cached results there, exactly like the push path, so
         // pull and push stay byte-identical under pressure too.
