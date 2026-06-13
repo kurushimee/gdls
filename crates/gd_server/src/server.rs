@@ -1934,7 +1934,9 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             // M9 (#68): `typeDefinition` runs `analyze_if_gd` to resolve the cursor symbol's type
             // before mapping it to a declaring Location — analysis-priced, so it sheds at Hard like
             // hover. `declaration` is intentionally absent: it delegates to `definition`, which is
-            // index-/parse-only and stays served under pressure.
+            // itself absent from this set, so `declaration` inherits identical under-pressure
+            // behavior (the two stay byte-identical — `definition` may still analyze on some arms,
+            // but neither is shed here).
             | "textDocument/typeDefinition"
     );
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {

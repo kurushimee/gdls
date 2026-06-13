@@ -446,6 +446,45 @@ fn type_definition_on_script_typed_symbol_jumps_to_class_name_site() {
 }
 
 #[test]
+fn type_definition_cross_file_inferred_is_currently_null() {
+    // Pins the known analyzer-pinning gap (see the module note): a cross-file *inferred* binding
+    // `var x := Enemy.new()` (Enemy a `class_name` in another file) currently resolves to `null` —
+    // the analyzer pins no `smallest_typed_containing`-reachable type on it. `definition` still
+    // finds the symbol's own binding (proving `x` is a real symbol; only its TYPE is unpinned).
+    // This asserts CURRENT behavior: if the frontend later pins cross-file inferred types, this
+    // `is_none()` flips — an intentional, visible change to update here, not a silent regression.
+    let consumer = concat!(
+        "extends Node\n",         // line 0
+        "\n",                     // line 1
+        "var x := Enemy.new()\n", // line 2 — cross-file inferred member `x` (cols 4..5)
+        "\n",                     // line 3
+        "func go() -> void:\n",   // line 4
+        "\tprint(x)\n",           // line 5 — use of `x` (cols 7..8)
+    );
+    let project = NativeProject::new(&[
+        ("enemy.gd", "class_name Enemy\nextends Node2D\n"),
+        ("consumer.gd", consumer),
+    ]);
+    let (client, handle, _) = boot(&project);
+    let uri = project.uri("consumer.gd");
+    did_open(&client, &uri, consumer);
+
+    // Sanity: `x` is a resolvable member — `definition` on its use lands on the `var x` declaration.
+    assert!(
+        definition_at(&client, &uri, Position::new(5, 7)).is_some(),
+        "`x` should be a resolvable binding (definition on the use is non-null)"
+    );
+    // The gap: the cross-file inferred TYPE isn't pinned, so typeDefinition is currently null.
+    assert!(
+        type_definition_at(&client, &uri, Position::new(2, 4)).is_none(),
+        "cross-file inferred `var x := Enemy.new()` currently yields null typeDefinition \
+         (analyzer-pinning gap); if this ever resolves, the frontend improved — update intentionally"
+    );
+
+    shutdown(&client, handle);
+}
+
+#[test]
 fn type_definition_on_native_typed_symbol_jumps_to_stub_header() {
     // A symbol declared with a native type (`var n: Node`) → that engine class's stub header
     // (the Native-kind arm). Requires the populated dump (`boot` here points at one).
