@@ -433,7 +433,7 @@ fn script_method_sig(
     // `&mut` the analysis borrow already holds). Parameter names + defaults need the parse *tree*;
     // the index interface alone can't supply the default expressions.
     let parsed = gd_syntax::parse(decl_src);
-    let func = function_at_name_span(&parsed.tree, name_span)?;
+    let func = function_at_name_span(&parsed.tree, name_span, name)?;
     Some(vec![Sig::from_function_node(
         &parsed.tree,
         decl_src,
@@ -461,20 +461,25 @@ fn script_init_sig(state: &ServerState, text: &str, fid: gd_project::FileId) -> 
     Some(vec![Sig::constructor(&class)])
 }
 
-/// The `FunctionNode` whose identifier span equals `name_span` — the precise declaring function,
-/// found by the name token (so an inner-class same-named function is never confused for the
-/// outer one). `None` when no function's identifier matches (a defensively-empty `name_span`, or a
-/// stale interface vs the live text).
-fn function_at_name_span(
-    tree: &ParseTree,
+/// The `FunctionNode` whose identifier span equals `name_span` AND whose identifier text equals
+/// `name` — the precise declaring function, found by the name token (so an inner-class same-named
+/// function is never confused for the outer one). The name re-check is cheap insurance against a
+/// *coincidental* span collision: `name_span` comes from the cached interface, but the tree is a
+/// fresh re-parse of the (possibly on-disk-newer) declaring file, so a span that now lands on a
+/// different identifier must not be accepted (`MemberDecl::name_span`'s "validate against live
+/// text" contract). `None` when no function matches (a defensively-empty `name_span`, or a stale
+/// interface vs the live text).
+fn function_at_name_span<'a>(
+    tree: &'a ParseTree,
     name_span: gd_syntax::ByteSpan,
-) -> Option<&gd_syntax::ast::FunctionNode> {
+    name: &str,
+) -> Option<&'a gd_syntax::ast::FunctionNode> {
     tree.iter_ids().find_map(|id| {
         let NodeKind::Function(f) = &tree.get(id).kind else {
             return None;
         };
         let ident = f.identifier?;
-        (tree.get(ident).span == name_span).then_some(f)
+        (tree.get(ident).span == name_span && ident_text(tree, ident) == name).then_some(f)
     })
 }
 
@@ -873,5 +878,33 @@ fn retained_active_signature(
     match prior {
         Some(idx) if (idx as usize) < count => idx,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FIX 5 (review): `function_at_name_span` must reject a span that matches but whose identifier
+    /// text differs from the requested name — the coincidental-collision path that could otherwise
+    /// render a different function's signature under the requested name (a "never lie" hole).
+    #[test]
+    fn function_at_name_span_rejects_span_match_with_wrong_name() {
+        let src = "func alpha(a: int):\n\tpass\nfunc bravo(b: int):\n\tpass\n";
+        let tree = gd_syntax::parse(src).tree;
+        let alpha_span = tree
+            .iter_ids()
+            .find_map(|id| {
+                let NodeKind::Function(f) = &tree.get(id).kind else {
+                    return None;
+                };
+                let ident = f.identifier?;
+                (ident_text(&tree, ident) == "alpha").then(|| tree.get(ident).span)
+            })
+            .expect("alpha function present");
+        // Span lands on alpha, but the requested name is bravo → the guard rejects it.
+        assert!(function_at_name_span(&tree, alpha_span, "bravo").is_none());
+        // Span and name both alpha → resolves.
+        assert!(function_at_name_span(&tree, alpha_span, "alpha").is_some());
     }
 }
