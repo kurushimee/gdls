@@ -306,6 +306,13 @@ impl NativeDb {
         self.classes.len()
     }
 
+    /// How many `@GlobalScope` utility functions this DB ingested. Lets a consumer assert the
+    /// ingest carried the full Variant utility set (parity against
+    /// [`crate::VARIANT_UTILITY_FUNCTIONS`]).
+    pub fn utility_count(&self) -> usize {
+        self.utilities.len()
+    }
+
     pub fn header(&self) -> &api::Header {
         &self.header
     }

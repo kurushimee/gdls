@@ -176,6 +176,31 @@ fn trimmed_real_fixture_parses_and_chains() {
         .is_some_and(|c| !c.methods.is_empty()));
 }
 
+/// The Variant utility ingest path at unit level: every `utility_functions` entry in the dump
+/// lands in `NativeDb::utility`, and each is recognized by the DB-independent registry. Guards the
+/// extension_api → `NativeDb::utility` decode that the analyzer's bare-utility arm relies on.
+#[test]
+fn trimmed_fixture_ingests_variant_utilities() {
+    let db = NativeDb::from_json(TRIMMED).expect("trimmed real dump parses");
+    for name in [
+        "is_same", "sqrt", "floor", "ceil", "round", "abs", "lerp", "max", "print",
+    ] {
+        assert!(
+            db.utility(name).is_some(),
+            "trimmed dump dropped utility {name}"
+        );
+        assert!(
+            gd_types::is_variant_utility(name),
+            "{name} must be in the canonical Variant-utility registry"
+        );
+    }
+    assert_eq!(
+        db.utility_count(),
+        9,
+        "trimmed fixture carries exactly its 9 utilities"
+    );
+}
+
 // ============================================================================
 // v1.0.4 groundwork: lookup_member / lookup_builtin_member / default_value /
 // display_type (consumed by hover #35, definition stubs #34)
