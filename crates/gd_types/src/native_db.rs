@@ -376,6 +376,36 @@ impl NativeDb {
         all.into_iter()
     }
 
+    /// Enumerate every native class **name**, **sorted**. The by-name [`Self::class_named`] lookup
+    /// is the targeted complement; this is the enumeration M8 completion lists in the IDENTIFIER and
+    /// TYPE contexts (`Node`, `Timer`, …, the engine class set Godot's `get_global_map()` /
+    /// `_list_available_types` surface). The backing store is an [`FxHashMap`] (nondeterministic
+    /// iteration), so the result is sorted to give completion a stable order to rank against.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    pub fn class_names(&self) -> impl Iterator<Item = &str> + '_ {
+        let mut all: Vec<&str> = self
+            .classes
+            .values()
+            .map(|c| self.name_of(c.name))
+            .collect();
+        all.sort_unstable();
+        all.into_iter()
+    }
+
+    /// Enumerate every builtin type **name**, **sorted** (`Vector2`, `Color`, `Array`, …). The
+    /// complement of [`Self::builtin_named`]; sorted for the same determinism reason as
+    /// [`Self::class_names`].
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    pub fn builtin_names(&self) -> impl Iterator<Item = &str> + '_ {
+        let mut all: Vec<&str> = self
+            .builtins
+            .values()
+            .map(|b| self.name_of(b.name))
+            .collect();
+        all.sort_unstable();
+        all.into_iter()
+    }
+
     pub fn header(&self) -> &api::Header {
         &self.header
     }
@@ -454,6 +484,38 @@ impl NativeDb {
             }
         }
         None
+    }
+
+    /// Enumerate the **value names** of an enum, **sorted**, for M8 call-argument / assignment
+    /// enum-candidate completion (`ClassDB::get_enum_constants` / `_find_enumeration_candidates`).
+    /// `scope` is the owning class for a class-scoped enum (`Input.MouseMode` → `Some("Input")`),
+    /// or `None` for a `@GlobalScope` enum (`Error`). A class-scoped enum is looked up on the
+    /// class **and inherited** up the `inherits` chain (an enum-typed param can name a base
+    /// class's enum). Empty when the enum is unknown. Names only — completion adds the qualifier.
+    #[must_use]
+    pub fn enum_constants(&self, scope: Option<&str>, enum_name: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        match scope {
+            None => {
+                if let Some(ne) = self.global_enum(enum_name) {
+                    out.extend(ne.values.iter().map(|(s, _)| self.name_of(*s)));
+                }
+            }
+            Some(class) => {
+                let target = self.interner.get(enum_name);
+                let mut cur = self.class_named(class);
+                for _ in 0..64 {
+                    let Some(nc) = cur else { break };
+                    if let Some(ne) = target.and_then(|t| nc.enums.iter().find(|e| e.name == t)) {
+                        out.extend(ne.values.iter().map(|(s, _)| self.name_of(*s)));
+                        break;
+                    }
+                    cur = nc.inherits.and_then(|s| self.classes.get(&s));
+                }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// A `@GlobalScope` constant's value.
@@ -1120,6 +1182,72 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted, "utilities() yields a name-sorted order");
+    }
+
+    #[test]
+    fn class_and_builtin_names_enumerated_sorted() {
+        let db = trimmed_db();
+        let classes: Vec<&str> = db.class_names().collect();
+        assert!(classes.contains(&"Node"), "Node enumerated: {classes:?}");
+        assert!(classes.contains(&"Object"), "Object enumerated");
+        let mut sorted = classes.clone();
+        sorted.sort_unstable();
+        assert_eq!(classes, sorted, "class_names() is name-sorted");
+
+        let builtins: Vec<&str> = db.builtin_names().collect();
+        assert!(builtins.contains(&"Color"), "Color builtin enumerated");
+        assert!(builtins.contains(&"Vector2"), "Vector2 builtin enumerated");
+        let mut bsorted = builtins.clone();
+        bsorted.sort_unstable();
+        assert_eq!(builtins, bsorted, "builtin_names() is name-sorted");
+
+        // Empty DB yields nothing, never panics.
+        let empty = NativeDb::empty();
+        assert_eq!(empty.class_names().count(), 0);
+        assert_eq!(empty.builtin_names().count(), 0);
+    }
+
+    #[test]
+    fn enum_constants_global_and_scoped() {
+        // Global enum (`Error`) values via `enum_constants(None, "Error")`.
+        let db = mini_globals_db();
+        let mut err = db.enum_constants(None, "Error");
+        err.sort_unstable();
+        assert_eq!(
+            err,
+            vec!["FAILED", "OK"],
+            "global Error enum values, sorted"
+        );
+        assert!(
+            db.enum_constants(None, "NotAnEnum").is_empty(),
+            "unknown enum → empty"
+        );
+
+        // Class-scoped enum, including inherited up the chain.
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Base", "is_instantiable": true,
+                     "enums": [{"name": "Mode", "is_bitfield": false,
+                                "values": [{"name": "MODE_A", "value": 0},
+                                           {"name": "MODE_B", "value": 1}]}]},
+                    {"name": "Derived", "inherits": "Base", "is_instantiable": true}
+                ]
+            }"#,
+        )
+        .expect("scoped enum dump");
+        // Looked up on the declaring class.
+        assert_eq!(
+            db.enum_constants(Some("Base"), "Mode"),
+            vec!["MODE_A", "MODE_B"]
+        );
+        // Inherited: `Derived` reaches `Base.Mode` up the `inherits` chain.
+        assert_eq!(
+            db.enum_constants(Some("Derived"), "Mode"),
+            vec!["MODE_A", "MODE_B"],
+            "a class-scoped enum is found up the inherits chain"
+        );
     }
 
     #[test]

@@ -290,6 +290,52 @@ fn annotation_target_kind(name: &str) -> Option<u32> {
     })
 }
 
+/// Every registered annotation `(name_with_@, takes_arguments)`, transcribed from the
+/// `register_annotation(MethodInfo("@…", …), …)` calls in `GDScriptParser::GDScriptParser()`
+/// (`gdscript_parser.cpp:149-190`) — the **single source of truth** the M8 `ANNOTATION` completion
+/// renders from (Godot's `get_annotation_list` iterates the same `valid_annotations` registry).
+/// `takes_arguments` is `true` exactly when the registering `MethodInfo` carried one or more
+/// `PropertyInfo` parameters (so completion appends `(`, matching `gdscript_editor.cpp:3473`). The
+/// names are kept in Godot's registration order; the completion renderer sorts as needed.
+pub const REGISTERED_ANNOTATIONS: &[(&str, bool)] = &[
+    ("@tool", false),
+    ("@icon", true),
+    ("@static_unload", false),
+    ("@abstract", false),
+    ("@onready", false),
+    ("@export", false),
+    ("@export_enum", true),
+    ("@export_file", true),
+    ("@export_file_path", true),
+    ("@export_dir", false),
+    ("@export_global_file", true),
+    ("@export_global_dir", false),
+    ("@export_multiline", true),
+    ("@export_placeholder", true),
+    ("@export_range", true),
+    ("@export_exp_easing", true),
+    ("@export_color_no_alpha", false),
+    ("@export_node_path", true),
+    ("@export_flags", true),
+    ("@export_flags_2d_render", false),
+    ("@export_flags_2d_physics", false),
+    ("@export_flags_2d_navigation", false),
+    ("@export_flags_3d_render", false),
+    ("@export_flags_3d_physics", false),
+    ("@export_flags_3d_navigation", false),
+    ("@export_flags_avoidance", false),
+    ("@export_storage", false),
+    ("@export_custom", true),
+    ("@export_tool_button", true),
+    ("@export_category", true),
+    ("@export_group", true),
+    ("@export_subgroup", true),
+    ("@warning_ignore", true),
+    ("@warning_ignore_start", true),
+    ("@warning_ignore_restore", true),
+    ("@rpc", true),
+];
+
 /// `GDScriptWarning::get_code_from_name`'s accepted `PNAME`s, copied into `gd_syntax` because the
 /// Godot applies `@warning_ignore*` annotations in the parser while gdls keeps warning policy in the
 /// analyzer crate. This tiny validity table lets parser diagnostics match Godot without adding a

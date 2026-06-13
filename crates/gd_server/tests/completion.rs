@@ -788,8 +788,7 @@ fn completion_in_unhandled_context_is_an_empty_list() {
     let raw = complete_raw(&client, 70, &uri, Position::new(0, 0));
     assert!(raw.is_object(), "still a CompletionList object: {raw}");
     let list: CompletionList = serde_json::from_value(raw).unwrap();
-    // Either empty or some inherit-type set — but never an error and always a List. (This phase
-    // renders InheritType as empty.)
+    // Either empty or some identifier set — but never an error and always a List.
     let _ = list.items.len();
 
     // The raw message just exchanged proves no stdout corruption (the client got a clean Response).
@@ -799,4 +798,731 @@ fn completion_in_unhandled_context_is_an_empty_list() {
     )));
 
     shutdown(&client, server_thread);
+}
+
+// ===================================================================================================
+// Phase 4 — the remaining completion contexts.
+// ===================================================================================================
+
+/// A dump rich enough for the Phase 4 contexts: native classes carrying **virtual** methods
+/// (`Node._ready`/`_process` — the override set), a class with an **enum-typed** method parameter
+/// (`Player.set_state(state: enum::Player.State)` — the call-arg enum candidates), the `State` enum,
+/// and a `Color` builtin with a constant (`RED`), a **static** method (`from_hsv`), and an
+/// **instance** method (`lerp` — must NOT appear in the `Color.` static set).
+const P4_API: &str = r#"{
+    "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+    "global_constants": [{"name": "KEY_A", "value": 65}],
+    "utility_functions": [
+        {"name": "print", "return_type": "void", "is_vararg": true, "arguments": []}
+    ],
+    "builtin_classes": [
+        {"name": "Color", "is_keyed": false,
+         "constants": [{"name": "RED", "type": "Color", "value": "Color(1, 0, 0, 1)"}],
+         "methods": [
+            {"name": "from_hsv", "is_const": false, "is_static": true, "is_vararg": false,
+             "return_type": "Color",
+             "arguments": [{"name": "h", "type": "float"}, {"name": "s", "type": "float"}]},
+            {"name": "lerp", "is_const": true, "is_static": false, "is_vararg": false,
+             "return_type": "Color",
+             "arguments": [{"name": "to", "type": "Color"}, {"name": "weight", "type": "float"}]}
+         ]}
+    ],
+    "classes": [
+        {"name": "Object", "methods": [
+            {"name": "get_class", "is_const": true, "return_value": {"type": "String"}}
+        ]},
+        {"name": "Node", "inherits": "Object", "methods": [
+            {"name": "queue_free"},
+            {"name": "_ready", "is_virtual": true, "return_value": {"type": "void"}},
+            {"name": "_process", "is_virtual": true, "return_value": {"type": "void"},
+             "arguments": [{"name": "delta", "type": "float"}]}
+        ]},
+        {"name": "CanvasItem", "inherits": "Node"},
+        {"name": "Node2D", "inherits": "CanvasItem"},
+        {"name": "Player", "inherits": "Node2D",
+         "enums": [{"name": "State", "values": [
+            {"name": "STATE_IDLE", "value": 0}, {"name": "STATE_RUN", "value": 1}]}],
+         "methods": [
+            {"name": "set_state", "is_const": false, "is_static": false, "is_vararg": false,
+             "return_value": {"type": "void"},
+             "arguments": [{"name": "state", "type": "enum::Player.State"}]}
+         ]}
+    ]
+}"#;
+
+/// A project on [`P4_API`] with a `Hero` (`class_name`, extends `Node2D`) carrying a documented
+/// member — the Phase 4 fixture. Mirrors `rich_project`'s layout.
+fn p4_project() -> TempProject {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"T\"\n",
+    );
+    p.write("extension_api.json", P4_API);
+    p.write(
+        "src/hero.gd",
+        "class_name Hero\nextends Node2D\n\n## The hero's hit points.\nvar hp: int = 10\n\nfunc attack() -> void:\n\tpass\n",
+    );
+    p
+}
+
+/// The label set of a completion result, for terse `contains` assertions.
+fn labels(list: &CompletionList) -> Vec<String> {
+    list.items.iter().map(|i| i.label.clone()).collect()
+}
+
+// --- ANNOTATION ---
+
+/// `@<cursor>` returns the annotation name list (no leading `@`), and an annotation that takes
+/// arguments inserts a trailing `(`. `@export_range(0, 10, 1, <cursor>` returns its special slider
+/// argument words.
+#[test]
+fn annotation_name_list_and_argument_words() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/a.gd"));
+    // `@` on its own line (a script-level annotation position).
+    let src = "@\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 100, &uri, Position::new(0, 1));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    // The `@` is stripped from labels; the registry names appear.
+    assert!(
+        ls.contains(&"export".to_string()),
+        "@export offered: {ls:?}"
+    );
+    assert!(ls.contains(&"onready".to_string()), "@onready offered");
+    assert!(ls.contains(&"tool".to_string()), "@tool offered");
+    assert!(
+        ls.contains(&"export_range".to_string()),
+        "@export_range offered"
+    );
+    // `@export_range` takes args → its insert appends `(`; `@tool` takes none → bare name.
+    let export_range = list
+        .items
+        .iter()
+        .find(|i| i.label == "export_range")
+        .unwrap();
+    assert!(
+        edit_new_text(export_range).ends_with('('),
+        "an arg-taking annotation inserts a trailing `(`: {:?}",
+        edit_new_text(export_range)
+    );
+    let tool = list.items.iter().find(|i| i.label == "tool").unwrap();
+    assert_eq!(
+        edit_new_text(tool),
+        "tool",
+        "a no-arg annotation inserts the bare name"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// `@export_range(0, 10, 1, <cursor>` — the slider argument words at the `extra_hints` slot
+/// (argument index ≥ 3, matching Godot's `_find_annotation_arguments` index gate).
+#[test]
+fn annotation_export_range_slider_words() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/r.gd"));
+    // The slider words are offered at the 4th argument (index 3) and beyond.
+    let src = "extends Node2D\n\n@export_range(0, 10, 1, )\nvar speed: float\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // Cursor inside the 4th arg slot: line 2, just after the last `, ` → column 24.
+    let raw = complete_raw(&client, 101, &uri, Position::new(2, 24));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    for word in ["or_greater", "or_less", "prefer_slider", "hide_control"] {
+        assert!(
+            ls.contains(&word.to_string()),
+            "@export_range slider word {word} offered: {ls:?}"
+        );
+    }
+    // The word inserts as a double-quoted string (canonical, W17).
+    let or_greater = list.items.iter().find(|i| i.label == "or_greater").unwrap();
+    assert_eq!(edit_new_text(or_greater), "\"or_greater\"");
+
+    shutdown(&client, server_thread);
+}
+
+// --- TYPE positions ---
+
+/// `var x: <cursor>` returns the available types: builtins, native classes, project `class_name`s,
+/// and `Variant` — but no `void`.
+#[test]
+fn type_name_position_lists_types_no_void() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/t.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar x: \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar x: ` → cursor at column 8 on line 3.
+    let raw = complete_raw(&client, 110, &uri, Position::new(3, 8));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"Node".to_string()),
+        "native class Node: {ls:?}"
+    );
+    assert!(ls.contains(&"Color".to_string()), "builtin Color offered");
+    assert!(
+        ls.contains(&"Hero".to_string()),
+        "project class Hero offered"
+    );
+    assert!(ls.contains(&"Variant".to_string()), "Variant offered");
+    assert!(
+        !ls.contains(&"void".to_string()),
+        "void must NOT appear at a `var:` type position: {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// `-> <cursor>` (return type) returns the type set **plus** `void`.
+#[test]
+fn return_type_position_includes_void() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/rt.gd"));
+    let src = "extends Node2D\n\nfunc f() -> \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `func f() -> ` → cursor at column 12 on line 2.
+    let raw = complete_raw(&client, 111, &uri, Position::new(2, 12));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"void".to_string()),
+        "void IS offered at a return-type position: {ls:?}"
+    );
+    assert!(
+        ls.contains(&"Node".to_string()),
+        "native class Node offered"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// `extends <cursor>` returns class names only — no builtins, no `void`, no `Variant`.
+#[test]
+fn inherit_type_position_excludes_builtins_and_void() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/ih.gd"));
+    let src = "extends \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `extends ` → cursor at column 8 on line 0.
+    let raw = complete_raw(&client, 112, &uri, Position::new(0, 8));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"Node".to_string()),
+        "native class Node offered"
+    );
+    assert!(
+        ls.contains(&"Hero".to_string()),
+        "project class Hero offered"
+    );
+    assert!(
+        !ls.contains(&"Color".to_string()),
+        "a builtin must NOT appear for `extends`: {ls:?}"
+    );
+    assert!(
+        !ls.contains(&"void".to_string()),
+        "void must NOT appear for `extends`"
+    );
+    assert!(
+        !ls.contains(&"Variant".to_string()),
+        "Variant must NOT appear for `extends`"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- BUILTIN STATIC ---
+
+/// `Color.<cursor>` returns the builtin type's constants + **static** methods (`Color.RED`,
+/// `Color.from_hsv`), and NOT its instance methods (`Color.lerp` must be absent).
+#[test]
+fn builtin_static_lists_constants_and_static_methods_only() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/bs.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar c = Color.\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar c = Color.` → cursor right after the `.`. `\t`=col0, `Color` ends at col13, `.` at
+    // col13..14, so after the dot is column 15.
+    let raw = complete_raw(&client, 120, &uri, Position::new(3, 15));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"RED".to_string()),
+        "Color.RED constant offered: {ls:?}"
+    );
+    assert!(
+        ls.contains(&"from_hsv".to_string()),
+        "Color.from_hsv static method offered: {ls:?}"
+    );
+    assert!(
+        !ls.contains(&"lerp".to_string()),
+        "Color.lerp is an INSTANCE method — must NOT appear as a static: {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- CALL ARGUMENTS enum candidates ---
+
+/// Completing a call argument whose parameter is enum-typed (`Player.set_state(state: State)`)
+/// suggests that enum's constants (`STATE_IDLE`, `STATE_RUN`).
+#[test]
+fn call_argument_enum_candidates() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/ca.gd"));
+    // A typed parameter `pl: Player`, then `pl.set_state(` on its own line.
+    let src = "extends Node2D\n\nfunc f(pl: Player) -> void:\n\tpl.set_state()\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // Inside the `set_state(` arg list: `\tpl.set_state(` → cursor at column 14 on line 3.
+    let raw = complete_raw(&client, 130, &uri, Position::new(3, 14));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"STATE_IDLE".to_string()) && ls.contains(&"STATE_RUN".to_string()),
+        "an enum-typed parameter suggests its enum's constants; got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- ASSIGN enum candidates ---
+
+/// `x = <cursor>` where `x` is enum-typed suggests that enum's members (`STATE_IDLE`, `STATE_RUN`).
+#[test]
+fn assign_to_enum_typed_var_suggests_enum_members() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/as.gd"));
+    // A local typed with the native enum, then an assignment to it.
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar s: Player.State\n\ts = \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\ts = ` → cursor at column 5 on line 4 (after `s = `).
+    let raw = complete_raw(&client, 135, &uri, Position::new(4, 5));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"STATE_IDLE".to_string()) && ls.contains(&"STATE_RUN".to_string()),
+        "assigning to an enum-typed var suggests the enum's members; got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- SUBSCRIPT (identifier fallback this phase) ---
+
+/// `d[<cursor>` falls back to the in-scope identifier set (the constant-dict-key refinement is
+/// deferred to the identifier fallback this phase). The identifier set is offered (a global like
+/// `print`, a self member) — never empty / a wrong guess.
+#[test]
+fn subscript_falls_back_to_identifiers() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/sub.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar d = {}\n\tprint(d[)\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tprint(d[` → cursor right after `[`. `\t`=0, `print(d[` → `[` at byte 8, after = column 9.
+    let raw = complete_raw(&client, 136, &uri, Position::new(4, 9));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"print".to_string()),
+        "a subscript index falls back to the identifier set (the global `print`); got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- PROPERTY METHOD (get =/set = binds a class method) ---
+
+/// `var x: int:\n\tget = <cursor>` offers the class's own methods (the accessor binds a getter by
+/// method name). The class method `helper` is offered.
+#[test]
+fn property_method_offers_class_methods() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/pm.gd"));
+    // A class method `helper`, then a property whose `get =` accessor binds a method by name.
+    let src = "extends Node2D\n\nfunc helper() -> int:\n\treturn 1\n\nvar x: int:\n\tget = \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tget = ` on line 6 → cursor at column 7 (after `get = `).
+    let raw = complete_raw(&client, 137, &uri, Position::new(6, 7));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"helper".to_string()),
+        "a property accessor (`get =`) offers the class's own methods (helper); got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- OVERRIDE METHOD ---
+
+/// `func <cursor>` in a class body suggests overridable parent **virtuals** (`_ready`, `_process`)
+/// with a full signature stub. With `snippetSupport` the insert carries a `$0` body tab-stop and
+/// the canonical one-tab indent. A non-virtual native method (`queue_free`) is NOT offered.
+#[test]
+fn override_method_lists_virtuals_with_signature_stub() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/ov.gd"));
+    let src = "extends Node2D\n\nfunc \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `func ` → cursor at column 5 on line 2.
+    let raw = complete_raw(&client, 140, &uri, Position::new(2, 5));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+
+    // `_ready` and `_process` are offered; the label is the full `name(...) -> Ret:` stub.
+    let ready = list
+        .items
+        .iter()
+        .find(|i| i.filter_text.as_deref() == Some("_ready"))
+        .expect("_ready virtual offered");
+    assert!(
+        ready.label.starts_with("_ready(") && ready.label.ends_with(':'),
+        "the label is a signature stub `_ready() -> void:`, got {:?}",
+        ready.label
+    );
+    let process = list
+        .items
+        .iter()
+        .find(|i| i.filter_text.as_deref() == Some("_process"))
+        .expect("_process virtual offered");
+    assert!(
+        process.label.contains("delta"),
+        "the _process stub carries its parameter name: {:?}",
+        process.label
+    );
+    // A non-virtual native method is not an override candidate.
+    assert!(
+        !list
+            .items
+            .iter()
+            .any(|i| i.filter_text.as_deref() == Some("queue_free")),
+        "a non-virtual native method must not be an override candidate"
+    );
+    // snippetSupport on ⇒ the insert is a snippet with a `$0` body tab-stop and a one-tab indent.
+    assert_eq!(
+        ready.insert_text_format,
+        Some(lsp_types::InsertTextFormat::SNIPPET),
+        "override stub is a snippet when gated"
+    );
+    let nt = edit_new_text(ready);
+    assert!(
+        nt.contains("$0") && nt.contains("\n\t"),
+        "snippet body has a $0 tab-stop and canonical one-tab indent: {nt:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A virtual the class **already overrides** is NOT offered again (Godot's
+/// `has_function(...) continue`, `gdscript_editor.cpp:3744`): with `func _ready()` already defined,
+/// completing `func <cursor>` offers `_process` (not yet overridden) but NOT `_ready`.
+#[test]
+fn override_method_skips_already_overridden_virtual() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/ov2.gd"));
+    // `_ready` is already defined on this class; a new `func ` should not re-offer it.
+    let src = "extends Node2D\n\nfunc _ready() -> void:\n\tpass\n\nfunc \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `func ` on line 5 → cursor at column 5.
+    let raw = complete_raw(&client, 142, &uri, Position::new(5, 5));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    assert!(
+        !list
+            .items
+            .iter()
+            .any(|i| i.filter_text.as_deref() == Some("_ready")),
+        "an already-overridden virtual (_ready) must NOT be offered again; got {:?}",
+        list.items
+            .iter()
+            .filter_map(|i| i.filter_text.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        list.items
+            .iter()
+            .any(|i| i.filter_text.as_deref() == Some("_process")),
+        "a not-yet-overridden virtual (_process) is still offered"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// snippetSupport OFF: the override stub inserts the bare signature line (no `$0` body), as a plain
+/// `TextEdit`. The signature is still present (the headline of the feature).
+#[test]
+fn override_method_stub_without_snippet_is_plain_signature() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/ovp.gd"));
+    let src = "extends Node2D\n\nfunc \n";
+    let (client, server_thread) = boot(&p, caps(false, false, false, None, None), &uri, src);
+
+    let raw = complete_raw(&client, 141, &uri, Position::new(2, 5));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ready = list
+        .items
+        .iter()
+        .find(|i| i.filter_text.as_deref() == Some("_ready"))
+        .expect("_ready offered");
+    assert_eq!(
+        ready.insert_text_format, None,
+        "no snippetSupport ⇒ a plain-text insert"
+    );
+    let nt = edit_new_text(ready);
+    assert!(
+        nt.starts_with("_ready(") && nt.ends_with(':') && !nt.contains("$0"),
+        "plain insert is the bare signature line `_ready() -> void:`: {nt:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- SUPER METHOD ---
+
+/// `super.<cursor>` offers the **parent** class's methods (`queue_free` from the native `Node`
+/// parent), restricted to methods — and NOT the current class's own method (`my_helper`), which
+/// `super.` literally cannot call. Discriminates parent-only enumeration from a self-inclusive walk.
+#[test]
+fn super_method_lists_parent_methods_not_own() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/sm.gd"));
+    // The class defines `my_helper`; `super.` must not offer it (it's not on the parent).
+    let src =
+        "extends Node2D\n\nfunc my_helper() -> void:\n\tpass\n\nfunc _ready() -> void:\n\tsuper.\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tsuper.` on line 6 → cursor right after the `.` at column 7.
+    let raw = complete_raw(&client, 150, &uri, Position::new(6, 7));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"queue_free".to_string()),
+        "super. offers the parent's queue_free method: {ls:?}"
+    );
+    assert!(
+        !ls.contains(&"my_helper".to_string()),
+        "super. must NOT offer the current class's own method (parent-only): {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- TYPE ATTRIBUTE ---
+
+/// `var x: Player.<cursor>` — the nested types / enums / constants of the type `Player` (its `State`
+/// enum), NOT its instance members (`set_state`). The type-scoped set (Godot `COMPLETION_TYPE_ATTRIBUTE`).
+#[test]
+fn type_attribute_lists_nested_types_not_instance_members() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/ta.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar x: Player.\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar x: Player.` → cursor after the `.`. `\t`=col0, `Player` ends col13, `.` at col13..14 →
+    // after dot is column 15.
+    let raw = complete_raw(&client, 200, &uri, Position::new(3, 15));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"State".to_string()),
+        "Player.State (a nested enum type) is offered in a type-attribute position: {ls:?}"
+    );
+    assert!(
+        !ls.contains(&"set_state".to_string()),
+        "an instance method (set_state) must NOT appear in a type-attribute position: {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- carry-forward (a): native class names in IDENTIFIER position ---
+
+/// Native engine class names (`Node`, `Color` is a builtin not a class, `Player`) appear in the
+/// bare-identifier completion set (carry-forward (a)).
+#[test]
+fn identifier_position_offers_native_class_names() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/id.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar x = \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar x = ` → cursor at column 9 on line 3 (an expression position).
+    let raw = complete_raw(&client, 160, &uri, Position::new(3, 9));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"Node".to_string()),
+        "the native class name Node appears in IDENTIFIER position (carry-forward a): {ls:?}"
+    );
+    assert!(
+        ls.contains(&"Player".to_string()),
+        "the native class name Player appears in IDENTIFIER position"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- carry-forward (b): native + inherited member docs on resolve ---
+
+/// `completionItem/resolve` fills a **native** member's documentation from the declaring class
+/// (carry-forward (b)) — the Phase-3 gap where native member docs returned `None`.
+#[test]
+fn resolve_fills_native_member_doc() {
+    // A documented native method: add a description to `Node.queue_free` via a bespoke dump.
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"T\"\n",
+    );
+    p.write(
+        "extension_api.json",
+        r#"{
+        "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+        "classes": [
+            {"name": "Object"},
+            {"name": "Node", "inherits": "Object", "methods": [
+                {"name": "queue_free", "description": "Queues this node for deletion."}
+            ]},
+            {"name": "CanvasItem", "inherits": "Node"},
+            {"name": "Node2D", "inherits": "CanvasItem"}
+        ]
+    }"#,
+    );
+    let uri = file_uri(&p.root.join("src/nd.gd"));
+    let src = "extends Node2D\n\nfunc use(n: Node) -> void:\n\tn.\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 170, &uri, Position::new(3, 3));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let qf = list
+        .items
+        .iter()
+        .find(|i| i.label == "queue_free")
+        .expect("queue_free present")
+        .clone();
+    assert!(
+        qf.documentation.is_none(),
+        "documentation is lazy pre-resolve"
+    );
+
+    client
+        .sender
+        .send(request(171, "completionItem/resolve", &qf))
+        .unwrap();
+    let resp = recv_response(&client);
+    let post: CompletionItem = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let doc = format!("{:?}", post.documentation);
+    assert!(
+        doc.contains("Queues this node for deletion"),
+        "resolve fills the native member's description (carry-forward b); got {doc}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// `completionItem/resolve` fills an **inherited cross-file** member's `##` doc from the
+/// **declaring** parent file (carry-forward (b)) — the exact Phase-3 bug (resolve used to read the
+/// requesting buffer, never the declaring file). `Child` extends `Base`; `Base.health` has a doc
+/// comment; completion is requested in `Child`.
+#[test]
+fn resolve_fills_inherited_crossfile_member_doc() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"T\"\n",
+    );
+    p.write("extension_api.json", common::MINI_API);
+    // The declaring parent file: `Base` with a documented member `health`.
+    p.write(
+        "src/base.gd",
+        "class_name Base\nextends Node\n\n## The base's health pool.\nvar health: int = 100\n",
+    );
+    // The child file: extends the parent script; completes a `self` member that is INHERITED.
+    let child = "extends Base\n\nfunc f() -> void:\n\thealth\n";
+    let uri = file_uri(&p.root.join("src/child.gd"));
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, child);
+
+    // `\thealth` → cursor at column 7 on line 3 (an identifier position; `health` is an inherited
+    // self member).
+    let raw = complete_raw(&client, 180, &uri, Position::new(3, 7));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let health = list
+        .items
+        .iter()
+        .find(|i| i.label == "health")
+        .expect("the inherited member `health` is offered")
+        .clone();
+
+    client
+        .sender
+        .send(request(181, "completionItem/resolve", &health))
+        .unwrap();
+    let resp = recv_response(&client);
+    let post: CompletionItem = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let doc = format!("{:?}", post.documentation);
+    assert!(
+        doc.contains("base's health pool"),
+        "resolve reads the DECLARING parent file's doc for an inherited member (carry-forward b); got {doc}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- deferred contexts return empty ---
+
+/// The deferred (M11) contexts — `$NodePath`, `%Unique`, and a `load("…")` resource path — return
+/// a well-formed **empty** list, never a wrong guess.
+#[test]
+fn deferred_contexts_return_empty() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/def.gd"));
+    // Three deferred sites: a `$` node path, a `%` unique node path, and a `load("` resource path.
+    let src =
+        "extends Node2D\n\nfunc f() -> void:\n\tvar a = $\n\tvar b = %\n\tvar c = load(\"\")\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar a = $` → cursor right after `$` (col0=`\t`, `$` at byte 9) → column 10.
+    let node_path = complete_raw(&client, 190, &uri, Position::new(3, 10));
+    let np: CompletionList = serde_json::from_value(node_path).expect("a CompletionList");
+    assert!(
+        np.items.is_empty(),
+        "a `$` node path is deferred (M11) — empty, not a guess; got {:?}",
+        labels(&np)
+    );
+
+    // `\tvar b = %` → cursor right after `%` → column 10.
+    let unique = complete_raw(&client, 191, &uri, Position::new(4, 10));
+    let uq: CompletionList = serde_json::from_value(unique).expect("a CompletionList");
+    assert!(uq.items.is_empty(), "a `%` unique node path is deferred");
+
+    // `\tvar c = load("")` → cursor inside the load string (between the quotes) at column 15.
+    let res_path = complete_raw(&client, 192, &uri, Position::new(5, 15));
+    let rp: CompletionList = serde_json::from_value(res_path).expect("a CompletionList");
+    assert!(
+        rp.items.is_empty(),
+        "a `load(\"…\")` resource path is deferred (M11)"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The single-line replace text of an item's edit (whichever edit form the client negotiated).
+fn edit_new_text(item: &CompletionItem) -> String {
+    match item.text_edit.as_ref().expect("an item has a textEdit") {
+        CompletionTextEdit::Edit(e) => e.new_text.clone(),
+        CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
+    }
 }

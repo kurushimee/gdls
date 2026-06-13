@@ -53,9 +53,18 @@ fn completion_data_round_trips_compactly_and_carries_no_request_params() {
     // The W18 contract: `data` is a compact symbol key, never the request position/params.
     let cases = [
         CompletionData::Member {
-            file: "file:///p/a.gd".to_string(),
+            owner: CompletionDataOwner::NativeClass {
+                class: "Node".to_string(),
+            },
             name: "queue_free".to_string(),
             detail: Some("() -> void".to_string()),
+        },
+        CompletionData::Member {
+            owner: CompletionDataOwner::ScriptFile {
+                uri: "file:///p/a.gd".to_string(),
+            },
+            name: "hp".to_string(),
+            detail: None,
         },
         CompletionData::Global {
             name: "print".to_string(),
@@ -64,6 +73,7 @@ fn completion_data_round_trips_compactly_and_carries_no_request_params() {
             class: "Node".to_string(),
         },
         CompletionData::Local,
+        CompletionData::Keyword,
     ];
     for original in cases {
         let json = serde_json::to_value(&original).expect("data serializes");
@@ -86,7 +96,9 @@ fn completion_data_round_trips_compactly_and_carries_no_request_params() {
 fn member_detail_in_data_is_optional_and_omitted_when_absent() {
     // A member with no source-derived detail serializes without a `detail` key (skip_serializing).
     let no_detail = CompletionData::Member {
-        file: "file:///a.gd".to_string(),
+        owner: CompletionDataOwner::ScriptFile {
+            uri: "file:///a.gd".to_string(),
+        },
         name: "x".to_string(),
         detail: None,
     };

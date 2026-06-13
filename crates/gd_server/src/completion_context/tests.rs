@@ -641,3 +641,13 @@ fn chained_attribute_recovers_member_access() {
         ctx.kind
     );
 }
+
+/// A bare `@` (the lexer also emits a co-located `Error` "expected identifier" token) still
+/// classifies as an annotation-name context — the `Error` diagnostic marker must not steal the
+/// anchor from the `Annotation` token (M8 Phase 4 regression).
+#[test]
+fn bare_at_is_annotation_despite_error_token() {
+    assert_eq!(at("@|").kind, CompletionKind::Annotation);
+    assert_eq!(at("@|\n").kind, CompletionKind::Annotation);
+    assert_eq!(at("extends Node\n@|\n").kind, CompletionKind::Annotation);
+}

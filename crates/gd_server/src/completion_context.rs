@@ -211,24 +211,35 @@ fn is_layout(kind: TokenKind) -> bool {
     )
 }
 
-/// Index of the anchor token: the last token whose `span.end <= byte`, skipping layout tokens.
-/// `None` when no such token exists (cursor before the first real token).
+/// Tokens skipped when picking the anchor or a meaningful neighbor: the layout tokens **plus**
+/// `Error`. The standalone lexer emits an `Error` token as a *diagnostic marker* — often
+/// co-located with a real token (a bare `@` lexes as `[Annotation, Error]` sharing the same span).
+/// It is never the token the cursor is anchored to, so letting it steal the anchor would misread
+/// `@<cursor>` (the `Error` wins the `span.end <= byte` tie) as a no-context position. Skipping it
+/// here keeps the *real* token (the `Annotation`, the identifier, …) as the anchor; `is_layout`
+/// stays unchanged for the bracket-depth / line-start logic that legitimately ignores only layout.
+fn is_anchor_skippable(kind: TokenKind) -> bool {
+    is_layout(kind) || kind == TokenKind::Error
+}
+
+/// Index of the anchor token: the last token whose `span.end <= byte`, skipping layout / error
+/// tokens. `None` when no such token exists (cursor before the first real token).
 fn anchor_index(tokens: &[Token], byte: usize) -> Option<usize> {
     tokens
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, t)| !is_layout(t.kind) && t.span.end <= byte)
+        .find(|(_, t)| !is_anchor_skippable(t.kind) && t.span.end <= byte)
         .map(|(i, _)| i)
 }
 
-/// The non-layout token immediately before index `i` (skipping layout), if any.
+/// The non-layout token immediately before index `i` (skipping layout / error tokens), if any.
 fn prev_meaningful(tokens: &[Token], i: usize) -> Option<usize> {
     tokens[..i]
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, t)| !is_layout(t.kind))
+        .find(|(_, t)| !is_anchor_skippable(t.kind))
         .map(|(j, _)| j)
 }
 

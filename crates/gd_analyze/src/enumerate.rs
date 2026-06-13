@@ -16,7 +16,7 @@
 //! Ordering is deterministic so a later ranking phase has a stable base: members come out in
 //! declaration order within a class/interface, derived classes before their bases.
 
-use gd_project::{Interface, MemberKind as IfaceMemberKind};
+use gd_project::{FileId, Interface, MemberKind as IfaceMemberKind};
 use gd_syntax::ast::{ClassNode, Member, NodeId, NodeKind};
 use gd_syntax::ParseTree;
 use gd_types::{NativeDb, NativeMember};
@@ -45,11 +45,33 @@ pub enum MemberItemKind {
     Class,
 }
 
+/// Where an enumerated [`MemberItem`] was **declared** — enough for `completionItem/resolve` to
+/// re-fetch its long-form documentation deterministically (carry-forward (b), M8 Phase 4). A
+/// member enumerated through an `extends` chain may be declared on a *different* file/class than
+/// the one the cursor sits in, so the requesting buffer alone can't find its doc; this names the
+/// actual declarer.
+///
+/// Encoded as a serializable key (a native class **name** or a declaring **[`FileId`]**) rather
+/// than a borrow, so it can ride a completion item's `data` field across the
+/// completion→resolve round trip without a nondeterministic name-only re-search.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberOwner {
+    /// Declared on a native (engine / builtin) class — resolve via
+    /// [`NativeDb::lookup_member`] / [`NativeDb::lookup_builtin_member`] on this class name.
+    Native(String),
+    /// Declared in a project GDScript file — resolve via that file's [`Interface`]. The
+    /// [`FileId`] is the **declaring** file, not necessarily the requesting buffer.
+    Script(FileId),
+    /// No recoverable declarer (an in-file `Class`-node member enumerated without a finished
+    /// analysis, an enum *value* flattened off a type) — resolve has no doc source.
+    Unknown,
+}
+
 /// One enumerated member — an **owned**, source-agnostic descriptor. Owning (rather than
 /// borrowing the declaring `NativeClass` / `Interface` / tree) lets one uniform list mix members
 /// from all three sources, which the [`members_of_type`] dispatcher requires (each arm borrows a
-/// different backing store). The fields are the minimum completion needs to render an item; the
-/// richer detail/documentation a `completionItem/resolve` adds is a later phase's job.
+/// different backing store). The fields are the minimum completion needs to render an item plus
+/// the [`MemberOwner`] resolve needs to re-find the long-form documentation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemberItem {
     pub name: String,
@@ -58,15 +80,39 @@ pub struct MemberItem {
     /// cheaply derivable (a native method/property's type, an interface member's annotation).
     /// `None` when no annotation is recorded — never a fabricated type.
     pub detail: Option<String>,
+    /// The declaring class/file (carry-forward (b)): lets `completionItem/resolve` fetch the
+    /// member's BBCode description from the native DB / the declaring file's interface.
+    pub owner: MemberOwner,
+    /// A native `static` method (or a builtin static like `Color.from_hsv`). Lets the
+    /// `BuiltinTypeStatic` (`Color.`) render keep only statics, and the instance-member render
+    /// drop them — Godot's `Variant::is_builtin_method_static` gate. `false` for every script
+    /// member (GDScript statics aren't distinguished at enumeration here).
+    pub is_static: bool,
+    /// A native `virtual` method (`_ready`, `_process`, …) — the overridable set
+    /// `OverrideMethod` completion offers from the native tail (Godot's
+    /// `ClassDB::get_virtual_methods`). `false` for non-virtual / script members.
+    pub is_virtual: bool,
 }
 
 impl MemberItem {
+    /// A member with no known declarer / flags — the script-interface and in-file-class arms,
+    /// where `is_static`/`is_virtual` aren't tracked at enumeration and the owner is set
+    /// separately by the caller that knows the declaring file.
     fn new(name: impl Into<String>, kind: MemberItemKind, detail: Option<String>) -> Self {
         MemberItem {
             name: name.into(),
             kind,
             detail,
+            owner: MemberOwner::Unknown,
+            is_static: false,
+            is_virtual: false,
         }
+    }
+
+    /// Set the declaring owner (builder style), for the arms that know it.
+    fn with_owner(mut self, owner: MemberOwner) -> Self {
+        self.owner = owner;
+        self
     }
 }
 
@@ -75,28 +121,44 @@ impl MemberItem {
 // ===================================================================================================
 
 /// Project a borrowed [`NativeMember`] (from [`NativeDb::all_members`] /
-/// [`NativeDb::builtin_members`]) into an owned [`MemberItem`].
+/// [`NativeDb::builtin_members`]) into an owned [`MemberItem`]. `declaring` is the class the
+/// member resolves through (the chain link that exposes it) — it becomes the item's
+/// [`MemberOwner::Native`] so resolve can re-fetch the BBCode description by name. A method's
+/// `is_static`/`is_virtual` ride along (the builtin-static and override-virtual render gates).
 fn native_member_item(db: &NativeDb, declaring: Option<&str>, m: &NativeMember) -> MemberItem {
+    let owner = match declaring {
+        Some(c) => MemberOwner::Native(c.to_owned()),
+        None => MemberOwner::Unknown,
+    };
     match m {
         NativeMember::Property(p) => MemberItem::new(
             db.name_of(p.name),
             MemberItemKind::Property,
             Some(db.display_type(&p.ty, declaring)),
-        ),
-        NativeMember::Method(meth) => MemberItem::new(
-            db.name_of(meth.name),
-            MemberItemKind::Method,
-            Some(native_method_detail(db, declaring, meth)),
-        ),
-        NativeMember::Signal(s) => {
-            MemberItem::new(db.name_of(s.name), MemberItemKind::Signal, None)
+        )
+        .with_owner(owner),
+        NativeMember::Method(meth) => {
+            let mut it = MemberItem::new(
+                db.name_of(meth.name),
+                MemberItemKind::Method,
+                Some(native_method_detail(db, declaring, meth)),
+            )
+            .with_owner(owner);
+            it.is_static = meth.is_static;
+            it.is_virtual = meth.is_virtual;
+            it
         }
-        NativeMember::Enum(e) => MemberItem::new(db.name_of(e.name), MemberItemKind::Enum, None),
+        NativeMember::Signal(s) => {
+            MemberItem::new(db.name_of(s.name), MemberItemKind::Signal, None).with_owner(owner)
+        }
+        NativeMember::Enum(e) => {
+            MemberItem::new(db.name_of(e.name), MemberItemKind::Enum, None).with_owner(owner)
+        }
         NativeMember::Constant(k) => {
-            MemberItem::new(db.name_of(k.name), MemberItemKind::Constant, None)
+            MemberItem::new(db.name_of(k.name), MemberItemKind::Constant, None).with_owner(owner)
         }
         NativeMember::EnumValue { name, .. } => {
-            MemberItem::new(db.name_of(*name), MemberItemKind::EnumValue, None)
+            MemberItem::new(db.name_of(*name), MemberItemKind::EnumValue, None).with_owner(owner)
         }
     }
 }
@@ -265,11 +327,17 @@ pub fn script_chain_native_root(
 /// Project one [`Interface`]'s own members (not its bases) into [`MemberItem`]s, appending only
 /// names not already in `seen` (derived-shadows-base when called down a chain). Named enums and
 /// their value identifiers are distinct entries; an inner class is a [`MemberItemKind::Class`].
+/// `owner_file` is the file this interface belongs to — recorded on each item as
+/// [`MemberOwner::Script`] so `completionItem/resolve` re-fetches the doc from the **declaring**
+/// file's interface (carry-forward (b): a base-class member's doc lives in the base file, not the
+/// requesting buffer).
 fn collect_interface_members(
     iface: &Interface,
+    owner_file: FileId,
     seen: &mut FxHashSet<String>,
     out: &mut Vec<MemberItem>,
 ) {
+    let owner = MemberOwner::Script(owner_file);
     for m in &iface.members {
         if !seen.insert(m.name.clone()) {
             continue;
@@ -281,22 +349,20 @@ fn collect_interface_members(
             IfaceMemberKind::Signal => MemberItemKind::Signal,
             IfaceMemberKind::Enum => MemberItemKind::Enum,
         };
-        out.push(MemberItem::new(
-            m.name.clone(),
-            kind,
-            interface_member_detail(m),
-        ));
+        out.push(
+            MemberItem::new(m.name.clone(), kind, interface_member_detail(m))
+                .with_owner(owner.clone()),
+        );
     }
     // Named-enum value identifiers (`E.A`) — reachable as bare members through the enum, but
     // also surfaced flat the way Godot hoists them for completion.
     for e in &iface.enums {
         for v in &e.values {
             if seen.insert(v.name.clone()) {
-                out.push(MemberItem::new(
-                    v.name.clone(),
-                    MemberItemKind::EnumValue,
-                    None,
-                ));
+                out.push(
+                    MemberItem::new(v.name.clone(), MemberItemKind::EnumValue, None)
+                        .with_owner(owner.clone()),
+                );
             }
         }
     }
@@ -304,7 +370,10 @@ fn collect_interface_members(
     for inner in &iface.inner {
         if let Some(name) = &inner.class_name {
             if seen.insert(name.clone()) {
-                out.push(MemberItem::new(name.clone(), MemberItemKind::Class, None));
+                out.push(
+                    MemberItem::new(name.clone(), MemberItemKind::Class, None)
+                        .with_owner(owner.clone()),
+                );
             }
         }
     }
@@ -336,7 +405,44 @@ pub fn script_chain_members(
     let mut seen: FxHashSet<String> = FxHashSet::default();
     for link in script_chain_links(xfile, native, start) {
         if let Some(iface) = link_interface(xfile, &link) {
-            collect_interface_members(iface, &mut seen, &mut out);
+            collect_interface_members(iface, link.file, &mut seen, &mut out);
+        }
+    }
+    out
+}
+
+/// The members of `start`'s **parent** chain — everything strictly above `start` in the `extends`
+/// chain (the immediate base script, its bases, and the native tail they ultimately inherit), as
+/// owned [`MemberItem`]s. This is the `super.<cursor>` set (Godot's
+/// `_find_identifiers_in_class(..., p_parent_only = true)`): `start`'s **own** members are
+/// excluded by *enumerating from the parent*, so a method `start` overrides is still offered
+/// (its parent declares it) — the opposite of filtering after a derived-shadows-base dedup, which
+/// would wrongly drop the very method `super.method()` targets.
+///
+/// Side-effect-free, like [`script_chain_members`]. The native tail is appended (lower priority);
+/// when `start` extends a native class directly (no script parent) the result is exactly that
+/// native class's members.
+#[must_use]
+pub fn script_parent_members(
+    xfile: &dyn CrossFileQuery,
+    native: &NativeDb,
+    start: &ScriptRef,
+) -> Vec<MemberItem> {
+    let mut out: Vec<MemberItem> = Vec::new();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    // Skip the first link (`start` itself); collect the script links strictly above it.
+    for link in script_chain_links(xfile, native, start).into_iter().skip(1) {
+        if let Some(iface) = link_interface(xfile, &link) {
+            collect_interface_members(iface, link.file, &mut seen, &mut out);
+        }
+    }
+    // The native class the parent chain bottoms out in — the same root `start` reaches (a script
+    // parent doesn't change the native root). Appended de-duped, lower priority.
+    if let Some(root) = script_chain_native_root(xfile, native, start) {
+        for m in native_class_members(native, &root) {
+            if seen.insert(m.name.clone()) {
+                out.push(m);
+            }
         }
     }
     out
@@ -495,4 +601,87 @@ fn enum_value_items(dt: &DataType) -> Vec<MemberItem> {
         .into_iter()
         .map(|n| MemberItem::new(n.clone(), MemberItemKind::EnumValue, None))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gd_types::NativeDb;
+
+    /// A tiny dump with a static, an instance, and a virtual method — to pin the M8 Phase 4
+    /// `MemberItem` flags (`is_static`/`is_virtual`) and the `MemberOwner::Native` declaring class.
+    fn db() -> NativeDb {
+        NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Object", "is_instantiable": true, "methods": [
+                        {"name": "get_class", "is_const": true, "is_static": false,
+                         "is_vararg": false, "is_virtual": false,
+                         "return_value": {"type": "String"}}
+                    ]},
+                    {"name": "Node", "inherits": "Object", "is_instantiable": true, "methods": [
+                        {"name": "_ready", "is_const": false, "is_static": false,
+                         "is_vararg": false, "is_virtual": true,
+                         "return_value": {"type": "void"}},
+                        {"name": "make", "is_const": false, "is_static": true,
+                         "is_vararg": false, "is_virtual": false,
+                         "return_value": {"type": "Node"}}
+                    ]}
+                ]
+            }"#,
+        )
+        .expect("flags dump")
+    }
+
+    #[test]
+    fn native_members_carry_flags_and_native_owner() {
+        let db = db();
+        let members = native_class_members(&db, "Node");
+        let by_name = |n: &str| members.iter().find(|m| m.name == n).cloned().unwrap();
+
+        // A virtual method is flagged `is_virtual`, not `is_static`.
+        let ready = by_name("_ready");
+        assert!(ready.is_virtual && !ready.is_static, "_ready is a virtual");
+        assert_eq!(ready.owner, MemberOwner::Native("Node".to_owned()));
+
+        // A static method is flagged `is_static`, not `is_virtual`.
+        let make = by_name("make");
+        assert!(make.is_static && !make.is_virtual, "make is static");
+        assert_eq!(make.owner, MemberOwner::Native("Node".to_owned()));
+
+        // An inherited member's owner is the DECLARING class (Object), not the queried class.
+        let get_class = by_name("get_class");
+        assert_eq!(
+            get_class.owner,
+            MemberOwner::Native("Object".to_owned()),
+            "inherited member's owner is the declaring class"
+        );
+        assert!(!get_class.is_virtual && !get_class.is_static);
+    }
+
+    #[test]
+    fn builtin_members_carry_static_flag_and_owner() {
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "builtin_classes": [
+                    {"name": "Color", "is_keyed": false,
+                     "constants": [{"name": "RED", "type": "Color", "value": "Color(1,0,0,1)"}],
+                     "methods": [
+                        {"name": "from_hsv", "is_const": false, "is_static": true,
+                         "is_vararg": false, "return_type": "Color", "arguments": []},
+                        {"name": "lerp", "is_const": true, "is_static": false,
+                         "is_vararg": false, "return_type": "Color", "arguments": []}
+                     ]}
+                ]
+            }"#,
+        )
+        .expect("builtin dump");
+        let members = builtin_members(&db, "Color").expect("Color members");
+        let from_hsv = members.iter().find(|m| m.name == "from_hsv").unwrap();
+        assert!(from_hsv.is_static, "from_hsv is a static builtin method");
+        let lerp = members.iter().find(|m| m.name == "lerp").unwrap();
+        assert!(!lerp.is_static, "lerp is an instance builtin method");
+    }
 }
