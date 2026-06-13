@@ -449,6 +449,38 @@ fn deferred_unique_node_path_percent() {
 }
 
 #[test]
+fn infix_modulo_percent_is_not_a_unique_node_path() {
+    // `x % ` and `x % yy` are infix modulo, NOT a `%unique` node path — they must classify as a
+    // normal identifier/expression context, never Deferred(UniqueNodePath) (which would fire an
+    // empty completion since `%` is a trigger char). The legitimate prefix `= %Health` must stay
+    // Deferred. (#94 FIX 2.)
+    let bare_op = at("func f():\n\tvar y = x % |");
+    assert_ne!(
+        bare_op.kind,
+        CompletionKind::Deferred(DeferredReason::UniqueNodePath),
+        "`x % ` is modulo, not a unique node path: {:?}",
+        bare_op.kind
+    );
+
+    let partial = at("func f():\n\tvar z = x % yy|");
+    assert_ne!(
+        partial.kind,
+        CompletionKind::Deferred(DeferredReason::UniqueNodePath),
+        "`x % yy` is modulo, not a unique node path: {:?}",
+        partial.kind
+    );
+
+    // The prefix `%unique` sigil case must be preserved: `= %Hea` is still a unique node path.
+    let prefix = at("func f():\n\tvar b = %Hea|");
+    assert_eq!(
+        prefix.kind,
+        CompletionKind::Deferred(DeferredReason::UniqueNodePath),
+        "`= %Hea` is a unique node path (prefix sigil): {:?}",
+        prefix.kind
+    );
+}
+
+#[test]
 fn deferred_resource_path_load() {
     // `load("res://` → deferred resource path (inside a `load(...)` argument).
     let m = "func f():\n\tload(\"res://x|";

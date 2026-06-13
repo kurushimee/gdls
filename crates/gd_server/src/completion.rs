@@ -27,7 +27,8 @@
 //! - `InsertReplaceEdit` only when `completionItem.insertReplaceSupport`; otherwise a plain
 //!   `TextEdit`.
 //! - `commitCharacters` only when `completionItem.commitCharactersSupport`, and even then suppressed
-//!   in string / new-identifier contexts.
+//!   for the string-valued annotation-argument context (a `.`/`(` commit mid-string is a wart);
+//!   member / identifier / type / keyword items keep them.
 
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionTextEdit,
@@ -121,6 +122,7 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
         config: &state.options.completion,
         edit_range,
         index: &state.workspace.index,
+        suppress_commit: suppress_commit_for(&ctx.kind),
     };
 
     let items = match &ctx.kind {
@@ -231,6 +233,10 @@ struct RenderCtx<'a> {
     edit_range: Range,
     /// The project index — maps a declaring [`gd_project::FileId`] to its URI for the resolve key.
     index: &'a gd_project::Index,
+    /// Whether to drop commit characters for this whole request — set for the string-valued
+    /// annotation-argument context, where a `.`/`(` commit mid-string is a UX wart. One request is
+    /// one [`CompletionKind`], so a per-request flag is exact (see [`suppress_commit_for`]).
+    suppress_commit: bool,
 }
 
 impl RenderCtx<'_> {
@@ -538,7 +544,17 @@ fn identifier_items(
             &mut rank,
         );
     }
-    for (name, _entry) in state.workspace.index.registry().entries() {
+    // Project `class_name` registry — sorted for determinism (the registry is an `FxHashMap`, so
+    // `entries()` iterates in nondeterministic file-discovery order, unlike every sibling tier).
+    let mut registry_names: Vec<&str> = state
+        .workspace
+        .index
+        .registry()
+        .entries()
+        .map(|(n, _)| n)
+        .collect();
+    registry_names.sort_unstable();
+    for name in registry_names {
         let name = name.to_string();
         push(
             &name,
@@ -826,8 +842,17 @@ fn type_name_items(
         );
     }
 
-    // Project `class_name` registry (user-declared global classes).
-    for (name, _entry) in state.workspace.index.registry().entries() {
+    // Project `class_name` registry (user-declared global classes) — sorted for determinism (the
+    // registry `FxHashMap` iterates in nondeterministic order, unlike the sibling tiers above).
+    let mut registry_names: Vec<&str> = state
+        .workspace
+        .index
+        .registry()
+        .entries()
+        .map(|(n, _)| n)
+        .collect();
+    registry_names.sort_unstable();
+    for name in registry_names {
         push(
             name,
             CompletionItemKind::CLASS,
@@ -1515,10 +1540,10 @@ fn build_item_with(
         filter_text: Some(text.filter.to_string()),
         text_edit: Some(text_edit),
         insert_text_format,
-        // Commit characters only when supported AND this is a member/identifier (not a string/new
-        // identifier where a punctuation commit would be surprising). The identifier/attribute
-        // contexts this phase serves are member-shaped, so `.` and `(` are reasonable commits.
-        commit_characters: commit_chars(render.caps),
+        // Commit characters (`.`/`(`) only when the client supports them AND this context isn't a
+        // string-valued one (annotation arguments), where a punctuation commit mid-string would be
+        // surprising. Member / identifier / type / keyword items keep them.
+        commit_characters: commit_chars(render.caps, render.suppress_commit),
         // Lazy: documentation + detail are filled by `completionItem/resolve`.
         detail: None,
         documentation: None,
@@ -1566,13 +1591,23 @@ fn snippet_text(name: &str, style: CallArgumentStyle) -> String {
 
 /// The commit characters for an item, or `None` when the client can't handle them. Member/identifier
 /// completions accept `.` (chain another access) and `(` (call). Suppressed entirely without the
-/// `commitCharactersSupport` capability (LSP: a server must not send them otherwise).
-fn commit_chars(caps: &CompletionCaps) -> Option<Vec<String>> {
-    if caps.commit_characters_support {
+/// `commitCharactersSupport` capability (LSP: a server must not send them otherwise), and when
+/// `suppress` is set — the string-valued annotation-argument context, where committing on `.`/`(`
+/// mid-string is a UX wart.
+fn commit_chars(caps: &CompletionCaps, suppress: bool) -> Option<Vec<String>> {
+    if caps.commit_characters_support && !suppress {
         Some(vec![".".to_string(), "(".to_string()])
     } else {
         None
     }
+}
+
+/// Whether a completion request's items should drop commit characters, by context. Only the
+/// string-valued annotation-argument words (`@export_range("or_greater"` …) qualify: a `.`/`(`
+/// commit would land inside the quoted string. Every other context this phase serves is
+/// member-/identifier-/type-/keyword-shaped, where `.` and `(` are reasonable commits.
+fn suppress_commit_for(kind: &CompletionKind) -> bool {
+    matches!(kind, CompletionKind::AnnotationArguments { .. })
 }
 
 /// Clamp a server-chosen kind to the client's `completionItemKind.valueSet` (or the LSP-default

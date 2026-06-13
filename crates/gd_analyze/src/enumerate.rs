@@ -401,6 +401,20 @@ pub fn script_chain_members(
     native: &NativeDb,
     start: &ScriptRef,
 ) -> Vec<MemberItem> {
+    script_chain_members_seen(xfile, native, start).0
+}
+
+/// Like [`script_chain_members`] but also returns the `seen` name set the walk accumulated, so a
+/// caller appending the chain's native tail can de-dup it against the script-overridden names (the
+/// dispatcher's Script arm needs this so a script overriding a native method does not yield that
+/// name twice — once as the override, once as the native base). Mirrors how
+/// [`script_parent_members`] threads one shared `seen` across both the script links and the native
+/// tail.
+fn script_chain_members_seen(
+    xfile: &dyn CrossFileQuery,
+    native: &NativeDb,
+    start: &ScriptRef,
+) -> (Vec<MemberItem>, FxHashSet<String>) {
     let mut out: Vec<MemberItem> = Vec::new();
     let mut seen: FxHashSet<String> = FxHashSet::default();
     for link in script_chain_links(xfile, native, start) {
@@ -408,7 +422,7 @@ pub fn script_chain_members(
             collect_interface_members(iface, link.file, &mut seen, &mut out);
         }
     }
-    out
+    (out, seen)
 }
 
 /// The members of `start`'s **parent** chain — everything strictly above `start` in the `extends`
@@ -564,9 +578,16 @@ pub fn members_of_type(
         DtKind::Native => native_class_members(native, &dt.native_type),
         DtKind::Script => match &dt.script_type {
             Some(sr) => {
-                let mut members = script_chain_members(xfile, native, sr);
+                let (mut members, mut seen) = script_chain_members_seen(xfile, native, sr);
+                // Append the native tail de-duped against the script-overridden names, so a method
+                // a script overrides (`_ready`, `queue_free`, …) stays the user's own entry and is
+                // not also emitted as the native base (which would point resolve at the wrong doc).
                 if let Some(root) = script_chain_native_root(xfile, native, sr) {
-                    members.extend(native_class_members(native, &root));
+                    for m in native_class_members(native, &root) {
+                        if seen.insert(m.name.clone()) {
+                            members.push(m);
+                        }
+                    }
                 }
                 members
             }

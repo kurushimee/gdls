@@ -445,6 +445,54 @@ fn identifier_completion_ranks_locals_before_globals() {
     shutdown(&client, server_thread);
 }
 
+/// The project `class_name` registry tier of IDENTIFIER completion is emitted in **sorted** order,
+/// not the registry `FxHashMap`'s nondeterministic file-discovery order (#94 FIX 3). With several
+/// global classes present, the registry-tier items must appear name-sorted in the response — so two
+/// indexings of the same project yield the same ranking.
+#[test]
+fn identifier_completion_class_name_tier_is_sorted() {
+    let p = rich_project();
+    // Several user global classes whose names are deliberately not in registry-insertion order, so
+    // an unsorted `entries()` walk would surface them out of alphabetical order.
+    let classes = ["Zebra", "Mango", "Apple", "Pelican", "Delta"];
+    for name in classes {
+        p.write(
+            &format!("src/{}.gd", name.to_lowercase()),
+            &format!("class_name {name}\nextends Node\n"),
+        );
+    }
+    // A buffer whose body has a bare-identifier site (the trailing `x`) so IDENTIFIER completion
+    // fires the global tiers, including the `class_name` registry.
+    let src = "extends Node\n\nfunc go() -> void:\n\tx\n";
+    let uri = file_uri(&p.root.join("src/driver.gd"));
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 12, &uri, Position::new(3, 2));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+
+    // The registry-tier items in list order: the labels that are one of our user global classes.
+    let want: std::collections::HashSet<&str> = classes.iter().copied().collect();
+    let registry_order: Vec<String> = list
+        .items
+        .iter()
+        .filter(|i| want.contains(i.label.as_str()))
+        .map(|i| i.label.clone())
+        .collect();
+    assert_eq!(
+        registry_order.len(),
+        classes.len(),
+        "every user global class is offered in the IDENTIFIER set: {registry_order:?}"
+    );
+    let mut sorted = registry_order.clone();
+    sorted.sort();
+    assert_eq!(
+        registry_order, sorted,
+        "the class_name registry tier must be emitted in sorted order, got {registry_order:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 // ===================================================================================================
 // completionItem/resolve — round-trip: docs filled, ranking/edit fields immutable, compact data.
 // ===================================================================================================
@@ -1230,6 +1278,52 @@ fn annotation_export_range_slider_words() {
     // The word inserts as a double-quoted string (canonical, W17).
     let or_greater = list.items.iter().find(|i| i.label == "or_greater").unwrap();
     assert_eq!(edit_new_text(or_greater), "\"or_greater\"");
+
+    shutdown(&client, server_thread);
+}
+
+/// Commit characters are suppressed for string-valued annotation-argument items (a `.`/`(` commit
+/// mid-string is a wart) but KEPT for member items — both asserted under commit-capable caps so the
+/// "member half" guards against over-suppression (#94 FIX 4).
+#[test]
+fn annotation_argument_items_suppress_commit_but_members_keep_it() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/c.gd"));
+    // One file with both an `@export_range(…, <cursor>)` slider-word site and a `n.<cursor>` member
+    // site, so a single boot exercises both contexts under the same (commit-capable) caps.
+    let src =
+        "extends Node2D\n\n@export_range(0, 10, 1, )\nvar speed: float\n\nfunc use(n: Node) -> void:\n\tn.\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // (a) Annotation-argument words: cursor in the 4th arg slot (line 2, column 24).
+    let raw = complete_raw(&client, 130, &uri, Position::new(2, 24));
+    let ann: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let or_greater = ann
+        .items
+        .iter()
+        .find(|i| i.label == "or_greater")
+        .expect("the slider word `or_greater` is offered");
+    assert_eq!(
+        or_greater.commit_characters, None,
+        "a string-valued annotation-argument item must carry NO commit characters: {:?}",
+        or_greater.commit_characters
+    );
+
+    // (b) Member access: cursor after `n.` (line 6, column 3). A member item KEEPS commit chars —
+    // proves the suppression is context-scoped, not global.
+    let raw = complete_raw(&client, 131, &uri, Position::new(6, 3));
+    let members: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let qf = members
+        .items
+        .iter()
+        .find(|i| i.label == "queue_free")
+        .expect("Node's `queue_free` is offered");
+    assert_eq!(
+        qf.commit_characters,
+        Some(vec![".".to_string(), "(".to_string()]),
+        "a member item must keep `.`/`(` commit characters: {:?}",
+        qf.commit_characters
+    );
 
     shutdown(&client, server_thread);
 }

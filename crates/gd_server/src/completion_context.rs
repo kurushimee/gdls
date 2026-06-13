@@ -426,6 +426,16 @@ fn classify_deferred(
                 ));
             }
             Percent => {
+                // `%` is a unique-node sigil only in prefix/expression-boundary position. When the
+                // token before it produces a value (`x % yy`), the `%` is infix modulo, not a node
+                // path — fall through to the normal identifier/expression context rather than
+                // firing an empty `%unique` completion. (`%=` is a distinct token, never reached
+                // here.) `Token::can_precede_bin_op` is exactly Godot's value-producing test.
+                let is_modulo = prev_meaningful(tokens, j as usize)
+                    .is_some_and(|p| tokens[p].kind.can_precede_bin_op());
+                if is_modulo {
+                    break;
+                }
                 let prefix = prefix_at(tokens, anchor, byte);
                 return Some(CompletionContext::new(
                     CompletionKind::Deferred(DeferredReason::UniqueNodePath),

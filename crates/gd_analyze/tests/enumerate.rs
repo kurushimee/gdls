@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use gd_analyze::enumerate::{members_of_type, script_chain_members, MemberItem, MemberItemKind};
+use gd_analyze::enumerate::{
+    members_of_type, script_chain_members, MemberItem, MemberItemKind, MemberOwner,
+};
 use gd_analyze::{CrossFileQuery, DataType, DtKind, ScriptRef, TypeSource, VariantType};
 use gd_project::{FileId, Interface};
 use gd_syntax::ast::{Member, NodeKind};
@@ -248,6 +250,47 @@ fn dispatcher_script_arm_appends_native_tail() {
     assert!(
         got.contains(&"queue_free"),
         "native tail member appended: {got:?}"
+    );
+}
+
+#[test]
+fn dispatcher_script_arm_dedups_native_override_against_script() {
+    // A script overriding a native method (`queue_free`, declared on `Node`) must surface that
+    // name EXACTLY ONCE — the user's own override — not also as the native base. The native dup
+    // (owner=Native, detail=Some(...)) would make `completionItem/resolve` fetch the wrong
+    // (base-class) doc/signature for the override (#94 FIX 1).
+    const OVERRIDE_GD: &str = "\
+extends Node
+func queue_free():
+\tpass
+";
+    let project = Project::new(&[("res://override.gd", OVERRIDE_GD)]);
+    let native = native_db();
+    let tree = parse("").tree;
+    let dt = DataType {
+        kind: DtKind::Script,
+        script_type: Some(ScriptRef {
+            file: project.fid("res://override.gd"),
+            inner: Vec::new(),
+        }),
+        type_source: TypeSource::AnnotatedExplicit,
+        ..Default::default()
+    };
+    let members = members_of_type(&dt, &native, &project, &tree);
+
+    let qf: Vec<&MemberItem> = members.iter().filter(|i| i.name == "queue_free").collect();
+    assert_eq!(
+        qf.len(),
+        1,
+        "queue_free (script override of Node::queue_free) must appear exactly once: {:?}",
+        names(&members)
+    );
+    // The survivor is the script's own entry — owner is the declaring script file, not the native
+    // base. (The native dup would carry `MemberOwner::Native("Node")`.)
+    assert_eq!(
+        qf[0].owner,
+        MemberOwner::Script(project.fid("res://override.gd")),
+        "the surviving queue_free is the script override, not the native base"
     );
 }
 

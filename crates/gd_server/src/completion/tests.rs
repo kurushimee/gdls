@@ -145,7 +145,7 @@ fn default_kind_value_set_is_exactly_text_through_reference() {
 #[test]
 fn commit_chars_gated_on_capability() {
     assert_eq!(
-        commit_chars(&caps_off()),
+        commit_chars(&caps_off(), false),
         None,
         "no support ⇒ no commit chars"
     );
@@ -154,7 +154,13 @@ fn commit_chars_gated_on_capability() {
         ..CompletionCaps::default()
     };
     assert_eq!(
-        commit_chars(&caps),
+        commit_chars(&caps, false),
         Some(vec![".".to_string(), "(".to_string()])
+    );
+    // Suppressed (the string-valued annotation-argument context) ⇒ none, even with support.
+    assert_eq!(
+        commit_chars(&caps, true),
+        None,
+        "suppress ⇒ no commit chars even when supported"
     );
 }
