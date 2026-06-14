@@ -88,6 +88,51 @@ M9 — Phase 2 navigation & refactoring completeness (#66–#71), merged 2026-06
 - M9 §7.4 editor-profile walk extended over the rename/foldingRange/workspaceSymbol gated
   projections (`tests/editor_profiles.rs`).
 
+M10 — Phase 2 presentation & code actions (#72–#75), merged 2026-06-14. No release cut.
+
+### Added
+- **`textDocument/semanticTokens` full/delta/range (+ refresh)** (#72): syntax-aware highlighting
+  over the **STANDARD LSP legend only — zero `gdscript/`-prefixed or custom token names** (the #30
+  generic-LSP highlighting target; every theme already maps the 10 standard types + 6 standard
+  modifiers). The advertised legend is always full-width for stable wire indices; per-client legend
+  intersection happens at emit time (a type the client didn't declare is dropped, the rest remapped
+  to the client's own indices — never by shrinking the advertised legend). `full/delta` emits a
+  minimal flat-array edit vs the cached prior array (10k-line files); `range` is parse-priced and
+  served even at Hard memory pressure (full/delta are analysis-priced and shed). A
+  `workspace/semanticTokens/refresh` is sent only with `workspace.semanticTokens.refreshSupport`.
+- **`textDocument/inlayHint` (+ resolve, refresh)** (#73): inferred `var x := …` / `for`-loop types
+  (`: Type`) and call-site parameter-name hints, each config-toggleable
+  (`inlayHint.typeHints`/`parameterHints`). Type hints carry an accept-the-hint `textEdit` that
+  neutralizes `:=` into `: Type =` without eating a parenthesized initializer's `(`; the edit is
+  attached only for a source-valid annotation (an unnamed-script basename shows the label but carries
+  no corrupting edit). The tooltip is DEFERRED to `inlayHint/resolve` (carried in `data`) for a
+  client with `inlayHint.resolveSupport`, embedded eagerly otherwise; the textEdit is always eager. A
+  `workspace/inlayHint/refresh` is sent only with `workspace.inlayHint.refreshSupport`.
+- **`textDocument/documentColor` + `colorPresentation`** (#74): color swatches for `Color(r, g, b[,
+  a])` constructors, `Color.CONSTANT` named constants, and `Color("#hex")`/`Color("name")` string
+  forms, scanned token-primary (string-safe; no analyzer, no fan-out → a bare `Simple(true)` provider
+  served even at Hard memory pressure). `colorPresentation` offers the lossless float `Color(…)`
+  constructor (always) plus the `Color.NAME` form on an exact constant match.
+- **`textDocument/codeAction` (+ resolve, `source.fixAll`)** (#75): quickfixes for the warning set —
+  the `@warning_ignore("CODE")` suppression (landed above the enclosing statement, never
+  mid-statement) plus mutating fixes (`_`-prefix an unused local, `@onready` for a
+  `get_node`-without-onready, drop a redundant annotation), aggregated under `source.fixAll` for
+  `editor.codeActionsOnSave`. `code_action_kinds` advertises EXACTLY the offered kinds (`quickfix` +
+  `source.fixAll`); `executeCommandProvider` lists EXACTLY the one real command (`gdls.applyWarningIgnore`)
+  — never an empty/broken list (anti-catalog W15). Generic-client-first: a `CodeAction` literal with a
+  resolve-deferred edit for a rich client, a `Command` routed through
+  `workspace/executeCommand` → `workspace/applyEdit` for a client without `codeActionLiteralSupport`,
+  and an eager edit for one without `resolveSupport`; the additive `Diagnostic.data` tag is gated on
+  `publishDiagnostics.dataSupport` (byte-identical pre-tag diagnostics otherwise). The mutating fixes
+  carry their edit eagerly behind a fail-closed ERROR/shadow backstop (what the offer-time gate proved
+  safe is exactly what the client applies — no re-derive-at-resolve onto a changed buffer).
+- M10 §7.4 editor-profile walk extended over the semanticTokens (per-client legend remap) /
+  inlayHint (tooltip deferral) / documentColor / codeAction (deferred edit + `Diagnostic.data` gate +
+  `source.fixAll` separation) gated projections (`tests/editor_profiles.rs`); the degraded
+  `Command`/eager-edit codeAction paths (no vendored real client advertises them) are covered by
+  `tests/code_action.rs`. Both conformance ratchets hold at 1.0000 (M10 is server-glue + additive —
+  the parser/analyzer are untouched).
+
 ## [1.0.7] — 2026-06-13
 
 Follow-ups to the v1.0.6 utility-as-Callable hotfix, surfaced by its review (#92). Cut from

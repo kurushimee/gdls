@@ -142,18 +142,30 @@ binding.
 follow-ups #92, tagged on `release/v1.0.7` = v1.0.6 + #92, so the unreleased Phase 2 work on
 `main` stayed unreleased — #91's code was already in v1.0.6; v1.0.6 itself was the #88 hotfix off
 v1.0.5); Phase 2 underway: **M7 (protocol foundations), M8 (editing core — `completion` +
-`signatureHelp`), and M9 (navigation & refactoring — `documentHighlight`, `foldingRange`/
+`signatureHelp`), M9 (navigation & refactoring — `documentHighlight`, `foldingRange`/
 `selectionRange`, `declaration`/`typeDefinition`, `typeHierarchy`, `workspaceSymbol/resolve`,
-`rename`/`prepareRename`) complete** — M7's #57–#63 and M8's #64/#65 merged 2026-06-13, M9's
-#66–#71 merged 2026-06-14, all three milestones closed (M8 via PRs #94/#95, M9 via #100–#105,
-all adversarially reviewed; a Godot-headless-LSP differential showed 99.6% completion agreement
-on member access). M9 `rename` (#66) took **six adversarial review rounds** to close every proven
-source-corruption path — the lesson, captured in memory: `references`/`definition` are read-tuned,
-so their inaccuracies become silent corruption under rename, the first mutating consumer; the fix
-is a fail-closed positive-project-resolution firewall + binding-correct local resolution (excludes
-`self.x`-attribute over-capture). It round-trips on Pixelorama with zero stale-version edits; the
-additive `ParseResult.comments` field (foldingRange) kept both ratchets at 1.0000. M9 deferred
-items filed: #106 (enum-value/autoload rename refuse), #107 (for-loop/match/inner-shadow).
+`rename`/`prepareRename`), and M10 (presentation & code actions — `semanticTokens` full/delta/range
+standard-legend-only, `inlayHint`+resolve, `documentColor`/`colorPresentation`, `codeAction`
+warning quickfixes + `source.fixAll`) complete** — M7's #57–#63 and M8's #64/#65 merged 2026-06-13,
+M9's #66–#71 and M10's #72–#75 merged 2026-06-14, all four milestones closed (M8 via PRs #94/#95,
+M9 via #100–#105, M10 via #110/#112/#116/#117, all adversarially reviewed; a Godot-headless-LSP
+differential showed 99.6% completion agreement on member access). M9 `rename` (#66) took **six
+adversarial review rounds** to close every proven source-corruption path — the lesson, captured in
+memory: `references`/`definition` are read-tuned, so their inaccuracies become silent corruption
+under rename, the first mutating consumer; the fix is a fail-closed positive-project-resolution
+firewall + binding-correct local resolution (excludes `self.x`-attribute over-capture). It
+round-trips on Pixelorama with zero stale-version edits; the additive `ParseResult.comments` field
+(foldingRange) kept both ratchets at 1.0000. M10's `codeAction` (#75) inherited that mutating-consumer
+lesson — its warning quickfixes ship edits behind a fail-closed ERROR/shadow backstop (what the
+offer-time gate proved safe is exactly what the client applies). `semanticTokens` advertises the
+STANDARD LSP legend only (zero custom token names — the #30 generic-LSP target), intersecting it
+per-client at emit time; `executeCommandProvider` lists EXACTLY the one real command
+(`gdls.applyWarningIgnore`), never an empty/broken list (anti-catalog W15). M9 deferred items filed:
+#106 (enum-value/autoload rename refuse), #107 (for-loop/match/inner-shadow). M10 deferred items
+filed: #111 (semanticTokens bare-call/for-loop/match-pattern decl sites), #114/#115 (inlayHint
+script-owned enum / `Array[<named-script>]` container hints), #118/#119 (codeAction `_`-prefix for
+`UNUSED_PRIVATE_CLASS_VARIABLE` / over-refuse when `_name` exists in an unrelated scope); plus #113
+(signatureHelp wrong inner-class-method signature — an M8 carry-over surfaced during M10 review).
 Per-milestone interactive checks are batched into ONE end-of-Phase-2 trial by the user
 in real work (capability captures are Claude's, headless — inventory + gaps in
 `crates/gd_server/tests/fixtures/client_caps/README.md`; deferred feel-check items in

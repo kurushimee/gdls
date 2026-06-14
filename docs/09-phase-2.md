@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Spec date** | 2026-06-12 |
-| **Status** | Phase 2 definition — authoritative scope for everything post-v1.0.5. Supersedes the one-row "Phase 2" sketches in `docs/00 §3`, `docs/05 §1`, `docs/07 §1`, and `docs/08 §4`. **Progress (2026-06-14): M7, M8, M9 shipped and closed (#57–#71); M10–M11 remain.** |
+| **Status** | Phase 2 definition — authoritative scope for everything post-v1.0.5. Supersedes the one-row "Phase 2" sketches in `docs/00 §3`, `docs/05 §1`, `docs/07 §1`, and `docs/08 §4`. **Progress (2026-06-14): M7, M8, M9, M10 shipped and closed (#57–#75); M11 remains.** |
 | **Baseline** | v1.0.5 (2026-06-12): both fidelity ratchets 1.0000, exposed-capability parity + LSP-convention audit complete. |
 | **Tracking** | Umbrella issue [#30](https://github.com/kurushimee/gdls/issues/30); milestones **M7–M11** on GitHub; project board *gdls roadmap*. |
 
