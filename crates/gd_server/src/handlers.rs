@@ -3525,9 +3525,28 @@ fn push_identifier_locations_within(
     uri: &Uri,
     mapper: &PositionMapper,
 ) {
+    // This is the LOCAL/PARAMETER resolution path (the only callers are the `NonMethodTarget::Local`
+    // arms). A local is a bare identifier in its function scope; it can NEVER be reached as the
+    // attribute of a member access (`self.x` / `obj.x` — that `x` is a MEMBER, a different symbol).
+    // The flat by-name scan would otherwise grab those attribute idents — harmless as a read (a
+    // documentHighlight panel), but CORRUPTING for rename (its first mutating consumer): renaming a
+    // local `x` would rewrite `self.x` into a dangling member reference (the BLOCKER-6 case). So
+    // collect every attribute-position identifier (`SubscriptAccess::Attribute(Some(aid))` names it)
+    // and exclude it — making the local resolution binding-correct w.r.t. member accesses.
+    let mut attribute_idents: FxHashSet<NodeId> = FxHashSet::default();
+    for id in tree.iter_ids() {
+        if let NodeKind::Subscript(s) = &tree.get(id).kind {
+            if let Some(SubscriptAccess::Attribute(Some(aid))) = s.access {
+                attribute_idents.insert(aid);
+            }
+        }
+    }
     for id in tree.iter_ids() {
         let node = tree.get(id);
         if node.span.start < scope.start || node.span.end > scope.end {
+            continue;
+        }
+        if attribute_idents.contains(&id) {
             continue;
         }
         if let NodeKind::Identifier(i) = &node.kind {

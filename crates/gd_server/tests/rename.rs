@@ -1286,3 +1286,54 @@ fn rename_local_shadowing_member_targets_the_local_not_the_member() {
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_param_does_not_capture_self_attribute_access() {
+    // BLOCKER-6 regression: renaming a parameter `x` must NOT rewrite the same-named `self.x` member
+    // access inside its function — the by-name local scan over-captured it, so a rename produced a
+    // dangling `self.amount` write to a nonexistent member (silent broken code). The local
+    // resolution now excludes attribute-position identifiers (a local is never reached as `.x`).
+    // member `x`: line 1 col 4; param `x`: line 2 col 11; `self.x` attribute: line 3 col 6; bare
+    // param use: line 3 col 10.
+    let src = "extends Node\nvar x: int = 0\nfunc set_x(x) -> void:\n\tself.x = x\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the PARAM declaration (line 2, col 11). Rename → `amount`.
+    client
+        .sender
+        .send(request(
+            76,
+            "textDocument/rename",
+            rename_params(&main_uri, 2, 11, "amount"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "param rename must succeed: {:?}",
+        resp.error
+    );
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    let sites: Vec<(u32, u32)> = view
+        .set
+        .iter()
+        .map(|(_, r)| (r.start.line, r.start.character))
+        .collect();
+    // The param decl (2,11) + the bare param use (3,10) are renamed.
+    assert!(
+        sites.contains(&(2, 11)) && sites.contains(&(3, 10)),
+        "the param decl + its bare use must be renamed; got {sites:?}"
+    );
+    // The `self.x` member access (3,6) must NOT be captured (else a dangling member reference), and
+    // the member declaration (line 1) must be untouched.
+    assert!(
+        !sites.contains(&(3, 6)),
+        "the `self.x` member access must NOT be captured — dangling-reference corruption; got {sites:?}"
+    );
+    assert!(
+        !sites.iter().any(|(l, _)| *l == 1),
+        "the member declaration (line 1) must NOT be touched; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
