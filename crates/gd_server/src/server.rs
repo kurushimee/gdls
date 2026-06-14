@@ -9,13 +9,13 @@ use camino::{Utf8Path, Utf8PathBuf};
 use crossbeam_channel::{select, Receiver, Sender};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
-    CallHierarchyServerCapability, CodeDescription, DeclarationCapability, Diagnostic,
-    DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentLinkOptions,
-    FoldingRangeProviderCapability, HoverProviderCapability, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, OneOf, PublishDiagnosticsParams,
-    SelectionRangeProviderCapability, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TypeDefinitionProviderCapability, Uri,
+    CallHierarchyServerCapability, CodeDescription, ColorProviderCapability, DeclarationCapability,
+    Diagnostic, DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentLinkOptions, FoldingRangeProviderCapability, HoverProviderCapability,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, OneOf,
+    PublishDiagnosticsParams, SelectionRangeProviderCapability, ServerCapabilities, ServerInfo,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TypeDefinitionProviderCapability, Uri,
 };
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent};
 use rustc_hash::FxHashSet;
@@ -1832,6 +1832,11 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         // bare booleans and are served even at Hard memory pressure (not in `analyze_using`).
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        // M10 (#74): documentColor + colorPresentation for `Color` literals. Parse-priced (a token
+        // scan, no analyzer, no fan-out), so it advertises as a bare `Simple(true)` provider and is
+        // served even at Hard memory pressure (not in the `analyze_using` shed set), exactly like
+        // foldingRange.
+        color_provider: Some(ColorProviderCapability::Simple(true)),
         // M9 (#66): rename + prepareRename. `prepare_provider: true` advertises that the client may
         // pre-flight a rename with `textDocument/prepareRename` (range + placeholder); the rename
         // itself reuses the `references` resolution to collect every edit site, validates the new
@@ -2126,6 +2131,13 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // per requested position. Both are parse-priced (NOT in the Hard-pressure shed set above).
         "textDocument/foldingRange" => handle!(handlers::folding_range),
         "textDocument/selectionRange" => handle!(handlers::selection_range),
+        // M10 (#74): documentColor returns `ColorInformation[]` (a swatch per `Color` literal —
+        // numeric ctor, named constant, or hex/name string form); colorPresentation returns the
+        // constructor form(s) for a picked color as `ColorPresentation[]` (whole-literal textEdit,
+        // lossless round-trip). Both are token-scan / parse-priced (NOT in the Hard-pressure shed
+        // set above), served like foldingRange.
+        "textDocument/documentColor" => handle!(handlers::document_color),
+        "textDocument/colorPresentation" => handle!(handlers::color_presentation),
         // M9 (#66): rename + prepareRename — the fallible arms (a syntactically-valid request may
         // still be REFUSED with a typed error: a native/stub target, or an invalid new name).
         // `prepareRename` returns the identifier range (+ placeholder when the client advertised
