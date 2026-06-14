@@ -33,6 +33,33 @@
 //! is unregistered and would return method-not-found — its six-profile walk extends this file on
 //! that branch (the stacked geometry means these completion additions are already present there).
 //!
+//! M10 (#72–#75) extends the walk with the **presentation + code-action** gated projections, again
+//! derived per profile from its own flags (so a new capture extends the walk automatically):
+//! - **`semanticTokens`** (#72): the per-client legend ALLOW-FILTER — gdls's fixed 10-type STANDARD
+//!   legend is its own advertised legend; the profile's `tokenTypes` only gate which types survive
+//!   (LSP 3.17: the wire integers index the SERVER-advertised legend, not a client remap). So a
+//!   `method` token (a class-member `func` like `paint` is a METHOD, since the script IS its root
+//!   class) is emitted at gdls's OWN server index 4 for every profile that advertises `method`
+//!   (regardless of where `method` sits in the profile's list), and dropped for one that doesn't.
+//!   The `full → full/delta` edit-shape round-trip is driven once (delta is NOT a client-gated
+//!   projection — `SemanticTokensCaps` captures only the legend + refresh — so it is asserted as an
+//!   endpoint, not per-profile).
+//! - **`inlayHint`** (#73): the `resolveSupport` gate — a `var x := …` type hint ships its tooltip
+//!   EMBEDDED for a client without `resolveSupport` (helix) and DEFERRED (tooltip absent, `data`
+//!   present, filled by an `inlayHint/resolve` round-trip) for a client with it (neovim/zed).
+//! - **`documentColor`** (#74): the `Color(…)` literal is reported for EVERY profile (a bare
+//!   `Simple(true)` provider with no client-capability path — the generic-LSP floor).
+//! - **`codeAction`** (#75): all three vendored profiles advertise `codeActionLiteralSupport` +
+//!   `resolveSupport`, so the walk asserts each profile's actual (rich) projection — a `CodeAction`
+//!   literal with a DEFERRED edit + the additive `Diagnostic.data` tag gated on
+//!   `publishDiagnostics.dataSupport` (helix lacks it), and the `source.fixAll` family separation.
+//!   The DEGRADED paths (the `Command[]` fallback for a no-`codeActionLiteralSupport` client and the
+//!   eager-edit path for a no-`resolveSupport` client) have no vendored profile to exercise them, so
+//!   they are covered by the synthetic-capability unit tests in `tests/code_action.rs`
+//!   (`command_fallback_triggers_correlated_apply_edit_*`,
+//!   `code_action_computes_edit_eagerly_without_resolve_support`) — the vendored-real-client contract
+//!   of THIS file forbids a synthetic minimal fixture.
+//!
 //! Every milestone from M8 on extends this list with its own gated projections.
 
 mod common;
@@ -154,6 +181,9 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
     // The M9 projection probe (rename / foldingRange / workspaceSymbol gates), likewise on disk
     // before boot so its `class_name` is in the index for the workspace/symbol query.
     p.write("src/m9probe.gd", M9_PROBE_SRC);
+    // The M10 projection probe (semanticTokens / inlayHint / documentColor / codeAction gates),
+    // likewise on disk before boot so it is in the eager-interface index.
+    p.write("src/m10probe.gd", M10_PROBE_SRC);
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
     let init = InitializeParams {
@@ -339,6 +369,9 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
     // M9 (#66/#70/#71): the rename / foldingRange / workspaceSymbol gated-projection walk.
     check_m9_projection(name, profile, &p, &client);
 
+    // M10 (#72/#73/#74/#75): the semanticTokens / inlayHint / documentColor / codeAction walk.
+    check_m10_projection(name, profile, &p, &client);
+
     common::shutdown(&client, server_thread);
 }
 
@@ -468,6 +501,393 @@ fn check_m9_projection(
             "{name}: workspace/symbol location carries a range iff NOT resolveSupport (lazy WorkspaceSymbol otherwise)"
         );
     }
+}
+
+/// The M10 probe — a `func` declaration (`paint`, a `method` semantic token: the legend allow-filter
+/// discriminator), a `var x := Color(…)` walrus declaration (BOTH a `documentColor` literal AND an
+/// inferred-type inlayHint carrying a tooltip), and an unused local (`leftover`, an
+/// `UNUSED_VARIABLE` warning: the codeAction quickfix target). `print(tint)` keeps the class member
+/// used (so only `leftover` is unused).
+const M10_PROBE_SRC: &str = "\
+class_name M10ProbeClass
+extends Node
+
+var tint := Color(1, 0, 0)
+
+func paint() -> void:
+\tvar leftover = 5
+\tprint(tint)
+";
+
+/// gdls's own fixed STANDARD semantic-tokens legend (`crate::semantic_tokens::LEGEND_TYPES`), in wire
+/// order — these ARE the wire indices for EVERY profile. The profile's advertised `tokenTypes` are a
+/// pure allow-filter (a type it didn't list is dropped); they never remap the index (LSP 3.17: the
+/// wire integer indexes the SERVER-advertised legend). Kept in lockstep with the server table by the
+/// `legend_is_standard_names_only` unit test (which pins the exact names) — this is the test-side
+/// mirror used to predict the wire index of a type.
+const GDLS_LEGEND_TYPES: &[&str] = &[
+    "class",
+    "enum",
+    "enumMember",
+    "function",
+    "method",
+    "property",
+    "parameter",
+    "variable",
+    "event",
+    "decorator",
+];
+
+/// Drive the gated M10 capabilities for one profile and assert each projection from the profile's OWN
+/// flags (never hard-coding per-editor expectations): the semanticTokens legend ALLOW-FILTER
+/// (`method` → gdls's own SERVER index 4 for any profile that advertises it, dropped for one that
+/// doesn't), the `full → full/delta` edit-shape round-trip, the inlayHint `resolveSupport` tooltip
+/// deferral, documentColor (served for every profile), and the codeAction rich-client projection
+/// (deferred `CodeAction` edit + the `Diagnostic.data` tag gated on
+/// `publishDiagnostics.dataSupport`, plus `source.fixAll` separation).
+fn check_m10_projection(
+    name: &str,
+    profile: &serde_json::Value,
+    p: &common::TempProject,
+    client: &Connection,
+) {
+    let uri = file_uri(&p.root.join("src/m10probe.gd"));
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 1,
+                    text: M10_PROBE_SRC.to_string(),
+                },
+            },
+        ))
+        .unwrap();
+    // Drain the open's publishDiagnostics, KEEPING the one for this URI — the codeAction request
+    // below must echo the `UNUSED_VARIABLE` diagnostic back in its `context.diagnostics` (the handler
+    // reads the context, not a fresh analysis).
+    let mut diagnostics = serde_json::Value::Null;
+    while let Some(msg) = try_recv(client, Duration::from_millis(400)) {
+        if let Message::Notification(n) = msg {
+            if n.method == "textDocument/publishDiagnostics"
+                && n.params["uri"].as_str() == Some(uri.as_str())
+            {
+                diagnostics = n.params["diagnostics"].clone();
+            }
+        }
+    }
+
+    // ---- semanticTokens (#72): the legend ALLOW-FILTER. -----------------------------------------
+    // gdls's legend is the 10 STANDARD types; the profile's advertised `tokenTypes` only gate which
+    // survive — gdls always emits its OWN (server-advertised) index (LSP 3.17: the wire integer
+    // indexes the server-advertised legend, NOT a client remap). So a `method` token (gdls index 4 —
+    // a class-member `func` like `paint` is a METHOD, not a free `function`, since the script IS its
+    // root class) is emitted at index 4 for EVERY profile that advertises `method` (regardless of
+    // where `method` sits in the profile's own list), and DROPPED for one that advertised a
+    // `tokenTypes` list without it. helix advertises no `tokenTypes` ⇒ the full legend ⇒ also index
+    // 4. The discriminator is the `paint` method-name token.
+    let client_types: Vec<String> = profile["textDocument"]["semanticTokens"]["tokenTypes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    // gdls's own SERVER index for `method` — the wire index for EVERY profile (the allow-filter never
+    // changes it). This is the value asserted, not a per-client position.
+    let server_method_index = GDLS_LEGEND_TYPES
+        .iter()
+        .position(|t| *t == "method")
+        .unwrap() as u64;
+    // The profile renders `method` iff it advertised no `tokenTypes` (→ full legend) or its list
+    // includes `method`. Otherwise gdls drops the token (the allow-filter), so it must be ABSENT.
+    let profile_advertises_method =
+        client_types.is_empty() || client_types.iter().any(|t| t == "method");
+    client
+        .sender
+        .send(request(
+            50,
+            "textDocument/semanticTokens/full",
+            serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+        ))
+        .unwrap();
+    let st_full = response_result(name, client, 50);
+    let data = st_full["data"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{name}: semanticTokens/full returns a flat data array"));
+    assert!(
+        !data.is_empty(),
+        "{name}: the probe emits at least the `paint` method token"
+    );
+    // Decode the flat 5-int stream `[deltaLine, deltaStart, length, tokenType, modifiers]` and collect
+    // the set of token-type wire indices present. gdls emits the SERVER index for `method`, the same
+    // for every profile that advertises it (proving emission is server-legend-indexed, not remapped).
+    let token_types: Vec<u64> = data.chunks_exact(5).filter_map(|c| c[3].as_u64()).collect();
+    if profile_advertises_method {
+        assert!(
+            token_types.contains(&server_method_index),
+            "{name}: a method token must be emitted at gdls's SERVER index {server_method_index} \
+             (client types: {client_types:?}); got type indices {token_types:?}"
+        );
+    } else {
+        assert!(
+            !token_types.contains(&server_method_index),
+            "{name}: the profile didn't advertise `method`, so the method token must be DROPPED; \
+             got type indices {token_types:?}"
+        );
+    }
+
+    // ---- semanticTokens (#72): the full → full/delta edit-shape endpoint. -----------------------
+    // Delta is NOT a client-gated projection (`SemanticTokensCaps` has only legend + refresh), so it
+    // is asserted ONCE as an endpoint: a delta request with the prior resultId returns the
+    // `SemanticTokensDelta` (an `edits` array) shape, not a fresh full set, when nothing changed.
+    let result_id = st_full["resultId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{name}: semanticTokens/full carries a resultId"));
+    client
+        .sender
+        .send(request(
+            51,
+            "textDocument/semanticTokens/full/delta",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "previousResultId": result_id,
+            }),
+        ))
+        .unwrap();
+    let st_delta = response_result(name, client, 51);
+    assert!(
+        st_delta.get("edits").is_some(),
+        "{name}: full/delta with the prior resultId returns a SemanticTokensDelta (edits array), got {st_delta}"
+    );
+
+    // ---- inlayHint (#73): the resolveSupport tooltip deferral. ----------------------------------
+    // A `var tint := Color(…)` walrus declaration yields an inferred-type hint (`: Color`) carrying a
+    // tooltip. With `inlayHint.resolveSupport` the tooltip is DEFERRED (absent on the hint, present in
+    // `data`, filled by `inlayHint/resolve`); without it the tooltip is EMBEDDED eagerly.
+    let want_inlay_resolve = profile["textDocument"]["inlayHint"]["resolveSupport"].is_object();
+    client
+        .sender
+        .send(request(
+            52,
+            "textDocument/inlayHint",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 9, "character": 0 },
+                },
+            }),
+        ))
+        .unwrap();
+    let hints = response_result(name, client, 52);
+    let type_hint = hints
+        .as_array()
+        .unwrap_or_else(|| panic!("{name}: inlayHint returns an array"))
+        .iter()
+        .find(|h| h["label"].as_str().is_some_and(|l| l.contains("Color")))
+        .unwrap_or_else(|| {
+            panic!("{name}: the `var tint := Color(…)` type hint `: Color` is offered; got {hints}")
+        })
+        .clone();
+    if want_inlay_resolve {
+        assert!(
+            type_hint["tooltip"].is_null() && !type_hint["data"].is_null(),
+            "{name}: resolveSupport ⇒ tooltip DEFERRED (absent + data present); got {type_hint}"
+        );
+        // The resolve round-trip fills the tooltip from `data`.
+        client
+            .sender
+            .send(request(53, "inlayHint/resolve", &type_hint))
+            .unwrap();
+        let resolved = response_result(name, client, 53);
+        assert!(
+            !resolved["tooltip"].is_null(),
+            "{name}: inlayHint/resolve fills the deferred tooltip; got {resolved}"
+        );
+    } else {
+        assert!(
+            !type_hint["tooltip"].is_null(),
+            "{name}: no resolveSupport ⇒ tooltip EMBEDDED eagerly; got {type_hint}"
+        );
+    }
+
+    // ---- documentColor (#74): served for EVERY profile (no client-capability gate). -------------
+    client
+        .sender
+        .send(request(
+            54,
+            "textDocument/documentColor",
+            serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+        ))
+        .unwrap();
+    let colors = response_result(name, client, 54);
+    let color_info = colors
+        .as_array()
+        .unwrap_or_else(|| panic!("{name}: documentColor returns an array"));
+    assert_eq!(
+        color_info.len(),
+        1,
+        "{name}: the `Color(1, 0, 0)` literal is the one reported color; got {colors}"
+    );
+    let red = &color_info[0]["color"];
+    assert_eq!(red["red"].as_f64(), Some(1.0), "{name}: color red channel");
+    assert_eq!(
+        red["green"].as_f64(),
+        Some(0.0),
+        "{name}: color green channel"
+    );
+    // colorPresentation for that color always offers at least the float `Color(…)` form.
+    client
+        .sender
+        .send(request(
+            55,
+            "textDocument/colorPresentation",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "color": red,
+                "range": color_info[0]["range"],
+            }),
+        ))
+        .unwrap();
+    let presentations = response_result(name, client, 55);
+    assert!(
+        presentations
+            .as_array()
+            .is_some_and(|a| a.iter().any(|p| p["label"].as_str().is_some_and(|l| l.starts_with("Color(")))),
+        "{name}: colorPresentation always offers the float Color(…) constructor form; got {presentations}"
+    );
+
+    // ---- codeAction (#75): the rich-client projection (all vendored profiles advertise -----------
+    // codeActionLiteralSupport + resolveSupport, so the walk asserts the rich path; the degraded
+    // Command/eager paths are covered by tests/code_action.rs). The `Diagnostic.data` tag is gated on
+    // publishDiagnostics.dataSupport; `source.fixAll` is its own family.
+    let literal_support =
+        profile["textDocument"]["codeAction"]["codeActionLiteralSupport"].is_object();
+    let resolve_support = profile["textDocument"]["codeAction"]["resolveSupport"].is_object();
+    let data_support = flag(
+        profile,
+        &["textDocument", "publishDiagnostics", "dataSupport"],
+    );
+
+    // The published UNUSED_VARIABLE diagnostic — round-tripped into the request context (the handler
+    // reads `context.diagnostics`, not a fresh analysis).
+    let unused = diagnostics
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|d| d["code"] == "UNUSED_VARIABLE")
+        .unwrap_or_else(|| panic!("{name}: UNUSED_VARIABLE fires on `leftover`; got {diagnostics}"))
+        .clone();
+    // The additive `Diagnostic.data` tag is present iff publishDiagnostics.dataSupport (FIDELITY: the
+    // tag is the ONLY thing dataSupport adds).
+    assert_eq!(
+        !unused["data"].is_null(),
+        data_support,
+        "{name}: Diagnostic.data tag present iff publishDiagnostics.dataSupport"
+    );
+
+    // quickfix family: the suppression + any mutating fix. With literal+resolve support (every
+    // vendored profile) each action is a `CodeAction` literal whose `edit` is DEFERRED to resolve.
+    client
+        .sender
+        .send(request(
+            56,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "range": unused["range"],
+                "context": {
+                    "diagnostics": [unused],
+                    "only": ["quickfix"],
+                },
+            }),
+        ))
+        .unwrap();
+    let actions = response_result(name, client, 56);
+    let actions = actions
+        .as_array()
+        .unwrap_or_else(|| panic!("{name}: codeAction returns an array"));
+    assert!(
+        !actions.is_empty(),
+        "{name}: a quickfix is offered for UNUSED_VARIABLE"
+    );
+    // The suppression action ("Ignore …") — a CodeAction literal (every vendored profile has
+    // literalSupport), kind quickfix.
+    let suppression = actions
+        .iter()
+        .find(|a| a["title"].as_str().is_some_and(|t| t.contains("Ignore")))
+        .unwrap_or_else(|| {
+            panic!("{name}: the @warning_ignore suppression is offered; got {actions:?}")
+        })
+        .clone();
+    assert!(
+        literal_support && suppression["kind"] == "quickfix",
+        "{name}: with literalSupport the suppression is a CodeAction literal of kind quickfix"
+    );
+    if resolve_support {
+        // resolveSupport ⇒ the suppression's edit is DEFERRED (absent + data present), filled by
+        // codeAction/resolve.
+        assert!(
+            suppression["edit"].is_null() && !suppression["data"].is_null(),
+            "{name}: resolveSupport ⇒ the suppression edit is deferred (data present, edit absent); got {suppression}"
+        );
+        client
+            .sender
+            .send(request(57, "codeAction/resolve", &suppression))
+            .unwrap();
+        let resolved = response_result(name, client, 57);
+        assert!(
+            !resolved["edit"].is_null(),
+            "{name}: codeAction/resolve fills the deferred suppression edit; got {resolved}"
+        );
+    }
+
+    // source.fixAll family separation: a `source.fixAll` filter yields ONLY source.fixAll actions
+    // (never the per-diagnostic suppression). Meaningful only with literalSupport (the aggregate is a
+    // multi-edit CodeAction literal); every vendored profile has it.
+    client
+        .sender
+        .send(request(
+            58,
+            "textDocument/codeAction",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "range": unused["range"],
+                "context": {
+                    "diagnostics": [unused],
+                    "only": ["source.fixAll"],
+                },
+            }),
+        ))
+        .unwrap();
+    let fix_all = response_result(name, client, 58);
+    let arr = fix_all.as_array().unwrap_or_else(|| {
+        panic!("{name}: codeAction(source.fixAll) returns an array; got {fix_all}")
+    });
+    // The probe's UNUSED_VARIABLE on `leftover` has a deterministic `_`-prefix fix, which source.fixAll
+    // aggregates (every vendored profile has literalSupport) → exactly one source.fixAll action. A
+    // non-empty assertion guards against a vacuous separation check on an empty array.
+    assert_eq!(
+        arr.len(),
+        1,
+        "{name}: source.fixAll aggregates the one auto-fixable warning into one action; got {fix_all}"
+    );
+    assert!(
+        arr.iter().all(|a| a["kind"]
+            .as_str()
+            .is_some_and(|k| k.starts_with("source.fixAll"))),
+        "{name}: a source.fixAll filter yields ONLY source.fixAll actions (no quickfix/suppression); got {fix_all}"
+    );
+    assert!(
+        !arr.iter()
+            .any(|a| a["title"].as_str().is_some_and(|t| t.contains("Ignore"))),
+        "{name}: the per-diagnostic suppression must NOT appear under a source.fixAll filter"
+    );
 }
 
 /// Drive `textDocument/completion` (+ a `completionItem/resolve` round-trip) for one profile and

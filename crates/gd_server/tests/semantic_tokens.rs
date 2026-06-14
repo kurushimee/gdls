@@ -666,42 +666,64 @@ fn range_returns_only_intersecting_tokens() {
     shutdown(&client, server_thread);
 }
 
-/// Criterion 5a: a reduced-legend client receives ONLY its declared types/modifiers. A client that
-/// supports only `class` + `function` and only the `static` modifier must never see a `property` /
-/// `enum` token, nor a `declaration` / `readonly` modifier bit.
+/// Criterion 5a: a reduced-legend client's advertised legend is a pure ALLOW-FILTER. gdls emits its
+/// own (server-advertised) legend indices — never a per-client remap (LSP 3.17: the wire integers
+/// index the server-advertised legend, not the client's `tokenTypes` capability) — and DROPS any
+/// type/modifier the client didn't advertise. A client supporting only `class` + `method` and only
+/// the `static` modifier therefore: sees `class`/`method` at their SERVER indices (0 / 4), never sees
+/// a `property`/`enum`/etc. token (dropped), and sees only the `static` bit at its SERVER bit (3).
 #[test]
 fn reduced_legend_client_gets_only_declared_types_and_modifiers() {
     let p = base_project();
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
-    // The CLIENT advertises only class + method (its own order: class=0, method=1) and only the
-    // static modifier. The SERVER still advertises the full legend (stable indices); emission is
-    // intersected. (`method` is in the reduced set so the static method survives to prove modifier
-    // projection; `property`/`enum`/`event`/`function`/etc. are NOT, so they must be dropped.)
+    // The CLIENT advertises only class + method (in its own order: class=0, method=1) and only the
+    // static modifier. The SERVER still advertises the full legend; emission uses the SERVER indices
+    // and drops anything the client didn't list. (`method` is in the reduced set so the static method
+    // survives to prove modifier projection; `property`/`enum`/`event`/`function`/etc. are NOT, so
+    // they must be dropped.)
     let caps = client_caps_with_legend(
         &[SemanticTokenType::CLASS, SemanticTokenType::METHOD],
         &[SemanticTokenModifier::STATIC],
         None,
     );
     let init = init_and_open_caps(&p, &client, &[("rich.gd", RICH)], caps);
-    // Decode against the CLIENT's legend (that's what its indices mean to it).
-    let client_legend = lsp_types::SemanticTokensLegend {
-        token_types: vec![SemanticTokenType::CLASS, SemanticTokenType::METHOD],
-        token_modifiers: vec![SemanticTokenModifier::STATIC],
-    };
-    // The server STILL advertises its full standard legend (stable wire indices for delta
-    // correlation); intersection happens at emit time, never by shrinking the advertised legend.
+    // Decode against the SERVER-advertised legend — that is what the wire indices mean (LSP 3.17).
+    let legend = server_legend(&init);
+    // The server advertises its full standard legend (stable wire indices); the client's reduced one
+    // is only an allow-filter applied at emit time, never a remap and never a shrink of the legend.
     assert_eq!(
-        server_legend(&init).token_types.len(),
+        legend.token_types.len(),
         10,
         "the server must advertise its full legend regardless of the client's reduced one"
     );
     let uri = file_uri(&p.root.join("rich.gd"));
     let tokens = request_full(&client, 10, &uri);
-    let d = decode(&tokens, &client_legend);
 
+    // Raw-wire proof (independent of name-decoding): every emitted `tokenType` is a gdls SERVER index
+    // (class=0, method=4) — NOT a client-list position (which would put method at 1 → decode as enum).
+    let server_class = 0u32;
+    let server_method = 4u32;
+    for tok in &tokens.data {
+        assert!(
+            tok.token_type == server_class || tok.token_type == server_method,
+            "a reduced-legend client must only receive its declared types, at gdls's SERVER indices \
+             (class={server_class}, method={server_method}); got tokenType {}",
+            tok.token_type
+        );
+    }
+    assert!(
+        tokens
+            .data
+            .iter()
+            .any(|tok| tok.token_type == server_method),
+        "the `method` tokens must be emitted at gdls's server index {server_method}"
+    );
+
+    let d = decode(&tokens, &legend);
     assert!(!d.is_empty(), "some class/method tokens should survive");
-    // Only `class` and `method` types appear — no property/enum/event/etc.
+    // Decoded against the server legend, only `class` and `method` types appear — no property/enum/
+    // event/etc. (those are dropped because the client didn't advertise them).
     for t in &d {
         assert!(
             t.ty == "class" || t.ty == "method",
@@ -716,7 +738,8 @@ fn reduced_legend_client_gets_only_declared_types_and_modifiers() {
             );
         }
     }
-    // The static method `make` is present, and it carries the `static` modifier (which IS declared).
+    // The static method `make` is present and carries `static` at the SERVER bit (3) — the bitset
+    // indexes the server legend, so `static` decodes correctly against it.
     assert!(
         d.iter()
             .any(|t| t.ty == "method" && t.mods.contains(&"static".to_string())),
@@ -745,6 +768,71 @@ fn reduced_legend_client_gets_only_declared_types_and_modifiers() {
         tokens.data.len()
     );
     shutdown(&client2, server_thread2);
+}
+
+/// Order-independence (the proof the fix indexes the SERVER legend, not the client's): a client that
+/// advertises gdls's types in a DIFFERENT order than the server legend still receives gdls's own
+/// (server) indices on the wire — decoding against the server-advertised legend yields the correct
+/// names. If gdls remapped to client positions, this client would mis-highlight (e.g. `method` would
+/// arrive at the client's position and decode as the wrong type against the server legend).
+#[test]
+fn client_legend_in_a_different_order_still_gets_server_indices() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    // The client lists method, class, event (positions 0, 1, 2) — a different order from the server
+    // legend (class=0, method=4, event=8). It also lists `static`, `declaration` (positions 0, 1) —
+    // again a different order from the server (declaration=0, static=3).
+    let caps = client_caps_with_legend(
+        &[
+            SemanticTokenType::METHOD,
+            SemanticTokenType::CLASS,
+            SemanticTokenType::EVENT,
+        ],
+        &[
+            SemanticTokenModifier::STATIC,
+            SemanticTokenModifier::DECLARATION,
+        ],
+        None,
+    );
+    let init = init_and_open_caps(&p, &client, &[("rich.gd", RICH)], caps);
+    let legend = server_legend(&init);
+    let uri = file_uri(&p.root.join("rich.gd"));
+    let tokens = request_full(&client, 10, &uri);
+
+    // Raw-wire proof: every emitted `tokenType` is a SERVER index from the advertised set {0,4,8},
+    // independent of the client's {0,1,2} ordering. (A remap would emit the client positions.)
+    for tok in &tokens.data {
+        assert!(
+            [0u32, 4, 8].contains(&tok.token_type),
+            "an order-different client must still receive gdls's SERVER indices (class=0, method=4, \
+             event=8); got tokenType {}",
+            tok.token_type
+        );
+    }
+
+    // Decoded against the server legend, the `make`/`step` methods are `method` and `died` is `event`
+    // — the names a correct client renders. The `static func make` carries `static` (server bit 3).
+    let d = decode(&tokens, &legend);
+    assert!(
+        d.iter().any(|t| t.ty == "method"),
+        "a method token must decode as `method` against the server legend; got {d:#?}"
+    );
+    assert!(
+        d.iter().any(|t| t.ty == "event"),
+        "the `died` signal must decode as `event` against the server legend; got {d:#?}"
+    );
+    assert!(
+        d.iter()
+            .any(|t| t.ty == "method" && t.mods.contains(&"static".to_string())),
+        "the static method must carry `static` (at the server bit); got {d:#?}"
+    );
+    // A type the client did NOT advertise (e.g. `enum`, `property`) is absent.
+    assert!(
+        !d.iter().any(|t| t.ty == "enum" || t.ty == "property"),
+        "types the client didn't advertise must be dropped; got {d:#?}"
+    );
+    shutdown(&client, server_thread);
 }
 
 /// Criterion 5b: `augmentsSyntaxTokens` true vs false produce IDENTICAL output. gdls's legend has
