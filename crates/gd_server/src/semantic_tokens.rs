@@ -193,10 +193,21 @@ pub(crate) fn classify_document(
     // First pass: declarations (structural — always emitted) + collect decl/type/attribute span sets.
     for id in tree.iter_ids() {
         let node = tree.get(id);
-        // Annotations attached to this node (`@export`, `@onready`, …) → decorator.
+        // Annotations attached to this node (`@export`, `@onready`, …) → decorator. Color ONLY the
+        // `@name` marker, not the whole annotation node: the node span stretches over the argument
+        // list (`@export_range(0, MAX_VAL)`), so spanning it would (a) paint the argument expressions
+        // `decorator`, overlapping any token they earn in the use pass, and (b) drop the whole
+        // decorator when the arguments wrap across lines (the single-line guard in `encode`). The
+        // `@name` is ASCII and always single-line, and the node span starts at the `@` — so the
+        // marker is `span.start .. span.start + name.len()` (bytes == columns for ASCII).
         for &ann_id in &node.annotations {
-            if let NodeKind::Annotation(_) = &tree.get(ann_id).kind {
-                push_span(&mut out, tree.get(ann_id).span, TokType::Decorator, 0);
+            if let NodeKind::Annotation(a) = &tree.get(ann_id).kind {
+                let span = tree.get(ann_id).span;
+                let name_span = ByteSpan {
+                    start: span.start,
+                    end: span.start + a.name.len(),
+                };
+                push_span(&mut out, name_span, TokType::Decorator, 0);
             }
         }
         match &node.kind {
@@ -1175,6 +1186,72 @@ mod tests {
             .expect("the local declaration must be colored");
         assert_eq!(decl_tok.ty, TokType::Variable);
         assert_ne!(decl_tok.modifiers & MOD_DECLARATION, 0);
+    }
+
+    /// An annotation with an argument list colors ONLY the `@name` marker as `decorator` — not the
+    /// whole `@name(args)` node span. Covering the node span would paint the argument expressions
+    /// `decorator` (overlapping any token they earn) and would drop the decorator entirely when the
+    /// arguments wrap across lines (the single-line guard in `encode`). Here the `@export_range`
+    /// marker is 13 chars; the token must be exactly that, leaving the `(0, MAX_VAL)` bytes uncolored.
+    #[test]
+    fn annotation_with_args_colors_only_the_name_marker() {
+        let src = "const MAX_VAL = 100\n@export_range(0, MAX_VAL) var hp: int = 0\n";
+        let parsed = gd_syntax::parse(src);
+        let db = gd_types::NativeDb::empty();
+        let raw = classify_document(&parsed.tree, None, &db);
+
+        let at_byte = src.find("@export_range").unwrap();
+        let deco = raw
+            .iter()
+            .find(|t| t.ty == TokType::Decorator)
+            .expect("the annotation must be colored as a decorator");
+        assert_eq!(deco.span.start, at_byte, "the decorator starts at the `@`");
+        assert_eq!(
+            deco.span.end - deco.span.start,
+            "@export_range".len(),
+            "the decorator must cover ONLY the `@name` marker, not the argument list"
+        );
+        // No token may cover any byte of the `(0, MAX_VAL)` argument region as a decorator.
+        let args_start = at_byte + "@export_range".len();
+        assert!(
+            raw.iter()
+                .all(|t| !(t.ty == TokType::Decorator && t.span.start >= args_start)),
+            "the annotation argument list must not be colored as decorator"
+        );
+    }
+
+    /// A multi-line annotation (`@export_range(` on one line, the args on the next) still emits its
+    /// `@name` decorator token through `encode` — the marker is single-line, so it survives the
+    /// multi-line guard that (correctly) drops genuinely multi-line spans. Pins the fix for the
+    /// silently-dropped decorator on a wrapped annotation.
+    #[test]
+    fn multiline_annotation_marker_survives_encode() {
+        use crate::position::{PositionEncoding, PositionMapper};
+        use ropey::Rope;
+
+        let src = "@export_range(\n\t0, 100) var hp: int = 0\n";
+        let parsed = gd_syntax::parse(src);
+        let db = gd_types::NativeDb::empty();
+        let raw = classify_document(&parsed.tree, None, &db);
+        let rope = Rope::from_str(src);
+        let mapper = PositionMapper::new(&rope, PositionEncoding::Utf16);
+        let encoded = encode(&raw, &mapper, &ClientLegend::full());
+
+        // Decode the first token absolutely: it must be the `@export_range` decorator on line 0.
+        let first = encoded
+            .first()
+            .expect("a wrapped annotation must still emit its decorator");
+        assert_eq!(first.delta_line, 0);
+        assert_eq!(first.delta_start, 0, "the marker starts at column 0");
+        assert_eq!(
+            first.length as usize,
+            "@export_range".len(),
+            "the decorator marker length is the `@name` width"
+        );
+        assert_eq!(
+            LEGEND_TYPES[first.token_type as usize],
+            SemanticTokenType::DECORATOR
+        );
     }
 
     /// `ClientLegend::from_client` with a reduced legend drops undeclared types entirely and clears
