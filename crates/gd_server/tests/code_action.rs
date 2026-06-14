@@ -2147,3 +2147,49 @@ fn add_onready_refused_despite_duplicate_existing_error_message() {
     );
     shutdown(&client, t);
 }
+
+/// REGRESSION (blocker — silent member capture): a class member `_y` is READ via `print(_y)`, and an
+/// unused local `y` is renamed to `_y`. After the rename, `var _y` (local) shadows the member, so
+/// `print(_y)` SILENTLY reads the local (=1) instead of the member (=0) — compiles, different behavior
+/// (no error, so the error backstop alone wouldn't catch it). The SHADOW backstop must WITHHOLD the
+/// fix (the capture manifests as a new SHADOWED_VARIABLE).
+#[test]
+fn underscore_prefix_refused_on_silent_member_capture() {
+    const SRC: &str = "extends Node\n\nvar _y = 0\n\nfunc f() -> void:\n\tvar y = 1\n\tprint(_y)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    // Precondition: valid input (warnings only — the rebind would be a NET-NEW behavior change).
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "precondition: input must be error-free; got {:?}",
+        diags.diagnostics
+    );
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == Some(NumberOrString::String("UNUSED_VARIABLE".to_string()))
+                && d.range.start.line == 5
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the unused local `y` must warn; got {:?}",
+                diags.diagnostics
+            )
+        });
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Prefix unused name").is_none(),
+        "renaming `y`→`_y` would silently capture the `print(_y)` member read — the SHADOW backstop \
+         must REFUSE it; got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}

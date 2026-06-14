@@ -1053,6 +1053,7 @@ fn edit_is_safe(state: &mut ServerState, uri: &Uri, edit: &WorkspaceEdit) -> boo
     }
     let before_errors = error_message_counts(&before_analysis);
     let before_syntax = before_tree.diagnostics.len();
+    let before_shadows = shadow_code_counts(&before_analysis);
 
     // Apply the edit to the buffer text. `None` ⇒ the edit didn't apply cleanly ⇒ refuse.
     let Some(after_text) = apply_workspace_edit_to_text(uri, &before_text, edit, state.encoding)
@@ -1074,9 +1075,27 @@ fn edit_is_safe(state: &mut ServerState, uri: &Uri, edit: &WorkspaceEdit) -> boo
     // line insert shifts ranges). Counts, not a set: if `M` occurs once before and the edit makes it
     // occur twice, that SECOND `M` is a new error (the duplicate-message bypass the review found).
     let after_errors = error_message_counts(&after_analysis);
-    after_errors
+    let no_new_error = after_errors
         .iter()
-        .all(|(msg, n)| before_errors.get(msg).copied().unwrap_or(0) >= *n)
+        .all(|(msg, n)| before_errors.get(msg).copied().unwrap_or(0) >= *n);
+    if !no_new_error {
+        return false;
+    }
+
+    // No NEW shadow/confusable WARNING may appear — the SILENT-CAPTURE backstop. The `_`-prefix rename
+    // could rename a binding to `_name` in a scope where `_name` already exists, silently re-binding a
+    // reference to a different symbol with NO error (`var _y` member + `var y` local + `print(_y)` →
+    // after `y`→`_y`, `print(_y)` reads the local). The analyzer flags that capture as a SHADOWED_* /
+    // CONFUSABLE_* warning, so refuse if any such code's count rose. Compared by CODE (not message):
+    // shadow messages embed line numbers, which a line insert shifts — the code string is
+    // position-independent. This is the principled close for the open-ended capture-vector space
+    // (member / outer-local / parameter / global / autoload) the structural collision check can't
+    // enumerate. (Over-refuses a benign NON-capturing new shadow — withholding the lightbulb there is
+    // a safe under-offer; see the filed limitation.)
+    let after_shadows = shadow_code_counts(&after_analysis);
+    after_shadows
+        .iter()
+        .all(|(code, n)| before_shadows.get(code).copied().unwrap_or(0) >= *n)
 }
 
 /// A multiset (message → count) of error-severity analyzer diagnostics — the backstop's
@@ -1089,6 +1108,38 @@ fn error_message_counts(
     for d in &result.diagnostics {
         if matches!(d.severity(), gd_analyze::Severity::Error) {
             *counts.entry(d.message().to_owned()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// The shadow / confusable warning family — the codes a SILENT identifier CAPTURE manifests as (an
+/// edit that renames a binding into a scope where the new name already exists rebinds a reference with
+/// no error). The full `SHADOWED_*` / `CONFUSABLE_*` set from `gd_analyze::warnings` (enumerated, not
+/// hand-picked, so a future addition is caught by re-checking this list against the source).
+const SHADOW_CONFUSABLE_CODES: &[&str] = &[
+    "SHADOWED_VARIABLE",
+    "SHADOWED_VARIABLE_BASE_CLASS",
+    "SHADOWED_GLOBAL_IDENTIFIER",
+    "CONFUSABLE_IDENTIFIER",
+    "CONFUSABLE_LOCAL_DECLARATION",
+    "CONFUSABLE_LOCAL_USAGE",
+    "CONFUSABLE_CAPTURE_REASSIGNMENT",
+];
+
+/// A multiset (warning CODE → count) of the shadow/confusable family — the silent-capture backstop's
+/// position-independent identity (message text embeds shifting line numbers, the code does not).
+fn shadow_code_counts(
+    result: &gd_analyze::AnalysisResult,
+) -> std::collections::BTreeMap<&'static str, usize> {
+    let mut counts: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    for d in &result.diagnostics {
+        if let Some(code) = d.warning_code() {
+            let name = gd_analyze::warnings::name_from_code(code);
+            if let Some(&known) = SHADOW_CONFUSABLE_CODES.iter().find(|&&c| c == name) {
+                *counts.entry(known).or_insert(0) += 1;
+            }
         }
     }
     counts
