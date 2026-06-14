@@ -3953,10 +3953,7 @@ fn type_is_node_typed_for_export(ctx: &AnalysisContext, dt: &DataType) -> bool {
 /// drop-`@onready` quickfix to consult so it can REFUSE the fix when removing `@onready` would
 /// re-induce this warning — reusing Godot's emission condition rather than re-deriving it (the
 /// faithful-port discipline forbids replicating the predicate in two places, which would drift).
-pub fn get_node_default_form(
-    tree: &gd_syntax::ast::ParseTree,
-    init_id: NodeId,
-) -> Option<String> {
+pub fn get_node_default_form(tree: &gd_syntax::ast::ParseTree, init_id: NodeId) -> Option<String> {
     // analyzer.cpp:1075-1077 — unwrap a single Cast wrapper.
     let inner_id = match &tree.get(init_id).kind {
         NodeKind::Cast(c) => c.operand?,

@@ -349,7 +349,10 @@ pub fn code_action(state: &mut ServerState, params: CodeActionParams) -> CodeAct
         }
     }
 
-    if want_fix_all {
+    // `source.fixAll` is a `CodeAction` literal (it carries a multi-edit `WorkspaceEdit`), so it is
+    // only meaningful to a client with `codeActionLiteralSupport` — a no-literal client can't render
+    // it. (`editor.codeActionsOnSave` clients all advertise literal support.)
+    if want_fix_all && state.caps.code_action.literal_support {
         if let Some(action) = build_fix_all(state, &params) {
             out.push(CodeActionOrCommand::CodeAction(action));
         }
@@ -719,7 +722,11 @@ fn push_underscore_prefix_action(
 /// its `identifier` span start — NEVER `diag.range.start` (the `var` keyword), which would put the
 /// rename cursor on a keyword and resolve nothing. `None` (fail-closed) when the buffer is gone or no
 /// declaration identifier can be located.
-fn underscore_decl_anchor(state: &mut ServerState, uri: &Uri, diag: &Diagnostic) -> Option<Position> {
+fn underscore_decl_anchor(
+    state: &mut ServerState,
+    uri: &Uri,
+    diag: &Diagnostic,
+) -> Option<Position> {
     let doc = state.vfs.get(uri.as_str())?;
     let text = doc.text();
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
@@ -827,7 +834,8 @@ fn push_add_onready_action(
     diag: &Diagnostic,
     out: &mut CodeActionResponse,
 ) {
-    let Some((var_line, has_export, _onready, _export_span)) = enclosing_variable_facts(state, uri, diag)
+    let Some((var_line, has_export, _onready, _export_span)) =
+        enclosing_variable_facts(state, uri, diag)
     else {
         return;
     };
@@ -837,8 +845,9 @@ fn push_add_onready_action(
     }
     let data = AddOnreadyData::new(uri, var_line);
     let title = "Add \"@onready\" annotation".to_string();
-    if let Some(action) = mutating_action(state, title, diag, &data, |s| build_add_onready_edit(s, &data))
-    {
+    if let Some(action) = mutating_action(state, title, diag, &data, |s| {
+        build_add_onready_edit(s, &data)
+    }) {
         out.push(action);
     }
 }
@@ -939,9 +948,9 @@ fn push_drop_annotation_actions(
         {
             let data = DropAnnotationData::new(uri, span);
             let title = "Remove \"@onready\" annotation".to_string();
-            if let Some(action) =
-                mutating_action(state, title, diag, &data, |s| build_drop_annotation_edit(s, &data))
-            {
+            if let Some(action) = mutating_action(state, title, diag, &data, |s| {
+                build_drop_annotation_edit(s, &data)
+            }) {
                 out.push(action);
             }
         }
@@ -957,9 +966,9 @@ fn push_drop_annotation_actions(
             _ => "@export".to_string(),
         };
         let title = format!("Remove \"{export_name}\" annotation");
-        if let Some(action) =
-            mutating_action(state, title, diag, &data, |s| build_drop_annotation_edit(s, &data))
-        {
+        if let Some(action) = mutating_action(state, title, diag, &data, |s| {
+            build_drop_annotation_edit(s, &data)
+        }) {
             out.push(action);
         }
     }
@@ -1008,7 +1017,10 @@ fn annotation_delete_span(
 /// Build the drop-annotation edit: a deletion of `data`'s byte range, converted to the negotiated
 /// [`WorkspaceEdit`] shape against the current buffer. `None` when the buffer is gone or the byte
 /// range is out of bounds for the current text (the buffer changed since offer — fail-closed).
-fn build_drop_annotation_edit(state: &ServerState, data: &DropAnnotationData) -> Option<WorkspaceEdit> {
+fn build_drop_annotation_edit(
+    state: &ServerState,
+    data: &DropAnnotationData,
+) -> Option<WorkspaceEdit> {
     let uri: Uri = data.uri.parse().ok()?;
     let doc = state.vfs.get(uri.as_str())?;
     let len = doc.rope.len_bytes();
@@ -1103,7 +1115,9 @@ fn merge_workspace_edits(
     for edit in edits {
         for te in text_edits_for_uri(&edit, uri) {
             // Drop an edit overlapping any already-accepted one (or exactly duplicating it).
-            let overlaps = collected.iter().any(|c| ranges_overlap(&c.range, &te.range));
+            let overlaps = collected
+                .iter()
+                .any(|c| ranges_overlap(&c.range, &te.range));
             if !overlaps {
                 collected.push(te);
             }
@@ -1203,7 +1217,10 @@ fn enclosing_variable_facts(
 
 /// The `NodeId` of the smallest `Variable` node covering `byte`, or `None`. Walks up from the
 /// innermost node via strict-container ancestors (the same step the suppression line resolution uses).
-fn enclosing_variable(tree: &gd_syntax::ast::ParseTree, byte: usize) -> Option<gd_syntax::ast::NodeId> {
+fn enclosing_variable(
+    tree: &gd_syntax::ast::ParseTree,
+    byte: usize,
+) -> Option<gd_syntax::ast::NodeId> {
     let mut cur = tree.innermost_node_at(byte)?;
     let mut guard = tree.len();
     loop {
@@ -1313,7 +1330,11 @@ fn workspace_edit_for(state: &ServerState, uri: Uri, text_edit: TextEdit) -> Wor
 /// `documentChanges`, else the legacy `changes` map. The caller guarantees the edits don't overlap, so
 /// the resulting `WorkspaceEdit` is well-defined.
 #[allow(clippy::mutable_key_type)]
-fn workspace_edit_for_many(state: &ServerState, uri: Uri, text_edits: Vec<TextEdit>) -> WorkspaceEdit {
+fn workspace_edit_for_many(
+    state: &ServerState,
+    uri: Uri,
+    text_edits: Vec<TextEdit>,
+) -> WorkspaceEdit {
     use lsp_types::{
         DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, TextDocumentEdit,
     };
