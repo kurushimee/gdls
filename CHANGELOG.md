@@ -44,6 +44,50 @@ milestones land on `main` and release together once the phase matures.
 - The warm-start cache format bumped (v4 → v5) for the doc-carrying `Interface` shape — one
   cold re-index per project on first launch after upgrading, self-healing.
 
+M8 — Phase 2 editing core (#64–#65), merged 2026-06-13. No release cut.
+
+### Added
+- **`textDocument/completion` + `completionItem/resolve`** (#64): `CompletionList` (never a bare
+  array); member-access / identifier / type-position contexts driven token-primary; `textEdit`,
+  `sortText` (fixed-width rank), `filterText`, snippet + `InsertReplaceEdit` + `commitCharacters`
+  all capability-gated; lazy `documentation`/`detail` via resolve with a compact self-sufficient
+  `data` key. 99.6% member-access agreement vs Godot's headless LSP differential.
+- **`textDocument/signatureHelp`** (#65): triggers `(`/`,`, retrigger `)`; `activeParameter` per
+  spec; label offsets gated on `labelOffsetSupport`; native + project signatures with default
+  values; string-safe backward bracket/comma scan.
+
+M9 — Phase 2 navigation & refactoring completeness (#66–#71), merged 2026-06-14. No release cut.
+
+### Added
+- **`textDocument/documentHighlight`** (#67): in-file Read/Write highlights reusing the references
+  engine's binding-backed resolution; Write derived from assignment + compound-assignment LHS,
+  excluding attribute-position identifiers; identifier-token ranges.
+- **`textDocument/foldingRange` + `selectionRange`** (#70): AST suites + `#region`/`#endregion`
+  pairs + comment runs with `FoldingRangeKind`, honoring `rangeLimit` + `lineFoldingOnly`; the AST
+  ancestor chain for selectionRange. `ParseResult` gains an additive `comments` field (token stream
+  untouched — both fidelity ratchets hold at 1.0000).
+- **`textDocument/declaration` + `typeDefinition`** (#68): declaration = the definition target
+  (GDScript has no separate declare/define); typeDefinition resolves the symbol's type to its
+  declaring script `class_name` site or native stub header (Builtin/Variant/unresolved → `null`,
+  never a guess).
+- **`typeHierarchy` prepare/supertypes/subtypes** (#69): the `class_name` registry + extends graph
+  as a class-tree navigator; supertypes cross the project→native boundary (stub-anchored), subtypes
+  reuse the `implementation` walk; compact `data` blobs so expansion survives past depth 2.
+  `typeHierarchyProvider` injected as the standard wire key (lsp-types 0.97 lacks the server field).
+- **`workspaceSymbol/resolve`** (#71): lazy `WorkspaceSymbol[]` (location-sans-range + a compact
+  `data` key) when the client advertises `workspace.symbol.resolveSupport`, resolving the precise
+  range on demand; eager `SymbolInformation[]` otherwise (byte-identical to before).
+- **`textDocument/rename` + `prepareRename`** (#66): workspace-wide semantic rename reusing the
+  references engine for the edit set; versioned `documentChanges` (zero stale-version edits) gated
+  on `workspace.workspaceEdit.documentChanges`, legacy `changes` map otherwise; `prepareRename`
+  `{range, placeholder}` gated on `rename.prepareSupport`. A fail-closed corruption firewall
+  (positive-project-resolution: native engine symbols, native methods on non-Native bases, stub
+  files, and new-name engine/registry collisions all refuse with a typed error and zero edits —
+  refuse-rather-than-corrupt); the local edit set is binding-correct (excludes `self.x`-attribute
+  over-capture). Round-trips on the Pixelorama acceptance project with zero stale-version edits.
+- M9 §7.4 editor-profile walk extended over the rename/foldingRange/workspaceSymbol gated
+  projections (`tests/editor_profiles.rs`).
+
 ## [1.0.7] — 2026-06-13
 
 Follow-ups to the v1.0.6 utility-as-Callable hotfix, surfaced by its review (#92). Cut from
