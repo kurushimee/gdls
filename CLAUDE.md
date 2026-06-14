@@ -141,10 +141,19 @@ binding.
 **Current:** Phase 1 complete — **v1.0.7 shipped** (2026-06-13; the utility-as-Callable
 follow-ups #92, tagged on `release/v1.0.7` = v1.0.6 + #92, so the unreleased Phase 2 work on
 `main` stayed unreleased — #91's code was already in v1.0.6; v1.0.6 itself was the #88 hotfix off
-v1.0.5); Phase 2 underway: **M7 (protocol foundations) and M8 (editing core — `completion` +
-`signatureHelp`) complete** — M7's seven issues (#57–#63) and M8's #64/#65 merged 2026-06-13,
-both milestones closed (M8 via PRs #94 completion + #95 signatureHelp, adversarially reviewed;
-a Godot-headless-LSP differential showed 99.6% completion agreement on member access).
+v1.0.5); Phase 2 underway: **M7 (protocol foundations), M8 (editing core — `completion` +
+`signatureHelp`), and M9 (navigation & refactoring — `documentHighlight`, `foldingRange`/
+`selectionRange`, `declaration`/`typeDefinition`, `typeHierarchy`, `workspaceSymbol/resolve`,
+`rename`/`prepareRename`) complete** — M7's #57–#63 and M8's #64/#65 merged 2026-06-13, M9's
+#66–#71 merged 2026-06-14, all three milestones closed (M8 via PRs #94/#95, M9 via #100–#105,
+all adversarially reviewed; a Godot-headless-LSP differential showed 99.6% completion agreement
+on member access). M9 `rename` (#66) took **six adversarial review rounds** to close every proven
+source-corruption path — the lesson, captured in memory: `references`/`definition` are read-tuned,
+so their inaccuracies become silent corruption under rename, the first mutating consumer; the fix
+is a fail-closed positive-project-resolution firewall + binding-correct local resolution (excludes
+`self.x`-attribute over-capture). It round-trips on Pixelorama with zero stale-version edits; the
+additive `ParseResult.comments` field (foldingRange) kept both ratchets at 1.0000. M9 deferred
+items filed: #106 (enum-value/autoload rename refuse), #107 (for-loop/match/inner-shadow).
 Per-milestone interactive checks are batched into ONE end-of-Phase-2 trial by the user
 in real work (capability captures are Claude's, headless — inventory + gaps in
 `crates/gd_server/tests/fixtures/client_caps/README.md`; deferred feel-check items in

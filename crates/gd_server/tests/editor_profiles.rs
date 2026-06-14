@@ -151,6 +151,9 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
     p.write("src/probe.gd", DOCUMENTED_SRC);
     // The M8 completion-projection probe, on disk before boot so it is in the eager-interface index.
     p.write("src/consumer.gd", COMPLETION_PROBE_SRC);
+    // The M9 projection probe (rename / foldingRange / workspaceSymbol gates), likewise on disk
+    // before boot so its `class_name` is in the index for the workspace/symbol query.
+    p.write("src/m9probe.gd", M9_PROBE_SRC);
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
     let init = InitializeParams {
@@ -333,7 +336,138 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
     // M8 (#64): the completion gated-projection walk against the self-contained probe file.
     check_completion_projection(name, profile, &p, &client);
 
+    // M9 (#66/#70/#71): the rename / foldingRange / workspaceSymbol gated-projection walk.
+    check_m9_projection(name, profile, &p, &client);
+
     common::shutdown(&client, server_thread);
+}
+
+/// The M9 probe — a `class_name` (for the workspace/symbol query), a foldable function body, and a
+/// function-local (`counter`) to rename.
+const M9_PROBE_SRC: &str = "\
+class_name M9ProbeClass
+extends Node
+
+func fold_region() -> void:
+\tvar counter := 0
+\tcounter += 1
+\tprint(counter)
+";
+
+/// Drive the gated M9 capabilities for one profile and assert each projection from the profile's OWN
+/// flags (never hard-coding per-editor expectations): rename `WorkspaceEdit` shape
+/// (`documentChanges` vs `changes`) + `prepareRename` placeholder, foldingRange `lineFoldingOnly`,
+/// and workspace/symbol `resolveSupport` (lazy `WorkspaceSymbol` vs eager `SymbolInformation`).
+fn check_m9_projection(
+    name: &str,
+    profile: &serde_json::Value,
+    p: &common::TempProject,
+    client: &Connection,
+) {
+    let uri = file_uri(&p.root.join("src/m9probe.gd"));
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 1,
+                    text: M9_PROBE_SRC.to_string(),
+                },
+            },
+        ))
+        .unwrap();
+    while try_recv(client, Duration::from_millis(300)).is_some() {}
+
+    // rename the local `counter` (line 4, col 5) — `documentChanges` iff workspaceEdit.documentChanges.
+    let expect_doc_changes = flag(profile, &["workspace", "workspaceEdit", "documentChanges"]);
+    client
+        .sender
+        .send(request(
+            40,
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 4, "character": 5 },
+                "newName": "tally",
+            }),
+        ))
+        .unwrap();
+    let we = response_result(name, client, 40);
+    assert_eq!(
+        we.get("documentChanges").is_some(),
+        expect_doc_changes,
+        "{name}: rename documentChanges iff workspace.workspaceEdit.documentChanges"
+    );
+    assert_eq!(
+        we.get("changes").is_some(),
+        !expect_doc_changes,
+        "{name}: rename legacy changes-map iff NOT documentChanges"
+    );
+
+    // prepareRename — `{range, placeholder}` iff rename.prepareSupport, else a bare range.
+    let expect_prepare = flag(profile, &["textDocument", "rename", "prepareSupport"]);
+    client
+        .sender
+        .send(request(
+            41,
+            "textDocument/prepareRename",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": 4, "character": 5 },
+            }),
+        ))
+        .unwrap();
+    let pr = response_result(name, client, 41);
+    assert_eq!(
+        pr.get("placeholder").is_some(),
+        expect_prepare,
+        "{name}: prepareRename placeholder iff rename.prepareSupport (bare range otherwise)"
+    );
+
+    // foldingRange — `lineFoldingOnly` drops the column fields.
+    let line_only = flag(
+        profile,
+        &["textDocument", "foldingRange", "lineFoldingOnly"],
+    );
+    client
+        .sender
+        .send(request(
+            42,
+            "textDocument/foldingRange",
+            serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+        ))
+        .unwrap();
+    let folds = response_result(name, client, 42);
+    if let Some(f) = folds.as_array().and_then(|a| a.first()) {
+        assert_eq!(
+            f.get("startCharacter").is_none(),
+            line_only,
+            "{name}: foldingRange omits start/end columns iff lineFoldingOnly"
+        );
+    }
+
+    // workspace/symbol — lazy `WorkspaceSymbol` (uri-only location, no range) iff resolveSupport,
+    // else eager `SymbolInformation` (location carries a range).
+    let resolve_support = profile["workspace"]["symbol"]["resolveSupport"].is_object();
+    client
+        .sender
+        .send(request(
+            43,
+            "workspace/symbol",
+            serde_json::json!({ "query": "M9ProbeClass" }),
+        ))
+        .unwrap();
+    let syms = response_result(name, client, 43);
+    if let Some(s) = syms.as_array().and_then(|a| a.first()) {
+        let has_range = s["location"].get("range").is_some();
+        assert_eq!(
+            has_range, !resolve_support,
+            "{name}: workspace/symbol location carries a range iff NOT resolveSupport (lazy WorkspaceSymbol otherwise)"
+        );
+    }
 }
 
 /// Drive `textDocument/completion` (+ a `completionItem/resolve` round-trip) for one profile and
