@@ -341,6 +341,106 @@ fn text_edit_for_bare_untyped_array_inferred_type() {
     shutdown(&client, server_thread);
 }
 
+/// Regression (review B1, the CONTAINER-ELEMENT variant — the proven corruption path the original
+/// `dt.to_string()` rendering let through): a `var := …` that infers a typed container whose ELEMENT
+/// is a script-owned enum in an UNNAMED script (`Array[A.E]`, `E` declared in `a.gd` with no
+/// `class_name`) gets the informational label `: Array[a.gd.E]` but carries **NO `textEdit`**.
+///
+/// Why this is the load-bearing test: `DataType`'s `Display` renders such an enum element as the file
+/// BASENAME (`a.gd.E`), so a `textEdit` built from the display string would emit `: Array[a.gd.E] = `
+/// — which, applied, re-parses `a.gd` as `type a` member `gd` and yields a NEW
+/// `Could not find type "a"` diagnostic, silently corrupting the user's file. The fix is that
+/// `annotation_type` recurses container element types through ITSELF (the kind-driven gate), where a
+/// `DtKind::Enum` element hits the conservative `_ => None` arm and `?`-propagates `None` up the
+/// container — so the whole container yields no edit while the label still shows. The scalar sibling
+/// (`no_text_edit_for_unnamed_script_inferred_type`) never exercises this element-recursion path; the
+/// `new.len() <= base.len()` count compare the older clean-apply test used would also have missed it.
+#[test]
+fn no_text_edit_for_unnamed_script_enum_container_element() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    // `a.gd` is UNNAMED (no class_name) and declares `enum E`. `t.gd` types `arr: Array[A.E]` via a
+    // preload, then `var x := arr` infers that container — element `A.E` is a script-owned enum.
+    let a = "extends RefCounted\n\nenum E { X }\n";
+    let t = "extends Node\n\nconst A = preload(\"res://a.gd\")\n\nvar arr: Array[A.E] = []\n\nfunc run() -> void:\n\tvar x := arr\n";
+    init_and_open_caps(
+        &p,
+        &client,
+        &[("a.gd", a), ("t.gd", t)],
+        inlay_caps(false, false),
+    );
+    let uri = file_uri(&p.root.join("t.gd"));
+    let hints = request_hints(&client, 10, &uri, whole_doc());
+
+    // The inferred `var x := arr` (line 7) gets a TYPE hint with the basename-rendered label…
+    let type_hint = hints
+        .iter()
+        .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 7)
+        .expect("the inferred Array[A.E] var must still get a TYPE hint (label)");
+    assert_eq!(
+        label_of(type_hint),
+        ": Array[a.gd.E]",
+        "the informational label renders the enum element as the file basename"
+    );
+    // …but it must carry NO textEdit: a `: Array[a.gd.E] = ` edit, applied, would re-parse the
+    // basename as `type a` member `gd` and produce a NEW `Could not find type \"a\"` diagnostic —
+    // the exact silent corruption the kind-driven element recursion exists to prevent.
+    assert!(
+        type_hint.text_edits.is_none(),
+        "a script-enum container element must carry NO textEdit (would corrupt the file); got {:?}",
+        type_hint.text_edits
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Companion to the corruption case: a `var := …` that infers a container whose ELEMENT is a
+/// `class_name`'d script (`Array[Hero]`) currently produces NO hint AT ALL — a safe FALSE-NEGATIVE.
+///
+/// This pins the actual behavior. The inference IS correct (hover on the var renders
+/// `Array[<Script #4>]`), but the hint is dropped UPSTREAM of `annotation_type`, at the label gate:
+/// `hintable_type_label` renders via `human_type_label`, which does not recurse name-substitution into
+/// container elements, so a script element falls through to `Display`'s `<Script #N>` placeholder; the
+/// `<`-guard then drops the whole hint. The net effect is safe (no edit ⇒ no corruption). Surfacing a
+/// correct `Array[Hero]` edit would require recursing `human_type_label` into element types (shared
+/// with hover) — a separate, larger change, tracked as a follow-up rather than done here.
+#[test]
+fn named_script_container_element_currently_no_hint() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let hero = "class_name Hero\nextends RefCounted\n";
+    let t = "extends Node\n\nvar arr: Array[Hero] = []\n\nfunc run() -> void:\n\tvar h := arr\n";
+    init_and_open_caps(
+        &p,
+        &client,
+        &[("hero.gd", hero), ("t.gd", t)],
+        inlay_caps(false, false),
+    );
+    let uri = file_uri(&p.root.join("t.gd"));
+    let hints = request_hints(&client, 10, &uri, whole_doc());
+
+    // No TYPE hint on the `var h := arr` line (5) — the `<Script #N>` element render is dropped by the
+    // label gate. Crucially: whatever the future label behavior, there must NEVER be a corrupting
+    // textEdit here, so assert no hint carries one regardless.
+    let line5_type_hints: Vec<&InlayHint> = hints
+        .iter()
+        .filter(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 5)
+        .collect();
+    assert!(
+        line5_type_hints.is_empty(),
+        "Array[Hero] currently yields no TYPE hint (label gate drops the `<Script #N>` render); \
+         got {line5_type_hints:?}"
+    );
+    assert!(
+        line5_type_hints.iter().all(|h| h.text_edits.is_none()),
+        "a script-element container must never carry a textEdit; got {line5_type_hints:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 /// A `var := …` that infers a `class_name`'d script type DOES get a `textEdit` inserting the bare
 /// class name (the positive companion to the unnamed-script case above).
 #[test]
