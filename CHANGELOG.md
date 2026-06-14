@@ -94,11 +94,12 @@ M10 — Phase 2 presentation & code actions (#72–#75), merged 2026-06-14. No r
 - **`textDocument/semanticTokens` full/delta/range (+ refresh)** (#72): syntax-aware highlighting
   over the **STANDARD LSP legend only — zero `gdscript/`-prefixed or custom token names** (the #30
   generic-LSP highlighting target; every theme already maps the 10 standard types + 6 standard
-  modifiers). The advertised legend is always full-width for stable wire indices; per-client legend
-  intersection happens at emit time (a type the client didn't declare is dropped, the rest remapped
-  to the client's own indices — never by shrinking the advertised legend). `full/delta` emits a
-  minimal flat-array edit vs the cached prior array (10k-line files); `range` is parse-priced and
-  served even at Hard memory pressure (full/delta are analysis-priced and shed). A
+  modifiers). The advertised legend is always full-width for stable wire indices; the client's
+  advertised legend is a pure ALLOW-FILTER applied at emit time (LSP 3.17: the wire integers index
+  the server-advertised legend) — gdls always emits its own server-legend indices/modifier bits and
+  drops any type/modifier the client didn't declare, never by shrinking the advertised legend.
+  `full/delta` emits a minimal flat-array edit vs the cached prior array (10k-line files); `range` is
+  parse-priced and served even at Hard memory pressure (full/delta are analysis-priced and shed). A
   `workspace/semanticTokens/refresh` is sent only with `workspace.semanticTokens.refreshSupport`.
 - **`textDocument/inlayHint` (+ resolve, refresh)** (#73): inferred `var x := …` / `for`-loop types
   (`: Type`) and call-site parameter-name hints, each config-toggleable
@@ -126,12 +127,17 @@ M10 — Phase 2 presentation & code actions (#72–#75), merged 2026-06-14. No r
   `publishDiagnostics.dataSupport` (byte-identical pre-tag diagnostics otherwise). The mutating fixes
   carry their edit eagerly behind a fail-closed ERROR/shadow backstop (what the offer-time gate proved
   safe is exactly what the client applies — no re-derive-at-resolve onto a changed buffer).
-- M10 §7.4 editor-profile walk extended over the semanticTokens (per-client legend remap) /
+- M10 §7.4 editor-profile walk extended over the semanticTokens (per-client legend allow-filter) /
   inlayHint (tooltip deferral) / documentColor / codeAction (deferred edit + `Diagnostic.data` gate +
   `source.fixAll` separation) gated projections (`tests/editor_profiles.rs`); the degraded
   `Command`/eager-edit codeAction paths (no vendored real client advertises them) are covered by
   `tests/code_action.rs`. Both conformance ratchets hold at 1.0000 (M10 is server-glue + additive —
   the parser/analyzer are untouched).
+
+### Fixed
+- **`textDocument/semanticTokens`** now emits server-legend indices (the client's advertised legend
+  is an allow-filter, not a remap table) — fixes a wire-index mishighlight on clients whose legend
+  differs from gdls's in membership or order (#121).
 
 ## [1.0.7] — 2026-06-13
 

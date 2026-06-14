@@ -35,13 +35,15 @@
 //!
 //! M10 (#72–#75) extends the walk with the **presentation + code-action** gated projections, again
 //! derived per profile from its own flags (so a new capture extends the walk automatically):
-//! - **`semanticTokens`** (#72): the per-client legend remap — gdls's fixed 10-type STANDARD legend
-//!   is intersected with the profile's advertised `tokenTypes`, so a `method` token (a class-member
-//!   `func` like `paint` is a METHOD, since the script IS its root class) is emitted at the wire index
-//!   `"method"` occupies in THAT profile's legend (helix advertises none ⇒ gdls's own index 4;
-//!   neovim/zed remap it to 13). The `full → full/delta` edit-shape round-trip is driven once (delta
-//!   is NOT a client-gated projection — `SemanticTokensCaps` captures only the legend + refresh — so
-//!   it is asserted as an endpoint, not per-profile).
+//! - **`semanticTokens`** (#72): the per-client legend ALLOW-FILTER — gdls's fixed 10-type STANDARD
+//!   legend is its own advertised legend; the profile's `tokenTypes` only gate which types survive
+//!   (LSP 3.17: the wire integers index the SERVER-advertised legend, not a client remap). So a
+//!   `method` token (a class-member `func` like `paint` is a METHOD, since the script IS its root
+//!   class) is emitted at gdls's OWN server index 4 for every profile that advertises `method`
+//!   (regardless of where `method` sits in the profile's list), and dropped for one that doesn't.
+//!   The `full → full/delta` edit-shape round-trip is driven once (delta is NOT a client-gated
+//!   projection — `SemanticTokensCaps` captures only the legend + refresh — so it is asserted as an
+//!   endpoint, not per-profile).
 //! - **`inlayHint`** (#73): the `resolveSupport` gate — a `var x := …` type hint ships its tooltip
 //!   EMBEDDED for a client without `resolveSupport` (helix) and DEFERRED (tooltip absent, `data`
 //!   present, filled by an `inlayHint/resolve` round-trip) for a client with it (neovim/zed).
@@ -501,7 +503,7 @@ fn check_m9_projection(
     }
 }
 
-/// The M10 probe — a `func` declaration (`paint`, a `Function` semantic token: the legend-remap
+/// The M10 probe — a `func` declaration (`paint`, a `method` semantic token: the legend allow-filter
 /// discriminator), a `var x := Color(…)` walrus declaration (BOTH a `documentColor` literal AND an
 /// inferred-type inlayHint carrying a tooltip), and an unused local (`leftover`, an
 /// `UNUSED_VARIABLE` warning: the codeAction quickfix target). `print(tint)` keeps the class member
@@ -518,10 +520,11 @@ func paint() -> void:
 ";
 
 /// gdls's own fixed STANDARD semantic-tokens legend (`crate::semantic_tokens::LEGEND_TYPES`), in wire
-/// order. A profile that advertises no `tokenTypes` (helix) gets these indices verbatim; a profile
-/// that advertises its own list gets each type REMAPPED to the index that name occupies in ITS list.
-/// Kept in lockstep with the server table by the `legend_is_standard_names_only` unit test (which pins
-/// the exact names) — this is the test-side mirror used to predict the per-profile wire index.
+/// order — these ARE the wire indices for EVERY profile. The profile's advertised `tokenTypes` are a
+/// pure allow-filter (a type it didn't list is dropped); they never remap the index (LSP 3.17: the
+/// wire integer indexes the SERVER-advertised legend). Kept in lockstep with the server table by the
+/// `legend_is_standard_names_only` unit test (which pins the exact names) — this is the test-side
+/// mirror used to predict the wire index of a type.
 const GDLS_LEGEND_TYPES: &[&str] = &[
     "class",
     "enum",
@@ -536,11 +539,12 @@ const GDLS_LEGEND_TYPES: &[&str] = &[
 ];
 
 /// Drive the gated M10 capabilities for one profile and assert each projection from the profile's OWN
-/// flags (never hard-coding per-editor expectations): the semanticTokens per-client legend REMAP
-/// (`Method` → the wire index `"method"` occupies in this profile's legend), the `full → full/delta`
-/// edit-shape round-trip, the inlayHint `resolveSupport` tooltip deferral, documentColor (served for
-/// every profile), and the codeAction rich-client projection (deferred `CodeAction` edit + the
-/// `Diagnostic.data` tag gated on `publishDiagnostics.dataSupport`, plus `source.fixAll` separation).
+/// flags (never hard-coding per-editor expectations): the semanticTokens legend ALLOW-FILTER
+/// (`method` → gdls's own SERVER index 4 for any profile that advertises it, dropped for one that
+/// doesn't), the `full → full/delta` edit-shape round-trip, the inlayHint `resolveSupport` tooltip
+/// deferral, documentColor (served for every profile), and the codeAction rich-client projection
+/// (deferred `CodeAction` edit + the `Diagnostic.data` tag gated on
+/// `publishDiagnostics.dataSupport`, plus `source.fixAll` separation).
 fn check_m10_projection(
     name: &str,
     profile: &serde_json::Value,
@@ -576,12 +580,15 @@ fn check_m10_projection(
         }
     }
 
-    // ---- semanticTokens (#72): the per-client legend REMAP. -------------------------------------
-    // gdls's legend is the 10 STANDARD types; it is intersected with the profile's advertised
-    // `tokenTypes`, so a `method` token (gdls index 4 — a class-member `func` like `paint` is a
-    // METHOD, not a free `function`, since the script IS its root class) is emitted at the wire index
-    // `"method"` occupies in THIS profile's legend. helix advertises none ⇒ gdls's own index (4);
-    // neovim/zed remap it (to 13). The discriminator is the `paint` method-name token.
+    // ---- semanticTokens (#72): the legend ALLOW-FILTER. -----------------------------------------
+    // gdls's legend is the 10 STANDARD types; the profile's advertised `tokenTypes` only gate which
+    // survive — gdls always emits its OWN (server-advertised) index (LSP 3.17: the wire integer
+    // indexes the server-advertised legend, NOT a client remap). So a `method` token (gdls index 4 —
+    // a class-member `func` like `paint` is a METHOD, not a free `function`, since the script IS its
+    // root class) is emitted at index 4 for EVERY profile that advertises `method` (regardless of
+    // where `method` sits in the profile's own list), and DROPPED for one that advertised a
+    // `tokenTypes` list without it. helix advertises no `tokenTypes` ⇒ the full legend ⇒ also index
+    // 4. The discriminator is the `paint` method-name token.
     let client_types: Vec<String> = profile["textDocument"]["semanticTokens"]["tokenTypes"]
         .as_array()
         .map(|a| {
@@ -590,21 +597,16 @@ fn check_m10_projection(
                 .collect()
         })
         .unwrap_or_default();
-    // The expected wire index of gdls's `method` type for this profile (its position in the client's
-    // list, or gdls's own index when the client advertised no legend → the full legend).
-    let gdls_method_index = GDLS_LEGEND_TYPES
+    // gdls's own SERVER index for `method` — the wire index for EVERY profile (the allow-filter never
+    // changes it). This is the value asserted, not a per-client position.
+    let server_method_index = GDLS_LEGEND_TYPES
         .iter()
         .position(|t| *t == "method")
-        .unwrap();
-    let expected_method_wire = if client_types.is_empty() {
-        gdls_method_index as u64
-    } else {
-        client_types
-            .iter()
-            .position(|t| t == "method")
-            .unwrap_or_else(|| panic!("{name}: profile advertises a `method` token type"))
-            as u64
-    };
+        .unwrap() as u64;
+    // The profile renders `method` iff it advertised no `tokenTypes` (→ full legend) or its list
+    // includes `method`. Otherwise gdls drops the token (the allow-filter), so it must be ABSENT.
+    let profile_advertises_method =
+        client_types.is_empty() || client_types.iter().any(|t| t == "method");
     client
         .sender
         .send(request(
@@ -622,13 +624,22 @@ fn check_m10_projection(
         "{name}: the probe emits at least the `paint` method token"
     );
     // Decode the flat 5-int stream `[deltaLine, deltaStart, length, tokenType, modifiers]` and collect
-    // the set of token-type wire indices present. The `paint` token's type must be the remapped index.
+    // the set of token-type wire indices present. gdls emits the SERVER index for `method`, the same
+    // for every profile that advertises it (proving emission is server-legend-indexed, not remapped).
     let token_types: Vec<u64> = data.chunks_exact(5).filter_map(|c| c[3].as_u64()).collect();
-    assert!(
-        token_types.contains(&expected_method_wire),
-        "{name}: a method token is emitted at the per-client-legend wire index {expected_method_wire} \
-         (client types: {client_types:?}); got type indices {token_types:?}"
-    );
+    if profile_advertises_method {
+        assert!(
+            token_types.contains(&server_method_index),
+            "{name}: a method token must be emitted at gdls's SERVER index {server_method_index} \
+             (client types: {client_types:?}); got type indices {token_types:?}"
+        );
+    } else {
+        assert!(
+            !token_types.contains(&server_method_index),
+            "{name}: the profile didn't advertise `method`, so the method token must be DROPPED; \
+             got type indices {token_types:?}"
+        );
+    }
 
     // ---- semanticTokens (#72): the full → full/delta edit-shape endpoint. -----------------------
     // Delta is NOT a client-gated projection (`SemanticTokensCaps` has only legend + refresh), so it

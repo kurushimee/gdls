@@ -631,16 +631,18 @@ fn push_span(out: &mut Vec<RawToken>, span: ByteSpan, ty: TokType, modifiers: u3
 // Encoding — map → sort → dedup → delta-encode → legend-intersect.
 // ===================================================================================================
 
-/// Encode classified tokens to the LSP flat-delta form, intersecting with the client's advertised
-/// legend.
+/// Encode classified tokens to the LSP flat-delta form, with the client's advertised legend applied
+/// as an ALLOW-FILTER. gdls always emits its own (server-advertised) [`LEGEND_TYPES`] indices and
+/// [`LEGEND_MODIFIERS`] bit positions — per LSP 3.17 the wire integers index the server-advertised
+/// legend, not a client remap — and DROPS any type/modifier the client didn't advertise.
 ///
 /// Steps (the order is load-bearing): map each byte span to an LSP [`Range`] through `mapper`
 /// (encoding-unit columns), drop any token whose type the client didn't advertise and clear modifier
-/// bits the client didn't advertise (the legend-intersection contract), sort by start position,
-/// dedup coincident (range, type) pairs, then delta-encode (`length` is the mapped range width, in
-/// the negotiated encoding's units — never raw bytes). Multi-line spans are skipped unless the client
-/// advertised `multilineTokenSupport` (the standard legend produces only single-line identifier
-/// tokens, so this is defensive).
+/// bits the client didn't advertise (the allow-filter contract; surviving indices/bits stay at their
+/// server positions), sort by start position, dedup coincident (range, type) pairs, then delta-encode
+/// (`length` is the mapped range width, in the negotiated encoding's units — never raw bytes).
+/// Multi-line spans are skipped unless the client advertised `multilineTokenSupport` (the standard
+/// legend produces only single-line identifier tokens, so this is defensive).
 #[must_use]
 pub(crate) fn encode(
     raw: &[RawToken],
@@ -651,7 +653,7 @@ pub(crate) fn encode(
     debug_assert_eq!(LEGEND_TYPES.len(), 10);
     debug_assert_eq!(LEGEND_MODIFIERS.len(), 6);
 
-    // (1) Map to ranges, intersect with the client legend, drop multi-line + undeclared types.
+    // (1) Map to ranges, apply the client allow-filter, drop multi-line + undeclared types.
     struct Mapped {
         line: u32,
         start: u32,
@@ -661,7 +663,8 @@ pub(crate) fn encode(
     }
     let mut mapped: Vec<Mapped> = Vec::with_capacity(raw.len());
     for t in raw {
-        // The client must advertise this type, else the token is dropped entirely.
+        // The client must advertise this type, else the token is dropped entirely; when it did, the
+        // kept index is gdls's own (server-advertised) legend index.
         let Some(ty_index) = client_legend.type_index(t.ty) else {
             continue;
         };
@@ -717,17 +720,25 @@ pub(crate) fn encode(
     out
 }
 
-/// The client's advertised legend, captured at `initialize` — gdls intersects every emission with
-/// it (LSP 3.17: never send a type/modifier index the client didn't declare). When the client
-/// advertised an EMPTY legend (or none), [`ClientLegend::full`] is used: gdls's own full legend,
-/// every type/modifier permitted (the conventional default — a client that sends no legend still
-/// gets colored; rust-analyzer does the same).
+/// The client's advertised legend, captured at `initialize`, used as a pure ALLOW-FILTER over
+/// gdls's own (server-advertised) legend. Per LSP 3.17 the on-wire `tokenType`/`tokenModifiers`
+/// integers index the SERVER-advertised legend (the one sent in the `initialize` result), NOT a
+/// client remap table — the client's `tokenTypes`/`tokenModifiers` capability only says which
+/// standard names it can render. So gdls always emits its own [`LEGEND_TYPES`] index / [`LEGEND_MODIFIERS`]
+/// bit position and DROPS any type/modifier the client did not advertise. When the client advertised
+/// an EMPTY legend (or none), [`ClientLegend::full`] is used: gdls's own full legend, every
+/// type/modifier permitted (the conventional default — a client that sends no legend still gets
+/// colored; rust-analyzer does the same).
 #[derive(Clone, Debug)]
 pub(crate) struct ClientLegend {
-    /// gdls-`TokType`-index → the client's wire index for that type, or `None` if the client did not
-    /// advertise it. Indexed by `TokType as usize`.
+    /// gdls-`TokType`-index → `Some(that same server index)` when the client advertised this type,
+    /// or `None` to DROP it (the client can't render it). The stored value is always the server
+    /// (gdls/legend) index, never a client position — the wire integer indexes the advertised
+    /// legend. Indexed by `TokType as usize`.
     type_to_client: [Option<u32>; 10],
-    /// gdls-modifier-bit (0..6) → the client's wire bit for that modifier, or `None`.
+    /// gdls-modifier-bit (0..6) → `Some(that same server bit)` when the client advertised this
+    /// modifier, or `None` to DROP it. The stored value is the server bit position, never a client
+    /// one.
     mod_to_client: [Option<u32>; 6],
 }
 
@@ -758,9 +769,11 @@ impl ClientLegend {
         }
     }
 
-    /// Build from the client's advertised `tokenTypes` / `tokenModifiers` lists. A gdls type/modifier
-    /// the client didn't list maps to `None` (dropped at encode time). An empty `types` list is
-    /// treated as "no legend advertised" → [`Self::full`] (every client accepts the standard names).
+    /// Build from the client's advertised `tokenTypes` / `tokenModifiers` lists, treated as an
+    /// ALLOW-FILTER: a gdls type/modifier the client DID advertise is kept at its SERVER (gdls/legend)
+    /// index — the wire integer indexes the advertised legend, not a client remap — and one the client
+    /// did NOT advertise maps to `None` (dropped at encode time). An empty `types` list is treated as
+    /// "no legend advertised" → [`Self::full`] (every client accepts the standard names).
     #[must_use]
     pub(crate) fn from_client(
         types: &[SemanticTokenType],
@@ -771,14 +784,14 @@ impl ClientLegend {
         }
         let mut type_to_client = [None; 10];
         for (gi, gty) in LEGEND_TYPES.iter().enumerate() {
-            if let Some(ci) = types.iter().position(|t| t == gty) {
-                type_to_client[gi] = Some(ci as u32);
+            if types.iter().any(|t| t == gty) {
+                type_to_client[gi] = Some(gi as u32);
             }
         }
         let mut mod_to_client = [None; 6];
         for (gi, gmod) in LEGEND_MODIFIERS.iter().enumerate() {
-            if let Some(ci) = modifiers.iter().position(|m| m == gmod) {
-                mod_to_client[gi] = Some(ci as u32);
+            if modifiers.iter().any(|m| m == gmod) {
+                mod_to_client[gi] = Some(gi as u32);
             }
         }
         Self {
@@ -787,20 +800,20 @@ impl ClientLegend {
         }
     }
 
-    /// The client's wire index for a gdls token type, or `None` if it wasn't advertised.
+    /// The wire `tokenType` index for a gdls token type — its own SERVER (gdls/legend) index — or
+    /// `None` if the client didn't advertise it (then the token is dropped at encode time).
     fn type_index(&self, ty: TokType) -> Option<u32> {
         self.type_to_client[ty as usize]
     }
 
-    /// Project a gdls modifier bitset onto the client's advertised modifier bits, dropping any the
-    /// client didn't declare.
+    /// Project a gdls modifier bitset to the wire `tokenModifiers` bitset, keeping each advertised
+    /// modifier at its SERVER (gdls/legend) bit position and DROPPING any bit the client didn't
+    /// declare. The wire bitset indexes the advertised legend, so a kept bit stays at its own index.
     fn project_modifiers(&self, gdls_bits: u32) -> u32 {
         let mut out = 0u32;
         for (bit, client_bit) in self.mod_to_client.iter().enumerate() {
-            if gdls_bits & (1 << bit) != 0 {
-                if let Some(cb) = client_bit {
-                    out |= 1 << cb;
-                }
+            if gdls_bits & (1 << bit) != 0 && client_bit.is_some() {
+                out |= 1 << bit;
             }
         }
         out
@@ -1254,25 +1267,40 @@ mod tests {
         );
     }
 
-    /// `ClientLegend::from_client` with a reduced legend drops undeclared types entirely and clears
-    /// undeclared modifier bits — never emitting an index the client didn't advertise.
+    /// `ClientLegend::from_client` is an ALLOW-FILTER: an advertised type/modifier keeps gdls's own
+    /// (server-advertised) legend index/bit, and an UNadvertised one is dropped (`None` / cleared
+    /// bit). The wire integers index the server legend (LSP 3.17), so the kept index is the SERVER
+    /// index — never a client-list position, even when the client lists them in a different order.
     #[test]
     fn reduced_client_legend_drops_undeclared_types_and_modifiers() {
         // A client that supports only `class` and `function` (in its own order: function=0, class=1)
-        // and only the `static` modifier (its bit 0).
+        // and only the `static` modifier (its bit 0). The client's ORDER must NOT affect the wire
+        // index gdls emits — that index is always gdls's own legend index.
         let client_types = vec![SemanticTokenType::FUNCTION, SemanticTokenType::CLASS];
         let client_mods = vec![SemanticTokenModifier::STATIC];
         let legend = ClientLegend::from_client(&client_types, &client_mods);
 
-        // `class` maps to the client's index 1; `function` to 0.
-        assert_eq!(legend.type_index(TokType::Class), Some(1));
-        assert_eq!(legend.type_index(TokType::Function), Some(0));
+        // `class`/`function` keep their SERVER indices (0 / 3), NOT the client positions (1 / 0).
+        assert_eq!(
+            legend.type_index(TokType::Class),
+            Some(0),
+            "an advertised type keeps gdls's own server index (class=0), not the client position"
+        );
+        assert_eq!(
+            legend.type_index(TokType::Function),
+            Some(3),
+            "an advertised type keeps gdls's own server index (function=3), not the client position"
+        );
         // A type the client didn't advertise is dropped.
         assert_eq!(legend.type_index(TokType::Property), None);
         assert_eq!(legend.type_index(TokType::Event), None);
 
-        // `static` (gdls bit 3) projects to the client's bit 0; everything else clears.
-        assert_eq!(legend.project_modifiers(MOD_STATIC), 1 << 0);
+        // `static` (gdls bit 3) keeps its SERVER bit (3); everything else clears.
+        assert_eq!(
+            legend.project_modifiers(MOD_STATIC),
+            1 << 3,
+            "an advertised modifier keeps gdls's own server bit (static=3), not the client position"
+        );
         assert_eq!(
             legend.project_modifiers(MOD_DECLARATION | MOD_READONLY),
             0,
@@ -1280,9 +1308,31 @@ mod tests {
         );
         assert_eq!(
             legend.project_modifiers(MOD_STATIC | MOD_DECLARATION),
-            1 << 0,
-            "only the advertised `static` survives; `declaration` is dropped"
+            1 << 3,
+            "only the advertised `static` survives (at server bit 3); `declaration` is dropped"
         );
+    }
+
+    /// Order-independence: a client that advertises gdls's types in a DIFFERENT order than the
+    /// server legend still gets gdls's own (server) indices, never the client-list positions. This
+    /// is what proves emission indexes the server-advertised legend (LSP 3.17), not a client remap.
+    #[test]
+    fn client_legend_order_does_not_change_wire_indices() {
+        // The client lists method, class, decorator (its positions 0, 1, 2) — a different order from
+        // the server legend (class=0, method=4, decorator=9).
+        let client_types = vec![
+            SemanticTokenType::METHOD,
+            SemanticTokenType::CLASS,
+            SemanticTokenType::DECORATOR,
+        ];
+        let legend = ClientLegend::from_client(&client_types, &[]);
+        // Each advertised type keeps its SERVER index regardless of the client's ordering.
+        assert_eq!(legend.type_index(TokType::Method), Some(4));
+        assert_eq!(legend.type_index(TokType::Class), Some(0));
+        assert_eq!(legend.type_index(TokType::Decorator), Some(9));
+        // Types absent from the client's list are dropped.
+        assert_eq!(legend.type_index(TokType::Enum), None);
+        assert_eq!(legend.type_index(TokType::Variable), None);
     }
 
     /// An empty client legend (a client that advertised semanticTokens but no type list) falls back

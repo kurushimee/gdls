@@ -191,10 +191,12 @@ pub(crate) struct CodeActionCaps {
 /// minimal/Godot-unaware client still gets standard-legend coloring — generic-LSP-first (#30).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SemanticTokensCaps {
-    /// The intersection of the client's advertised `tokenTypes`/`tokenModifiers` with gdls's own
-    /// standard legend: gdls never emits a type/modifier index the client didn't declare (LSP 3.17).
-    /// An absent / empty client legend yields [`crate::semantic_tokens::ClientLegend::full`] (gdls's
-    /// own legend; every standard name is universally understood — rust-analyzer does the same).
+    /// The client's advertised `tokenTypes`/`tokenModifiers` as an ALLOW-FILTER over gdls's own
+    /// standard legend: gdls always emits its own (server-advertised) legend indices and modifier
+    /// bit positions (LSP 3.17: the wire integers index the server legend), and DROPS any
+    /// type/modifier the client didn't declare. An absent / empty client legend yields
+    /// [`crate::semantic_tokens::ClientLegend::full`] (gdls's own legend; every standard name is
+    /// universally understood — rust-analyzer does the same).
     pub(crate) legend: crate::semantic_tokens::ClientLegend,
     /// `workspace.semanticTokens.refreshSupport` — gates the server→client
     /// `workspace/semanticTokens/refresh` request. When absent the refresh is never sent (the
