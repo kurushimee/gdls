@@ -39,7 +39,7 @@ use rustc_hash::FxHashMap;
 
 // JSON-RPC error codes (LSP uses the JSON-RPC reserved range).
 const ERR_METHOD_NOT_FOUND: i32 = -32601;
-const ERR_INVALID_PARAMS: i32 = -32602;
+pub(crate) const ERR_INVALID_PARAMS: i32 = -32602;
 /// JSON-RPC `InvalidRequest` (-32600) — returned for requests received after `shutdown`,
 /// per LSP 3.17 §shutdown.
 const ERR_INVALID_REQUEST: i32 = -32600;
@@ -47,6 +47,13 @@ const ERR_INVALID_REQUEST: i32 = -32600;
 /// intentionally not answering"; per the spec it signals the client to retry — exactly the
 /// behavior we want once peak RSS drops back below Hard.
 const ERR_CONTENT_MODIFIED: i32 = -32801;
+/// LSP 3.17 `RequestFailed` (-32803): "A request failed but it was syntactically correct, e.g the
+/// method name was known and the parameters were valid. The error message should contain human
+/// readable information about why the request failed." Used by M9 #66 `rename`/`prepareRename` to
+/// refuse a target that is not an editable project source (a native engine symbol or a generated
+/// API stub) — the refusal is a typed error carrying a human message, never a silent null or a
+/// corrupting edit.
+pub(crate) const ERR_REQUEST_FAILED: i32 = -32803;
 
 /// How often the event loop re-stats the watch root to detect silent watcher death (notify's
 /// Windows backend un-watches a deleted/moved/unmounted root without emitting an error — see
@@ -124,6 +131,20 @@ pub(crate) struct ClientCaps {
     /// opt-in, its `properties` list (usually `["location.range"]`) merely names what gdls already
     /// defers, so a non-`None` value is the gate.
     pub(crate) symbol_resolve_support: bool,
+    /// `textDocument.rename.prepareSupport` (M9 #66) — when true the client issues
+    /// `textDocument/prepareRename` ahead of a rename and can render a placeholder, so prepare
+    /// returns the rich [`lsp_types::PrepareRenameResponse::RangeWithPlaceholder`] (identifier
+    /// range + current name). Absent ⇒ `false` ⇒ prepare still answers (the keybinding must work)
+    /// but with a bare [`lsp_types::PrepareRenameResponse::Range`] — a client that didn't opt into
+    /// placeholder support gets only the range it knows how to consume.
+    pub(crate) rename_prepare_support: bool,
+    /// `workspace.workspaceEdit.documentChanges` (M9 #66) — when true a `rename`'s
+    /// [`lsp_types::WorkspaceEdit`] uses the versioned `documentChanges`
+    /// ([`lsp_types::DocumentChanges::Edits`]) shape, each [`lsp_types::TextDocumentEdit`] carrying
+    /// the affected file's current open-buffer version (so the client rejects an edit it has since
+    /// changed). Absent ⇒ `false` ⇒ the legacy `changes` URI→edits map (no version), which every
+    /// client accepts. Exactly one of the two fields is populated; the other is `None`.
+    pub(crate) workspace_edit_document_changes: bool,
 }
 
 /// The `textDocument.completion` client capabilities gdls projects each item against (M8 #64).
@@ -245,6 +266,21 @@ impl ClientCaps {
                 .and_then(|w| w.symbol.as_ref())
                 .and_then(|s| s.resolve_support.as_ref())
                 .is_some(),
+            // M9 (#66): rename gates. `prepareSupport` rides `textDocument.rename` (same
+            // optional-path convention as the flags above); `documentChanges` rides
+            // `workspace.workspaceEdit`. Both absent-default to `false` — prepare downgrades to a
+            // bare range and the edit downgrades to the legacy `changes` map, each of which every
+            // client accepts.
+            rename_prepare_support: td
+                .and_then(|t| t.rename.as_ref())
+                .and_then(|r| r.prepare_support)
+                .unwrap_or(false),
+            workspace_edit_document_changes: caps
+                .workspace
+                .as_ref()
+                .and_then(|w| w.workspace_edit.as_ref())
+                .and_then(|w| w.document_changes)
+                .unwrap_or(false),
         }
     }
 }
@@ -1796,6 +1832,16 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         // bare booleans and are served even at Hard memory pressure (not in `analyze_using`).
         folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
         selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+        // M9 (#66): rename + prepareRename. `prepare_provider: true` advertises that the client may
+        // pre-flight a rename with `textDocument/prepareRename` (range + placeholder); the rename
+        // itself reuses the `references` resolution to collect every edit site, validates the new
+        // name (identifier, non-keyword, non-colliding) before assembling any edit, and refuses a
+        // native/stub target with a typed request error — never a partial or corrupting edit. No
+        // project fan-out beyond what `references` already does, so it carries no workDoneProgress.
+        rename_provider: Some(OneOf::Right(lsp_types::RenameOptions {
+            prepare_provider: Some(true),
+            work_done_progress_options: Default::default(),
+        })),
         document_link_provider: Some(DocumentLinkOptions {
             resolve_provider: Some(false),
             work_done_progress_options: Default::default(),
@@ -1940,6 +1986,38 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             resp
         }};
     }
+    // M9 (#66): the fallible variant for handlers that may REFUSE a syntactically-valid request
+    // with a typed error (rename/prepareRename: a native or stub target, an invalid new name).
+    // Same params-deserialize prologue as `handle!`; the handler returns
+    // `Result<T, crate::handlers::RequestRefusal>` so an `Ok(value)` serializes as a normal result
+    // and an `Err(refusal)` becomes a `Response::new_err` carrying the refusal's JSON-RPC code +
+    // human message (NOT a silent null — the corruption firewall is that the client SEES the
+    // refusal). Runs through the same `finish_request` interrupt gate as every other arm.
+    macro_rules! handle_fallible {
+        ($h:path) => {{
+            let _start = std::time::Instant::now();
+            let _span = tracing::info_span!(
+                "handle_request",
+                method = %method,
+                id = %id,
+                elapsed_us = tracing::field::Empty,
+            );
+            let _enter = _span.enter();
+            let resp = match serde_json::from_value(params) {
+                Ok(p) => match $h(state, p) {
+                    Ok(value) => Response::new_ok(id, value),
+                    Err(refusal) => {
+                        let crate::handlers::RequestRefusal { code, message } = refusal;
+                        log::info!("{method} refused: {message}");
+                        Response::new_err(id, code, message)
+                    }
+                },
+                Err(e) => invalid_params_response(id, &method, e),
+            };
+            _span.record("elapsed_us", _start.elapsed().as_micros() as u64);
+            resp
+        }};
+    }
     // M5 WP-H1: at Hard pressure, refuse new full analyses with ContentModified (-32801) per LSP
     // 3.17. "Analyze-using" is exactly the set of handlers that re-enter a per-handler analyze span
     // (`handlers::analyze_with_request_token` / `analyze_if_gd`): that span holds enough Rc weight
@@ -1979,6 +2057,12 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             // behavior (the two stay byte-identical — `definition` may still analyze on some arms,
             // but neither is shed here).
             | "textDocument/typeDefinition"
+            // M9 (#66): `rename` reuses the full `references` engine (per-candidate analyze) to
+            // collect every edit site, and `prepareRename` runs the same cursor→symbol resolution
+            // (definition / native-stub gate analyzes); both are analysis-priced, so they shed at
+            // Hard memory pressure with ContentModified exactly like `references`.
+            | "textDocument/rename"
+            | "textDocument/prepareRename"
     );
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {
         // Re-record the request as cancelled-cum-shed so the per-handler trace still shows the
@@ -2042,6 +2126,16 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // per requested position. Both are parse-priced (NOT in the Hard-pressure shed set above).
         "textDocument/foldingRange" => handle!(handlers::folding_range),
         "textDocument/selectionRange" => handle!(handlers::selection_range),
+        // M9 (#66): rename + prepareRename — the fallible arms (a syntactically-valid request may
+        // still be REFUSED with a typed error: a native/stub target, or an invalid new name).
+        // `prepareRename` returns the identifier range (+ placeholder when the client advertised
+        // `rename.prepareSupport`) or refuses; `rename` returns the workspace-wide `WorkspaceEdit`
+        // (versioned `documentChanges` or the legacy `changes` map, per the client's
+        // `workspace.workspaceEdit.documentChanges`) built from the SAME `references` set, or
+        // refuses with zero edits. `serde_json::to_value(None)` → the LSP `null` wire shape when the
+        // cursor lands on no identifier at all.
+        "textDocument/prepareRename" => handle_fallible!(handlers::prepare_rename),
+        "textDocument/rename" => handle_fallible!(handlers::rename),
         // M9 (#69): typeHierarchy. `prepareTypeHierarchy` resolves the class under the cursor to
         // one `TypeHierarchyItem` carrying a compact `data` blob (the type's identity); the
         // follow-ups walk the extends graph one level from that blob — `supertypes` UP (parent
