@@ -3845,7 +3845,7 @@ fn emit_variable_annotation_warnings(ctx: &mut AnalysisContext, class_id: NodeId
         // analyzer.cpp:1070-1106 — non-static + non-onready + initializer is `$`/`%`/`get_node`.
         if !is_static && !has_onready {
             if let Some(init_id) = initializer {
-                if let Some(offending) = get_node_default_form(ctx, init_id) {
+                if let Some(offending) = get_node_default_form(ctx.tree, init_id) {
                     ctx.push_warning(
                         WarningCode::GetNodeDefaultWithoutOnready,
                         &[offending],
@@ -3947,25 +3947,31 @@ fn type_is_node_typed_for_export(ctx: &AnalysisContext, dt: &DataType) -> bool {
 /// (analyzer.cpp:1073-1102). Returns `Some(offending_syntax)` if the initializer is `$Node` /
 /// `%Unique` / a `get_node(...)` call (optionally wrapped in a single `Cast`). Returns `None`
 /// otherwise — including for any expression shape Godot wouldn't flag.
-fn get_node_default_form(ctx: &AnalysisContext, init_id: NodeId) -> Option<String> {
+///
+/// Reads only node kinds, so it takes a [`ParseTree`] rather than a full [`AnalysisContext`]: this
+/// is the SAME predicate the analyzer emits the warning from, exposed for the `gd_server` codeAction
+/// drop-`@onready` quickfix to consult so it can REFUSE the fix when removing `@onready` would
+/// re-induce this warning — reusing Godot's emission condition rather than re-deriving it (the
+/// faithful-port discipline forbids replicating the predicate in two places, which would drift).
+pub fn get_node_default_form(tree: &gd_syntax::ast::ParseTree, init_id: NodeId) -> Option<String> {
     // analyzer.cpp:1075-1077 — unwrap a single Cast wrapper.
-    let inner_id = match &ctx.node(init_id).kind {
+    let inner_id = match &tree.get(init_id).kind {
         NodeKind::Cast(c) => c.operand?,
         _ => init_id,
     };
 
-    match &ctx.node(inner_id).kind {
+    match &tree.get(inner_id).kind {
         NodeKind::GetNode(gn) => Some(if gn.use_dollar { "$" } else { "%" }.to_owned()),
         NodeKind::Call(c) if c.function_name == "get_node" => {
             // analyzer.cpp:1083-1095 — only count when the callee is bare `get_node` or
             // `self.get_node` (an attribute subscript whose base is `self`). Other callees fall
             // through (Godot's switch-default).
             let callee_id = c.callee?;
-            match &ctx.node(callee_id).kind {
+            match &tree.get(callee_id).kind {
                 NodeKind::Identifier(_) => Some("get_node()".to_owned()),
                 NodeKind::Subscript(s) => match (s.access, s.base) {
                     (Some(gd_syntax::ast::SubscriptAccess::Attribute(_)), Some(base_id)) => {
-                        if matches!(&ctx.node(base_id).kind, NodeKind::SelfExpr) {
+                        if matches!(&tree.get(base_id).kind, NodeKind::SelfExpr) {
                             Some("get_node()".to_owned())
                         } else {
                             None

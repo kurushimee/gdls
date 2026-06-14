@@ -19,6 +19,7 @@ pub mod watcher;
 pub mod workspace;
 pub mod xfile;
 
+mod code_action;
 mod color;
 mod completion;
 mod docs;
