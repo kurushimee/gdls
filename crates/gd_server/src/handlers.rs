@@ -6048,3 +6048,158 @@ fn root_class_declares(tree: &ParseTree, name: &str) -> bool {
 fn function_declares_local(tree: &ParseTree, byte: usize, name: &str) -> bool {
     enclosing_function_declaring(tree, byte, name).is_some()
 }
+
+// ===================================================================================================
+// M10 (#72): semanticTokens — full / full/delta / range. Standard-legend-only projection over the
+// existing binding/resolution info (see `crate::semantic_tokens`). `full`/`full/delta` are
+// analysis-priced (shed at Hard memory pressure); `range` is parse-priced and stays served (it
+// classifies against the CACHED analysis only — `None` on a miss → structural-only tokens).
+// ===================================================================================================
+
+/// `textDocument/semanticTokens/full`: every semantic token for the document, LSP delta-encoded,
+/// stamped with a fresh result id (cached so the next `full/delta` can diff against it).
+///
+/// Analysis-priced: classifies against a full `analyze` (always available when this runs — it sheds
+/// at Hard pressure before reaching here). Returns `Some(Tokens)`; never `None` (an unparseable
+/// buffer yields whatever the tokenizer/analyzer recovered, possibly an empty token set).
+pub fn semantic_tokens_full(
+    state: &mut ServerState,
+    params: lsp_types::SemanticTokensParams,
+) -> Option<lsp_types::SemanticTokensResult> {
+    let uri = params.text_document.uri;
+    let text = state.vfs.get(uri.as_str()).map(|d| d.text())?;
+    let path = uri_to_path(&uri)?;
+    let key = CanonicalKey::for_uri(&uri);
+    let enc = state.encoding;
+    let parsed = state.workspace.parse(&key, &text);
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, enc);
+    let analysis = analyze_with_request_token(state, &key, &path, &parsed.tree, &text);
+
+    let raw = crate::semantic_tokens::classify_document(
+        &parsed.tree,
+        Some(&analysis),
+        &state.workspace.native,
+    );
+    let data = crate::semantic_tokens::encode(&raw, &mapper, &state.caps.semantic_tokens.legend);
+
+    let result_id = next_semantic_tokens_id(state);
+    state.semantic_tokens_cache.insert(
+        uri,
+        crate::server::SemanticTokensCacheEntry {
+            result_id: result_id.clone(),
+            tokens: data.clone(),
+        },
+    );
+    Some(lsp_types::SemanticTokensResult::Tokens(
+        crate::semantic_tokens::semantic_tokens(result_id, data),
+    ))
+}
+
+/// `textDocument/semanticTokens/full/delta`: a `SemanticTokensDelta` (flat-array edits) versus the
+/// `previous_result_id`'s token array, or a fresh full set when that id is unknown (the client's
+/// record diverged from ours — e.g. a session restart, or the entry was evicted).
+///
+/// Re-classifies the current document (analysis-priced, like `full`), diffs against the cached array
+/// when the previous id matches, and re-stamps the cache with a new id + the new array regardless.
+pub fn semantic_tokens_full_delta(
+    state: &mut ServerState,
+    params: lsp_types::SemanticTokensDeltaParams,
+) -> Option<lsp_types::SemanticTokensFullDeltaResult> {
+    let uri = params.text_document.uri;
+    let text = state.vfs.get(uri.as_str()).map(|d| d.text())?;
+    let path = uri_to_path(&uri)?;
+    let key = CanonicalKey::for_uri(&uri);
+    let enc = state.encoding;
+    let parsed = state.workspace.parse(&key, &text);
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, enc);
+    let analysis = analyze_with_request_token(state, &key, &path, &parsed.tree, &text);
+
+    let raw = crate::semantic_tokens::classify_document(
+        &parsed.tree,
+        Some(&analysis),
+        &state.workspace.native,
+    );
+    let data = crate::semantic_tokens::encode(&raw, &mapper, &state.caps.semantic_tokens.legend);
+
+    // Does the previous id match what we last handed this URI? If so, emit edits; else fall back to a
+    // full set (the spec's documented behavior for an unknown previous id).
+    let prev = state.semantic_tokens_cache.get(&uri);
+    let matched = prev.is_some_and(|e| e.result_id == params.previous_result_id);
+    let new_id = next_semantic_tokens_id(state);
+
+    let response = if matched {
+        let old = &state.semantic_tokens_cache[&uri].tokens;
+        let edits = crate::semantic_tokens::diff(old, &data);
+        lsp_types::SemanticTokensFullDeltaResult::TokensDelta(lsp_types::SemanticTokensDelta {
+            result_id: Some(new_id.clone()),
+            edits,
+        })
+    } else {
+        lsp_types::SemanticTokensFullDeltaResult::Tokens(crate::semantic_tokens::semantic_tokens(
+            new_id.clone(),
+            data.clone(),
+        ))
+    };
+
+    state.semantic_tokens_cache.insert(
+        uri,
+        crate::server::SemanticTokensCacheEntry {
+            result_id: new_id,
+            tokens: data,
+        },
+    );
+    Some(response)
+}
+
+/// `textDocument/semanticTokens/range`: only the tokens intersecting `params.range`.
+///
+/// Parse-priced — it classifies against the CACHED analysis ([`Workspace::cached_analysis`], an
+/// `Option`), never a fresh `analyze`, so it stays served at Hard memory pressure (NOT in the
+/// `analyze_using` shed set). On a cache miss (e.g. while shedding) the classifier gets `None` and
+/// emits only the structurally-derivable tokens (declarations + annotations). Mints no result id and
+/// never touches the `full/delta` cache (a partial set must never seed a delta baseline).
+pub fn semantic_tokens_range(
+    state: &mut ServerState,
+    params: lsp_types::SemanticTokensRangeParams,
+) -> Option<lsp_types::SemanticTokensRangeResult> {
+    let uri = params.text_document.uri;
+    let text = state.vfs.get(uri.as_str()).map(|d| d.text())?;
+    let path = uri_to_path(&uri)?;
+    let key = CanonicalKey::for_uri(&uri);
+    let enc = state.encoding;
+    let parsed = state.workspace.parse(&key, &text);
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, enc);
+    // Parse-priced: cached analysis only (None under Hard pressure → structural-only classification).
+    let analysis = state.workspace.cached_analysis(&key, &path, &text);
+
+    let raw = crate::semantic_tokens::classify_document(
+        &parsed.tree,
+        analysis.as_deref(),
+        &state.workspace.native,
+    );
+
+    // Filter to tokens intersecting the requested range, on the byte spans (before encoding, so the
+    // relative-delta baseline restarts cleanly from the first surviving token).
+    let start_byte = mapper.position_to_byte(params.range.start);
+    let end_byte = mapper.position_to_byte(params.range.end);
+    let in_range: Vec<_> = raw
+        .into_iter()
+        .filter(|t| t.span.start < end_byte && t.span.end > start_byte)
+        .collect();
+
+    let data =
+        crate::semantic_tokens::encode(&in_range, &mapper, &state.caps.semantic_tokens.legend);
+    Some(lsp_types::SemanticTokensRangeResult::Tokens(
+        crate::semantic_tokens::semantic_tokens_no_id(data),
+    ))
+}
+
+/// Mint the next opaque `semanticTokens` result id (`"st-{n}"`). Monotonic per session; the id is
+/// only used to correlate the next `full/delta` request.
+fn next_semantic_tokens_id(state: &mut ServerState) -> String {
+    state.semantic_tokens_result_seq += 1;
+    format!("st-{}", state.semantic_tokens_result_seq)
+}
