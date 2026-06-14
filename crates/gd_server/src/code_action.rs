@@ -703,6 +703,19 @@ fn build_underscore_prefix_edit(
     // at offer time, so this always runs against the same buffer the action was offered for.)
     let old_name = identifier_name_at(state, &uri, data.anchor())?;
     let new_name = format!("_{old_name}");
+    // SILENT-CAPTURE FIREWALL (sound, conservative): refuse if `_name` ALREADY occurs as an identifier
+    // anywhere in the file. A capture (the renamed declaration shadowing an existing `_name`, or an
+    // existing `_name` reference rebinding to it) is only POSSIBLE when an `_name` identifier already
+    // exists — and the `references`/rename local resolution over-captures forward-references (a
+    // `print(y)` that binds to a MEMBER `y` is in the local `y`'s rename set), so renaming to a name
+    // that collides can silently rebind a read with NO error (the error/shadow backstops miss a shadow
+    // that merely MOVES targets, count unchanged). If no `_name` identifier exists, the new name is
+    // genuinely fresh and every post-rename `_name` reference binds to the renamed declaration — no
+    // capture is possible. This over-refuses when `_name` is used only in an unrelated scope (a benign
+    // under-offer, filed as a limitation), but it is SOUND: a capturing rename is never offered.
+    if file_contains_identifier(state, &uri, &new_name) {
+        return None;
+    }
     let params = RenameParams {
         text_document_position: TextDocumentPositionParams {
             text_document: TextDocumentIdentifier { uri },
@@ -739,6 +752,22 @@ fn identifier_name_at(state: &mut ServerState, uri: &Uri, pos: Position) -> Opti
         NodeKind::Identifier(i) => Some(i.name.clone()),
         _ => None,
     }
+}
+
+/// `true` iff `name` occurs as ANY [`NodeKind::Identifier`] in `uri`'s current parse tree — the
+/// silent-capture firewall's existence check for the `_`-prefix fix. Whole-file (not scope-limited) so
+/// it is SOUND: any pre-existing occurrence of the would-be new name is a potential capture target, so
+/// the rename is refused. Buffer gone ⇒ `true` (fail-closed: treat as "exists" ⇒ refuse).
+fn file_contains_identifier(state: &mut ServerState, uri: &Uri, name: &str) -> bool {
+    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
+        return true; // Fail-closed.
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
+    let found = parsed
+        .tree
+        .iter_ids()
+        .any(|id| matches!(&parsed.tree.get(id).kind, NodeKind::Identifier(i) if i.name == name));
+    found
 }
 
 // =================================================================================================
@@ -1082,16 +1111,15 @@ fn edit_is_safe(state: &mut ServerState, uri: &Uri, edit: &WorkspaceEdit) -> boo
         return false;
     }
 
-    // No NEW shadow/confusable WARNING may appear — the SILENT-CAPTURE backstop. The `_`-prefix rename
-    // could rename a binding to `_name` in a scope where `_name` already exists, silently re-binding a
-    // reference to a different symbol with NO error (`var _y` member + `var y` local + `print(_y)` →
-    // after `y`→`_y`, `print(_y)` reads the local). The analyzer flags that capture as a SHADOWED_* /
-    // CONFUSABLE_* warning, so refuse if any such code's count rose. Compared by CODE (not message):
-    // shadow messages embed line numbers, which a line insert shifts — the code string is
-    // position-independent. This is the principled close for the open-ended capture-vector space
-    // (member / outer-local / parameter / global / autoload) the structural collision check can't
-    // enumerate. (Over-refuses a benign NON-capturing new shadow — withholding the lightbulb there is
-    // a safe under-offer; see the filed limitation.)
+    // Defense-in-depth: refuse if the edit ADDS a shadow/confusable warning (count rose). The
+    // `_`-prefix fix's PRIMARY capture guard is the silent-capture firewall in
+    // [`build_underscore_prefix_edit`] (refuse if `_name` already exists), which is sound and runs
+    // first; this backstop is a second layer so a FUTURE narrowing of that firewall (e.g. scoping it
+    // to the function) can't silently reintroduce a member/global capture that manifests as a NEW
+    // shadow. Compared by CODE, not message (shadow messages embed line numbers a line-insert shifts;
+    // the code string is position-independent). It does NOT catch a shadow that merely MOVES targets
+    // (count unchanged) — that case is the firewall's job. The annotation fixes create no shadows, so
+    // this is a no-op for them.
     let after_shadows = shadow_code_counts(&after_analysis);
     after_shadows
         .iter()

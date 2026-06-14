@@ -2187,8 +2187,47 @@ fn underscore_prefix_refused_on_silent_member_capture() {
     let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
     assert!(
         find_action(&actions, "Prefix unused name").is_none(),
-        "renaming `y`→`_y` would silently capture the `print(_y)` member read — the SHADOW backstop \
-         must REFUSE it; got titles {:?}",
+        "renaming `y`→`_y` would silently capture the `print(_y)` member read — the silent-capture \
+         firewall (`_y` already exists) must REFUSE it; got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
+
+/// REGRESSION (blocker — the adversarial reviewer's exact moved-shadow case): `var y` AND `var _y`
+/// are both members; `print(y)` (forward-ref) reads member `y`; the unused local `var y = 1` shadows
+/// member `y`. The input already carries a SHADOWED_VARIABLE (local `y` over member `y`), so renaming
+/// `y`→`_y` MOVES the shadow to member `_y` (count unchanged — a count-based shadow check is blind),
+/// and `print(...)`'s over-captured rewrite would read member `_y` instead of member `y` — a silent
+/// behavior change with NO error. The silent-capture firewall (`_y` already exists) must REFUSE it.
+#[test]
+fn underscore_prefix_refused_on_moved_shadow_capture() {
+    const SRC: &str =
+        "extends Node\nvar y = 0\nvar _y = 99\nfunc f() -> void:\n\tprint(y)\n\tvar y = 1\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == Some(NumberOrString::String("UNUSED_VARIABLE".to_string()))
+                && d.range.start.line == 5
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the unused local `y` must warn; got {:?}",
+                diags.diagnostics
+            )
+        });
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Prefix unused name").is_none(),
+        "renaming `y`→`_y` would silently rebind the `print(y)` read to member `_y` (a MOVED shadow, \
+         count unchanged) — the firewall must REFUSE it; got titles {:?}",
         action_titles(&actions)
     );
     shutdown(&client, t);
