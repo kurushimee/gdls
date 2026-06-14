@@ -23,6 +23,7 @@ mod color;
 mod completion;
 mod docs;
 mod handlers;
+mod inlay_hint;
 pub mod logging;
 mod native_render;
 mod progress;

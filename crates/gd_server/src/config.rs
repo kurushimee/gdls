@@ -10,11 +10,11 @@ use serde::Deserialize;
 ///
 /// M7 (#59) — runtime re-config: `workspace/didChangeConfiguration` (or the
 /// `workspace/configuration` pull) re-reads this same schema mid-session, but only the
-/// **runtime-reloadable** subset applies: `strict.*`, `analyzer.*`, `memory.*`. The remaining
-/// fields are **session-structural** (`projectRoot`, `extensionApiPath`, `godotBinaryPath`,
-/// `autoDumpExtensionApi`, `embeddedApiFallback`, `stubCacheDir`): each is baked into
-/// `Workspace::load` / watcher arming / background-dump topology at startup, so a runtime
-/// payload that changes one keeps the old value and logs a "requires restart" warning.
+/// **runtime-reloadable** subset applies: `strict.*`, `analyzer.*`, `memory.*`, `inlayHint.*`.
+/// The remaining fields are **session-structural** (`projectRoot`, `extensionApiPath`,
+/// `godotBinaryPath`, `autoDumpExtensionApi`, `embeddedApiFallback`, `stubCacheDir`): each is
+/// baked into `Workspace::load` / watcher arming / background-dump topology at startup, so a
+/// runtime payload that changes one keeps the old value and logs a "requires restart" warning.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct InitializationOptions {
@@ -61,6 +61,11 @@ pub struct InitializationOptions {
     /// completion request (a render-time concern), so unlike `strict`/`analyzer`/`memory` it is not
     /// part of the runtime-reload set — the startup value stands for the session.
     pub completion: CompletionConfig,
+    /// M10 (#73): `textDocument/inlayHint` toggles (inferred-type hints, parameter-name hints).
+    /// Unlike `completion` (read live per request), this IS part of the runtime-reload set:
+    /// toggling either knob via `workspace/didChangeConfiguration` re-applies here and emits a
+    /// `workspace/inlayHint/refresh` so the client re-requests with the new policy live.
+    pub inlay_hint: InlayHintConfig,
 }
 
 /// Manual so `parse(None)`, `parse(Some({}))`, and a missing single field all agree —
@@ -79,6 +84,34 @@ impl Default for InitializationOptions {
             memory: MemoryConfig::default(),
             stub_cache_dir: None,
             completion: CompletionConfig::default(),
+            inlay_hint: InlayHintConfig::default(),
+        }
+    }
+}
+
+/// M10 (#73): the two independent inlay-hint toggles surfaced through `initializationOptions.inlayHint`.
+/// Both default **true** (the rust-analyzer/gopls default — hints on, the user dials them down). A
+/// runtime-reloadable group: a change to either toggle re-applies via
+/// [`super::server::apply_runtime_config`] and triggers a `workspace/inlayHint/refresh` so the
+/// already-displayed hints update without a restart.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct InlayHintConfig {
+    /// `InlayHintKind::TYPE` hints: the inferred type on a `var x := …` declaration and on an
+    /// inferred `for` loop variable. Default **true**.
+    pub type_hints: bool,
+    /// `InlayHintKind::PARAMETER` hints: parameter-name labels before each argument at a resolved
+    /// call site (`move(10, 20)` → `x:`/`y:`). Default **true**. Single-argument calls never get a
+    /// parameter hint regardless of this toggle (a deliberate noise cut — see
+    /// [`crate::inlay_hint`]).
+    pub parameter_hints: bool,
+}
+
+impl Default for InlayHintConfig {
+    fn default() -> Self {
+        InlayHintConfig {
+            type_hints: true,
+            parameter_hints: true,
         }
     }
 }
@@ -257,6 +290,35 @@ mod tests {
             opts.completion.call_argument_style,
             CallArgumentStyle::ParensWithCursor
         );
+        // M10 (#73): inlay-hint defaults — both toggles on.
+        assert!(opts.inlay_hint.type_hints);
+        assert!(opts.inlay_hint.parameter_hints);
+    }
+
+    #[test]
+    fn parse_inlay_hint_toggles_round_trip() {
+        let v = serde_json::json!({
+            "inlayHint": { "typeHints": false, "parameterHints": true }
+        });
+        let opts = InitializationOptions::parse(Some(&v));
+        assert!(!opts.inlay_hint.type_hints);
+        assert!(opts.inlay_hint.parameter_hints);
+    }
+
+    /// A malformed `inlayHint` group falls back to the FULL default (both on), never failing
+    /// `initialize` — the same "never crash, never lie" contract the other groups hold.
+    #[test]
+    fn malformed_inlay_hint_falls_back_to_defaults() {
+        for case in [
+            serde_json::json!({ "inlayHint": "not-an-object" }),
+            serde_json::json!({ "inlayHint": { "typeHints": 7 } }),
+        ] {
+            let opts = InitializationOptions::parse(Some(&case));
+            assert!(
+                opts.inlay_hint.type_hints && opts.inlay_hint.parameter_hints,
+                "case {case:?} should default inlayHint"
+            );
+        }
     }
 
     #[test]
