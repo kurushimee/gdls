@@ -318,8 +318,9 @@ fn fixable_warning_code(diag: &Diagnostic) -> Option<String> {
 /// always syntactically safe AND whose ignore-span covers the original anchor, so the warning is
 /// actually suppressed.
 ///
-/// `None` (fail-closed ⇒ no action offered) when the buffer is gone or no enclosing target node
-/// covers the anchor — never a guessed line, because this is a mutating feature.
+/// `None` (fail-closed ⇒ no action offered) when the buffer is gone or no enclosing statement can be
+/// resolved (the anchor is at class scope, in a header, or no node covers it) — never a guessed line,
+/// because this is a mutating feature.
 fn enclosing_statement_line(state: &mut ServerState, uri: &Uri, diag: &Diagnostic) -> Option<u32> {
     use crate::position::PositionMapper;
     use crate::uri::CanonicalKey;
@@ -333,7 +334,14 @@ fn enclosing_statement_line(state: &mut ServerState, uri: &Uri, diag: &Diagnosti
     let tree = &parsed.tree;
 
     // Innermost node at the anchor, then walk up via strictly-containing ancestors (the same step
-    // selectionRange/completion use) to the first `@warning_ignore`-target node.
+    // selectionRange/completion use). Stop at `cur` when it is either an `@warning_ignore`-target
+    // node OR a direct statement of a `Suite` (its strict-container is the block) — the latter
+    // catches a BARE EXPRESSION-STATEMENT (`a == 1`, a standalone ternary): there is no
+    // expression-statement wrapper node, so the statement IS the expression node, which is not a
+    // target kind; without this stop the walk would over-shoot to the enclosing function and the
+    // annotation would land on the signature (whose ignore-span doesn't cover the body line — valid
+    // GDScript but the warning wouldn't be suppressed). Godot's `_ => {}` arm covers such a target
+    // through its own `loc.end.line`, so the expression line is suppressed.
     let mut cur = tree.innermost_node_at(byte)?;
     let mut guard = tree.len();
     loop {
@@ -341,7 +349,12 @@ fn enclosing_statement_line(state: &mut ServerState, uri: &Uri, diag: &Diagnosti
             // The node's byte-span start → 0-based line (clamp-don't-lie via the mapper).
             return Some(mapper.byte_to_position(tree.get(cur).span.start).line);
         }
-        cur = crate::completion_context::smallest_node_strictly_containing(tree, cur)?;
+        let parent = crate::completion_context::smallest_node_strictly_containing(tree, cur)?;
+        if matches!(tree.get(parent).kind, gd_syntax::ast::NodeKind::Suite(_)) {
+            // `cur` is a direct block statement — a safe, span-covering insertion point.
+            return Some(mapper.byte_to_position(tree.get(cur).span.start).line);
+        }
+        cur = parent;
         guard = guard.saturating_sub(1);
         if guard == 0 {
             return None; // Malformed-tree span cycle guard — refuse rather than spin.

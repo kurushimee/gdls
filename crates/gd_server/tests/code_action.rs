@@ -49,6 +49,16 @@ const MULTILINE_INTDIV_SRC: &str =
 /// The 0-based line of `var x = (` — the enclosing statement the annotation must attach above.
 const MULTILINE_INTDIV_STMT_LINE: u32 = 4;
 
+/// A fixture whose warning IS a bare expression-statement (no enclosing target node between the
+/// expression and the function): `a == 1` fires STANDALONE_EXPRESSION, anchored on the BinaryOp on
+/// 0-based line 4 — which is itself the statement. The annotation must attach to that line (NOT
+/// over-walk to the `func` signature, which would be valid GDScript but leave the warning unsuppressed
+/// because the function's ignore-span is signature-only). (Regression guard.)
+const STANDALONE_EXPR_SRC: &str = "extends Node\n\n\nfunc f(a: int) -> void:\n\ta == 1\n";
+
+/// The 0-based line of the `a == 1` standalone expression statement.
+const STANDALONE_EXPR_LINE: u32 = 4;
+
 /// A base project (project.godot + minimal api), no source files — tests write their own.
 fn base_project() -> TempProject {
     let p = TempProject::new();
@@ -484,6 +494,95 @@ fn warning_ignore_attaches_to_enclosing_statement_for_multiline_anchor() {
             .iter()
             .any(|d| d.code == Some(NumberOrString::String("INTEGER_DIVISION".to_string()))),
         "the warning must be SUPPRESSED after the edit; got {:?}",
+        after.diagnostics
+    );
+    shutdown(&client, t);
+}
+
+/// REGRESSION (standalone-expression over-walk): a warning that IS a bare expression-statement has no
+/// `@warning_ignore`-target node between it and the function. The annotation must attach to the
+/// statement's OWN line (resolved via the direct-suite-statement stop), not over-walk to the `func`
+/// signature — over-walking is valid GDScript but leaves the warning unsuppressed.
+#[test]
+fn warning_ignore_attaches_to_bare_expression_statement() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(
+        &p,
+        &client,
+        &[("a.gd", STANDALONE_EXPR_SRC)],
+        caps(true, true, true),
+    );
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| d.code == Some(NumberOrString::String("STANDALONE_EXPRESSION".to_string())))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "STANDALONE_EXPRESSION must fire; got {:?}",
+                diags.diagnostics
+            )
+        });
+
+    let actions = request_code_action(
+        &client,
+        10,
+        &uri,
+        diag_range(&diag),
+        vec![diag.clone()],
+        None,
+    );
+    assert_eq!(actions.len(), 1, "exactly one quickfix; got {actions:?}");
+    let CodeActionOrCommand::CodeAction(action) = actions.into_iter().next().unwrap() else {
+        panic!("a literal-support client must get a CodeAction");
+    };
+    let resolved = resolve_action(&client, 11, action);
+    let (_uri, new_text, range) = single_text_edit(&resolved.edit.expect("resolve fills the edit"));
+    assert_eq!(
+        range.start,
+        Position {
+            line: STANDALONE_EXPR_LINE,
+            character: 0
+        },
+        "the annotation lands on the statement's own line, not the func signature"
+    );
+
+    // The edit must re-analyze clean AND actually suppress STANDALONE_EXPRESSION.
+    let patched = apply_insertion(STANDALONE_EXPR_SRC, range.start.line, &new_text);
+    let uri2 = file_uri(&p.root.join("b.gd"));
+    p.write("b.gd", &patched);
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri2.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 70,
+                    text: patched.clone(),
+                },
+            },
+        ))
+        .unwrap();
+    let after = recv_publish_for(&client, &uri2);
+    assert!(
+        !after
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "the inserted annotation must keep the file parseable; got {:?}",
+        after.diagnostics
+    );
+    assert!(
+        !after
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(NumberOrString::String("STANDALONE_EXPRESSION".to_string()))),
+        "STANDALONE_EXPRESSION must be SUPPRESSED after the edit; got {:?}",
         after.diagnostics
     );
     shutdown(&client, t);
