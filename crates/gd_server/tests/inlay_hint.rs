@@ -361,9 +361,13 @@ fn no_text_edit_for_unnamed_script_enum_container_element() {
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
     // `a.gd` is UNNAMED (no class_name) and declares `enum E`. `t.gd` types `arr: Array[A.E]` via a
-    // preload, then `var x := arr` infers that container — element `A.E` is a script-owned enum.
+    // preload, then `var x := arr` infers that container — element `A.E` is a script-owned enum. A
+    // sibling `dict: Dictionary[A.E, int]` inferred by `var d := dict` exercises the SAME script-enum
+    // element in a Dictionary KEY position (#73 mutating-surface review, area 3): the `annotation_type`
+    // Dictionary arm recurses K and V through itself, so the enum K hits the same conservative
+    // `_ => None` and `?`-propagates — no edit, like the Array case.
     let a = "extends RefCounted\n\nenum E { X }\n";
-    let t = "extends Node\n\nconst A = preload(\"res://a.gd\")\n\nvar arr: Array[A.E] = []\n\nfunc run() -> void:\n\tvar x := arr\n";
+    let t = "extends Node\n\nconst A = preload(\"res://a.gd\")\n\nvar arr: Array[A.E] = []\nvar dict: Dictionary[A.E, int] = {}\n\nfunc run() -> void:\n\tvar x := arr\n\tvar d := dict\n";
     init_and_open_caps(
         &p,
         &client,
@@ -373,10 +377,10 @@ fn no_text_edit_for_unnamed_script_enum_container_element() {
     let uri = file_uri(&p.root.join("t.gd"));
     let hints = request_hints(&client, 10, &uri, whole_doc());
 
-    // The inferred `var x := arr` (line 7) gets a TYPE hint with the basename-rendered label…
+    // The inferred `var x := arr` (line 8) gets a TYPE hint with the basename-rendered label…
     let type_hint = hints
         .iter()
-        .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 7)
+        .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 8)
         .expect("the inferred Array[A.E] var must still get a TYPE hint (label)");
     assert_eq!(
         label_of(type_hint),
@@ -390,6 +394,19 @@ fn no_text_edit_for_unnamed_script_enum_container_element() {
         type_hint.text_edits.is_none(),
         "a script-enum container element must carry NO textEdit (would corrupt the file); got {:?}",
         type_hint.text_edits
+    );
+
+    // The same enum element in a Dictionary KEY (`var d := dict`, line 9): label shows, NO textEdit
+    // (the Dictionary arm recurses K through `annotation_type`, the enum K → `None` → whole dict
+    // drops the edit). Whatever the label, the edit must never be present.
+    let dict_hint = hints
+        .iter()
+        .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 9)
+        .expect("the inferred Dictionary[A.E, int] var must still get a TYPE hint (label)");
+    assert!(
+        dict_hint.text_edits.is_none(),
+        "a script-enum Dictionary key must carry NO textEdit (would corrupt the file); got {:?}",
+        dict_hint.text_edits
     );
 
     shutdown(&client, server_thread);
@@ -788,6 +805,73 @@ fn type_hint_text_edit_applies_clean() {
         assert!(
             base_set.contains(&(d.code.clone(), d.message.clone())),
             "applying the type-hint textEdits introduced a NEW diagnostic: {d:?}\n\
+             baseline was {:?}\nedited source:\n{edited}",
+            base_diags.diagnostics
+        );
+    }
+
+    shutdown(&client, server_thread);
+}
+
+/// Regression (#73 mutating-surface review): a `var x := …` whose initializer is PARENTHESIZED
+/// (`var z := (1 + 2)`) must NOT corrupt the file. Parentheses are transparent in the AST — the
+/// initializer node begins INSIDE the parens (at `1`) — so a `:=` edit that replaced
+/// `[ident_end, init_start)` swallowed the `(` and orphaned the `)`, turning a baseline-clean file
+/// into `var z: int = 1 + 2)` with a NEW `Closing ")" doesn't have an opening counterpart` error.
+/// The fix ends the replace span at the operator's trailing whitespace (the `(` as WRITTEN), not at
+/// the node start. Covers single-line, MULTILINE, and DOUBLE parens — all by-identity (a clean
+/// baseline must gain no new diagnostic), the only proof that catches a swallowed token.
+#[test]
+fn type_hint_text_edit_paren_initializer_no_corruption() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    // `a` single-line `(1 + 2)`, `b` multiline `(\n 3 \n)`, `c` double `((4 + 5))` — all infer int.
+    let src = "extends Node\n\nfunc run() -> void:\n\tvar a := (1 + 2)\n\tvar b := (\n\t\t3\n\t)\n\tvar c := ((4 + 5))\n\tprint(a)\n\tprint(b)\n\tprint(c)\n";
+    init_and_open_caps(&p, &client, &[("t.gd", src)], inlay_caps(false, false));
+    let uri = file_uri(&p.root.join("t.gd"));
+
+    let base_diags = reopen_and_get_diags(&client, &uri, src, 100);
+    let base_set: std::collections::HashSet<(Option<lsp_types::NumberOrString>, String)> =
+        base_diags
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.clone(), d.message.clone()))
+            .collect();
+
+    let hints = request_hints(&client, 10, &uri, whole_doc());
+    let edits: Vec<lsp_types::TextEdit> = hints
+        .iter()
+        .filter(|h| h.kind == Some(InlayHintKind::TYPE))
+        .filter_map(|h| h.text_edits.clone())
+        .flatten()
+        .collect();
+    assert!(
+        edits.len() >= 3,
+        "all three parenthesized `:=` vars must carry a textEdit; got {edits:?}"
+    );
+
+    let edited = apply_edits(src, &edits);
+    // The parens must SURVIVE intact (no swallowed `(`, no orphaned `)`).
+    assert!(
+        edited.contains("var a: int = (1 + 2)"),
+        "single-line paren initializer must survive; got:\n{edited}"
+    );
+    assert!(
+        edited.contains("var b: int = (") && edited.contains("\t\t3\n\t)"),
+        "multiline paren initializer must survive; got:\n{edited}"
+    );
+    assert!(
+        edited.contains("var c: int = ((4 + 5))"),
+        "double-paren initializer must survive; got:\n{edited}"
+    );
+
+    // By-identity: the edited source must introduce NO new diagnostic versus the (clean) baseline.
+    let new_diags = reopen_and_get_diags(&client, &uri, &edited, 101);
+    for d in &new_diags.diagnostics {
+        assert!(
+            base_set.contains(&(d.code.clone(), d.message.clone())),
+            "applying a paren-initializer type-hint edit introduced a NEW diagnostic: {d:?}\n\
              baseline was {:?}\nedited source:\n{edited}",
             base_diags.diagnostics
         );

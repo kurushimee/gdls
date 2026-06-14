@@ -100,7 +100,7 @@ pub fn inlay_hint(state: &mut ServerState, params: InlayHintParams) -> Option<Ve
     // to the requested range + project to LSP.
     let mut raw: Vec<RawHint> = Vec::new();
     if cfg.type_hints {
-        collect_type_hints(state, &parsed.tree, &analysis, &mut raw);
+        collect_type_hints(state, &parsed.tree, &analysis, &text, &mut raw);
     }
     if cfg.parameter_hints {
         collect_parameter_hints(state, &parsed.tree, &analysis, &text, &mut raw);
@@ -190,6 +190,7 @@ fn collect_type_hints(
     state: &ServerState,
     tree: &ParseTree,
     analysis: &AnalysisResult,
+    text: &str,
     out: &mut Vec<RawHint>,
 ) {
     for id in tree.iter_ids() {
@@ -210,16 +211,24 @@ fn collect_type_hints(
                 };
                 let ident_end = tree.get(ident_id).span.end;
                 let init_start = tree.get(init_id).span.start;
-                // The edit NEUTRALIZES `:=`: replace the `<ident> .. <initializer>` gap (which holds
-                // ` := `) with `: <Type> = `, so `var x := 5.0` becomes `var x: <Type> = 5.0`. The
-                // edit is attached ONLY when the type yields a source-valid annotation (derived from
-                // the DataType, not the display label — so an unnamed-script basename like `a.gd`
-                // shows the label but carries NO corrupting edit).
+                // The edit NEUTRALIZES `:=`: replace the operator gap (which holds ` := `) with
+                // `: <Type> = `, so `var x := 5.0` becomes `var x: <Type> = 5.0`. The replace span
+                // must END at the operator's trailing whitespace — NOT at the initializer node's
+                // start: a PARENTHESIZED initializer (`var z := (1 + 2)`) is transparent in the AST,
+                // so its node span begins INSIDE the parens (at `1`), and replacing up to it would
+                // eat the `(` and orphan the `)` (a silent corruption — baseline-clean → syntax
+                // error). `walrus_replace_end` finds the byte just past `:=` + its trailing spaces,
+                // which for every non-paren initializer equals `init_start` (so the edit is
+                // byte-identical to before) and for a paren initializer stops at the `(`.
+                let replace_end = walrus_replace_end(text, ident_end, init_start);
+                // The edit is attached ONLY when the type yields a source-valid annotation (derived
+                // from the DataType, not the display label — so an unnamed-script basename like
+                // `a.gd` shows the label but carries NO corrupting edit).
                 let text_edit = annotation_type(state, dt).map(|ty| {
                     (
                         ByteSpan {
                             start: ident_end,
-                            end: init_start,
+                            end: replace_end,
                         },
                         format!(": {ty} = "),
                     )
@@ -268,6 +277,40 @@ fn collect_type_hints(
             _ => {}
         }
     }
+}
+
+/// The END byte of the `var x := …` operator-neutralizing replace span: the first non-whitespace
+/// byte AFTER the `:=` operator, clamped to `init_start`.
+///
+/// The `:=` walrus edit replaces `[ident_end, end)` with `": <T> = "`. The end must NOT be the
+/// initializer node's `start`: a parenthesized initializer (`var z := (1 + 2)`) is transparent in
+/// the AST — its node span begins at `1`, INSIDE the parens — so replacing up to `init_start` would
+/// swallow the `(` and orphan the `)`, turning a clean file into a syntax error. Instead, find the
+/// operator (the `:=` always present in this — the `infer_datatype` — form) and skip its trailing
+/// ASCII whitespace; the result is the FIRST initializer byte as WRITTEN (the `(` for a paren form,
+/// the literal/bracket/call/identifier otherwise). For every non-paren initializer this equals
+/// `init_start` (the node already starts at its first written byte), so the edit is byte-identical
+/// to the pre-fix behavior; only the paren form is corrected.
+///
+/// Defensive: if `:=` can't be located in the gap (an unexpected shape — this is only called for an
+/// `infer_datatype` variable, where the operator is present by construction), falls back to
+/// `init_start` (the prior behavior), never producing an out-of-order or overrun span.
+fn walrus_replace_end(text: &str, ident_end: usize, init_start: usize) -> usize {
+    // The gap between the identifier end and the initializer node start — holds ` := ` (plus any
+    // surrounding whitespace / a line continuation). `init_start >= ident_end` always (node order).
+    let gap = text.get(ident_end..init_start).unwrap_or("");
+    let Some(op_rel) = gap.find(":=") else {
+        return init_start;
+    };
+    // One past the `:=`, then skip ASCII whitespace (spaces/tabs/newlines from a `\` continuation)
+    // to the first written initializer byte. `bytes()` indexing is safe: ASCII whitespace bytes are
+    // never a UTF-8 continuation byte, so we always stop on a char boundary (or at `init_start`).
+    let mut end = ident_end + op_rel + 2;
+    let bytes = text.as_bytes();
+    while end < init_start && bytes[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    end
 }
 
 /// The label for a resolved type IFF it is worth hinting — `None` for a type that should produce no
