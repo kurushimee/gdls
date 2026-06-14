@@ -38,6 +38,17 @@ const UNUSED_VAR_SRC: &str = "extends Node\n\n\nfunc test() -> void:\n\tvar dead
 /// The 0-based line of the `var dead = 1` declaration (where the suppression annotation must land).
 const UNUSED_VAR_LINE: u32 = 4;
 
+/// A fixture whose warning anchors on a CONTINUATION line of a multi-line statement: an
+/// `INTEGER_DIVISION` inside a parenthesized initializer split across lines. The division `5 / 2` is
+/// on 0-based line 5, but the enclosing statement (`var x = (`) starts on line 4. Inserting the
+/// annotation at line 5 (col 0) would splice it INSIDE the parens → invalid GDScript. The fix must
+/// resolve the enclosing statement (line 4). (Regression guard for the multi-line-corruption bug.)
+const MULTILINE_INTDIV_SRC: &str =
+    "extends Node\n\n\nfunc f() -> int:\n\tvar x = (\n\t\t5 / 2\n\t)\n\treturn x\n";
+
+/// The 0-based line of `var x = (` — the enclosing statement the annotation must attach above.
+const MULTILINE_INTDIV_STMT_LINE: u32 = 4;
+
 /// A base project (project.godot + minimal api), no source files — tests write their own.
 fn base_project() -> TempProject {
     let p = TempProject::new();
@@ -374,6 +385,105 @@ fn code_action_then_resolve_inserts_warning_ignore_and_suppresses() {
             .iter()
             .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
         "the inserted annotation must keep the file clean (no parse/type errors); got {:?}",
+        after.diagnostics
+    );
+    shutdown(&client, t);
+}
+
+/// REGRESSION (multi-line corruption): when a warning anchors on a CONTINUATION line of a multi-line
+/// statement (here `INTEGER_DIVISION` inside a parenthesized initializer), the `@warning_ignore` must
+/// be inserted above the ENCLOSING STATEMENT (`var x = (` on line 4), NOT at the raw diagnostic line
+/// (the `5 / 2` continuation on line 5 — splicing there produced invalid GDScript). The patched
+/// source must re-analyze with ZERO error-severity diagnostics AND the warning suppressed.
+#[test]
+fn warning_ignore_attaches_to_enclosing_statement_for_multiline_anchor() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(
+        &p,
+        &client,
+        &[("a.gd", MULTILINE_INTDIV_SRC)],
+        caps(true, true, true),
+    );
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| d.code == Some(NumberOrString::String("INTEGER_DIVISION".to_string())))
+        .cloned()
+        .unwrap_or_else(|| panic!("INTEGER_DIVISION must fire; got {:?}", diags.diagnostics));
+
+    // Sanity: the diagnostic itself anchors BELOW the enclosing statement (the bug's precondition).
+    assert!(
+        diag.range.start.line > MULTILINE_INTDIV_STMT_LINE,
+        "fixture precondition: the diagnostic must anchor on a continuation line (got line {}, \
+         enclosing statement line {MULTILINE_INTDIV_STMT_LINE})",
+        diag.range.start.line
+    );
+
+    let actions = request_code_action(
+        &client,
+        10,
+        &uri,
+        diag_range(&diag),
+        vec![diag.clone()],
+        None,
+    );
+    assert_eq!(actions.len(), 1, "exactly one quickfix; got {actions:?}");
+    let CodeActionOrCommand::CodeAction(action) = actions.into_iter().next().unwrap() else {
+        panic!("a literal-support client must get a CodeAction");
+    };
+    let resolved = resolve_action(&client, 11, action);
+    let edit = resolved.edit.expect("resolve must fill the edit");
+    let (_uri, new_text, range) = single_text_edit(&edit);
+    assert_eq!(
+        new_text, "\t@warning_ignore(\"INTEGER_DIVISION\")\n",
+        "the insertion copies the ENCLOSING statement's tab indent"
+    );
+    assert_eq!(
+        range.start,
+        Position {
+            line: MULTILINE_INTDIV_STMT_LINE,
+            character: 0
+        },
+        "the insertion must land at col 0 of the ENCLOSING statement line (not the continuation line)"
+    );
+
+    // RE-ANALYZE CLEAN: applying the edit must NOT break parsing (the old behavior produced syntax
+    // errors) and must suppress the warning.
+    let patched = apply_insertion(MULTILINE_INTDIV_SRC, range.start.line, &new_text);
+    let uri2 = file_uri(&p.root.join("b.gd"));
+    p.write("b.gd", &patched);
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri2.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 60,
+                    text: patched.clone(),
+                },
+            },
+        ))
+        .unwrap();
+    let after = recv_publish_for(&client, &uri2);
+    assert!(
+        !after
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "the inserted annotation must keep the file parseable (NO errors); got {:?}\npatched:\n{patched}",
+        after.diagnostics
+    );
+    assert!(
+        !after
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(NumberOrString::String("INTEGER_DIVISION".to_string()))),
+        "the warning must be SUPPRESSED after the edit; got {:?}",
         after.diagnostics
     );
     shutdown(&client, t);

@@ -76,7 +76,7 @@ pub(crate) fn offered_kinds() -> Vec<CodeActionKind> {
 /// The self-contained payload identifying a `@warning_ignore` action across the
 /// `codeAction`→`codeAction/resolve` round-trip AND the `executeCommand`→`applyEdit` fallback. It
 /// carries the **URI** (resolve/executeCommand receive no `textDocument`), the warning `code`, and
-/// the 0-based `line` of the diagnosed code — everything [`build_warning_ignore_edit`] needs to
+/// the resolved 0-based `line` to insert above — everything [`build_warning_ignore_edit`] needs to
 /// reconstruct the edit without re-running diagnostics. Opaque to the client (round-tripped verbatim).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct WarningIgnoreData {
@@ -90,8 +90,10 @@ pub(crate) struct WarningIgnoreData {
     /// analyzer upper-cases an annotation arg before lookup, and this is already the upper-case
     /// `PNAME`, so the inserted `@warning_ignore("<code>")` round-trips and actually suppresses.
     code: String,
-    /// The 0-based line of the diagnosed code (the diagnostic range's start line). The suppression
-    /// annotation is inserted at column 0 of this line, copying its leading indentation.
+    /// The 0-based line the suppression annotation is inserted ABOVE — the first line of the
+    /// enclosing statement/declaration (NOT the raw diagnostic-range start line, which can be a
+    /// continuation line of a multi-line statement; see [`enclosing_statement_line`]). The annotation
+    /// is inserted at column 0 of this line, copying its leading indentation.
     line: u32,
 }
 
@@ -121,10 +123,11 @@ impl WarningIgnoreData {
 /// `textDocument/codeAction`: for every diagnostic in the request range carrying a fixable warning
 /// `code`, offer a `@warning_ignore` suppression quickfix.
 ///
-/// Index-/parse-priced — the offer is driven entirely by `context.diagnostics` (the edit, when eager,
-/// reads only the current buffer's diagnosed line for indentation), so it is NOT in the Hard-pressure
-/// shed set. Returns `Some(vec)` (possibly empty); the LSP `null` shape never applies here (an empty
-/// array is the right "no actions" answer).
+/// Index-/parse-priced — the offer is driven by `context.diagnostics`, plus a cached shallow PARSE of
+/// the buffer (never the analyzer) to resolve each annotation's enclosing-statement line
+/// ([`enclosing_statement_line`]), so it is NOT in the Hard-pressure shed set. Returns `Some(vec)`
+/// (possibly empty); the LSP `null` shape never applies here (an empty array is the right "no actions"
+/// answer).
 #[must_use]
 pub fn code_action(state: &mut ServerState, params: CodeActionParams) -> CodeActionResponse {
     // `context.only` honoring: if the filter excludes `quickfix`, compute NOTHING. This is what keeps
@@ -142,8 +145,17 @@ pub fn code_action(state: &mut ServerState, params: CodeActionParams) -> CodeAct
         let Some(code) = fixable_warning_code(diag) else {
             continue;
         };
-        // The diagnosed line — the suppression goes above it at the same indent.
-        let line = diag.range.start.line;
+        // The line the annotation lands on: NOT `diag.range.start.line` (which can be a sub-
+        // expression on a CONTINUATION line of a multi-line statement — inserting there would splice
+        // the annotation *inside* the statement and produce invalid GDScript). Resolve the enclosing
+        // statement/declaration's first line so the annotation attaches to the right node and the
+        // splice can never corrupt. FAIL-CLOSED: if the line can't be positively resolved (the buffer
+        // is gone, or no enclosing target node covers the diagnostic), the action is NOT offered for
+        // this diagnostic — a missing quickfix is a feature gap; a corrupting edit is not (the rename
+        // lesson: a mutating consumer must never offer-and-hope).
+        let Some(line) = enclosing_statement_line(state, &uri, diag) else {
+            continue;
+        };
         let data = WarningIgnoreData::new(&uri, &code, line);
         let title = format!("Ignore \"{code}\" warning on this line");
 
@@ -184,10 +196,11 @@ pub fn code_action(state: &mut ServerState, params: CodeActionParams) -> CodeAct
 /// `codeAction/resolve`: fill the deferred `edit` of a `@warning_ignore` action from its
 /// self-contained `data` blob.
 ///
-/// Index-/parse-priced (reads only the round-tripped `data` + the target buffer's diagnosed line for
-/// indentation; never a fresh analyze), so it is NOT in the Hard-pressure shed set — mirroring
-/// `inlayHint/resolve`. An action with no `data` (an eager action, or a non-gdls action) or one whose
-/// edit can't be reconstructed (the target buffer is gone) is returned unchanged.
+/// Index-/parse-priced (reads only the round-tripped `data` — which already carries the resolved
+/// enclosing-statement line — plus that line's text for indentation; never a fresh analyze), so it is
+/// NOT in the Hard-pressure shed set — mirroring `inlayHint/resolve`. An action with no `data` (an
+/// eager action, or a non-gdls action) or one whose edit can't be reconstructed (the target buffer is
+/// gone) is returned unchanged.
 #[must_use]
 pub fn code_action_resolve(state: &mut ServerState, mut action: CodeAction) -> CodeAction {
     let Some(data) = action.data.clone() else {
@@ -293,6 +306,81 @@ fn fixable_warning_code(diag: &Diagnostic) -> Option<String> {
     code_from_name(code).map(|_| code.to_string())
 }
 
+/// Resolve the 0-based line the `@warning_ignore` annotation must be inserted ABOVE: the first line
+/// of the smallest enclosing statement/declaration node covering the diagnostic's anchor.
+///
+/// Why not `diag.range.start.line` directly: a warning's anchor can be a sub-expression on a
+/// CONTINUATION line of a multi-line statement (a parameter on a wrapped `func` signature, a
+/// sub-expression inside a parenthesized initializer). Inserting `@warning_ignore(...)` at column 0
+/// of *that* line splices it INSIDE the statement — invalid GDScript. Walking up to the enclosing
+/// statement (mirroring the analyzer's `@warning_ignore` *target* model in
+/// `gd_analyze::context::build_warning_ignored_lines`) gives a line where a column-0 insertion is
+/// always syntactically safe AND whose ignore-span covers the original anchor, so the warning is
+/// actually suppressed.
+///
+/// `None` (fail-closed ⇒ no action offered) when the buffer is gone or no enclosing target node
+/// covers the anchor — never a guessed line, because this is a mutating feature.
+fn enclosing_statement_line(state: &mut ServerState, uri: &Uri, diag: &Diagnostic) -> Option<u32> {
+    use crate::position::PositionMapper;
+    use crate::uri::CanonicalKey;
+
+    let doc = state.vfs.get(uri.as_str())?;
+    let text = doc.text();
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+    let byte = mapper.position_to_byte(diag.range.start);
+
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
+    let tree = &parsed.tree;
+
+    // Innermost node at the anchor, then walk up via strictly-containing ancestors (the same step
+    // selectionRange/completion use) to the first `@warning_ignore`-target node.
+    let mut cur = tree.innermost_node_at(byte)?;
+    let mut guard = tree.len();
+    loop {
+        if is_ignore_target(&tree.get(cur).kind) {
+            // The node's byte-span start → 0-based line (clamp-don't-lie via the mapper).
+            return Some(mapper.byte_to_position(tree.get(cur).span.start).line);
+        }
+        cur = crate::completion_context::smallest_node_strictly_containing(tree, cur)?;
+        guard = guard.saturating_sub(1);
+        if guard == 0 {
+            return None; // Malformed-tree span cycle guard — refuse rather than spin.
+        }
+    }
+}
+
+/// Whether a node kind is an `@warning_ignore` *target* — a statement or declaration the parser
+/// attaches an annotation to, and therefore a syntactically-safe place to insert the suppression
+/// above. Mirrors the annotation-owner kinds in
+/// `gd_analyze::context::build_warning_ignored_lines` (the declaration kinds it special-cases) plus
+/// the statement kinds that fall through its `_ => {}` (`return`/`assert`/assignment/call). Anything
+/// not in this set is a sub-expression / sub-component (an `Identifier`, `Type`, `Parameter`,
+/// `Pattern`, a `BinaryOp` operand, …) the walk steps past.
+fn is_ignore_target(kind: &gd_syntax::ast::NodeKind) -> bool {
+    use gd_syntax::ast::NodeKind::{
+        Assert, Assignment, Call, Class, Constant, Enum, For, Function, If, Match, MatchBranch,
+        Return, Signal, Variable, While,
+    };
+    matches!(
+        kind,
+        Variable(_)
+            | Constant(_)
+            | Function(_)
+            | Signal(_)
+            | Enum(_)
+            | Class(_)
+            | For(_)
+            | If(_)
+            | While(_)
+            | Match(_)
+            | MatchBranch(_)
+            | Return(_)
+            | Assert(_)
+            | Assignment(_)
+            | Call(_)
+    )
+}
+
 /// Hierarchical `context.only` matching: does the filter admit `quickfix`? `None` (no filter) ⇒ yes.
 /// A filter admits `quickfix` iff some requested kind is `quickfix` or a prefix of it
 /// (`""`/`quickfix`). `source.fixAll` does NOT admit it — which is exactly what keeps the suppression
@@ -320,12 +408,15 @@ fn only_admits_quickfix(only: Option<&[CodeActionKind]>) -> bool {
 /// Build the `@warning_ignore("<code>")` insertion as a negotiated [`WorkspaceEdit`], or `None` when
 /// the target buffer is gone.
 ///
-/// The annotation is inserted at **column 0 of the diagnosed line**, copying that line's leading
-/// whitespace, as `"<indent>@warning_ignore(\"<code>\")\n"`. Placing it directly above the diagnosed
-/// statement is what makes Godot's parser attach it to that statement's node (the analyzer's
-/// `@warning_ignore` filter records the annotation owner's header lines), so the warning is actually
-/// suppressed. The exact leading whitespace is copied from the source (never assumed to be tabs), so
-/// the indentation always matches.
+/// The annotation is inserted at **column 0 of `data.line`** — the enclosing statement/declaration
+/// line already resolved by [`enclosing_statement_line`] (so it is never a continuation line of a
+/// multi-line statement) — copying that line's leading whitespace, as
+/// `"<indent>@warning_ignore(\"<code>\")\n"`. Placing it directly above the enclosing statement is
+/// what makes Godot's parser attach it to that statement's node (the analyzer's `@warning_ignore`
+/// filter records the annotation owner's header lines, which cover the original anchor), so the
+/// warning is actually suppressed. The exact leading whitespace is copied from the source (never
+/// assumed to be tabs), so the indentation always matches. This stays a dumb splice — the line
+/// correctness lives entirely in [`enclosing_statement_line`].
 ///
 /// The edit is emitted in the client's negotiated shape: versioned `documentChanges` (carrying the
 /// open buffer's CURRENT version) when `workspace.workspaceEdit.documentChanges` is advertised, else
@@ -336,8 +427,8 @@ fn build_warning_ignore_edit(
 ) -> Option<WorkspaceEdit> {
     let uri: Uri = data.uri.parse().ok()?;
     let doc = state.vfs.get(uri.as_str())?;
-    // The diagnosed line's text, to copy its leading indentation. ropey's `get_line` is None for an
-    // out-of-range index (defensive — the line came from a diagnostic range over this buffer).
+    // The enclosing-statement line's text, to copy its leading indentation. ropey's `get_line` is
+    // None for an out-of-range index (defensive — the line was resolved over this buffer's tree).
     let line_slice = doc.rope.get_line(data.line as usize)?;
     let line_text = line_slice.to_string();
     let indent: String = line_text
@@ -347,7 +438,7 @@ fn build_warning_ignore_edit(
     let new_text = format!("{indent}@warning_ignore(\"{}\")\n", data.code);
 
     // A zero-width insertion at (line, col 0): the new annotation line is spliced in ABOVE the
-    // diagnosed line, pushing it (and everything below) down by one line.
+    // enclosing-statement line, pushing it (and everything below) down by one line.
     let at = Position {
         line: data.line,
         character: 0,
@@ -444,6 +535,24 @@ mod tests {
             code,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn ignore_target_accepts_statements_and_decls_rejects_subexpressions() {
+        use gd_syntax::ast::NodeKind;
+        // A representative declaration and statement are targets...
+        assert!(is_ignore_target(&NodeKind::Variable(Default::default())));
+        assert!(is_ignore_target(&NodeKind::Function(Default::default())));
+        assert!(is_ignore_target(&NodeKind::If(Default::default())));
+        assert!(is_ignore_target(&NodeKind::Return(Default::default())));
+        assert!(is_ignore_target(&NodeKind::Call(Default::default())));
+        // ...while a sub-expression / sub-component is NOT (the walk steps past it so the annotation
+        // never lands mid-statement).
+        assert!(!is_ignore_target(&NodeKind::Identifier(Default::default())));
+        assert!(!is_ignore_target(&NodeKind::Subscript(Default::default())));
+        assert!(!is_ignore_target(&NodeKind::Array(Default::default())));
+        assert!(!is_ignore_target(&NodeKind::Type(Default::default())));
+        assert!(!is_ignore_target(&NodeKind::Parameter(Default::default())));
     }
 
     #[test]
