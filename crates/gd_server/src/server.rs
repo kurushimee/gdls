@@ -153,6 +153,37 @@ pub(crate) struct ClientCaps {
     /// `workspace.inlayHint`. Grouped in a sub-struct like [`SemanticTokensCaps`] so the handler
     /// reads `state.caps.inlay_hint.<gate>`.
     pub(crate) inlay_hint: InlayHintCaps,
+    /// The M10 (#75) codeAction gates, captured under `textDocument.codeAction` +
+    /// `textDocument.publishDiagnostics`. Grouped in a sub-struct like [`InlayHintCaps`] so the
+    /// handlers read `state.caps.code_action.<gate>`.
+    pub(crate) code_action: CodeActionCaps,
+}
+
+/// The `textDocument.codeAction` + `textDocument.publishDiagnostics` client capabilities the
+/// codeAction pipeline branches on (M10 #75). Every field has a documented absent-default so a
+/// minimal / Godot-unaware client still gets a working pipeline (degraded to the `Command` + eager-
+/// edit path) — generic-LSP-first (#30).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CodeActionCaps {
+    /// `textDocument.codeAction.codeActionLiteralSupport` (presence) — when the client advertises it,
+    /// `textDocument/codeAction` returns `CodeAction` literals (kind-tagged, resolvable). Absent ⇒ the
+    /// client only understands the legacy `Command[]` shape, so each action is returned as a
+    /// [`lsp_types::Command`] routed through `workspace/executeCommand` (→ the `workspace/applyEdit`
+    /// fallback). Read as presence-of-`codeActionLiteralSupport`, matching how the other literal/
+    /// resolve gates are captured.
+    pub(crate) literal_support: bool,
+    /// `textDocument.codeAction.resolveSupport` (presence) — meaningful only when `literal_support`
+    /// is also set. When present, a `CodeAction`'s `edit` is DEFERRED to a `codeAction/resolve`
+    /// round-trip (the action ships with a `data` blob resolve turns into the edit); absent ⇒ the
+    /// `edit` is computed EAGERLY in the `codeAction` response (a client that can't resolve still gets
+    /// an applicable action). Read as presence (matching `inlayHint`/`completionItem`).
+    pub(crate) resolve_support: bool,
+    /// `textDocument.publishDiagnostics.dataSupport` — gates the additive `Diagnostic.data` tag
+    /// attached at publish time (the per-warning fix payload a later phase consumes). When absent the
+    /// client won't round-trip `data`, so the tag is omitted (and the codeAction path falls back to
+    /// the diagnostic's `code` — which it does regardless, see
+    /// [`crate::code_action`]). Byte-identical pre-tag diagnostics for a client without it.
+    pub(crate) diagnostic_data_support: bool,
 }
 
 /// The `textDocument.semanticTokens` + `workspace.semanticTokens` client capabilities gdls projects
@@ -326,6 +357,34 @@ impl ClientCaps {
                 .unwrap_or(false),
             semantic_tokens: SemanticTokensCaps::negotiate(caps),
             inlay_hint: InlayHintCaps::negotiate(caps),
+            code_action: CodeActionCaps::negotiate(caps),
+        }
+    }
+}
+
+impl CodeActionCaps {
+    /// Walk `textDocument.codeAction` (literal + resolve support) + `textDocument.publishDiagnostics`
+    /// (data support), mirroring the optional-path convention the rest of [`ClientCaps::negotiate`]
+    /// uses. An absent `codeAction` capability yields no literal support (the `Command[]` fallback),
+    /// no resolve (eager edits), and no diagnostic-data tag — a client that didn't opt in still gets a
+    /// working pipeline.
+    fn negotiate(caps: &lsp_types::ClientCapabilities) -> Self {
+        let td = caps.text_document.as_ref();
+        let code_action = td.and_then(|t| t.code_action.as_ref());
+        let literal_support = code_action
+            .and_then(|c| c.code_action_literal_support.as_ref())
+            .is_some();
+        let resolve_support = code_action
+            .and_then(|c| c.resolve_support.as_ref())
+            .is_some();
+        let diagnostic_data_support = td
+            .and_then(|t| t.publish_diagnostics.as_ref())
+            .and_then(|p| p.data_support)
+            .unwrap_or(false);
+        CodeActionCaps {
+            literal_support,
+            resolve_support,
+            diagnostic_data_support,
         }
     }
 }
@@ -488,6 +547,14 @@ pub(crate) enum OutboundKind {
     /// client re-requests hints for its visible documents). Sent when the inlay-hint config toggles
     /// (`workspace/didChangeConfiguration`) so already-shown hints reflect the new policy live.
     InlayHintRefresh,
+    /// M10 (#75): a `workspace/applyEdit` request — gdls's FIRST server→client request that expects a
+    /// meaningful RESPONSE ([`lsp_types::ApplyWorkspaceEditResponse`] `{ applied }`). Sent by the
+    /// `gdls.applyWarningIgnore` command (the `codeActionLiteralSupport` fallback path) FIRE-AND-FORGET
+    /// — the worker must not block on the reply (it is the sole consumer of the response channel).
+    /// The reply is correlated HERE: `applied: true` ⇒ debug log, `applied: false` / an error ⇒ warn
+    /// log; neither crashes, neither bounces (anti-catalog W3). gdls owns no buffer, so a rejected
+    /// edit needs no rollback.
+    ApplyEdit,
 }
 
 /// All mutable server state for one session.
@@ -1297,6 +1364,39 @@ fn handle_outbound_response(state: &mut ServerState, resp: Response) {
             ),
             None => log::debug!("client acknowledged the inlayHint refresh"),
         },
+        // M10 (#75): the `workspace/applyEdit` reply for a `gdls.applyWarningIgnore` command. Correlate
+        // it (the W3 requirement: a server→client request MUST be correlated, never bounced) — accept
+        // and reject both end here, neither crashes the session. An error reply (the client refused
+        // the request outright) or `applied: false` (the client declined to apply) are both warn-logged;
+        // gdls owns no buffer, so there is nothing to roll back.
+        OutboundKind::ApplyEdit => {
+            if let Some(err) = &resp.error {
+                log::warn!(
+                    "client errored on workspace/applyEdit ({}); the @warning_ignore edit was not \
+                     applied",
+                    err.message
+                );
+                return;
+            }
+            // Parse the `{ applied }` payload; a malformed/absent result is treated as not-applied
+            // (defensive — every conformant client sends it).
+            let applied = resp
+                .result
+                .as_ref()
+                .and_then(|r| {
+                    serde_json::from_value::<lsp_types::ApplyWorkspaceEditResponse>(r.clone()).ok()
+                })
+                .map(|r| r.applied)
+                .unwrap_or(false);
+            if applied {
+                log::debug!("client applied the @warning_ignore workspace edit");
+            } else {
+                log::warn!(
+                    "client declined the @warning_ignore workspace edit (applied: false); no \
+                     suppression was inserted"
+                );
+            }
+        }
     }
 }
 
@@ -2102,6 +2202,29 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 work_done_progress_options: Default::default(),
             },
         )),
+        // M10 (#75): codeAction. `resolve_provider: true` advertises `codeAction/resolve` — a client
+        // with `codeAction.resolveSupport` receives the action sans `edit` and pulls the edit lazily.
+        // `code_action_kinds` lists EXACTLY the kinds gdls offers (only `quickfix` this phase) so a
+        // `source.fixAll` filter naturally excludes the suppression action (anti-catalog W15: advertise
+        // only what is implemented).
+        code_action_provider: Some(lsp_types::CodeActionProviderCapability::Options(
+            lsp_types::CodeActionOptions {
+                code_action_kinds: Some(crate::code_action::offered_kinds()),
+                resolve_provider: Some(true),
+                work_done_progress_options: Default::default(),
+            },
+        )),
+        // M10 (#75): the `workspace/executeCommand` command list — EXACTLY the commands gdls handles
+        // (anti-catalog W15: never advertise an empty/broken list that errors when invoked). The list
+        // is the same constant `execute_command`'s unknown-command guard checks, so the two cannot
+        // drift.
+        execute_command_provider: Some(lsp_types::ExecuteCommandOptions {
+            commands: crate::code_action::COMMANDS
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+            work_done_progress_options: Default::default(),
+        }),
         // `textDocument/publishDiagnostics` is a server→client push, not a capability field.
         ..Default::default()
     }
@@ -2408,6 +2531,20 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // reads the hint's `data` blob only (not shed).
         "textDocument/inlayHint" => handle!(handlers::inlay_hint),
         "inlayHint/resolve" => handle!(handlers::inlay_hint_resolve),
+        // M10 (#75): codeAction pipeline. `codeAction` returns `CodeActionOrCommand[]` (a `quickfix`
+        // per `@warning_ignore`-able diagnostic in range; `Command` shape for a client without
+        // `codeActionLiteralSupport`, `CodeAction` otherwise — edit eager or deferred per
+        // `resolveSupport`); `codeAction/resolve` fills a deferred action's `edit`. Both are driven by
+        // `context.diagnostics` / the action's `data` (never a fresh analyze), so neither is in the
+        // Hard-pressure `analyze_using` shed set above — served like foldingRange / `inlayHint/resolve`.
+        "textDocument/codeAction" => handle!(handlers::code_action),
+        "codeAction/resolve" => handle!(handlers::code_action_resolve),
+        // M10 (#75): `workspace/executeCommand` — runs a server command (only `gdls.applyWarningIgnore`,
+        // which sends the `workspace/applyEdit` fallback fire-and-forget). The fallible arm: an UNKNOWN
+        // command returns a typed error (never a panic — anti-catalog W15). A handled command answers
+        // `null` (the applyEdit reply is correlated separately via `handle_outbound_response`). Args-
+        // driven (no analyze), so it is NOT in the shed set.
+        "workspace/executeCommand" => handle_fallible!(handlers::execute_command),
         // M9 (#66): rename + prepareRename — the fallible arms (a syntactically-valid request may
         // still be REFUSED with a typed error: a native/stub target, or an invalid new name).
         // `prepareRename` returns the identifier range (+ placeholder when the client advertised
@@ -2904,11 +3041,12 @@ fn analyze_gd(
 /// emits them in source order), then analyzer diagnostics (the sink sorts by `span.start` at
 /// `finish`). The merged stream is what the editor highlights.
 ///
-/// The `tags` / `codeDescription` fields are LSP-projection-only additions: Godot's own output
-/// never serializes them, so message strings, spans, and severities stay byte-identical to the
+/// The `tags` / `codeDescription` / `data` fields are LSP-projection-only additions: Godot's own
+/// output never serializes them, so message strings, spans, and severities stay byte-identical to the
 /// faithful stream (`.out` conformance untouched). Tags are gated on the client's
 /// `publishDiagnostics.tagSupport` (pyright-style); the docs link ships ungated
-/// (rust-analyzer-style — clients ignore unknown members).
+/// (rust-analyzer-style — clients ignore unknown members); the M10 (#75) `data` fix payload is gated
+/// on `publishDiagnostics.dataSupport` (a client that won't round-trip `data` gets none).
 fn collect_diagnostics(
     mapper: &PositionMapper,
     enc: PositionEncoding,
@@ -2951,6 +3089,16 @@ fn collect_diagnostics(
                 } else {
                     None
                 },
+                // M10 (#75): the additive fix-payload tag. Carries the warning's `PNAME` so a later
+                // phase can offer a quickfix without re-deriving the code. Gated on
+                // `publishDiagnostics.dataSupport`; ABSENT changes nothing else (message/range/severity
+                // are untouched above — fidelity), so the acceptance sweep stays byte-identical. The
+                // codeAction path does NOT depend on this (it reads the diagnostic's `code`).
+                data: if caps.code_action.diagnostic_data_support {
+                    warning_diagnostic_data(d.warning_code())
+                } else {
+                    None
+                },
                 related_information: project_related(
                     d.related(),
                     mapper,
@@ -2958,7 +3106,6 @@ fn collect_diagnostics(
                     request_uri,
                     related_texts,
                 ),
-                ..Default::default()
             });
         }
     }
@@ -3038,6 +3185,20 @@ fn project_related(
         });
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// M10 (#75): the additive `Diagnostic.data` fix payload — the warning's `PNAME`, so a quickfix
+/// consumer can offer a fix without re-deriving the code. Namespaced under a `gdls` key so it can
+/// never collide with another producer's `data` in a buffer the client merges across servers; the
+/// inner field is the upper-case warning name (the same `code` carried on the diagnostic). `None` for
+/// a bare type/semantic error (no `warning_code`) — those carry no fix payload. This is the ONLY use
+/// of `Diagnostic.data` in gdls; the codeAction path keys off the diagnostic's `code` instead, so this
+/// tag is pure forward-looking enrichment, gated on `publishDiagnostics.dataSupport`.
+fn warning_diagnostic_data(
+    code: Option<gd_analyze::warnings::WarningCode>,
+) -> Option<serde_json::Value> {
+    let name = gd_analyze::warnings::name_from_code(code?);
+    Some(serde_json::json!({ "gdls": { "warningCode": name } }))
 }
 
 /// The unused/unreachable warning family editors render FADED via `DiagnosticTag::UNNECESSARY`

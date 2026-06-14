@@ -61,6 +61,12 @@ pub(crate) use crate::color::{color_presentation, document_color};
 // alongside every other request handler — re-export so the dispatch table stays one uniform path.
 pub(crate) use crate::inlay_hint::{inlay_hint, inlay_hint_resolve};
 
+// M10 (#75): the codeAction pipeline lives in `crate::code_action` (its own module, like
+// `crate::color`) but dispatch addresses its handlers as `handlers::code_action` /
+// `handlers::code_action_resolve` / `handlers::execute_command` alongside every other request
+// handler — re-export so the dispatch table stays one uniform path.
+pub(crate) use crate::code_action::{code_action, code_action_resolve, execute_command};
+
 /// `textDocument/documentSymbol`: project the `gd_syntax` symbol outline into LSP's nested
 /// [`lsp_types::DocumentSymbol`] tree — kinds plus byte→position ranges, with the full declaration as
 /// `range` and the identifier as `selection_range`. Reads the shared cached parse (the same one
@@ -5442,6 +5448,18 @@ impl RequestRefusal {
     /// says return a `ResponseError` with an appropriate message; `ERR_INVALID_PARAMS` (-32602) is
     /// the conventional code for a request the server understood but whose parameter is unusable.
     fn invalid_name(message: impl Into<String>) -> Self {
+        RequestRefusal {
+            code: crate::server::ERR_INVALID_PARAMS,
+            message: message.into(),
+        }
+    }
+
+    /// M10 (#75): a `workspace/executeCommand` for a command gdls does not handle. LSP §3.17 says an
+    /// unknown command is answered with a `ResponseError`; `ERR_INVALID_PARAMS` (-32602) fits — the
+    /// request was understood, its `command` parameter is just not one gdls advertises (never a panic
+    /// and never `ERR_METHOD_NOT_FOUND`, which is reserved for the JSON-RPC METHOD, not its argument —
+    /// anti-catalog W15).
+    pub(crate) fn unknown_command(message: impl Into<String>) -> Self {
         RequestRefusal {
             code: crate::server::ERR_INVALID_PARAMS,
             message: message.into(),
