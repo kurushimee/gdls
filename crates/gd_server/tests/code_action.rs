@@ -1981,3 +1981,86 @@ fn fix_all_excludes_unsafe_add_onready_on_non_node_class() {
     );
     shutdown(&client, t);
 }
+
+/// NON-ASCII encoding correctness: a multi-byte character (emoji in a string) precedes the fix
+/// location, so byte offsets and UTF-16 columns diverge. The `_`-prefix fix (and the ERROR backstop's
+/// in-memory edit application) must still produce a correct edit — proving `apply_workspace_edit_to_text`
+/// and the rename emit ranges in the same (negotiated) encoding the client applies.
+#[test]
+fn underscore_prefix_handles_non_ascii_before_edit() {
+    // Line 4 has an emoji (4 UTF-8 bytes, 2 UTF-16 units, 1 char) in a string; the unused param is
+    // on a later line so its column resolution crosses the multibyte content.
+    const SRC: &str =
+        "extends Node\n\n\nfunc f(unused: int) -> void:\n\tprint(\"hi \u{1F600} there\")\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diag_with_warning(&diags, "UNUSED_PARAMETER");
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Prefix unused name");
+    let tes = all_text_edits(&edit);
+    assert!(
+        tes.iter().all(|te| te.new_text == "_unused"),
+        "the param renames to `_unused`; got {tes:?}"
+    );
+    // Apply via the byte-accurate helper (it converts LSP positions over the rope, like the server).
+    let patched = apply_text_edits_utf16(SRC, tes);
+    assert!(
+        patched.contains("func f(_unused: int)"),
+        "the rename must land correctly despite the multibyte line; patched:\n{patched}"
+    );
+    assert!(
+        patched.contains("hi \u{1F600} there"),
+        "the emoji string must be untouched; patched:\n{patched}"
+    );
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !has_warning(&after, "UNUSED_PARAMETER"),
+        "UNUSED_PARAMETER cleared; got {:?}",
+        after.diagnostics
+    );
+    assert!(
+        !after
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "no errors; got {:?}\npatched:\n{patched}",
+        after.diagnostics
+    );
+    shutdown(&client, t);
+}
+
+/// Apply UTF-16-positioned `TextEdit`s to `src` (the LSP default encoding the test client negotiates).
+/// Mirrors `apply_text_edits` but maps `character` as a UTF-16 offset, so a multibyte line resolves the
+/// same way the server's PositionMapper does.
+fn apply_text_edits_utf16(src: &str, mut edits: Vec<lsp_types::TextEdit>) -> String {
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(src.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let to_offset = |p: lsp_types::Position| -> usize {
+        let line_start = line_starts
+            .get(p.line as usize)
+            .copied()
+            .unwrap_or(src.len());
+        // Walk UTF-16 units from the line start to find the byte offset.
+        let mut utf16 = 0u32;
+        let mut byte = line_start;
+        for ch in src[line_start..].chars() {
+            if utf16 >= p.character {
+                break;
+            }
+            utf16 += ch.len_utf16() as u32;
+            byte += ch.len_utf8();
+        }
+        byte
+    };
+    edits.sort_by_key(|e| std::cmp::Reverse((e.range.start.line, e.range.start.character)));
+    let mut out = src.to_string();
+    for e in edits {
+        let start = to_offset(e.range.start);
+        let end = to_offset(e.range.end);
+        out.replace_range(start..end, &e.new_text);
+    }
+    out
+}

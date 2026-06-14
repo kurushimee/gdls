@@ -1160,9 +1160,7 @@ fn edit_is_safe(state: &mut ServerState, uri: &Uri, edit: &WorkspaceEdit) -> boo
     let before_tree = state
         .workspace
         .parse(&CanonicalKey::for_uri(uri), &before_text);
-    let before_analysis = state
-        .workspace
-        .analyze_ephemeral(&path, &before_tree.tree);
+    let before_analysis = state.workspace.analyze_ephemeral(&path, &before_tree.tree);
     if before_analysis.bailed {
         return false;
     }
@@ -1174,9 +1172,7 @@ fn edit_is_safe(state: &mut ServerState, uri: &Uri, edit: &WorkspaceEdit) -> boo
         return false;
     };
     let after_parsed = gd_syntax::parse(&after_text);
-    let after_analysis = state
-        .workspace
-        .analyze_ephemeral(&path, &after_parsed.tree);
+    let after_analysis = state.workspace.analyze_ephemeral(&path, &after_parsed.tree);
     if after_analysis.bailed {
         return false;
     }
