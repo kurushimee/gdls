@@ -96,6 +96,13 @@ pub struct NamedConst {
     /// `Vector3.AXIS_X` → `int`). `Some` only for builtin-class constants — engine-class
     /// constants are bare integers and carry no type field in the API.
     pub ty: Option<Sym>,
+    /// Decoded RGBA for a builtin **`Color`** constant (`Color.RED`, `Color.CORNFLOWER_BLUE`,
+    /// …). The dump carries these as `value` strings like `"Color(1, 0, 0, 1)"`; the integer
+    /// `value` model can't hold them, so they were dropped. `Some([r, g, b, a])` only when this
+    /// constant's declared type is `Color` and the literal parsed; `None` for every other
+    /// constant. Additive — does not change the existing integer-constant path. The source of
+    /// truth stays `extension_api.json`; M10 `textDocument/documentColor` reads RGBA from here.
+    pub color: Option<[f32; 4]>,
 }
 
 /// A native class and its members.
@@ -583,6 +590,57 @@ impl NativeDb {
         .map(|m| (bt, m))
     }
 
+    /// The decoded RGBA of a named builtin **`Color`** constant (`Color.RED` → `[1, 0, 0, 1]`),
+    /// sourced from the [`NamedConst::color`] the ingest parsed out of `extension_api.json`.
+    /// `None` when `Color` isn't in the DB, `name` isn't one of its constants, or that constant
+    /// isn't a `Color` literal. Drives M10 `textDocument/documentColor`'s `Color.<NAME>` resolution
+    /// — the values flow from the dump, never a server-side table.
+    pub fn builtin_color_constant(&self, name: &str) -> Option<[f32; 4]> {
+        let target = self.interner.get(name)?;
+        let bt = self.builtin_named("Color")?;
+        bt.constants
+            .iter()
+            .find(|k| k.name == target)
+            .and_then(|k| k.color)
+    }
+
+    /// Resolve a `Color(String)` **name** argument (`Color("cornflower blue")`, `Color("RED")`) to
+    /// RGBA, faithful to `Color::find_named_color` (`core/math/color.cpp`): normalize the query
+    /// (strip ` `, `-`, `_`, `'`, `.`; uppercase) and match it against each builtin `Color`
+    /// constant's name normalized the same way. The constant names are the upstream
+    /// `named_colors[i].name`, so this is the single source of truth — no hard-coded color table.
+    /// `None` when `Color` isn't in the DB or no name matches. Aliases that share a normalized name
+    /// can't occur (the upstream table has unique names); ties are therefore impossible here.
+    pub fn color_constant_by_display_name(&self, name: &str) -> Option<[f32; 4]> {
+        let bt = self.builtin_named("Color")?;
+        let want = normalize_color_name(name);
+        bt.constants
+            .iter()
+            .find(|k| k.color.is_some() && normalize_color_name(self.name_of(k.name)) == want)
+            .and_then(|k| k.color)
+    }
+
+    /// Reverse of [`Self::builtin_color_constant`]: the name of the builtin `Color` constant whose
+    /// RGBA **exactly** equals `rgba` (bitwise on each component), or `None` if no constant matches.
+    /// Used by `colorPresentation` to offer a `Color.<NAME>` form only on an exact match. Aliases
+    /// exist in the dump (`AQUA`/`CYAN`, `FUCHSIA`/`MAGENTA` share RGBA); the match is resolved
+    /// **alphabetically** (constants scanned in name order) so the choice is deterministic.
+    pub fn color_constant_named_exact(&self, rgba: [f32; 4]) -> Option<&str> {
+        let bt = self.builtin_named("Color")?;
+        let bits = |c: [f32; 4]| c.map(f32::to_bits);
+        let want = bits(rgba);
+        let mut hit: Option<&str> = None;
+        for k in &bt.constants {
+            if k.color.is_some_and(|c| bits(c) == want) {
+                let name = self.name_of(k.name);
+                if hit.is_none_or(|cur| name < cur) {
+                    hit = Some(name);
+                }
+            }
+        }
+        hit
+    }
+
     /// Collect **every member** reachable on `class` — its own plus all inherited up the
     /// `inherits` chain — the enumeration counterpart of the by-name [`Self::lookup_member`]
     /// walk (it serves `Class.<cursor>` / instance member completion). Returns each member
@@ -709,6 +767,8 @@ fn ingest_class(c: api::ClassDef, it: &mut Interner) -> NativeClass {
                 name: it.intern(&k.name),
                 value: k.value,
                 ty: None,
+                // Engine-class constants are bare integers — never a Color literal.
+                color: None,
             })
             .collect(),
         brief_description: c.brief_description,
@@ -793,10 +853,42 @@ fn ingest_builtin(b: api::BuiltinClass, it: &mut Interner) -> BuiltinType {
                 // Builtin-constant values are non-scalar literals ("Vector3(0, 1, 0)") the type
                 // model doesn't evaluate; the declared type below is what the analyzer consumes.
                 value: 0,
+                // A `Color`-typed builtin constant carries its RGBA in the `value` string
+                // (`"Color(1, 0, 0, 1)"`); decode it so M10 documentColor can resolve
+                // `Color.<NAME>` → swatch. Every other builtin constant → `None`.
+                color: (k.ty == "Color")
+                    .then(|| parse_color_literal(&k.value))
+                    .flatten(),
                 ty: non_empty(&k.ty, it),
             })
             .collect(),
     }
+}
+
+/// Decode a `Color(r, g, b, a)` constant-`value` string (as the dump writes named-color constants:
+/// `Color.RED → "Color(1, 0, 0, 1)"`) into RGBA. Faithful to how `extension_api_dump.cpp`
+/// serializes a `Color` Variant — four comma-separated floats inside `Color(...)`. Returns `None`
+/// for any shape that isn't exactly four parseable floats (never panics on a malformed dump).
+fn parse_color_literal(value: &str) -> Option<[f32; 4]> {
+    let inner = value.strip_prefix("Color(")?.strip_suffix(')')?;
+    let mut comps = [0.0f32; 4];
+    let mut n = 0;
+    for part in inner.split(',') {
+        let f: f32 = part.trim().parse().ok()?;
+        *comps.get_mut(n)? = f;
+        n += 1;
+    }
+    (n == 4).then_some(comps)
+}
+
+/// Normalize a color name the way `Color::find_named_color` does (`core/math/color.cpp`): drop every
+/// ` `, `-`, `_`, `'`, and `.`, then uppercase. So `"cornflower blue"`, `"CORNFLOWER_BLUE"`, and
+/// `"Cornflower-Blue"` all collapse to `"CORNFLOWERBLUE"`. ASCII-only, matching the upstream table.
+fn normalize_color_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !matches!(c, ' ' | '-' | '_' | '\'' | '.'))
+        .flat_map(char::to_uppercase)
+        .collect()
 }
 
 fn ingest_utility(u: api::UtilityFunction, it: &mut Interner) -> UtilityFn {
@@ -1281,5 +1373,107 @@ mod tests {
         // `global_constants` is genuinely empty on this (and the stock) dump — the iterator is
         // present and correct, it just has nothing to yield.
         assert_eq!(db.global_constants().count(), 0);
+    }
+
+    /// A dump whose `Color` builtin carries named-color constants as `value` strings — exactly the
+    /// shape `extension_api.json` writes (`RED → "Color(1, 0, 0, 1)"`). Proves the M10 ingest
+    /// extension decodes that string into [`NamedConst::color`] and the two lookups read it back,
+    /// with the values flowing from the dump (never a server-side table). Includes an alias pair
+    /// (`AQUA`/`CYAN` share RGBA) to pin the reverse lookup's deterministic tie-break.
+    fn color_db() -> NativeDb {
+        NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "builtin_classes": [
+                    {"name": "Color",
+                     "constants": [
+                        {"name": "RED", "type": "Color", "value": "Color(1, 0, 0, 1)"},
+                        {"name": "CORNFLOWER_BLUE", "type": "Color",
+                         "value": "Color(0.39215687, 0.58431375, 0.92941177, 1)"},
+                        {"name": "TRANSPARENT", "type": "Color", "value": "Color(1, 1, 1, 0)"},
+                        {"name": "AQUA", "type": "Color", "value": "Color(0, 1, 1, 1)"},
+                        {"name": "CYAN", "type": "Color", "value": "Color(0, 1, 1, 1)"}
+                     ]}
+                ]
+            }"#,
+        )
+        .expect("color dump")
+    }
+
+    #[test]
+    fn builtin_color_constants_ingested_with_rgba() {
+        let db = color_db();
+        // Forward: name → RGBA, straight from the dump's `value` string.
+        assert_eq!(db.builtin_color_constant("RED"), Some([1.0, 0.0, 0.0, 1.0]));
+        assert_eq!(
+            db.builtin_color_constant("CORNFLOWER_BLUE"),
+            Some([0.39215687, 0.58431375, 0.92941177, 1.0]),
+            "fractional RGBA decoded from the Color(...) literal verbatim"
+        );
+        assert_eq!(
+            db.builtin_color_constant("TRANSPARENT"),
+            Some([1.0, 1.0, 1.0, 0.0]),
+            "alpha component decoded (not defaulted to 1)"
+        );
+        // A name that isn't a Color constant → None (not a panic, not a zero color).
+        assert_eq!(db.builtin_color_constant("NOPE"), None);
+
+        // The decoded RGBA is also reachable through the generic member lookup as a Constant whose
+        // `color` field is populated — proving the value lives on the ingested model, not a side
+        // table.
+        let (_, m) = db
+            .lookup_builtin_member("Color", "RED")
+            .expect("Color.RED resolves as a builtin member");
+        let NativeMember::Constant(k) = m else {
+            panic!("Color.RED is a constant");
+        };
+        assert_eq!(k.color, Some([1.0, 0.0, 0.0, 1.0]));
+
+        // Reverse: exact RGBA → constant name (exact, bitwise). Alias pair resolves alphabetically
+        // (AQUA < CYAN) so the choice is deterministic.
+        assert_eq!(
+            db.color_constant_named_exact([1.0, 0.0, 0.0, 1.0]),
+            Some("RED")
+        );
+        assert_eq!(
+            db.color_constant_named_exact([0.0, 1.0, 1.0, 1.0]),
+            Some("AQUA"),
+            "alias pair (AQUA/CYAN) → the alphabetically-first name, deterministically"
+        );
+        // A color that matches no constant → None (so colorPresentation offers no named form).
+        assert_eq!(db.color_constant_named_exact([0.1, 0.2, 0.3, 1.0]), None);
+
+        // An empty DB never panics and finds nothing.
+        let empty = NativeDb::empty();
+        assert_eq!(empty.builtin_color_constant("RED"), None);
+        assert_eq!(empty.color_constant_named_exact([1.0, 0.0, 0.0, 1.0]), None);
+    }
+
+    #[test]
+    fn non_color_builtin_constants_keep_none_color() {
+        // A non-Color builtin constant (e.g. `Vector3.UP`) must NOT get a `color` — the M10 ingest
+        // extension is gated on the declared type being `Color` (additive, no behavior change for
+        // the existing integer/typed-constant path).
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "builtin_classes": [
+                    {"name": "Vector3",
+                     "constants": [{"name": "UP", "type": "Vector3", "value": "Vector3(0, 1, 0)"}]}
+                ]
+            }"#,
+        )
+        .expect("vector dump");
+        let (_, m) = db
+            .lookup_builtin_member("Vector3", "UP")
+            .expect("Vector3.UP resolves");
+        let NativeMember::Constant(k) = m else {
+            panic!("Vector3.UP is a constant");
+        };
+        assert_eq!(
+            k.color, None,
+            "a non-Color constant carries no decoded color"
+        );
+        assert_eq!(db.builtin_color_constant("UP"), None);
     }
 }

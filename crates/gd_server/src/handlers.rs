@@ -50,6 +50,12 @@ pub(crate) use crate::completion::{completion, completion_item_resolve};
 // other request handler — re-export so the dispatch table stays one uniform path.
 pub(crate) use crate::signature_help::signature_help;
 
+// M10 (#74): documentColor + colorPresentation live in `crate::color` (its own module, like
+// `crate::completion`) but dispatch addresses them as `handlers::document_color` /
+// `handlers::color_presentation` alongside every other request handler — re-export so the dispatch
+// table stays one uniform path.
+pub(crate) use crate::color::{color_presentation, document_color};
+
 /// `textDocument/documentSymbol`: project the `gd_syntax` symbol outline into LSP's nested
 /// [`lsp_types::DocumentSymbol`] tree — kinds plus byte→position ranges, with the full declaration as
 /// `range` and the identifier as `selection_range`. Reads the shared cached parse (the same one
