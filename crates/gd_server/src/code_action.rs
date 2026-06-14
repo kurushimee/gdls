@@ -150,17 +150,23 @@ struct UnderscorePrefixData {
     line: u32,
     /// 0-based character of the declaration identifier, in the negotiated encoding.
     character: u32,
+    /// The identifier name at the anchor when the action was OFFERED. Re-checked at resolve against
+    /// the CURRENT buffer: if a concurrent edit moved/changed the binding so the anchor no longer
+    /// names this symbol, the rebuild refuses rather than renaming whatever is now there (stale-resolve
+    /// corruption — the rename lesson).
+    expected_name: String,
 }
 
 impl UnderscorePrefixData {
     const ACTION: &'static str = "underscore_prefix";
 
-    fn new(uri: &Uri, anchor: Position) -> Self {
+    fn new(uri: &Uri, anchor: Position, expected_name: String) -> Self {
         UnderscorePrefixData {
             action: Self::ACTION.to_string(),
             uri: uri.as_str().to_string(),
             line: anchor.line,
             character: anchor.character,
+            expected_name,
         }
     }
 
@@ -437,25 +443,48 @@ pub fn code_action_resolve(state: &mut ServerState, mut action: CodeAction) -> C
         }
         return action;
     }
+    // The mutating families rebuild their edit against the CURRENT buffer and re-run the ERROR
+    // BACKSTOP via [`gate_resolved_edit`] — so a buffer that changed between offer and resolve (a
+    // concurrent edit) can't apply a stale, now-corrupting edit. `_`-prefix additionally re-checks the
+    // anchor still names the same binding (in `build_underscore_prefix_edit`); drop-annotation's frozen
+    // byte range is validated by the backstop's parse+reanalyze (a range that now spans different bytes
+    // either fails to apply or introduces an error).
     if let Some(parsed) = UnderscorePrefixData::parse(data.clone()) {
-        if let Some(edit) = build_underscore_prefix_edit(state, &parsed) {
-            action.edit = Some(edit);
-        }
+        let edit = build_underscore_prefix_edit(state, &parsed);
+        gate_resolved_edit(state, &parsed.uri, edit, &mut action);
         return action;
     }
     if let Some(parsed) = AddOnreadyData::parse(data.clone()) {
-        if let Some(edit) = build_add_onready_edit(state, &parsed) {
-            action.edit = Some(edit);
-        }
+        let edit = build_add_onready_edit(state, &parsed);
+        gate_resolved_edit(state, &parsed.uri, edit, &mut action);
         return action;
     }
     if let Some(parsed) = DropAnnotationData::parse(data) {
-        if let Some(edit) = build_drop_annotation_edit(state, &parsed) {
-            action.edit = Some(edit);
-        }
+        let edit = build_drop_annotation_edit(state, &parsed);
+        gate_resolved_edit(state, &parsed.uri, edit, &mut action);
         return action;
     }
     action
+}
+
+/// Set `action.edit` to `edit` only if it passes the ERROR BACKSTOP against the current buffer — the
+/// resolve-time stale-guard for the mutating fixes. A `None` edit, an unparseable URI, or a now-unsafe
+/// edit leaves `action.edit` as `None` (the client applies nothing — never a stale corrupting edit).
+fn gate_resolved_edit(
+    state: &mut ServerState,
+    uri_str: &str,
+    edit: Option<WorkspaceEdit>,
+    action: &mut CodeAction,
+) {
+    let Some(edit) = edit else {
+        return;
+    };
+    let Ok(uri) = uri_str.parse::<Uri>() else {
+        return;
+    };
+    if edit_is_safe(state, &uri, &edit) {
+        action.edit = Some(edit);
+    }
 }
 
 /// `workspace/executeCommand`: run a server command. The ONE command is
@@ -688,12 +717,22 @@ fn push_underscore_prefix_action(
     let Some(anchor) = underscore_decl_anchor(state, uri, diag) else {
         return;
     };
-    let data = UnderscorePrefixData::new(uri, anchor);
+    let Some(expected_name) = identifier_name_at(state, uri, anchor) else {
+        return;
+    };
+    let data = UnderscorePrefixData::new(uri, anchor, expected_name);
     // Run the rename now to decide whether to offer (and, on the eager path, to embed the edit). A
-    // refusal / empty result ⇒ no action.
+    // refusal / empty result ⇒ no action (rename's own collision/native gates already refuse here).
     let Some(edit) = build_underscore_prefix_edit(state, &data) else {
         return;
     };
+    // ERROR BACKSTOP: refuse if applying the rename would introduce a new error (e.g. the unused
+    // local's name collides with a forward-referenced member/parameter/global, so renaming a use that
+    // actually binds elsewhere would dangle). Catches the open-ended induction the structural gates
+    // can't enumerate.
+    if !edit_is_safe(state, uri, &edit) {
+        return;
+    }
     let title = "Prefix unused name with \"_\"".to_string();
     let (action_edit, action_data) = if state.caps.code_action.resolve_support {
         // Deferred: the edit is rebuilt at resolve. We already proved an edit exists (the offer gate
@@ -777,6 +816,11 @@ fn build_underscore_prefix_edit(
     // Read the current declaration name at the anchor so `new_name` is exactly `_` + that name. If the
     // anchor no longer lands on an identifier (the buffer changed), bail — fail-closed.
     let old_name = identifier_name_at(state, &uri, data.anchor())?;
+    // STALE-RESOLVE GUARD: the anchor must still name the binding the action was offered for. If a
+    // concurrent edit changed it, refuse rather than rename a different symbol.
+    if old_name != data.expected_name {
+        return None;
+    }
     let new_name = format!("_{old_name}");
     let params = RenameParams {
         text_document_position: TextDocumentPositionParams {
@@ -823,11 +867,14 @@ fn identifier_name_at(state: &mut ServerState, uri: &Uri, pos: Position) -> Opti
 /// Offer the `@onready` insertion for a `var x = $Node` / `get_node(...)` default, appending it to
 /// `out` when safe.
 ///
-/// REFUSE-GATE (cross-warning induction): adding `@onready` to a var that ALSO carries an `@export*`
-/// annotation would induce ONREADY_WITH_EXPORT. So this offers the fix ONLY when the declaration has
-/// no `@export*` annotation. (Adding `@onready` to a non-Node class would induce an error, but
-/// GET_NODE_DEFAULT_WITHOUT_ONREADY fires only when the initializer is `$`/`get_node`, which already
-/// implies a Node-derived class — so that induction can't arise here; covered by a test fixture.)
+/// Two gates:
+///   * structural fast-path: adding `@onready` to a var that ALSO carries an `@export*` annotation
+///     would induce ONREADY_WITH_EXPORT — refuse without paying an analyze (the common case).
+///   * the ERROR BACKSTOP: `@onready` on a NON-Node-derived class is a hard error
+///     (`"@onready" can only be used in classes that inherit "Node"`), and GET_NODE_DEFAULT fires for
+///     a bare `get_node(...)` call regardless of the class's node-ness — so the non-Node induction IS
+///     reachable (`extends Object; var n = get_node("Child")`). [`edit_is_safe`] catches it (and any
+///     other induced error, e.g. a property var) by re-analyzing the patched buffer.
 fn push_add_onready_action(
     state: &mut ServerState,
     uri: &Uri,
@@ -844,6 +891,13 @@ fn push_add_onready_action(
         return;
     }
     let data = AddOnreadyData::new(uri, var_line);
+    let Some(edit) = build_add_onready_edit(state, &data) else {
+        return;
+    };
+    // ERROR BACKSTOP: refuse if adding @onready would introduce an error (non-Node class, etc.).
+    if !edit_is_safe(state, uri, &edit) {
+        return;
+    }
     let title = "Add \"@onready\" annotation".to_string();
     if let Some(action) = mutating_action(state, title, diag, &data, |s| {
         build_add_onready_edit(s, &data)
@@ -901,9 +955,41 @@ fn push_drop_annotation_actions(
     diag: &Diagnostic,
     out: &mut CodeActionResponse,
 ) {
-    let doc = match state.vfs.get(uri.as_str()) {
-        Some(d) => d,
-        None => return,
+    // Collect the candidate (title, recipe) pairs FIRST (over the parse tree), then drop the tree
+    // borrow before building + gating each edit (the backstop needs `&mut state`).
+    let candidates = drop_annotation_candidates(state, uri, diag);
+    for (title, data) in candidates {
+        let Some(edit) = build_drop_annotation_edit(state, &data) else {
+            continue;
+        };
+        // ERROR BACKSTOP: refuse a direction whose deletion would introduce an error (defensive — the
+        // structural gates already exclude the known inductions, but a deletion that broke parsing
+        // would be caught here too).
+        if !edit_is_safe(state, uri, &edit) {
+            continue;
+        }
+        if let Some(action) = mutating_action(state, title, diag, &data, |s| {
+            build_drop_annotation_edit(s, &data)
+        }) {
+            out.push(action);
+        }
+    }
+}
+
+/// The drop-annotation candidate (title, recipe) pairs for the `@onready`+`@export` conflict at
+/// `diag`, computed over the parse tree (returns OWNED data so the tree borrow is released before the
+/// caller builds + gates edits). Applies the two structural refuse-gates: drop-`@onready` is omitted
+/// when the initializer is a get_node-default (would re-induce GET_NODE_DEFAULT_WITHOUT_ONREADY); a
+/// direction whose deletion range overlaps a comment is omitted (would eat user text). `drop @export`
+/// is otherwise always a candidate.
+fn drop_annotation_candidates(
+    state: &mut ServerState,
+    uri: &Uri,
+    diag: &Diagnostic,
+) -> Vec<(String, DropAnnotationData)> {
+    let mut out = Vec::new();
+    let Some(doc) = state.vfs.get(uri.as_str()) else {
+        return out;
     };
     let text = doc.text();
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
@@ -912,7 +998,7 @@ fn push_drop_annotation_actions(
     let tree = &parsed.tree;
 
     let Some(var_id) = enclosing_variable(tree, byte) else {
-        return;
+        return out;
     };
     let var_span = tree.get(var_id).span;
     let annotations: Vec<gd_syntax::ast::NodeId> = tree.get(var_id).annotations.clone();
@@ -931,7 +1017,7 @@ fn push_drop_annotation_actions(
         }
     }
     let (Some(onready_id), Some(export_id)) = (onready, export) else {
-        return; // Not actually the @onready+@export shape — nothing to offer.
+        return out; // Not actually the @onready+@export shape — nothing to offer.
     };
 
     // drop @onready — refuse if removing it would re-induce GET_NODE_DEFAULT_WITHOUT_ONREADY.
@@ -946,32 +1032,27 @@ fn push_drop_annotation_actions(
         if let Some(span) =
             annotation_delete_span(tree, &annotations, onready_id, var_span, &parsed.comments)
         {
-            let data = DropAnnotationData::new(uri, span);
-            let title = "Remove \"@onready\" annotation".to_string();
-            if let Some(action) = mutating_action(state, title, diag, &data, |s| {
-                build_drop_annotation_edit(s, &data)
-            }) {
-                out.push(action);
-            }
+            out.push((
+                "Remove \"@onready\" annotation".to_string(),
+                DropAnnotationData::new(uri, span),
+            ));
         }
     }
 
-    // drop @export — always safe (no induction path; comment-in-range still refuses).
+    // drop @export — always a candidate (no induction path; comment-in-range still refuses).
     if let Some(span) =
         annotation_delete_span(tree, &annotations, export_id, var_span, &parsed.comments)
     {
-        let data = DropAnnotationData::new(uri, span);
         let export_name = match &tree.get(export_id).kind {
             NodeKind::Annotation(a) => a.name.clone(),
             _ => "@export".to_string(),
         };
-        let title = format!("Remove \"{export_name}\" annotation");
-        if let Some(action) = mutating_action(state, title, diag, &data, |s| {
-            build_drop_annotation_edit(s, &data)
-        }) {
-            out.push(action);
-        }
+        out.push((
+            format!("Remove \"{export_name}\" annotation"),
+            DropAnnotationData::new(uri, span),
+        ));
     }
+    out
 }
 
 /// The BYTE range to delete to drop `target` from a declaration's annotation list: `[target.start,
@@ -1041,6 +1122,152 @@ fn build_drop_annotation_edit(
 // source.fixAll: aggregate the SAFE, auto-applicable fixes.
 // =================================================================================================
 
+// =================================================================================================
+// The ERROR backstop — the authoritative mutation-correctness gate.
+//
+// Every structural refuse-gate above (has_export, get_node-default, collision) catches a SPECIFIC
+// known induction. But the induction space is open-ended (a `@onready` on a non-Node class, a local
+// `_x` that rebinds a forward-referenced member/parameter/global, a property-var…), and an EDIT that
+// introduces a parse/type ERROR is exactly "broken code" — the BLOCKER tier of this phase's bar. So
+// before any mutating fix is OFFERED, its candidate edit is applied to an in-memory copy of the
+// buffer and RE-ANALYZED; the fix is withheld if the edit introduces a NEW error-severity diagnostic.
+// This is the one mechanism that closes every blocker (known and unknown) uniformly. It is scoped to
+// ERRORS — a fix is allowed to shift/alter WARNINGS (a benign over-edit is a documented limitation),
+// and errors don't move under a line insert the way warning ranges do, so the comparison is robust.
+// =================================================================================================
+
+/// `true` iff applying `edit` to `uri`'s current buffer would introduce NO new error-severity
+/// diagnostic — the authoritative blocker-tier gate for a mutating fix. Applies the edit in memory,
+/// re-parses + re-analyzes EPHEMERALLY (no cache pollution; real path so the cross-file / native
+/// environment is intact), and compares the post-edit error set against the pre-edit one by MESSAGE
+/// (position-independent — a line insert shifts ranges). A buffer that can't be read, an edit that
+/// can't be applied, or an analysis that BAILED (partial side tables ⇒ can't trust "no error") all
+/// return `false` (fail-closed: don't offer a fix we can't prove safe).
+fn edit_is_safe(state: &mut ServerState, uri: &Uri, edit: &WorkspaceEdit) -> bool {
+    let Some(path) = crate::uri::uri_to_path(uri) else {
+        return false;
+    };
+    if path.extension() != Some("gd") {
+        return false;
+    }
+    let Some(doc) = state.vfs.get(uri.as_str()) else {
+        return false;
+    };
+    let before_text = doc.text();
+
+    // Baseline error messages (pre-edit), from an ephemeral analysis of the CURRENT text — so a file
+    // that already has errors isn't blamed on the fix. Bailed ⇒ refuse.
+    let before_tree = state
+        .workspace
+        .parse(&CanonicalKey::for_uri(uri), &before_text);
+    let before_analysis = state
+        .workspace
+        .analyze_ephemeral(&path, &before_tree.tree);
+    if before_analysis.bailed {
+        return false;
+    }
+    let before_errors = error_messages(&before_analysis);
+
+    // Apply the edit to the buffer text. `None` ⇒ the edit didn't apply cleanly ⇒ refuse.
+    let Some(after_text) = apply_workspace_edit_to_text(uri, &before_text, edit, state.encoding)
+    else {
+        return false;
+    };
+    let after_parsed = gd_syntax::parse(&after_text);
+    let after_analysis = state
+        .workspace
+        .analyze_ephemeral(&path, &after_parsed.tree);
+    if after_analysis.bailed {
+        return false;
+    }
+    // Also reject if the EDIT produced a new syntax (parse) error — a structurally broken splice.
+    let after_errors = error_messages(&after_analysis);
+
+    let new_syntax_error =
+        !after_parsed.diagnostics.is_empty() && before_tree.diagnostics.is_empty();
+    if new_syntax_error {
+        return false;
+    }
+    // No NEW analyzer error message may appear.
+    after_errors.iter().all(|m| before_errors.contains(m))
+}
+
+/// The set of error-severity analyzer diagnostic messages (position-independent identity for the
+/// backstop comparison — a line insert shifts ranges, so message is the stable key).
+fn error_messages(result: &gd_analyze::AnalysisResult) -> std::collections::BTreeSet<String> {
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.severity(), gd_analyze::Severity::Error))
+        .map(|d| d.message().to_owned())
+        .collect()
+}
+
+/// Apply a single-file `WorkspaceEdit`'s [`TextEdit`]s (those targeting `uri`) to `text`, returning
+/// the resulting string — the in-memory effect of a client applying the edit. Edits are converted to
+/// byte offsets via a [`PositionMapper`] over the current rope and applied last-first so earlier
+/// ranges stay valid. `None` if any edit's range maps out of bounds or the edits overlap (an
+/// undefined edit set — the backstop refuses rather than guess).
+fn apply_workspace_edit_to_text(
+    uri: &Uri,
+    text: &str,
+    edit: &WorkspaceEdit,
+    encoding: crate::position::PositionEncoding,
+) -> Option<String> {
+    use lsp_types::{DocumentChanges, OneOf};
+    let mut tes: Vec<TextEdit> = Vec::new();
+    if let Some(DocumentChanges::Edits(tdes)) = &edit.document_changes {
+        for tde in tdes {
+            if &tde.text_document.uri != uri {
+                continue;
+            }
+            for e in &tde.edits {
+                if let OneOf::Left(te) = e {
+                    tes.push(te.clone());
+                }
+            }
+        }
+    } else if let Some(changes) = &edit.changes {
+        if let Some(v) = changes.get(uri) {
+            tes.extend(v.iter().cloned());
+        }
+    }
+    if tes.is_empty() {
+        return None;
+    }
+
+    let rope = ropey::Rope::from_str(text);
+    // The edit ranges gdls emits are in the NEGOTIATED encoding (`encoding`), and the same mapper
+    // round-trips them — so the probe applies exactly the bytes the client will edit.
+    let mapper = PositionMapper::new(&rope, encoding);
+    // Convert to (start_byte, end_byte, new_text), validate in-bounds + non-overlapping.
+    let mut spans: Vec<(usize, usize, String)> = Vec::with_capacity(tes.len());
+    let len = text.len();
+    for te in &tes {
+        let s = mapper.position_to_byte(te.range.start);
+        let e = mapper.position_to_byte(te.range.end);
+        if s > e || e > len {
+            return None;
+        }
+        spans.push((s, e, te.new_text.clone()));
+    }
+    spans.sort_by_key(|(s, _, _)| *s);
+    // Overlap check on the sorted spans (a zero-width insert sharing an endpoint is allowed).
+    for w in spans.windows(2) {
+        let (_, e0, _) = &w[0];
+        let (s1, _, _) = &w[1];
+        if s1 < e0 {
+            return None;
+        }
+    }
+    // Apply last-first.
+    let mut out = text.to_string();
+    for (s, e, nt) in spans.into_iter().rev() {
+        out.replace_range(s..e, &nt);
+    }
+    Some(out)
+}
+
 /// Build the `source.fixAll` aggregate action: ONE [`CodeActionKind::SOURCE_FIX_ALL`] action whose
 /// edit bundles only the DETERMINISTIC, auto-applicable fixes — the `_`-prefix rename and the
 /// `@onready` insertion — for every fixable diagnostic in `context.diagnostics`.
@@ -1065,24 +1292,32 @@ fn build_fix_all(state: &mut ServerState, params: &CodeActionParams) -> Option<C
         let Some(code) = diag_warning_code(diag) else {
             continue;
         };
+        // Each candidate goes through the SAME structural gates AND the ERROR BACKSTOP as the
+        // interactive offer — fixAll fires silently on save, so an ungated path here would apply a
+        // corrupting edit with no user interaction (the blocker class this gate closes).
         match code.as_str() {
             "UNUSED_VARIABLE" | "UNUSED_PARAMETER" => {
                 if let Some(anchor) = underscore_decl_anchor(state, &uri, diag) {
-                    let data = UnderscorePrefixData::new(&uri, anchor);
-                    if let Some(edit) = build_underscore_prefix_edit(state, &data) {
-                        edits.push(edit);
+                    if let Some(expected_name) = identifier_name_at(state, &uri, anchor) {
+                        let data = UnderscorePrefixData::new(&uri, anchor, expected_name);
+                        if let Some(edit) = build_underscore_prefix_edit(state, &data) {
+                            if edit_is_safe(state, &uri, &edit) {
+                                edits.push(edit);
+                            }
+                        }
                     }
                 }
             }
             "GET_NODE_DEFAULT_WITHOUT_ONREADY" => {
-                // Re-run the @export refuse-gate (same as the per-diagnostic offer).
                 if let Some((var_line, has_export, _, _)) =
                     enclosing_variable_facts(state, &uri, diag)
                 {
                     if !has_export {
                         let data = AddOnreadyData::new(&uri, var_line);
                         if let Some(edit) = build_add_onready_edit(state, &data) {
-                            edits.push(edit);
+                            if edit_is_safe(state, &uri, &edit) {
+                                edits.push(edit);
+                            }
                         }
                     }
                 }
@@ -1091,6 +1326,11 @@ fn build_fix_all(state: &mut ServerState, params: &CodeActionParams) -> Option<C
         }
     }
     let merged = merge_workspace_edits(state, &uri, edits)?;
+    // Final guard: re-analyze the AGGREGATE once (each fix is individually safe, but a combination
+    // could in principle interact). Refuse the whole aggregate rather than ship a corrupting save fix.
+    if !edit_is_safe(state, &uri, &merged) {
+        return None;
+    }
     Some(CodeAction {
         title: "Fix all auto-fixable warnings".to_string(),
         kind: Some(CodeActionKind::SOURCE_FIX_ALL),

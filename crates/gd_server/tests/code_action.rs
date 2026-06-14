@@ -1863,3 +1863,121 @@ fn fix_all_excludes_onready_with_export() {
     );
     shutdown(&client, t);
 }
+
+// ---------------------------------------------------------------------------------------------------
+// ERROR-backstop regression tests (corruption blockers caught by the adversarial review)
+// ---------------------------------------------------------------------------------------------------
+
+/// REGRESSION (blocker — @onready on a non-Node class): `extends Object` (NOT Node-derived) with a
+/// bare `get_node(...)` default fires GET_NODE_DEFAULT_WITHOUT_ONREADY (which keys on initializer
+/// shape, no node-ness gate), but adding `@onready` would induce the hard error
+/// `"@onready" can only be used in classes that inherit "Node"`. The ERROR BACKSTOP must WITHHOLD the
+/// `@onready` fix (only the suppression remains).
+#[test]
+fn add_onready_refused_on_non_node_class() {
+    const SRC: &str =
+        "extends Object\n\nvar n = get_node(\"Child\")\n\nfunc f() -> void:\n\tprint(0)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diag_with_warning(&diags, "GET_NODE_DEFAULT_WITHOUT_ONREADY");
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "@onready").is_none(),
+        "adding @onready to a non-Node class would induce a hard error — the ERROR backstop must \
+         REFUSE it; got titles {:?}",
+        action_titles(&actions)
+    );
+    // The suppression is still available (it never induces an error).
+    assert!(
+        find_action(&actions, "Ignore").is_some(),
+        "the suppression must remain; got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
+
+/// REGRESSION (blocker — `_`-prefix hijacks a forward-referenced member): `print(y)` (before the local
+/// declaration) binds to the class MEMBER `var y = 0`; `var y = 1` is the unused local. A name-based
+/// rewrite would turn `print(y)` into `print(_y)` — dangling (`Identifier "_y" not declared`). The
+/// ERROR BACKSTOP must WITHHOLD the `_`-prefix fix (only the suppression remains).
+#[test]
+fn underscore_prefix_refused_on_forward_ref_member_hijack() {
+    const SRC: &str = "extends Node\n\nvar y = 0\n\nfunc f() -> void:\n\tprint(y)\n\tvar y = 1\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    // Precondition: the input is valid (warnings only — the corruption would be NET-NEW).
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "precondition: input must be error-free; got {:?}",
+        diags.diagnostics
+    );
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == Some(NumberOrString::String("UNUSED_VARIABLE".to_string()))
+                && d.range.start.line == 6
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the unused local `y` (line 6) must warn; got {:?}",
+                diags.diagnostics
+            )
+        });
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Prefix unused name").is_none(),
+        "renaming the local would hijack the forward-ref `print(y)` (binds to the member) into a \
+         dangling `_y` — the ERROR backstop must REFUSE it; got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
+
+/// REGRESSION (blocker — silent-on-save via source.fixAll): the non-Node `@onready` induction must be
+/// excluded from the `source.fixAll` aggregate too (fixAll applies with zero user interaction). With
+/// only that unsafe candidate present, fixAll offers NOTHING.
+#[test]
+fn fix_all_excludes_unsafe_add_onready_on_non_node_class() {
+    const SRC: &str =
+        "extends Object\n\nvar n = get_node(\"Child\")\n\nfunc f() -> void:\n\tprint(0)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diag_with_warning(&diags, "GET_NODE_DEFAULT_WITHOUT_ONREADY");
+    let actions = request_code_action(
+        &client,
+        10,
+        &uri,
+        Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 5,
+                character: 0,
+            },
+        },
+        vec![diag],
+        Some(vec![CodeActionKind::from("source.fixAll".to_string())]),
+    );
+    assert!(
+        actions.is_empty(),
+        "the unsafe @onready (non-Node) must be excluded from fixAll → nothing offered; got \
+         {actions:?}"
+    );
+    shutdown(&client, t);
+}

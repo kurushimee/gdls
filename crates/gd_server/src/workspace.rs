@@ -542,6 +542,48 @@ impl Workspace {
         result
     }
 
+    /// Analyze a tree/text **without reading or writing either cache** — the M10 (#75) codeAction
+    /// mutation gate's probe. The mutating warning quickfixes apply their candidate edit to an
+    /// in-memory copy of the buffer and re-analyze it to confirm the edit introduces no new ERROR
+    /// (broken code) before OFFERING the fix; that probe must NOT pollute the real file's cached
+    /// analysis (which concurrent readers serve) nor read a stale cache entry.
+    ///
+    /// `path` is the REAL on-disk path (so `file_id` resolves and the cross-file / native-class /
+    /// autoload environment is identical to a normal analyze — node-ness, `extends`, autoload typing
+    /// all resolve correctly), but the result is returned by value and never cached. Same xfile-query
+    /// construction as the cache-miss arm of [`Self::analyze_with_options`]; the only difference is the
+    /// missing cache get/put. Cheap to call once per candidate fix (a mutating-fix lightbulb is an
+    /// acceptable place to pay an analyze).
+    pub fn analyze_ephemeral(&self, path: &Utf8Path, tree: &ParseTree) -> AnalysisResult {
+        let file = self.index.file_id(path);
+        let script_path = path.file_name().unwrap_or_default();
+        let autoload_map: rustc_hash::FxHashMap<String, gd_project::FileId> = self
+            .project
+            .autoloads
+            .iter()
+            .filter_map(|a| {
+                let p = self.project.autoload_script_path(&a.name)?;
+                let fid = self.index.resolve_res_path(&p)?;
+                Some((a.name.clone(), fid))
+            })
+            .collect();
+        let xfile = WorkspaceXFileQuery::new(
+            &self.index,
+            &self.native,
+            &self.analysis_cache,
+            autoload_map,
+        );
+        gd_analyze::analyze_with_options(
+            tree,
+            file,
+            script_path,
+            &self.native,
+            &xfile,
+            &self.policy,
+            gd_analyze::AnalyzeOptions::default(),
+        )
+    }
+
     /// Drop a URI's cached parse and analysis (on `didClose`).
     pub fn forget(&mut self, key: &CanonicalKey) {
         // `LruCache::pop` is the spelling for "remove by key, return the removed value"; it
