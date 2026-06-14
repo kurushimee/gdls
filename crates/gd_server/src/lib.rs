@@ -27,6 +27,7 @@ pub mod logging;
 mod native_render;
 mod progress;
 mod router;
+mod semantic_tokens;
 mod server;
 mod signature_help;
 mod stubs;

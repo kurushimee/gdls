@@ -145,6 +145,26 @@ pub(crate) struct ClientCaps {
     /// changed). Absent ⇒ `false` ⇒ the legacy `changes` URI→edits map (no version), which every
     /// client accepts. Exactly one of the two fields is populated; the other is `None`.
     pub(crate) workspace_edit_document_changes: bool,
+    /// The M10 (#72) semanticTokens gates, captured under `textDocument.semanticTokens` +
+    /// `workspace.semanticTokens`. Grouped in a sub-struct like [`CompletionCaps`] so the handlers
+    /// read `state.caps.semantic_tokens.<gate>`.
+    pub(crate) semantic_tokens: SemanticTokensCaps,
+}
+
+/// The `textDocument.semanticTokens` + `workspace.semanticTokens` client capabilities gdls projects
+/// every semantic-token emission against (M10 #72). Every field has a documented absent-default so a
+/// minimal/Godot-unaware client still gets standard-legend coloring — generic-LSP-first (#30).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SemanticTokensCaps {
+    /// The intersection of the client's advertised `tokenTypes`/`tokenModifiers` with gdls's own
+    /// standard legend: gdls never emits a type/modifier index the client didn't declare (LSP 3.17).
+    /// An absent / empty client legend yields [`crate::semantic_tokens::ClientLegend::full`] (gdls's
+    /// own legend; every standard name is universally understood — rust-analyzer does the same).
+    pub(crate) legend: crate::semantic_tokens::ClientLegend,
+    /// `workspace.semanticTokens.refreshSupport` — gates the server→client
+    /// `workspace/semanticTokens/refresh` request. When absent the refresh is never sent (the
+    /// client can't consume it); the client re-requests tokens on its own edit cadence instead.
+    pub(crate) refresh_support: bool,
 }
 
 /// The `textDocument.completion` client capabilities gdls projects each item against (M8 #64).
@@ -281,6 +301,38 @@ impl ClientCaps {
                 .and_then(|w| w.workspace_edit.as_ref())
                 .and_then(|w| w.document_changes)
                 .unwrap_or(false),
+            semantic_tokens: SemanticTokensCaps::negotiate(caps),
+        }
+    }
+}
+
+impl SemanticTokensCaps {
+    /// Walk `textDocument.semanticTokens` (the advertised legend) + `workspace.semanticTokens`
+    /// (refresh support), mirroring the optional-path convention the rest of [`ClientCaps::negotiate`]
+    /// uses. An absent `semanticTokens` capability yields the permissive default legend
+    /// ([`crate::semantic_tokens::ClientLegend::full`]) and no refresh — a client that didn't opt in
+    /// still gets standard-legend coloring, just no server-pushed refresh.
+    fn negotiate(caps: &lsp_types::ClientCapabilities) -> Self {
+        let legend = caps
+            .text_document
+            .as_ref()
+            .and_then(|t| t.semantic_tokens.as_ref())
+            .map(|s| {
+                crate::semantic_tokens::ClientLegend::from_client(
+                    &s.token_types,
+                    &s.token_modifiers,
+                )
+            })
+            .unwrap_or_default();
+        let refresh_support = caps
+            .workspace
+            .as_ref()
+            .and_then(|w| w.semantic_tokens.as_ref())
+            .and_then(|s| s.refresh_support)
+            .unwrap_or(false);
+        SemanticTokensCaps {
+            legend,
+            refresh_support,
         }
     }
 }
@@ -379,6 +431,10 @@ pub(crate) enum OutboundKind {
     /// acknowledgment-only (success logs at debug; an error reply means the session runs on the
     /// native watcher alone, which stays armed regardless).
     RegisterWatchedFiles,
+    /// M10 (#72): a `workspace/semanticTokens/refresh` request — the response is acknowledgment-only
+    /// (the client re-requests tokens for its visible documents). Sent after an index-wide change
+    /// (native DB reload / warm-start adoption) where every document's tokens may have shifted.
+    SemanticTokensRefresh,
 }
 
 /// All mutable server state for one session.
@@ -443,6 +499,23 @@ pub struct ServerState {
     /// keyed by the dump's content hash, so a mid-session dump adoption invalidates it
     /// naturally.
     pub(crate) stub_cache: crate::stubs::StubCache,
+    /// M10 (#72): per-URI semantic-tokens result cache, for `semanticTokens/full/delta`. Maps a
+    /// document URI to the last result id gdls minted for it plus the token array it returned. A
+    /// `full/delta` request whose `previous_result_id` matches the stored id diffs against the stored
+    /// array; an unknown id (the client's record and ours diverged) falls back to a fresh `full`.
+    /// Per-session, in-memory only (rebuilt on the next `full`); never persisted.
+    pub(crate) semantic_tokens_cache: FxHashMap<Uri, SemanticTokensCacheEntry>,
+    /// M10 (#72): monotonic counter minting `semanticTokens` result ids. A new `full` (or a delta
+    /// fall-back) stamps `"st-{n}"`; the id is opaque to the client and only used to correlate the
+    /// next delta request.
+    pub(crate) semantic_tokens_result_seq: u64,
+}
+
+/// M10 (#72): one entry of [`ServerState::semantic_tokens_cache`] — the last result id + token array
+/// gdls returned for a document, so the next `full/delta` can diff against it.
+pub(crate) struct SemanticTokensCacheEntry {
+    pub(crate) result_id: String,
+    pub(crate) tokens: Vec<lsp_types::SemanticToken>,
 }
 
 /// Build and run the server on stdio. This is the binary entry point's worker.
@@ -655,6 +728,8 @@ fn serve_inner(
         memory_pressure: MemoryPressure::Normal,
         outbound: FxHashMap::default(),
         stub_cache: crate::stubs::StubCache::default(),
+        semantic_tokens_cache: FxHashMap::default(),
+        semantic_tokens_result_seq: 0,
     };
 
     // M7 (#60): the one dynamic registration, sent once the session state exists (the
@@ -747,6 +822,9 @@ fn serve_inner(
                             // spinner. The republish below is the user-visible bulk anyway.
                             let _progress = server_progress(&state, "Reloading Godot API");
                             republish_all_open_buffers(&mut state);
+                            // M10 (#72): the native DB shifted (a class may have become native /
+                            // gained members) — ask the client to re-request semantic tokens.
+                            send_semantic_tokens_refresh(&mut state);
                             // The warm-start cache key includes the native DB; re-save so the
                             // NEXT session warm-loads instead of cold-indexing on key mismatch.
                             state.workspace.save_cache();
@@ -1150,6 +1228,37 @@ fn handle_outbound_response(state: &mut ServerState, resp: Response) {
             ),
             None => log::debug!("client acknowledged the didChangeWatchedFiles registration"),
         },
+        OutboundKind::SemanticTokensRefresh => match &resp.error {
+            Some(err) => log::debug!(
+                "client declined workspace/semanticTokens/refresh ({}); it will re-request on its \
+                 own cadence",
+                err.message
+            ),
+            None => log::debug!("client acknowledged the semanticTokens refresh"),
+        },
+    }
+}
+
+/// M10 (#72): ask the client to re-request semantic tokens for its visible documents — sent after an
+/// index-wide change (native DB reload / warm-start adoption) that may have shifted every document's
+/// classification (e.g. a class that became native, a newly-resolved member). Gated on the client's
+/// `workspace.semanticTokens.refreshSupport`; a no-op (never sent) otherwise. Fire-and-forget: the
+/// response is acknowledgment-only (correlated to [`OutboundKind::SemanticTokensRefresh`]).
+fn send_semantic_tokens_refresh(state: &mut ServerState) {
+    if !state.caps.semantic_tokens.refresh_support {
+        return;
+    }
+    let id = state.shared.next_outgoing_id();
+    state
+        .outbound
+        .insert(id.clone(), OutboundKind::SemanticTokensRefresh);
+    let req = Request {
+        id,
+        method: "workspace/semanticTokens/refresh".to_string(),
+        params: serde_json::Value::Null,
+    };
+    if state.sender.send(Message::Request(req)).is_err() {
+        log::warn!("workspace/semanticTokens/refresh send failed (client disconnected?)");
     }
 }
 
@@ -1362,6 +1471,8 @@ fn apply_reaction_batch(
         let _progress = server_progress(state, "Reloading Godot API");
         state.workspace.reload_project_and_native(&state.options);
         republish_all_open_buffers(state);
+        // M10 (#72): project/native surface changed → re-request semantic tokens for visible docs.
+        send_semantic_tokens_refresh(state);
     } else if native_changed {
         log::info!(
             "watcher: extension_api.json changed; reloading native DB (coalesced for the batch)"
@@ -1374,6 +1485,8 @@ fn apply_reaction_batch(
             // flash a spinner. The republish below is the user-visible bulk anyway.
             let _progress = server_progress(state, "Reloading Godot API");
             republish_all_open_buffers(state);
+            // M10 (#72): native DB changed → re-request semantic tokens for visible docs.
+            send_semantic_tokens_refresh(state);
             // The warm-start cache key includes the native DB — re-save so the next session
             // warm-loads against the new key. (The background-dump completion arm does the
             // same; whichever path adopts first wins, the other dedupes by content hash.)
@@ -1837,6 +1950,24 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         // served even at Hard memory pressure (not in the `analyze_using` shed set), exactly like
         // foldingRange.
         color_provider: Some(ColorProviderCapability::Simple(true)),
+        // M10 (#72): semanticTokens. The legend is gdls's fixed STANDARD-only legend (10 standard
+        // token types + 6 standard modifiers — ZERO custom names; this is the #30 highlighting
+        // target). `full: Delta{delta: true}` advertises both `semanticTokens/full` and
+        // `.../full/delta` (10k-line files need delta); `range: true` advertises
+        // `semanticTokens/range` (parse-priced, served even at Hard memory pressure). The full/delta
+        // requests are analysis-priced and shed at Hard pressure; range stays served. The legend is
+        // advertised ALWAYS at full width (stable wire indices for delta correlation); per-client
+        // legend intersection happens at emit time, never by shrinking the advertised legend.
+        semantic_tokens_provider: Some(
+            lsp_types::SemanticTokensServerCapabilities::SemanticTokensOptions(
+                lsp_types::SemanticTokensOptions {
+                    work_done_progress_options: Default::default(),
+                    legend: crate::semantic_tokens::legend(),
+                    range: Some(true),
+                    full: Some(lsp_types::SemanticTokensFullOptions::Delta { delta: Some(true) }),
+                },
+            ),
+        ),
         // M9 (#66): rename + prepareRename. `prepare_provider: true` advertises that the client may
         // pre-flight a rename with `textDocument/prepareRename` (range + placeholder); the rename
         // itself reuses the `references` resolution to collect every edit site, validates the new
@@ -2068,6 +2199,13 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             // Hard memory pressure with ContentModified exactly like `references`.
             | "textDocument/rename"
             | "textDocument/prepareRename"
+            // M10 (#72): `semanticTokens/full` + `.../full/delta` re-classify the whole document
+            // against a fresh `analyze` (member/native/enum/static precision) — analysis-priced, so
+            // they shed at Hard memory pressure with ContentModified like hover. `semanticTokens/
+            // range` is intentionally ABSENT: it classifies against `cached_analysis` only (never a
+            // fresh analyze) and must stay served at Hard pressure, exactly like foldingRange.
+            | "textDocument/semanticTokens/full"
+            | "textDocument/semanticTokens/full/delta"
     );
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {
         // Re-record the request as cancelled-cum-shed so the per-handler trace still shows the
@@ -2138,6 +2276,16 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // set above), served like foldingRange.
         "textDocument/documentColor" => handle!(handlers::document_color),
         "textDocument/colorPresentation" => handle!(handlers::color_presentation),
+        // M10 (#72): semanticTokens. `full` returns the whole delta-encoded token set (fresh result
+        // id); `full/delta` returns flat-array edits vs the prior id (or a fresh full on an unknown
+        // id); `range` returns only the intersecting tokens. `full`/`full/delta` are analysis-priced
+        // (in the `analyze_using` shed set above → ContentModified at Hard pressure); `range` is
+        // parse-priced (cached-analysis only) and stays served at Hard pressure, like foldingRange.
+        "textDocument/semanticTokens/full" => handle!(handlers::semantic_tokens_full),
+        "textDocument/semanticTokens/full/delta" => {
+            handle!(handlers::semantic_tokens_full_delta)
+        }
+        "textDocument/semanticTokens/range" => handle!(handlers::semantic_tokens_range),
         // M9 (#66): rename + prepareRename — the fallible arms (a syntactically-valid request may
         // still be REFUSED with a typed error: a native/stub target, or an invalid new name).
         // `prepareRename` returns the identifier range (+ placeholder when the client advertised
@@ -2876,6 +3024,8 @@ mod tests {
             memory_pressure: MemoryPressure::Normal,
             outbound: FxHashMap::default(),
             stub_cache: crate::stubs::StubCache::default(),
+            semantic_tokens_cache: FxHashMap::default(),
+            semantic_tokens_result_seq: 0,
         };
         (state, rx)
     }
@@ -2922,6 +3072,8 @@ mod tests {
             memory_pressure: MemoryPressure::Normal,
             outbound: FxHashMap::default(),
             stub_cache: crate::stubs::StubCache::default(),
+            semantic_tokens_cache: FxHashMap::default(),
+            semantic_tokens_result_seq: 0,
         };
         (state, rx)
     }
@@ -3096,6 +3248,76 @@ mod tests {
         );
     }
 
+    /// M10 (#72): the semanticTokens shed-set contract. `semanticTokens/full` and `.../full/delta`
+    /// re-classify against a fresh `analyze`, so they shed with `ContentModified` (-32801) at Hard
+    /// memory pressure exactly like hover. `semanticTokens/range` classifies against
+    /// `cached_analysis` only (never a fresh analyze) and MUST stay served at Hard pressure, like
+    /// foldingRange — it is deliberately absent from the `analyze_using` set. Driving the dispatch
+    /// shed gate directly (`memory_pressure = Hard`) is the deterministic seam — the RSS pressure
+    /// sampler is `#[cfg(test)]`/`pub(crate)` and can't be forced through the Connection loop, so
+    /// the existing shed set has no integration test either; this mirrors `hover`'s in-crate
+    /// coverage above.
+    #[test]
+    fn hard_pressure_sheds_semantic_tokens_full_and_delta_but_serves_range() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(dir.path().join("project.godot"), "config_version=5\n").unwrap();
+        let (mut state, _rx) = state_on(&root);
+        state.memory_pressure = MemoryPressure::Hard;
+
+        // `full` is analyze-using → shed with ContentModified.
+        let full = Request {
+            id: lsp_server::RequestId::from(1),
+            method: "textDocument/semanticTokens/full".to_string(),
+            params: serde_json::json!({ "textDocument": { "uri": "file:///test/a.gd" } }),
+        };
+        let resp = dispatch_request(&mut state, full);
+        assert_eq!(
+            resp.error.as_ref().map(|e| e.code),
+            Some(ERR_CONTENT_MODIFIED),
+            "semanticTokens/full is analyze-using and must be shed at Hard pressure; got {:?}",
+            resp.error
+        );
+
+        // `full/delta` is analyze-using → shed with ContentModified.
+        let delta = Request {
+            id: lsp_server::RequestId::from(2),
+            method: "textDocument/semanticTokens/full/delta".to_string(),
+            params: serde_json::json!({
+                "textDocument": { "uri": "file:///test/a.gd" },
+                "previousResultId": "st-1"
+            }),
+        };
+        let resp = dispatch_request(&mut state, delta);
+        assert_eq!(
+            resp.error.as_ref().map(|e| e.code),
+            Some(ERR_CONTENT_MODIFIED),
+            "semanticTokens/full/delta is analyze-using and must be shed at Hard pressure; got {:?}",
+            resp.error
+        );
+
+        // `range` is parse-priced (cached-analysis only) → must NOT be shed. No buffer is open, so
+        // the handler returns a null/empty result, but crucially NOT the -32801 shed error.
+        let range = Request {
+            id: lsp_server::RequestId::from(3),
+            method: "textDocument/semanticTokens/range".to_string(),
+            params: serde_json::json!({
+                "textDocument": { "uri": "file:///test/a.gd" },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 0, "character": 0 }
+                }
+            }),
+        };
+        let resp = dispatch_request(&mut state, range);
+        assert_ne!(
+            resp.error.as_ref().map(|e| e.code),
+            Some(ERR_CONTENT_MODIFIED),
+            "semanticTokens/range is parse-priced and must stay served at Hard pressure; got {:?}",
+            resp.error
+        );
+    }
+
     #[test]
     fn hard_pressure_publish_diagnostics_does_not_start_uncached_analysis() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -3261,6 +3483,8 @@ mod tests {
             memory_pressure: MemoryPressure::Normal,
             outbound: FxHashMap::default(),
             stub_cache: crate::stubs::StubCache::default(),
+            semantic_tokens_cache: FxHashMap::default(),
+            semantic_tokens_result_seq: 0,
         };
 
         // Pre-populate the cache via the dev/test debug-insert helpers. Without entries to
