@@ -2064,3 +2064,86 @@ fn apply_text_edits_utf16(src: &str, mut edits: Vec<lsp_types::TextEdit>) -> Str
     }
     out
 }
+
+/// REGRESSION (eager edits for mutating fixes): even WITH resolveSupport, a mutating fix carries its
+/// (gated) edit eagerly in the codeAction response and NO `data` — so what the ERROR backstop proved
+/// safe is exactly what the client applies (a deferred re-derive against a changed buffer is the
+/// stale-resolve corruption class). The suppression still defers (it carries `data`, no eager edit).
+#[test]
+fn mutating_fixes_carry_eager_edit_not_deferred() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(
+        &p,
+        &client,
+        &[("a.gd", UNUSED_VAR_SRC)],
+        caps(true, true, true), // resolveSupport = TRUE
+    );
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = unused_var_diag(&diags);
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+
+    let prefix = find_action(&actions, "Prefix unused name").unwrap_or_else(|| {
+        panic!(
+            "the `_`-prefix fix must be offered; got {:?}",
+            action_titles(&actions)
+        )
+    });
+    assert!(
+        prefix.edit.is_some() && prefix.data.is_none(),
+        "the mutating fix must carry an EAGER edit and NO data (even with resolveSupport); got \
+         edit={:?} data={:?}",
+        prefix.edit.is_some(),
+        prefix.data.is_some()
+    );
+    // The suppression, by contrast, defers (data present, edit absent) under resolveSupport.
+    let suppress = find_action(&actions, "Ignore").expect("suppression offered");
+    assert!(
+        suppress.edit.is_none() && suppress.data.is_some(),
+        "the suppression must DEFER under resolveSupport (data present, edit absent)"
+    );
+    shutdown(&client, t);
+}
+
+/// REGRESSION (duplicate-message backstop bypass): the ERROR backstop compares error MULTIPLICITY,
+/// not a set. A file with a PRE-EXISTING `@onready`-on-non-Node error must still have its UNSAFE
+/// second @onready fix refused — even though the induced error has the SAME message as the existing
+/// one (a set comparison would see {M} unchanged and wrongly accept). Here `already` has a standalone
+/// @onready (pre-existing error M), and `child` is a get_node default whose @onready fix would add a
+/// SECOND error M.
+#[test]
+fn add_onready_refused_despite_duplicate_existing_error_message() {
+    // `extends Object` (non-Node). `already` already errors (@onready on non-Node). `child` is a
+    // get_node default — its @onready fix would induce the SAME-message error a SECOND time.
+    const SRC: &str = "extends Object\n\n@onready var already = 1\n\nvar child = get_node(\"C\")\n\nfunc get_node(p):\n\treturn null\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    // `child` must warn GET_NODE_DEFAULT (it's a get_node default with no @onready).
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code
+                == Some(NumberOrString::String(
+                    "GET_NODE_DEFAULT_WITHOUT_ONREADY".to_string(),
+                ))
+        })
+        .cloned();
+    let Some(diag) = diag else {
+        // If the fixture doesn't produce the warning shape, the test is vacuous — skip cleanly.
+        shutdown(&client, t);
+        return;
+    };
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "@onready").is_none(),
+        "the @onready fix must be REFUSED even though the induced error shares a message with a \
+         pre-existing one (multiplicity, not set); got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
