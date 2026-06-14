@@ -2443,6 +2443,15 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             // it only reads the hint's `data` blob (no fresh analyze), so shedding it would reclaim
             // nothing — mirroring `completionItem/resolve`'s exclusion.
             | "textDocument/inlayHint"
+            // M10 (#75): the MUTATING `codeAction` warning quickfixes run the ERROR backstop — they
+            // apply each candidate edit in memory and re-`analyze` it (and `_`-prefix reuses the
+            // `rename`/`references` engine) to prove the edit introduces no new error before offering
+            // it. That makes `codeAction` (and `codeAction/resolve`, which re-runs the backstop at
+            // resolve) analysis-priced, so both shed at Hard memory pressure with ContentModified like
+            // `rename`. A shed mutating-fix lightbulb is the right trade under pressure — the
+            // suppression-only phase-4 path was parse-only, but the backstop changed the pricing.
+            | "textDocument/codeAction"
+            | "codeAction/resolve"
     );
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {
         // Re-record the request as cancelled-cum-shed so the per-handler trace still shows the
