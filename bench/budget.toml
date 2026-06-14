@@ -26,6 +26,19 @@ observed_ms = 3340
 # start; subsequent reconciles fire only on watcher overflow (need_rescan).
 observed_ms = 783
 
+[scene_index]
+# M11 (#76): SceneIndex::build -- a dedicated `.tscn`/`.scn` walk (shared exclusion set) that
+# parses each scene's node/script/instance relations into the scene index, built in parallel with
+# the script cold index. ESTIMATED, NOT measured on the 2338-file calibration project above: that
+# tree's `.tscn` count + per-scene parse cost was not captured in the M5 calibration walk (which
+# predates the scene index). The scene parser is a single linear pass per file (logical-line merge
+# + attr tokenize, no cross-file work at build time -- instance resolution is lazy/on-demand), so
+# it is far cheaper per file than the GDScript frontend's tokenize+parse+interface-extract; the
+# scene count is also typically a fraction of the `.gd` count. The operator's calibration walk
+# MUST recalibrate this against the real project's scene corpus. Basis for the placeholder: ~118
+# scenes / 2129 nodes parsed in well under cold_index's 3340 ms on a comparable tree.
+observed_ms = 120
+
 [warm_analyze]
 # 702 samples across the calibration walk (45 didOpen events each fanning out to ~16 cross-file
 # analyses via member-initializer xrefs + dirty-deps walk). p50 is the dominant case (cache hit

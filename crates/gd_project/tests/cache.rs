@@ -23,6 +23,13 @@ fn make_project(dir: &tempfile::TempDir) -> Utf8PathBuf {
     // A couple of real .gd files for the cold-indexer to find.
     fs::write(root.join("a.gd"), "extends Node\n").expect("write a.gd");
     fs::write(root.join("b.gd"), "class_name MyBase\nextends Node\n").expect("write b.gd");
+    // A .tscn attaching a.gd, so the SceneIndex has a real relation to round-trip through the cache.
+    fs::write(
+        root.join("a.tscn"),
+        "[gd_scene format=3]\n\n[ext_resource type=\"Script\" path=\"res://a.gd\" id=\"1\"]\n\n\
+         [node name=\"Root\" type=\"Node\"]\nscript = ExtResource(\"1\")\n",
+    )
+    .expect("write a.tscn");
     root
 }
 
@@ -77,6 +84,7 @@ fn round_trip_warm_equivalent_to_cold() {
 
     // Build a cold index and snapshot it.
     let cold = Index::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root);
     let cold_file_count = cold.file_count();
     assert!(
         cold_file_count >= 2,
@@ -85,7 +93,7 @@ fn round_trip_warm_equivalent_to_cold() {
 
     let key = make_key(&root);
     let files = stat_gd_files(&root);
-    cache::save(&root, &cold, &files, key.clone());
+    cache::save(&root, &cold, &scenes, &files, key.clone());
 
     // The .gdls dir should exist, the cache file should be there.
     let cache_path = root.join(".gdls").join(cache::cache_file_name());
@@ -98,6 +106,25 @@ fn round_trip_warm_equivalent_to_cold() {
     assert!(
         loaded.index.cache_equivalent(&cold),
         "warm-started index must equal the cold-built index"
+    );
+
+    // Scene index round-trips through the cache: a.tscn and its script reverse-map edge survive.
+    assert_eq!(scenes.len(), 1, "cold scene index should have found a.tscn");
+    assert_eq!(
+        loaded.scenes.len(),
+        scenes.len(),
+        "warm scene index must equal the cold-built scene index"
+    );
+    assert!(
+        loaded.scenes.scene("res://a.tscn").is_some(),
+        "warm scene index must contain a.tscn"
+    );
+    assert!(
+        loaded
+            .scenes
+            .scenes_attaching_script("res://a.gd")
+            .any(|res| res == "res://a.tscn"),
+        "warm scene index must rebuild the script→scene reverse-map edge"
     );
 
     // Bonus: rebuild cold again, confirm file_count unchanged (the cache file didn't re-enter the index).
@@ -120,8 +147,9 @@ fn corrupt_file_yields_none_and_quarantines() {
 
     let key = make_key(&root);
     let cold = Index::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root);
     let files = stat_gd_files(&root);
-    cache::save(&root, &cold, &files, key.clone());
+    cache::save(&root, &cold, &scenes, &files, key.clone());
 
     let cache_path = root.join(".gdls").join(cache::cache_file_name());
     assert!(cache_path.exists());
@@ -161,8 +189,9 @@ fn key_mismatch_yields_none_without_quarantine() {
 
     let save_key = make_key(&root);
     let cold = Index::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root);
     let files = stat_gd_files(&root);
-    cache::save(&root, &cold, &files, save_key);
+    cache::save(&root, &cold, &scenes, &files, save_key);
 
     // Load with a different gdls_version → key mismatch.
     let mismatched_key = CacheKey {
@@ -201,6 +230,7 @@ fn file_id_stable_across_round_trip() {
     let root = make_project(&tmp);
 
     let cold = Index::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root);
     let a_path = root.join("a.gd");
     let b_path = root.join("b.gd");
 
@@ -209,7 +239,7 @@ fn file_id_stable_across_round_trip() {
 
     let key = make_key(&root);
     let files = stat_gd_files(&root);
-    cache::save(&root, &cold, &files, key.clone());
+    cache::save(&root, &cold, &scenes, &files, key.clone());
 
     let loaded = cache::load(&root, &key).expect("load");
 
@@ -237,11 +267,12 @@ fn stat_delta_detects_size_change() {
     let root = make_project(&tmp);
 
     let cold = Index::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root);
     let key = make_key(&root);
 
     // Snapshot stats before save.
     let files_before = stat_gd_files(&root);
-    cache::save(&root, &cold, &files_before, key.clone());
+    cache::save(&root, &cold, &scenes, &files_before, key.clone());
 
     let loaded = cache::load(&root, &key).expect("load");
 
@@ -311,11 +342,12 @@ fn concurrent_writers_never_corrupt_the_cache() {
 
     // Pre-build a cold index and key to reuse across threads.
     let cold = Index::build(&root);
+    let scenes = Arc::new(gd_project::SceneIndex::build(&root));
     let key = Arc::new(make_key(&root));
     let files = Arc::new(stat_gd_files(&root));
 
     // Give the writers a head start — save once before the reader starts.
-    cache::save(&root, &cold, &files, (*key).clone());
+    cache::save(&root, &cold, &scenes, &files, (*key).clone());
 
     let barrier = Arc::new(Barrier::new(3));
     let stop = Arc::new(AtomicBool::new(false));
@@ -327,6 +359,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
     // Writer thread factory.
     let make_writer = |root: Arc<Utf8PathBuf>,
                        cold: Arc<Index>,
+                       scenes: Arc<gd_project::SceneIndex>,
                        files: Arc<Vec<FileStat>>,
                        key: Arc<CacheKey>,
                        barrier: Arc<Barrier>,
@@ -335,7 +368,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
             barrier.wait();
             let mut iters = 0usize;
             while !stop.load(Ordering::Relaxed) || iters < 50 {
-                cache::save(&root, &cold, &files, (*key).clone());
+                cache::save(&root, &cold, &scenes, &files, (*key).clone());
                 iters += 1;
                 if iters >= 200 {
                     break;
@@ -349,6 +382,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
     let w1 = make_writer(
         root.clone(),
         cold.clone(),
+        scenes.clone(),
         files.clone(),
         key.clone(),
         barrier.clone(),
@@ -357,6 +391,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
     let w2 = make_writer(
         root.clone(),
         cold.clone(),
+        scenes.clone(),
         files.clone(),
         key.clone(),
         barrier.clone(),

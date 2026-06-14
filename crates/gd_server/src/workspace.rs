@@ -11,7 +11,7 @@ use std::rc::Rc;
 use camino::{Utf8Path, Utf8PathBuf};
 use gd_analyze::{code_from_name, AnalysisResult, StrictProfile, StrictSettings, WarnPolicy};
 use gd_project::cache::{self, FileStat};
-use gd_project::{Index, ProjectModel};
+use gd_project::{Index, ProjectModel, SceneIndex};
 use gd_syntax::{ParseResult, ParseTree};
 use gd_types::{DocXmlError, NativeDb};
 use lru::LruCache;
@@ -127,6 +127,12 @@ pub struct Workspace {
     /// [`Self::reconcile`] as files are added/modified/removed so the table stays current
     /// throughout the session. Consumed by [`Self::save_cache`] → `gd_project::cache::save`.
     pub(crate) stat_table: FxHashMap<Utf8PathBuf, FileStat>,
+    /// M11 (#76): the project's `.tscn` scene index — node/script/instance relations, keyed by
+    /// `res://` path. Built parallel to [`Self::index`] (scenes aren't `FileId`s; see
+    /// [`gd_project::SceneIndex`]). Persisted/restored via the same warm-start cache. **Phase 1:**
+    /// nothing consumes it yet — `$`/`%` typing stays the permissive `gd_analyze` deferred-node
+    /// seam; this field is the foundation Phase 2 scene typing reads.
+    pub(crate) scenes: SceneIndex,
 }
 
 impl Workspace {
@@ -172,7 +178,7 @@ impl Workspace {
 
         // Attempt warm-start: load the persisted cache and stat-diff it against disk.
         // On any failure (missing file, key mismatch, verify failure) fall through to cold build.
-        let (index, stat_table) = match cache::load(root, &key) {
+        let (index, scenes, stat_table) = match cache::load(root, &key) {
             Some(loaded) => {
                 log::info!(
                     "cache: warm-start candidate found; stat-diffing {} cached files",
@@ -181,12 +187,15 @@ impl Workspace {
                 warm_index_from_cache(loaded, root, sink)
             }
             None => {
-                // Cold build — then sweep all interned files to populate the stat table.
+                // Cold build — then sweep all interned files to populate the stat table. The scene
+                // index is cold-built in parallel (its own `.tscn` walk, shared exclusion set).
                 let idx = Index::build_with_progress(root, &mut |done, total| {
                     sink.progress(done, Some(total), "parsing scripts");
                 });
-                let stats = build_stat_table_from_index(&idx);
-                (idx, stats)
+                let scene_idx = SceneIndex::build(root);
+                let mut stats = build_stat_table_from_index(&idx);
+                add_scene_stats(&mut stats, &scene_idx, root);
+                (idx, scene_idx, stats)
             }
         };
 
@@ -222,6 +231,7 @@ impl Workspace {
                     .expect("invariant: the dedupe cache capacity is a nonzero constant"),
             ),
             stat_table,
+            scenes,
         }
     }
 
@@ -309,7 +319,7 @@ impl Workspace {
             .filter(|(path, _)| !open_paths.contains(*path))
             .map(|(_, stat)| stat.clone())
             .collect();
-        cache::save(root, &self.index, &files, key);
+        cache::save(root, &self.index, &self.scenes, &files, key);
     }
 
     /// Parse `text`, reusing the cached result when the content fingerprint is unchanged. Both
@@ -733,6 +743,45 @@ impl Workspace {
         self.stat_table.remove(path);
     }
 
+    /// M11 (#76): the project's `.tscn` scene index (read-only). Phase 2 scene typing and any
+    /// scene-aware LSP query reads through here; Phase 1 exposes it so tests can assert the index
+    /// stays live across watcher events.
+    #[must_use]
+    pub fn scenes(&self) -> &SceneIndex {
+        &self.scenes
+    }
+
+    /// M11 (#76): re-index a `.tscn` scene from disk into the [`SceneIndex`] (watcher-driven). The
+    /// scene is keyed by its `res://` path; reading/parsing failures are logged and skipped (never
+    /// crash). The stat table is refreshed so the next warm-load can skip an unchanged scene. Phase
+    /// 1: this keeps the scene index live but does NOT re-diagnose attached scripts (no analyzer
+    /// consumption yet).
+    pub fn reindex_scene(&mut self, path: &Utf8Path) {
+        let Some(res) = self.project.path_to_res(path) else {
+            log::debug!("reindex_scene: {path} is not under the project root; skipping");
+            return;
+        };
+        match std::fs::read_to_string(path.as_std_path()) {
+            Ok(text) => {
+                self.scenes.reindex(&res, &text);
+                self.update_stat_from_disk(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Vanished between event and read (transient delete / cross-mount rename source).
+                self.remove_scene(path);
+            }
+            Err(e) => log::warn!("reindex_scene: cannot read {path}: {e}; keeping prior scene"),
+        }
+    }
+
+    /// M11 (#76): drop a deleted `.tscn` from the [`SceneIndex`] and its stat entry.
+    pub fn remove_scene(&mut self, path: &Utf8Path) {
+        if let Some(res) = self.project.path_to_res(path) {
+            self.scenes.remove(&res);
+        }
+        self.stat_table.remove(path);
+    }
+
     /// Re-read `project.godot` from disk (file changed via the M4 watcher) and rebuild the policy
     /// + re-load the native DB (because the gdextensions list is in `ProjectModel` and the doc-XML
     ///   merge step reads them). Cheaper than a full re-`load`: keeps the index and parse cache.
@@ -895,6 +944,11 @@ impl Workspace {
         let mut skipped_unreadable = 0usize;
         let mut skipped_non_utf8 = 0usize;
         let mut walked_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
+        // M11 (#76): scenes get the same stat-diff treatment as scripts on this path. Without it,
+        // the watcher-overflow (`need_rescan`) and disabled-watcher liveness-tick recovery paths —
+        // both routed through this reconcile — would recover drifted `.gd` but leave `.tscn` stale
+        // (the scene index has no other backstop on those paths; cold/warm/per-event all handle it).
+        let mut walked_scene_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
 
         let walker = WalkDir::new(root.as_std_path())
             .into_iter()
@@ -937,6 +991,30 @@ impl Workspace {
                 );
                 continue;
             };
+            // M11 (#76): a `.tscn` is reconciled into the scene index (never the script interner).
+            // Same stat-diff shape as scripts: re-parse only when (size, mtime_ns) changed vs the
+            // stat table. The stat table is shared (scenes were added to it at cold/warm build).
+            if gd_project::is_scene_path(p) {
+                let path = gd_project::normalize_path(p);
+                walked += 1;
+                walked_scene_paths.insert(path.clone());
+                sink.progress(walked, None, "reconciling scenes");
+                let new_stat = entry
+                    .metadata()
+                    .ok()
+                    .map(|m| cache::stat_from_metadata(path.clone(), &m));
+                let stat_changed = match (self.stat_table.get(&path), &new_stat) {
+                    (None, _) => true,
+                    (Some(_), None) => true,
+                    (Some(old), Some(new)) => old.size != new.size || old.mtime_ns != new.mtime_ns,
+                };
+                if stat_changed {
+                    // `reindex_scene` reads the file, updates the scene index, and refreshes the
+                    // stat entry; on a vanished file it routes to `remove_scene` (never crash).
+                    self.reindex_scene(&path);
+                }
+                continue;
+            }
             if p.extension() != Some("gd") {
                 continue;
             }
@@ -1038,6 +1116,28 @@ impl Workspace {
             for path in &removed_paths {
                 self.index.txn(path, |idx| idx.on_file_removed(path));
                 self.stat_table.remove(path);
+            }
+            // M11 (#76): parallel scene removal pass — a `.tscn` in the index but absent from the
+            // walk was deleted while the watcher was off/overflowed. Scene keys are res:// paths;
+            // map each back to its absolute path to test against the walked-scene set. Guarded by
+            // the same authoritative-walk check as scripts (this whole branch).
+            let removed_scenes: Vec<String> = self
+                .scenes
+                .iter()
+                .map(|(res, _)| res.to_owned())
+                .filter(|res| {
+                    gd_project::res_to_path(&root, res)
+                        .map(|abs| gd_project::normalize_path(&abs))
+                        .is_none_or(|abs| {
+                            !walked_scene_paths.contains(&abs) && !open_paths.contains(&abs)
+                        })
+                })
+                .collect();
+            for res in &removed_scenes {
+                self.scenes.remove(res);
+                if let Some(abs) = gd_project::res_to_path(&root, res) {
+                    self.stat_table.remove(&gd_project::normalize_path(&abs));
+                }
             }
             n
         };
@@ -1149,8 +1249,12 @@ fn warm_index_from_cache(
     loaded: gd_project::cache::LoadedCache,
     root: &Utf8Path,
     sink: &mut dyn crate::progress::ProgressSink,
-) -> (Index, FxHashMap<Utf8PathBuf, FileStat>) {
-    let gd_project::cache::LoadedCache { mut index, files } = loaded;
+) -> (Index, SceneIndex, FxHashMap<Utf8PathBuf, FileStat>) {
+    let gd_project::cache::LoadedCache {
+        mut index,
+        files,
+        mut scenes,
+    } = loaded;
 
     // Build a lookup table from the cached file stats.
     let mut stat_table: FxHashMap<Utf8PathBuf, FileStat> =
@@ -1200,7 +1304,9 @@ fn warm_index_from_cache(
             log::warn!("warm_index: skipping non-UTF-8 path under {root}");
             continue;
         };
-        if p.extension() != Some("gd") {
+        let is_gd = p.extension() == Some("gd");
+        let is_scene = gd_project::is_scene_path(p);
+        if !is_gd && !is_scene {
             continue;
         }
         let path = gd_project::normalize_path(p);
@@ -1226,21 +1332,32 @@ fn warm_index_from_cache(
             // Re-read and re-parse this file.
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
-                    let tree = gd_syntax::parse(&text).tree;
-                    let iface = gd_project::extract_interface(&tree);
-                    let is_added = index.interface_of(&path).is_none();
-                    index.txn(&path, |idx| {
-                        idx.on_file_changed(&path, iface);
-                    });
+                    if is_scene {
+                        // `.tscn` → the scene index ONLY (never the script interner). Key by the
+                        // file's res:// path so it matches the cold-built scene index's keys.
+                        if let Some(res) = gd_project::path_to_res(root, &path) {
+                            scenes.reindex(&res, &text);
+                        }
+                        reparsed += 1;
+                    } else {
+                        // `.gd` → the script index, exactly as before. `is_added` is checked before
+                        // the txn (which would otherwise have already interned the interface).
+                        let is_added = index.interface_of(&path).is_none();
+                        let tree = gd_syntax::parse(&text).tree;
+                        let iface = gd_project::extract_interface(&tree);
+                        index.txn(&path, |idx| {
+                            idx.on_file_changed(&path, iface);
+                        });
+                        if is_added {
+                            added += 1;
+                        } else {
+                            reparsed += 1;
+                        }
+                    }
                     if let Some(s) = new_stat {
                         stat_table.insert(path.clone(), s);
                     } else {
                         stat_table.remove(&path);
-                    }
-                    if is_added {
-                        added += 1;
-                    } else {
-                        reparsed += 1;
                     }
                 }
                 Err(e) => {
@@ -1267,6 +1384,26 @@ fn warm_index_from_cache(
             index.txn(path, |idx| idx.on_file_removed(path));
             stat_table.remove(path);
         }
+        // Parallel removal pass for scenes: a `.tscn` cached but no longer on disk is dropped from
+        // the scene index. Scene keys are res:// paths, so map each back to its absolute path to
+        // test against the walked set.
+        let removed_scenes: Vec<String> = scenes
+            .iter()
+            .map(|(res, _)| res.to_owned())
+            .filter(|res| {
+                gd_project::res_to_path(root, res)
+                    .map(|abs| gd_project::normalize_path(&abs))
+                    .is_none_or(|abs| !walked_paths.contains(&abs))
+            })
+            .collect();
+        for res in &removed_scenes {
+            scenes.remove(res);
+            // Prune the dead stat entry too (mirrors the reconcile removal pass), so a scene
+            // deleted while offline doesn't leave an immortal FileStat that re-persists forever.
+            if let Some(abs) = gd_project::res_to_path(root, res) {
+                stat_table.remove(&gd_project::normalize_path(&abs));
+            }
+        }
         log::info!(
             "warm_index: stat-diff complete: {} unchanged, {} reparsed, {} added, {} removed, \
              {} skipped (unreadable)",
@@ -1289,7 +1426,7 @@ fn warm_index_from_cache(
         );
     }
 
-    (index, stat_table)
+    (index, scenes, stat_table)
 }
 
 /// Build a stat table by iterating all interned files in the index after a cold build.
@@ -1312,6 +1449,30 @@ fn build_stat_table_from_index(index: &Index) -> FxHashMap<Utf8PathBuf, FileStat
         }
     }
     table
+}
+
+/// Add a [`FileStat`] for every indexed scene to `table`, so the warm-start stat-diff re-parses a
+/// `.tscn` edited while gdls was off (the scene index has no `CacheKey` component of its own —
+/// freshness rides this stat table, exactly like scripts). Scenes are keyed by res:// path; map
+/// each back to its absolute path to stat it. A scene whose file vanished between the index build
+/// and this sweep is skipped.
+fn add_scene_stats(
+    table: &mut FxHashMap<Utf8PathBuf, FileStat>,
+    scenes: &SceneIndex,
+    root: &Utf8Path,
+) {
+    for (res, _) in scenes.iter() {
+        let Some(abs) = gd_project::res_to_path(root, res) else {
+            continue;
+        };
+        let key = gd_project::normalize_path(&abs);
+        match std::fs::metadata(abs.as_std_path()) {
+            Ok(meta) => {
+                table.insert(key.clone(), cache::stat_from_metadata(key, &meta));
+            }
+            Err(e) => log::warn!("cold_index: could not stat scene {abs} for cache table: {e}"),
+        }
+    }
 }
 
 /// Project the server's `initializationOptions.strict` (its own enum, kept off the analyzer crate)

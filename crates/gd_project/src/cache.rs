@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 
 use crate::index::{Index, IndexCache};
+use crate::scene_index::{SceneIndex, SceneIndexCache};
 
 // ---------------------------------------------------------------------------
 // Public constants and structs (B4 reads these to construct the cache key).
@@ -49,7 +50,14 @@ use crate::index::{Index, IndexCache};
 /// v5 (M7 #62): `Interface`/`MemberDecl`/`EnumValueDecl` gained `doc` — a v4 cache would
 /// otherwise warm-load doc-less interfaces and hover would silently show no prose until each
 /// file's first edit. One cold re-index per project, self-healing.
-pub const CACHE_FORMAT_VERSION: u32 = 5;
+///
+/// v6 (M11 #76): `CacheFile` gained the `scenes` field (the persisted [`SceneIndex`] — `.tscn`
+/// node/script/instance relations). A v5 cache would deserialize-fail (missing field), so v5 files
+/// are ignored and rebuilt. Deliberately NOT `#[serde(default)]`: a defaulted empty scene index
+/// loaded from an old cache would silently serve a project with no scene relations until each
+/// `.tscn`'s first edit — the same "warm-load serves stale/empty derived state" hazard the v4 note
+/// guards against. One cold re-index per project on upgrade, self-healing.
+pub const CACHE_FORMAT_VERSION: u32 = 6;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
@@ -107,6 +115,12 @@ pub struct LoadedCache {
     pub index: Index,
     /// Per-file (path, size, mtime_ns) snapshot as of the time `save` was called.
     pub files: Vec<FileStat>,
+    /// The deserialized scene index (`.tscn` relations). Rebuilt-on-load reverse maps; see
+    /// [`SceneIndex::from_cache`]. Scene freshness on warm-start rides the same [`FileStat`]
+    /// stat-diff as scripts — `.tscn` entries are included in [`Self::files`], so a scene edited
+    /// while gdls was off is re-parsed by the caller's stat-diff pass (the scene index does not get
+    /// its own validity key; the `CacheKey` only covers binary/native-DB/project.godot state).
+    pub scenes: SceneIndex,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +132,8 @@ struct CacheFile {
     key: CacheKey,
     files: Vec<FileStat>,
     index: IndexCache,
+    /// M11 #76: the persisted scene index (`.tscn` relations). See [`CACHE_FORMAT_VERSION`] v6.
+    scenes: SceneIndexCache,
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +206,13 @@ pub fn project_godot_fingerprint(root: &Utf8Path) -> u64 {
 ///
 /// Write failures are logged at `warn` and return — "never crash" (CLAUDE.md). The worst case is
 /// one cold index on the next launch.
-pub fn save(root: &Utf8Path, index: &Index, files: &[FileStat], key: CacheKey) {
+pub fn save(
+    root: &Utf8Path,
+    index: &Index,
+    scenes: &SceneIndex,
+    files: &[FileStat],
+    key: CacheKey,
+) {
     let dir = root.join(".gdls");
     if let Err(e) = std::fs::create_dir_all(dir.as_std_path()) {
         log::warn!("cache: mkdir .gdls failed: {e}");
@@ -200,6 +222,7 @@ pub fn save(root: &Utf8Path, index: &Index, files: &[FileStat], key: CacheKey) {
         key,
         files: files.to_vec(),
         index: index.to_cache(),
+        scenes: scenes.to_cache(),
     };
     let bytes = match serde_json::to_vec(&cache) {
         Ok(b) => b,
@@ -264,9 +287,16 @@ pub fn load(root: &Utf8Path, expected_key: &CacheKey) -> Option<LoadedCache> {
         return None;
     }
 
+    // The scene index has no structural cross-table invariants to verify (it's a flat map + rebuilt
+    // reverse maps); `from_cache` re-derives the reverse maps from the stored scenes, so a corrupt
+    // scene entry can at worst be a partial-but-valid Scene (parse_scene is total). No quarantine
+    // path needed beyond the whole-file JSON-parse guard above.
+    let scenes = SceneIndex::from_cache(cache.scenes);
+
     Some(LoadedCache {
         index,
         files: cache.files,
+        scenes,
     })
 }
 

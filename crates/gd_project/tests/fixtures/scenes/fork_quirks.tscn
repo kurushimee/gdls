@@ -1,0 +1,14 @@
+[gd_scene format=3 uid="uid://dforkquirks"]
+
+[ext_resource type="Script" path="res://src/forked.gd" id="1"]
+
+[some_future_section foo="bar" id="99"]
+
+[node name="Root" type="Control" unique_id=1088730198]
+script = ExtResource("1")
+
+[node name="100%" type="Button" parent="." index="6" unique_id=746701739 groups=["UIButtons"]]
+unique_name_in_owner = true
+
+[node name="3D Object Tree" type="Tree" parent="." unique_id=365085463]
+weird_unknown_key = Object(Nonsense, "x":1, "y":[1, 2, 3])

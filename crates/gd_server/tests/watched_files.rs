@@ -117,7 +117,7 @@ fn workspace_symbol_names(client: &Connection, id: i32, query: &str) -> String {
 }
 
 /// Registration is sent exactly when offered: with `dynamicRegistration: true` the client
-/// receives one `client/registerCapability` for the five watch globs after `initialized`;
+/// receives one `client/registerCapability` for the six watch globs after `initialized`;
 /// without it, nothing arrives.
 #[test]
 fn registration_sent_iff_dynamic_registration_offered() {
@@ -143,6 +143,7 @@ fn registration_sent_iff_dynamic_registration_offered() {
         globs,
         vec![
             "**/*.gd",
+            "**/*.tscn",
             "**/project.godot",
             "**/*.gdextension",
             "**/extension_api.json",

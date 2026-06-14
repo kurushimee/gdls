@@ -18,6 +18,8 @@ pub mod model;
 pub mod paths;
 pub mod project_godot;
 pub mod registry;
+pub mod scene;
+pub mod scene_index;
 
 pub use cache::{
     load as cache_load, project_godot_fingerprint, save as cache_save, stat_from_metadata,
@@ -32,8 +34,14 @@ pub use interface::{
     MemberKind, TypeExpr,
 };
 pub use model::{LoadOutcome, ProjectModel};
+pub use paths::{path_to_res, res_to_path};
 pub use project_godot::{
     classify, parse as parse_project_godot, Autoload, ProjectGodot, ResTarget, WarnLevel,
     WarningConfig,
 };
 pub use registry::{BaseRef, ClassEntry, ClassNameRegistry};
+pub use scene::{
+    is_scene_path, normalize_res, parse_scene, ExtResource, NodeType, ResolvedRoot, Scene,
+    SceneNode, MAX_INSTANCE_DEPTH,
+};
+pub use scene_index::{SceneIndex, SceneIndexCache};
