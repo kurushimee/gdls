@@ -730,10 +730,44 @@ fn build_underscore_prefix_edit(
         Ok(Some(edit)) => {
             // Guard against a vacuous edit (no occurrences resolved): an empty edit is not a fix.
             if workspace_edit_is_empty(&edit) {
-                None
-            } else {
-                Some(edit)
+                return None;
             }
+            // SINGLE-DECLARATION-TOKEN GATE (sound, corruption firewall). gdls fires
+            // UNUSED_VARIABLE/UNUSED_PARAMETER ONLY when the binding has ZERO non-declaration
+            // occurrences (any read/write/same-named attribute access suppresses the warning), and a
+            // GDScript declaration is a single token. So a CORRECTLY-resolved `_`-prefix rename of a
+            // genuinely-unused binding touches EXACTLY ONE token — the declaration. Any 2nd edit is
+            // necessarily the over-approximating local resolver
+            // (`handlers::push_identifier_locations_within`, a name-based function-wide scan) grabbing
+            // a DIFFERENT binding: a forward-reference to a member/global, or a sibling-block's distinct
+            // same-named local. Renaming such an occurrence can silently rebind a read to the wrong
+            // symbol when `_name` collides with a cross-file global/autoload/class_name — error-free
+            // (the ERROR backstop is blind) and not-in-file (the `file_contains_identifier` firewall
+            // misses it). So refuse rather than risk a wrong-symbol rebind: accept ONLY a one-edit
+            // rename, position- and file-blind. PRECONDITION: count==1 is correct ONLY because the
+            // `_`-prefix is offered solely for the two FUNCTION-SCOPED warnings
+            // (UNUSED_VARIABLE/UNUSED_PARAMETER; see the dispatch in `push_mutating_actions`). A future
+            // member-variable warning would drive a project-wide multi-file rename — many legitimate
+            // edits — and would break this invariant, needing its own re-derivation.
+            let ranges = workspace_edit_ranges(&edit);
+            if ranges.len() != 1 {
+                return None;
+            }
+            // Belt-and-suspenders: the single edit must cover the declaration identifier anchor. By
+            // construction it always does (rename anchors on the declaration token, and a one-edit set
+            // IS that token), so this never false-refuses a legitimate single-edit rename — but a
+            // fail-closed check (refuse, never panic — CLAUDE.md "never crash") catches any future
+            // resolver drift that produced one edit somewhere OTHER than the declaration.
+            let anchor = data.anchor();
+            let r = ranges[0];
+            let pos_le = |p: Position, q: Position| (p.line, p.character) <= (q.line, q.character);
+            let pos_lt = |p: Position, q: Position| (p.line, p.character) < (q.line, q.character);
+            // Half-open [start, end); a zero-width range (start == end) covers no position, so require
+            // the anchor to fall within an actually-spanning edit (the declaration token is non-empty).
+            if !(pos_le(r.start, anchor) && pos_lt(anchor, r.end)) {
+                return None;
+            }
+            Some(edit)
         }
         _ => None,
     }
@@ -1387,6 +1421,31 @@ fn workspace_edit_is_empty(edit: &WorkspaceEdit) -> bool {
     }
     // Neither field populated (or an operations-style documentChanges gdls never emits) → empty.
     true
+}
+
+/// Every [`Range`] a [`WorkspaceEdit`] would edit, summed across ALL files in EITHER negotiated shape
+/// (`documentChanges`/`TextDocumentEdit`s and the `changes` map) — total, never URI-scoped. The
+/// `_`-prefix gate counts these: a correct underscore-rename of a genuinely-unused binding is exactly
+/// ONE range (the declaration token), and ANY extra range anywhere — including in another file — is
+/// over-reach onto a different binding, so the count must be position- and file-blind.
+fn workspace_edit_ranges(edit: &WorkspaceEdit) -> Vec<Range> {
+    use lsp_types::{DocumentChanges, OneOf};
+    let mut ranges = Vec::new();
+    if let Some(DocumentChanges::Edits(tdes)) = &edit.document_changes {
+        for tde in tdes {
+            for e in &tde.edits {
+                match e {
+                    OneOf::Left(te) => ranges.push(te.range),
+                    OneOf::Right(ate) => ranges.push(ate.text_edit.range), // AnnotatedTextEdit (unused).
+                }
+            }
+        }
+    } else if let Some(changes) = &edit.changes {
+        for tes in changes.values() {
+            ranges.extend(tes.iter().map(|te| te.range));
+        }
+    }
+    ranges
 }
 
 /// Facts about the `Variable` declaration enclosing `diag`'s anchor, for the annotation fixes:

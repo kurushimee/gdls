@@ -2232,3 +2232,115 @@ fn underscore_prefix_refused_on_moved_shadow_capture() {
     );
     shutdown(&client, t);
 }
+
+/// REGRESSION (blocker — sibling-block over-reach, count>1 gate; the case the error/shadow/firewall
+/// backstops all MISS): two distinct locals `x` live in disjoint `if`/`else` sub-blocks. The
+/// then-block `var x` is UNUSED (the diagnostic); the else-block `var x` is read by `print(x)`. The
+/// name-based function-wide local resolver over-reaches: renaming the then-block `x`→`_x` returns 3
+/// edits (then-decl + else-decl + the `print(x)` use of the DIFFERENT else-block binding). That extra
+/// rewrite corrupts the else-block binding. Critically this slips EVERY pre-existing backstop: it's
+/// error-free post-rename (so the ERROR backstop is blind), it induces no shadow (so the SHADOW
+/// backstop is blind), and `_x` does not pre-exist in the file (so `file_contains_identifier` misses
+/// it). ONLY the single-declaration-token count gate (3 != 1) refuses. Single-file, no autoload.
+#[test]
+fn underscore_prefix_refused_on_sibling_block_over_reach() {
+    // Then-block `x` is unused; else-block `x` (distinct binding) is used by `print(x)`.
+    const SRC: &str =
+        "extends Node\n\nfunc f(cond):\n\tif cond:\n\t\tvar x = 1\n\telse:\n\t\tvar x = 2\n\t\tprint(x)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    // Precondition: error-free input — the corruption would be NET-NEW (and so the error backstop,
+    // which only fires on a post-rename ERROR, can't be what refuses here).
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "precondition: input must be error-free; got {:?}",
+        diags.diagnostics
+    );
+    // The UNUSED_VARIABLE must be the THEN-block `var x` on line 4 (the else-block `x` is used).
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == Some(NumberOrString::String("UNUSED_VARIABLE".to_string()))
+                && d.range.start.line == 4
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the unused THEN-block `x` (line 4) must warn; got {:?}",
+                diags.diagnostics
+            )
+        });
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Prefix unused name").is_none(),
+        "the function-wide resolver over-reaches onto the else-block binding (3 edits) — the \
+         single-declaration-token gate must REFUSE the `_`-prefix; got titles {:?}",
+        action_titles(&actions)
+    );
+    // ON-SAVE GUARD (task point 2): the gate lives INSIDE `build_underscore_prefix_edit`, which
+    // `build_fix_all` calls directly — so the over-reaching `_`-prefix must ALSO be absent from the
+    // `source.fixAll` aggregate (which `only: None` returns), or it would corrupt silently on save with
+    // zero user interaction. With its sole fixable diagnostic gated out, fixAll collapses to nothing.
+    assert!(
+        find_action(&actions, "Fix all").is_none(),
+        "the over-reaching `_`-prefix must be excluded from source.fixAll too (silent-on-save \
+         corruption); got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
+
+/// REGRESSION (blocker — the PROVEN cross-file wrong-symbol rebind this gate closes; #75): an autoload
+/// named `_y` makes `_y` a valid PROJECT-WIDE global. In `a.gd`, `print(y)` forward-refs the class
+/// MEMBER `y`, and the unused LOCAL `var y = 1` shadows it. Renaming the local `y`→`_y` over-reaches
+/// onto `print(y)` (the function-wide name scan grabs it though it binds to the member), rewriting it
+/// to `print(_y)` — which now resolves ERROR-FREE to the autoload, a SILENT rebind to the wrong symbol.
+/// Both file-local backstops miss it: no error (ERROR backstop blind) and `_y` is in `project.godot`,
+/// NOT in `a.gd` (so `file_contains_identifier` misses it). ONLY the count gate (2 edits != 1) refuses.
+#[test]
+fn underscore_prefix_refused_on_cross_file_autoload_rebind() {
+    let p = TempProject::new();
+    // Autoload `_y` → `_y` is a project-wide global identifier (lives in project.godot, NOT in a.gd).
+    p.write(
+        "project.godot",
+        "[application]\nconfig/name=\"T\"\nconfig_version=5\n\n[autoload]\n_y=\"*res://auto.gd\"\n",
+    );
+    p.write("extension_api.json", common::MINI_API);
+    p.write("auto.gd", "extends Node\n\nfunc ping() -> void:\n\tpass\n");
+    // Member `y`; forward-ref `print(y)` binds to the member; unused local `y` shadows it.
+    const SRC: &str = "extends Node\n\nvar y = 10\n\nfunc f() -> void:\n\tprint(y)\n\tvar y = 1\n";
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    // The unused LOCAL `y` is on line 6 (the member `y` on line 2 and forward-ref on line 5 don't warn).
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == Some(NumberOrString::String("UNUSED_VARIABLE".to_string()))
+                && d.range.start.line == 6
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the unused local `y` (line 6) must warn; got {:?}",
+                diags.diagnostics
+            )
+        });
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Prefix unused name").is_none(),
+        "renaming `y`→`_y` over-captures `print(y)` into a SILENT bind to the `_y` autoload (error-free, \
+         and `_y` is not in this file) — only the count gate catches it; got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
