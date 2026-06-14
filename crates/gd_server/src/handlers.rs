@@ -56,6 +56,11 @@ pub(crate) use crate::signature_help::signature_help;
 // table stays one uniform path.
 pub(crate) use crate::color::{color_presentation, document_color};
 
+// M10 (#73): inlayHint + inlayHint/resolve live in `crate::inlay_hint` (its own module, like
+// `crate::color`) but dispatch addresses them as `handlers::inlay_hint` / `handlers::inlay_hint_resolve`
+// alongside every other request handler — re-export so the dispatch table stays one uniform path.
+pub(crate) use crate::inlay_hint::{inlay_hint, inlay_hint_resolve};
+
 /// `textDocument/documentSymbol`: project the `gd_syntax` symbol outline into LSP's nested
 /// [`lsp_types::DocumentSymbol`] tree — kinds plus byte→position ranges, with the full declaration as
 /// `range` and the identifier as `selection_range`. Reads the shared cached parse (the same one
@@ -1570,7 +1575,14 @@ fn hover_declaration_signature(
 /// `Display` impl's `<Script #N>` / `<Class>` diagnostic placeholders (issue #26). Script types
 /// render their global `class_name` (or file basename) plus any inner-class path; in-file Class
 /// types render their declared identifier. Everything else keeps the faithful `Display` text.
-fn human_type_label(state: &ServerState, tree: &ParseTree, dt: &gd_analyze::DataType) -> String {
+///
+/// Shared with M10 (#73) inlayHint (the inferred-type hint label) so the two surfaces render a
+/// resolved type identically.
+pub(crate) fn human_type_label(
+    state: &ServerState,
+    tree: &ParseTree,
+    dt: &gd_analyze::DataType,
+) -> String {
     use gd_analyze::DtKind;
     match dt.kind {
         DtKind::Script => {

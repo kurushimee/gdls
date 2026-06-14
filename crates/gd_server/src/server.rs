@@ -149,6 +149,10 @@ pub(crate) struct ClientCaps {
     /// `workspace.semanticTokens`. Grouped in a sub-struct like [`CompletionCaps`] so the handlers
     /// read `state.caps.semantic_tokens.<gate>`.
     pub(crate) semantic_tokens: SemanticTokensCaps,
+    /// The M10 (#73) inlayHint gates, captured under `textDocument.inlayHint` +
+    /// `workspace.inlayHint`. Grouped in a sub-struct like [`SemanticTokensCaps`] so the handler
+    /// reads `state.caps.inlay_hint.<gate>`.
+    pub(crate) inlay_hint: InlayHintCaps,
 }
 
 /// The `textDocument.semanticTokens` + `workspace.semanticTokens` client capabilities gdls projects
@@ -164,6 +168,25 @@ pub(crate) struct SemanticTokensCaps {
     /// `workspace.semanticTokens.refreshSupport` — gates the server→client
     /// `workspace/semanticTokens/refresh` request. When absent the refresh is never sent (the
     /// client can't consume it); the client re-requests tokens on its own edit cadence instead.
+    pub(crate) refresh_support: bool,
+}
+
+/// The `textDocument.inlayHint` + `workspace.inlayHint` client capabilities the inlay-hint handler
+/// branches on (M10 #73). Every field has a documented absent-default so a minimal client still
+/// gets complete, eager hints — generic-LSP-first (#30).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct InlayHintCaps {
+    /// `textDocument.inlayHint.resolveSupport` (presence) — when the client advertises it, the
+    /// tooltip is DEFERRED to an `inlayHint/resolve` round-trip (the hint ships without a `tooltip`,
+    /// carrying a `data` blob resolve uses to fill it). Absent ⇒ the tooltip is embedded EAGERLY in
+    /// the initial hint (a client that can't resolve still gets the full hint). Read as
+    /// presence-of-`resolveSupport`, matching `workspaceSymbol`/`completionItem` — the `properties`
+    /// list merely names what gdls already defers, so a non-`None` value is the gate. The textEdit
+    /// is ALWAYS eager (never deferred), so an apply works without a resolve round-trip.
+    pub(crate) resolve_support: bool,
+    /// `workspace.inlayHint.refreshSupport` — gates the server→client `workspace/inlayHint/refresh`
+    /// request emitted when the inlay-hint config toggles. When absent the refresh is never sent;
+    /// the client re-requests hints on its own cadence (typically on the next edit / scroll).
     pub(crate) refresh_support: bool,
 }
 
@@ -302,6 +325,32 @@ impl ClientCaps {
                 .and_then(|w| w.document_changes)
                 .unwrap_or(false),
             semantic_tokens: SemanticTokensCaps::negotiate(caps),
+            inlay_hint: InlayHintCaps::negotiate(caps),
+        }
+    }
+}
+
+impl InlayHintCaps {
+    /// Walk `textDocument.inlayHint` (resolve support) + `workspace.inlayHint` (refresh support),
+    /// mirroring the optional-path convention the rest of [`ClientCaps::negotiate`] uses. An absent
+    /// `inlayHint` capability yields no resolve (tooltips ship eagerly) and no refresh — a client
+    /// that didn't opt in still gets complete hints, just no server-pushed refresh.
+    fn negotiate(caps: &lsp_types::ClientCapabilities) -> Self {
+        let resolve_support = caps
+            .text_document
+            .as_ref()
+            .and_then(|t| t.inlay_hint.as_ref())
+            .and_then(|h| h.resolve_support.as_ref())
+            .is_some();
+        let refresh_support = caps
+            .workspace
+            .as_ref()
+            .and_then(|w| w.inlay_hint.as_ref())
+            .and_then(|h| h.refresh_support)
+            .unwrap_or(false);
+        InlayHintCaps {
+            resolve_support,
+            refresh_support,
         }
     }
 }
@@ -435,6 +484,10 @@ pub(crate) enum OutboundKind {
     /// (the client re-requests tokens for its visible documents). Sent after an index-wide change
     /// (native DB reload / warm-start adoption) where every document's tokens may have shifted.
     SemanticTokensRefresh,
+    /// M10 (#73): a `workspace/inlayHint/refresh` request — the response is acknowledgment-only (the
+    /// client re-requests hints for its visible documents). Sent when the inlay-hint config toggles
+    /// (`workspace/didChangeConfiguration`) so already-shown hints reflect the new policy live.
+    InlayHintRefresh,
 }
 
 /// All mutable server state for one session.
@@ -1236,6 +1289,14 @@ fn handle_outbound_response(state: &mut ServerState, resp: Response) {
             ),
             None => log::debug!("client acknowledged the semanticTokens refresh"),
         },
+        OutboundKind::InlayHintRefresh => match &resp.error {
+            Some(err) => log::debug!(
+                "client declined workspace/inlayHint/refresh ({}); it will re-request on its own \
+                 cadence",
+                err.message
+            ),
+            None => log::debug!("client acknowledged the inlayHint refresh"),
+        },
     }
 }
 
@@ -1259,6 +1320,28 @@ fn send_semantic_tokens_refresh(state: &mut ServerState) {
     };
     if state.sender.send(Message::Request(req)).is_err() {
         log::warn!("workspace/semanticTokens/refresh send failed (client disconnected?)");
+    }
+}
+
+/// M10 (#73): ask the client to re-request inlay hints for its visible documents — sent when the
+/// inlay-hint config toggles, so already-shown hints reflect the new policy without an edit. Gated on
+/// the client's `workspace.inlayHint.refreshSupport`; a no-op (never sent) otherwise. Fire-and-forget:
+/// the response is acknowledgment-only (correlated to [`OutboundKind::InlayHintRefresh`]).
+fn send_inlay_hint_refresh(state: &mut ServerState) {
+    if !state.caps.inlay_hint.refresh_support {
+        return;
+    }
+    let id = state.shared.next_outgoing_id();
+    state
+        .outbound
+        .insert(id.clone(), OutboundKind::InlayHintRefresh);
+    let req = Request {
+        id,
+        method: "workspace/inlayHint/refresh".to_string(),
+        params: serde_json::Value::Null,
+    };
+    if state.sender.send(Message::Request(req)).is_err() {
+        log::warn!("workspace/inlayHint/refresh send failed (client disconnected?)");
     }
 }
 
@@ -1334,6 +1417,9 @@ fn apply_runtime_config(state: &mut ServerState, raw: &serde_json::Value) {
     let strict_changed = provided("strict") && new_options.strict != state.options.strict;
     let analyzer_changed = provided("analyzer") && new_options.analyzer != state.options.analyzer;
     let memory_changed = provided("memory") && new_options.memory != state.options.memory;
+    // M10 (#73): inlay-hint toggles are runtime-reloadable. A genuine change re-stores them and asks
+    // the client to re-request hints (refresh) so already-displayed hints reflect the new policy.
+    let inlay_changed = provided("inlayHint") && new_options.inlay_hint != state.options.inlay_hint;
 
     if strict_changed {
         log::info!(
@@ -1358,6 +1444,15 @@ fn apply_runtime_config(state: &mut ServerState, raw: &serde_json::Value) {
     }
     if strict_changed || analyzer_changed {
         republish_all_open_buffers(state);
+    }
+    // Inlay hints aren't carried on `publishDiagnostics` — instead of a republish, ask the client to
+    // re-request hints. Done last so it's independent of the diagnostics republish above.
+    if inlay_changed {
+        log::info!(
+            "runtime configuration: inlay-hint toggles changed; requesting an inlayHint refresh"
+        );
+        state.options.inlay_hint = new_options.inlay_hint;
+        send_inlay_hint_refresh(state);
     }
 }
 
@@ -1968,6 +2063,19 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 },
             ),
         ),
+        // M10 (#73): inlayHint. `resolve_provider: true` advertises `inlayHint/resolve` — a client
+        // with `inlayHint.resolveSupport` then receives hints WITHOUT a tooltip (carrying a `data`
+        // blob) and pulls each tooltip lazily; a client without it receives complete hints eagerly.
+        // The textEdit is always eager (an apply never needs a resolve round-trip). Analysis-priced
+        // (type table + call resolution), so the request sheds at Hard memory pressure
+        // (ContentModified, in the `analyze_using` set above); `inlayHint/resolve` is NOT shed (it
+        // reads the cached `data` blob only — never a fresh analyze, like `completionItem/resolve`).
+        inlay_hint_provider: Some(OneOf::Right(
+            lsp_types::InlayHintServerCapabilities::Options(lsp_types::InlayHintOptions {
+                work_done_progress_options: Default::default(),
+                resolve_provider: Some(true),
+            }),
+        )),
         // M9 (#66): rename + prepareRename. `prepare_provider: true` advertises that the client may
         // pre-flight a rename with `textDocument/prepareRename` (range + placeholder); the rename
         // itself reuses the `references` resolution to collect every edit site, validates the new
@@ -2206,6 +2314,12 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             // fresh analyze) and must stay served at Hard pressure, exactly like foldingRange.
             | "textDocument/semanticTokens/full"
             | "textDocument/semanticTokens/full/delta"
+            // M10 (#73): `inlayHint` runs a fresh `analyze` to read the inferred-type table and
+            // resolve call-site parameter names — analysis-priced, so it sheds at Hard memory
+            // pressure with ContentModified like hover. `inlayHint/resolve` is intentionally ABSENT:
+            // it only reads the hint's `data` blob (no fresh analyze), so shedding it would reclaim
+            // nothing — mirroring `completionItem/resolve`'s exclusion.
+            | "textDocument/inlayHint"
     );
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {
         // Re-record the request as cancelled-cum-shed so the per-handler trace still shows the
@@ -2286,6 +2400,14 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             handle!(handlers::semantic_tokens_full_delta)
         }
         "textDocument/semanticTokens/range" => handle!(handlers::semantic_tokens_range),
+        // M10 (#73): inlayHint. `inlayHint` returns `InlayHint[]` for the requested range — inferred
+        // `:= `/`for`-var TYPE hints and call-site PARAMETER-name hints, each config-toggleable. The
+        // tooltip is deferred to `inlayHint/resolve` only for a `resolveSupport` client (eager
+        // otherwise); the textEdit is always eager. `serde_json::to_value(None)` → the LSP `null`
+        // wire shape. `inlayHint` is analysis-priced (sheds at Hard, see `analyze_using`); `resolve`
+        // reads the hint's `data` blob only (not shed).
+        "textDocument/inlayHint" => handle!(handlers::inlay_hint),
+        "inlayHint/resolve" => handle!(handlers::inlay_hint_resolve),
         // M9 (#66): rename + prepareRename — the fallible arms (a syntactically-valid request may
         // still be REFUSED with a typed error: a native/stub target, or an invalid new name).
         // `prepareRename` returns the identifier range (+ placeholder when the client advertised
