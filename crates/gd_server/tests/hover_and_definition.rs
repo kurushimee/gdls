@@ -1482,3 +1482,70 @@ fn definition_on_native_symbols_jumps_into_materialized_stubs() {
 
     shutdown(&client, handle);
 }
+
+// --- #146: inner-class instance hover/definition resolve the INNER member, not the file root ---
+
+/// #146: hover on a method of an inner-class INSTANCE (`var x := Inner.new()`) that name-collides
+/// with a root method must show the INNER signature, not the root one. Fail-OPEN before the fix
+/// (showed the root `collide(a)`); the producer (context.rs finish) now populates the value's
+/// inner-class chain and the hover consumer must descend it.
+#[test]
+fn hover_inner_class_instance_member_uses_inner_not_root() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/inner_hover.gd".parse().unwrap();
+    let src = concat!(
+        "func collide(a: int) -> void:\n",               // 0  root collide
+        "\tpass\n",                                      // 1
+        "\n",                                            // 2
+        "class Inner:\n",                                // 3
+        "\tfunc collide(a: int, extra: int) -> void:\n", // 4  inner collide
+        "\t\tpass\n",                                    // 5
+        "\n",                                            // 6
+        "func use_it() -> void:\n",                      // 7
+        "\tvar x := Inner.new()\n",                      // 8
+        "\tx.collide(1, 2)\n",                           // 9
+    );
+    did_open(&client, &uri, src);
+    // `\tx.collide(1, 2)` — `collide` at cols 3..10; hover at col 5.
+    let hover = hover_at(&client, &uri, Position::new(9, 5)).expect("hover on x.collide");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("extra"),
+        "hover on an inner-class instance member must show the INNER signature (param `extra`), \
+         not the root collide(a); got {md:?}"
+    );
+    shutdown(&client, handle);
+}
+
+/// #146: definition on an inner-class instance member jumps to the INNER declaration (line 4), not
+/// the root one (line 0).
+#[test]
+fn definition_inner_class_instance_member_jumps_to_inner() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/inner_def.gd".parse().unwrap();
+    let src = concat!(
+        "func collide(a: int) -> void:\n",               // 0  root collide
+        "\tpass\n",                                      // 1
+        "\n",                                            // 2
+        "class Inner:\n",                                // 3
+        "\tfunc collide(a: int, extra: int) -> void:\n", // 4  inner collide (identifier at col 6)
+        "\t\tpass\n",                                    // 5
+        "\n",                                            // 6
+        "func use_it() -> void:\n",                      // 7
+        "\tvar x := Inner.new()\n",                      // 8
+        "\tx.collide(1, 2)\n",                           // 9
+    );
+    did_open(&client, &uri, src);
+    let response = definition_at(&client, &uri, Position::new(9, 5))
+        .expect("definition on x.collide resolves");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    assert_eq!(
+        location.range.start.line, 4,
+        "definition must jump to the INNER collide (line 4), not the root (line 0); got {:?}",
+        location.range.start
+    );
+    shutdown(&client, handle);
+}
