@@ -4345,16 +4345,19 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             }
         }
         // analyzer.cpp:3740-3742 — UNSAFE_METHOD_ACCESS on a `$`/`%` (GetNode) base method miss. Godot
-        // warns on ANY unresolved non-`self`, non-hard-BUILTIN method; gdls can emit this SAFELY only
-        // for the `$`/`%` base, whose bare-`Node` type gdls SYNTHESIZES (M11, analyzer.cpp:3882-3886).
-        // The miss therefore does NOT depend on the native dump's method-list completeness the way an
-        // arbitrary `var x: SomeClass` does: the GENERAL hard NATIVE/SCRIPT-base case is blocked by
-        // gdls's JSON-dump-vs-ClassDB completeness gap — the conformance dump (trimmed, yet marked
-        // Exact) over-emits on real-but-undumped methods (`Script.get_script_constant_map`, a script's
-        // `new()`), indistinguishable from a fabricated name — so it stays silent here, like the hard
-        // "Function not found" error already silences native-instance misses. Exact-gated (a non-Exact
-        // dump can't be trusted even for `Node`); additive — no error path changes, so the hard
-        // "Function not found in base" error stays reserved for `is_self || (hard && BUILTIN)`.
+        // warns on ANY unresolved non-`self`, non-hard-BUILTIN method; gdls emits this SAFELY only for
+        // the `$`/`%` base, whose bare-`Node` type gdls SYNTHESIZES (M11, analyzer.cpp:3882-3886) — so
+        // the base type is not dump-dependent. The METHOD LOOKUP still walks the native dump, and
+        // `extension_api.json` OMITS the Object-core methods Godot resolves via ClassDB: `free` and the
+        // `_`-prefixed virtuals (`_notification`, `_get`, `_set`, `_to_string`, `_init`, …). Diffing
+        // `ClassDB.class_get_method_list(Object/Node)` against the dump shows the omitted set is EXACTLY
+        // `free` + every `_`-prefixed name (zero non-underscore omissions besides `free`), so skipping
+        // those is the COMPLETE FP-avoidance for this fixed `Node` chain — a miss on them is a dump gap,
+        // not a real miss (Godot stays silent). `new()` is NOT skipped: `$X` is a Node INSTANCE and
+        // `new()` lives on the metatype, so Godot warns on it. The GENERAL hard NATIVE/SCRIPT-instance
+        // case is blocked by the same dump-vs-ClassDB gap across arbitrary classes (deferred). Exact-
+        // gated (a non-Exact dump can't be trusted even for `Node`); additive — no error path changes,
+        // so the hard "Function not found in base" error stays reserved for `is_self || (hard && BUILTIN)`.
         let base_is_get_node = call
             .callee
             .and_then(|c| match &ctx.node(c).kind {
@@ -4364,7 +4367,8 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             .is_some_and(|bid| matches!(&ctx.node(bid).kind, NodeKind::GetNode(_)));
         if base_is_get_node
             && !name_is_value
-            && function_name != "new"
+            && function_name != "free"
+            && !function_name.starts_with('_')
             && base_type.is_hard_type()
             && base_type.kind == DtKind::Native
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact

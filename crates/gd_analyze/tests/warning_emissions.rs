@@ -1057,6 +1057,51 @@ fn self_method_miss_no_unsafe_method_access() {
     );
 }
 
+/// FP guard (the dump-completeness class): `$X.free()` must stay SILENT. `free` is a real `Object`
+/// method that Godot resolves via ClassDB but `extension_api.json` OMITS — `unsafe_method_native()`
+/// is production-shaped (no `free`), so without the skip this would FALSE-POSITIVE. Oracle-confirmed:
+/// `godot` is silent on `$Child.free()`, and the dump-omitted set is exactly `free` + `_`-virtuals.
+#[test]
+fn dollar_free_method_is_silent() {
+    let src = "extends Node\nfunc f() -> void:\n\t$Child.free()\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &unsafe_method_native());
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "`$Child.free()` is a real (dump-omitted) Object method — must NOT fire, got {got:?}"
+    );
+}
+
+/// FP guard: a `_`-prefixed virtual (`$X._notification(0)`) must stay SILENT — Godot resolves every
+/// declared virtual via ClassDB, but the dump omits them; the skip covers all `_`-prefixed names.
+#[test]
+fn dollar_underscore_virtual_method_is_silent() {
+    let src = "extends Node\nfunc f() -> void:\n\t$Child._notification(0)\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &unsafe_method_native());
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "a `_`-prefixed virtual on a `$Node` base must NOT fire, got {got:?}"
+    );
+}
+
+/// True-positive guard: `$X.new()` MUST fire. `$X` is a Node INSTANCE and `new()` lives on the
+/// metatype, so Godot warns (oracle-confirmed: `The method "new()" is not present on … "Node"`). The
+/// `!= "new"` guard that suppressed it (a metatype-vs-instance conflation) was removed for this arm.
+#[test]
+fn dollar_new_method_fires_unsafe_method_access() {
+    let src = "extends Node\nfunc f() -> void:\n\t$Child.new()\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &unsafe_method_native());
+    assert!(
+        got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "`$Child.new()` on a Node instance must fire UNSAFE_METHOD_ACCESS, got {got:?}"
+    );
+}
+
 #[test]
 fn dollar_valid_node_method_is_silent() {
     // `$x.get_parent()` (a real `Node` method) → silent under both unsafe-access warnings enabled.
