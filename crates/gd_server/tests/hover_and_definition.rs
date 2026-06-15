@@ -1482,3 +1482,168 @@ fn definition_on_native_symbols_jumps_into_materialized_stubs() {
 
     shutdown(&client, handle);
 }
+
+// --- #146: inner-class instance hover/definition resolve the INNER member, not the file root ---
+
+/// #146: hover on a method of an inner-class INSTANCE (`var x := Inner.new()`) that name-collides
+/// with a root method must show the INNER signature, not the root one. Fail-OPEN before the fix
+/// (showed the root `collide(a)`); the producer (context.rs finish) now populates the value's
+/// inner-class chain and the hover consumer must descend it.
+#[test]
+fn hover_inner_class_instance_member_uses_inner_not_root() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/inner_hover.gd".parse().unwrap();
+    let src = concat!(
+        "func collide(a: int) -> void:\n",               // 0  root collide
+        "\tpass\n",                                      // 1
+        "\n",                                            // 2
+        "class Inner:\n",                                // 3
+        "\tfunc collide(a: int, extra: int) -> void:\n", // 4  inner collide
+        "\t\tpass\n",                                    // 5
+        "\n",                                            // 6
+        "func use_it() -> void:\n",                      // 7
+        "\tvar x := Inner.new()\n",                      // 8
+        "\tx.collide(1, 2)\n",                           // 9
+    );
+    did_open(&client, &uri, src);
+    // `\tx.collide(1, 2)` — `collide` at cols 3..10; hover at col 5.
+    let hover = hover_at(&client, &uri, Position::new(9, 5)).expect("hover on x.collide");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("extra"),
+        "hover on an inner-class instance member must show the INNER signature (param `extra`), \
+         not the root collide(a); got {md:?}"
+    );
+    shutdown(&client, handle);
+}
+
+/// #146: definition on an inner-class instance member jumps to the INNER declaration (line 4), not
+/// the root one (line 0).
+#[test]
+fn definition_inner_class_instance_member_jumps_to_inner() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/inner_def.gd".parse().unwrap();
+    let src = concat!(
+        "func collide(a: int) -> void:\n",               // 0  root collide
+        "\tpass\n",                                      // 1
+        "\n",                                            // 2
+        "class Inner:\n",                                // 3
+        "\tfunc collide(a: int, extra: int) -> void:\n", // 4  inner collide (identifier at col 6)
+        "\t\tpass\n",                                    // 5
+        "\n",                                            // 6
+        "func use_it() -> void:\n",                      // 7
+        "\tvar x := Inner.new()\n",                      // 8
+        "\tx.collide(1, 2)\n",                           // 9
+    );
+    did_open(&client, &uri, src);
+    let response = definition_at(&client, &uri, Position::new(9, 5))
+        .expect("definition on x.collide resolves");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    assert_eq!(
+        location.range.start.line, 4,
+        "definition must jump to the INNER collide (line 4), not the root (line 0); got {:?}",
+        location.range.start
+    );
+    shutdown(&client, handle);
+}
+
+/// #146 (non-call attribute): definition on an inner-class instance **property** (`x.field`, not a
+/// call) jumps to the INNER `field`, not the same-named ROOT one. Exercises definition step (0.5)
+/// for a bare attribute (no Call binding) + `member_decl_location` resolving a var member.
+#[test]
+fn definition_inner_class_property_jumps_to_inner() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/inner_prop.gd".parse().unwrap();
+    let src = concat!(
+        "var field := 0\n",         // 0  root field
+        "\n",                       // 1
+        "class Inner:\n",           // 2
+        "\tvar field := 0\n",       // 3  inner field (the target, line 3)
+        "\n",                       // 4
+        "func use_it() -> void:\n", // 5
+        "\tvar x := Inner.new()\n", // 6
+        "\tvar y := x.field\n",     // 7  `field` at cols 11..16; cursor at col 13
+    );
+    did_open(&client, &uri, src);
+    let response =
+        definition_at(&client, &uri, Position::new(7, 13)).expect("definition on x.field resolves");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    assert_eq!(
+        location.range.start.line, 3,
+        "definition must jump to the INNER field (line 3), not the root (line 0); got {:?}",
+        location.range.start
+    );
+    shutdown(&client, handle);
+}
+
+/// #146 (deep nesting, CALL path): a **doubly**-nested inner-class instance method
+/// (`Outer.Inner.new(); x.deep(1)`) resolves on `Outer.Inner` — locking `iface_at_inner`'s depth-2
+/// descent via definition step (1.6)'s `CalleeTarget` `class_path` (built in `reduce_call`, so this
+/// does NOT exercise the `finish()` producer chain — see the non-call test below for that).
+#[test]
+fn definition_doubly_nested_inner_class_member_descends_full_chain() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/depth2.gd".parse().unwrap();
+    let src = concat!(
+        "class Outer:\n",                   // 0
+        "\tclass Inner:\n",                 // 1
+        "\t\tfunc deep(a: int) -> void:\n", // 2  target (line 2)
+        "\t\t\tpass\n",                     // 3
+        "\n",                               // 4
+        "func use_it() -> void:\n",         // 5
+        "\tvar x := Outer.Inner.new()\n",   // 6
+        "\tx.deep(1)\n",                    // 7  `deep` cursor at col 4
+    );
+    did_open(&client, &uri, src);
+    let response =
+        definition_at(&client, &uri, Position::new(7, 4)).expect("definition on x.deep resolves");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    assert_eq!(
+        location.range.start.line, 2,
+        "definition must descend to Outer.Inner.deep (line 2); got {:?}",
+        location.range.start
+    );
+    shutdown(&client, handle);
+}
+
+/// #146 (deep nesting, PRODUCER path): a **doubly**-nested inner-class instance **property**
+/// (`Outer.Inner.new(); x.deep_field`, not a call) resolves on `Outer.Inner`. Unlike the call
+/// variant, a bare attribute goes through definition step (0.5), which reads `base_dt.script_type`
+/// — the `finish()`-produced `ScriptRef` — so this LOCKS the producer building the full
+/// `["Outer","Inner"]` chain (a depth-1-only producer would fail to descend / find the member).
+#[test]
+fn definition_doubly_nested_inner_class_property_locks_producer_chain() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/depth2_prop.gd".parse().unwrap();
+    let src = concat!(
+        "class Outer:\n",                 // 0
+        "\tclass Inner:\n",               // 1
+        "\t\tvar deep_field := 0\n",      // 2  target (line 2)
+        "\n",                             // 3
+        "func use_it() -> void:\n",       // 4
+        "\tvar x := Outer.Inner.new()\n", // 5
+        "\tvar y := x.deep_field\n",      // 6  `deep_field` starts col 12; cursor at col 14
+    );
+    did_open(&client, &uri, src);
+    let response = definition_at(&client, &uri, Position::new(6, 14))
+        .expect("definition on x.deep_field resolves");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    assert_eq!(
+        location.range.start.line, 2,
+        "definition must descend to Outer.Inner.deep_field (line 2) via the producer chain; got {:?}",
+        location.range.start
+    );
+    shutdown(&client, handle);
+}

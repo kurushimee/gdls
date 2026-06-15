@@ -476,9 +476,12 @@ pub fn definition(
     let text = state.vfs.get(uri.as_str()).map(|d| d.text())?;
     let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
 
-    let doc = state.vfs.get(uri.as_str())?;
-    let mapper = PositionMapper::new(&doc.rope, state.encoding);
-    let byte = mapper.position_to_byte(tdp.position);
+    // Scope the rope borrow to just the byte computation so the inner-class attribute step (0.5)
+    // below can take `&mut state` (analysis + index lookups); the mapper is rebuilt before step (1).
+    let byte = {
+        let doc = state.vfs.get(uri.as_str())?;
+        PositionMapper::new(&doc.rope, state.encoding).position_to_byte(tdp.position)
+    };
     let node_id = parsed.tree.innermost_node_at(byte)?;
 
     // (C1) String literal inside preload/load: cursor on `"res://foo.gd"` → jump to foo.gd.
@@ -488,7 +491,43 @@ pub fn definition(
 
     let name = cursor_identifier(&parsed.tree, node_id)?;
 
+    // (0.5) #146: a subscript attribute (`base.member`) on a project-Script base resolves on the
+    // OWNING class — descending the base value's inner-class chain — and MUST run before the bare
+    // in-file lookup (1), which would otherwise match a same-named ROOT member for an inner-class
+    // instance (`var x := Inner.new(); x.collide` → the inner `collide`, not the root's). Only the
+    // attribute-on-Script case is handled here; a non-attribute cursor or a Native base falls through.
+    {
+        let attr_base = parsed.tree.iter_ids().find_map(|id| {
+            if let NodeKind::Subscript(sub) = &parsed.tree.get(id).kind {
+                if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
+                    let s = parsed.tree.get(attr_id).span;
+                    if s.start <= byte && byte < s.end && ident_name(&parsed.tree, attr_id) == name
+                    {
+                        return sub.base;
+                    }
+                }
+            }
+            None
+        });
+        if let Some(base_id) = attr_base {
+            let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+            let sr = analyzed.as_deref().and_then(|a| {
+                let dt = a.types.get(base_id);
+                (dt.kind == DtKind::Script)
+                    .then(|| dt.script_type.clone())
+                    .flatten()
+            });
+            if let Some(sr) = sr {
+                if let Some(loc) = member_decl_location(state, sr.file, &sr.inner, &name) {
+                    return Some(GotoDefinitionResponse::Scalar(loc));
+                }
+            }
+        }
+    }
+
     // (1) In-file member.
+    let doc = state.vfs.get(uri.as_str())?;
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
     if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
         return Some(GotoDefinitionResponse::Scalar(loc));
     }
@@ -519,7 +558,10 @@ pub fn definition(
             })
         });
         if let Some(fid) = target {
-            if let Some(loc) = member_decl_location(state, fid, &name) {
+            // A `Binding::Use` carries no inner-class chain (only the declaring file), so resolve in
+            // the file's root interface. (The inner-class member-call case is handled by the
+            // `CalleeTarget` block below, which does carry the chain.)
+            if let Some(loc) = member_decl_location(state, fid, &[], &name) {
                 return Some(GotoDefinitionResponse::Scalar(loc));
             }
         }
@@ -540,21 +582,23 @@ pub fn definition(
             let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
             a.bindings().iter().find_map(|b| match b {
                 Binding::Call {
-                    callee,
+                    callee: CalleeTarget::Script { file, class_path },
                     callee_name,
                     call_site,
                     ..
                 } if callee_name == &name => {
-                    let f = callee.script_file()?;
                     let spans = spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
                     let ident = spans.get(call_site).copied()?;
-                    (ident.start <= node_byte && node_byte < ident.end).then_some(f)
+                    // Carry the callee's inner-class chain so an inner-class method resolves on the
+                    // owning inner class, not the file root (#146 — same CalleeTarget path as #113).
+                    (ident.start <= node_byte && node_byte < ident.end)
+                        .then(|| (*file, class_path.clone()))
                 }
                 _ => None,
             })
         });
-        if let Some(fid) = target {
-            if let Some(loc) = member_decl_location(state, fid, &name) {
+        if let Some((fid, inner)) = target {
+            if let Some(loc) = member_decl_location(state, fid, &inner, &name) {
                 return Some(GotoDefinitionResponse::Scalar(loc));
             }
         }
@@ -1108,10 +1152,10 @@ fn hover_member_signature(
     match base_dt.kind {
         DtKind::Script => {
             let script_ref = base_dt.script_type.as_ref()?;
-            let callee_file = script_ref.file;
 
-            // Look up the method name in the callee file's interface.
-            let iface = state.workspace.index.interface(callee_file)?;
+            // Look up the method name in the OWNING class's interface, descending the inner-class
+            // chain (#146) so an inner-class instance's method resolves on the inner class, not root.
+            let iface = iface_at_inner(&state.workspace.index, script_ref.file, &script_ref.inner)?;
             let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
 
             let sig = format_func_signature(fn_name, decl);
@@ -1340,7 +1384,7 @@ fn hover_attribute_member_signature(
         base_dt
             .script_type
             .as_ref()
-            .and_then(|sr| state.workspace.index.interface(sr.file))
+            .and_then(|sr| iface_at_inner(&state.workspace.index, sr.file, &sr.inner))
     } else {
         None
     };
@@ -1846,15 +1890,32 @@ fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
 /// the member vanished from the live tree — never dropping a previously-working jump.
 /// Inner-class members aren't head-interface visible and degrade to `None` (the documented
 /// inner-class stance).
+/// The owning `Interface` for a script ref's inner-class chain — root `inner` → the file's own
+/// interface; an inner-class chain (`["Inner"]`) → the nested interface. Lets value-node consumers
+/// (hover / definition) resolve an inner-class instance's member on the OWNING inner class, not the
+/// file root (#146). `None` if the file or any chain segment is missing.
+fn iface_at_inner<'a>(
+    index: &'a gd_project::Index,
+    file: gd_project::FileId,
+    inner: &[String],
+) -> Option<&'a gd_project::Interface> {
+    let mut iface = index.interface(file)?;
+    for seg in inner {
+        iface = iface
+            .inner
+            .iter()
+            .find(|c| c.class_name.as_deref() == Some(seg.as_str()))?;
+    }
+    Some(iface)
+}
+
 fn member_decl_location(
     state: &mut ServerState,
     fid: gd_project::FileId,
+    inner: &[String],
     name: &str,
 ) -> Option<Location> {
-    let (name_span, decl_span) = state
-        .workspace
-        .index
-        .interface(fid)?
+    let (name_span, decl_span) = iface_at_inner(&state.workspace.index, fid, inner)?
         .members
         .iter()
         .find(|m| m.name == name)

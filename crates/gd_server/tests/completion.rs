@@ -2229,3 +2229,27 @@ fn edit_new_text(item: &CompletionItem) -> String {
         CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
     }
 }
+
+/// #146 regression (completion arm): member completion on an **inner-class instance** lists the
+/// INNER class's members — including an inner-only member (`only_inner`) absent from the root class.
+/// Before the producer fix (inner-class value types collapsed to the bare root `Script` with an
+/// empty inner chain) `x.` listed the ROOT's members and dropped `only_inner` — the completion twin
+/// of the hover/definition #146 lie. `var x := Inner.new()` infers `x` as the inner class.
+#[test]
+fn member_completion_on_inner_class_instance_lists_inner_members() {
+    let p = sample_project();
+    let src = "extends Node2D\n\nfunc collide(a):\n\tpass\n\nclass Inner:\n\tfunc collide(a, b):\n\t\tpass\n\tfunc only_inner():\n\t\tpass\n\nfunc use() -> void:\n\tvar x := Inner.new()\n\tx.\n";
+    let uri = file_uri(&p.root.join("src/inner_consumer.gd"));
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tx.` is the last code line (0-based line 13); cursor right after the `.` → column 3.
+    let raw = complete_raw(&client, 20, &uri, Position::new(13, 3));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.iter().any(|l| l == "only_inner"),
+        "inner-class instance completion must list the inner-only member only_inner; got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}

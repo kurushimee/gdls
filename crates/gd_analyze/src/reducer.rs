@@ -2555,7 +2555,7 @@ pub(crate) fn is_type_compatible(
 /// The this-file [`ScriptRef`] identity of an in-file class NODE — root has an empty inner
 /// path; inner classes get their name chain (depth-first search from the root). The inverse of
 /// [`script_ref_as_in_file_class`].
-fn in_file_script_ref_of_class(
+pub(crate) fn in_file_script_ref_of_class(
     ctx: &AnalysisContext,
     node: NodeId,
 ) -> Option<crate::data_type::ScriptRef> {
