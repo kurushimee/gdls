@@ -433,7 +433,7 @@ fn classify_deferred(
         let k = tokens[j as usize].kind;
         match k {
             Dollar => {
-                let prefix = prefix_at(tokens, anchor, byte);
+                let prefix = bare_node_path_prefix(tokens, anchor, byte, DeferredReason::NodePath);
                 return Some(CompletionContext::new(
                     CompletionKind::Deferred(DeferredReason::NodePath),
                     prefix,
@@ -450,7 +450,8 @@ fn classify_deferred(
                 if is_modulo {
                     break;
                 }
-                let prefix = prefix_at(tokens, anchor, byte);
+                let prefix =
+                    bare_node_path_prefix(tokens, anchor, byte, DeferredReason::UniqueNodePath);
                 return Some(CompletionContext::new(
                     CompletionKind::Deferred(DeferredReason::UniqueNodePath),
                     prefix,
@@ -466,22 +467,327 @@ fn classify_deferred(
         j -= 1;
     }
 
-    // `load("…")` / `preload("…")` resource paths: the cursor is inside the argument list of a
-    // `load`/`preload` call. Detect the enclosing `(` and check the callee token.
+    // String-argument deferred contexts: the cursor is inside a string literal that is the first
+    // argument of a resource-loader (`load`/`preload`) or a node-path call (`get_node`/
+    // `get_node_or_null`/`NodePath`). Detect the enclosing `(`, check the callee, and require the
+    // cursor to sit inside the *first* argument's string literal.
     if let Some((open_idx, ParenthesisOpen)) = enclosing_open_bracket(tokens, anchor) {
         if let Some(callee_idx) = prev_meaningful(tokens, open_idx) {
             let callee = &tokens[callee_idx];
-            let is_resource_loader = matches!(callee.kind, Preload)
-                || (callee.kind == Identifier && &*callee.source == "load");
-            if is_resource_loader {
-                return Some(CompletionContext::bare(CompletionKind::Deferred(
-                    DeferredReason::ResourcePath,
-                )));
+            let reason = match callee.kind {
+                // `preload(` is its own keyword; `load`/`get_node`/`get_node_or_null`/`NodePath`
+                // are plain identifiers in GDScript (no dedicated tokens).
+                Preload => Some(DeferredReason::ResourcePath),
+                Identifier => match &*callee.source {
+                    "load" => Some(DeferredReason::ResourcePath),
+                    // `get_node`/`get_node_or_null` take a node-PATH string; `NodePath("…")` is the
+                    // same shape (a node path written as a `NodePath` value).
+                    "get_node" | "get_node_or_null" | "NodePath" => Some(DeferredReason::NodePath),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                // The path is always the FIRST argument of these calls (`get_node(path)`,
+                // `load(path)`, …). Only fire in arg slot 0 — a `get_node(foo, "Bar"|)` 2nd arg is
+                // not a path position, so it falls through to the normal call-argument context.
+                if arg_index_after(tokens, open_idx, byte) == 0 {
+                    // A node-path call (`get_node`/`get_node_or_null`/`NodePath`) only completes a
+                    // path when arg 0 is a STRING-literal context: the cursor inside the string
+                    // (`get_node("Sp|")`) or just past a complete one (`get_node("x"|)` → an empty
+                    // post-quote list). A bare-identifier arg (`get_node(pa|)`, passing a `NodePath`/
+                    // `String` variable) is a normal expression position → fall through to identifier
+                    // completion, not an (empty) node-path list that suppresses it. (`load`/`preload`
+                    // keep their established whole-arg behavior.)
+                    if matches!(reason, DeferredReason::NodePath)
+                        && !first_arg_has_string_literal(tokens, open_idx, byte)
+                    {
+                        return None;
+                    }
+                    // The path text lives INSIDE one string-literal token (the lexer makes a string a
+                    // single token), so `prefix_at` can't recover it — compute the in-string prefix
+                    // span (the last segment up to the cursor) directly so the edit replaces exactly
+                    // the typed segment, never the whole path or the surrounding quotes. The segment
+                    // split is reason-specific (it must match the renderer's committed-dir split).
+                    let prefix = string_arg_prefix(tokens, byte, reason);
+                    return Some(CompletionContext::new(
+                        CompletionKind::Deferred(reason),
+                        prefix,
+                    ));
+                }
             }
         }
     }
 
     None
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Deferred (M11 node-path / resource-path) prefix extraction.
+//
+// These are `pub(crate)` so the M11 Phase-3 completion renderer (`completion.rs`) reuses the SAME
+// token/string walk the classifier uses, rather than re-implementing a path scan (#65: the bracket /
+// string framing lives here, never in the handler). A deferred context's *committed directory* (the
+// path up to the last `/`) tells the renderer which node's children to enumerate; the *last segment*
+// is the already-captured `CompletionContext::prefix` (the edit/filter span), so it is NOT recomputed
+// here.
+// ---------------------------------------------------------------------------------------------------
+
+/// The committed directory of a **bare** `$`/`%` node-path access at the cursor: the path segments
+/// before the last `/`, joined with `/`. For `$A/B/Sp|` it is `"A/B"`; for `$A/|` it is `"A"`; for a
+/// rootless `$|` / `$Sp|` it is `""` (the access node's own children). `None` when the cursor is not
+/// in a bare `$`/`%` node path (e.g. it is a `get_node("…")` string form — use
+/// [`string_node_path_committed_dir`] there).
+///
+/// Returned alongside the sigil so the renderer can branch `$` (relative path) vs `%` (unique name)
+/// without re-scanning. Segments are read from the token stream (names / `/` separators / quoted
+/// `$"a/b"` segments), mirroring [`classify_deferred`]'s own backward walk.
+#[must_use]
+pub(crate) fn bare_node_path_committed_dir(
+    tokens: &[Token],
+    byte: usize,
+) -> Option<(NodePathSigil, String)> {
+    use TokenKind::*;
+    let anchor = anchor_index(tokens, byte)?;
+
+    // Collect the path segment tokens (names + separators) walking left to the `$`/`%` root, the
+    // same set `classify_deferred` accepts. Stop the moment a non-path token appears.
+    let mut segs_rev: Vec<&str> = Vec::new();
+    let mut j = anchor as isize;
+    let sigil;
+    loop {
+        if j < 0 {
+            return None; // ran off the front without a sigil → not a bare node path
+        }
+        let t = &tokens[j as usize];
+        match t.kind {
+            Dollar => {
+                sigil = NodePathSigil::Relative;
+                break;
+            }
+            Percent => {
+                // Modulo `x % y`, not a unique-node sigil — not a bare node path.
+                let is_modulo = prev_meaningful(tokens, j as usize)
+                    .is_some_and(|p| tokens[p].kind.can_precede_bin_op());
+                if is_modulo {
+                    return None;
+                }
+                sigil = NodePathSigil::Unique;
+                break;
+            }
+            Slash => segs_rev.push("/"),
+            // A quoted segment (`$"a/b"`) — take its decoded/source text verbatim as one segment.
+            Literal => segs_rev.push(literal_segment_text(t)),
+            _ if t.kind.is_node_name() => segs_rev.push(&t.source),
+            _ => return None,
+        }
+        j -= 1;
+    }
+
+    // Reassemble the path text in source order, then drop the trailing partial segment (the part
+    // after the last `/`, which is the captured `prefix`). What remains is the committed directory.
+    segs_rev.reverse();
+    let joined: String = segs_rev.concat();
+    let committed = match joined.rfind('/') {
+        Some(slash) => joined[..slash].to_string(),
+        None => String::new(), // no `/` → the partial is a first segment → dir is the access root
+    };
+    Some((sigil, committed))
+}
+
+/// Which sigil a node-path access uses: `$` (a tree-relative path) or `%` (an owner-unique name).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodePathSigil {
+    /// `$Rel/Path` — resolved relative to the access node.
+    Relative,
+    /// `%UniqueName` — resolved owner-wide by unique name.
+    Unique,
+}
+
+/// The committed directory of a **string-form** node path (`get_node("A/B/Sp|")` /
+/// `NodePath("A/B/|")`) at the cursor: the in-string path up to the last `/`. For
+/// `get_node("A/B/Sp|")` it is `"A/B"`; for `get_node("|")` it is `""`. `None` when the cursor is
+/// not inside such a call's string argument. Leading `./` is preserved verbatim (Godot resolves it),
+/// and a `%`-rooted string (`get_node("%Unique")`) is reported via the returned leading-`%` flag so
+/// the renderer can treat it as a unique-name access.
+#[must_use]
+pub(crate) fn string_node_path_committed_dir(
+    tokens: &[Token],
+    byte: usize,
+) -> Option<StringNodePath> {
+    let content = string_arg_content_before_cursor(tokens, byte)?;
+    // A `%Name`-rooted string is a unique-name access written as a path string.
+    if let Some(rest) = content.strip_prefix('%') {
+        // `%Unique/child` (a slash after the unique name) is a deeper traversal we defer; only the
+        // bare `%Unique` form lists unique names.
+        if rest.contains('/') {
+            return Some(StringNodePath {
+                unique: true,
+                committed_dir: rest[..rest
+                    .rfind('/')
+                    .expect("invariant: rest.contains('/') checked immediately above")]
+                    .to_string(),
+                deeper_unique: true,
+            });
+        }
+        return Some(StringNodePath {
+            unique: true,
+            committed_dir: String::new(),
+            deeper_unique: false,
+        });
+    }
+    let committed_dir = match content.rfind('/') {
+        Some(slash) => content[..slash].to_string(),
+        None => String::new(),
+    };
+    Some(StringNodePath {
+        unique: false,
+        committed_dir,
+        deeper_unique: false,
+    })
+}
+
+/// A parsed string-form node path access (`get_node("…")`): whether it is `%`-rooted (unique) and the
+/// committed directory before the cursor's last `/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StringNodePath {
+    /// `true` for a `%Name`-rooted string (a unique-name access).
+    pub unique: bool,
+    /// The path up to the last `/` (the children of this directory are the suggestions).
+    pub committed_dir: String,
+    /// `true` for the deferred `%Unique/child` deeper-traversal form (renderer emits nothing).
+    pub deeper_unique: bool,
+}
+
+/// The committed `res://` directory of a `load`/`preload` string argument at the cursor: the typed
+/// path up to the last `/`. For `load("res://a/b/c|")` it is `"res://a/b"`; for `load("|")` it is
+/// `""`. `None` when the cursor is not inside a resource-loader string. (The last segment is the
+/// captured `prefix`; this is everything before it.)
+#[must_use]
+pub(crate) fn resource_path_committed_dir(tokens: &[Token], byte: usize) -> Option<String> {
+    let content = string_arg_content_before_cursor(tokens, byte)?;
+    Some(match content.rfind('/') {
+        Some(slash) => content[..=slash].to_string(), // keep the trailing `/` (a directory prefix)
+        None => String::new(),
+    })
+}
+
+/// True iff the first argument of the call opened at `open_idx` is (or begins as) a string-literal
+/// context before `byte` — a quote-starting `Literal` at arg-0 depth. Distinguishes a node-path
+/// string (`get_node("…"|)` — keep classifying so the renderer offers paths, or an empty post-quote
+/// list) from a bare identifier (`get_node(pa|)` — fall through to identifier completion).
+fn first_arg_has_string_literal(tokens: &[Token], open_idx: usize, byte: usize) -> bool {
+    let mut depth = 0i32;
+    for t in tokens.iter().skip(open_idx + 1) {
+        if t.span.start >= byte {
+            break;
+        }
+        match t.kind {
+            TokenKind::ParenthesisOpen | TokenKind::BracketOpen | TokenKind::BraceOpen => {
+                depth += 1;
+            }
+            TokenKind::ParenthesisClose | TokenKind::BracketClose | TokenKind::BraceClose => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+            }
+            TokenKind::Comma if depth == 0 => break,
+            TokenKind::Literal if depth == 0 && t.source.starts_with(['"', '\'']) => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The raw source text of a string literal's content from the opening quote to the cursor, for the
+/// string-argument deferred contexts. The cursor must sit STRICTLY inside a string-literal token —
+/// after the opening quote and *before* the closing quote (`start < cursor < end`). A cursor AT the
+/// closing quote (`cursor == end`, i.e. just past it) is NOT inside the string: returning content
+/// there would let the edit span swallow the closing quote (an unterminated-string corruption).
+/// `None` for any non-in-string position. Works on the SOURCE bytes (not the decoded value) so the
+/// offsets line up with the cursor; an escape sequence in the typed prefix is not un-escaped (a
+/// documented limit — node names / res paths are plain text).
+fn string_arg_content_before_cursor(tokens: &[Token], byte: usize) -> Option<&str> {
+    // The string token whose span STRICTLY contains the cursor. The lexer makes a string a single
+    // `Literal` token whose `span` covers BOTH quotes; `byte < span.end` keeps the cursor before the
+    // closing quote (so the prefix span never includes it). A `Literal` is always terminated (an
+    // unterminated string lexes as an `Error`, never reaching here), so this is the right bound.
+    let tok = tokens
+        .iter()
+        .find(|t| t.kind == TokenKind::Literal && t.span.start < byte && byte < t.span.end)?;
+    // Content starts after the opening quote (1 byte: `"` / `'`). Guard a malformed/short token.
+    let content_start = tok.span.start + 1;
+    if byte < content_start {
+        return None;
+    }
+    // Slice the token's own source text (which spans the quotes) from after the quote to the cursor.
+    let rel_start = content_start - tok.span.start;
+    let rel_end = byte - tok.span.start;
+    tok.source.get(rel_start..rel_end)
+}
+
+/// The in-string prefix span the edit replaces for a string-argument deferred context — chosen so
+/// accepting an item never doubles a prefix and never drops a required scheme. Returns a source-byte
+/// [`ByteSpan`]; `None` when the cursor is not strictly inside the string.
+///
+/// The span model is REASON-SPECIFIC:
+///
+/// * **Node paths** ([`DeferredReason::NodePath`] / [`UniqueNodePath`](DeferredReason::UniqueNodePath)):
+///   the LAST segment (after the last `/`, or the `%` root sigil) — the renderer inserts a bare node
+///   name, which fills exactly that segment (`get_node("A/B/Sp|")` accept `Sprite` →
+///   `get_node("A/B/Sprite")`). `%` is a boundary here (a `%Name`-rooted string).
+/// * **Resource paths** ([`DeferredReason::ResourcePath`]): the WHOLE typed content from the opening
+///   quote to the cursor. A `res://…` literal has a mandatory `res://` scheme the renderer inserts as
+///   part of the full path, so the edit must cover the entire (possibly partial) scheme+path — else
+///   `load("re|")` accepting `res://src/` would leave `load("src/")` (scheme dropped) or
+///   `load("reres://src/")` (doubled). Replacing the whole content with the full path is correct for
+///   any amount of typed prefix. `%` is just a filename byte here, never a boundary.
+fn string_arg_prefix(tokens: &[Token], byte: usize, reason: DeferredReason) -> Option<ByteSpan> {
+    let content = string_arg_content_before_cursor(tokens, byte)?;
+    let seg_len = match reason {
+        // Node path: only the last `/`- or `%`-delimited segment.
+        DeferredReason::NodePath | DeferredReason::UniqueNodePath => {
+            match content.rfind(['/', '%']) {
+                Some(pos) => content.len() - pos - 1,
+                None => content.len(),
+            }
+        }
+        // Resource path: the entire typed content (the renderer inserts the full `res://` path).
+        DeferredReason::ResourcePath => content.len(),
+    };
+    Some(ByteSpan::new(byte - seg_len, byte))
+}
+
+/// The completion prefix span for a BARE `$`/`%` node path. The usual case is a partial word token
+/// glued to the cursor (`$A/B/Sp|` → `prefix_at` returns the `Sp` span). But a quoted segment
+/// (`$"Sp|"` / `$Player/"Sp|"`) puts the cursor INSIDE a string-literal token, where `prefix_at`
+/// returns `None` (the anchor is the `$`/`%`, not the still-open literal) — which would give a
+/// zero-width edit while the item carries the bare child name, DOUBLING it (`$"SpSprite"`). When the
+/// cursor is strictly inside such a literal, use the in-string segment span instead.
+fn bare_node_path_prefix(
+    tokens: &[Token],
+    anchor: Option<usize>,
+    byte: usize,
+    reason: DeferredReason,
+) -> Option<ByteSpan> {
+    // Cursor strictly inside a quoted segment → the in-string segment span (handles `$"Sp|"`).
+    if let Some(span) = string_arg_prefix(tokens, byte, reason) {
+        return Some(span);
+    }
+    // Otherwise the ordinary partial-word prefix (`$A/B/Sp|`, `%Hea|`).
+    prefix_at(tokens, anchor, byte)
+}
+
+/// The text of a quoted node-path segment token (`$"a/b"`), as it should join into the path string —
+/// the decoded string value when available (so `$"weird name"` keeps its spaces), else the raw
+/// source. Used only for assembling the committed directory of a bare `$`/`%` path.
+fn literal_segment_text(tok: &Token) -> &str {
+    use gd_syntax::token::Literal;
+    match &tok.literal {
+        Some(Literal::String(s) | Literal::NodePath(s) | Literal::StringName(s)) => s,
+        _ => &tok.source,
+    }
 }
 
 /// (2) Member access (`.`-anchored). `super.` ⇒ `SuperMethod`; otherwise `Attribute`, recovering the

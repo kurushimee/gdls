@@ -241,6 +241,69 @@ impl SceneIndex {
         self.resolve_node_root_via_index(node, &mut FxHashSet::default(), 0)
     }
 
+    /// The direct children of the node reached by `$rel_path` as seen by a script attached at
+    /// `attachment_path` within `scene_res` — the candidate set for `$RelPath/<cursor>` completion
+    /// (M11 Phase 3). The base node's root-relative path is `attachment_path` joined with `rel_path`
+    /// (lexically, via [`join_node_path`], so `.`/`..` resolve and an escape above the root yields
+    /// nothing); each returned `(name, ResolvedRoot)` is a direct child's name and its resolved root
+    /// (native type / attached script, instanced sub-scenes followed for the type). Names are sorted
+    /// for deterministic ranking. Empty when the scene, the base node, or its children don't resolve.
+    ///
+    /// SAME-SCENE only: a base that lands ON an instanced sub-scene resolves its TYPE (via
+    /// `ResolvedRoot`) but its sub-tree children are not enumerated here — that cross-scene walk is a
+    /// documented Phase-3 deferral; this lists children declared directly in `scene_res`.
+    #[must_use]
+    pub fn children_relative_from(
+        &self,
+        scene_res: &str,
+        attachment_path: &str,
+        rel_path: &str,
+    ) -> Vec<(String, ResolvedRoot)> {
+        let Some(scene) = self.scene(scene_res) else {
+            return Vec::new();
+        };
+        let Some(base_path) = join_node_path(attachment_path, rel_path) else {
+            return Vec::new();
+        };
+        // The base must name an actual node (so `$Bogus/` lists nothing, not the root's children).
+        if scene.node_at(&base_path).is_none() {
+            return Vec::new();
+        }
+        let mut out: Vec<(String, ResolvedRoot)> = scene
+            .nodes
+            .iter()
+            .filter(|n| !n.name.is_empty() && is_direct_child(&base_path, &n.path))
+            .filter_map(|n| {
+                let resolved = self.resolve_node_root_via_index(n, &mut FxHashSet::default(), 0)?;
+                Some((n.name.clone(), resolved))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Every `unique_name_in_owner` node of `scene_res`, as `(unique_name, ResolvedRoot)` — the
+    /// candidate set for `%<cursor>` completion (M11 Phase 3). Owner-scoped (attachment-independent),
+    /// mirroring [`Self::resolve_unique_in`]. Names sorted; empty if the scene isn't indexed.
+    #[must_use]
+    pub fn unique_nodes_in(&self, scene_res: &str) -> Vec<(String, ResolvedRoot)> {
+        let Some(scene) = self.scene(scene_res) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, ResolvedRoot)> = scene
+            .unique_names
+            .keys()
+            .filter_map(|name| {
+                let node = scene.node_by_unique_name(name)?;
+                let resolved =
+                    self.resolve_node_root_via_index(node, &mut FxHashSet::default(), 0)?;
+                Some((name.clone(), resolved))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Index-backed analogue of [`scene::resolve_node_root`](crate::scene): resolve one node's
     /// contributed root, recursing through instanced sub-scenes by looking the PackedScene up in this
     /// index (the parsed scene, no disk re-read), bounded by a `visited` cycle set and
@@ -395,6 +458,23 @@ fn join_node_path(attachment: &str, rel: &str) -> Option<String> {
         }
     }
     Some(parts.join("/"))
+}
+
+/// Whether `child_path` is a DIRECT child of the node at `parent_path` (both root-relative). The
+/// root is `""`, so its direct children are the single-segment paths (`"A"`, `"B"` — no `/`); a node
+/// `"A"`'s direct children are `"A/<name>"` with exactly one more segment. Used by
+/// [`SceneIndex::children_relative_from`] to list a path prefix's immediate children.
+fn is_direct_child(parent_path: &str, child_path: &str) -> bool {
+    if parent_path.is_empty() {
+        // Root's direct children: non-empty single-segment paths (the root itself is "").
+        !child_path.is_empty() && !child_path.contains('/')
+    } else {
+        match child_path.strip_prefix(parent_path) {
+            // `parent/<seg>` with exactly one trailing segment (no further `/`).
+            Some(rest) => rest.strip_prefix('/').is_some_and(|seg| !seg.contains('/')),
+            None => false,
+        }
+    }
 }
 
 /// Normalize a project-absolute path to its `res://` form for scene-index keys, given the project
@@ -572,6 +652,121 @@ script = ExtResource("1")
             .unwrap();
         assert_eq!(r.native_type.as_deref(), Some("Sprite2D"));
         assert_eq!(r.script, None);
+    }
+
+    #[test]
+    fn children_relative_lists_direct_children_with_types() {
+        // Root has two children (Health: Node2D, UI: Control); UI has a Button. `$` (from the root
+        // attachment) lists Root's DIRECT children only; `$UI` lists UI's child.
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://s.tscn",
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://s.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Node2D\"]\nscript = ExtResource(\"1\")\n\
+             [node name=\"Health\" type=\"Node2D\" parent=\".\"]\n\
+             [node name=\"UI\" type=\"Control\" parent=\".\"]\n\
+             [node name=\"Button\" type=\"Button\" parent=\"UI\"]\n",
+        );
+        // `$` from the root: direct children Health + UI, NOT the nested Button. Sorted by name.
+        let kids = idx.children_relative_from("res://s.tscn", "", "");
+        let names: Vec<&str> = kids.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["Health", "UI"], "direct children only, sorted");
+        assert_eq!(kids[0].1.native_type.as_deref(), Some("Node2D")); // Health
+        assert_eq!(kids[1].1.native_type.as_deref(), Some("Control")); // UI
+
+        // `$UI/` → UI's direct child Button.
+        let ui_kids = idx.children_relative_from("res://s.tscn", "", "UI");
+        let ui_names: Vec<&str> = ui_kids.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(ui_names, vec!["Button"]);
+        assert_eq!(ui_kids[0].1.native_type.as_deref(), Some("Button"));
+    }
+
+    #[test]
+    fn children_relative_from_non_root_attachment() {
+        // A script attached at `Wrap` accessing `$` lists Wrap's children (attachment-relative).
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://s.tscn",
+            "[gd_scene format=3]\n\
+             [node name=\"Root\" type=\"Node\"]\n\
+             [node name=\"Wrap\" type=\"Control\" parent=\".\"]\n\
+             [node name=\"Leaf\" type=\"Button\" parent=\"Wrap\"]\n",
+        );
+        let kids = idx.children_relative_from("res://s.tscn", "Wrap", "");
+        let names: Vec<&str> = kids.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["Leaf"]);
+    }
+
+    #[test]
+    fn children_relative_unknown_base_is_empty() {
+        // `$Bogus/` (a base that names no node) lists NOTHING — never falls back to the root.
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://s.tscn",
+            "[gd_scene format=3]\n\
+             [node name=\"Root\" type=\"Node\"]\n\
+             [node name=\"A\" type=\"Node\" parent=\".\"]\n",
+        );
+        assert!(idx
+            .children_relative_from("res://s.tscn", "", "Bogus")
+            .is_empty());
+        // A missing scene → empty.
+        assert!(idx
+            .children_relative_from("res://nope.tscn", "", "")
+            .is_empty());
+    }
+
+    #[test]
+    fn children_relative_resolves_instanced_child_type() {
+        // A child that is an instanced sub-scene resolves its TYPE through the instance (script-first
+        // via the sub-scene root), even though we don't enumerate ITS children here.
+        let mut idx = SceneIndex::new();
+        idx.reindex("res://child.tscn", CHILD); // root Panel + child.gd
+        idx.reindex(
+            "res://parent.tscn",
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://child.tscn\" id=\"2\"]\n\
+             [node name=\"Root\" type=\"Node\"]\n\
+             [node name=\"Sub\" parent=\".\" instance=ExtResource(\"2\")]\n",
+        );
+        let kids = idx.children_relative_from("res://parent.tscn", "", "");
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].0, "Sub");
+        // Sub's type comes from child.tscn's root (Panel) + its script (script-first at the caller).
+        assert_eq!(kids[0].1.native_type.as_deref(), Some("Panel"));
+        assert_eq!(kids[0].1.script.as_deref(), Some("res://child.gd"));
+    }
+
+    #[test]
+    fn unique_nodes_lists_owner_unique_names() {
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://s.tscn",
+            "[gd_scene format=3]\n\
+             [node name=\"Root\" type=\"Node\"]\n\
+             [node name=\"Wrap\" type=\"Control\" parent=\".\"]\n\
+             [node name=\"Special\" type=\"Label\" parent=\"Wrap\"]\nunique_name_in_owner = true\n\
+             [node name=\"Bar\" type=\"ProgressBar\" parent=\".\"]\nunique_name_in_owner = true\n",
+        );
+        let uniques = idx.unique_nodes_in("res://s.tscn");
+        let names: Vec<&str> = uniques.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["Bar", "Special"], "owner-unique names, sorted");
+        assert_eq!(uniques[0].1.native_type.as_deref(), Some("ProgressBar")); // Bar
+        assert_eq!(uniques[1].1.native_type.as_deref(), Some("Label")); // Special
+    }
+
+    #[test]
+    fn is_direct_child_root_and_nested() {
+        // Root ("") direct children: single-segment paths.
+        assert!(is_direct_child("", "A"));
+        assert!(!is_direct_child("", "A/B")); // nested, not direct
+        assert!(!is_direct_child("", "")); // the root itself
+                                           // "A"'s direct children: "A/<seg>".
+        assert!(is_direct_child("A", "A/B"));
+        assert!(!is_direct_child("A", "A/B/C")); // grandchild
+        assert!(!is_direct_child("A", "AB")); // a sibling whose name starts with A
+        assert!(!is_direct_child("A", "A")); // the node itself
     }
 
     #[test]
