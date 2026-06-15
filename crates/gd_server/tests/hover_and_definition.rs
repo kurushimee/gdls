@@ -1582,9 +1582,10 @@ fn definition_inner_class_property_jumps_to_inner() {
     shutdown(&client, handle);
 }
 
-/// #146 (deep nesting): a **doubly**-nested inner-class instance (`Outer.Inner.new()`) resolves
-/// members on `Outer.Inner` — proving the producer builds the full `["Outer","Inner"]` chain and
-/// `iface_at_inner` descends every segment (not just depth-1).
+/// #146 (deep nesting, CALL path): a **doubly**-nested inner-class instance method
+/// (`Outer.Inner.new(); x.deep(1)`) resolves on `Outer.Inner` — locking `iface_at_inner`'s depth-2
+/// descent via definition step (1.6)'s `CalleeTarget` `class_path` (built in `reduce_call`, so this
+/// does NOT exercise the `finish()` producer chain — see the non-call test below for that).
 #[test]
 fn definition_doubly_nested_inner_class_member_descends_full_chain() {
     let (client, handle) = boot();
@@ -1609,6 +1610,39 @@ fn definition_doubly_nested_inner_class_member_descends_full_chain() {
     assert_eq!(
         location.range.start.line, 2,
         "definition must descend to Outer.Inner.deep (line 2); got {:?}",
+        location.range.start
+    );
+    shutdown(&client, handle);
+}
+
+/// #146 (deep nesting, PRODUCER path): a **doubly**-nested inner-class instance **property**
+/// (`Outer.Inner.new(); x.deep_field`, not a call) resolves on `Outer.Inner`. Unlike the call
+/// variant, a bare attribute goes through definition step (0.5), which reads `base_dt.script_type`
+/// — the `finish()`-produced `ScriptRef` — so this LOCKS the producer building the full
+/// `["Outer","Inner"]` chain (a depth-1-only producer would fail to descend / find the member).
+#[test]
+fn definition_doubly_nested_inner_class_property_locks_producer_chain() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/depth2_prop.gd".parse().unwrap();
+    let src = concat!(
+        "class Outer:\n",                 // 0
+        "\tclass Inner:\n",               // 1
+        "\t\tvar deep_field := 0\n",      // 2  target (line 2)
+        "\n",                             // 3
+        "func use_it() -> void:\n",       // 4
+        "\tvar x := Outer.Inner.new()\n", // 5
+        "\tvar y := x.deep_field\n",      // 6  `deep_field` starts col 12; cursor at col 14
+    );
+    did_open(&client, &uri, src);
+    let response = definition_at(&client, &uri, Position::new(6, 14))
+        .expect("definition on x.deep_field resolves");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    assert_eq!(
+        location.range.start.line, 2,
+        "definition must descend to Outer.Inner.deep_field (line 2) via the producer chain; got {:?}",
         location.range.start
     );
     shutdown(&client, handle);

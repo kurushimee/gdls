@@ -587,7 +587,8 @@ impl<'a> AnalysisContext<'a> {
     /// Consume the context into the analysis result. Rewrites any surviving in-file `Class` type to a
     /// self-referential `Script` ref so that no transient `NodeId` (meaningless in another tree) ever
     /// escapes `analyze()` — the plan's "no `class_node` leaves the result" guard. The inner-class
-    /// chain is refined when interface resolution tracks nesting (WP-D); WP-C only needs the file id.
+    /// chain is DERIVED here (pass 1 below) from each `Class` value's `class_node`, so an inner-class
+    /// INSTANCE keeps its precise identity for the post-analysis nav/completion consumers (#146).
     pub fn finish(mut self) -> AnalysisResult {
         // WP-RD2: an orphan file (`self.file == None`) still needs a concrete id for its own
         // class types' self-`ScriptRef` so the "no `class_node` leaves the result" rewrite below

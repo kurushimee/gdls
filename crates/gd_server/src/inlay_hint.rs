@@ -383,7 +383,9 @@ fn annotation_type(state: &ServerState, dt: &DataType) -> Option<String> {
             let sr = dt.script_type.as_ref()?;
             // Only a TOP-LEVEL script with a real `class_name` is insertable by its bare name; an
             // inner-class type (`sr.inner` non-empty) or an unnamed script is not (its display is a
-            // basename / dotted-basename — not a source type).
+            // basename / dotted-basename — not a source type). This gate is load-bearing: since #146,
+            // `sr.inner` is reliably populated for an inner-class instance, so this withholds the
+            // (would-be source-invalid) auto-insert edit rather than emitting the root `class_name`.
             if !sr.inner.is_empty() {
                 return None;
             }
