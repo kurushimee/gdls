@@ -4358,6 +4358,10 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // case is blocked by the same dump-vs-ClassDB gap across arbitrary classes (deferred). Exact-
         // gated (a non-Exact dump can't be trusted even for `Node`); additive — no error path changes,
         // so the hard "Function not found in base" error stays reserved for `is_self || (hard && BUILTIN)`.
+        // The `_`-prefix skip is deliberately BROAD: it also silences a FABRICATED `_typo()` (a missed
+        // lint on invalid code — the safe under-emit direction), traded for zero blast radius + forward
+        // safety as future Godot adds Object-core virtuals. Seeding the dump-omitted Object-core set
+        // into the native DB would let this skip drop (real virtuals resolve, fabricated `_`-names warn).
         let base_is_get_node = call
             .callee
             .and_then(|c| match &ctx.node(c).kind {
