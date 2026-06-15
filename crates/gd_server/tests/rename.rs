@@ -1559,3 +1559,87 @@ fn rename_local_does_not_rewrite_lua_style_dict_key() {
     );
     shutdown(&client, server);
 }
+
+// =================================================================================================
+// #106: a PROJECT enum VALUE renames (positive analyzer anchor), an unrelated same-named symbol
+// does NOT, and a native @GlobalScope enum value still refuses.
+//
+// The fail-closed firewall (#66) refused a project enum VALUE because the analyzer recorded NO
+// `Binding::Use` for a named-enum value access (`E.NORTH`) and `member_named` matches an enum's NAME
+// not its values — so `rename_target_has_project_anchor` found no positive project anchor. The fix
+// pins the value's binding by IDENTITY (the file declaring the enum) so the gate can admit ONLY the
+// value's own occurrences, never a raw-text scan.
+// =================================================================================================
+
+#[test]
+fn rename_in_file_enum_value_from_declaration_renames_precisely() {
+    // `enum Direction { NORTH, SOUTH }` declared in this file; `NORTH` read as `Direction.NORTH`.
+    // Renaming the value from its DECLARATION must edit the decl + the qualified use, and refuse
+    // nothing. (Pre-#106 this refused with -32803: no project anchor for a named-enum value.)
+    //   line 1 `enum Direction { NORTH, SOUTH }` → decl `NORTH` at col 17
+    //   line 3 `\tvar d = Direction.NORTH`        → use  `NORTH` at col 19
+    let src = "extends Node\nenum Direction { NORTH, SOUTH }\nfunc go() -> void:\n\tvar d = Direction.NORTH\n\tprint(d)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the value DECLARATION (line 1, col 17). Rename → `UP`.
+    let sites = rename_sites(&client, 200, &main_uri, 1, 17, "UP");
+    assert_eq!(
+        sites,
+        vec![(1, 17), (3, 19)],
+        "renaming an in-file enum value from its declaration must edit the decl + the \
+         `Direction.NORTH` use, never the sibling `SOUTH`; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_in_file_enum_value_from_use_renames_precisely() {
+    // Same enum, but clicked on the `Direction.NORTH` USE site. The edit set must be identical
+    // (click-site-independent) — the analyzer anchor canonicalizes to the declaration.
+    let src = "extends Node\nenum Direction { NORTH, SOUTH }\nfunc go() -> void:\n\tvar d = Direction.NORTH\n\tprint(d)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the USE `NORTH` (line 3, col 19). Rename → `UP`.
+    let sites = rename_sites(&client, 201, &main_uri, 3, 19, "UP");
+    assert_eq!(
+        sites,
+        vec![(1, 17), (3, 19)],
+        "renaming an in-file enum value from a use site must edit the same set as the declaration \
+         click (decl + use); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_enum_value_does_not_touch_unrelated_same_named_symbol() {
+    // CORRUPTION GUARD (by-identity, not by-name): a `const NORTH` in the SAME file shares the enum
+    // value's name but is a DISTINCT symbol. Renaming the enum value must NOT rewrite the unrelated
+    // `const NORTH` (its decl or its use) — that would be the W16 raw-text-scan corruption the
+    // fail-closed firewall exists to prevent.
+    //   line 1 `enum Direction { NORTH }`     → enum value decl `NORTH` at col 17
+    //   line 2 `const NORTH := 99`            → UNRELATED const decl `NORTH` at col 6
+    //   line 4 `\tvar a = Direction.NORTH`    → enum value use at col 19
+    //   line 5 `\tvar b = NORTH`              → UNRELATED const use at col 9
+    let src = "extends Node\nenum Direction { NORTH }\nconst NORTH := 99\nfunc go() -> void:\n\tvar a = Direction.NORTH\n\tvar b = NORTH\n\tprint(a + b)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Rename the ENUM VALUE from its decl (line 1, col 17) → `UP`.
+    let sites = rename_sites(&client, 202, &main_uri, 1, 17, "UP");
+    assert_eq!(
+        sites,
+        vec![(1, 17), (4, 19)],
+        "renaming the enum value must edit ONLY its decl + `Direction.NORTH` use, never the \
+         unrelated `const NORTH` decl (line 2) or its use (line 5); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_refuses_global_scope_enum_value_still() {
+    // The firewall must STILL refuse a NATIVE @GlobalScope enum value (`SIDE_LEFT`) — the #106 fix
+    // admits only PROJECT enum values (positively anchored), never native ones. (Mirrors the
+    // pre-existing `rename_refuses_global_enum_value`, re-asserted here so the #106 widening can't
+    // silently let native enum values through.)
+    let src = "extends Node\nfunc go() -> void:\n\tvar d = SIDE_LEFT\n";
+    let (client, server, main_uri, _project) = boot_native_member_with_api(src, RICH_NATIVE_API);
+    // `SIDE_LEFT` at line 2, col 9.
+    assert_rename_refused_native(&client, 203, &main_uri, 2, 9);
+    shutdown(&client, server);
+}
