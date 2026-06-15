@@ -594,16 +594,42 @@ impl<'a> AnalysisContext<'a> {
         // holds. `FileId::ORPHAN` is that id; it is never recorded in a `Binding` and never
         // escapes to another file's analysis, so it cannot mis-attribute anything.
         let self_file = self.file.unwrap_or(FileId::ORPHAN);
+        // Two passes so the inner-class chain is DERIVED (not dropped). Pass 1 (immutable): for each
+        // in-file `Class` value, recover its inner-class name chain from `class_node` via the DFS
+        // (`in_file_script_ref_of_class`) — root → empty, an inner class → e.g. `["Inner"]`. The old
+        // single-pass `unwrap_or_default()` left `inner` EMPTY, so an inner-class INSTANCE value
+        // (`var x := Inner.new()`) was rewritten to the file ROOT — a fail-open lie on every value-node
+        // consumer (hover/completion/definition resolved root members, not the inner class). Only
+        // inner-class instances change; a root instance still yields `inner: []`.
+        let class_inner: Vec<(usize, Vec<String>)> = self
+            .types
+            .iter()
+            .enumerate()
+            .filter(|(_, dt)| dt.kind == DtKind::Class)
+            .map(|(i, dt)| {
+                let inner = dt
+                    .class_node
+                    .and_then(|n| crate::reducer::in_file_script_ref_of_class(&self, n))
+                    .map(|sr| sr.inner)
+                    .unwrap_or_default();
+                (i, inner)
+            })
+            .collect();
+        // Pass 2 (mutable): rewrite each `Class` value to its `Script` ref (the result must not leak
+        // `DtKind::Class` — a transient NodeId). Both passes visit `Class` types in index order, so
+        // the pass-1 paths drain positionally onto the same types (`TypeTable` is not `Index`able).
+        let mut paths = class_inner.into_iter();
         for dt in self.types.iter_mut() {
-            if dt.kind == DtKind::Class {
-                let inner = dt.script_type.take().map(|s| s.inner).unwrap_or_default();
-                dt.kind = DtKind::Script;
-                dt.class_node = None;
-                dt.script_type = Some(ScriptRef {
-                    file: self_file,
-                    inner,
-                });
+            if dt.kind != DtKind::Class {
+                continue;
             }
+            let inner = paths.next().map(|(_, p)| p).unwrap_or_default();
+            dt.kind = DtKind::Script;
+            dt.class_node = None;
+            dt.script_type = Some(ScriptRef {
+                file: self_file,
+                inner,
+            });
         }
         debug_assert!(
             self.types.iter().all(|dt| dt.kind != DtKind::Class),
