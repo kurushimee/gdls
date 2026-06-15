@@ -1549,3 +1549,67 @@ fn definition_inner_class_instance_member_jumps_to_inner() {
     );
     shutdown(&client, handle);
 }
+
+/// #146 (non-call attribute): definition on an inner-class instance **property** (`x.field`, not a
+/// call) jumps to the INNER `field`, not the same-named ROOT one. Exercises definition step (0.5)
+/// for a bare attribute (no Call binding) + `member_decl_location` resolving a var member.
+#[test]
+fn definition_inner_class_property_jumps_to_inner() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/inner_prop.gd".parse().unwrap();
+    let src = concat!(
+        "var field := 0\n",         // 0  root field
+        "\n",                       // 1
+        "class Inner:\n",           // 2
+        "\tvar field := 0\n",       // 3  inner field (the target, line 3)
+        "\n",                       // 4
+        "func use_it() -> void:\n", // 5
+        "\tvar x := Inner.new()\n", // 6
+        "\tvar y := x.field\n",     // 7  `field` at cols 11..16; cursor at col 13
+    );
+    did_open(&client, &uri, src);
+    let response =
+        definition_at(&client, &uri, Position::new(7, 13)).expect("definition on x.field resolves");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    assert_eq!(
+        location.range.start.line, 3,
+        "definition must jump to the INNER field (line 3), not the root (line 0); got {:?}",
+        location.range.start
+    );
+    shutdown(&client, handle);
+}
+
+/// #146 (deep nesting): a **doubly**-nested inner-class instance (`Outer.Inner.new()`) resolves
+/// members on `Outer.Inner` — proving the producer builds the full `["Outer","Inner"]` chain and
+/// `iface_at_inner` descends every segment (not just depth-1).
+#[test]
+fn definition_doubly_nested_inner_class_member_descends_full_chain() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/depth2.gd".parse().unwrap();
+    let src = concat!(
+        "class Outer:\n",                   // 0
+        "\tclass Inner:\n",                 // 1
+        "\t\tfunc deep(a: int) -> void:\n", // 2  target (line 2)
+        "\t\t\tpass\n",                     // 3
+        "\n",                               // 4
+        "func use_it() -> void:\n",         // 5
+        "\tvar x := Outer.Inner.new()\n",   // 6
+        "\tx.deep(1)\n",                    // 7  `deep` cursor at col 4
+    );
+    did_open(&client, &uri, src);
+    let response =
+        definition_at(&client, &uri, Position::new(7, 4)).expect("definition on x.deep resolves");
+    let location = match response {
+        GotoDefinitionResponse::Scalar(loc) => loc,
+        other => panic!("expected scalar Location, got {other:?}"),
+    };
+    assert_eq!(
+        location.range.start.line, 2,
+        "definition must descend to Outer.Inner.deep (line 2); got {:?}",
+        location.range.start
+    );
+    shutdown(&client, handle);
+}
