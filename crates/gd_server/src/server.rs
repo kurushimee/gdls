@@ -157,6 +157,35 @@ pub(crate) struct ClientCaps {
     /// `textDocument.publishDiagnostics`. Grouped in a sub-struct like [`InlayHintCaps`] so the
     /// handlers read `state.caps.code_action.<gate>`.
     pub(crate) code_action: CodeActionCaps,
+    /// The M11 (#79) workspace file-operation gates, captured under
+    /// `workspace.fileOperations`. Grouped in a sub-struct like [`CodeActionCaps`] so the handler
+    /// reads `state.caps.file_operations.<gate>` and the advertised capability mirrors them.
+    pub(crate) file_operations: FileOperationsCaps,
+}
+
+/// The `workspace.fileOperations` client capabilities gdls branches on (M11 #79). Each flag both
+/// (a) gates ADVERTISING the matching server capability — gdls advertises a file-operation provider
+/// ONLY when the client opted into sending that operation (a client that won't send
+/// `willRenameFiles` must not be told gdls handles it) — and (b) is therefore the precondition for
+/// the matching handler ever running. Absent ⇒ all `false` ⇒ no file-operation capability is
+/// advertised at all and the native watcher alone carries index freshness (generic-LSP-first, #30).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FileOperationsCaps {
+    /// `workspace.fileOperations.willRename` — the client will send a `workspace/willRenameFiles`
+    /// REQUEST before applying a rename and apply the returned [`lsp_types::WorkspaceEdit`]. Gates
+    /// advertising `workspace.fileOperations.willRename`; the handler rewrites `res://` `preload`/
+    /// `load` literals that positively resolve to a renamed file.
+    pub(crate) will_rename: bool,
+    /// `workspace.fileOperations.didRename` — the client will send `workspace/didRenameFiles`
+    /// NOTIFICATIONS after a rename. An index nudge (the old path drops, the new path enters),
+    /// deduped against the native watcher by the content-fingerprint gate.
+    pub(crate) did_rename: bool,
+    /// `workspace.fileOperations.didCreate` — the client will send `workspace/didCreateFiles`
+    /// notifications. An index nudge (the new path enters), deduped against the native watcher.
+    pub(crate) did_create: bool,
+    /// `workspace.fileOperations.didDelete` — the client will send `workspace/didDeleteFiles`
+    /// notifications. An index nudge (the path drops), deduped against the native watcher.
+    pub(crate) did_delete: bool,
 }
 
 /// The `textDocument.codeAction` + `textDocument.publishDiagnostics` client capabilities the
@@ -360,6 +389,25 @@ impl ClientCaps {
             semantic_tokens: SemanticTokensCaps::negotiate(caps),
             inlay_hint: InlayHintCaps::negotiate(caps),
             code_action: CodeActionCaps::negotiate(caps),
+            file_operations: FileOperationsCaps::negotiate(caps),
+        }
+    }
+}
+
+impl FileOperationsCaps {
+    /// Walk `workspace.fileOperations`, mirroring the optional-path convention the rest of
+    /// [`ClientCaps::negotiate`] uses. Each `.{will,did}_<op>` flag is a per-operation opt-in:
+    /// absent ⇒ `false` ⇒ that file-operation capability is neither advertised nor handled.
+    fn negotiate(caps: &lsp_types::ClientCapabilities) -> Self {
+        let fo = caps
+            .workspace
+            .as_ref()
+            .and_then(|w| w.file_operations.as_ref());
+        FileOperationsCaps {
+            will_rename: fo.and_then(|f| f.will_rename).unwrap_or(false),
+            did_rename: fo.and_then(|f| f.did_rename).unwrap_or(false),
+            did_create: fo.and_then(|f| f.did_create).unwrap_or(false),
+            did_delete: fo.and_then(|f| f.did_delete).unwrap_or(false),
         }
     }
 }
@@ -708,7 +756,7 @@ fn serve_inner(
     let root = resolve_root(&options, &init);
 
     let result = InitializeResult {
-        capabilities: capabilities(encoding),
+        capabilities: capabilities(encoding, &caps),
         server_info: Some(ServerInfo {
             name: "gdls".to_string(),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -1561,7 +1609,7 @@ fn apply_runtime_config(state: &mut ServerState, raw: &serde_json::Value) {
 /// Send a `window/showMessage` notification — the operator-facing channel for conditions that
 /// deserve more than a stderr log line (M7 §5 showMessage conventions: used sparingly, never as
 /// log spam).
-fn show_message(state: &ServerState, kind: lsp_types::MessageType, message: &str) {
+pub(crate) fn show_message(state: &ServerState, kind: lsp_types::MessageType, message: &str) {
     let note = Notification {
         method: "window/showMessage".to_string(),
         params: serde_json::json!({ "type": kind, "message": message }),
@@ -1700,7 +1748,10 @@ fn apply_reaction_batch(
 /// gate as the native watcher — `watcher::classify_client_event`) and run them through the
 /// shared batch applier. Out-of-root and excluded paths drop in classification/`apply_reaction`
 /// exactly as native events do; open buffers keep winning over disk.
-fn handle_client_file_events(state: &mut ServerState, changes: Vec<lsp_types::FileEvent>) {
+pub(crate) fn handle_client_file_events(
+    state: &mut ServerState,
+    changes: Vec<lsp_types::FileEvent>,
+) {
     if changes.is_empty() {
         return;
     }
@@ -2094,7 +2145,11 @@ fn republish_all_open_buffers(state: &mut ServerState) {
 }
 
 /// Advertise exactly the v1 capability set Claude Code consumes (`docs/05-lsp-cc-integration.md`).
-fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
+///
+/// `caps` carries the negotiated client capabilities so the M11 (#79) `workspace.fileOperations`
+/// block is advertised per-operation only when the client offered that operation — gdls never tells
+/// a client it handles a file operation the client won't send (anti-catalog W15).
+fn capabilities(encoding: PositionEncoding, caps: &ClientCaps) -> ServerCapabilities {
     ServerCapabilities {
         position_encoding: Some(encoding.to_kind()),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -2255,6 +2310,14 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
                 .collect(),
             work_done_progress_options: Default::default(),
         }),
+        // M11 (#79): the `workspace.fileOperations` block — advertised per-operation only when the
+        // client opted in (a `None` block means gdls never claims a file operation it can't receive).
+        // `willRename` is the mutating surface (returns a `WorkspaceEdit` rewriting `res://`
+        // `preload`/`load` literals that resolve to the renamed file); the `did*` operations are
+        // index nudges. Each filter scopes to `**/*.gd` + `**/*.tscn` — the only file kinds gdls
+        // tracks (W16: scene TEXT only). `willCreate`/`willDelete` are intentionally absent (gdls has
+        // no edit to contribute on a create/delete).
+        workspace: crate::file_operations::workspace_server_capabilities(&caps.file_operations),
         // `textDocument/publishDiagnostics` is a server→client push, not a capability field.
         ..Default::default()
     }
@@ -2482,6 +2545,12 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             // suppression-only phase-4 path was parse-only, but the backstop changed the pricing.
             | "textDocument/codeAction"
             | "codeAction/resolve"
+            // M11 (#79): `workspace/willRenameFiles` is the MUTATING reference-rewrite — it parses
+            // EVERY indexed `.gd` to find `res://` literals that resolve to a renamed file (a
+            // project-wide fan-out like `references`). Analysis-priced by that fan-out, so it sheds at
+            // Hard memory pressure with ContentModified; the client falls back to moving the file
+            // without rewriting refs (a missed rewrite, never a broken one — correctness over coverage).
+            | "workspace/willRenameFiles"
     );
     if state.memory_pressure == MemoryPressure::Hard && analyze_using {
         // Re-record the request as cancelled-cum-shed so the per-handler trace still shows the
@@ -2594,6 +2663,13 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // cursor lands on no identifier at all.
         "textDocument/prepareRename" => handle_fallible!(handlers::prepare_rename),
         "textDocument/rename" => handle_fallible!(handlers::rename),
+        // M11 (#79): `workspace/willRenameFiles` — the MUTATING file-operation hook. Returns a
+        // `WorkspaceEdit` rewriting `res://` `preload`/`load` literals that POSITIVELY resolve to a
+        // renamed/moved `.gd`/`.tscn` (fail-closed: only literals whose resolved identity equals a
+        // renamed file are touched, and only the path between the quotes). `serde_json::to_value(None)`
+        // → the LSP `null` wire shape when nothing needs rewriting. Advertised only when the client
+        // offered `workspace.fileOperations.willRename`.
+        "workspace/willRenameFiles" => handle!(crate::file_operations::will_rename_files),
         // M9 (#69): typeHierarchy. `prepareTypeHierarchy` resolves the class under the cursor to
         // one `TypeHierarchyItem` carrying a compact `data` blob (the type's identity); the
         // follow-ups walk the extends graph one level from that blob — `supertypes` UP (parent
@@ -2771,6 +2847,25 @@ fn dispatch_notification(state: &mut ServerState, note: Notification) {
             // content-fingerprint gate in `apply_reaction_inner`.
             if let Ok(p) = parse_params::<lsp_types::DidChangeWatchedFilesParams>(&method, params) {
                 handle_client_file_events(state, p.changes);
+            }
+        }
+        // M11 (#79): the `did*` file-operation notifications — index NUDGES routed through the SAME
+        // `handle_client_file_events` → `apply_reaction_batch` funnel as `didChangeWatchedFiles`, so
+        // the content-fingerprint gate dedupes a change the native watcher also observed (no
+        // double-processing). A rename is delete(old)+create(new); create/delete map directly.
+        "workspace/didRenameFiles" => {
+            if let Ok(p) = parse_params::<lsp_types::RenameFilesParams>(&method, params) {
+                crate::file_operations::did_rename_files(state, p);
+            }
+        }
+        "workspace/didCreateFiles" => {
+            if let Ok(p) = parse_params::<lsp_types::CreateFilesParams>(&method, params) {
+                crate::file_operations::did_create_files(state, p);
+            }
+        }
+        "workspace/didDeleteFiles" => {
+            if let Ok(p) = parse_params::<lsp_types::DeleteFilesParams>(&method, params) {
+                crate::file_operations::did_delete_files(state, p);
             }
         }
         "workspace/didChangeConfiguration" => {

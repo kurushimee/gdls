@@ -23,6 +23,7 @@ mod code_action;
 mod color;
 mod completion;
 mod docs;
+mod file_operations;
 mod handlers;
 mod inlay_hint;
 pub mod logging;
