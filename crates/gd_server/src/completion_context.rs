@@ -734,9 +734,10 @@ fn string_arg_content_before_cursor(tokens: &[Token], byte: usize) -> Option<&st
 /// The span model is REASON-SPECIFIC:
 ///
 /// * **Node paths** ([`DeferredReason::NodePath`] / [`UniqueNodePath`](DeferredReason::UniqueNodePath)):
-///   the LAST segment (after the last `/`, or the `%` root sigil) — the renderer inserts a bare node
-///   name, which fills exactly that segment (`get_node("A/B/Sp|")` accept `Sprite` →
-///   `get_node("A/B/Sprite")`). `%` is a boundary here (a `%Name`-rooted string).
+///   the LAST segment (after the last `/`) — the renderer inserts a bare node name, which fills
+///   exactly that segment (`get_node("A/B/Sp|")` accept `Sprite` → `get_node("A/B/Sprite")`). A
+///   leading `%` (a `%Name`-rooted string) is the root sigil and is kept; a mid-path `%` is NOT a
+///   boundary (it can't legally appear mid-segment) — matching the committed-dir `/`-only split.
 /// * **Resource paths** ([`DeferredReason::ResourcePath`]): the WHOLE typed content from the opening
 ///   quote to the cursor. A `res://…` literal has a mandatory `res://` scheme the renderer inserts as
 ///   part of the full path, so the edit must cover the entire (possibly partial) scheme+path — else
@@ -746,11 +747,16 @@ fn string_arg_content_before_cursor(tokens: &[Token], byte: usize) -> Option<&st
 fn string_arg_prefix(tokens: &[Token], byte: usize, reason: DeferredReason) -> Option<ByteSpan> {
     let content = string_arg_content_before_cursor(tokens, byte)?;
     let seg_len = match reason {
-        // Node path: only the last `/`- or `%`-delimited segment.
+        // Node path: the last `/`-delimited segment. `%` is a boundary ONLY as the leading root
+        // sigil of a `%Name`-rooted string (it can't legally appear mid-segment), never mid-path —
+        // stripping a leading `%` then splitting on `/` matches `string_node_path_committed_dir`'s
+        // `/`-only split, so accepting an item replaces exactly the segment whose children the
+        // committed dir lists (no stale `Bar%` fragment for an already-invalid `Foo/Bar%Baz`).
         DeferredReason::NodePath | DeferredReason::UniqueNodePath => {
-            match content.rfind(['/', '%']) {
-                Some(pos) => content.len() - pos - 1,
-                None => content.len(),
+            let segment = content.strip_prefix('%').unwrap_or(content);
+            match segment.rfind('/') {
+                Some(pos) => segment.len() - pos - 1,
+                None => segment.len(),
             }
         }
         // Resource path: the entire typed content (the renderer inserts the full `res://` path).
