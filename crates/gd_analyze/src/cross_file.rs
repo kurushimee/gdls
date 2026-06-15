@@ -157,6 +157,44 @@ pub trait CrossFileQuery {
         None
     }
 
+    /// The bare native class an autoload `name` should fall back to when it has NO backing script —
+    /// i.e. a SCENE autoload whose resolved root node attaches no indexable `.gd`. Godot types such
+    /// an autoload as a hard-coded `Node` (`gdscript_analyzer.cpp:4575-4609`: `result.native_type =
+    /// "Node"` set before the resource-type checks, kept when the `PackedScene` arm finds no root
+    /// script — NOT the root's specific native type), so the returned string is `"Node"` in practice.
+    ///
+    /// Consulted by `reduce_identifier` ONLY after [`Self::autoload_file`] missed: a script-backed
+    /// autoload is typed as that Script instance (the precise case); this supplies the bare-`Node`
+    /// floor for the scriptless-scene case so the name doesn't degrade to dynamic — which would let a
+    /// lowercase-named scriptless autoload fall through to the "Identifier not declared" error (a
+    /// false positive, since Godot always types a registered autoload as at least `Node`).
+    ///
+    /// **Default `None`** (not an autoload, or script-backed). Overridden only by `gd_server`'s
+    /// `WorkspaceXFileQuery`, which owns the [`ProjectModel`](gd_project::ProjectModel) +
+    /// [`SceneIndex`](gd_project::SceneIndex). The conformance corpus has no autoloads, so every
+    /// in-tree query keeps the default and the ratchets are untouched by construction.
+    fn autoload_native_type(&self, _name: &str) -> Option<String> {
+        None
+    }
+
+    /// Whether `name` is a configured autoload singleton AT ALL — a pure name-table membership check,
+    /// independent of whether its target resolves to a script/scene/native type. Used by
+    /// `reduce_identifier`'s "Identifier not declared" fallthrough (step 10) to SUPPRESS that error
+    /// for any registered autoload whose typing couldn't be resolved (a `uid://` that doesn't
+    /// dereference, a scene missing from the index, a script not yet indexed): Godot types EVERY
+    /// registered autoload as at least `Node` (`gdscript_analyzer.cpp:4570-4577`), so flagging one as
+    /// undeclared is a false positive. The `is_global_like` (uppercase-name) gate already covers a
+    /// PascalCase autoload like `Global`; this closes the LOWERCASE-named-and-unresolvable hole that
+    /// gate misses. Distinct from [`Self::autoload_file`] / [`Self::autoload_native_type`], which only
+    /// return `Some` when the typing actually resolved.
+    ///
+    /// **Default `false`** (no project autoload table). Overridden only by `gd_server`'s
+    /// `WorkspaceXFileQuery`. The conformance corpus has no autoloads → always `false` → no
+    /// behavioral change to the ratchets by construction.
+    fn is_autoload(&self, _name: &str) -> bool {
+        false
+    }
+
     /// Resolve a statically-known `$`/`%` node-path access made by the script `script_file` into the
     /// concrete type fact of the target node, reading the `.tscn` scene(s) `script_file` is attached
     /// to.

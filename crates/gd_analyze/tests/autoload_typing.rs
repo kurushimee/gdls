@@ -92,6 +92,27 @@ impl CrossFileQuery for AutoloadQuery {
         }
     }
 
+    fn autoload_native_type(&self, name: &str) -> Option<String> {
+        // A scriptless SCENE autoload — both a PascalCase and a lowercase one, to prove the
+        // bare-Node floor fires regardless of casing (the lowercase case is the false-positive the
+        // floor closes: without it, `scriptless_thing` falls through to "Identifier not declared").
+        if name == "SceneNoScript" || name == "scriptless_thing" {
+            Some("Node".to_owned())
+        } else {
+            None
+        }
+    }
+
+    fn is_autoload(&self, name: &str) -> bool {
+        // Every autoload this mock knows — INCLUDING `unresolved_auto`, which resolves to NO script
+        // and NO native type (its scene/uid is unresolvable). That name exercises the pure
+        // "not declared" suppression gate (step 10), the path the resolved cases don't reach.
+        matches!(
+            name,
+            "Global" | "SceneNoScript" | "scriptless_thing" | "unresolved_auto"
+        )
+    }
+
     fn member_initializer_xrefs(&self, _file: FileId, _member: &str) -> Vec<MemberXref> {
         Vec::new()
     }
@@ -127,6 +148,115 @@ fn resolve_type_of_identifier(src: &str, target_name: &str, fid: FileId) -> Data
         }
     }
     found
+}
+
+/// Like [`resolve_type_of_identifier`] but returns the whole result so a test can inspect
+/// diagnostics (the false-positive checks for the scriptless-Node arm).
+fn analyze_src(src: &str, fid: FileId) -> gd_analyze::AnalysisResult {
+    let parsed = parse(src);
+    let db = native_db();
+    let query = AutoloadQuery::new(fid);
+    analyze(
+        &parsed.tree,
+        Some(FileId::new(99)),
+        "caller.gd",
+        &db,
+        &query,
+        &policy(),
+    )
+}
+
+/// Scriptless SCENE autoload → bare NATIVE `Node` (Godot's hard-coded floor). The `SceneNoScript`
+/// identifier resolves to a Native type whose `native_type` is `"Node"`, NOT a Script and NOT a
+/// degraded/unset type.
+#[test]
+fn scriptless_scene_autoload_resolves_to_native_node() {
+    let fid = FileId::new(42);
+    let src = "extends Node\n\nfunc test():\n\tSceneNoScript.add_child(self)\n";
+    let dt = resolve_type_of_identifier(src, "SceneNoScript", fid);
+    assert_eq!(
+        dt.kind,
+        DtKind::Native,
+        "scriptless scene autoload must resolve to a NATIVE type, got {:?}",
+        dt.kind
+    );
+    assert_eq!(
+        dt.native_type, "Node",
+        "Godot types a scriptless scene autoload as the hard-coded bare `Node`"
+    );
+    assert!(
+        !dt.is_meta_type,
+        "the singleton IS the instance — not a meta type"
+    );
+}
+
+/// The false positive the native floor closes: a *lowercase*-named scriptless scene autoload must
+/// NOT emit `Identifier "…" not declared in the current scope.` (`name.starts_with(uppercase)` does
+/// not save a lowercase name from step 10 — the native-floor arm at step 9a must catch it first).
+#[test]
+fn lowercase_scriptless_autoload_no_not_declared_false_positive() {
+    let fid = FileId::new(42);
+    let src = "extends Node\n\nfunc test():\n\tscriptless_thing.add_child(self)\n";
+    let result = analyze_src(src, fid);
+    let offending: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .map(gd_analyze::Diagnostic::message)
+        .filter(|m| m.contains("scriptless_thing") && m.contains("not declared"))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "a lowercase scriptless autoload must not be flagged 'not declared'; got: {offending:?}"
+    );
+    // And it's typed as the bare Node floor.
+    let dt = resolve_type_of_identifier(src, "scriptless_thing", fid);
+    assert_eq!(dt.kind, DtKind::Native);
+    assert_eq!(dt.native_type, "Node");
+}
+
+/// The pure `is_autoload` suppression gate (step 10): a registered autoload whose typing could NOT
+/// be resolved this pass (unresolvable uid / missing scene — no FileId, no native type) is STILL
+/// "declared" in Godot's eyes. A *lowercase*-named one (`unresolved_auto`) must NOT be flagged
+/// `Identifier "…" not declared` — the `is_global_like` uppercase gate doesn't save it, only
+/// `is_autoload` does. This is the path the resolved (script / native-floor) tests never reach.
+#[test]
+fn unresolvable_autoload_no_not_declared_false_positive() {
+    let fid = FileId::new(42);
+    let src = "extends Node\n\nfunc test():\n\tunresolved_auto.foo()\n";
+    let result = analyze_src(src, fid);
+    let offending: Vec<&str> = result
+        .diagnostics
+        .iter()
+        .map(gd_analyze::Diagnostic::message)
+        .filter(|m| m.contains("unresolved_auto") && m.contains("not declared"))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "an unresolvable registered autoload must not be flagged 'not declared'; got: {offending:?}"
+    );
+}
+
+/// Control: a name NOT registered as any autoload AND lowercase AND not a native member still gets
+/// the "not declared" error — proving the `is_autoload` gate is narrow (it suppresses ONLY registered
+/// autoloads, not every unresolved lowercase identifier).
+#[test]
+fn unregistered_lowercase_identifier_still_not_declared() {
+    let fid = FileId::new(42);
+    let src = "extends Node\n\nfunc test():\n\ttotally_unknown_thing.foo()\n";
+    let result = analyze_src(src, fid);
+    let flagged = result.diagnostics.iter().any(|d| {
+        d.message().contains("totally_unknown_thing") && d.message().contains("not declared")
+    });
+    assert!(
+        flagged,
+        "an unregistered lowercase identifier must still be flagged 'not declared' (the gate is \
+         autoload-only); diagnostics: {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(gd_analyze::Diagnostic::message)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// Primary test: `Global.popup_error("x")` — the `Global` identifier must resolve to a Script

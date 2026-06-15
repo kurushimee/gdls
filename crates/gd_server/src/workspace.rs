@@ -19,7 +19,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use walkdir::WalkDir;
 
 use crate::uri::CanonicalKey;
-use crate::xfile::WorkspaceXFileQuery;
+use crate::xfile::{AutoloadEnv, WorkspaceXFileQuery};
 use gd_project::is_excluded;
 
 use crate::config::{InitializationOptions, StrictConfig, StrictProfile as ServerStrictProfile};
@@ -474,26 +474,19 @@ impl Workspace {
                     // `member_initializer_xrefs` and `autoload_file` against the cache/project;
                     // every other CrossFileQuery method delegates to SyntacticQuery.
                     //
-                    // Build autoload name→FileId map per-call: a filter_map over the project's
-                    // autoload list. Cost is negligible against a full analyze, and building it
-                    // per-call avoids any stale-map risk (e.g. autoload script indexed after
-                    // project load). Non-script autoloads and unindexed scripts are silently
-                    // skipped — the resolver degrades to Variant for those.
-                    let autoload_map: rustc_hash::FxHashMap<String, gd_project::FileId> = self
-                        .project
-                        .autoloads
-                        .iter()
-                        .filter_map(|a| {
-                            let path = self.project.autoload_script_path(&a.name)?;
-                            let fid = self.index.resolve_res_path(&path)?;
-                            Some((a.name.clone(), fid))
-                        })
-                        .collect();
+                    // Build the autoload typing maps per-call from the project's autoload list +
+                    // scene index (M11 Phase 4). Cost is negligible against a full analyze, and
+                    // building it per-call avoids any stale-map risk (e.g. an autoload script/scene
+                    // indexed after project load). `autoload_typing` mirrors Godot's arm: a
+                    // script-backed autoload (direct `.gd`, `uid://`→`.gd`, or scene→root-`.gd`)
+                    // populates the FileId map; a scriptless scene populates the native-`Node` floor;
+                    // everything else / unindexed degrades to Variant.
+                    let autoloads = self.build_autoload_maps(&self.project, &self.scenes);
                     let xfile = WorkspaceXFileQuery::new(
                         &self.index,
                         &self.native,
                         &self.analysis_cache,
-                        autoload_map,
+                        autoloads,
                         &self.scenes,
                         &self.project.root,
                     );
@@ -555,6 +548,51 @@ impl Workspace {
         result
     }
 
+    /// Build the [`AutoloadEnv`] the [`WorkspaceXFileQuery`] consumes (M11 Phase 4), mirroring Godot's
+    /// autoload arm (`gdscript_analyzer.cpp:4570-4609`) via [`ProjectModel::autoload_typing`]:
+    ///
+    /// * `script` (name → [`FileId`](gd_project::FileId)): autoloads with a backing GDScript — a
+    ///   direct `.gd`, a `uid://`→`.gd`, OR a scene whose resolved root attaches an indexed `.gd`.
+    ///   Drives `autoload_file` → precise Script-instance typing (the #19 path).
+    /// * `native` (name → `"Node"`): SCENE autoloads with no backing script. Drives
+    ///   `autoload_native_type` → the bare-`Node` floor.
+    /// * `names` (every configured autoload, resolved or not): drives `is_autoload`, suppressing the
+    ///   "Identifier not declared" fallthrough for an unresolvable autoload (no false positive).
+    ///
+    /// Built per-call (cheap against a full analyze) rather than cached, so the maps are always
+    /// consistent with the current index/scene snapshot — no stale-map class (e.g. an autoload's
+    /// script/scene indexed after project load). A scene→root-`.gd` whose script isn't indexed *yet*,
+    /// or a `uid://` that doesn't dereference, is silently skipped from `script`/`native` and degrades
+    /// to the prior generic typing. `&ProjectModel`/`&SceneIndex` are passed explicitly (not via
+    /// `&self`) so a caller already borrowing `&self.scenes` immutably can reuse that borrow.
+    fn build_autoload_maps(&self, project: &ProjectModel, scenes: &SceneIndex) -> AutoloadEnv {
+        let mut env = AutoloadEnv::default();
+        for a in &project.autoloads {
+            // Godot gates the autoload typing arm on `is_singleton` (gdscript_analyzer.cpp:4572): a
+            // non-`*` autoload is registered but NOT a global singleton, so a bare reference is
+            // "Identifier not declared". Skip it entirely — it must not seed `names` (which would
+            // wrongly suppress that diagnostic via `is_autoload`) nor `script`/`native` (typing).
+            if !a.is_singleton {
+                continue;
+            }
+            // EVERY singleton autoload name, resolved or not (the `is_autoload` membership set).
+            env.names.insert(a.name.clone());
+            match project.autoload_typing(&a.name, scenes) {
+                Some(gd_project::AutoloadTyping::Script(path)) => {
+                    // Skip (degrade) if the backing script isn't indexed yet — no entry in `script`.
+                    if let Some(fid) = self.index.resolve_res_path(&path) {
+                        env.script.insert(a.name.clone(), fid);
+                    }
+                }
+                Some(gd_project::AutoloadTyping::NativeNode) => {
+                    env.native.insert(a.name.clone(), "Node".to_owned());
+                }
+                None => {}
+            }
+        }
+        env
+    }
+
     /// Analyze a tree/text **without reading or writing either cache** — the M10 (#75) codeAction
     /// mutation gate's probe. The mutating warning quickfixes apply their candidate edit to an
     /// in-memory copy of the buffer and re-analyze it to confirm the edit introduces no new ERROR
@@ -570,21 +608,12 @@ impl Workspace {
     pub fn analyze_ephemeral(&self, path: &Utf8Path, tree: &ParseTree) -> AnalysisResult {
         let file = self.index.file_id(path);
         let script_path = path.file_name().unwrap_or_default();
-        let autoload_map: rustc_hash::FxHashMap<String, gd_project::FileId> = self
-            .project
-            .autoloads
-            .iter()
-            .filter_map(|a| {
-                let p = self.project.autoload_script_path(&a.name)?;
-                let fid = self.index.resolve_res_path(&p)?;
-                Some((a.name.clone(), fid))
-            })
-            .collect();
+        let autoloads = self.build_autoload_maps(&self.project, &self.scenes);
         let xfile = WorkspaceXFileQuery::new(
             &self.index,
             &self.native,
             &self.analysis_cache,
-            autoload_map,
+            autoloads,
             &self.scenes,
             &self.project.root,
         );

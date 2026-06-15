@@ -1642,6 +1642,41 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
+    // 9a. Scriptless SCENE autoload → bare NATIVE `Node` (analyzer.cpp:4575+4587-4609). When step 9
+    //    missed because the autoload is a scene whose root attaches no indexable `.gd`, Godot still
+    //    types the name as a hard-coded `Node` (the `result` floor it sets before the resource-type
+    //    checks, kept when the `PackedScene` arm resolves no root script). Supplying that floor here —
+    //    instead of letting the name degrade to dynamic — matches Godot AND closes a false positive:
+    //    a *lowercase*-named scriptless autoload would otherwise fall through to step 10's "Identifier
+    //    not declared" error. Like step 9 this is ADDITIVE and corpus-safe: `autoload_native_type`
+    //    returns `None` for every non-autoload and for the script-backed case (step 9 handled it), and
+    //    the conformance corpus has no autoloads. Records a `Use` binding (mirroring step 9) so
+    //    references/definition on the name still work.
+    if let Some(native) = ctx.xfile.autoload_native_type(&name) {
+        let site = ctx.node(id).span;
+        ctx.record_binding(Binding::use_(
+            None,
+            BindingSymbolKind::Class,
+            name.clone(),
+            site,
+        ));
+        ctx.set_type(
+            id,
+            DataType {
+                // The autoload singleton IS the instance (`Global.method()`), so this is an instance
+                // type, never a meta type. Godot marks it `is_constant = true` (the singleton ref is a
+                // constant); mirror that.
+                type_source: TypeSource::AnnotatedExplicit,
+                kind: DtKind::Native,
+                builtin_type: VariantType::Object,
+                native_type: native,
+                is_constant: true,
+                ..Default::default()
+            },
+        );
+        return;
+    }
+
     // 9b. Utility function referenced as a first-class Callable (analyzer.cpp:4641-4652): a
     //    bare `print` / `len` / `floor` reduces to a constant Callable — `print.call_deferred(m)`,
     //    `arr.map(floor)`, `var f := absi`, `const PRINTER = print`. Godot's arm checks
@@ -1704,7 +1739,14 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         if !dt.is_set() {
             let is_native_member = is_plausible_native_member(ctx, &name);
             let is_global_like = name.starts_with(|c: char| c.is_ascii_uppercase());
-            if !is_native_member && !is_global_like {
+            // A registered autoload whose typing couldn't be resolved this pass (unresolvable uid,
+            // un-indexed scene/script) is STILL declared in Godot's eyes (every autoload is at least
+            // `Node`), so it must not be flagged undeclared. `is_global_like` already covers a
+            // PascalCase name like `Global`; this closes the lowercase-named hole (e.g. a scene
+            // autoload `game="*res://ghost.tscn"` whose scene is missing) — without it, `game.foo()`
+            // would false-positive here. Corpus-safe: `is_autoload` is `false` for every corpus query.
+            let is_autoload = ctx.xfile.is_autoload(&name);
+            if !is_native_member && !is_global_like && !is_autoload {
                 ctx.push_error(
                     format!(r#"Identifier "{name}" not declared in the current scope."#),
                     id,

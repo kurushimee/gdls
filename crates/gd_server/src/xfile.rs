@@ -37,6 +37,31 @@ use rustc_hash::FxHashMap;
 use crate::uri::CanonicalKey;
 use crate::workspace::CacheEntry;
 
+/// The per-call autoload typing environment, built from the project's autoload table + scene index
+/// (M11 Phase 4), mirroring Godot's autoload arm (`gdscript_analyzer.cpp:4570-4609`). Built per
+/// analysis (cheap against a full analyze) rather than cached on `Workspace`, so the maps are always
+/// consistent with the current index/scene snapshot — no stale-map class.
+#[derive(Default)]
+pub(crate) struct AutoloadEnv {
+    /// Autoload name → FileId for every autoload with a backing GDScript: a direct `.gd`, a
+    /// `uid://`→`.gd`, OR a scene whose resolved root node attaches an indexed `.gd`. Drives
+    /// [`WorkspaceXFileQuery::autoload_file`] → precise Script-instance typing (the #19 path). An
+    /// autoload whose script isn't indexed yet is silently absent — degrades to Variant / the native
+    /// floor.
+    pub script: FxHashMap<String, FileId>,
+    /// Autoload name → bare native class (always `"Node"` in practice) for SCENE autoloads with no
+    /// backing script (scriptless root). Godot types these as a hard-coded `Node`; drives
+    /// [`WorkspaceXFileQuery::autoload_native_type`] → the bare-`Node` floor. Disjoint from `script`:
+    /// a name resolves to a script OR a native floor, never both.
+    pub native: FxHashMap<String, String>,
+    /// EVERY configured autoload name, regardless of whether its typing resolved — a SUPERSET of
+    /// `script`/`native`'s keys (also holds names whose target was unresolvable: a broken `uid://`, a
+    /// missing scene). Drives [`WorkspaceXFileQuery::is_autoload`] so the analyzer suppresses the
+    /// "Identifier not declared" fallthrough for any registered autoload (Godot types every autoload
+    /// as at least `Node`), closing the lowercase-named-unresolvable false positive.
+    pub names: rustc_hash::FxHashSet<String>,
+}
+
 /// Wraps [`SyntacticQuery`] and overrides [`CrossFileQuery::member_initializer_xrefs`] and
 /// [`CrossFileQuery::autoload_file`] with project-backed lookups. Every other method delegates
 /// to the inner query.
@@ -52,12 +77,9 @@ pub struct WorkspaceXFileQuery<'a> {
     /// actively editing, so re-promoting its recency to MRU would distort the eviction order and
     /// shield seldom-touched files from the WP-H1 Soft-pressure shed.
     analysis_cache: &'a LruCache<CanonicalKey, CacheEntry<AnalysisResult>>,
-    /// Autoload name → FileId map, built once per analysis context from the project's autoload
-    /// table. Built per-call (a small `filter_map` over the autoload list) rather than cached on
-    /// `Workspace` so there is no stale-cache class: the map is always consistent with the
-    /// current index snapshot. Non-script autoloads and autoloads whose script has not been
-    /// indexed yet are silently skipped — the resolver degrades gracefully to Variant for those.
-    autoloads: FxHashMap<String, FileId>,
+    /// The per-call autoload typing environment (script-backed FileIds, scriptless-scene native
+    /// floors, and the full name membership set). Bundled so the [`Self::new`] arg count stays sane.
+    autoloads: AutoloadEnv,
     /// The project's parsed scene index (M11 Phase 2), used by [`Self::scene_node_facts`] to resolve
     /// `$`/`%` accesses precisely. Borrowed from `Workspace.scenes`.
     scenes: &'a SceneIndex,
@@ -73,7 +95,7 @@ impl<'a> WorkspaceXFileQuery<'a> {
         index: &'a Index,
         native: &'a NativeDb,
         analysis_cache: &'a LruCache<CanonicalKey, CacheEntry<AnalysisResult>>,
-        autoloads: FxHashMap<String, FileId>,
+        autoloads: AutoloadEnv,
         scenes: &'a SceneIndex,
         project_root: &Utf8Path,
     ) -> Self {
@@ -169,7 +191,15 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
     }
 
     fn autoload_file(&self, name: &str) -> Option<FileId> {
-        self.autoloads.get(name).copied()
+        self.autoloads.script.get(name).copied()
+    }
+
+    fn autoload_native_type(&self, name: &str) -> Option<String> {
+        self.autoloads.native.get(name).cloned()
+    }
+
+    fn is_autoload(&self, name: &str) -> bool {
+        self.autoloads.names.contains(name)
     }
 
     /// Phase-3 navigation substrate (dormant; NOT consulted by the diagnostic path — `reduce_get_node`
@@ -330,7 +360,7 @@ mod tests {
             &idx,
             &native,
             &cache,
-            rustc_hash::FxHashMap::default(),
+            AutoloadEnv::default(),
             &scenes,
             Utf8Path::new("/proj"),
         );
@@ -361,7 +391,7 @@ mod tests {
             &idx,
             &native,
             &cache,
-            rustc_hash::FxHashMap::default(),
+            AutoloadEnv::default(),
             &scenes,
             Utf8Path::new("/proj"),
         );
@@ -409,7 +439,7 @@ mod tests {
             &idx,
             &native,
             &cache,
-            rustc_hash::FxHashMap::default(),
+            AutoloadEnv::default(),
             &scenes,
             Utf8Path::new("/proj"),
         );
@@ -447,7 +477,7 @@ mod tests {
             &idx,
             &native,
             &cache,
-            rustc_hash::FxHashMap::default(),
+            AutoloadEnv::default(),
             &scenes,
             Utf8Path::new("/proj"),
         );
@@ -478,7 +508,7 @@ mod tests {
             &idx,
             &native,
             &cache,
-            rustc_hash::FxHashMap::default(),
+            AutoloadEnv::default(),
             &scenes,
             Utf8Path::new("/proj"),
         );
@@ -523,7 +553,7 @@ mod tests {
             &idx,
             &native,
             &cache,
-            rustc_hash::FxHashMap::default(),
+            AutoloadEnv::default(),
             &scenes,
             Utf8Path::new("/proj"),
         );
