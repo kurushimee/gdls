@@ -1899,19 +1899,22 @@ fn add_onready_refused_on_non_node_class() {
     shutdown(&client, t);
 }
 
-/// REGRESSION (blocker — `_`-prefix hijacks a forward-referenced member): `print(y)` (before the local
-/// declaration) binds to the class MEMBER `var y = 0`; `var y = 1` is the unused local. A name-based
-/// rewrite would turn `print(y)` into `print(_y)` — dangling (`Identifier "_y" not declared`). The
-/// ERROR BACKSTOP must WITHHOLD the `_`-prefix fix (only the suppression remains).
+/// SCOPE-AWARE (#107): a forward-referenced member is NOT hijacked. `print(y)` (before the local
+/// declaration) binds to the class MEMBER `var y = 0`; `var y = 1` is the unused local. The old
+/// name-based function-wide scan over-captured `print(y)` into the local's rename set, so the count
+/// gate / ERROR backstop had to REFUSE. With scope-aware resolution the forward-ref binds outward
+/// (the local is declared AFTER it), so the fix renames ONLY `var y = 1`→`var _y = 1` — a precise,
+/// safe one-edit rename that IS offered. Verified by apply→reanalyze: the member stays bound (no
+/// dangling `_y`), no new error, and the warning clears.
 #[test]
-fn underscore_prefix_refused_on_forward_ref_member_hijack() {
+fn underscore_prefix_forward_ref_member_not_hijacked() {
     const SRC: &str = "extends Node\n\nvar y = 0\n\nfunc f() -> void:\n\tprint(y)\n\tvar y = 1\n";
     let p = base_project();
     let (server, client) = Connection::memory();
     let t = std::thread::spawn(move || gd_server::serve(server));
     let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
     let uri = file_uri(&p.root.join("a.gd"));
-    // Precondition: the input is valid (warnings only — the corruption would be NET-NEW).
+    // Precondition: the input is valid (warnings only — any corruption would be NET-NEW).
     assert!(
         !diags
             .diagnostics
@@ -1934,12 +1937,31 @@ fn underscore_prefix_refused_on_forward_ref_member_hijack() {
                 diags.diagnostics
             )
         });
-    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Prefix unused name");
+    let patched = apply_text_edits(SRC, all_text_edits(&edit));
+    // ONLY the unused local is renamed; the member decl and the forward-ref read stay verbatim.
     assert!(
-        find_action(&actions, "Prefix unused name").is_none(),
-        "renaming the local would hijack the forward-ref `print(y)` (binds to the member) into a \
-         dangling `_y` — the ERROR backstop must REFUSE it; got titles {:?}",
-        action_titles(&actions)
+        patched.contains("var _y = 1"),
+        "the unused local must be renamed to `_y`; patched:\n{patched}"
+    );
+    assert!(
+        patched.contains("var y = 0"),
+        "the class member declaration must NOT be renamed; patched:\n{patched}"
+    );
+    assert!(
+        patched.contains("print(y)"),
+        "the forward-ref read (binds to the member) must NOT be rewritten; patched:\n{patched}"
+    );
+    // Apply→reanalyze: binding identity preserved — the member `y` is still declared/bound (no
+    // dangling reference), no new error, and the unused-variable warning is gone.
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !after
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "no errors after the fix (forward-ref still bound to the member); got {:?}\npatched:\n{patched}",
+        after.diagnostics
     );
     shutdown(&client, t);
 }
@@ -2233,17 +2255,16 @@ fn underscore_prefix_refused_on_moved_shadow_capture() {
     shutdown(&client, t);
 }
 
-/// REGRESSION (blocker — sibling-block over-reach, count>1 gate; the case the error/shadow/firewall
-/// backstops all MISS): two distinct locals `x` live in disjoint `if`/`else` sub-blocks. The
-/// then-block `var x` is UNUSED (the diagnostic); the else-block `var x` is read by `print(x)`. The
-/// name-based function-wide local resolver over-reaches: renaming the then-block `x`→`_x` returns 3
-/// edits (then-decl + else-decl + the `print(x)` use of the DIFFERENT else-block binding). That extra
-/// rewrite corrupts the else-block binding. Critically this slips EVERY pre-existing backstop: it's
-/// error-free post-rename (so the ERROR backstop is blind), it induces no shadow (so the SHADOW
-/// backstop is blind), and `_x` does not pre-exist in the file (so `file_contains_identifier` misses
-/// it). ONLY the single-declaration-token count gate (3 != 1) refuses. Single-file, no autoload.
+/// SCOPE-AWARE (#107): two distinct locals `x` in disjoint `if`/`else` sub-blocks are kept apart.
+/// The then-block `var x` is UNUSED (the diagnostic); the else-block `var x` is a DIFFERENT binding
+/// read by `print(x)`. The old name-based function-wide resolver over-reached (renaming the then `x`
+/// returned 3 edits — then-decl + else-decl + `print(x)`), corrupting the else binding; only the
+/// count gate caught it. With scope-aware resolution the then-block `x` resolves to EXACTLY its own
+/// declaration (it has no uses — it is unused), so the fix is a precise one-edit rename that IS
+/// offered, AND is safe in the `source.fixAll` aggregate (which applies on save). Verified by
+/// apply→reanalyze on the fixAll result: the else binding stays intact, no new error.
 #[test]
-fn underscore_prefix_refused_on_sibling_block_over_reach() {
+fn underscore_prefix_sibling_block_not_over_reached() {
     // Then-block `x` is unused; else-block `x` (distinct binding) is used by `print(x)`.
     const SRC: &str =
         "extends Node\n\nfunc f(cond):\n\tif cond:\n\t\tvar x = 1\n\telse:\n\t\tvar x = 2\n\t\tprint(x)\n";
@@ -2252,8 +2273,7 @@ fn underscore_prefix_refused_on_sibling_block_over_reach() {
     let t = std::thread::spawn(move || gd_server::serve(server));
     let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
     let uri = file_uri(&p.root.join("a.gd"));
-    // Precondition: error-free input — the corruption would be NET-NEW (and so the error backstop,
-    // which only fires on a post-rename ERROR, can't be what refuses here).
+    // Precondition: error-free input — any corruption would be NET-NEW.
     assert!(
         !diags
             .diagnostics
@@ -2277,35 +2297,44 @@ fn underscore_prefix_refused_on_sibling_block_over_reach() {
                 diags.diagnostics
             )
         });
-    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    // The offered `_`-prefix edit renames ONLY the then-block declaration.
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag.clone(), "Prefix unused name");
+    let patched = apply_text_edits(SRC, all_text_edits(&edit));
     assert!(
-        find_action(&actions, "Prefix unused name").is_none(),
-        "the function-wide resolver over-reaches onto the else-block binding (3 edits) — the \
-         single-declaration-token gate must REFUSE the `_`-prefix; got titles {:?}",
-        action_titles(&actions)
+        patched.contains("if cond:\n\t\tvar _x = 1"),
+        "the unused then-block `x` must be renamed to `_x`; patched:\n{patched}"
     );
-    // ON-SAVE GUARD (task point 2): the gate lives INSIDE `build_underscore_prefix_edit`, which
-    // `build_fix_all` calls directly — so the over-reaching `_`-prefix must ALSO be absent from the
-    // `source.fixAll` aggregate (which `only: None` returns), or it would corrupt silently on save with
-    // zero user interaction. With its sole fixable diagnostic gated out, fixAll collapses to nothing.
     assert!(
-        find_action(&actions, "Fix all").is_none(),
-        "the over-reaching `_`-prefix must be excluded from source.fixAll too (silent-on-save \
-         corruption); got titles {:?}",
-        action_titles(&actions)
+        patched.contains("else:\n\t\tvar x = 2\n\t\tprint(x)"),
+        "the DISTINCT else-block binding + its use must be left untouched; patched:\n{patched}"
+    );
+    // ON-SAVE GUARD (task point 2): the `_`-prefix flows through `build_fix_all` too — the
+    // `source.fixAll` aggregate (what `only: None` returns) applies with zero user interaction. With
+    // precise resolution it now offers the safe one-edit rename. Apply the fixAll result and reanalyze
+    // by identity: no new error, the else binding still resolves (its `print(x)` is not dangling), and
+    // the then-block warning clears.
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !after
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "no errors after the fix (else binding intact); got {:?}\npatched:\n{patched}",
+        after.diagnostics
     );
     shutdown(&client, t);
 }
 
-/// REGRESSION (blocker — the PROVEN cross-file wrong-symbol rebind this gate closes; #75): an autoload
-/// named `_y` makes `_y` a valid PROJECT-WIDE global. In `a.gd`, `print(y)` forward-refs the class
-/// MEMBER `y`, and the unused LOCAL `var y = 1` shadows it. Renaming the local `y`→`_y` over-reaches
-/// onto `print(y)` (the function-wide name scan grabs it though it binds to the member), rewriting it
-/// to `print(_y)` — which now resolves ERROR-FREE to the autoload, a SILENT rebind to the wrong symbol.
-/// Both file-local backstops miss it: no error (ERROR backstop blind) and `_y` is in `project.godot`,
-/// NOT in `a.gd` (so `file_contains_identifier` misses it). ONLY the count gate (2 edits != 1) refuses.
+/// SCOPE-AWARE (#107): NO cross-file silent rebind. An autoload named `_y` makes `_y` a valid
+/// PROJECT-WIDE global. In `a.gd`, `print(y)` forward-refs the class MEMBER `y`, and the unused LOCAL
+/// `var y = 1` shadows it. The old name-based scan over-captured `print(y)` and rewrote it to
+/// `print(_y)`, a SILENT error-free rebind to the autoload (the count gate was the only catch).
+/// With scope-aware resolution the forward-ref binds outward to the member (the local is declared
+/// AFTER it), so the fix renames ONLY `var y = 1`→`var _y = 1` and leaves `print(y)` verbatim — no
+/// rebind. Verified by apply→reanalyze: `print(y)` text is unchanged (still bound to the member),
+/// no new error, the warning clears.
 #[test]
-fn underscore_prefix_refused_on_cross_file_autoload_rebind() {
+fn underscore_prefix_no_cross_file_autoload_rebind() {
     let p = TempProject::new();
     // Autoload `_y` → `_y` is a project-wide global identifier (lives in project.godot, NOT in a.gd).
     p.write(
@@ -2335,12 +2364,28 @@ fn underscore_prefix_refused_on_cross_file_autoload_rebind() {
                 diags.diagnostics
             )
         });
-    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Prefix unused name");
+    let patched = apply_text_edits(SRC, all_text_edits(&edit));
+    // ONLY the unused local is renamed; the forward-ref read stays verbatim → no rebind to `_y`.
     assert!(
-        find_action(&actions, "Prefix unused name").is_none(),
-        "renaming `y`→`_y` over-captures `print(y)` into a SILENT bind to the `_y` autoload (error-free, \
-         and `_y` is not in this file) — only the count gate catches it; got titles {:?}",
-        action_titles(&actions)
+        patched.contains("var _y = 1"),
+        "the unused local must be renamed to `_y`; patched:\n{patched}"
+    );
+    assert!(
+        patched.contains("print(y)"),
+        "the forward-ref `print(y)` must stay VERBATIM (no silent rebind to the `_y` autoload); \
+         patched:\n{patched}"
+    );
+    // Apply→reanalyze: binding identity preserved (the member `y` still declared, `print(y)` bound
+    // to it), no new error.
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !after
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "no errors after the fix (no cross-file rebind); got {:?}\npatched:\n{patched}",
+        after.diagnostics
     );
     shutdown(&client, t);
 }

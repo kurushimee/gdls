@@ -1353,7 +1353,14 @@ fn rename_param_does_not_capture_self_attribute_access() {
 // =================================================================================================
 
 /// Collect the (line, character) start of every renamed site from a successful rename response.
-fn rename_sites(client: &Connection, id: i32, uri: &Uri, line: u32, ch: u32, new_name: &str) -> Vec<(u32, u32)> {
+fn rename_sites(
+    client: &Connection,
+    id: i32,
+    uri: &Uri,
+    line: u32,
+    ch: u32,
+    new_name: &str,
+) -> Vec<(u32, u32)> {
     client
         .sender
         .send(request(
@@ -1391,7 +1398,7 @@ fn rename_for_loop_variable_renames_precisely() {
     // two body uses, NOT refuse. (Pre-#107 this refused with -32803 because
     // `enclosing_function_declaring` did not look at `ForVariable` locals.)
     //   line 2 `\tfor i in [1, 2]:` → decl `i` at col 5
-    //   line 3 `\t\tprint(i)`       → use  `i` at col 7
+    //   line 3 `\t\tprint(i)`       → use  `i` at col 8 (2 tabs + `print(`)
     //   line 4 `\t\ti = 0`          → use  `i` at col 2
     let src = "extends Node\nfunc f() -> void:\n\tfor i in [1, 2]:\n\t\tprint(i)\n\t\ti = 0\n";
     let (client, server, main_uri, _project) = boot_native_member(src);
@@ -1399,7 +1406,7 @@ fn rename_for_loop_variable_renames_precisely() {
     let sites = rename_sites(&client, 90, &main_uri, 2, 5, "idx");
     assert_eq!(
         sites,
-        vec![(2, 5), (3, 7), (4, 2)],
+        vec![(2, 5), (3, 8), (4, 2)],
         "for-loop iterator rename must edit exactly its decl + both body uses; got {sites:?}"
     );
     shutdown(&client, server);
