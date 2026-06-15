@@ -679,6 +679,13 @@ pub struct ServerState {
     /// fall-back) stamps `"st-{n}"`; the id is opaque to the client and only used to correlate the
     /// next delta request.
     pub(crate) semantic_tokens_result_seq: u64,
+    /// M11 (#80): the set of external-formatter failure classes already surfaced via
+    /// `window/showMessage(Warning)` THIS SESSION. `textDocument/formatting` runs on every save; a
+    /// persistently-misconfigured formatter would otherwise spam a warning per save. The handler
+    /// warns at most once per distinct [`crate::formatter::FormatterFailure`] (spawn / non-zero exit
+    /// / timeout / non-UTF-8 output) — the first occurrence shows the message and records the class
+    /// here; later occurrences of the same class stay silent (the full detail still goes to stderr).
+    pub(crate) formatter_warned: FxHashSet<crate::formatter::FormatterFailure>,
 }
 
 /// M10 (#72): one entry of [`ServerState::semantic_tokens_cache`] — the last result id + token array
@@ -756,7 +763,7 @@ fn serve_inner(
     let root = resolve_root(&options, &init);
 
     let result = InitializeResult {
-        capabilities: capabilities(encoding, &caps),
+        capabilities: capabilities(encoding, &caps, &options.formatter),
         server_info: Some(ServerInfo {
             name: "gdls".to_string(),
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -900,6 +907,7 @@ fn serve_inner(
         stub_cache: crate::stubs::StubCache::default(),
         semantic_tokens_cache: FxHashMap::default(),
         semantic_tokens_result_seq: 0,
+        formatter_warned: FxHashSet::default(),
     };
 
     // M7 (#60): the one dynamic registration, sent once the session state exists (the
@@ -1526,7 +1534,7 @@ fn apply_runtime_config(state: &mut ServerState, raw: &serde_json::Value) {
     // load / watcher / dump topology at startup. Warn per drifted (and provided) field, keep
     // the old value.
     let old = &state.options;
-    let structural: [(&str, bool); 6] = [
+    let structural: [(&str, bool); 7] = [
         (
             "projectRoot",
             provided("projectRoot") && new_options.project_root != old.project_root,
@@ -1553,6 +1561,13 @@ fn apply_runtime_config(state: &mut ServerState, raw: &serde_json::Value) {
         (
             "stubCacheDir",
             provided("stubCacheDir") && new_options.stub_cache_dir != old.stub_cache_dir,
+        ),
+        // M11 (#80): the formatter is session-structural — it gates whether
+        // `documentFormattingProvider` was advertised at the handshake, and a capability can't be
+        // added/removed mid-session. A drifted value is warned about and the startup value retained.
+        (
+            "formatter",
+            provided("formatter") && new_options.formatter != old.formatter,
         ),
     ];
     for (field, drifted) in structural {
@@ -2149,7 +2164,16 @@ fn republish_all_open_buffers(state: &mut ServerState) {
 /// `caps` carries the negotiated client capabilities so the M11 (#79) `workspace.fileOperations`
 /// block is advertised per-operation only when the client offered that operation — gdls never tells
 /// a client it handles a file operation the client won't send (anti-catalog W15).
-fn capabilities(encoding: PositionEncoding, caps: &ClientCaps) -> ServerCapabilities {
+///
+/// `formatter` is the session-structural [`FormatterConfig`] (M11 #80): `documentFormattingProvider`
+/// is advertised ONLY when a formatter command is configured (same W15 rule — never advertise an
+/// unconfigured/unimplemented surface). It is read here, at the one-shot `initialize`, because a
+/// capability cannot be added mid-session.
+fn capabilities(
+    encoding: PositionEncoding,
+    caps: &ClientCaps,
+    formatter: &crate::config::FormatterConfig,
+) -> ServerCapabilities {
     ServerCapabilities {
         position_encoding: Some(encoding.to_kind()),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(
@@ -2310,6 +2334,16 @@ fn capabilities(encoding: PositionEncoding, caps: &ClientCaps) -> ServerCapabili
                 .collect(),
             work_done_progress_options: Default::default(),
         }),
+        // M11 (#80): `documentFormattingProvider` — advertised ONLY when a formatter command is
+        // configured (`formatter.command` set), so `None` (the default) means gdls never claims to
+        // format when no external tool is wired up (anti-catalog W15). The handler shells out to the
+        // configured command with NO shell (argv vector), pipes the buffer through stdin/stdout under
+        // a bounded timeout, and returns minimal-diff edits on success / no edits + a deduped
+        // showMessage(Warning) on failure — the buffer is never corrupted. `rangeFormatting` is
+        // deliberately NOT advertised: GDScript formatters (gdformat) are whole-file, and the spec
+        // says to advertise range formatting only when the tool supports it (a future config flag
+        // could add it).
+        document_formatting_provider: crate::formatter::document_formatting_provider(formatter),
         // M11 (#79): the `workspace.fileOperations` block — advertised per-operation only when the
         // client opted in (a `None` block means gdls never claims a file operation it can't receive).
         // `willRename` is the mutating surface (returns a `WorkspaceEdit` rewriting `res://`
@@ -2621,6 +2655,14 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // set above), served like foldingRange.
         "textDocument/documentColor" => handle!(handlers::document_color),
         "textDocument/colorPresentation" => handle!(handlers::color_presentation),
+        // M11 (#80): the external-formatter bridge. Pipes the open buffer through the configured
+        // command (no shell, bounded timeout) and returns minimal-diff `TextEdit`s, or `null` (no
+        // edits) + a deduped showMessage(Warning) on any failure — the buffer is never corrupted.
+        // NOT analysis-priced (it never runs the analyzer — just reads buffer text and shells out),
+        // so it is absent from the Hard-pressure `analyze_using` shed set above; the bounded
+        // subprocess timeout is its own backstop. Only reached when `documentFormattingProvider` was
+        // advertised (a command is configured); a non-conforming client gets `null` defensively.
+        "textDocument/formatting" => handle!(crate::formatter::formatting),
         // M10 (#72): semanticTokens. `full` returns the whole delta-encoded token set (fresh result
         // id); `full/delta` returns flat-array edits vs the prior id (or a fresh full on an unknown
         // id); `range` returns only the intersecting tokens. `full`/`full/delta` are analysis-priced
@@ -3443,6 +3485,7 @@ mod tests {
             stub_cache: crate::stubs::StubCache::default(),
             semantic_tokens_cache: FxHashMap::default(),
             semantic_tokens_result_seq: 0,
+            formatter_warned: FxHashSet::default(),
         };
         (state, rx)
     }
@@ -3491,6 +3534,7 @@ mod tests {
             stub_cache: crate::stubs::StubCache::default(),
             semantic_tokens_cache: FxHashMap::default(),
             semantic_tokens_result_seq: 0,
+            formatter_warned: FxHashSet::default(),
         };
         (state, rx)
     }
@@ -3902,6 +3946,7 @@ mod tests {
             stub_cache: crate::stubs::StubCache::default(),
             semantic_tokens_cache: FxHashMap::default(),
             semantic_tokens_result_seq: 0,
+            formatter_warned: FxHashSet::default(),
         };
 
         // Pre-populate the cache via the dev/test debug-insert helpers. Without entries to
