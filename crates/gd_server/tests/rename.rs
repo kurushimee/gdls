@@ -1337,3 +1337,225 @@ fn rename_param_does_not_capture_self_attribute_access() {
     );
     shutdown(&client, server);
 }
+
+// =================================================================================================
+// #107: scope-aware local binding resolution. Two precision gaps the function-span by-name scan
+// left behind once attribute-position over-capture (BLOCKER-6) was fixed:
+//   (a) for-loop iterators (`for i in …`) and match-pattern binds (`match v: var n:`) are real
+//       function-locals but were not recognized by `enclosing_function_declaring` (it checked only
+//       Parameter/Variable/Constant nodes), so a rename on them fail-closed REFUSED (-32803).
+//   (b) inner-scope shadowing: an outer local `x` plus an inner-block `var x` — the whole-function
+//       by-name scan renamed BOTH, a benign over-rename of a sibling the user did not select.
+// The fix resolves each in-function identifier to its declaring binding (the parser's per-suite
+// `locals` model), so for-loop/match binds rename precisely and inner-shadowed siblings are left
+// alone. Each test applies the edit and re-checks the renamed/untouched site set by position
+// (apply→verify-by-identity, not a string match).
+// =================================================================================================
+
+/// Collect the (line, character) start of every renamed site from a successful rename response.
+fn rename_sites(
+    client: &Connection,
+    id: i32,
+    uri: &Uri,
+    line: u32,
+    ch: u32,
+    new_name: &str,
+) -> Vec<(u32, u32)> {
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/rename",
+            rename_params(uri, line, ch, new_name),
+        ))
+        .unwrap();
+    let resp = recv_response(client);
+    assert!(
+        resp.error.is_none(),
+        "rename at ({line},{ch})→{new_name:?} must succeed, got error {:?}",
+        resp.error
+    );
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    assert!(
+        view.new_texts.iter().all(|t| t == new_name),
+        "every edit must write {new_name:?}, got {:?}",
+        view.new_texts
+    );
+    let mut sites: Vec<(u32, u32)> = view
+        .set
+        .iter()
+        .map(|(_, r)| (r.start.line, r.start.character))
+        .collect();
+    sites.sort();
+    sites
+}
+
+#[test]
+fn rename_for_loop_variable_renames_precisely() {
+    // `for i in [1, 2]:` — the iterator `i` is a function-local; renaming it must edit its decl + its
+    // two body uses, NOT refuse. (Pre-#107 this refused with -32803 because
+    // `enclosing_function_declaring` did not look at `ForVariable` locals.)
+    //   line 2 `\tfor i in [1, 2]:` → decl `i` at col 5
+    //   line 3 `\t\tprint(i)`       → use  `i` at col 8 (2 tabs + `print(`)
+    //   line 4 `\t\ti = 0`          → use  `i` at col 2
+    let src = "extends Node\nfunc f() -> void:\n\tfor i in [1, 2]:\n\t\tprint(i)\n\t\ti = 0\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the iterator declaration (line 2, col 5). Rename → `idx`.
+    let sites = rename_sites(&client, 90, &main_uri, 2, 5, "idx");
+    assert_eq!(
+        sites,
+        vec![(2, 5), (3, 8), (4, 2)],
+        "for-loop iterator rename must edit exactly its decl + both body uses; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_match_pattern_bind_renames_precisely() {
+    // `match v: var n:` — the pattern bind `n` is a function-local; renaming it must edit its bind
+    // site + its branch-body use, NOT refuse. (Pre-#107 this refused: `PatternBind` locals were not
+    // recognized by `enclosing_function_declaring`.)
+    //   line 2 `\tmatch v:`     (the matched value)
+    //   line 3 `\t\tvar n:`     → bind `n` at col 6
+    //   line 4 `\t\t\tprint(n)` → use  `n` at col 9
+    let src = "extends Node\nfunc f(v) -> void:\n\tmatch v:\n\t\tvar n:\n\t\t\tprint(n)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the bind site (line 3, col 6). Rename → `bound`.
+    let sites = rename_sites(&client, 91, &main_uri, 3, 6, "bound");
+    assert_eq!(
+        sites,
+        vec![(3, 6), (4, 9)],
+        "match-pattern bind rename must edit exactly its bind site + branch-body use; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_inner_shadow_does_not_rename_outer_sibling() {
+    // An outer local `x` and an inner-block `var x` (a different binding). Renaming the OUTER `x` must
+    // edit ONLY its own decl + the use that resolves to it (the one BEFORE the inner re-declaration),
+    // never the inner binding's decl/use — those are a distinct symbol the user did not select.
+    // (Pre-#107 the whole-function by-name scan renamed all four sites, a benign over-rename.)
+    //   line 2 `\tvar x = 1`   → OUTER decl `x` at col 5
+    //   line 3 `\tprint(x)`    → OUTER use  `x` at col 7
+    //   line 4 `\tif true:`
+    //   line 5 `\t\tvar x = 2` → INNER decl `x` at col 6
+    //   line 6 `\t\tprint(x)`  → INNER use  `x` at col 8
+    let src = "extends Node\nfunc f() -> void:\n\tvar x = 1\n\tprint(x)\n\tif true:\n\t\tvar x = 2\n\t\tprint(x)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the OUTER declaration (line 2, col 5). Rename → `outer`.
+    let sites = rename_sites(&client, 92, &main_uri, 2, 5, "outer");
+    assert_eq!(
+        sites,
+        vec![(2, 5), (3, 7)],
+        "renaming the outer local must edit ONLY its own sites, never the inner-shadow binding (lines 5,6); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_inner_shadow_from_inner_targets_inner_binding() {
+    // The mirror of the above: clicking the INNER `var x` must edit ONLY the inner binding's sites
+    // (decl + the use that resolves to it), never the outer binding's — precise both directions.
+    let src = "extends Node\nfunc f() -> void:\n\tvar x = 1\n\tprint(x)\n\tif true:\n\t\tvar x = 2\n\t\tprint(x)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the INNER declaration (line 5, col 6). Rename → `inner`.
+    let sites = rename_sites(&client, 93, &main_uri, 5, 6, "inner");
+    assert_eq!(
+        sites,
+        vec![(5, 6), (6, 8)],
+        "renaming the inner local must edit ONLY the inner binding's sites, never the outer (lines 2,3); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_outer_local_captured_in_lambda_edits_all_occurrences() {
+    // A lambda body is a NESTED function node, so the occurrence-scan bound must be the function
+    // enclosing the DECLARATION (the outer `f`), not the cursor's enclosing function (the lambda) —
+    // otherwise renaming from the lambda-interior capture drops the OUTER uses, dangling them. Click
+    // the captured `c` INSIDE the lambda; every occurrence (outer decl + both outer uses + the
+    // capture) must be renamed.
+    //   line 2 `\tvar c = 1`                  → decl `c` at col 5
+    //   line 3 `\tprint(c)`                   → use  `c` at col 7
+    //   line 4 `\tvar g = func(): return c`   → captured use `c` at col 24
+    //   line 5 `\tprint(c)`                   → use  `c` at col 7
+    let src = "extends Node\nfunc f() -> void:\n\tvar c = 1\n\tprint(c)\n\tvar g = func(): return c\n\tprint(c)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the lambda-interior capture (line 4, col 24). Rename → `renamed`.
+    let sites = rename_sites(&client, 94, &main_uri, 4, 24, "renamed");
+    assert_eq!(
+        sites,
+        vec![(2, 5), (3, 7), (4, 24), (5, 7)],
+        "renaming an outer local from inside a capturing lambda must edit ALL occurrences (decl + \
+         both outer uses + the capture) — never drop the outer uses (dangling); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_lambda_parameter_does_not_capture_outer_same_named() {
+    // A lambda PARAMETER shadows an outer same-named local: renaming the lambda param must edit ONLY
+    // the param's own sites (inside the lambda), never the outer binding's — precise across the
+    // lambda boundary in the shadowing direction too.
+    //   line 2 `\tvar v = 1`                          → OUTER decl `v` at col 5
+    //   line 3 `\tprint(v)`                           → OUTER use  `v` at col 7
+    //   line 4 `\tvar g = func(v): return v`          → param `v` at col 14, param use `v` at col 25
+    let src =
+        "extends Node\nfunc f() -> void:\n\tvar v = 1\n\tprint(v)\n\tvar g = func(v): return v\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the lambda PARAMETER (line 4, col 14). Rename → `p`.
+    let sites = rename_sites(&client, 95, &main_uri, 4, 14, "p");
+    assert_eq!(
+        sites,
+        vec![(4, 14), (4, 25)],
+        "renaming a lambda parameter must edit ONLY the param decl + its in-lambda use, never the \
+         shadowed outer `v` (lines 2,3); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_outer_local_captured_in_nested_lambda_edits_all_occurrences() {
+    // A capture two lambda levels deep: the occurrence-scan bound must still resolve to the OUTERMOST
+    // declaring function (`f`), never either lambda — otherwise the outer use dangles. Click the
+    // deeply-nested capture; the decl + the outer use + the deep capture must all be renamed.
+    //   line 2 `\tvar c = 1`                                  → decl `c` at col 5
+    //   line 3 `\tvar g = func(): var h = func(): return c`   → capture `c` at col 40
+    //   line 4 `\tprint(c)`                                   → use  `c` at col 7
+    let src = "extends Node\nfunc f() -> void:\n\tvar c = 1\n\tvar g = func(): var h = func(): return c\n\tprint(c)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the deepest capture (line 3, col 40). Rename → `renamed`.
+    let sites = rename_sites(&client, 96, &main_uri, 3, 40, "renamed");
+    assert_eq!(
+        sites,
+        vec![(2, 5), (3, 40), (4, 7)],
+        "a capture nested two lambdas deep must edit the decl + outer use + the deep capture, \
+         scoping to the outermost function; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_local_does_not_rewrite_lua_style_dict_key() {
+    // A Lua-style dict KEY (`{ name = 2 }`) is a folded STRING literal, NOT a reference to the local
+    // `name` — renaming the local must NOT rewrite it (that would silently change the key string,
+    // breaking `d["name"]`/`d.name` lookups at runtime). The dict VALUE reference (`other = name`)
+    // IS a real use and MUST be renamed.
+    //   line 2 `\tvar name = 1`                          → decl `name` at col 5
+    //   line 3 `\tvar d = { name = 2, other = name }`    → KEY at col 11 (EXCLUDE), value at col 29
+    //   line 4 `\tprint(name)`                           → use `name` at col 7
+    let src = "extends Node\nfunc f() -> void:\n\tvar name = 1\n\tvar d = { name = 2, other = name }\n\tprint(name)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the declaration (line 2, col 5). Rename → `renamed`.
+    let sites = rename_sites(&client, 97, &main_uri, 2, 5, "renamed");
+    assert_eq!(
+        sites,
+        vec![(2, 5), (3, 29), (4, 7)],
+        "renaming the local must edit decl + dict VALUE ref + print, NEVER the Lua-style dict KEY \
+         (col 11 on line 3) — rewriting it is silent runtime corruption; got {sites:?}"
+    );
+    shutdown(&client, server);
+}

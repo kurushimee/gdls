@@ -730,6 +730,155 @@ impl ParseTree {
         }
         out
     }
+
+    /// The declaration **identifier** node of a [`Local`] — the token that names it. This is the
+    /// stable identity key for a binding across the LSP local-resolution / rename path, because a
+    /// `Local`'s `source` varies by kind: a `Variable`/`Constant` records the whole statement node
+    /// (`var x = …`), while a `ForVariable`/`PatternBind` records the identifier directly. Returns
+    /// `None` only for a malformed `var`/`const` with no identifier.
+    fn local_decl_ident(&self, local: &Local) -> Option<NodeId> {
+        match &self.get(local.source).kind {
+            NodeKind::Variable(v) => v.identifier,
+            NodeKind::Constant(c) => c.identifier,
+            NodeKind::Parameter(p) => p.identifier,
+            // ForVariable / PatternBind store the identifier node as the source itself.
+            NodeKind::Identifier(_) => Some(local.source),
+            _ => None,
+        }
+    }
+
+    /// Resolve the identifier at `byte` (textually `name`) to the **declaration identifier** of the
+    /// local binding it refers to, respecting nested `var`/`for`/`match`-bind/`param`/lambda scopes —
+    /// the precise (binding-based) analog of [`Self::locals_in_scope_at`]. `None` when `byte` is not
+    /// inside any block, or `name` is not a local there (a member / global / unresolved identifier).
+    ///
+    /// Two cases, in order:
+    /// - **Declaration click:** `byte` lands on a binding's own declaration identifier (which for a
+    ///   `for`/`match` bind sits textually OUTSIDE the body block that owns the `Local`, so the suite
+    ///   walk below would miss it) → that binding. The nearest enclosing block to the click is used
+    ///   to disambiguate same-named bindings, so clicking an inner `var x` resolves to the inner one.
+    /// - **Use:** walk the block chain innermost-first (so an inner binding shadows an outer one) and
+    ///   return the first in-scope binding of `name` whose declaration **completes at or before**
+    ///   `byte` (`source.span.end <= byte`) — the same not-yet-declared rule as `locals_in_scope_at`,
+    ///   which also makes a use inside a binding's own initializer (`var x = x`) resolve outward.
+    pub fn resolve_local_binding_at(&self, byte: usize, name: &str) -> Option<NodeId> {
+        // Declaration click: the cursor is on a binding's own declaration identifier. A `for`/`match`
+        // bind's declaration token sits textually OUTSIDE the body block that owns its `Local`, so
+        // this scans every block's locals (not just the blocks containing `byte`) for the binding
+        // whose declaration identifier covers the cursor. Declaration identifiers are unique extents,
+        // so at most one matches — no innermost-first disambiguation is needed for this branch.
+        for id in self.iter_ids() {
+            let NodeKind::Suite(s) = &self.get(id).kind else {
+                continue;
+            };
+            for local in &s.locals {
+                if local.name != name {
+                    continue;
+                }
+                if let Some(decl) = self.local_decl_ident(local) {
+                    let dspan = self.get(decl).span;
+                    if dspan.start <= byte && byte < dspan.end {
+                        return Some(decl);
+                    }
+                }
+            }
+        }
+        // Use: the first in-scope, already-declared binding of `name`.
+        let mut cur = self.innermost_suite_at(byte);
+        while let Some(id) = cur {
+            let NodeKind::Suite(s) = &self.get(id).kind else {
+                break;
+            };
+            for local in &s.locals {
+                if local.name != name {
+                    continue;
+                }
+                if self.get(local.source).span.end > byte {
+                    continue; // not yet declared at the cursor (incl. inside its own initializer)
+                }
+                return self.local_decl_ident(local);
+            }
+            cur = s.parent_block;
+        }
+        None
+    }
+
+    /// Every identifier occurrence (declaration + uses) that resolves to the binding whose
+    /// declaration identifier is `decl_ident`, searched within `scope` (pass the enclosing
+    /// **function** span — a `for`/`match` declaration token sits outside the body block, so a
+    /// block-scoped search would drop it). The precise occurrence set for a local rename /
+    /// documentHighlight: distinct same-named siblings in inner/outer blocks are excluded by
+    /// per-occurrence re-resolution ([`Self::resolve_local_binding_at`]).
+    ///
+    /// Non-reference identifiers that share the name are excluded so a rewrite never corrupts them:
+    /// attribute positions (`obj.x` / `self.x` — that `x` is a member) and Lua-style dictionary keys
+    /// (`{ x = value }` — a folded string literal, not a reference to the local). The returned spans
+    /// are the identifier token extents, in arena (source) order.
+    ///
+    /// Cost: one arena pass to collect attribute idents, then one to scan candidates; each candidate
+    /// that matches the name is re-resolved (another suite-chain walk). The re-resolve runs only for
+    /// identifiers that already share the target name, so the quadratic factor is bounded by that
+    /// name's occurrence count (small in practice), not the node count — and this runs at most once
+    /// per LSP request on a single file.
+    pub fn local_binding_occurrences(&self, decl_ident: NodeId, scope: ByteSpan) -> Vec<ByteSpan> {
+        // Collect identifier nodes that LOOK like a same-named local but are NOT a reference to one,
+        // so renaming/highlighting the local never rewrites them (a wrong-symbol/dangling edit under
+        // rename). Two non-reference positions:
+        //   - an ATTRIBUTE identifier (`obj.x` / `self.x`) — that `x` is a member, a different symbol.
+        //   - a LUA-STYLE dictionary KEY (`{ x = value }`) — the analyzer folds the key to a STRING
+        //     literal and records no binding, so it is not a reference to the local `x`; rewriting it
+        //     would silently change the key string. A Python-style key (`{ expr: value }`) IS an
+        //     expression, so its identifiers stay (normal references). The single-element ambiguous
+        //     case (`style == None`) is parsed Lua-style, so treat it so. (Mirrors the same exclusion
+        //     in the read-only semantic-tokens local-use fallback.)
+        let mut excluded_idents: std::collections::HashSet<NodeId> =
+            std::collections::HashSet::new();
+        for id in self.iter_ids() {
+            match &self.get(id).kind {
+                NodeKind::Subscript(s) => {
+                    if let Some(SubscriptAccess::Attribute(Some(aid))) = s.access {
+                        excluded_idents.insert(aid);
+                    }
+                }
+                NodeKind::Dictionary(d) => {
+                    if matches!(d.style, Some(DictStyle::LuaTable) | None) {
+                        for kv in &d.elements {
+                            if let Some(k) = kv.key {
+                                if let NodeKind::Identifier(_) = &self.get(k).kind {
+                                    excluded_idents.insert(k);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let target_name = match &self.get(decl_ident).kind {
+            NodeKind::Identifier(i) => i.name.as_str(),
+            _ => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for id in self.iter_ids() {
+            let node = self.get(id);
+            if node.span.start < scope.start || node.span.end > scope.end {
+                continue;
+            }
+            if excluded_idents.contains(&id) {
+                continue;
+            }
+            let NodeKind::Identifier(i) = &node.kind else {
+                continue;
+            };
+            if i.name != target_name {
+                continue;
+            }
+            if self.resolve_local_binding_at(node.span.start, target_name) == Some(decl_ident) {
+                out.push(node.span);
+            }
+        }
+        out
+    }
 }
 
 impl std::ops::Index<NodeId> for ParseTree {

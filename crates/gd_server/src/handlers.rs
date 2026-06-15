@@ -2487,14 +2487,14 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 if let Some(loc) = find_autoload_definition(state, &name) {
                     decls.push(loc);
                 }
-            } else if let NonMethodTarget::Local(fn_span) = &non_method_target {
-                // A local's declaration is its own identifier inside the enclosing function —
-                // find_in_file_definition would wrongly return a same-named class member's.
-                if let Some(loc) =
-                    local_declaration_location(&parsed.tree, *fn_span, &name, &uri, &mapper)
-                {
-                    decls.push(loc);
-                }
+            } else if let NonMethodTarget::Local { decl_ident, .. } = &non_method_target {
+                // A local's declaration is its own binding identifier (resolved respecting nested
+                // scopes) — find_in_file_definition would wrongly return a same-named class member's,
+                // and a same-named sibling binding's token must not be reported either.
+                decls.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
+                });
             } else if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
                 decls.push(loc);
             } else if let Some(loc) = find_global_class_definition(state, &name) {
@@ -2551,11 +2551,14 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                         &mapper,
                     );
                 }
-                NonMethodTarget::Local(fn_span) => {
-                    push_identifier_locations_within(
+                NonMethodTarget::Local {
+                    decl_ident,
+                    fn_span,
+                } => {
+                    push_local_binding_locations(
                         &mut locations,
                         &parsed.tree,
-                        &name,
+                        *decl_ident,
                         *fn_span,
                         &uri,
                         &mapper,
@@ -2606,7 +2609,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 method_scan_candidate_uris(state, &name, current_fid, "references")
             }
             // Locals can never be referenced from another file — no fan-out at all.
-            NonMethodTarget::Local(_) => Vec::new(),
+            NonMethodTarget::Local { .. } => Vec::new(),
             NonMethodTarget::Unresolved => {
                 // Fast-path for class/type names: only files whose interface mentions `name`
                 // can reference it; `name_referencers` already has that set. (Autoloads are
@@ -2701,7 +2704,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                     );
                 }
                 // Local targets fan out no candidates (unreachable; kept exhaustive).
-                NonMethodTarget::Local(_) => {}
+                NonMethodTarget::Local { .. } => {}
                 NonMethodTarget::Unresolved => {
                     // Residue floor: identifier scan picks up `extends Foo` and other
                     // parser-level refs the reducer doesn't record. De-dupes happen below.
@@ -2825,8 +2828,8 @@ pub fn document_highlight(
 ///
 /// The declaration site is **always** included (documentHighlight has no `includeDeclaration` flag —
 /// the declaring identifier is itself an in-file occupant the editor highlights). For a local target
-/// it is omitted here because [`push_identifier_locations_within`] already emits the `var`/param
-/// identifier in scope (appending it again would double the decl; the dedup runs in the caller).
+/// it is omitted here because [`push_local_binding_locations`] already emits the binding's
+/// declaration identifier (appending it again would double the decl; the dedup runs in the caller).
 fn collect_in_file_highlight_sites(
     state: &mut ServerState,
     key: &CanonicalKey,
@@ -2952,8 +2955,8 @@ fn collect_in_file_highlight_sites(
         if let Some(loc) = find_autoload_definition(state, name) {
             locations.push(loc);
         }
-    } else if let NonMethodTarget::Local(_) = &non_method_target {
-        // decl emitted by push_identifier_locations_within below.
+    } else if let NonMethodTarget::Local { .. } = &non_method_target {
+        // decl token is emitted by push_local_binding_locations below.
     } else if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, &mapper) {
         locations.push(loc);
     } else if let Some(loc) = find_global_class_definition(state, name) {
@@ -2999,11 +3002,14 @@ fn collect_in_file_highlight_sites(
                         &mapper,
                     );
                 }
-                NonMethodTarget::Local(fn_span) => {
-                    push_identifier_locations_within(
+                NonMethodTarget::Local {
+                    decl_ident,
+                    fn_span,
+                } => {
+                    push_local_binding_locations(
                         &mut locations,
                         &parsed.tree,
-                        name,
+                        *decl_ident,
                         *fn_span,
                         uri,
                         &mapper,
@@ -3421,10 +3427,16 @@ enum NonMethodTarget {
     /// filtered by `(declaring file, name)` — two unrelated `var speed`s in different classes
     /// stop reporting each other's sites.
     Member(gd_project::FileId),
-    /// A local/parameter of the enclosing function (its span): scan identifiers within that
-    /// function only — locals can never be referenced cross-file, so the old project-wide scan
-    /// was pure over-report.
-    Local(ByteSpan),
+    /// A local of the enclosing function, identified by its DECLARATION identifier (`decl_ident`)
+    /// plus the enclosing function span (`fn_span`). Occurrences are resolved per-identifier against
+    /// `decl_ident` ([`ParseTree::local_binding_occurrences`]) so a same-named binding in a nested
+    /// or sibling block stays a distinct symbol (no over-report), and `for`/`match` binds — whose
+    /// declaration token sits outside their body block — resolve too. Locals can never be referenced
+    /// cross-file, so there is no project-wide fan-out.
+    Local {
+        decl_ident: NodeId,
+        fn_span: ByteSpan,
+    },
     /// Couldn't resolve — the documented "over-approximate, never under-report" residue floor
     /// (raw identifier scan). Class/Enum/EnumValue targets classify here DELIBERATELY:
     /// `extends Foo`, `class_name`, and type annotations are resolver-level references with no
@@ -3493,21 +3505,36 @@ fn classify_non_method_target(
             }
         }
     }
-    if let Some(fn_span) = enclosing_function_declaring(tree, byte, name) {
-        return NonMethodTarget::Local(fn_span);
+    if let Some((decl_ident, fn_span)) = resolve_local_binding(tree, byte, name) {
+        return NonMethodTarget::Local {
+            decl_ident,
+            fn_span,
+        };
     }
     NonMethodTarget::Unresolved
 }
 
-/// The span of the smallest function containing `byte`, iff that function declares `name` as a
-/// parameter or a body-local var/const. A class-level member can never pass the span filter
-/// (declarations outside the function body), so a member target never mis-classifies as local.
+/// Resolve the identifier at `byte` (named `name`) to its declaring local binding: the declaration
+/// identifier ([`ParseTree::resolve_local_binding_at`] — respecting nested `var`/`for`/`match`-bind/
+/// `param`/lambda scopes) plus the search bound for occurrence collection. `None` when `byte` is not
+/// on a local of an enclosing function.
 ///
-/// Two bounded arena passes (find the enclosing function, then scan its contained nodes) — the
-/// flat arena has no parent pointers or per-subtree iteration, so this is the same O(#nodes)
-/// family as the sibling cursor walks (`innermost_node_at`, `is_member_or_attribute_ident`)
-/// and runs at most once per references request.
-fn enclosing_function_declaring(tree: &ParseTree, byte: usize, name: &str) -> Option<ByteSpan> {
+/// The bound is the function enclosing the **declaration**, NOT the cursor: a lambda body is a
+/// nested `Function`, so a use captured inside a lambda has a smaller cursor-enclosing function than
+/// the binding it refers to — bounding by the cursor's function would drop the binding's outer uses
+/// (an under-report → a dangling reference under rename). The declaration's enclosing function
+/// contains the declaration token AND every use (captures included), while a local declared inside a
+/// lambda stays correctly bounded to that lambda.
+fn resolve_local_binding(tree: &ParseTree, byte: usize, name: &str) -> Option<(NodeId, ByteSpan)> {
+    let decl_ident = tree.resolve_local_binding_at(byte, name)?;
+    let decl_byte = tree.get(decl_ident).span.start;
+    let fn_span = enclosing_function_span(tree, decl_byte)?;
+    Some((decl_ident, fn_span))
+}
+
+/// The span of the smallest `Function` node containing `byte`, or `None` at class scope. The bound
+/// for a local binding's occurrence scan (see [`resolve_local_binding`]).
+fn enclosing_function_span(tree: &ParseTree, byte: usize) -> Option<ByteSpan> {
     let mut best: Option<ByteSpan> = None;
     for id in tree.iter_ids() {
         if let NodeKind::Function(_) = &tree.get(id).kind {
@@ -3520,23 +3547,7 @@ fn enclosing_function_declaring(tree: &ParseTree, byte: usize, name: &str) -> Op
             }
         }
     }
-    let fn_span = best?;
-    for id in tree.iter_ids() {
-        let node = tree.get(id);
-        if node.span.start < fn_span.start || node.span.end > fn_span.end {
-            continue;
-        }
-        let ident = match &node.kind {
-            NodeKind::Parameter(p) => p.identifier,
-            NodeKind::Variable(v) => v.identifier,
-            NodeKind::Constant(c) => c.identifier,
-            _ => None,
-        };
-        if ident.is_some_and(|iid| ident_name(tree, iid) == name) {
-            return Some(fn_span);
-        }
-    }
-    None
+    best
 }
 
 /// Append a [`Location`] for every [`Binding::Use`] that resolved to the member `name` DECLARED
@@ -3569,82 +3580,30 @@ fn push_use_binding_locations_for(
     }
 }
 
-/// The declaration [`Location`] of the local/parameter `name` inside `scope` (the enclosing
-/// function's span): the first `Parameter`/`Variable`/`Constant` identifier of that name in
-/// arena order — the local-target analog of [`find_in_file_definition`].
-fn local_declaration_location(
-    tree: &ParseTree,
-    scope: ByteSpan,
-    name: &str,
-    uri: &Uri,
-    mapper: &PositionMapper,
-) -> Option<Location> {
-    for id in tree.iter_ids() {
-        let node = tree.get(id);
-        if node.span.start < scope.start || node.span.end > scope.end {
-            continue;
-        }
-        let ident = match &node.kind {
-            NodeKind::Parameter(p) => p.identifier,
-            NodeKind::Variable(v) => v.identifier,
-            NodeKind::Constant(c) => c.identifier,
-            _ => None,
-        };
-        if let Some(iid) = ident {
-            if ident_name(tree, iid) == name {
-                return Some(Location {
-                    uri: uri.clone(),
-                    range: mapper.span_to_range(tree.get(iid).span),
-                });
-            }
-        }
-    }
-    None
-}
-
-/// [`push_identifier_locations`] restricted to identifiers inside `scope` — the function-scoped
-/// references path for locals/parameters. A same-named member ACCESS inside the same function
-/// still matches (bounded over-approximation); the cross-function and cross-file bleed is gone.
-fn push_identifier_locations_within(
+/// The precise occurrence set of the LOCAL binding whose declaration identifier is `decl_ident`,
+/// searched within `fn_span` (the enclosing function) — the function-scoped references /
+/// documentHighlight / rename path for locals, parameters, `for` iterators, and `match` binds.
+///
+/// Delegates to [`ParseTree::local_binding_occurrences`], which re-resolves each candidate
+/// identifier to its declaring binding ([`ParseTree::resolve_local_binding_at`]). This is what makes
+/// the set BINDING-correct rather than name-correct:
+///   - a same-named binding in a nested or sibling block is a DISTINCT symbol and is excluded (no
+///     over-rename of a shadowed sibling — the #107 precision fix);
+///   - an attribute-position identifier (`self.x` / `obj.x`) is excluded (a local is never reached
+///     as a member access — rewriting one would dangle a member reference, the BLOCKER-6 case).
+fn push_local_binding_locations(
     out: &mut Vec<Location>,
     tree: &ParseTree,
-    name: &str,
-    scope: ByteSpan,
+    decl_ident: NodeId,
+    fn_span: ByteSpan,
     uri: &Uri,
     mapper: &PositionMapper,
 ) {
-    // This is the LOCAL/PARAMETER resolution path (the only callers are the `NonMethodTarget::Local`
-    // arms). A local is a bare identifier in its function scope; it can NEVER be reached as the
-    // attribute of a member access (`self.x` / `obj.x` — that `x` is a MEMBER, a different symbol).
-    // The flat by-name scan would otherwise grab those attribute idents — harmless as a read (a
-    // documentHighlight panel), but CORRUPTING for rename (its first mutating consumer): renaming a
-    // local `x` would rewrite `self.x` into a dangling member reference (the BLOCKER-6 case). So
-    // collect every attribute-position identifier (`SubscriptAccess::Attribute(Some(aid))` names it)
-    // and exclude it — making the local resolution binding-correct w.r.t. member accesses.
-    let mut attribute_idents: FxHashSet<NodeId> = FxHashSet::default();
-    for id in tree.iter_ids() {
-        if let NodeKind::Subscript(s) = &tree.get(id).kind {
-            if let Some(SubscriptAccess::Attribute(Some(aid))) = s.access {
-                attribute_idents.insert(aid);
-            }
-        }
-    }
-    for id in tree.iter_ids() {
-        let node = tree.get(id);
-        if node.span.start < scope.start || node.span.end > scope.end {
-            continue;
-        }
-        if attribute_idents.contains(&id) {
-            continue;
-        }
-        if let NodeKind::Identifier(i) = &node.kind {
-            if i.name == name {
-                out.push(Location {
-                    uri: uri.clone(),
-                    range: mapper.span_to_range(node.span),
-                });
-            }
-        }
+    for span in tree.local_binding_occurrences(decl_ident, fn_span) {
+        out.push(Location {
+            uri: uri.clone(),
+            range: mapper.span_to_range(span),
+        });
     }
 }
 
@@ -5710,8 +5669,9 @@ fn rename_target_has_project_anchor(
     if find_in_file_definition(&parsed.tree, name, uri, &mapper).is_some() {
         return true;
     }
-    // Enclosing-function local or parameter.
-    if enclosing_function_declaring(&parsed.tree, byte, name).is_some() {
+    // Enclosing-function local, parameter, `for` iterator, or `match` bind (resolved respecting
+    // nested scopes) — all editable project symbols.
+    if resolve_local_binding(&parsed.tree, byte, name).is_some() {
         return true;
     }
     // A project `class_name` (declared in any project file).
@@ -5763,7 +5723,7 @@ fn rename_target_has_project_anchor(
     let node_span = parsed.tree.get(node_id).span;
     if matches!(
         classify_non_method_target(&parsed.tree, &result, node_span, byte, name, current_fid),
-        NonMethodTarget::Member(_) | NonMethodTarget::Local(_)
+        NonMethodTarget::Member(_) | NonMethodTarget::Local { .. }
     ) {
         return true;
     }
@@ -5911,13 +5871,14 @@ pub fn rename(
     // complete anchor, so resolve it via `definition` and collect from THERE — making the edit set
     // click-site-INDEPENDENT. Falls back to the cursor when the target is already its own declaration
     // (definition → None / non-scalar), where the cursor set is itself complete.
-    // Skip canonicalization for a function-local / parameter: they are function-scoped and
-    // click-site-SYMMETRIC (no method-style bare-vs-`self.`-qualified asymmetry), so the cursor set
-    // is already complete — and `definition()` is member-FIRST, so canonicalizing a local that
-    // SHADOWS a member (`func set_value(value): …` over `var value`) would jump to the member and
-    // rename the WRONG symbol project-wide, leaving the local broken. Only methods / members (which
-    // carry the bare-vs-qualified asymmetry) need the declaration anchor.
-    let is_local_or_param = enclosing_function_declaring(&parsed.tree, byte, &old_name).is_some();
+    // Skip canonicalization for a function-local / parameter / `for` iterator / `match` bind: they
+    // are function-scoped and click-site-SYMMETRIC (no method-style bare-vs-`self.`-qualified
+    // asymmetry), so the cursor set is already complete — and `definition()` is member-FIRST, so
+    // canonicalizing a local that SHADOWS a member (`func set_value(value): …` over `var value`)
+    // would jump to the member and rename the WRONG symbol project-wide, leaving the local broken.
+    // Only methods / members (which carry the bare-vs-qualified asymmetry) need the declaration
+    // anchor. Resolving respects nested scopes, so the cursor stays on its own binding.
+    let is_local_or_param = resolve_local_binding(&parsed.tree, byte, &old_name).is_some();
     let edit_tdp = if is_local_or_param {
         tdp.clone()
     } else {
@@ -6067,14 +6028,14 @@ fn rename_collision(
     node_id: NodeId,
     new_name: &str,
 ) -> Option<RequestRefusal> {
-    // Local/parameter scope FIRST: a cursor inside a function on its own param/var/const is a
-    // local target (locals shadow members), so its collision scope is the function, not the class.
-    // The enclosing-function walk only matches when `byte` is inside a function that declares the
-    // OLD name as a local — exactly the `NonMethodTarget::Local` precondition.
+    // Local/parameter scope FIRST: a cursor inside a function on its own local (param/var/const/
+    // `for` iterator/`match` bind) is a local target (locals shadow members), so its collision scope
+    // is the function, not the class. The resolver only matches when `byte` resolves to a binding
+    // declared in the enclosing function — exactly the `NonMethodTarget::Local` precondition.
     let old_name = cursor_identifier(tree, node_id);
     if let Some(old) = old_name.as_deref() {
-        if enclosing_function_declaring(tree, byte, old).is_some() {
-            if function_declares_local(tree, byte, new_name) {
+        if let Some((_, fn_span)) = resolve_local_binding(tree, byte, old) {
+            if function_declares_local(tree, fn_span, new_name) {
                 return Some(RequestRefusal::invalid_name(format!(
                     "Cannot rename to `{new_name}`: `{new_name}` is already declared in this scope"
                 )));
@@ -6136,11 +6097,27 @@ fn root_class_declares(tree: &ParseTree, name: &str) -> bool {
         .any(|m| member_named(tree, m, name).is_some())
 }
 
-/// `true` iff the smallest function containing `byte` declares `name` as a parameter or a
-/// body-local var/const — the local-collision predicate. Reuses the exact shape of
-/// [`enclosing_function_declaring`] (the `references` local-classification walk).
-fn function_declares_local(tree: &ParseTree, byte: usize, name: &str) -> bool {
-    enclosing_function_declaring(tree, byte, name).is_some()
+/// `true` iff the function spanning `fn_span` declares `name` as ANY local — a parameter, body-local
+/// `var`/`const`, `for` iterator, or `match` bind — the local-collision predicate (the new-name side
+/// of [`rename_collision`]). Scans every block within `fn_span` for a `Local` of that name, so it
+/// sees the for/match binds a var/const/param-only walk would miss. `fn_span` is the OLD binding's
+/// enclosing-function span (from [`resolve_local_binding`], declaration-derived so a lambda-captured
+/// cursor still scopes to the outer function). Function-wide is deliberately CONSERVATIVE: it refuses
+/// a rename whose new name shadows ANY local in the function, even one in a sibling block —
+/// refuse-rather-than-corrupt.
+fn function_declares_local(tree: &ParseTree, fn_span: ByteSpan, name: &str) -> bool {
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        if node.span.start < fn_span.start || node.span.end > fn_span.end {
+            continue;
+        }
+        if let NodeKind::Suite(s) = &node.kind {
+            if s.locals.iter().any(|l| l.name == name) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ===================================================================================================

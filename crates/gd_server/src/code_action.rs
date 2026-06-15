@@ -732,23 +732,23 @@ fn build_underscore_prefix_edit(
             if workspace_edit_is_empty(&edit) {
                 return None;
             }
-            // SINGLE-DECLARATION-TOKEN GATE (sound, corruption firewall). gdls fires
+            // SINGLE-DECLARATION-TOKEN GATE (sound, defense-in-depth). gdls fires
             // UNUSED_VARIABLE/UNUSED_PARAMETER ONLY when the binding has ZERO non-declaration
             // occurrences (any read/write/same-named attribute access suppresses the warning), and a
-            // GDScript declaration is a single token. So a CORRECTLY-resolved `_`-prefix rename of a
-            // genuinely-unused binding touches EXACTLY ONE token — the declaration. Any 2nd edit is
-            // necessarily the over-approximating local resolver
-            // (`handlers::push_identifier_locations_within`, a name-based function-wide scan) grabbing
-            // a DIFFERENT binding: a forward-reference to a member/global, or a sibling-block's distinct
-            // same-named local. Renaming such an occurrence can silently rebind a read to the wrong
-            // symbol when `_name` collides with a cross-file global/autoload/class_name — error-free
-            // (the ERROR backstop is blind) and not-in-file (the `file_contains_identifier` firewall
-            // misses it). So refuse rather than risk a wrong-symbol rebind: accept ONLY a one-edit
-            // rename, position- and file-blind. PRECONDITION: count==1 is correct ONLY because the
-            // `_`-prefix is offered solely for the two FUNCTION-SCOPED warnings
-            // (UNUSED_VARIABLE/UNUSED_PARAMETER; see the dispatch in `push_mutating_actions`). A future
-            // member-variable warning would drive a project-wide multi-file rename — many legitimate
-            // edits — and would break this invariant, needing its own re-derivation.
+            // GDScript declaration is a single token. So a correctly-resolved `_`-prefix rename of a
+            // genuinely-unused binding touches EXACTLY ONE token — the declaration. The local
+            // resolution is now binding-precise (it resolves each occurrence to its declaring binding,
+            // so a forward-reference to a member/global or a sibling-block's distinct same-named local
+            // is NOT in the set), so a correct rename is already one edit — but a 2nd edit here would
+            // mean a resolver drift slipped a DIFFERENT binding in, and renaming it could silently
+            // rebind a read to the wrong symbol when `_name` collides with a cross-file
+            // global/autoload/class_name — error-free (the ERROR backstop is blind) and not-in-file
+            // (the `file_contains_identifier` firewall misses it). So keep the gate as a fail-closed
+            // backstop: accept ONLY a one-edit rename, position- and file-blind. PRECONDITION: count==1
+            // is correct ONLY because the `_`-prefix is offered solely for the two FUNCTION-SCOPED
+            // warnings (UNUSED_VARIABLE/UNUSED_PARAMETER; see the dispatch in `push_mutating_actions`).
+            // A future member-variable warning would drive a project-wide multi-file rename — many
+            // legitimate edits — and would break this invariant, needing its own re-derivation.
             let ranges = workspace_edit_ranges(&edit);
             if ranges.len() != 1 {
                 return None;
