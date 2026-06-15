@@ -6063,18 +6063,27 @@ fn reduce_identifier_with_flags(ctx: &mut AnalysisContext, id: NodeId, _can_be_b
 /// analyzer.cpp:3868-3878; on either, Godot leaves the default `VARIANT`/`UNDETECTED` result, which
 /// gdls reproduces so a `:=` infer off the failed `$` reports the companion infer error.
 fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
-    if !matches!(&ctx.node(id).kind, NodeKind::GetNode(_)) {
-        return;
-    }
+    // The context-error glyph below follows the access form: `$Node` prints '$', `%Unique` prints
+    // '%' (analyzer.cpp:3869/3875 — `p_get_node->use_dollar ? '$' : '%'`).
+    let glyph = match &ctx.node(id).kind {
+        NodeKind::GetNode(n) => {
+            if n.use_dollar {
+                '$'
+            } else {
+                '%'
+            }
+        }
+        _ => return,
+    };
     // WP-P10: get_node shorthand context restrictions (analyzer.cpp's `reduce_get_node` —
     // ~4870-4895). Two errors fire when `$Node` or `%Unique` is used in an inappropriate
     // context — both must be checked here because Godot's parser doesn't carry the
     // enclosing-class / enclosing-function shape that determines validity.
     //
     // (a) In a static function (no `self`): `Cannot use shorthand "get_node()" notation
-    //     ("$") in a static function.`
+    //     ("$"/"%") in a static function.`
     // (b) In a class that isn't Node-derived: `Cannot use shorthand "get_node()" notation
-    //     ("$") on a class that isn't a node.`
+    //     ("$"/"%") on a class that isn't a node.`
     //
     // Godot checks the enclosing class's native ancestor against "Node" — gdls uses the
     // `nearest_native_ancestor` helper (shared with WP-N5a's @onready / @export-of-Node walk).
@@ -6087,7 +6096,9 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
         .unwrap_or(false);
     if in_static_function {
         ctx.push_error(
-            r#"Cannot use shorthand "get_node()" notation ("$") in a static function."#,
+            format!(
+                r#"Cannot use shorthand "get_node()" notation ("{glyph}") in a static function."#
+            ),
             id,
         );
     }
@@ -6098,7 +6109,9 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
         .is_some_and(|native| !ctx.native.is_subclass_of_named(&native, "Node"));
     if in_non_node_class {
         ctx.push_error(
-            r#"Cannot use shorthand "get_node()" notation ("$") on a class that isn't a node."#,
+            format!(
+                r#"Cannot use shorthand "get_node()" notation ("{glyph}") on a class that isn't a node."#
+            ),
             id,
         );
     }
