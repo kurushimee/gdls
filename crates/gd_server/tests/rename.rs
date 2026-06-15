@@ -1516,3 +1516,24 @@ fn rename_lambda_parameter_does_not_capture_outer_same_named() {
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_outer_local_captured_in_nested_lambda_edits_all_occurrences() {
+    // A capture two lambda levels deep: the occurrence-scan bound must still resolve to the OUTERMOST
+    // declaring function (`f`), never either lambda — otherwise the outer use dangles. Click the
+    // deeply-nested capture; the decl + the outer use + the deep capture must all be renamed.
+    //   line 2 `\tvar c = 1`                                  → decl `c` at col 5
+    //   line 3 `\tvar g = func(): var h = func(): return c`   → capture `c` at col 40
+    //   line 4 `\tprint(c)`                                   → use  `c` at col 7
+    let src = "extends Node\nfunc f() -> void:\n\tvar c = 1\n\tvar g = func(): var h = func(): return c\n\tprint(c)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the deepest capture (line 3, col 40). Rename → `renamed`.
+    let sites = rename_sites(&client, 96, &main_uri, 3, 40, "renamed");
+    assert_eq!(
+        sites,
+        vec![(2, 5), (3, 40), (4, 7)],
+        "a capture nested two lambdas deep must edit the decl + outer use + the deep capture, \
+         scoping to the outermost function; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
