@@ -624,3 +624,73 @@ fn minimal_client_gets_well_formed_downgrade() {
 
     shutdown(&client, server_thread);
 }
+
+// ===================================================================================================
+// #113 — inner-class method signature (class_path walk, not root-only lookup).
+// ===================================================================================================
+
+/// #113: a call to an INNER-class method that name-collides with a root-class method must render the
+/// INNER signature, not the root one. `script_method_sig` previously did a root-only member lookup;
+/// it now resolves the callee through the analyzer's `CalleeTarget` (the call binding's inner-class
+/// `class_path`, as inlayHint does) and walks that chain — the base value's `ScriptRef` does not
+/// carry it. Reproduce-first: before the fix, `x.process(1, 2)` (x an `Inner` instance) showed the
+/// root `process(a)`.
+#[test]
+fn inner_class_method_signature_uses_inner_not_root() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/holder.gd"));
+    let src = "class_name Holder\nextends Node2D\n\n\
+               func process(a: int) -> void:\n\tpass\n\n\
+               class Inner:\n\tfunc process(a: int, extra: int) -> void:\n\t\tpass\n\n\
+               func use_inner() -> void:\n\tvar x := Inner.new()\n\tx.process(1, 2)\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\tx.process(1, 2)` is line 12 (0-based); cursor in arg 0 = tab(1) + "x.process(".len()(10) = 11.
+    let h = sig(&client, 30, &uri, Position::new(12, 11));
+    let info = &h.signatures[0];
+    let params = info.parameters.as_ref().expect("inner method parameters");
+    assert_eq!(
+        params.len(),
+        2,
+        "inner Inner.process(a, extra) has 2 params; got label {:?}",
+        info.label
+    );
+    assert!(
+        info.label.contains("extra"),
+        "the inner signature (param `extra`) must be shown, not the root process(a); got {:?}",
+        info.label
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Regression guard: a ROOT-class method call still resolves to the root signature (empty
+/// `class_path` → root member lookup, unchanged) — the inner walk must not pull the inner method.
+#[test]
+fn root_class_method_signature_unaffected_by_inner_walk() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/holder2.gd"));
+    let src = "class_name Holder2\nextends Node2D\n\n\
+               func process(a: int) -> void:\n\tpass\n\n\
+               class Inner:\n\tfunc process(a: int, extra: int) -> void:\n\t\tpass\n\n\
+               func use_root() -> void:\n\tvar r: Holder2 = Holder2.new()\n\tr.process(\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\tr.process(` is line 12 (0-based); column = tab(1) + "r.process(".len()(10) = 11.
+    let h = sig(&client, 31, &uri, Position::new(12, 11));
+    let info = &h.signatures[0];
+    let params = info.parameters.as_ref().expect("root method parameters");
+    assert_eq!(
+        params.len(),
+        1,
+        "root process(a) has 1 param; got label {:?}",
+        info.label
+    );
+    assert!(
+        !info.label.contains("extra"),
+        "the root signature must not pull the inner method's `extra` param; got {:?}",
+        info.label
+    );
+
+    shutdown(&client, server_thread);
+}

@@ -36,7 +36,7 @@ use lsp_types::{
     SignatureHelpParams, SignatureInformation,
 };
 
-use gd_analyze::{AnalysisResult, DataType, DtKind};
+use gd_analyze::{AnalysisResult, Binding, CalleeTarget, DataType, DtKind};
 use gd_syntax::ast::{NodeKind, ParseTree};
 use gd_syntax::token::{Token, TokenKind};
 
@@ -224,7 +224,9 @@ fn resolve_signatures(
                 }
             }
         }
-        return resolve_attribute_call(state, tree, analyzed, text, tokens, dot_idx, &name);
+        return resolve_attribute_call(
+            state, tree, analyzed, text, tokens, dot_idx, open_idx, &name,
+        );
     }
     resolve_bare_call(state, text, fid, &name)
 }
@@ -249,6 +251,7 @@ fn callee_token_name(callee: &Token) -> Option<String> {
 /// `base.method(` — resolve `base`'s type from the analysis and look up `method` on it. A `new` on a
 /// type base routes to the class `_init` (the constructor). The base expression is the typed node
 /// whose span ends at the dot (`smallest_typed_ending_at`, the completion ATTRIBUTE convention).
+#[allow(clippy::too_many_arguments)] // the resolved call-site (tree + tokens + analysis + dot/open idx)
 fn resolve_attribute_call(
     state: &ServerState,
     tree: &ParseTree,
@@ -256,6 +259,7 @@ fn resolve_attribute_call(
     text: &str,
     tokens: &[Token],
     dot_idx: usize,
+    open_idx: usize,
     method: &str,
 ) -> Option<Vec<Sig>> {
     let analyzed = analyzed?;
@@ -276,12 +280,48 @@ fn resolve_attribute_call(
                 // `ScriptInstance.new(` is unusual but valid; resolve the chain's `_init`.
                 return script_init_sig(state, text, sr.file);
             }
-            script_method_sig(state, text, sr.file, method)
+            // Prefer the analyzer's resolved callee for THIS call: it carries the inner-class
+            // `class_path` precisely, which the base VALUE's `ScriptRef` does not (an inner-class
+            // instance is stored on the value node as the root class — #113). Fall back to the base
+            // value's own (file, inner) when no Script call binding was recorded for this paren.
+            if let Some(CalleeTarget::Script { file, class_path }) =
+                call_target_at_open_paren(analyzed, tokens[open_idx].span.start)
+            {
+                if let Some(sig) = script_method_sig(state, text, file, &class_path, method) {
+                    return Some(sig);
+                }
+            }
+            script_method_sig(state, text, sr.file, &sr.inner, method)
         }
         // A `Class.new(` where the base is a *meta* type the analyzer left as a script/native ref is
         // handled by the meta-base name path in `resolve_bare_call`; nothing else resolves here.
         _ => None,
     }
+}
+
+/// The [`CalleeTarget`] the analyzer resolved for the call whose `(` is at `open_paren_byte`. Unlike
+/// inlayHint's exact whole-span match, signatureHelp fires MID-call — often an incomplete call whose
+/// recorded `Binding::Call.call_site` ends right AT the `(` — so match the INNERMOST call binding that
+/// BRACKETS the open paren (`call_site.start < open_paren_byte <= call_site.end`). This carries the
+/// inner-class `class_path` that the base value's `ScriptRef` does not (#113); `None` when the call
+/// isn't analyzer-resolved (the caller then falls back to the base value's own type).
+fn call_target_at_open_paren(
+    analysis: &AnalysisResult,
+    open_paren_byte: usize,
+) -> Option<CalleeTarget> {
+    analysis
+        .bindings()
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Call {
+                call_site, callee, ..
+            } if call_site.start < open_paren_byte && open_paren_byte <= call_site.end => {
+                Some((call_site.start, callee))
+            }
+            _ => None,
+        })
+        .max_by_key(|(start, _)| *start)
+        .map(|(_, callee)| callee.clone())
 }
 
 /// A bare `name(` — a `@GlobalScope` utility, a builtin constructor (`Vector2(`), or a method on the
@@ -353,7 +393,7 @@ fn resolve_self_method(
                 .iter()
                 .any(|m| m.name == name && m.kind == gd_project::MemberKind::Func)
             {
-                return script_method_sig(state, text, *f, name);
+                return script_method_sig(state, text, *f, &[], name);
             }
         }
     }
@@ -409,18 +449,32 @@ fn builtin_constructor_sig(state: &ServerState, name: &str) -> Option<Vec<Sig>> 
 // Script signature sourcing — from the DECLARING file's parse tree (names + types + defaults).
 // ===================================================================================================
 
-/// The signature of a project-script method `name` declared in file `fid`, built from that file's
-/// **parse tree** so parameter names, written types, AND default-value expressions are real (the
-/// cross-file [`gd_project::Interface`] has names + types but not defaults — see the module docs).
-/// The `FunctionNode` is pinpointed by the interface member's `name_span` (never a name-only walk).
+/// The signature of a project-script method `name` declared in file `fid` under `class_path` (the
+/// analyzer's inner-class chain for the callee — empty = the file's root class), built from that
+/// file's **parse tree** so parameter names, written types, AND default-value expressions are real
+/// (the cross-file [`gd_project::Interface`] has names + types but not defaults — see the module
+/// docs). The `FunctionNode` is pinpointed by the OWNING class's interface member `name_span` (never
+/// a name-only walk), so an inner method that name-collides with a root method is never confused for
+/// it — mirroring inlayHint's `script_parameter_names`.
 fn script_method_sig(
     state: &ServerState,
     text: &str,
     fid: gd_project::FileId,
+    class_path: &[String],
     name: &str,
 ) -> Option<Vec<Sig>> {
-    let iface = state.workspace.index.interface(fid)?;
-    let decl = iface
+    let root = state.workspace.index.interface(fid)?;
+    // Walk the inner-class chain to the OWNING class (each segment matches an inner class's
+    // `class_name`). An unresolvable segment → `None` (never fall through to the root and risk a
+    // same-named method's signature).
+    let mut owner = root;
+    for seg in class_path {
+        owner = owner
+            .inner
+            .iter()
+            .find(|c| c.class_name.as_deref() == Some(seg.as_str()))?;
+    }
+    let decl = owner
         .members
         .iter()
         .find(|m| m.name == name && m.kind == gd_project::MemberKind::Func)?;
@@ -448,7 +502,7 @@ fn script_method_sig(
 fn script_init_sig(state: &ServerState, text: &str, fid: gd_project::FileId) -> Option<Vec<Sig>> {
     // `_init` may be declared on the class itself or inherited; the head interface is the common
     // case (a constructor is rarely inherited as-is). Try the head file's `_init` first.
-    if let Some(sig) = script_method_sig(state, text, fid, "_init") {
+    if let Some(sig) = script_method_sig(state, text, fid, &[], "_init") {
         return Some(sig);
     }
     // No explicit `_init` — the implicit no-arg constructor.
