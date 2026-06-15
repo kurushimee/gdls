@@ -826,21 +826,39 @@ fn unsafe_property_access_silent_on_unresolvable_chain_root() {
 }
 
 #[test]
-fn unsafe_property_access_silent_on_builtin_and_deferred_node_bases() {
+fn unsafe_property_access_silent_on_builtin_base() {
     // Builtin instance miss: upstream's `valid = kind != BUILTIN` excludes builtins from the
-    // warning. `$Node` miss: the deferred-node type is deliberately permissive (docs/02 §11).
+    // warning (a builtin's member surface is closed, but Godot still declines the warning here).
     let src = "extends Node\n\
                func f() -> void:\n\
                \tvar v: Vector2\n\
                \tvar a = v.nope\n\
-               \tvar b = $Child.anything\n\
-               \tprint_debug([a, b])\n";
+               \tprint_debug(a)\n";
     let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
     let got = warnings_with_lines_in(src, &policy, &member_native());
     assert!(
         !got.iter()
             .any(|(c, _)| *c == WarningCode::UnsafePropertyAccess),
-        "builtin/deferred-node bases never warn, got {got:?}"
+        "a builtin base never warns, got {got:?}"
+    );
+}
+
+#[test]
+fn unsafe_property_access_fires_on_dollar_node_miss() {
+    // M11 Phase 2 convergence (docs/02 §11): `$Child` types as bare `NATIVE Node`
+    // (analyzer.cpp:3882-3886), so a member miss on it raises UNSAFE_PROPERTY_ACCESS exactly like
+    // any other typed node base — `anything` is not on `Node`. (Pre-M11 the permissive deferred-node
+    // type silenced this; that was a deliberate deviation, now removed to match Godot.)
+    let src = "extends Node\n\
+               func f() -> void:\n\
+               \tvar b = $Child.anything\n\
+               \tprint_debug(b)\n";
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &member_native());
+    assert!(
+        got.iter()
+            .any(|(c, line)| *c == WarningCode::UnsafePropertyAccess && *line == 3),
+        "a `$Child` member miss fires UNSAFE_PROPERTY_ACCESS on the bare-Node base, got {got:?}"
     );
 }
 
@@ -872,5 +890,163 @@ fn native_property_called_as_function_keeps_upstream_error() {
             .iter()
             .any(|m| m.contains(r#"Name "mode" called as a function"#)),
         "got: {errors:?}"
+    );
+}
+
+// --- M11 Phase 2: bare-`Node` `$`/`%` typing — the convergence battery ------------------------
+//
+// `reduce_get_node` types a valid `$`/`%` access as a hard `NATIVE Node` (analyzer.cpp:3882-3886),
+// derived from the enclosing class/function ALONE — it does NOT read the scene (`scene_node_facts`
+// stays dormant), so these cases reproduce the real `$x` type under `NoCrossFile` with no scene
+// fixture. Each assertion was confirmed against the real Godot 4.6.3 binary. The DB gives `Node` a
+// member surface (`get_parent`/`add_child` methods, a `name` property) and a sibling subtype
+// `Control` so a `Node` → `Control` downcast is a genuine cross-hierarchy move Godot tolerates.
+
+/// `Object ← Node ← CanvasItem ← {Node2D, Control}`. `Node` carries one property (`name`) and two
+/// methods (`get_parent` returning `Node`, `add_child(Node)`), enough to exercise valid-vs-miss
+/// member access and a typed-arg call on the bare-`Node` `$`/`%` type.
+fn scene_node_native() -> NativeDb {
+    NativeDb::from_json(
+        r#"{
+            "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+            "classes": [
+                {"name": "Object"},
+                {"name": "Node", "inherits": "Object",
+                 "properties": [{"name": "name", "type": "StringName", "setter": "set_name", "getter": "get_name"}],
+                 "methods": [
+                    {"name": "get_parent", "is_const": true, "is_static": false, "is_vararg": false,
+                     "is_virtual": false, "hash": 1, "return_value": {"type": "Node"}, "arguments": []},
+                    {"name": "add_child", "is_const": false, "is_static": false, "is_vararg": false,
+                     "is_virtual": false, "hash": 2, "return_value": {"type": "void"},
+                     "arguments": [{"name": "node", "type": "Node"}]}
+                 ]},
+                {"name": "CanvasItem", "inherits": "Node"},
+                {"name": "Node2D", "inherits": "CanvasItem"},
+                {"name": "Control", "inherits": "CanvasItem"}
+            ]
+        }"#,
+    )
+    .expect("valid scene-node dump")
+}
+
+#[test]
+fn dollar_property_read_miss_fires_unsafe_property_access() {
+    // `$x.<property read miss>` → UNSAFE_PROPERTY_ACCESS (bare `Node` has no `bogus`).
+    let src = "extends Node\nfunc f() -> void:\n\tvar v = $Child.bogus\n\tprint_debug(v)\n";
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &scene_node_native());
+    assert!(
+        got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafePropertyAccess),
+        "a `$Child` property-read miss must fire UNSAFE_PROPERTY_ACCESS, got {got:?}"
+    );
+}
+
+#[test]
+fn dollar_property_write_miss_fires_unsafe_property_access() {
+    // `$x.<property write miss>` (`$x.bogus = 5`) → UNSAFE_PROPERTY_ACCESS. The assignment-LHS
+    // subscript reduction must reach the same unsafe-property site as a read.
+    let src = "extends Node\nfunc f() -> void:\n\t$Child.bogus = 5\n";
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &scene_node_native());
+    assert!(
+        got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafePropertyAccess),
+        "a `$Child` property-write miss must fire UNSAFE_PROPERTY_ACCESS, got {got:?}"
+    );
+}
+
+#[test]
+#[ignore = "blocked on #123: UNSAFE_METHOD_ACCESS under-emits on native-base method misses \
+            (it only fires for the untyped-param Variant shape) — a general M3 analyzer gap, NOT \
+            $-specific (a plain `var n: Node; n.miss()` is silent too). Godot fires it here \
+            (analyzer.cpp:3741). Assertion is the correct convergence target, ignored until #123."]
+fn dollar_method_miss_fires_unsafe_method_access() {
+    // `$x.<method miss>()` → UNSAFE_METHOD_ACCESS (`Node` has no `bogus_method`). Godot
+    // (analyzer.cpp:3741) warns on a non-self, non-builtin-hard base miss; bare `Node` qualifies.
+    let src = "extends Node\nfunc f() -> void:\n\t$Child.bogus_method()\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &scene_node_native());
+    assert!(
+        got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "a `$Child` method miss must fire UNSAFE_METHOD_ACCESS, got {got:?}"
+    );
+}
+
+#[test]
+fn dollar_valid_node_method_is_silent() {
+    // `$x.get_parent()` (a real `Node` method) → silent under both unsafe-access warnings enabled.
+    let src = "extends Node\nfunc f() -> void:\n\tvar p = $Child.get_parent()\n\tprint_debug(p)\n";
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS", "UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &scene_node_native());
+    assert!(
+        !got.iter().any(|(c, _)| matches!(
+            c,
+            WarningCode::UnsafePropertyAccess | WarningCode::UnsafeMethodAccess
+        )),
+        "a valid `Node` method call on `$Child` must be silent, got {got:?}"
+    );
+}
+
+#[test]
+fn dollar_walrus_infers_node_no_inference_on_variant() {
+    // `var y := $Child` must infer a hard `Node` (the bare-Node type), NOT trip
+    // INFERENCE_ON_VARIANT — an error-by-default warning. The old permissive `Variant` seam was
+    // specifically tuned to dodge this; bare `Node` is a hard type, so `:=` infers it cleanly.
+    let src = "extends Node\nfunc f() -> void:\n\tvar y := $Child\n\tprint_debug(y)\n\tvar z := get_node(^\"Child\")\n\tprint_debug(z)\n";
+    let policy = policy_enabling(&["INFERENCE_ON_VARIANT"]);
+    let got = warnings_with_lines_in(src, &policy, &scene_node_native());
+    assert!(
+        !got.iter().any(|(c, _)| *c == WarningCode::InferenceOnVariant),
+        "`var y := $Child` / `:= get_node(...)` must infer a hard Node, not fire INFERENCE_ON_VARIANT, got {got:?}"
+    );
+}
+
+#[test]
+fn dollar_sibling_downcast_assignment_is_silent() {
+    // `var c: Control = $x` → SILENT: Godot tolerates the `Node` → `Control` downcast (gradual
+    // typing, an unsafe assignment, not an error). A precise scene type would reject this sibling
+    // downcast — the false positive this whole design avoids. Asserts NO assignment ERROR.
+    let src = "extends Node\nfunc f() -> void:\n\tvar c: Control = $Child\n\tprint_debug(c)\n";
+    let errors = errors_in(src, &scene_node_native());
+    assert!(
+        !errors.iter().any(|m| m.contains("Cannot assign")),
+        "a `Node` → `Control` downcast from `$Child` must NOT error (Godot tolerates it), got {errors:?}"
+    );
+}
+
+#[test]
+fn dollar_cast_is_silent() {
+    // `$x as Control` → silent: with `$x` a hard `Node` (not Variant), the operand is no longer the
+    // Variant/soft case that fires UNSAFE_CAST, and `Node as Control` is a valid downcast.
+    let src = "extends Node\nfunc f() -> void:\n\tvar c = $Child as Control\n\tprint_debug(c)\n";
+    let policy = policy_enabling(&["UNSAFE_CAST"]);
+    let got = warnings_with_lines_in(src, &policy, &scene_node_native());
+    assert!(
+        !got.iter().any(|(c, _)| *c == WarningCode::UnsafeCast),
+        "`$Child as Control` must be silent (the operand is a hard `Node`, not Variant), got {got:?}"
+    );
+    assert!(
+        errors_in(src, &scene_node_native()).is_empty(),
+        "`$Child as Control` is a valid downcast — no cast error"
+    );
+}
+
+#[test]
+fn dollar_typed_arg_pass_fires_unsafe_call_argument() {
+    // `wants($x)` where `wants(p: Control)` → UNSAFE_CALL_ARGUMENT: a bare `Node` (supertype) is
+    // passed where a `Control` (subtype) is required — Godot's unsafe-downcast-argument warning.
+    let src = "extends Node\n\
+               func wants(_c: Control) -> void:\n\
+               \tpass\n\
+               func f() -> void:\n\
+               \twants($Child)\n";
+    let policy = policy_enabling(&["UNSAFE_CALL_ARGUMENT"]);
+    let got = warnings_with_lines_in(src, &policy, &scene_node_native());
+    assert!(
+        got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeCallArgument),
+        "passing bare-`Node` `$Child` to a `Control` parameter must fire UNSAFE_CALL_ARGUMENT, got {got:?}"
     );
 }

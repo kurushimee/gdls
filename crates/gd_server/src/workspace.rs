@@ -129,9 +129,10 @@ pub struct Workspace {
     pub(crate) stat_table: FxHashMap<Utf8PathBuf, FileStat>,
     /// M11 (#76): the project's `.tscn` scene index — node/script/instance relations, keyed by
     /// `res://` path. Built parallel to [`Self::index`] (scenes aren't `FileId`s; see
-    /// [`gd_project::SceneIndex`]). Persisted/restored via the same warm-start cache. **Phase 1:**
-    /// nothing consumes it yet — `$`/`%` typing stays the permissive `gd_analyze` deferred-node
-    /// seam; this field is the foundation Phase 2 scene typing reads.
+    /// [`gd_project::SceneIndex`]). Persisted/restored via the same warm-start cache. The diagnostic
+    /// path does NOT read it — a valid `$`/`%` types as bare `NATIVE Node` (faithful to Godot),
+    /// scene-independent; this field is the dormant substrate a phase-3 precise hover/completion
+    /// feature reads (through [`crate::xfile::WorkspaceXFileQuery::scene_node_facts`]).
     pub(crate) scenes: SceneIndex,
 }
 
@@ -493,6 +494,8 @@ impl Workspace {
                         &self.native,
                         &self.analysis_cache,
                         autoload_map,
+                        &self.scenes,
+                        &self.project.root,
                     );
                     Rc::new(gd_analyze::analyze_with_options(
                         tree,
@@ -582,6 +585,8 @@ impl Workspace {
             &self.native,
             &self.analysis_cache,
             autoload_map,
+            &self.scenes,
+            &self.project.root,
         );
         gd_analyze::analyze_with_options(
             tree,

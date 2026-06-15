@@ -167,24 +167,61 @@ kept WP-R2's cross-file cycle detection inert in `SyntacticQuery` until M4, when
 analysis cache to make the diagnostic live in the LSP (see `03-indexing-freshness.md §5` and §7.5
 for the inline-on-`AnalysisResult` design).
 
-## 11. `$Node` / `%Unique` typing — v1 policy (deliberate deviation)
+## 11. `$Node` / `%Unique` typing — bare `Node` (faithful); precise scene types are navigation-only
 
-Godot's editor types `$Path` / `%Name` by reading the **`.tscn`** the script is attached to. v1 does **not**
-parse scenes (Phase 2), so:
+**Godot's frontend analyzer does NOT read the scene to type `$`/`%`.** `GDScriptAnalyzer::reduce_get_node`
+(`gdscript_analyzer.cpp:3882-3886`, verified at `4.6.3-stable`) types every `$Path` / `%Name` as a hard
+`NATIVE` **`Node`** (`ANNOTATED_EXPLICIT`, `native_type = "Node"`, builtin `OBJECT`) — the precise per-node
+type the *editor* surfaces in completion/hover comes from a **separate** mechanism, not the type the analyzer
+assigns. Because the analyzer's `$` type is a bare `Node`, an assignment/argument to any **Node-derived
+subtype or sibling** is an *unsafe downcast*, which Godot **tolerates** (the `UNSAFE_*` warnings are `Ignore`
+by default) — e.g. `var c: Control = $Health` and `wants($Health)` (with `func wants(c: Control)`) both pass
+with no error even when `$Health` is a `Node2D`.
 
-- `$NodePath` and `%UniqueName` expressions yield a **permissive deferred-node type**:
-  - **Assignable to any explicitly-typed `Node`-derived variable without error.** Example that must NOT
-    error in v1: `var enemy: Node3D = $Enemy`.
-  - **Dynamic on member/method access** (no "unknown member" errors).
-- This is a **conscious, documented deviation** from Godot's exact behavior, chosen so the tool **never emits
-  a false positive** on node access before scene typing exists.
-- Implementation: `gd_analyze::DataType::deferred_node` (`is_pseudo_type = true`, `native_type = "Node"`,
-  `is_read_only = true`). Member-access reduction routes through the pseudo-type guard and yields
-  `Variant` rather than emitting unknown-member errors.
-- **Phase 2 (M11)** replaces this with precise scene-derived typing (parse the attached `.tscn`, map node
-  names → node types → instanced-scene `class_name`s), at which point `$`/`%` diagnostics converge with
-  Godot — while unresolvable paths stay permissive, preserving the no-false-positive guarantee. See
-  `09-phase-2.md` §6-M11 and `07-milestones-risks.md`.
+**gdls types a valid `$`/`%` as bare `NATIVE Node`** (`gd_analyze::reduce_get_node`), matching Godot
+function-for-function. The convergence behaviours, each confirmed against the real 4.6.3 binary:
+
+- A member miss raises `UNSAFE_PROPERTY_ACCESS` (`$x.bogus`, read or write) — the same as any typed `Node`
+  base. (`UNSAFE_METHOD_ACCESS` on a method miss is the matching expectation; gdls currently under-emits it on
+  *every* native-base method miss — a general analyzer gap tracked separately, not `$`-specific.)
+- A valid `Node` method (`$x.get_parent()`) is silent.
+- A sibling/subtype downcast (`var c: Control = $x`, `$x as Control`) is **silent** — the unsafe downcast
+  Godot tolerates.
+- `wants($x)` where `func wants(p: Control)` raises `UNSAFE_CALL_ARGUMENT` (bare `Node` supertype passed where
+  a `Control` subtype is required).
+
+**Why precise scene types are NOT in the diagnostic path.** Resolving `$Path` to the node's precise `.tscn`
+type (e.g. `Node2D`, or a node's attached-script Script instance) and feeding it to the analyzer would turn
+those Godot-tolerated **sibling downcasts into false-positive errors** (`var c: Control = $Health` → "Cannot
+assign a value of type Node2D…"; `$Health as Control` → "Invalid cast…" — diagnostics Godot does NOT emit). A
+`DataType` is used **symmetrically** in compatibility checks, so there is no "precise for navigation, bare
+`Node` for assignment" without **decoupling the navigation type from the compatibility type** — a separate,
+larger effort. Precise scene-derived node types are therefore a **navigation-only goal** (precise
+hover/completion, phase 3), explicitly kept OUT of the diagnostic path.
+
+**Dormant substrate kept for that phase-3 navigation feature** (built + unit-tested, NOT consulted by
+`reduce_get_node` or any diagnostic):
+
+- `gd_analyze::CrossFileQuery::scene_node_facts` — a project-FACT seam (returns a `SceneNodeFacts`: a native
+  class name or an attached-script `FileId`, never a `DataType`). **Default impl returns `None`**; overridden
+  only by `gd_server`'s `WorkspaceXFileQuery` over the project `SceneIndex`, resolving conservatively (any
+  uncertainty / cross-scene disagreement → `None`; script-first when a node carries both `type=` and
+  `script=`; instanced sub-scenes walked through the index's own parsed scenes). A wrong navigation result is
+  a defect, so resolution fails closed.
+- `gd_project::SceneIndex::resolve_relative_from` / `resolve_unique_in` — the index-backed node-path
+  resolution (relative path from the attachment node; owner-scoped unique name; instanced-sub-scene
+  recursion). `join_node_path` returns `None` on a `..` that escapes above the scene root (no spurious match
+  on a root child).
+
+A `.tscn` edit keeps the **scene index** live (`reindex_scene` / `remove_scene`) but does NOT re-diagnose the
+scene's attached scripts: a `$`/`%` type is scene-independent (bare `Node` from the enclosing class alone), so
+re-publishing would be byte-identical churn, and precise navigation types are pull-based. (A scene→script
+re-diagnose trigger would only earn its keep if a *scene-dependent* diagnostic type ever landed — which the
+bare-`Node` design specifically avoids.)
+
+The **static-function / non-Node-class** `$`/`%` context errors (`reduce_get_node`'s two `push_error`s) fire
+exactly as Godot does; on either, the result is the default `VARIANT`/`UNDETECTED` (so a `:=` infer off the
+failed `$` reports its companion infer error), matching `gdscript_analyzer.cpp:3870`/`:3876`.
 
 ## 11b. Native-surface provenance gating (deliberate deviation, v1.0.2)
 

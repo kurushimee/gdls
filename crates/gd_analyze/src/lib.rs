@@ -41,7 +41,7 @@ pub use binding::{
 };
 pub use cancellation::CancellationToken;
 pub use context::{AnalysisContext, AnalysisResult};
-pub use cross_file::{CrossFileQuery, NoCrossFile, SyntacticQuery};
+pub use cross_file::{CrossFileQuery, NoCrossFile, NodePathQuery, SceneNodeFacts, SyntacticQuery};
 pub use data_type::{DataType, DtKind, MethodSig, ScriptRef, TypeSource, VariantType};
 pub use diagnostic::{Diagnostic, DiagnosticSink, RelatedInfo, Severity};
 pub use foldtable::{FoldTable, FoldedValue, UtilityCallableId, UtilityScope};

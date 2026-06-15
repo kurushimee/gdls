@@ -6,9 +6,10 @@
 //! *node tree shape* a `.gd` script sees through `$Node` / `%Unique` / `get_node()` — node names,
 //! their types, the script attached to each node, and which sub-scenes are instanced where.
 //!
-//! **Scope (M11 Phase 1).** This module owns parsing + an on-[`Scene`] query API. It does NOT feed
-//! the analyzer — `$`/`%` typing stays the permissive [`gd_analyze`] deferred-node seam until Phase
-//! 2 plugs this index in. The parser is the foundation; correctness on realistic input is the bar.
+//! **Scope.** This module owns parsing + an on-[`Scene`] query API. It does NOT feed the analyzer's
+//! diagnostic path — a valid `$`/`%` types as bare `NATIVE Node` ([`gd_analyze`], faithful to Godot),
+//! independent of the scene. This index is the dormant substrate for a phase-3 precise
+//! hover/completion feature. The parser is the foundation; correctness on realistic input is the bar.
 //!
 //! **Never crash, never lie** (`CLAUDE.md`). [`parse_scene`] returns a (possibly partial) [`Scene`]
 //! for *any* input — malformed, truncated, binary garbage — and never panics. Unknown sections and

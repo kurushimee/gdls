@@ -25,8 +25,11 @@
 //! [`WorkspaceXFileQuery::member_initializer_xrefs`] enforces the latter so a stale cross-file
 //! cycle diagnostic can never be served (trading it for a possibly-missing one).
 
-use gd_analyze::{AnalysisResult, CrossFileQuery, MemberXref, SyntacticQuery};
-use gd_project::{FileId, Index, Interface};
+use camino::Utf8Path;
+use gd_analyze::{
+    AnalysisResult, CrossFileQuery, MemberXref, NodePathQuery, SceneNodeFacts, SyntacticQuery,
+};
+use gd_project::{FileId, Index, Interface, ResolvedRoot, SceneIndex};
 use gd_types::NativeDb;
 use lru::LruCache;
 use rustc_hash::FxHashMap;
@@ -55,6 +58,14 @@ pub struct WorkspaceXFileQuery<'a> {
     /// current index snapshot. Non-script autoloads and autoloads whose script has not been
     /// indexed yet are silently skipped — the resolver degrades gracefully to Variant for those.
     autoloads: FxHashMap<String, FileId>,
+    /// The project's parsed scene index (M11 Phase 2), used by [`Self::scene_node_facts`] to resolve
+    /// `$`/`%` accesses precisely. Borrowed from `Workspace.scenes`.
+    scenes: &'a SceneIndex,
+    /// The project root, normalized the same way the index normalizes its paths, so a `FileId`'s
+    /// index path strips cleanly to its `res://` form (`path_to_res`) for the scene reverse-map
+    /// lookup. Held by value (a cheap clone of `Workspace.project.root`) so the query owns a
+    /// consistent root for the duration of one analysis.
+    project_root: camino::Utf8PathBuf,
 }
 
 impl<'a> WorkspaceXFileQuery<'a> {
@@ -63,13 +74,74 @@ impl<'a> WorkspaceXFileQuery<'a> {
         native: &'a NativeDb,
         analysis_cache: &'a LruCache<CanonicalKey, CacheEntry<AnalysisResult>>,
         autoloads: FxHashMap<String, FileId>,
+        scenes: &'a SceneIndex,
+        project_root: &Utf8Path,
     ) -> Self {
         WorkspaceXFileQuery {
             inner: SyntacticQuery::new(index, native),
             index,
             analysis_cache,
             autoloads,
+            scenes,
+            project_root: gd_project::normalize_path(project_root),
         }
+    }
+
+    /// Resolve `query` against ONE scene `scene_res` that attaches `script_res`, returning the type
+    /// fact of the access target. Returns `None` (→ permissive at the caller) on any uncertainty:
+    ///
+    /// * the script attaches at MULTIPLE nodes in this scene (relative resolution is ambiguous —
+    ///   `$X` would resolve differently per attachment node);
+    /// * the target node / unique name doesn't resolve (absent, unresolved instance, cycle).
+    ///
+    /// `ResolvedRoot` is mapped script-first: an attached script wins over a native `type=` (a node
+    /// can carry both, and a navigation feature on `$Child.script_method()` should surface the
+    /// SCRIPT's members, the more precise type).
+    fn resolve_one_scene(
+        &self,
+        scene_res: &str,
+        script_res: &str,
+        query: &NodePathQuery,
+    ) -> Option<SceneNodeFacts> {
+        let scene = self.scenes.scene(scene_res)?;
+        // The attachment node: the node whose `script=` is THIS script. A relative `$X` is resolved
+        // against it. If the script is attached at more than one node in this scene, the relative
+        // base is ambiguous → refuse. (A unique-name query is owner-scoped and attachment-
+        // independent, but a multi-attach scene is still a degenerate shape we decline uniformly.)
+        let mut attachment_path: Option<&str> = None;
+        for node in &scene.nodes {
+            if node.script.as_deref() == Some(script_res) {
+                if attachment_path.is_some() {
+                    return None; // multiple attachment nodes — ambiguous
+                }
+                attachment_path = Some(&node.path);
+            }
+        }
+        let attachment_path = attachment_path?;
+
+        let resolved: ResolvedRoot = match query {
+            NodePathQuery::RelativePath(rel) => {
+                self.scenes
+                    .resolve_relative_from(scene_res, attachment_path, rel)?
+            }
+            NodePathQuery::UniqueName(name) => self.scenes.resolve_unique_in(scene_res, name)?,
+        };
+        self.resolved_root_to_facts(resolved)
+    }
+
+    /// Map a [`ResolvedRoot`] to a [`SceneNodeFacts`], SCRIPT-FIRST. An attached GDScript (resolvable
+    /// to an indexed `FileId`) takes precedence over a native `type=`; a script that doesn't resolve
+    /// to an indexed file falls back to the native type; a node with neither yields `None`
+    /// (permissive — we know nothing precise to say).
+    fn resolved_root_to_facts(&self, resolved: ResolvedRoot) -> Option<SceneNodeFacts> {
+        if let Some(script_res) = &resolved.script {
+            if let Some(fid) = self.inner.resolve_res_path(script_res) {
+                return Some(SceneNodeFacts::Script(fid));
+            }
+            // The script attached to the node isn't an indexed `.gd` (e.g. a `.cs`/`.gdshader`, or a
+            // path the index doesn't know): fall through to the native type rather than lying.
+        }
+        resolved.native_type.map(SceneNodeFacts::Native)
     }
 }
 
@@ -98,6 +170,45 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
 
     fn autoload_file(&self, name: &str) -> Option<FileId> {
         self.autoloads.get(name).copied()
+    }
+
+    /// Phase-3 navigation substrate (dormant; NOT consulted by the diagnostic path — `reduce_get_node`
+    /// types `$`/`%` as bare `Node`, see [`gd_analyze::CrossFileQuery::scene_node_facts`]). Resolves a
+    /// `$`/`%` access by `script_file` against the scene(s) it is attached to. CONSERVATIVE: returns
+    /// `Some` only when EVERY attaching scene resolves the access to the identical fact; any miss /
+    /// disagreement / unresolved instance yields `None` (a missed precise type is fine; a wrong one is
+    /// not). The gd_project [`SceneIndex`] does the graph walk (instanced sub-scenes through its own
+    /// parsed scenes); this method finds the attachment node, requires cross-scene agreement, and maps
+    /// the resolved root to the analyzer's fact type.
+    fn scene_node_facts(
+        &self,
+        script_file: FileId,
+        query: &NodePathQuery,
+    ) -> Option<SceneNodeFacts> {
+        // FileId → the script's `res://` path (the scene reverse-map key). The index path is already
+        // normalized; `path_to_res` string-strips the (normalized) project root.
+        let script_path = self.file_path(script_file)?;
+        let script_res = gd_project::path_to_res(&self.project_root, Utf8Path::new(script_path))?;
+
+        // Every scene that attaches this script. Resolve in each and require unanimous agreement —
+        // a script shared by two scenes that resolve `$X` to different types must stay permissive.
+        let mut agreed: Option<SceneNodeFacts> = None;
+        let mut any_scene = false;
+        for scene_res in self.scenes.scenes_attaching_script(&script_res) {
+            any_scene = true;
+            let facts = self.resolve_one_scene(scene_res, &script_res, query)?;
+            match &agreed {
+                None => agreed = Some(facts),
+                Some(prev) if *prev == facts => {}
+                Some(_) => return None, // disagreement across scenes — permissive
+            }
+        }
+        // No scene attaches this script → nothing to say (permissive). `agreed` is `Some` iff at
+        // least one scene resolved AND all that did agreed.
+        if !any_scene {
+            return None;
+        }
+        agreed
     }
 
     fn member_initializer_xrefs(&self, file: FileId, member: &str) -> Vec<MemberXref> {
@@ -214,8 +325,15 @@ mod tests {
         let mut cache = test_cache();
         cache.put(wire_key("file:///proj/b.gd"), entry(Rc::clone(&cached)));
 
-        let xfile =
-            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
+        let scenes = SceneIndex::default();
+        let xfile = WorkspaceXFileQuery::new(
+            &idx,
+            &native,
+            &cache,
+            rustc_hash::FxHashMap::default(),
+            &scenes,
+            Utf8Path::new("/proj"),
+        );
         let got = xfile.member_initializer_xrefs(b_fid, "V");
         assert_eq!(
             got,
@@ -238,8 +356,15 @@ mod tests {
         let native = NativeDb::empty();
         let cache = test_cache();
 
-        let xfile =
-            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
+        let scenes = SceneIndex::default();
+        let xfile = WorkspaceXFileQuery::new(
+            &idx,
+            &native,
+            &cache,
+            rustc_hash::FxHashMap::default(),
+            &scenes,
+            Utf8Path::new("/proj"),
+        );
         assert!(xfile.member_initializer_xrefs(fid, "anything").is_empty());
     }
 
@@ -279,8 +404,15 @@ mod tests {
         );
 
         let native = NativeDb::empty();
-        let xfile =
-            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
+        let scenes = SceneIndex::default();
+        let xfile = WorkspaceXFileQuery::new(
+            &idx,
+            &native,
+            &cache,
+            rustc_hash::FxHashMap::default(),
+            &scenes,
+            Utf8Path::new("/proj"),
+        );
         assert!(
             xfile.member_initializer_xrefs(b_fid, "V").is_empty(),
             "a dirty (stale) dependency must degrade to no-xrefs, not serve the cached entry"
@@ -310,8 +442,15 @@ mod tests {
             entry(Rc::clone(&cached)),
         );
 
-        let xfile =
-            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
+        let scenes = SceneIndex::default();
+        let xfile = WorkspaceXFileQuery::new(
+            &idx,
+            &native,
+            &cache,
+            rustc_hash::FxHashMap::default(),
+            &scenes,
+            Utf8Path::new("/proj"),
+        );
         let got = xfile.member_initializer_xrefs(b_fid, "V");
         assert_eq!(
             got,
@@ -334,8 +473,15 @@ mod tests {
         let native = NativeDb::empty();
         let cache = test_cache();
 
-        let xfile =
-            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
+        let scenes = SceneIndex::default();
+        let xfile = WorkspaceXFileQuery::new(
+            &idx,
+            &native,
+            &cache,
+            rustc_hash::FxHashMap::default(),
+            &scenes,
+            Utf8Path::new("/proj"),
+        );
         assert!(xfile.global_class_file("Hero").is_some());
         assert!(xfile.global_class_file("Nonexistent").is_none());
     }
@@ -372,8 +518,15 @@ mod tests {
 
         // Look up the oldest via the xfile reader → its xrefs come back, and recency must NOT
         // shift (otherwise the next pop_lru would target the wrong entry).
-        let xfile =
-            WorkspaceXFileQuery::new(&idx, &native, &cache, rustc_hash::FxHashMap::default());
+        let scenes = SceneIndex::default();
+        let xfile = WorkspaceXFileQuery::new(
+            &idx,
+            &native,
+            &cache,
+            rustc_hash::FxHashMap::default(),
+            &scenes,
+            Utf8Path::new("/proj"),
+        );
         let got = xfile.member_initializer_xrefs(oldest_fid, "V");
         assert_eq!(
             got,

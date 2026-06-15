@@ -14,15 +14,17 @@
 //! and rebuilt on [`SceneIndex::from_cache`]. So a warm-loaded scene index is identical to a
 //! cold-built one by construction.
 //!
-//! **Scope (M11 Phase 1).** Nothing consumes this yet — `$`/`%` typing stays the permissive
-//! `gd_analyze` deferred-node seam until Phase 2. This module builds the index + a query API on it.
+//! **Scope.** The diagnostic path does NOT consume this — a valid `$`/`%` types as bare `NATIVE
+//! Node` (`gd_analyze`, faithful to Godot), independent of the scene. This index + its node-path
+//! resolution are the dormant substrate for a phase-3 precise hover/completion feature; this module
+//! builds the index + a query API on it.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::scene::{self, Scene};
+use crate::scene::{self, NodeType, ResolvedRoot, Scene, SceneNode, MAX_INSTANCE_DEPTH};
 
 /// All parsed scenes in a project, keyed by normalized `res://` path, with the reverse relations a
 /// `.tscn` edit needs to invalidate the right scripts (directly and transitively through instanced
@@ -200,6 +202,90 @@ impl SceneIndex {
         scripts
     }
 
+    // --- Phase-2 node-path resolution -----------------------------------------------------------
+    //
+    // These resolve a `$RelPath` / `%UniqueName` access made by a script ATTACHED to a node in
+    // `scene_res` into the concrete [`ResolvedRoot`] (native class and/or attached script) of the
+    // target node, following instanced sub-scenes through the index's own parsed scenes (anti-catalog
+    // W16: parsed text only, never an engine instantiation). They are the gd_project half of M11
+    // Phase-2 scene typing — the analyzer's `CrossFileQuery::scene_node_facts` (in `gd_server`) maps
+    // the returned `ResolvedRoot` to the analyzer's fact type. Every uncertainty (missing scene,
+    // absent node, unresolvable instance, cycle/depth cap) degrades to `None` (stay permissive),
+    // never a wrong type — the no-false-positive bar.
+
+    /// Resolve `rel_path` (a root-relative `$A/B`-style path with NO leading `/` and NO `%`) as seen
+    /// by a script attached at `attachment_path` within `scene_res`. The access target's
+    /// root-relative path is `attachment_path` joined with `rel_path` (Godot resolves `$Rel` relative
+    /// to the node owning the script). `None` if the scene, the joined node, or the node's type chain
+    /// can't be resolved.
+    #[must_use]
+    pub fn resolve_relative_from(
+        &self,
+        scene_res: &str,
+        attachment_path: &str,
+        rel_path: &str,
+    ) -> Option<ResolvedRoot> {
+        let scene = self.scene(scene_res)?;
+        let target_path = join_node_path(attachment_path, rel_path)?;
+        let node = scene.node_at(&target_path)?;
+        self.resolve_node_root_via_index(node, &mut FxHashSet::default(), 0)
+    }
+
+    /// Resolve `%unique_name` (owner-scoped, single-segment) as seen by a script attached anywhere in
+    /// `scene_res`. Unique names are looked up in the scene's owner-wide table, not relative to the
+    /// attachment node. `None` if the scene has no such unique node or its type chain can't resolve.
+    #[must_use]
+    pub fn resolve_unique_in(&self, scene_res: &str, unique_name: &str) -> Option<ResolvedRoot> {
+        let scene = self.scene(scene_res)?;
+        let node = scene.node_by_unique_name(unique_name)?;
+        self.resolve_node_root_via_index(node, &mut FxHashSet::default(), 0)
+    }
+
+    /// Index-backed analogue of [`scene::resolve_node_root`](crate::scene): resolve one node's
+    /// contributed root, recursing through instanced sub-scenes by looking the PackedScene up in this
+    /// index (the parsed scene, no disk re-read), bounded by a `visited` cycle set and
+    /// [`MAX_INSTANCE_DEPTH`]. Mirrors the text-based resolver's three behaviours exactly: a Native
+    /// node yields its native type plus any local `script=`; an Instanced node recurses into the
+    /// sub-scene root with the instancing node's local `script=` overriding the packed root's script;
+    /// an unresolvable / typeless node yields just its local script.
+    fn resolve_node_root_via_index(
+        &self,
+        node: &SceneNode,
+        visited: &mut FxHashSet<String>,
+        depth: usize,
+    ) -> Option<ResolvedRoot> {
+        match &node.ty {
+            NodeType::Native(ty) => Some(ResolvedRoot {
+                native_type: Some(ty.clone()),
+                script: node.script.clone(),
+            }),
+            NodeType::Instanced(Some(sub_path)) => {
+                if depth >= MAX_INSTANCE_DEPTH {
+                    return None; // depth backstop — degrade, never recurse unbounded
+                }
+                let key = scene::normalize_res(sub_path);
+                // Insert BEFORE recursing so a self-/mutually-instancing graph terminates.
+                if !visited.insert(key.clone()) {
+                    return None; // cycle — already on the current resolution path
+                }
+                let sub = self.scenes.get(&key)?; // sub-scene not indexed → degrade
+                let sub_root = sub.root_node()?;
+                let local_script = node.script.clone();
+                let mut resolved =
+                    self.resolve_node_root_via_index(sub_root, visited, depth + 1)?;
+                // The local `script=` on the instancing node overrides the packed root's script.
+                if local_script.is_some() {
+                    resolved.script = local_script;
+                }
+                Some(resolved)
+            }
+            NodeType::Instanced(None) | NodeType::Unknown => Some(ResolvedRoot {
+                native_type: None,
+                script: node.script.clone(),
+            }),
+        }
+    }
+
     // --- Reverse-map maintenance ----------------------------------------------------------------
 
     /// Add `scene`'s attached-script and instanced-sub-scene reverse entries under key `scene_key`.
@@ -283,6 +369,32 @@ impl SceneIndex {
         }
         idx
     }
+}
+
+/// Join a node's root-relative `attachment` path with a `$rel` access path (no leading `/`, no `%`),
+/// resolving `.`/`..` segments lexically against the scene tree. Returns the target node's
+/// root-relative path, or `None` if a `..` would escape ABOVE the scene root (popping an empty
+/// stack): such a path names no node in the scene, and `None` is the safe permissive outcome (a
+/// resolved-but-escaped path string could spuriously match an unrelated node). An attachment of `""`
+/// is the scene root, so `join_node_path("", "A/B")` is `Some("A/B")`.
+fn join_node_path(attachment: &str, rel: &str) -> Option<String> {
+    let mut parts: Vec<&str> = if attachment.is_empty() {
+        Vec::new()
+    } else {
+        attachment.split('/').collect()
+    };
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                // A `..` above the root escapes the scene tree — refuse rather than silently
+                // resolving to a wrong (or root) node.
+                parts.pop()?;
+            }
+            s => parts.push(s),
+        }
+    }
+    Some(parts.join("/"))
 }
 
 /// Normalize a project-absolute path to its `res://` form for scene-index keys, given the project
@@ -431,6 +543,173 @@ script = ExtResource("1")
         assert!(closure.contains("res://b.tscn"));
         // Terminated with exactly the two scenes.
         assert_eq!(closure.len(), 2);
+    }
+
+    #[test]
+    fn resolve_relative_from_root_attachment() {
+        // main.gd is attached at the parent scene's ROOT (path ""). `$Sub` from the root resolves to
+        // the instanced child.tscn → child's Panel root + child.gd script (script wins).
+        let idx = build();
+        let r = idx
+            .resolve_relative_from("res://parent.tscn", "", "Sub")
+            .expect("Sub resolves through the instanced child scene");
+        assert_eq!(r.native_type.as_deref(), Some("Panel"));
+        assert_eq!(r.script.as_deref(), Some("res://child.gd"));
+    }
+
+    #[test]
+    fn resolve_relative_native_node() {
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://s.tscn",
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://s.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Node\"]\nscript = ExtResource(\"1\")\n\
+             [node name=\"Child\" type=\"Sprite2D\" parent=\".\"]\n",
+        );
+        let r = idx
+            .resolve_relative_from("res://s.tscn", "", "Child")
+            .unwrap();
+        assert_eq!(r.native_type.as_deref(), Some("Sprite2D"));
+        assert_eq!(r.script, None);
+    }
+
+    #[test]
+    fn resolve_unique_in_owner_scope() {
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://s.tscn",
+            "[gd_scene format=3]\n\
+             [node name=\"Root\" type=\"Node\"]\n\
+             [node name=\"Wrap\" type=\"Control\" parent=\".\"]\n\
+             [node name=\"Special\" type=\"Label\" parent=\"Wrap\"]\nunique_name_in_owner = true\n",
+        );
+        // `%Special` is owner-scoped: resolvable regardless of the attachment node's path.
+        let r = idx.resolve_unique_in("res://s.tscn", "Special").unwrap();
+        assert_eq!(r.native_type.as_deref(), Some("Label"));
+        // A non-unique name yields None.
+        assert!(idx.resolve_unique_in("res://s.tscn", "Wrap").is_none());
+    }
+
+    #[test]
+    fn resolve_relative_missing_node_is_none() {
+        let idx = build();
+        assert!(idx
+            .resolve_relative_from("res://parent.tscn", "", "Nonexistent")
+            .is_none());
+        // Missing scene → None.
+        assert!(idx
+            .resolve_relative_from("res://nope.tscn", "", "X")
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_relative_from_non_root_attachment() {
+        // A script attached at a non-root node `Wrap` accessing `$Leaf` resolves Wrap/Leaf.
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://s.tscn",
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"Script\" path=\"res://wrap.gd\" id=\"1\"]\n\
+             [node name=\"Root\" type=\"Node\"]\n\
+             [node name=\"Wrap\" type=\"Control\" parent=\".\"]\nscript = ExtResource(\"1\")\n\
+             [node name=\"Leaf\" type=\"Button\" parent=\"Wrap\"]\n",
+        );
+        let r = idx
+            .resolve_relative_from("res://s.tscn", "Wrap", "Leaf")
+            .unwrap();
+        assert_eq!(r.native_type.as_deref(), Some("Button"));
+    }
+
+    #[test]
+    fn resolve_relative_parent_segment() {
+        // `$../Sibling` from Wrap resolves to a sibling of Wrap under the root.
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://s.tscn",
+            "[gd_scene format=3]\n\
+             [node name=\"Root\" type=\"Node\"]\n\
+             [node name=\"Wrap\" type=\"Control\" parent=\".\"]\n\
+             [node name=\"Sibling\" type=\"Timer\" parent=\".\"]\n",
+        );
+        let r = idx
+            .resolve_relative_from("res://s.tscn", "Wrap", "../Sibling")
+            .unwrap();
+        assert_eq!(r.native_type.as_deref(), Some("Timer"));
+    }
+
+    #[test]
+    fn resolve_relative_parent_escape_above_root_is_none() {
+        // `..` that escapes ABOVE the scene root must refuse (a path naming no node), not silently
+        // resolve to the root (or an unrelated node). From `Wrap` (depth 1), `../../X` pops Wrap →
+        // root, then pops the empty stack → escape → `None`. `../..` from `Wrap` likewise escapes.
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://s.tscn",
+            "[gd_scene format=3]\n\
+             [node name=\"Root\" type=\"Node\"]\n\
+             [node name=\"Wrap\" type=\"Control\" parent=\".\"]\n\
+             [node name=\"X\" type=\"Timer\" parent=\".\"]\n",
+        );
+        assert!(
+            idx.resolve_relative_from("res://s.tscn", "Wrap", "../../X")
+                .is_none(),
+            "`../../X` from a depth-1 node escapes the scene root → None"
+        );
+        assert!(
+            idx.resolve_relative_from("res://s.tscn", "Wrap", "../..")
+                .is_none(),
+            "`../..` from a depth-1 node escapes the scene root → None"
+        );
+        // Sanity: the in-bounds `../X` still resolves (the escape guard is not over-broad).
+        let ok = idx
+            .resolve_relative_from("res://s.tscn", "Wrap", "../X")
+            .unwrap();
+        assert_eq!(ok.native_type.as_deref(), Some("Timer"));
+    }
+
+    #[test]
+    fn resolve_instanced_subscene_via_index_no_disk() {
+        // The instanced sub-scene resolution walks the INDEX's parsed scenes — both scenes are in
+        // the index, no text lookup closure. Parent's `Sub` is child.tscn instanced.
+        let idx = build();
+        let r = idx
+            .resolve_relative_from("res://parent.tscn", "", "Sub")
+            .unwrap();
+        assert_eq!(r.native_type.as_deref(), Some("Panel"));
+    }
+
+    #[test]
+    fn resolve_instanced_subscene_not_indexed_is_none() {
+        // Parent instances child.tscn but child is NOT in the index → degrade to None (permissive),
+        // never a bare/wrong type.
+        let mut idx = SceneIndex::new();
+        idx.reindex("res://parent.tscn", PARENT);
+        assert!(idx
+            .resolve_relative_from("res://parent.tscn", "", "Sub")
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_cyclic_instance_terminates_none() {
+        // a.tscn root instances b.tscn; b.tscn root instances a.tscn. Resolving the root via index
+        // must terminate at the cycle (None), not hang.
+        let mut idx = SceneIndex::new();
+        idx.reindex(
+            "res://a.tscn",
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://b.tscn\" id=\"1\"]\n\
+             [node name=\"ARoot\" instance=ExtResource(\"1\")]\n",
+        );
+        idx.reindex(
+            "res://b.tscn",
+            "[gd_scene format=3]\n\
+             [ext_resource type=\"PackedScene\" path=\"res://a.tscn\" id=\"1\"]\n\
+             [node name=\"BRoot\" instance=ExtResource(\"1\")]\n",
+        );
+        // The root node of a.tscn IS the instanced node; `resolve_relative_from(.., "", "")` targets
+        // the root (joined path "").
+        assert!(idx.resolve_relative_from("res://a.tscn", "", "").is_none());
     }
 
     #[test]

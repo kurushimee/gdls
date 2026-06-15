@@ -1940,19 +1940,20 @@ fn apply_reaction_inner(
             }
         }
         // M11 (#76): a `.tscn` change keeps the scene index live mid-session. Bounded to the project
-        // root like GdSource. Disk-sourced (the scene index is not fed from editor buffers in Phase
-        // 1). Phase 1 does NOT re-diagnose the scene's attached scripts — the analyzer doesn't
-        // consume scenes yet, so re-diagnosis would be byte-identical churn; that wiring lands in
-        // Phase 2 (the transitive scene→script set is already computed by `SceneIndex`).
+        // root like GdSource. Disk-sourced (the scene index is not fed from editor buffers). It does
+        // NOT re-diagnose the scene's attached scripts: a valid `$`/`%` types as bare `NATIVE Node`
+        // from the enclosing class/function alone (`reduce_get_node`), independent of the scene, so a
+        // scene edit cannot change a script's diagnostics — re-publishing them would be byte-identical
+        // churn. (Precise scene-derived types are navigation-only and pull-based — `docs/02` §11 —
+        // so they need no dirty-marking either.) Only the index itself is mutated, keeping queries
+        // that DO read scenes (future precise hover/completion) live.
         Reaction::Scene { path, change } => {
             if !path_is_within(&path, project_root) {
                 log::warn!("watcher: dropping out-of-root scene event for {path}");
                 return;
             }
             match change {
-                FileChange::Created | FileChange::Modified => {
-                    state.workspace.reindex_scene(&path);
-                }
+                FileChange::Created | FileChange::Modified => state.workspace.reindex_scene(&path),
                 FileChange::Deleted => state.workspace.remove_scene(&path),
                 FileChange::Renamed { from, to } => {
                     state.workspace.remove_scene(&from);
@@ -2134,9 +2135,9 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
         // M8 (#64): completion. Trigger characters are the NON-identifier characters that should
-        // auto-pop the list (`.` member access, `$`/`%` node paths — currently the deferred-node
-        // policy, `"` resource/string contexts, `@` annotations); identifier characters never go
-        // here (the client triggers on those itself). `resolve_provider: true` defers
+        // auto-pop the list (`.` member access, `$`/`%` node paths, `"` resource/string contexts,
+        // `@` annotations); identifier characters never go here (the client triggers on those
+        // itself). `resolve_provider: true` defers
         // documentation/detail to a `completionItem/resolve` round-trip (lazy — the list stays
         // cheap). `label_details_support: true` lets resolve attach the structured label detail in
         // a later phase.
