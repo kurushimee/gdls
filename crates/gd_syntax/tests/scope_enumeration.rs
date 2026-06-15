@@ -338,7 +338,8 @@ fn member_or_attribute_identifier_is_not_a_local() {
     // The LOCAL `member` (decl on the `var member := 1` line).
     let local_decl = after(SRC, "var member := 1").saturating_sub("member := 1".len());
     assert!(
-        tree.resolve_local_binding_at(local_decl, "member").is_some(),
+        tree.resolve_local_binding_at(local_decl, "member")
+            .is_some(),
         "the local member resolves to a binding"
     );
     let occ = occurrences_at(&tree, local_decl, "member");

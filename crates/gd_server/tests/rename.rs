@@ -1470,3 +1470,49 @@ fn rename_inner_shadow_from_inner_targets_inner_binding() {
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_outer_local_captured_in_lambda_edits_all_occurrences() {
+    // A lambda body is a NESTED function node, so the occurrence-scan bound must be the function
+    // enclosing the DECLARATION (the outer `f`), not the cursor's enclosing function (the lambda) —
+    // otherwise renaming from the lambda-interior capture drops the OUTER uses, dangling them. Click
+    // the captured `c` INSIDE the lambda; every occurrence (outer decl + both outer uses + the
+    // capture) must be renamed.
+    //   line 2 `\tvar c = 1`                  → decl `c` at col 5
+    //   line 3 `\tprint(c)`                   → use  `c` at col 7
+    //   line 4 `\tvar g = func(): return c`   → captured use `c` at col 24
+    //   line 5 `\tprint(c)`                   → use  `c` at col 7
+    let src = "extends Node\nfunc f() -> void:\n\tvar c = 1\n\tprint(c)\n\tvar g = func(): return c\n\tprint(c)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the lambda-interior capture (line 4, col 24). Rename → `renamed`.
+    let sites = rename_sites(&client, 94, &main_uri, 4, 24, "renamed");
+    assert_eq!(
+        sites,
+        vec![(2, 5), (3, 7), (4, 24), (5, 7)],
+        "renaming an outer local from inside a capturing lambda must edit ALL occurrences (decl + \
+         both outer uses + the capture) — never drop the outer uses (dangling); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_lambda_parameter_does_not_capture_outer_same_named() {
+    // A lambda PARAMETER shadows an outer same-named local: renaming the lambda param must edit ONLY
+    // the param's own sites (inside the lambda), never the outer binding's — precise across the
+    // lambda boundary in the shadowing direction too.
+    //   line 2 `\tvar v = 1`                          → OUTER decl `v` at col 5
+    //   line 3 `\tprint(v)`                           → OUTER use  `v` at col 7
+    //   line 4 `\tvar g = func(v): return v`          → param `v` at col 14, param use `v` at col 25
+    let src =
+        "extends Node\nfunc f() -> void:\n\tvar v = 1\n\tprint(v)\n\tvar g = func(v): return v\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the lambda PARAMETER (line 4, col 14). Rename → `p`.
+    let sites = rename_sites(&client, 95, &main_uri, 4, 14, "p");
+    assert_eq!(
+        sites,
+        vec![(4, 14), (4, 25)],
+        "renaming a lambda parameter must edit ONLY the param decl + its in-lambda use, never the \
+         shadowed outer `v` (lines 2,3); got {sites:?}"
+    );
+    shutdown(&client, server);
+}

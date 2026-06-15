@@ -3516,13 +3516,19 @@ fn classify_non_method_target(
 
 /// Resolve the identifier at `byte` (named `name`) to its declaring local binding: the declaration
 /// identifier ([`ParseTree::resolve_local_binding_at`] — respecting nested `var`/`for`/`match`-bind/
-/// `param`/lambda scopes) plus the smallest enclosing `Function` span. `None` when `byte` is not on
-/// a local of an enclosing function. The function span is the search bound for occurrence collection
-/// (a `for`/`match` declaration token sits outside its body block), guaranteed to contain both the
-/// declaration token and every use of the binding.
+/// `param`/lambda scopes) plus the search bound for occurrence collection. `None` when `byte` is not
+/// on a local of an enclosing function.
+///
+/// The bound is the function enclosing the **declaration**, NOT the cursor: a lambda body is a
+/// nested `Function`, so a use captured inside a lambda has a smaller cursor-enclosing function than
+/// the binding it refers to — bounding by the cursor's function would drop the binding's outer uses
+/// (an under-report → a dangling reference under rename). The declaration's enclosing function
+/// contains the declaration token AND every use (captures included), while a local declared inside a
+/// lambda stays correctly bounded to that lambda.
 fn resolve_local_binding(tree: &ParseTree, byte: usize, name: &str) -> Option<(NodeId, ByteSpan)> {
     let decl_ident = tree.resolve_local_binding_at(byte, name)?;
-    let fn_span = enclosing_function_span(tree, byte)?;
+    let decl_byte = tree.get(decl_ident).span.start;
+    let fn_span = enclosing_function_span(tree, decl_byte)?;
     Some((decl_ident, fn_span))
 }
 
@@ -6028,8 +6034,8 @@ fn rename_collision(
     // declared in the enclosing function — exactly the `NonMethodTarget::Local` precondition.
     let old_name = cursor_identifier(tree, node_id);
     if let Some(old) = old_name.as_deref() {
-        if resolve_local_binding(tree, byte, old).is_some() {
-            if function_declares_local(tree, byte, new_name) {
+        if let Some((_, fn_span)) = resolve_local_binding(tree, byte, old) {
+            if function_declares_local(tree, fn_span, new_name) {
                 return Some(RequestRefusal::invalid_name(format!(
                     "Cannot rename to `{new_name}`: `{new_name}` is already declared in this scope"
                 )));
@@ -6091,16 +6097,15 @@ fn root_class_declares(tree: &ParseTree, name: &str) -> bool {
         .any(|m| member_named(tree, m, name).is_some())
 }
 
-/// `true` iff the smallest function containing `byte` declares `name` as ANY local — a parameter,
-/// body-local `var`/`const`, `for` iterator, or `match` bind — the local-collision predicate (the
-/// new-name side of [`rename_collision`]). Scans every block within the function span for a `Local`
-/// of that name, so it sees the for/match binds `enclosing_function_declaring` (var/const/param
-/// only) would miss. Function-wide is deliberately CONSERVATIVE: it refuses a rename whose new name
-/// shadows ANY local in the function, even one in a sibling block — refuse-rather-than-corrupt.
-fn function_declares_local(tree: &ParseTree, byte: usize, name: &str) -> bool {
-    let Some(fn_span) = enclosing_function_span(tree, byte) else {
-        return false;
-    };
+/// `true` iff the function spanning `fn_span` declares `name` as ANY local — a parameter, body-local
+/// `var`/`const`, `for` iterator, or `match` bind — the local-collision predicate (the new-name side
+/// of [`rename_collision`]). Scans every block within `fn_span` for a `Local` of that name, so it
+/// sees the for/match binds a var/const/param-only walk would miss. `fn_span` is the OLD binding's
+/// enclosing-function span (from [`resolve_local_binding`], declaration-derived so a lambda-captured
+/// cursor still scopes to the outer function). Function-wide is deliberately CONSERVATIVE: it refuses
+/// a rename whose new name shadows ANY local in the function, even one in a sibling block —
+/// refuse-rather-than-corrupt.
+fn function_declares_local(tree: &ParseTree, fn_span: ByteSpan, name: &str) -> bool {
     for id in tree.iter_ids() {
         let node = tree.get(id);
         if node.span.start < fn_span.start || node.span.end > fn_span.end {

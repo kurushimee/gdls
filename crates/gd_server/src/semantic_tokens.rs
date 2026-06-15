@@ -418,8 +418,8 @@ pub(crate) fn classify_document(
 /// `match`-pattern bind — or `None` if no enclosing function declares it (then it isn't a local).
 ///
 /// Purely structural (no analyzer): finds the innermost enclosing `Function` span containing `byte`,
-/// then the nearest enclosing `Suite` whose `locals` declares `name`. Mirrors the scoping
-/// `handlers::enclosing_function_declaring` uses for references' local classification.
+/// then the nearest enclosing `Suite` whose `locals` declares `name`. Mirrors the per-suite `locals`
+/// scoping that `ParseTree::resolve_local_binding_at` uses for references' local classification.
 fn local_use_kind(tree: &ParseTree, byte: usize, name: &str) -> Option<TokType> {
     // Innermost enclosing function (smallest span containing the byte).
     let mut fn_span: Option<ByteSpan> = None;
