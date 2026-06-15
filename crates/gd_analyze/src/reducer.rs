@@ -6075,18 +6075,43 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
         }
         _ => return,
     };
-    // WP-P10: get_node shorthand context restrictions (analyzer.cpp's `reduce_get_node` —
-    // ~4870-4895). Two errors fire when `$Node` or `%Unique` is used in an inappropriate
-    // context — both must be checked here because Godot's parser doesn't carry the
-    // enclosing-class / enclosing-function shape that determines validity.
+    // WP-P10: get_node shorthand context restrictions (analyzer.cpp's `reduce_get_node`,
+    // analyzer.cpp:3864-3887). Two contexts make `$Node` / `%Unique` invalid; Godot checks the
+    // non-Node class FIRST, then the static-function context, and each check that fires pushes its
+    // error, leaves the default `VARIANT` result, and RETURNS — so at most ONE of the two errors is
+    // emitted, and the non-Node error wins when both hold. (Checking both without returning
+    // double-fired on a non-Node static function, which Godot never does.)
     //
-    // (a) In a static function (no `self`): `Cannot use shorthand "get_node()" notation
-    //     ("$"/"%") in a static function.`
-    // (b) In a class that isn't Node-derived: `Cannot use shorthand "get_node()" notation
-    //     ("$"/"%") on a class that isn't a node.`
-    //
-    // Godot checks the enclosing class's native ancestor against "Node" — gdls uses the
-    // `nearest_native_ancestor` helper (shared with WP-N5a's @onready / @export-of-Node walk).
+    // The default `VARIANT`/`UNDETECTED` result (analyzer.cpp:3866) is what a `:=` infer off the
+    // failed access reports its `Cannot infer the type of "X" variable because the value doesn't
+    // have a set type.` companion against.
+
+    // (a) A class that isn't Node-derived (analyzer.cpp:3868-3872), checked FIRST. Godot tests the
+    //     enclosing class's native ancestor against "Node"; gdls uses the `nearest_native_ancestor`
+    //     helper (shared with WP-N5a's @onready / @export-of-Node walk).
+    let in_non_node_class = ctx
+        .current_class
+        .and_then(|cc| crate::resolver::nearest_native_ancestor(ctx, cc))
+        .is_some_and(|native| !ctx.native.is_subclass_of_named(&native, "Node"));
+    if in_non_node_class {
+        ctx.push_error(
+            format!(
+                r#"Cannot use shorthand "get_node()" notation ("{glyph}") on a class that isn't a node."#
+            ),
+            id,
+        );
+        ctx.set_type(
+            id,
+            DataType {
+                kind: DtKind::Variant,
+                type_source: TypeSource::Undetected,
+                ..Default::default()
+            },
+        );
+        return;
+    }
+
+    // (b) Inside a static function — no `self` (analyzer.cpp:3874-3878).
     let in_static_function = ctx
         .current_function
         .and_then(|fn_id| match &ctx.node(fn_id).kind {
@@ -6101,28 +6126,6 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
             ),
             id,
         );
-    }
-
-    let in_non_node_class = ctx
-        .current_class
-        .and_then(|cc| crate::resolver::nearest_native_ancestor(ctx, cc))
-        .is_some_and(|native| !ctx.native.is_subclass_of_named(&native, "Node"));
-    if in_non_node_class {
-        ctx.push_error(
-            format!(
-                r#"Cannot use shorthand "get_node()" notation ("{glyph}") on a class that isn't a node."#
-            ),
-            id,
-        );
-    }
-
-    // Result type. When a context check above errored, Godot returns early leaving the default
-    // `VARIANT`/`UNDETECTED` (analyzer.cpp:3870/3876) — gdls reproduces that so a `:=` infer off the
-    // failed `$` reports its `Cannot infer the type of "X" variable because the value doesn't have a
-    // set type.` companion. Otherwise the access is a hard `NATIVE Node` (analyzer.cpp:3882-3886):
-    // bare `Node`, not the scene-precise node class — faithful to Godot, which never reads the scene
-    // for the analyzer's type. Member misses on it raise UNSAFE_*_ACCESS like any typed node base.
-    if in_static_function || in_non_node_class {
         ctx.set_type(
             id,
             DataType {
@@ -6131,18 +6134,22 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
                 ..Default::default()
             },
         );
-    } else {
-        ctx.set_type(
-            id,
-            DataType {
-                kind: DtKind::Native,
-                type_source: TypeSource::AnnotatedExplicit,
-                builtin_type: VariantType::Object,
-                native_type: "Node".to_owned(),
-                ..Default::default()
-            },
-        );
+        return;
     }
+
+    // Otherwise the access is a hard `NATIVE Node` (analyzer.cpp:3882-3886): bare `Node`, not the
+    // scene-precise node class — faithful to Godot, which never reads the scene for the analyzer's
+    // type. Member misses on it raise UNSAFE_*_ACCESS like any typed node base.
+    ctx.set_type(
+        id,
+        DataType {
+            kind: DtKind::Native,
+            type_source: TypeSource::AnnotatedExplicit,
+            builtin_type: VariantType::Object,
+            native_type: "Node".to_owned(),
+            ..Default::default()
+        },
+    );
 }
 
 // NOTE (M11 Phase 2): valid `$`/`%` types as bare `NATIVE Node` above — Godot's analyzer

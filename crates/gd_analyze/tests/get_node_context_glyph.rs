@@ -114,3 +114,31 @@ func f():
         messages(src)
     );
 }
+
+#[test]
+fn non_node_static_function_fires_only_the_non_node_error() {
+    // A class that is BOTH non-Node AND inside a static function: Godot checks the non-Node case
+    // first and early-returns (gdscript_analyzer.cpp:3868-3872), so EXACTLY ONE context error
+    // fires — the not-a-node one, never also the static-function one. (Reproduce-first: the code
+    // that checked both contexts without returning double-fired here.)
+    let src = "\
+extends RefCounted
+
+static func f():
+\tvar _n = $Node
+";
+    let shorthand: Vec<String> = messages(src)
+        .into_iter()
+        .filter(|m| m.contains(r#"shorthand "get_node()""#))
+        .collect();
+    assert_eq!(
+        shorthand.len(),
+        1,
+        "exactly one get_node context error must fire (Godot early-returns); got: {shorthand:?}"
+    );
+    assert!(
+        shorthand[0].contains("isn't a node"),
+        "the single error must be the not-a-node one (checked first); got: {:?}",
+        shorthand[0]
+    );
+}
