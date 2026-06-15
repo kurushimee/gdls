@@ -696,6 +696,16 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         // shape as the global-class arm; nested segments (`Keychain.InputAction`) continue
         // through the Script-segment walk below.
         result = script_base_datatype(ctx, fid);
+    } else if ctx.xfile.is_autoload(&first) {
+        // analyzer.cpp:804-823 — a registered singleton autoload with NO backing script (a
+        // scriptless SCENE autoload, or an unresolvable scene/uid). Godot's type-position arm
+        // early-returns `bad_type` SILENTLY here (`return bad_type` at :822-823): it does NOT fall
+        // through to the "Could not find type" error at :902. (Verified against the 4.6.3 binary:
+        // `var x: <scriptless-scene-autoload>` compiles with no error, while an unknown type does
+        // error.) Unlike the VALUE position — which floors the singleton to a bare `Node`
+        // (analyzer.cpp:4570-4609, mirrored by `reduce_identifier` step 9a) — the TYPE position is
+        // degenerate: the annotated variable just stays untyped (VARIANT). Return bad_type to match.
+        return bad_type;
     } else if let Some(dt) = inherited_enum_annotation(ctx, &first) {
         // A bare enum NAME from the class's INHERITED scope: a cross-file script base's enum
         // (`-> Status` with `enum Status` on the base) or a native base-chain enum (LimboAI's

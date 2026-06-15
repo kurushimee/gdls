@@ -337,3 +337,60 @@ fn unknown_name_not_typed_as_autoload() {
         dt.kind
     );
 }
+
+// --- #129: scriptless scene autoload used as a TYPE annotation ---
+
+/// #129: a scriptless SCENE autoload used as a TYPE annotation (`var x: SceneNoScript`) must NOT emit
+/// `Could not find type "…"`. Godot's type-position arm early-returns `bad_type` SILENTLY for a
+/// registered singleton autoload with no backing script (`gdscript_analyzer.cpp:822-823`) — it does
+/// NOT fall through to the "Could not find type" error at `:902`. Verified against the 4.6.3 binary:
+/// `var x: <scriptless-scene-autoload>` compiles with exit 0 and no error, while a genuinely-unknown
+/// type still reports "Could not find type". Reproduce-first: gdls fell through to the error.
+#[test]
+fn scriptless_scene_autoload_as_type_no_could_not_find_type() {
+    let fid = FileId::new(42);
+    let src = "extends Node\n\nfunc test():\n\tvar x: SceneNoScript = null\n\tprint(x)\n";
+    let offending: Vec<String> = analyze_src(src, fid)
+        .diagnostics
+        .iter()
+        .map(|d| d.message().to_owned())
+        .filter(|m| m.contains("SceneNoScript") && m.contains("Could not find type"))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "a scriptless scene autoload as a type must not emit 'Could not find type'; got: {offending:?}"
+    );
+}
+
+/// Regression guard (the #78 behavior must be preserved): a SCRIPT-BACKED autoload used as a type
+/// annotation (`var x: Global`) still resolves through the script path — no "Could not find type".
+#[test]
+fn script_backed_autoload_as_type_still_resolves() {
+    let fid = FileId::new(42);
+    let src = "extends Node\n\nfunc test():\n\tvar x: Global = null\n\tprint(x)\n";
+    let offending: Vec<String> = analyze_src(src, fid)
+        .diagnostics
+        .iter()
+        .map(|d| d.message().to_owned())
+        .filter(|m| m.contains("Global") && m.contains("Could not find type"))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "a script-backed autoload as a type must resolve (no 'Could not find type'); got: {offending:?}"
+    );
+}
+
+/// Control: the suppression is autoload-ONLY. A genuinely-unknown type name (not a registered
+/// autoload) must STILL emit `Could not find type "…"` (mirroring the 4.6.3 binary positive control).
+#[test]
+fn unregistered_type_annotation_still_could_not_find_type() {
+    let fid = FileId::new(42);
+    let src = "extends Node\n\nfunc test():\n\tvar x: TotallyUnknownType999 = null\n\tprint(x)\n";
+    let flagged = analyze_src(src, fid).diagnostics.iter().any(|d| {
+        d.message().contains("TotallyUnknownType999") && d.message().contains("Could not find type")
+    });
+    assert!(
+        flagged,
+        "an unregistered unknown type must still emit 'Could not find type' (the gate is autoload-only)"
+    );
+}
