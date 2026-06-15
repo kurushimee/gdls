@@ -351,3 +351,52 @@ fn member_or_attribute_identifier_is_not_a_local() {
         "local decl + bare RHS use, not the self.member attribute: {occ:?}"
     );
 }
+
+#[test]
+fn lua_style_dict_key_is_not_a_local_occurrence() {
+    // `{ name = value }` — the Lua-style KEY is a folded string literal, NOT a reference to the local
+    // `name`. It must be excluded from the occurrence set (renaming it would silently change the key
+    // string). The dict VALUE reference (`other = name`) IS a real use and stays.
+    const SRC: &str =
+        "func f() -> void:\n\tvar name = 1\n\tvar d = { name = 2, other = name }\n\tprint(name)\n";
+    let tree = parse(SRC).tree;
+    let decl_byte = after(SRC, "\tvar "); // start of the `name` declaration
+    let occ = occurrences_at(&tree, decl_byte, "name");
+    // decl + the dict VALUE ref + print — NOT the Lua key (3, not 4).
+    assert_eq!(
+        occ.len(),
+        3,
+        "local decl + dict value ref + print, excluding the Lua-style key: {occ:?}"
+    );
+}
+
+#[test]
+fn lua_style_single_element_ambiguous_dict_key_excluded() {
+    // The single-element ambiguous case `{ key = key }` is parsed Lua-style (style == None): the KEY
+    // is a string literal (excluded), the VALUE is a real reference (kept).
+    const SRC: &str = "func f() -> void:\n\tvar key = 1\n\tvar d = { key = key }\n";
+    let tree = parse(SRC).tree;
+    let decl_byte = after(SRC, "\tvar ");
+    let occ = occurrences_at(&tree, decl_byte, "key");
+    assert_eq!(
+        occ.len(),
+        2,
+        "local decl + the value reference, excluding the ambiguous Lua key: {occ:?}"
+    );
+}
+
+#[test]
+fn python_style_dict_string_key_leaves_value_reference() {
+    // `{ "name": name }` — a Python-style key is a string LITERAL (not an identifier), so nothing to
+    // exclude there; the VALUE `name` is a real reference and is collected.
+    const SRC: &str =
+        "func f() -> void:\n\tvar name = 1\n\tvar d = { \"name\": name }\n\tprint(name)\n";
+    let tree = parse(SRC).tree;
+    let decl_byte = after(SRC, "\tvar ");
+    let occ = occurrences_at(&tree, decl_byte, "name");
+    assert_eq!(
+        occ.len(),
+        3,
+        "local decl + dict value ref + print (the string key is a literal, not an ident): {occ:?}"
+    );
+}

@@ -1537,3 +1537,25 @@ fn rename_outer_local_captured_in_nested_lambda_edits_all_occurrences() {
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_local_does_not_rewrite_lua_style_dict_key() {
+    // A Lua-style dict KEY (`{ name = 2 }`) is a folded STRING literal, NOT a reference to the local
+    // `name` — renaming the local must NOT rewrite it (that would silently change the key string,
+    // breaking `d["name"]`/`d.name` lookups at runtime). The dict VALUE reference (`other = name`)
+    // IS a real use and MUST be renamed.
+    //   line 2 `\tvar name = 1`                          → decl `name` at col 5
+    //   line 3 `\tvar d = { name = 2, other = name }`    → KEY at col 11 (EXCLUDE), value at col 29
+    //   line 4 `\tprint(name)`                           → use `name` at col 7
+    let src = "extends Node\nfunc f() -> void:\n\tvar name = 1\n\tvar d = { name = 2, other = name }\n\tprint(name)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the declaration (line 2, col 5). Rename → `renamed`.
+    let sites = rename_sites(&client, 97, &main_uri, 2, 5, "renamed");
+    assert_eq!(
+        sites,
+        vec![(2, 5), (3, 29), (4, 7)],
+        "renaming the local must edit decl + dict VALUE ref + print, NEVER the Lua-style dict KEY \
+         (col 11 on line 3) — rewriting it is silent runtime corruption; got {sites:?}"
+    );
+    shutdown(&client, server);
+}

@@ -810,9 +810,10 @@ impl ParseTree {
     /// documentHighlight: distinct same-named siblings in inner/outer blocks are excluded by
     /// per-occurrence re-resolution ([`Self::resolve_local_binding_at`]).
     ///
-    /// Attribute-position identifiers (`obj.x`, `self.x` — the `x` after a `.`) are excluded: a local
-    /// is never reached as a member access, and rewriting one would corrupt a member reference. The
-    /// returned spans are the identifier token extents, in arena (source) order.
+    /// Non-reference identifiers that share the name are excluded so a rewrite never corrupts them:
+    /// attribute positions (`obj.x` / `self.x` — that `x` is a member) and Lua-style dictionary keys
+    /// (`{ x = value }` — a folded string literal, not a reference to the local). The returned spans
+    /// are the identifier token extents, in arena (source) order.
     ///
     /// Cost: one arena pass to collect attribute idents, then one to scan candidates; each candidate
     /// that matches the name is re-resolved (another suite-chain walk). The re-resolve runs only for
@@ -820,14 +821,37 @@ impl ParseTree {
     /// name's occurrence count (small in practice), not the node count — and this runs at most once
     /// per LSP request on a single file.
     pub fn local_binding_occurrences(&self, decl_ident: NodeId, scope: ByteSpan) -> Vec<ByteSpan> {
-        // Collect attribute-position identifiers to exclude (a local is never a member access).
-        let mut attribute_idents: std::collections::HashSet<NodeId> =
+        // Collect identifier nodes that LOOK like a same-named local but are NOT a reference to one,
+        // so renaming/highlighting the local never rewrites them (a wrong-symbol/dangling edit under
+        // rename). Two non-reference positions:
+        //   - an ATTRIBUTE identifier (`obj.x` / `self.x`) — that `x` is a member, a different symbol.
+        //   - a LUA-STYLE dictionary KEY (`{ x = value }`) — the analyzer folds the key to a STRING
+        //     literal and records no binding, so it is not a reference to the local `x`; rewriting it
+        //     would silently change the key string. A Python-style key (`{ expr: value }`) IS an
+        //     expression, so its identifiers stay (normal references). The single-element ambiguous
+        //     case (`style == None`) is parsed Lua-style, so treat it so. (Mirrors the same exclusion
+        //     in the read-only semantic-tokens local-use fallback.)
+        let mut excluded_idents: std::collections::HashSet<NodeId> =
             std::collections::HashSet::new();
         for id in self.iter_ids() {
-            if let NodeKind::Subscript(s) = &self.get(id).kind {
-                if let Some(SubscriptAccess::Attribute(Some(aid))) = s.access {
-                    attribute_idents.insert(aid);
+            match &self.get(id).kind {
+                NodeKind::Subscript(s) => {
+                    if let Some(SubscriptAccess::Attribute(Some(aid))) = s.access {
+                        excluded_idents.insert(aid);
+                    }
                 }
+                NodeKind::Dictionary(d) => {
+                    if matches!(d.style, Some(DictStyle::LuaTable) | None) {
+                        for kv in &d.elements {
+                            if let Some(k) = kv.key {
+                                if let NodeKind::Identifier(_) = &self.get(k).kind {
+                                    excluded_idents.insert(k);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         let target_name = match &self.get(decl_ident).kind {
@@ -840,7 +864,7 @@ impl ParseTree {
             if node.span.start < scope.start || node.span.end > scope.end {
                 continue;
             }
-            if attribute_idents.contains(&id) {
+            if excluded_idents.contains(&id) {
                 continue;
             }
             let NodeKind::Identifier(i) = &node.kind else {
