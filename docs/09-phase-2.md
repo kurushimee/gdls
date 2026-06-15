@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Spec date** | 2026-06-12 |
-| **Status** | Phase 2 definition — authoritative scope for everything post-v1.0.5. Supersedes the one-row "Phase 2" sketches in `docs/00 §3`, `docs/05 §1`, `docs/07 §1`, and `docs/08 §4`. **Progress (2026-06-14): M7, M8, M9, M10 shipped and closed (#57–#75); M11 remains.** |
+| **Status** | Phase 2 definition — authoritative scope for everything post-v1.0.5. Supersedes the one-row "Phase 2" sketches in `docs/00 §3`, `docs/05 §1`, `docs/07 §1`, and `docs/08 §4`. **Progress (2026-06-15): M7–M11 shipped and closed (#57–#80); Phase 2 COMPLETE.** |
 | **Baseline** | v1.0.5 (2026-06-12): both fidelity ratchets 1.0000, exposed-capability parity + LSP-convention audit complete. |
 | **Tracking** | Umbrella issue [#30](https://github.com/kurushimee/gdls/issues/30); milestones **M7–M11** on GitHub; project board *gdls roadmap*. |
 
@@ -135,11 +135,11 @@ relevant 3.18) appears exactly once.
 | textDocument/inlayHint (+ resolve, refresh) | **M10** | Inferred `:=` types, parameter names; config-toggleable |
 | textDocument/documentColor + colorPresentation | **M10** | `Color(...)`, `Color.CONSTANT`, `Color("#hex")` literals |
 | textDocument/codeAction (+ resolve, `source.fixAll`) | **M10** | Quickfixes for the warning set; standard kind strings; honors `context.only`; `workspace/applyEdit` + `executeCommand` plumbing |
-| `.tscn` scene index → `$`/`%` typing | **M11** | Valid `$`/`%` types as bare `NATIVE Node` — diagnostics converge with Godot (`docs/02 §11`). Precise scene-derived node facts (the scene index + resolution seam) are kept dormant for navigation/completion in phase 3 — NOT the diagnostic path (they'd turn Godot-tolerated downcasts into false positives) |
-| Scene-aware completion (node paths in `$`/`%`/`get_node`) | **M11** | Extends M8 completion with the M11 scene index |
-| Autoload scene typing (`uid://` → scene → root script) | **M11** | The `gd_project` deferral (`model.rs` uid→scene lookup) |
-| fileOperations: willRenameFiles (+ did\*) | **M11** | Moving a `.gd`/`.tscn` returns `WorkspaceEdit` fixing `preload`/`load` paths; `did*` nudges the index |
-| Formatting: external-command bridge | **M11** | rust-analyzer pattern: no built-in formatter (none exists upstream to port); optional user-configured command (gdformat …) over stdin/stdout; `documentFormattingProvider` advertised **only when configured** |
+| `.tscn` scene index → `$`/`%` typing | ✅ M11 | Valid `$`/`%` types as bare `NATIVE Node` — diagnostics converge with Godot (`docs/02 §11`) (#76). Precise scene-derived node facts (the scene index + resolution seam) are kept dormant for navigation/completion in phase 3 — NOT the diagnostic path (they'd turn Godot-tolerated downcasts into false positives) |
+| Scene-aware completion (node paths in `$`/`%`/`get_node`) | ✅ M11 | Extends M8 completion with the M11 scene index; no scene ⇒ empty, multi-scene ⇒ annotated union (#77) |
+| Autoload scene typing (`uid://` → scene → root script) | ✅ M11 | The `gd_project` deferral (`model.rs` uid→scene lookup); scriptless root ⇒ bare `Node` floor (#78) |
+| fileOperations: willRenameFiles (+ did\*) | ✅ M11 | Moving a `.gd`/`.tscn` returns `WorkspaceEdit` fixing `preload`/`load` paths (positively-identified args only); `did*` nudges the index (#79) |
+| Formatting: external-command bridge | ✅ M11 | rust-analyzer pattern: no built-in formatter (none exists upstream to port); optional user-configured command (gdformat …) over stdin/stdout; `documentFormattingProvider` advertised **only when configured** (#80) |
 | `workspace/workspaceFolders` (first folder = root) | ✅/skip | Single-root per session stays (one Godot project = one gdls); multi-root sessions are a documented non-goal — editors spawn one instance per workspace |
 | workspace/diagnostic (project-wide pull) | skip | Conflicts with the per-file-diagnostics principle (`docs/00 §4`); clients fall back to per-file pull/push cleanly |
 | textDocument/codeLens (+ refresh) | skip (revisit post-M10) | Low value for GDScript; not consumed by Helix/eglot; reference-count lenses can be added later without protocol risk |
@@ -240,7 +240,7 @@ zero stale-version edits.
 zero custom token names on the wire; fix-all on save works in VS Code via standard
 `editor.codeActionsOnSave`.
 
-### M11 — scenes & file operations (the original "Phase 2" payload)
+### M11 — scenes & file operations (the original "Phase 2" payload) — ✅ shipped 2026-06-15 (#76–#80)
 
 `.tscn` text parsing (`tree-sitter-godot-resource` as format reference; no engine instantiation —
 §3 W16) into a scene index keyed alongside the script index; valid `$Node`/`%Unique` type as bare
@@ -327,6 +327,12 @@ inventory and this machine's gaps). Deferred interactive items accumulate here p
   — lambdas, script-method docs, constructor overload args), and #99 (perf-budget recalibration).
 
 ## 8. Phase 2 exit criteria
+
+**Status (2026-06-15): all met — Phase 2 COMPLETE.** Exit #4 is bare-Node `$`/`%` parity (the
+premise correction in M11 #76), verified by the comparative `--strict` `scan_diags.py` sweeps on
+both acceptance projects (zero new default-profile false positives; the `--strict` increase is the
+convergent bare-Node `UNSAFE_*`-on-node-access family Godot's analyzer also emits); both ratchets
+hold 1.0000 and the five-target fuzz gate (now including `scene_parse`) is clean.
 
 1. Every capability in §5 marked M7–M11 is shipped, advertised exactly, and capability-gated.
 2. A stock Helix, VS Code (generic LSP client), Neovim, Zed, eglot, and Sublime LSP session gets

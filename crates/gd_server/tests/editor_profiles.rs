@@ -60,6 +60,25 @@
 //!   `code_action_computes_edit_eagerly_without_resolve_support`) — the vendored-real-client contract
 //!   of THIS file forbids a synthetic minimal fixture.
 //!
+//! M11 (#79/#80) extends the walk with the **scene/file-operation** gated projections:
+//! - **`workspace.fileOperations.willRename`** (#79): advertised IFF the profile offers
+//!   `workspace.fileOperations.willRename` (a client that won't send the request is never told gdls
+//!   handles it — W15); when advertised the registration scopes to gdls's tracked file kinds
+//!   (`**/*.gd` + `**/*.tscn`), and `willCreate`/`willDelete` are never advertised. A profile
+//!   offering NO file operation gets the whole `workspace.fileOperations` block ABSENT. Asserted
+//!   off the capabilities ADVERTISED at `initialize`, per profile (`check_m11_projection`).
+//! - **`textDocument/formatting`** (#80): CONFIG-gated (a `formatter.command` in
+//!   `initializationOptions`), NOT client-cap-gated — so it is ABSENT for EVERY profile in this walk
+//!   (which boots no formatter). The config-gated advertisement (present when a command is
+//!   configured) is exercised by the dedicated `document_formatting_is_config_gated` test, and the
+//!   double-negative (no willRename + no formatter ⇒ both absent) by
+//!   `ungated_client_gets_neither_will_rename_nor_formatting` — both synthetic-capability tests,
+//!   since the vendored-real-client walk varies neither the boot config nor a minimal client.
+//! - Scene-aware `$`/`%`/`get_node` + resource-path completion (#77/#78) rides the EXISTING
+//!   `completion_provider` (it only adds items under `textDocument/completion`, gated by the same M8
+//!   completion capabilities), so it introduces no new capability gate — already covered by
+//!   `check_completion_projection`.
+//!
 //! Every milestone from M8 on extends this list with its own gated projections.
 
 mod common;
@@ -140,6 +159,163 @@ fn every_vendored_profile_gets_its_exact_gated_projections() {
     }
 }
 
+/// Boot a fresh in-memory server with the given client `capabilities` JSON and extra
+/// `initializationOptions` (merged over the standard `projectRoot`/`extensionApiPath` keys), drive
+/// the `initialize` handshake, and return the advertised [`lsp_types::InitializeResult`] together
+/// with the [`common::TempProject`] + live connection + server thread. Used by the M11 dedicated
+/// tests that must vary the BOOT config (formatter on/off, an ungated client) — variations the
+/// vendored-profile walk doesn't cover (it boots once per profile with no formatter). The returned
+/// `TempProject` MUST be held by the caller until after `shutdown` (its drop removes the temp dir the
+/// server reads); bind it to a `_p` guard.
+#[must_use]
+fn boot_with(
+    capabilities: serde_json::Value,
+    extra_init_options: serde_json::Value,
+) -> (
+    common::TempProject,
+    lsp_types::InitializeResult,
+    Connection,
+    std::thread::JoinHandle<anyhow::Result<()>>,
+) {
+    let p = sample_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let mut init_options = serde_json::json!({
+        "projectRoot": p.root.as_str(),
+        "autoDumpExtensionApi": false,
+        "extensionApiPath": p.root.join("extension_api.json").as_str(),
+    });
+    if let (Some(base), Some(extra)) =
+        (init_options.as_object_mut(), extra_init_options.as_object())
+    {
+        for (k, v) in extra {
+            base.insert(k.clone(), v.clone());
+        }
+    }
+    let init = InitializeParams {
+        capabilities: serde_json::from_value(capabilities).expect("client caps deserialize"),
+        initialization_options: Some(init_options),
+        ..Default::default()
+    };
+    client.sender.send(request(1, "initialize", init)).unwrap();
+    let result: lsp_types::InitializeResult = loop {
+        if let Message::Response(resp) = recv(&client) {
+            assert!(resp.error.is_none(), "initialize failed");
+            break serde_json::from_value(resp.result.expect("initialize result present"))
+                .expect("InitializeResult deserializes");
+        }
+    };
+    client
+        .sender
+        .send(notification("initialized", InitializedParams {}))
+        .unwrap();
+    (p, result, client, server_thread)
+}
+
+/// M11 (#80): `documentFormattingProvider` is CONFIG-gated — advertised IFF `formatter.command` is
+/// set in `initializationOptions`, NOT client-cap-gated. The per-profile walk never configures a
+/// formatter (so it always asserts the ABSENT side); this dedicated test drives BOTH sides with the
+/// SAME (formatting-capable) client, isolating the config as the only variable.
+#[test]
+fn document_formatting_is_config_gated() {
+    // A client that advertises formatting support — to prove the gate is the CONFIG, not the client.
+    let caps = serde_json::json!({
+        "textDocument": { "formatting": { "dynamicRegistration": false } }
+    });
+
+    // (1) formatter configured ⇒ documentFormatting ADVERTISED.
+    let (_p, result, client, thread) = boot_with(
+        caps.clone(),
+        serde_json::json!({ "formatter": { "command": "gdformat" } }),
+    );
+    assert!(
+        result.capabilities.document_formatting_provider.is_some(),
+        "documentFormatting advertised when formatter.command is configured"
+    );
+    // We never advertise range formatting (GDScript formatters are whole-file).
+    assert!(
+        result
+            .capabilities
+            .document_range_formatting_provider
+            .is_none(),
+        "rangeFormatting is never advertised"
+    );
+    common::shutdown(&client, thread);
+
+    // (2) NO formatter configured ⇒ documentFormatting ABSENT (anti-catalog W15: never advertise an
+    // unconfigured/unimplemented surface), even though the client advertised formatting support.
+    let (_p2, result2, client2, thread2) = boot_with(caps, serde_json::json!({}));
+    assert!(
+        result2.capabilities.document_formatting_provider.is_none(),
+        "documentFormatting ABSENT with no formatter.command (config-gated, not client-cap-gated)"
+    );
+    common::shutdown(&client2, thread2);
+}
+
+/// M11 (#79/#80): the negative projection — a client offering NEITHER
+/// `workspace.fileOperations.willRename` NOR any formatter config gets BOTH capabilities ABSENT.
+/// Proves gdls never advertises what the client can't use / what isn't wired to a real tool
+/// (anti-catalog W15). A dedicated synthetic-capability test (not a vendored fixture: this file's
+/// walk is a vendored-REAL-client contract, so a minimal synthetic profile belongs in a unit test).
+#[test]
+fn ungated_client_gets_neither_will_rename_nor_formatting() {
+    // A minimal client: no `workspace.fileOperations`, no formatting config. (A bare hover capability
+    // just so it isn't an entirely empty object — irrelevant to the two surfaces under test.)
+    let caps = serde_json::json!({
+        "textDocument": { "hover": { "dynamicRegistration": false } }
+    });
+    let (_p, result, client, thread) = boot_with(caps, serde_json::json!({}));
+
+    // No fileOperations block at all (the handler is dead by construction).
+    assert!(
+        result
+            .capabilities
+            .workspace
+            .as_ref()
+            .and_then(|w| w.file_operations.as_ref())
+            .is_none(),
+        "ungated client: no workspace.fileOperations advertised"
+    );
+    // No documentFormatting (nothing configured).
+    assert!(
+        result.capabilities.document_formatting_provider.is_none(),
+        "ungated client: no documentFormatting advertised (no formatter.command)"
+    );
+    common::shutdown(&client, thread);
+}
+
+/// M11 (#79): the POSITIVE side of the per-operation `did*` gates that no vendored profile exercises
+/// (helix/zed offer only `willRename`+`didRename`; neovim offers none). A client offering ONLY
+/// `didCreate` + `didDelete` (and NOT `willRename`/`didRename`) must get exactly those two advertised
+/// and the other two absent — proving each operation is gated independently (an inverted gate on
+/// `didCreate`/`didDelete` would be caught here, where the walk's all-absent fixtures cannot).
+#[test]
+fn did_create_delete_gated_independently() {
+    let caps = serde_json::json!({
+        "workspace": { "fileOperations": { "didCreate": true, "didDelete": true } }
+    });
+    let (_p, result, client, thread) = boot_with(caps, serde_json::json!({}));
+    let fo = result
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.file_operations.as_ref())
+        .expect("fileOperations block advertised when didCreate/didDelete offered");
+    assert!(
+        fo.did_create.is_some() && fo.did_delete.is_some(),
+        "didCreate + didDelete advertised when offered"
+    );
+    assert!(
+        fo.will_rename.is_none() && fo.did_rename.is_none(),
+        "willRename/didRename NOT advertised when not offered (independent per-op gating)"
+    );
+    assert!(
+        fo.will_create.is_none() && fo.will_delete.is_none(),
+        "gdls never advertises willCreate/willDelete"
+    );
+    common::shutdown(&client, thread);
+}
+
 fn check_profile(name: &str, profile: &serde_json::Value) {
     let capabilities: ClientCapabilities = serde_json::from_value(profile.clone())
         .unwrap_or_else(|e| panic!("{name}: profile must deserialize as ClientCapabilities: {e}"));
@@ -196,12 +372,17 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
         ..Default::default()
     };
     client.sender.send(request(1, "initialize", init)).unwrap();
-    loop {
+    // Capture the InitializeResult — the M11 (#79) `willRename` projection asserts the ADVERTISED
+    // `workspace.fileOperations` block against what the profile offered, so the advertised
+    // capabilities are the source of truth (the server injects `typeHierarchyProvider` as a raw key
+    // the typed `InitializeResult` simply ignores on the way back in).
+    let init_result: lsp_types::InitializeResult = loop {
         if let Message::Response(resp) = recv(&client) {
             assert!(resp.error.is_none(), "{name}: initialize failed");
-            break;
+            break serde_json::from_value(resp.result.expect("initialize result present"))
+                .unwrap_or_else(|e| panic!("{name}: InitializeResult deserializes: {e}"));
         }
-    }
+    };
     client
         .sender
         .send(notification("initialized", InitializedParams {}))
@@ -371,6 +552,11 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
 
     // M10 (#72/#73/#74/#75): the semanticTokens / inlayHint / documentColor / codeAction walk.
     check_m10_projection(name, profile, &p, &client);
+
+    // M11 (#79/#80): the fileOperations.willRename advertisement gate + the config-gated
+    // documentFormatting floor (asserted off this walk's no-formatter boot). Driven off the
+    // advertised capabilities captured at `initialize`, derived from the profile's OWN flags.
+    check_m11_projection(name, profile, &init_result);
 
     common::shutdown(&client, server_thread);
 }
@@ -887,6 +1073,104 @@ fn check_m10_projection(
         !arr.iter()
             .any(|a| a["title"].as_str().is_some_and(|t| t.contains("Ignore"))),
         "{name}: the per-diagnostic suppression must NOT appear under a source.fixAll filter"
+    );
+}
+
+/// Assert the gated M11 projections for one profile against the capabilities ADVERTISED at
+/// `initialize` (the source of truth, derived from the profile's OWN flags — never hard-coding
+/// per-editor expectations):
+///
+/// - **`workspace.fileOperations.willRename`** (#79): advertised IFF the profile offered
+///   `workspace.fileOperations.willRename`. When advertised, the registration scopes to gdls's two
+///   tracked file kinds (`**/*.gd` + `**/*.tscn`) and gdls never advertises `willCreate`/`willDelete`
+///   (no edit to contribute on a create/delete). When the profile offers NO file operation at all,
+///   the whole `workspace.fileOperations` block is ABSENT (the negative projection — gdls advertises
+///   nothing the client can't send). The `did*` operations map 1:1 the same way.
+/// - **`textDocument/formatting`** (#80): this walk boots with NO `formatter.command` configured, and
+///   `documentFormatting` is CONFIG-gated (not client-cap-gated), so it must be ABSENT for EVERY
+///   profile here regardless of client capabilities. (The config-gated advertisement — present when a
+///   command is configured — is exercised by the dedicated [`document_formatting_is_config_gated`]
+///   test, since the per-profile walk never configures a formatter.)
+///
+/// Scene-aware `$`/`%`/`get_node` + resource-path completion (#77/#78) rides the EXISTING
+/// `completion_provider` (it only adds items under `textDocument/completion`, gated by the same M8
+/// completion capabilities), so it introduces NO new capability gate — already covered by
+/// [`check_completion_projection`]; nothing M11-specific to assert here.
+fn check_m11_projection(
+    name: &str,
+    profile: &serde_json::Value,
+    init: &lsp_types::InitializeResult,
+) {
+    let offers_will_rename = flag(profile, &["workspace", "fileOperations", "willRename"]);
+    let offers_did_rename = flag(profile, &["workspace", "fileOperations", "didRename"]);
+    let offers_did_create = flag(profile, &["workspace", "fileOperations", "didCreate"]);
+    let offers_did_delete = flag(profile, &["workspace", "fileOperations", "didDelete"]);
+    let offers_any_file_op =
+        offers_will_rename || offers_did_rename || offers_did_create || offers_did_delete;
+
+    let file_ops = init
+        .capabilities
+        .workspace
+        .as_ref()
+        .and_then(|w| w.file_operations.as_ref());
+
+    // The whole `workspace.fileOperations` block is present IFF the profile offered at least one
+    // file operation (a client that offers nothing is never told gdls handles file ops — W15).
+    assert_eq!(
+        file_ops.is_some(),
+        offers_any_file_op,
+        "{name}: workspace.fileOperations block present iff the client offered any file operation"
+    );
+
+    if let Some(file_ops) = file_ops {
+        // willRename advertised IFF offered; when advertised it scopes to gdls's two tracked file
+        // kinds (the MUTATING reference-rewrite over `.gd`/`.tscn`).
+        assert_eq!(
+            file_ops.will_rename.is_some(),
+            offers_will_rename,
+            "{name}: fileOperations.willRename advertised iff the client offered willRename"
+        );
+        if let Some(reg) = file_ops.will_rename.as_ref() {
+            let globs: Vec<&str> = reg
+                .filters
+                .iter()
+                .map(|f| f.pattern.glob.as_str())
+                .collect();
+            assert_eq!(
+                globs,
+                vec!["**/*.gd", "**/*.tscn"],
+                "{name}: willRename registration scopes to **/*.gd + **/*.tscn"
+            );
+        }
+        // The did* nudges map 1:1 the same way.
+        assert_eq!(
+            file_ops.did_rename.is_some(),
+            offers_did_rename,
+            "{name}: fileOperations.didRename advertised iff offered"
+        );
+        assert_eq!(
+            file_ops.did_create.is_some(),
+            offers_did_create,
+            "{name}: fileOperations.didCreate advertised iff offered"
+        );
+        assert_eq!(
+            file_ops.did_delete.is_some(),
+            offers_did_delete,
+            "{name}: fileOperations.didDelete advertised iff offered"
+        );
+        // gdls never contributes an edit on create/delete, so it never advertises will{Create,Delete}.
+        assert!(
+            file_ops.will_create.is_none() && file_ops.will_delete.is_none(),
+            "{name}: gdls never advertises willCreate/willDelete (no edit to contribute)"
+        );
+    }
+
+    // documentFormatting is CONFIG-gated (not client-cap-gated): this walk configured no formatter,
+    // so the capability must be ABSENT for every profile regardless of what the client advertises.
+    assert!(
+        init.capabilities.document_formatting_provider.is_none(),
+        "{name}: documentFormatting must be ABSENT with no formatter.command configured \
+         (config-gated, not client-cap-gated)"
     );
 }
 
