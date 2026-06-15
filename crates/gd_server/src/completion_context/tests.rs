@@ -912,3 +912,45 @@ fn bare_at_is_annotation_despite_error_token() {
     assert_eq!(at("@|\n").kind, CompletionKind::Annotation);
     assert_eq!(at("extends Node\n@|\n").kind, CompletionKind::Annotation);
 }
+
+// --- #126: string-form node-path prefix span must match the committed-dir split ---
+
+/// CORRUPTION GUARD (#126): in a string node path, `%` is a boundary ONLY as the leading `%Name`
+/// root sigil — never mid-path (it can't legally appear mid-segment). The committed dir is split on
+/// `/` only (`string_node_path_committed_dir`), so for `get_node("Foo/Bar%Baz|")` the committed dir
+/// is `Foo` and the prefix span must be the WHOLE last segment `Bar%Baz`. Accepting a child of `Foo`
+/// must then yield `Foo/<child>`, never `Foo/Bar%<child>` (a stale `Bar%` fragment). Reproduce-first:
+/// the pre-fix `string_arg_prefix` split the segment on the mid-path `%` and captured only `Baz`.
+#[test]
+fn string_node_path_mid_percent_splices_whole_segment_no_stale_fragment() {
+    let marked = "func f():\n\tget_node(\"Foo/Bar%Baz|\")";
+    assert_eq!(
+        splice(marked, "Area"),
+        "func f():\n\tget_node(\"Foo/Area\")",
+        "accepting a child must replace the whole `Bar%Baz` segment, not just `Baz`"
+    );
+}
+
+/// Regression guard: a `%Name`-rooted string keeps the leading `%` as the boundary — accepting a
+/// unique name replaces only the typed name after the `%` (`get_node("%Ui|")` → `get_node("%Health")`).
+#[test]
+fn string_node_path_rooted_percent_keeps_root_sigil() {
+    let marked = "func f():\n\tget_node(\"%Ui|\")";
+    assert_eq!(
+        splice(marked, "Health"),
+        "func f():\n\tget_node(\"%Health\")",
+        "a `%`-rooted string replaces only the name after the `%`"
+    );
+}
+
+/// Regression guard: an ordinary `/`-delimited string path is unaffected — the last segment after
+/// the final `/` is replaced (`get_node("A/B/Sp|")` → `get_node("A/B/Sprite")`).
+#[test]
+fn string_node_path_plain_slash_segment_unchanged() {
+    let marked = "func f():\n\tget_node(\"A/B/Sp|\")";
+    assert_eq!(
+        splice(marked, "Sprite"),
+        "func f():\n\tget_node(\"A/B/Sprite\")",
+        "the last `/`-delimited segment is replaced"
+    );
+}
