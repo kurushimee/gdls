@@ -2129,25 +2129,17 @@ fn reduce_cast(ctx: &mut AnalysisContext, id: NodeId) {
         // analyzer.cpp:3794-3798 — operand is Variant or soft-typed; Godot emits
         // `UNSAFE_CAST` with `cast_type.to_string()` as the lone symbol. No hard error.
         //
-        // **Suppression for `$Node`/`%Unique`/`get_node()` operands** — docs/02-frontend-port.md
-        // §10. gdls's permissive deferred-node policy types those expressions as Variant; in
-        // Godot they're typed as Node, so Godot doesn't fire UNSAFE_CAST on `$Foo as Bar`.
-        // Suppress to match. The corpus's `features/allow_get_node_with_onready.gd` exercises
-        // this exact pattern.
-        let operand_is_get_node = match &ctx.node(operand_id).kind {
-            NodeKind::GetNode(_) => true,
-            NodeKind::Call(c) => {
-                matches!(c.function_name.as_str(), "get_node" | "get_node_or_null")
-            }
-            _ => false,
-        };
-        if !operand_is_get_node {
-            ctx.push_warning(
-                crate::warnings::WarningCode::UnsafeCast,
-                &[cast_type.to_string()],
-                id,
-            );
-        }
+        // A `$Node`/`%Unique` operand never reaches here: `reduce_get_node` types it as a hard
+        // `NATIVE Node` (analyzer.cpp:3882-3886), so `$Foo as Bar` is the hard-operand cast handled
+        // below (a `Node` → `Bar` downcast, valid/no-warning), exactly as in Godot. A `get_node()`
+        // *call* likewise returns `Node` from the native DB, so it too is a hard operand — both the
+        // `features/allow_get_node_with_onready.gd` shapes (`$Node as Node`,
+        // `get_node(^"Node") as Node`) are same-type casts with no UNSAFE_CAST.
+        ctx.push_warning(
+            crate::warnings::WarningCode::UnsafeCast,
+            &[cast_type.to_string()],
+            id,
+        );
         return;
     }
 
@@ -6009,23 +6001,25 @@ fn reduce_identifier_with_flags(ctx: &mut AnalysisContext, id: NodeId, _can_be_b
 // reduce_get_node — analyzer.cpp:3848  (v1 policy: docs/02-frontend-port.md §11)
 // ===================================================================================================
 
-/// `GDScriptAnalyzer::reduce_get_node(p_get_node)` (analyzer.cpp:3848-3870). **gdls deliberately
-/// deviates from Godot here** — see docs/02-frontend-port.md §11. Until `.tscn` typing lands in
-/// Phase 2, `$NodePath` / `%UniqueName` expressions yield a **permissive deferred-node type** so
-/// the tool never emits a false positive on node access:
+/// `GDScriptAnalyzer::reduce_get_node(p_get_node)` (analyzer.cpp:3864-3887). A valid `$NodePath` /
+/// `%UniqueName` expression types as a hard **`NATIVE` `Node`** — exactly what Godot's analyzer
+/// produces (`kind=NATIVE`, `native_type="Node"`, `type_source=ANNOTATED_EXPLICIT`, builtin
+/// `OBJECT`). Godot never reads the `.tscn` for the *analyzer's* type, so a `$`/`%` access is the
+/// bare `Node` base, not the scene-precise node class. This is faithful convergence:
 ///
-/// * **No `Cannot use shorthand "get_node()" notation … on a class that isn't a node.` error** —
-///   Godot checks `ClassDB::is_parent_class(current_class.base_type.native_type, "Node")`. The
-///   `errors/get_node_shorthand_within_non_node.gd` corpus case stays permanently on the
-///   known-failure list per the v1 policy.
-/// * **No `Cannot use shorthand "get_node()" notation … in a static function.` error** — Godot
-///   gates on `static_context`. The `errors/get_node_shorthand_in_static_function.gd` case stays
-///   on the known-failure list.
-/// * **Result type is `Variant`**, not `NATIVE Node`. Per docs/02 §11 this is what makes
-///   `var enemy: Node3D = $Enemy` typecheck without "incompatible assignment" warnings: Variant
-///   accepts/produces any object type (`is_type_compatible` at analyzer.cpp:6315-6323), and member
-///   access on Variant is dynamic. Phase 2's `.tscn`-aware typing replaces this with the precise
-///   scene-derived node class.
+/// * `var enemy: Node2D = $Enemy` is a downcast `Node` → `Node2D`; Godot tolerates it silently
+///   (gradual typing: `is_type_compatible` accepts assigning a base to a derived var as an unsafe
+///   downcast, no error). A *precise* `Node2D`/`Control` scene type would instead reject a sibling
+///   downcast Godot accepts — a false positive. Precise scene-derived node types are therefore a
+///   navigation-only (hover/completion) goal kept OUT of the diagnostic path; see
+///   docs/02-frontend-port.md §11.
+/// * Member access on the bare `Node` resolves against `Node`'s member surface, so a miss
+///   (`$X.not_on_node`) raises `UNSAFE_PROPERTY_ACCESS` / `UNSAFE_METHOD_ACCESS` exactly as Godot
+///   does — the same behaviour as any other typed node base.
+///
+/// The two context errors below (`$` in a static function / in a non-`Node` class) mirror
+/// analyzer.cpp:3868-3878; on either, Godot leaves the default `VARIANT`/`UNDETECTED` result, which
+/// gdls reproduces so a `:=` infer off the failed `$` reports the companion infer error.
 fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
     if !matches!(&ctx.node(id).kind, NodeKind::GetNode(_)) {
         return;
@@ -6067,12 +6061,12 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
         );
     }
 
-    // Permissive deferred-node type — see fn-doc. When the contextual checks above DID emit an
-    // error the node type is effectively "no type" (Godot leaves `Variant` with the default
-    // `UNDETECTED` source), which propagates into a `:=` infer's `Cannot infer the type of "X"
-    // variable because the value doesn't have a set type.` companion. Otherwise we keep the
-    // permissive-deferred Variant so legitimate `$Node` accesses don't false-positive infer
-    // failures on classes that didn't error.
+    // Result type. When a context check above errored, Godot returns early leaving the default
+    // `VARIANT`/`UNDETECTED` (analyzer.cpp:3870/3876) — gdls reproduces that so a `:=` infer off the
+    // failed `$` reports its `Cannot infer the type of "X" variable because the value doesn't have a
+    // set type.` companion. Otherwise the access is a hard `NATIVE Node` (analyzer.cpp:3882-3886):
+    // bare `Node`, not the scene-precise node class — faithful to Godot, which never reads the scene
+    // for the analyzer's type. Member misses on it raise UNSAFE_*_ACCESS like any typed node base.
     if in_static_function || in_non_node_class {
         ctx.set_type(
             id,
@@ -6083,9 +6077,29 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
             },
         );
     } else {
-        ctx.set_type(id, DataType::variant());
+        ctx.set_type(
+            id,
+            DataType {
+                kind: DtKind::Native,
+                type_source: TypeSource::AnnotatedExplicit,
+                builtin_type: VariantType::Object,
+                native_type: "Node".to_owned(),
+                ..Default::default()
+            },
+        );
     }
 }
+
+// NOTE (M11 Phase 2): valid `$`/`%` types as bare `NATIVE Node` above — Godot's analyzer
+// (gdscript_analyzer.cpp:3882-3886) never reads the scene for the *type*, so it TOLERATES
+// sibling/subtype downcasts (`var c: Control = $Node2DChild` — exit 0) that a precise `Node2D` type
+// would reject. A `DataType` is used symmetrically in compatibility checks, so a scene-PRECISE type
+// fed here would turn those Godot-tolerated downcasts into false positives. Precise scene-derived
+// node types are therefore a navigation-only goal (precise HOVER/COMPLETION), kept OUT of the
+// diagnostic path. The `scene_node_facts` seam — the `CrossFileQuery::scene_node_facts` trait
+// default-None in `cross_file.rs`, the `WorkspaceXFileQuery` override, and the gd_project
+// `SceneIndex::resolve_relative_from`/`resolve_unique_in` resolution — is the dormant substrate for
+// that future feature; it is NOT consulted by the diagnostic path here. See docs/02 §11.
 
 // ===================================================================================================
 // reduce_await — analyzer.cpp:3053

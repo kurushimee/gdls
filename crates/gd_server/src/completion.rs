@@ -297,6 +297,8 @@ fn enumerate_members(state: &ServerState, tree: &ParseTree, dt: &DataType) -> Ve
         &state.workspace.native,
         &state.workspace.analysis_cache,
         rustc_hash::FxHashMap::default(),
+        &state.workspace.scenes,
+        &state.workspace.project.root,
     );
     enumerate::members_of_type(dt, &state.workspace.native, &xfile, tree)
 }
@@ -614,6 +616,8 @@ fn self_chain_members(
         &state.workspace.native,
         &state.workspace.analysis_cache,
         rustc_hash::FxHashMap::default(),
+        &state.workspace.scenes,
+        &state.workspace.project.root,
     );
     enumerate::members_of_type(dt, &state.workspace.native, &xfile, tree)
 }
@@ -1122,6 +1126,8 @@ fn call_arg_receiver_class(
             &state.workspace.native,
             &state.workspace.analysis_cache,
             rustc_hash::FxHashMap::default(),
+            &state.workspace.scenes,
+            &state.workspace.project.root,
         );
         enumerate::script_chain_native_root(&xfile, &state.workspace.native, sr)
     })
@@ -1295,6 +1301,8 @@ fn super_method_items(
         &state.workspace.native,
         &state.workspace.analysis_cache,
         rustc_hash::FxHashMap::default(),
+        &state.workspace.scenes,
+        &state.workspace.project.root,
     );
     enumerate::script_parent_members(&xfile, &state.workspace.native, &sr)
         .into_iter()

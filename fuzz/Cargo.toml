@@ -57,6 +57,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "scene_parse"
+path = "fuzz_targets/scene_parse.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 # Keep some debug info for readable crash backtraces without disabling optimizations.
 debug = 1

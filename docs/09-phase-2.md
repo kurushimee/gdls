@@ -135,7 +135,7 @@ relevant 3.18) appears exactly once.
 | textDocument/inlayHint (+ resolve, refresh) | **M10** | Inferred `:=` types, parameter names; config-toggleable |
 | textDocument/documentColor + colorPresentation | **M10** | `Color(...)`, `Color.CONSTANT`, `Color("#hex")` literals |
 | textDocument/codeAction (+ resolve, `source.fixAll`) | **M10** | Quickfixes for the warning set; standard kind strings; honors `context.only`; `workspace/applyEdit` + `executeCommand` plumbing |
-| `.tscn` scene index → precise `$`/`%` typing | **M11** | Retires the permissive deferred-node type (`docs/02 §11`); diagnostics converge with Godot |
+| `.tscn` scene index → `$`/`%` typing | **M11** | Valid `$`/`%` types as bare `NATIVE Node` — diagnostics converge with Godot (`docs/02 §11`). Precise scene-derived node facts (the scene index + resolution seam) are kept dormant for navigation/completion in phase 3 — NOT the diagnostic path (they'd turn Godot-tolerated downcasts into false positives) |
 | Scene-aware completion (node paths in `$`/`%`/`get_node`) | **M11** | Extends M8 completion with the M11 scene index |
 | Autoload scene typing (`uid://` → scene → root script) | **M11** | The `gd_project` deferral (`model.rs` uid→scene lookup) |
 | fileOperations: willRenameFiles (+ did\*) | **M11** | Moving a `.gd`/`.tscn` returns `WorkspaceEdit` fixing `preload`/`load` paths; `did*` nudges the index |
@@ -243,12 +243,15 @@ zero custom token names on the wire; fix-all on save works in VS Code via standa
 ### M11 — scenes & file operations (the original "Phase 2" payload)
 
 `.tscn` text parsing (`tree-sitter-godot-resource` as format reference; no engine instantiation —
-§3 W16) into a scene index keyed alongside the script index; `$Node`/`%Unique` resolve to precise
-node types, retiring the permissive deferred-node policy of `docs/02 §11` (its no-false-positive
-guarantee must survive: unresolvable paths stay permissive); scene-aware node-path completion;
-autoload `uid://` scene → root-script typing; `willRenameFiles` → `preload`/`load` path edits
-(+`did*` index nudges); the external-formatter bridge. **Exit:** `$`/`%` diagnostics converge with
-Godot on the acceptance projects (sweep gate per `scripts/m6-acceptance/scan_diags.py`,
+§3 W16) into a scene index keyed alongside the script index; valid `$Node`/`%Unique` type as bare
+`NATIVE Node` (faithful to Godot's analyzer, `docs/02 §11`), so diagnostics converge — precise
+scene-derived node types are deferred to a phase-3 navigation feature (precise hover/completion),
+explicitly OUT of the diagnostic path because a precise type fed into the symmetric compatibility
+checks would turn Godot-tolerated sibling downcasts into false positives; the resolution substrate
+(scene index + `scene_node_facts` seam) is built and kept dormant for that. Scene-aware node-path
+completion; autoload `uid://` scene → root-script typing; `willRenameFiles` → `preload`/`load` path
+edits (+`did*` index nudges); the external-formatter bridge. **Exit:** `$`/`%` diagnostics converge
+with Godot on the acceptance projects (sweep gate per `scripts/m6-acceptance/scan_diags.py`,
 comparative, both projects, Windows binary for the private one); renaming a script in VS Code's
 explorer fixes every `preload` in-project.
 
@@ -331,8 +334,13 @@ inventory and this machine's gaps). Deferred interactive items accumulate here p
    binary (and a tree-sitter grammar for base highlighting where the editor requires one).
 3. Zero custom methods/notifications on the wire; zero non-spec fields outside `data`; the §3
    anti-catalog holds row by row.
-4. `$`/`%` diagnostics converge with Godot (the `docs/02 §11` deviation retired without
-   reintroducing false positives).
+4. `$`/`%` diagnostics converge with Godot: a valid `$`/`%` types as bare `NATIVE Node`
+   (`docs/02 §11`), with no false positives on the sibling/subtype downcasts Godot tolerates.
+   Precise scene-derived node types are navigation-only (phase 3), explicitly out of the diagnostic
+   path. (Member-access convergence is property-access complete; `UNSAFE_METHOD_ACCESS` on a
+   method miss is a pre-existing analyzer-wide under-emission tracked in #123, not `$`-specific.)
+   Full convergence is adjudicated by the comparative `--strict` acceptance sweep on both projects
+   (the standing release gate), which may surface further follow-ups.
 5. Both fidelity ratchets still 1.0000; both acceptance-project sweeps clean under the standing
    comparative gate; fuzz gate green including the `.tscn` target.
 

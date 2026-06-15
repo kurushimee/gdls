@@ -16,6 +16,39 @@ use gd_types::NativeDb;
 
 use crate::binding::MemberXref;
 
+/// A statically-known `$`/`%` node-path access a future navigation feature asks the scene index to
+/// resolve (phase-3 substrate — see [`CrossFileQuery::scene_node_facts`]; NOT the diagnostic path).
+///
+/// Deliberately the SUBSET of `$`/`%` shapes scene resolution handles soundly; every other shape
+/// (absolute `$/root/...`, embedded/multi-segment `%`, `get_node("literal")`) yields no query and
+/// stays unresolved (the navigation feature degrades gracefully on those).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodePathQuery {
+    /// A root-relative `$A/B`-style path (no leading `/`, no `%`), resolved RELATIVE to the node the
+    /// querying script is attached to. The string is the path text after the `$` (e.g. `"A/B"`).
+    RelativePath(String),
+    /// A single-segment `%Name` unique-name lookup, resolved in the owner scene's unique-name table.
+    /// The string is the bare name (no `%` prefix).
+    UniqueName(String),
+}
+
+/// What the scene index knows about a `$`/`%` access target — a *fact*, never a `DataType` (the trait
+/// stays free of the analyzer's type lattice; a consumer builds a `DataType` from this). Phase-3
+/// navigation substrate (NOT the diagnostic path — [`CrossFileQuery::scene_node_facts`]).
+///
+/// Resolution is CONSERVATIVE end-to-end: a `Some` means every attaching scene agreed on this exact
+/// fact; any ambiguity (no scene, absent node, instanced sub-scene unresolved, two scenes
+/// disagreeing) yields `None` from [`CrossFileQuery::scene_node_facts`] (a missed precise type is a
+/// known limitation; a wrong one is a defect).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SceneNodeFacts {
+    /// The target node is a native/engine class (e.g. `"Sprite2D"`), with no attached script.
+    Native(String),
+    /// The target node has an attached GDScript (a `script=` on the node, or the script at the root
+    /// of an instanced sub-scene) — typed as a Script INSTANCE of that file.
+    Script(FileId),
+}
+
 /// What the analyzer can ask about *other* files while resolving the one in hand.
 ///
 /// Deliberately small: it exposes project facts (does this global name exist? what does this file
@@ -121,6 +154,37 @@ pub trait CrossFileQuery {
     /// the existing Script-member path. `None` = not an autoload (default; overridden only by
     /// `WorkspaceXFileQuery` in `gd_server`, which has access to the `ProjectModel`).
     fn autoload_file(&self, _name: &str) -> Option<FileId> {
+        None
+    }
+
+    /// Resolve a statically-known `$`/`%` node-path access made by the script `script_file` into the
+    /// concrete type fact of the target node, reading the `.tscn` scene(s) `script_file` is attached
+    /// to.
+    ///
+    /// **Phase-3 navigation substrate — NOT the diagnostic path.** This is the dormant seam for a
+    /// future precise-HOVER / precise-COMPLETION feature (resolving `$Foo` to its scene-precise node
+    /// class for navigation). It is **deliberately NOT consulted by `reduce_get_node`**: a valid
+    /// `$`/`%` types as bare `NATIVE Node` (faithful to Godot — see `docs/02` §11), because a
+    /// scene-PRECISE `DataType` fed into the symmetric compatibility checks would turn the
+    /// sibling/subtype downcasts Godot tolerates (`var c: Control = $Node2DChild`) into false
+    /// positives. A precise type is safe for navigation (read-only display) but not for diagnostics.
+    ///
+    /// **Default `None`.** `SyntacticQuery`, `NoCrossFile`, and the analyze-phase conformance
+    /// harness's `CorpusQuery` all inherit this default (none can reach a scene index). Only
+    /// `gd_server`'s `WorkspaceXFileQuery`, which owns the project's
+    /// [`SceneIndex`](gd_project::SceneIndex), overrides it.
+    ///
+    /// **Conservative contract (no false positives).** An override MUST return `None` for any
+    /// uncertainty: no scene attaches `script_file`; the script attaches at MULTIPLE nodes in one
+    /// scene (relative resolution ambiguous); the target node is absent; an instanced sub-scene can't
+    /// be resolved; or — critically — the script attaches to MULTIPLE scenes that resolve the access
+    /// to DIFFERENT facts (return `Some` only on unanimous agreement). A missed precise type is a
+    /// known limitation; a wrong one is a release blocker.
+    fn scene_node_facts(
+        &self,
+        _script_file: FileId,
+        _query: &NodePathQuery,
+    ) -> Option<SceneNodeFacts> {
         None
     }
 

@@ -454,21 +454,6 @@ impl DataType {
         }
     }
 
-    /// The permissive **deferred-node** type (`docs/02` §11): assignable to any `Node`-derived var
-    /// and dynamic on member access, so v1 never emits a false positive on `$Path` / `%Name` before
-    /// scene typing exists. A deliberate deviation from Godot, flagged by `is_pseudo_type`.
-    pub fn deferred_node() -> Self {
-        DataType {
-            kind: DtKind::Native,
-            type_source: TypeSource::AnnotatedExplicit,
-            builtin_type: VariantType::Object,
-            native_type: "Node".to_owned(),
-            is_read_only: true,
-            is_pseudo_type: true,
-            ..Default::default()
-        }
-    }
-
     /// Godot `operator==` (`gdscript_parser.h:196`): `Undetected`/`Inferred` compare equal to anything
     /// "for parsing purposes"; otherwise compare by kind-specific payload.
     pub fn equiv(&self, other: &DataType) -> bool {
@@ -601,15 +586,6 @@ mod tests {
     }
 
     #[test]
-    fn deferred_node_is_a_permissive_node() {
-        let n = DataType::deferred_node();
-        assert_eq!(n.kind, DtKind::Native);
-        assert_eq!(n.native_type, "Node");
-        assert!(n.is_pseudo_type, "the permissive-node marker");
-        assert!(n.is_hard_type());
-    }
-
-    #[test]
     fn kind_consistent_accepts_well_formed_types() {
         // Variant placeholders are always consistent.
         assert!(DataType::variant().kind_consistent());
@@ -625,7 +601,13 @@ mod tests {
         assert!(int.kind_consistent());
 
         // Native carries a native_type.
-        let node = DataType::deferred_node();
+        let node = DataType {
+            kind: DtKind::Native,
+            type_source: TypeSource::AnnotatedExplicit,
+            builtin_type: VariantType::Object,
+            native_type: "Node".to_owned(),
+            ..Default::default()
+        };
         assert!(node.kind_consistent());
 
         // Script carries a script_type.

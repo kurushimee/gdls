@@ -1,0 +1,6 @@
+[gd_scene format=3 uid="uid://truncated
+[ext_resource type="Script" path="res://only.gd" id=
+garbage line with no equals or bracket %%% binary-ish \x00
+[node name="Survivor" type="Node"
+[node name="RealNode" type="Node2D"]
+script = ExtResource(

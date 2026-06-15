@@ -62,6 +62,14 @@ pub enum Reaction {
         path: Utf8PathBuf,
         change: FileChange,
     },
+    /// M11 (#76): a `.tscn` scene file changed — re-index it in the [`gd_project::SceneIndex`]
+    /// (or drop it on delete). `path` is the canonical destination path, same convention as
+    /// [`Self::GdSource`]. Phase 1 keeps the scene index live; it does NOT yet re-diagnose the
+    /// scene's attached scripts (the analyzer doesn't consume scenes until Phase 2).
+    Scene {
+        path: Utf8PathBuf,
+        change: FileChange,
+    },
     /// A doc-classes XML changed under an addon directory — re-merge into [`gd_types::NativeDb`].
     DocClassesXml { path: Utf8PathBuf },
     /// Anything else — dropped without action. WP-RD7 split the former catch-all `Other` to carry a
@@ -406,6 +414,12 @@ fn reaction_for_path(path: &Utf8Path, change: FileChange, project_root: &Utf8Pat
     }
     match path.extension() {
         Some("gd") => gd_source_one_sided(path.to_path_buf(), change),
+        // M11 (#76): `.tscn` scene text → the scene index. `.scn` (binary) is deliberately not
+        // handled — gdls parses scene TEXT only (anti-catalog W16) and the watcher doesn't watch it.
+        Some("tscn") => Reaction::Scene {
+            path: path.to_path_buf(),
+            change,
+        },
         Some("gdextension") => Reaction::Gdextension {
             path: path.to_path_buf(),
             change,
@@ -470,6 +484,49 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    #[test]
+    fn classify_tscn_returns_scene() {
+        // M11 (#76): a `.tscn` change must route to `Reaction::Scene`, not the `.gd` interner path
+        // or an `Other` drop. This is what makes the `**/*.tscn` watcher glob's events actionable.
+        let root = p("/proj");
+        let ev = mk_event(
+            notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any,
+            )),
+            vec!["/proj/src/Main.tscn"],
+        );
+        assert!(matches!(
+            classify_event(&ev, &root).as_slice(),
+            [Reaction::Scene {
+                change: FileChange::Modified,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn classify_client_tscn_returns_scene() {
+        // The client-event funnel must classify `.tscn` identically to the native watcher.
+        let root = p("/proj");
+        let r = classify_client_event(&p("/proj/ui/Panel.tscn"), FileChange::Created, &root);
+        assert!(matches!(
+            r,
+            Reaction::Scene {
+                change: FileChange::Created,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn classify_scn_binary_is_not_a_scene_reaction() {
+        // `.scn` (binary) is deliberately NOT handled — gdls parses scene TEXT only (W16). It falls
+        // to the unknown-extension drop, never `Reaction::Scene`.
+        let root = p("/proj");
+        let r = classify_client_event(&p("/proj/ui/Panel.scn"), FileChange::Modified, &root);
+        assert!(matches!(r, Reaction::Other(SkipReason::UnknownExtension)));
     }
 
     #[test]

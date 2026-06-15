@@ -1,0 +1,12 @@
+[gd_scene format=3 uid="uid://dchildscene"]
+
+[ext_resource type="Script" path="res://src/child.gd" id="1"]
+
+[node name="ChildRoot" type="PanelContainer"]
+script = ExtResource("1")
+
+[node name="Inner" type="MarginContainer" parent="."]
+
+[node name="UniqueButton" type="Button" parent="Inner"]
+unique_name_in_owner = true
+text = "Press"

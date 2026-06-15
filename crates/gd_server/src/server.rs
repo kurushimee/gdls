@@ -1750,6 +1750,10 @@ fn register_watched_files(state: &mut ServerState) {
                 "registerOptions": {
                     "watchers": [
                         watcher("**/*.gd"),
+                        // M11 (#76): `.tscn` scene files feed the scene index (node/script/instance
+                        // relations). `.scn` (binary) is intentionally NOT watched — gdls parses
+                        // scene TEXT only (anti-catalog W16), and a binary `.scn` has no text form.
+                        watcher("**/*.tscn"),
                         watcher("**/project.godot"),
                         watcher("**/*.gdextension"),
                         watcher("**/extension_api.json"),
@@ -1813,6 +1817,7 @@ fn reaction_kind(reaction: &Reaction) -> &'static str {
         Reaction::ExtensionApiJson => "extension_api_json",
         Reaction::Gdextension { .. } => "gdextension",
         Reaction::DocClassesXml { .. } => "doc_classes_xml",
+        Reaction::Scene { .. } => "scene",
     }
 }
 
@@ -1823,6 +1828,7 @@ fn reaction_kind(reaction: &Reaction) -> &'static str {
 fn event_path(reaction: &Reaction) -> Option<String> {
     match reaction {
         Reaction::GdSource { path, .. } => Some(path.to_string()),
+        Reaction::Scene { path, .. } => Some(path.to_string()),
         _ => None,
     }
 }
@@ -1933,13 +1939,35 @@ fn apply_reaction_inner(
                 }
             }
         }
+        // M11 (#76): a `.tscn` change keeps the scene index live mid-session. Bounded to the project
+        // root like GdSource. Disk-sourced (the scene index is not fed from editor buffers). It does
+        // NOT re-diagnose the scene's attached scripts: a valid `$`/`%` types as bare `NATIVE Node`
+        // from the enclosing class/function alone (`reduce_get_node`), independent of the scene, so a
+        // scene edit cannot change a script's diagnostics — re-publishing them would be byte-identical
+        // churn. (Precise scene-derived types are navigation-only and pull-based — `docs/02` §11 —
+        // so they need no dirty-marking either.) Only the index itself is mutated, keeping queries
+        // that DO read scenes (future precise hover/completion) live.
+        Reaction::Scene { path, change } => {
+            if !path_is_within(&path, project_root) {
+                log::warn!("watcher: dropping out-of-root scene event for {path}");
+                return;
+            }
+            match change {
+                FileChange::Created | FileChange::Modified => state.workspace.reindex_scene(&path),
+                FileChange::Deleted => state.workspace.remove_scene(&path),
+                FileChange::Renamed { from, to } => {
+                    state.workspace.remove_scene(&from);
+                    state.workspace.reindex_scene(&to);
+                }
+            }
+        }
         // A dropped `Other` is a no-op here — its `SkipReason` was already recorded on the
         // surrounding `watcher_event` span (WP-RD7).
         Reaction::Other(_) => {}
         // WP-RD11 (3): the project/native-DB reactions (ProjectGodot, ExtensionApiJson,
         // Gdextension, DocClassesXml) are no longer reloaded per-event — `handle_watcher` scans the
         // whole batch and coalesces their reload + `republish_all_open_buffers` into one post-batch
-        // pass. So `apply_reaction` does per-file work only for `GdSource`.
+        // pass. So `apply_reaction` does per-file work only for `GdSource` and `Scene`.
         _ => {}
     }
 }
@@ -2107,9 +2135,9 @@ fn capabilities(encoding: PositionEncoding) -> ServerCapabilities {
         implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
         // M8 (#64): completion. Trigger characters are the NON-identifier characters that should
-        // auto-pop the list (`.` member access, `$`/`%` node paths — currently the deferred-node
-        // policy, `"` resource/string contexts, `@` annotations); identifier characters never go
-        // here (the client triggers on those itself). `resolve_provider: true` defers
+        // auto-pop the list (`.` member access, `$`/`%` node paths, `"` resource/string contexts,
+        // `@` annotations); identifier characters never go here (the client triggers on those
+        // itself). `resolve_provider: true` defers
         // documentation/detail to a `completionItem/resolve` round-trip (lazy — the list stays
         // cheap). `label_details_support: true` lets resolve attach the structured label detail in
         // a later phase.

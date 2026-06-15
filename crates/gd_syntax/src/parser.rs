@@ -4743,6 +4743,32 @@ mod tests {
         id.map(|i| &tree.get(i).kind)
     }
 
+    /// M11 scene-typing relies on `GetNodeNode::full_path` faithfully carrying the path text so the
+    /// analyzer can tell an ABSOLUTE path (leading `/`) and a UNIQUE name (leading `%`) apart from a
+    /// plain relative path — a misread is a false-positive vector (an absolute `$/abs/x` read as
+    /// relative would resolve against the wrong node). Pin the reconstructed `full_path`/`use_dollar`
+    /// for each shape.
+    #[test]
+    fn get_node_full_path_preserves_absolute_and_unique_markers() {
+        let path_of = |src: &str| -> (String, bool) {
+            let (tree, root, errs) = expr(src);
+            assert!(errs.is_empty(), "{src:?} parsed with errors: {errs:?}");
+            match kind_of(&tree, root) {
+                Some(NodeKind::GetNode(n)) => (n.full_path.clone(), n.use_dollar),
+                other => panic!("{src:?} did not parse to a GetNode: {other:?}"),
+            }
+        };
+        // Relative path: no leading slash, no `%`.
+        assert_eq!(path_of("$Health"), ("Health".to_owned(), true));
+        assert_eq!(path_of("$A/B"), ("A/B".to_owned(), true));
+        // Absolute path: the leading `/` MUST be preserved (the parser consumes one optional initial
+        // slash after `$`, then re-emits it into full_path — `$/root/x` → `/root/x`).
+        assert_eq!(path_of("$/root/Child"), ("/root/Child".to_owned(), true));
+        // Unique name: the `%` is preserved at the front.
+        assert_eq!(path_of("%Special"), ("%Special".to_owned(), false));
+        assert_eq!(path_of("$%Special"), ("%Special".to_owned(), true));
+    }
+
     /// WP-F1/F2 fidelity (`gdscript_parser.cpp:4441-4459`): `@icon` duplicate detection is keyed on
     /// the class already holding a NON-EMPTY `icon_path`, not on the mere presence of a prior
     /// `@icon` node. These malformed-input cases have no `.out` corpus fixture (the corpus only

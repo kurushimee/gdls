@@ -1,0 +1,26 @@
+[gd_scene load_steps=5 format=3 uid="uid://dmainscene01"]
+
+[ext_resource type="Theme" uid="uid://dtheme01" path="res://assets/theme.tres" id="1"]
+[ext_resource type="Script" uid="uid://dmainscript" path="res://src/main.gd" id="2"]
+[ext_resource type="PackedScene" uid="uid://dchildscene" path="res://src/child.tscn" id="3_abc"]
+
+[sub_resource type="StyleBoxFlat" id="StyleBoxFlat_1"]
+bg_color = Color(0.1, 0.1, 0.1, 1)
+
+[node name="Root" type="Control"]
+layout_mode = 3
+anchors_preset = 15
+theme = ExtResource("1")
+script = ExtResource("2")
+
+[node name="VBox" type="VBoxContainer" parent="."]
+layout_mode = 2
+
+[node name="TitleLabel" type="Label" parent="VBox"]
+unique_name_in_owner = true
+text = "Title"
+
+[node name="ChildInstance" parent="VBox" instance=ExtResource("3_abc")]
+layout_mode = 2
+
+[connection signal="pressed" from="VBox/TitleLabel" to="." method="_on_title_pressed"]
