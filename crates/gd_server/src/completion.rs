@@ -309,7 +309,7 @@ fn enumerate_members(state: &ServerState, tree: &ParseTree, dt: &DataType) -> Ve
         &state.workspace.index,
         &state.workspace.native,
         &state.workspace.analysis_cache,
-        rustc_hash::FxHashMap::default(),
+        crate::xfile::AutoloadEnv::default(),
         &state.workspace.scenes,
         &state.workspace.project.root,
     );
@@ -628,7 +628,7 @@ fn self_chain_members(
         &state.workspace.index,
         &state.workspace.native,
         &state.workspace.analysis_cache,
-        rustc_hash::FxHashMap::default(),
+        crate::xfile::AutoloadEnv::default(),
         &state.workspace.scenes,
         &state.workspace.project.root,
     );
@@ -1138,7 +1138,7 @@ fn call_arg_receiver_class(
             &state.workspace.index,
             &state.workspace.native,
             &state.workspace.analysis_cache,
-            rustc_hash::FxHashMap::default(),
+            crate::xfile::AutoloadEnv::default(),
             &state.workspace.scenes,
             &state.workspace.project.root,
         );
@@ -1313,7 +1313,7 @@ fn super_method_items(
         &state.workspace.index,
         &state.workspace.native,
         &state.workspace.analysis_cache,
-        rustc_hash::FxHashMap::default(),
+        crate::xfile::AutoloadEnv::default(),
         &state.workspace.scenes,
         &state.workspace.project.root,
     );

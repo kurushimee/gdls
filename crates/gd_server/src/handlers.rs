@@ -584,7 +584,7 @@ pub fn definition(
         let autoload_fid = state
             .workspace
             .project
-            .autoload_script_path(&name)
+            .autoload_script_path_in_scenes(&name, &state.workspace.scenes)
             .and_then(|p| state.workspace.index.resolve_res_path(&p));
         if let Some(fid) = autoload_fid {
             let node_span = parsed.tree.get(node_id).span;
@@ -1979,7 +1979,10 @@ fn find_res_path_definition(
 /// that hasn't been written to disk — the same class of bug already fixed in `find_res_path_definition`
 /// and `document_link`.
 fn find_autoload_definition(state: &ServerState, name: &str) -> Option<Location> {
-    let res_path = state.workspace.project.autoload_script_path(name)?;
+    let res_path = state
+        .workspace
+        .project
+        .autoload_script_path_in_scenes(name, &state.workspace.scenes)?;
     // Gate on index membership — only emit a Location for paths that resolve to an actually
     // existing, indexed project file. `resolve_res_path` returns Some only for indexed (on-disk)
     // files; if save.gd is absent from disk, this returns None → no Location emitted.
@@ -2244,7 +2247,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     let autoload_fid = state
         .workspace
         .project
-        .autoload_script_path(&name)
+        .autoload_script_path_in_scenes(&name, &state.workspace.scenes)
         .and_then(|p| state.workspace.index.resolve_res_path(&p));
     let is_autoload = autoload_fid.is_some_and(|fid| {
         let node_span = parsed.tree.get(node_id).span;
@@ -2798,7 +2801,7 @@ fn collect_in_file_highlight_sites(
     let autoload_fid = state
         .workspace
         .project
-        .autoload_script_path(name)
+        .autoload_script_path_in_scenes(name, &state.workspace.scenes)
         .and_then(|p| state.workspace.index.resolve_res_path(&p));
     let is_autoload = autoload_fid.is_some_and(|fid| {
         let Some(p) = current_path

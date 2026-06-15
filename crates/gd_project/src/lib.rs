@@ -33,7 +33,7 @@ pub use interface::{
     extract as extract_interface, EnumDecl, Extends, Interface, MemberDecl, MemberFlags,
     MemberKind, TypeExpr,
 };
-pub use model::{LoadOutcome, ProjectModel};
+pub use model::{AutoloadTyping, LoadOutcome, ProjectModel};
 pub use paths::{path_to_res, res_to_path};
 pub use project_godot::{
     classify, parse as parse_project_godot, Autoload, ProjectGodot, ResTarget, WarnLevel,
