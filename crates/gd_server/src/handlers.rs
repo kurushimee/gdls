@@ -2727,8 +2727,10 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             NonMethodTarget::Member(_) => {
                 method_scan_candidate_uris(state, &name, current_fid, "references")
             }
-            // Locals + in-file enum values can never be referenced from another file (the
-            // `EnumValueLocal` binding is recorded only in the declaring file) — no fan-out at all.
+            // Locals are never referenced cross-file. Enum values do no fan-out either: the
+            // `EnumValueLocal` binding is recorded only in the DECLARING file (the referencing file's
+            // cross-file enum metatype carries no `class_node` anchor), so a `class_name`'d enum's
+            // `Foo.E.V` uses in other files are under-collected — loud under-rename, tracked #158.
             NonMethodTarget::Local { .. } | NonMethodTarget::EnumValue { .. } => Vec::new(),
             NonMethodTarget::Unresolved => {
                 // Fast-path for class/type names: only files whose interface mentions `name`
@@ -3571,9 +3573,11 @@ enum NonMethodTarget {
     /// composite identity `"<EnumName>.<value>"`. Use sites are the `EnumValueLocal` bindings whose
     /// `target_name` equals `qualified` (an enum-qualified scan, never a bare-name one — `enum A { X }`
     /// and `enum B { X }` stay distinct, and an unrelated `const NORTH`/method `NORTH` is never
-    /// collected). Current-file-only: the binding is recorded only in the declaring file, so there is
-    /// no cross-file fan-out (a value of a named in-file enum is not reachable by name from another
-    /// file). #106.
+    /// collected). Current-file-only: the `EnumValueLocal` binding is recorded only in the declaring
+    /// file (a cross-file enum metatype carries `script_type`, not `class_node`, so the referencing
+    /// file records nothing), so there is no cross-file fan-out. For a `class_name`'d script this
+    /// UNDER-renames `Foo.E.V` uses in OTHER files when renaming from the declaration — a loud
+    /// compile error, not corruption (tracked #158). #106.
     EnumValue {
         decl_ident: NodeId,
         qualified: String,
@@ -5844,19 +5848,19 @@ fn rename_name_is_engine_symbol(state: &ServerState, name: &str) -> bool {
 /// `true` iff the cursor target positively resolves to an editable PROJECT declaration — the
 /// fail-closed gate's signal 4. A method/signal ROLE (declaration click or dotted call) is treated
 /// as anchored (native methods were already refused by signals 2/3; project methods have an in-file
-/// declaration). Otherwise require one of: an in-file root-class member declaration, a project
-/// `class_name`, an enclosing-function local/param, or a `Member`-classified analyzer use at the
-/// cursor span. The genuinely-unresolvable residue (unknown identifiers, `extends UnknownThing`)
-/// returns `false` → the caller refuses.
+/// declaration). Otherwise require one of: an in-file root-class member DECLARATION click
+/// ([`node_is_root_member`] — cursor-positional, NOT name-based, so a cross-file `X.NAME` can't
+/// borrow a same-named member's anchor), a project `class_name`, an enclosing-function local/param,
+/// or a `Member`/`EnumValue`-classified analyzer use at the cursor span (an in-file named enum VALUE
+/// anchors here by IDENTITY — its `EnumValueLocal` binding / `EnumNode.values` decl token). The
+/// genuinely-unresolvable residue (unknown identifiers, `extends UnknownThing`) returns `false` →
+/// the caller refuses.
 ///
-/// KNOWN LIMITATION (deliberate, fail-closed side effect — track as a follow-up issue): a *project*
-/// `@GlobalScope`-style enum VALUE (`enum E { NORTH }`; cursor on `NORTH`) and an autoload singleton
-/// NAME both lack a project anchor here — `classify_non_method_target` excludes `EnumValue`, and
-/// `member_named` matches an enum's own name, not its values — so they now REFUSE where the prior
-/// fail-open path raw-scanned and edited them. This is the refuse-rather-than-corrupt stance
-/// (renaming an enum value by raw text scan is exactly the W16 grep-rename), not a regression to fix
-/// by widening the gate (which would reopen the native-enum-value hole). Enum TYPE names and
-/// members rename normally.
+/// KNOWN LIMITATION (deliberate, fail-closed): an autoload singleton NAME lacks a project anchor here
+/// (its only declaration is the `project.godot` `[autoload]` key, not a `.gd` symbol), so it REFUSES
+/// rather than raw-scan-and-edit — the refuse-rather-than-corrupt stance (a name-scan rename is
+/// exactly the W16 grep-rename). A proper autoload rename (config-file rewrite) is tracked in #157.
+/// Enum TYPE names, enum members, and in-file enum VALUES rename normally.
 fn rename_target_has_project_anchor(
     state: &mut ServerState,
     uri: &Uri,

@@ -1802,3 +1802,76 @@ fn definition_on_enum_value_use_resolves_to_declaration() {
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_cross_file_class_name_enum_value_underrenames_from_declaration() {
+    // BOUNDARY PIN (#158): renaming a `class_name`'d script's enum value FROM ITS DECLARATION edits
+    // the declaring file but UNDER-collects the cross-file `Foo.Dir.NORTH` use (its base is a
+    // cross-file enum metatype carrying `script_type`, not `class_node`, so no `EnumValueLocal` is
+    // recorded there and there is no fan-out). This is loud UNDER-rename (the other file fails to
+    // compile), NOT corruption — the documented #106 fail-closed boundary. The edit must still be
+    // PRECISE in the declaring file (decl + its own in-file use), never touch an unrelated symbol,
+    // and must NOT error. Pinned so the behavior is intentional; flip to full coverage when #158 lands.
+    let project = common::sample_project();
+    project.write(
+        "src/lib.gd",
+        "class_name Lib\nextends Node\n\nenum Dir { NORTH }\n\nfunc here() -> int:\n\treturn Dir.NORTH\n",
+    );
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nfunc there() -> int:\n\treturn Lib.Dir.NORTH\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/lib.gd", "src/use.gd"],
+        2,
+    );
+    let lib_uri = file_uri(&project.root.join("src/lib.gd"));
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+
+    // Rename `NORTH` from its declaration in lib.gd (line 3 `enum Dir { NORTH }`, `NORTH` at col 11).
+    client
+        .sender
+        .send(request(
+            209,
+            "textDocument/rename",
+            rename_params(&lib_uri, 3, 11, "UP"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming a class_name'd enum value from its declaration must succeed (not error): {:?}",
+        resp.error
+    );
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    // The edited set is EXACTLY lib.gd's decl (3,11) + its in-file use (6,8 — `\treturn Dir.NORTH`,
+    // tab + `return Dir.`(cols1-10) → `NORTH` at col 11... recompute: tab(0) `return `(1-7) `Dir`(8-10)
+    // `.`(11) `NORTH`(12)). The cross-file use.gd site is NOT collected (the documented boundary).
+    let mut sites: Vec<(String, u32, u32)> = view
+        .set
+        .iter()
+        .map(|(u, r)| (u.clone(), r.start.line, r.start.character))
+        .collect();
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            (lib_uri.as_str().to_string(), 3, 11),
+            (lib_uri.as_str().to_string(), 6, 12),
+        ],
+        "the edit must be precise in the declaring file (decl + in-file use) and NOT touch the \
+         cross-file use.gd site (documented #158 under-rename boundary); got {sites:?}"
+    );
+    assert!(
+        !view.set.iter().any(|(u, _)| *u == use_uri.as_str()),
+        "the cross-file `Lib.Dir.NORTH` site must NOT be edited (documented boundary): {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
