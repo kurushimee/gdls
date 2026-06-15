@@ -66,6 +66,16 @@ pub struct InitializationOptions {
     /// toggling either knob via `workspace/didChangeConfiguration` re-applies here and emits a
     /// `workspace/inlayHint/refresh` so the client re-requests with the new policy live.
     pub inlay_hint: InlayHintConfig,
+    /// M11 (#80): the external-formatter bridge (`textDocument/formatting`). Godot ships no
+    /// GDScript formatter to port, so gdls shells out to a user-configured command
+    /// (rust-analyzer/rustfmt pattern). **Session-structural**, NOT runtime-reloadable: it is read
+    /// once at `initialize` to decide whether to advertise `documentFormattingProvider`, and a
+    /// capability cannot be added mid-session (the client already snapshotted the server caps at the
+    /// handshake), so a `didChangeConfiguration` payload that changes it keeps the startup value and
+    /// logs a "requires restart" warning — exactly like `projectRoot`/`extensionApiPath`. The
+    /// capability is advertised ONLY when `command` is set (anti-catalog W15: never advertise an
+    /// unconfigured/unimplemented surface).
+    pub formatter: FormatterConfig,
 }
 
 /// Manual so `parse(None)`, `parse(Some({}))`, and a missing single field all agree —
@@ -85,7 +95,45 @@ impl Default for InitializationOptions {
             stub_cache_dir: None,
             completion: CompletionConfig::default(),
             inlay_hint: InlayHintConfig::default(),
+            formatter: FormatterConfig::default(),
         }
+    }
+}
+
+/// M11 (#80): the external-formatter bridge configuration surfaced through
+/// `initializationOptions.formatter`. Godot has no GDScript formatter to port, so gdls invokes a
+/// user-configured external command (the rust-analyzer `rust-analyzer.rustfmt.overrideCommand`
+/// pattern): the document text is piped to the child's STDIN and its STDOUT is the formatted result.
+///
+/// "Configured" — and therefore whether `documentFormattingProvider` is advertised at all — is
+/// `command.is_some()`. The default (`command: None`) leaves the feature OFF and unadvertised
+/// (anti-catalog W15: never advertise a surface that isn't wired to a real tool).
+///
+/// **No shell.** `command` is the executable name/path and `args` its argument vector, passed
+/// straight to [`std::process::Command`] — gdls NEVER goes through `sh -c`/`cmd /c`, so a `command`
+/// or `args` value cannot be interpreted as a shell expression (no injection, no glob/`$VAR`
+/// expansion). A user wanting a pipeline configures a wrapper script as `command`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FormatterConfig {
+    /// The formatter executable — a name resolved on `PATH` (e.g. `"gdformat"`) or an absolute
+    /// path. `None` (the default) means no formatter is configured: the capability is not advertised
+    /// and `textDocument/formatting` returns no edits. The command receives the document on STDIN
+    /// and must write the formatted document to STDOUT and exit 0; any other outcome is a failure
+    /// (see [`crate::formatter`]) that yields NO edits (the buffer is never touched).
+    pub command: Option<String>,
+    /// Arguments passed to `command`, each as a separate `argv` entry (NO shell word-splitting). For
+    /// `gdformat` the stdin/stdout mode is the default, so this is usually empty; a user can add
+    /// flags like `["--line-length", "100"]`. Empty by default.
+    pub args: Vec<String>,
+}
+
+impl FormatterConfig {
+    /// Whether a formatter command is configured — the single gate for advertising
+    /// `documentFormattingProvider` and for the `textDocument/formatting` handler doing any work.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.command.is_some()
     }
 }
 
@@ -317,6 +365,45 @@ mod tests {
             assert!(
                 opts.inlay_hint.type_hints && opts.inlay_hint.parameter_hints,
                 "case {case:?} should default inlayHint"
+            );
+        }
+    }
+
+    /// M11 (#80): the formatter is unconfigured by default — `command` absent, so
+    /// `is_configured()` is false and the capability stays unadvertised.
+    #[test]
+    fn parse_none_yields_unconfigured_formatter() {
+        let opts = InitializationOptions::parse(None);
+        assert!(opts.formatter.command.is_none());
+        assert!(opts.formatter.args.is_empty());
+        assert!(!opts.formatter.is_configured());
+    }
+
+    /// M11 (#80): a configured formatter round-trips command + args; `is_configured()` flips true.
+    #[test]
+    fn parse_formatter_config_round_trips() {
+        let v = serde_json::json!({
+            "formatter": { "command": "gdformat", "args": ["--line-length", "100"] }
+        });
+        let opts = InitializationOptions::parse(Some(&v));
+        assert_eq!(opts.formatter.command.as_deref(), Some("gdformat"));
+        assert_eq!(opts.formatter.args, vec!["--line-length", "100"]);
+        assert!(opts.formatter.is_configured());
+    }
+
+    /// A malformed `formatter` group falls back to the FULL default (unconfigured), never failing
+    /// `initialize` — the same "never crash, never lie" contract the other groups hold.
+    #[test]
+    fn malformed_formatter_falls_back_to_defaults() {
+        for case in [
+            serde_json::json!({ "formatter": "not-an-object" }),
+            serde_json::json!({ "formatter": { "command": 7 } }),
+            serde_json::json!({ "formatter": { "args": "not-a-list" } }),
+        ] {
+            let opts = InitializationOptions::parse(Some(&case));
+            assert!(
+                !opts.formatter.is_configured() && opts.formatter.args.is_empty(),
+                "case {case:?} should default formatter"
             );
         }
     }

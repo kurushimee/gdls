@@ -10,6 +10,16 @@ rust-version.workspace = true
 name = "gdls"
 path = "src/main.rs"
 
+# M11 (#80): a cross-platform STUB formatter for `tests/formatting.rs` — a stdin→stdout filter whose
+# behavior is selected by its first arg (squeeze/replace/fail/sleep/binary/…). The integration test
+# locates it via `env!("CARGO_BIN_EXE_gdls_format_stub")` (Cargo sets that for every bin of the
+# package under test) and runs it through the real bridge, so the formatter path is exercised
+# identically on Linux and Windows (no `cat`/`sed`/`sleep` platform skew). NOT shipped: release
+# packaging builds `--bin gdls` explicitly, so this is compiled only by `cargo build`/`cargo test`.
+[[bin]]
+name = "gdls_format_stub"
+path = "src/bin/gdls_format_stub.rs"
+
 [dependencies]
 gd_syntax.workspace = true
 gd_types.workspace = true

@@ -24,6 +24,7 @@ mod color;
 mod completion;
 mod docs;
 mod file_operations;
+mod formatter;
 mod handlers;
 mod inlay_hint;
 pub mod logging;
