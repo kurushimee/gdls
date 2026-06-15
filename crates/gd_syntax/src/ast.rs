@@ -813,6 +813,12 @@ impl ParseTree {
     /// Attribute-position identifiers (`obj.x`, `self.x` — the `x` after a `.`) are excluded: a local
     /// is never reached as a member access, and rewriting one would corrupt a member reference. The
     /// returned spans are the identifier token extents, in arena (source) order.
+    ///
+    /// Cost: one arena pass to collect attribute idents, then one to scan candidates; each candidate
+    /// that matches the name is re-resolved (another suite-chain walk). The re-resolve runs only for
+    /// identifiers that already share the target name, so the quadratic factor is bounded by that
+    /// name's occurrence count (small in practice), not the node count — and this runs at most once
+    /// per LSP request on a single file.
     pub fn local_binding_occurrences(&self, decl_ident: NodeId, scope: ByteSpan) -> Vec<ByteSpan> {
         // Collect attribute-position identifiers to exclude (a local is never a member access).
         let mut attribute_idents: std::collections::HashSet<NodeId> =
