@@ -1863,40 +1863,361 @@ fn resolve_fills_inherited_crossfile_member_doc() {
     shutdown(&client, server_thread);
 }
 
-// --- deferred contexts return empty ---
+// --- M11 P3: scene-aware deferred contexts (`$`/`%`/`get_node` + `load`/`preload`) ---
 
-/// The deferred (M11) contexts — `$NodePath`, `%Unique`, and a `load("…")` resource path — return
-/// a well-formed **empty** list, never a wrong guess.
+/// W10 no-false-positive guard: a script attached to NO scene gets an EMPTY `$`/`%` node-path
+/// completion — never a project-wide name guess.
 #[test]
-fn deferred_contexts_return_empty() {
-    let p = p4_project();
+fn node_path_completion_without_a_scene_is_empty() {
+    let p = p4_project(); // has src/hero.gd but NO .tscn — def.gd is attached nowhere
     let uri = file_uri(&p.root.join("src/def.gd"));
-    // Three deferred sites: a `$` node path, a `%` unique node path, and a `load("` resource path.
-    let src =
-        "extends Node2D\n\nfunc f() -> void:\n\tvar a = $\n\tvar b = %\n\tvar c = load(\"\")\n";
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar a = $\n\tvar b = %\n";
     let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
 
-    // `\tvar a = $` → cursor right after `$` (col0=`\t`, `$` at byte 9) → column 10.
+    // `\tvar a = $` → cursor right after `$` → column 10.
     let node_path = complete_raw(&client, 190, &uri, Position::new(3, 10));
     let np: CompletionList = serde_json::from_value(node_path).expect("a CompletionList");
     assert!(
         np.items.is_empty(),
-        "a `$` node path is deferred (M11) — empty, not a guess; got {:?}",
+        "no scene attaches def.gd → `$` node path must be EMPTY (W10: never a guess); got {:?}",
         labels(&np)
     );
 
     // `\tvar b = %` → cursor right after `%` → column 10.
     let unique = complete_raw(&client, 191, &uri, Position::new(4, 10));
     let uq: CompletionList = serde_json::from_value(unique).expect("a CompletionList");
-    assert!(uq.items.is_empty(), "a `%` unique node path is deferred");
-
-    // `\tvar c = load("")` → cursor inside the load string (between the quotes) at column 15.
-    let res_path = complete_raw(&client, 192, &uri, Position::new(5, 15));
-    let rp: CompletionList = serde_json::from_value(res_path).expect("a CompletionList");
     assert!(
-        rp.items.is_empty(),
-        "a `load(\"…\")` resource path is deferred (M11)"
+        uq.items.is_empty(),
+        "no scene attaches def.gd → `%` unique node path must be EMPTY; got {:?}",
+        labels(&uq)
     );
+
+    shutdown(&client, server_thread);
+}
+
+/// `load("res://<cursor>")` lists the indexed `res://` project entries (scripts + scenes); the insert
+/// is the FULL res path and the edit spans the whole typed content (no scheme dropped, no doubling).
+#[test]
+fn resource_path_lists_indexed_files() {
+    let p = p4_project(); // indexes src/hero.gd
+    let uri = file_uri(&p.root.join("src/def.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar c = load(\"res://\")\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar c = load("res://")` → the opening `"` is at column 14, `res://` occupies columns 15..21,
+    // so the cursor sits at column 21.
+    let res_path = complete_raw(&client, 192, &uri, Position::new(3, 21));
+    let rp: CompletionList = serde_json::from_value(res_path).expect("a CompletionList");
+    let ls = labels(&rp);
+    assert!(
+        ls.iter().any(|l| l == "src/"),
+        "load(\"res://\") must list the `src/` subdirectory; got {ls:?}"
+    );
+    // The subdir item inserts the FULL `res://src/` prefix (whole-content span ⇒ scheme preserved).
+    let subdir = rp.items.iter().find(|i| i.label == "src/").unwrap();
+    assert_eq!(edit_new_text(subdir), "res://src/");
+
+    // Drilling into `res://src/` lists the .gd files there.
+    let src2 = "extends Node2D\n\nfunc f() -> void:\n\tvar c = load(\"res://src/\")\n";
+    let uri2 = file_uri(&p.root.join("src/def2.gd"));
+    let (client2, st2) = boot(&p, rich_caps(), &uri2, src2);
+    // `res://src/` occupies columns 15..25, cursor at column 25.
+    let res2 = complete_raw(&client2, 193, &uri2, Position::new(3, 25));
+    let rp2: CompletionList = serde_json::from_value(res2).expect("a CompletionList");
+    let ls2 = labels(&rp2);
+    assert!(
+        ls2.iter().any(|l| l == "src/hero.gd"),
+        "load(\"res://src/\") must list hero.gd; got {ls2:?}"
+    );
+    // CORRUPTION GUARD: the insert is the FULL res path; splicing it over the whole typed content
+    // yields `load("res://src/hero.gd")`.
+    let hero = rp2.items.iter().find(|i| i.label == "src/hero.gd").unwrap();
+    assert_eq!(edit_new_text(hero), "res://src/hero.gd");
+
+    shutdown(&client, server_thread);
+    shutdown(&client2, st2);
+}
+
+/// CORRUPTION GUARD (end-to-end): completing a PARTIAL filename `load("res://src/he|")` and accepting
+/// `src/hero.gd` produces exactly `res://src/hero.gd` once — the edit spans the whole content
+/// (`res://src/he`) and the insert is the full path, so nothing is doubled or dropped.
+#[test]
+fn resource_path_partial_prefix_replaces_whole_content() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/def.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar c = load(\"res://src/he\")\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `res://src/he` occupies columns 15..27, cursor at column 27.
+    let raw = complete_raw(&client, 194, &uri, Position::new(3, 27));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let hero = list
+        .items
+        .iter()
+        .find(|i| i.label == "src/hero.gd")
+        .expect("hero.gd offered for the `res://src/he` prefix");
+    let (range, new_text) = match hero.text_edit.as_ref().unwrap() {
+        CompletionTextEdit::Edit(e) => (e.range, e.new_text.clone()),
+        CompletionTextEdit::InsertAndReplace(e) => (e.replace, e.new_text.clone()),
+    };
+    // The edit spans the whole content: from after the opening quote (column 15) to the cursor (27).
+    assert_eq!(
+        range.start.character, 15,
+        "edit starts after the opening quote"
+    );
+    assert_eq!(range.end.character, 27, "edit ends at the cursor");
+    assert_eq!(new_text, "res://src/hero.gd", "insert is the full res path");
+
+    shutdown(&client, server_thread);
+}
+
+/// CORRUPTION GUARD (advisor, wire): a PARTIAL scheme `load("re|")` must NOT drop `res://`. Accepting
+/// the `src/` subdirectory yields `load("res://src/")`, never `load("src/")`.
+#[test]
+fn resource_path_partial_scheme_keeps_res_prefix() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/def.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar c = load(\"re\")\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `load("re")` — `re` occupies columns 15..17, cursor at column 17 (after `re`).
+    let raw = complete_raw(&client, 195, &uri, Position::new(3, 17));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let subdir = list
+        .items
+        .iter()
+        .find(|i| i.label == "src/")
+        .expect("the src/ subdirectory is offered even mid-scheme");
+    let (range, new_text) = match subdir.text_edit.as_ref().unwrap() {
+        CompletionTextEdit::Edit(e) => (e.range, e.new_text.clone()),
+        CompletionTextEdit::InsertAndReplace(e) => (e.replace, e.new_text.clone()),
+    };
+    // The edit spans the whole partial `re` (columns 15..17); the insert is the full `res://src/`.
+    assert_eq!(range.start.character, 15);
+    assert_eq!(range.end.character, 17);
+    assert_eq!(
+        new_text, "res://src/",
+        "the full res:// prefix must be inserted — the scheme is never dropped"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The `detail` (type label) of a named completion item, for asserting node types.
+fn detail_of(list: &CompletionList, label: &str) -> Option<String> {
+    list.items
+        .iter()
+        .find(|i| i.label == label)
+        .and_then(|i| i.detail.clone())
+}
+
+/// A project with one scene `player.tscn` attaching `player.gd` at its ROOT. Tree:
+/// `Root(Node2D)[player.gd]` → { `Health`(Node2D), `Sprite`(Sprite2D), `UI`(Control) → `Bar`(ProgressBar) };
+/// `Bar` is `unique_name_in_owner`. So `$` lists Health/Sprite/UI, `$UI/` lists Bar, `%` lists Bar.
+fn scene_project() -> TempProject {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"T\"\n",
+    );
+    p.write(
+        "extension_api.json",
+        r#"{
+        "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+        "classes": [
+            {"name": "Object"},
+            {"name": "Node", "inherits": "Object"},
+            {"name": "CanvasItem", "inherits": "Node"},
+            {"name": "Node2D", "inherits": "CanvasItem"},
+            {"name": "Sprite2D", "inherits": "Node2D"},
+            {"name": "Control", "inherits": "CanvasItem"},
+            {"name": "ProgressBar", "inherits": "Control"}
+        ]
+    }"#,
+    );
+    p.write(
+        "player.tscn",
+        r#"[gd_scene format=3]
+[ext_resource type="Script" path="res://player.gd" id="1"]
+[node name="Root" type="Node2D"]
+script = ExtResource("1")
+[node name="Health" type="Node2D" parent="."]
+[node name="Sprite" type="Sprite2D" parent="."]
+[node name="UI" type="Control" parent="."]
+[node name="Bar" type="ProgressBar" parent="UI"]
+unique_name_in_owner = true
+"#,
+    );
+    p.write(
+        "player.gd",
+        "extends Node2D\n\nfunc _ready() -> void:\n\tpass\n",
+    );
+    p
+}
+
+/// `$<cursor>` on a scene-attached script lists the attachment node's DIRECT children with types.
+#[test]
+fn dollar_node_path_lists_scene_children_with_types() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("player.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar a = $\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar a = $` → cursor right after `$` → column 10.
+    let raw = complete_raw(&client, 200, &uri, Position::new(3, 10));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"Health".to_string())
+            && ls.contains(&"Sprite".to_string())
+            && ls.contains(&"UI".to_string()),
+        "`$` must list the root's direct children Health/Sprite/UI; got {ls:?}"
+    );
+    assert!(
+        !ls.contains(&"Bar".to_string()),
+        "nested Bar must NOT appear at the root level; got {ls:?}"
+    );
+    assert_eq!(detail_of(&list, "Health").as_deref(), Some("Node2D"));
+    assert_eq!(detail_of(&list, "Sprite").as_deref(), Some("Sprite2D"));
+    assert_eq!(detail_of(&list, "UI").as_deref(), Some("Control"));
+    // A node-path list is `isIncomplete` so the client re-queries as the path grows past a `/`
+    // (`/` is not a trigger char). Without this the deep-path `$UI/` list would be a stale filter.
+    assert!(
+        list.is_incomplete,
+        "a `$` node-path completion must be isIncomplete (re-query as the path grows)"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A deep path `$UI/<cursor>` lists UI's children (the segment-by-segment walk).
+#[test]
+fn dollar_deep_path_lists_child_node_children() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("player.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar a = $UI/\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar a = $UI/` → the `/` is the char at column 12, so the cursor sits at column 13.
+    let raw = complete_raw(&client, 201, &uri, Position::new(3, 13));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert_eq!(
+        ls,
+        vec!["Bar".to_string()],
+        "`$UI/` must list UI's child Bar"
+    );
+    assert_eq!(detail_of(&list, "Bar").as_deref(), Some("ProgressBar"));
+
+    shutdown(&client, server_thread);
+}
+
+/// `%<cursor>` lists the scene's owner-unique node names with their types.
+#[test]
+fn percent_unique_node_path_lists_unique_names() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("player.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar a = %\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 202, &uri, Position::new(3, 10));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert_eq!(
+        ls,
+        vec!["Bar".to_string()],
+        "`%` must list the unique node Bar"
+    );
+    assert_eq!(detail_of(&list, "Bar").as_deref(), Some("ProgressBar"));
+
+    shutdown(&client, server_thread);
+}
+
+/// `get_node("<cursor>")` lists the same children as `$`, and the edit inserts the bare node name
+/// (quotes preserved — no corruption).
+#[test]
+fn get_node_string_lists_scene_children() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("player.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar a = get_node(\"\")\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar a = get_node("")` → cursor between the quotes. `get_node("` ends at column 19.
+    let raw = complete_raw(&client, 203, &uri, Position::new(3, 19));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"Health".to_string()) && ls.contains(&"UI".to_string()),
+        "get_node(\"\") must list the root's children; got {ls:?}"
+    );
+    let health = list.items.iter().find(|i| i.label == "Health").unwrap();
+    assert_eq!(
+        edit_new_text(health),
+        "Health",
+        "the node name is inserted into the string"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// CORRUPTION GUARD (Bug 2, wire): completing with the cursor AFTER a terminated string's closing
+/// quote (`get_node("Health"|)`) offers NOTHING — so the closing quote can never be swallowed.
+#[test]
+fn node_path_after_closing_quote_is_empty() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("player.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar a = get_node(\"Health\")\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `get_node("Health")` — cursor right AFTER the closing quote: `get_node("Health"` ends at col 26.
+    let raw = complete_raw(&client, 205, &uri, Position::new(3, 26));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    assert!(
+        list.items.is_empty(),
+        "a cursor past the closing quote must offer nothing (no quote-eating edit); got {:?}",
+        labels(&list)
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A second scene attaching the SAME script with a different child set/type → the node-path
+/// completion is the UNION, and a name with different types across scenes annotates `A | B`.
+#[test]
+fn multi_scene_attachment_unions_with_ambiguity_annotated() {
+    let p = scene_project();
+    // A SECOND scene attaching the same player.gd: a `Health` typed `Control` here (vs `Node2D` in
+    // player.tscn) plus a unique-to-this-scene `Menu` child.
+    p.write(
+        "menu.tscn",
+        r#"[gd_scene format=3]
+[ext_resource type="Script" path="res://player.gd" id="1"]
+[node name="Root" type="Node2D"]
+script = ExtResource("1")
+[node name="Health" type="Control" parent="."]
+[node name="Menu" type="Control" parent="."]
+"#,
+    );
+    let uri = file_uri(&p.root.join("player.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar a = $\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 204, &uri, Position::new(3, 10));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    for expected in ["Health", "Sprite", "UI", "Menu"] {
+        assert!(
+            ls.contains(&expected.to_string()),
+            "the union across both scenes must include {expected}; got {ls:?}"
+        );
+    }
+    // `Health` is Node2D in one scene, Control in the other → the detail annotates BOTH (sorted).
+    assert_eq!(
+        detail_of(&list, "Health").as_deref(),
+        Some("Control | Node2D"),
+        "an ambiguous node type across scenes must be annotated, not picked"
+    );
+    assert_eq!(detail_of(&list, "Menu").as_deref(), Some("Control"));
 
     shutdown(&client, server_thread);
 }

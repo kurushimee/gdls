@@ -42,7 +42,7 @@ use gd_analyze::{AnalysisResult, DataType, DtKind};
 use gd_syntax::ast::{NodeId, ParseTree};
 use gd_syntax::ByteSpan;
 
-use crate::completion_context::{classify, CompletionKind};
+use crate::completion_context::{self, classify, CompletionKind, DeferredReason, NodePathSigil};
 use crate::config::{CallArgumentStyle, CompletionConfig};
 use crate::docs::ProseFormat;
 use crate::position::PositionMapper;
@@ -215,12 +215,25 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
         CompletionKind::OverrideMethod => {
             override_method_items(state, &parsed.tree, analyzed.as_deref(), &render)
         }
-        // Deferred (`$`/`%`/path) and None: a well-formed empty list — never a wrong guess.
-        CompletionKind::Deferred(_) | CompletionKind::None => Vec::new(),
+        // Deferred (`$`/`%`/`get_node`/path) — scene-aware node-path + resource-path completion
+        // (M11 Phase 3). Each arm returns an empty list when nothing concrete is known (no scene
+        // attached, no match) — never a project-wide guess (anti-catalog W10).
+        CompletionKind::Deferred(reason) => {
+            deferred_items(state, &uri, &tokens, byte, *reason, &render)
+        }
+        // None: a well-formed empty list.
+        CompletionKind::None => Vec::new(),
     };
 
+    // A path context's candidate set genuinely changes as the user types past a `/` (each segment
+    // re-roots the listing), and `/` is NOT a trigger character (it is also division) — so mark these
+    // results incomplete to make the client RE-QUERY on the next keystroke rather than filter a stale
+    // segment's list. Every other context is complete for its prefix (a re-filter suffices). This
+    // only ever tells the client to ask again; it carries no edit, so it cannot corrupt.
+    let is_incomplete = matches!(ctx.kind, CompletionKind::Deferred(_));
+
     CompletionList {
-        is_incomplete: false,
+        is_incomplete,
         items,
     }
 }
@@ -1435,6 +1448,360 @@ fn override_stub_item(m: &MemberItem, rank: usize, render: &RenderCtx) -> Comple
         rank,
         render,
     )
+}
+
+// ===================================================================================================
+// DEFERRED — scene-aware `$`/`%`/`get_node` node paths + `load`/`preload` resource paths (M11 P3).
+// ===================================================================================================
+
+/// Dispatch a deferred completion context (M11 Phase 3). `NodePath` (`$Rel/Path`, `get_node("…")`,
+/// `NodePath("…")`) and `UniqueNodePath` (`%Name`) suggest the scene's node names from the scene(s)
+/// that ATTACH the current `.gd` (anti-catalog W10: no scene attached ⇒ empty, never a project-wide
+/// guess). `ResourcePath` (`load`/`preload`) suggests `res://` project paths (scripts + scenes). The
+/// dormant gd_project resolvers ([`SceneIndex::children_relative_from`] /
+/// [`SceneIndex::unique_nodes_in`] / [`SceneIndex::resolve_relative_from`]) do the scene-graph walk.
+fn deferred_items(
+    state: &ServerState,
+    uri: &lsp_types::Uri,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+    reason: DeferredReason,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    match reason {
+        DeferredReason::NodePath => node_path_items(state, uri, tokens, byte, render),
+        DeferredReason::UniqueNodePath => unique_node_path_items(state, uri, tokens, byte, render),
+        DeferredReason::ResourcePath => resource_path_items(state, tokens, byte, render),
+    }
+}
+
+/// The current `.gd` buffer's `res://` path — the key into the scene reverse map
+/// ([`SceneIndex::scenes_attaching_script`]). `None` for a buffer outside the project root or a
+/// non-`file://` URI (then the deferred arms degrade to empty — permissive, never a guess).
+fn current_script_res(state: &ServerState, uri: &lsp_types::Uri) -> Option<String> {
+    let path = crate::uri::uri_to_path(uri)?;
+    let root = gd_project::normalize_path(&state.workspace.project.root);
+    let norm = gd_project::normalize_path(&path);
+    gd_project::path_to_res(&root, &norm)
+}
+
+/// The scenes that attach the current script, sorted for deterministic union ordering
+/// ([`SceneIndex::scenes_attaching_script`] iterates a `FxHashSet`). Empty ⇒ no scene attaches this
+/// script ⇒ the caller returns an empty completion list (W10).
+fn attaching_scenes_sorted(state: &ServerState, script_res: &str) -> Vec<String> {
+    let mut scenes: Vec<String> = state
+        .workspace
+        .scenes
+        .scenes_attaching_script(script_res)
+        .map(str::to_string)
+        .collect();
+    scenes.sort_unstable();
+    scenes
+}
+
+/// The single node `script_res` attaches at within `scene` — the relative base a `$X` resolves
+/// against. `None` (skip this scene) when the script attaches at zero or MORE THAN ONE node (the
+/// relative base would be ambiguous), mirroring `xfile::resolve_one_scene`.
+fn unique_attachment_path<'a>(scene: &'a gd_project::Scene, script_res: &str) -> Option<&'a str> {
+    let mut attachment: Option<&str> = None;
+    for node in &scene.nodes {
+        if node.script.as_deref() == Some(script_res) {
+            if attachment.is_some() {
+                return None; // multiple attachment nodes — ambiguous relative base
+            }
+            attachment = Some(&node.path);
+        }
+    }
+    attachment
+}
+
+/// `$Rel/Path/<cursor>` / `get_node("Rel/Path/<cursor>")` — the child node names reachable from the
+/// access base, UNIONED across every scene that attaches the current script. A `%`-rooted string
+/// (`get_node("%Name")`) is routed to the unique-name set. Empty when no scene attaches the script
+/// (W10) or the base path resolves to nothing.
+fn node_path_items(
+    state: &ServerState,
+    uri: &lsp_types::Uri,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    // The committed directory (path up to the last `/`) tells us which node's children to list. Bare
+    // `$…` reads it from the token stream; a `get_node("…")` string reads it from inside the literal.
+    let committed_dir: String = if let Some((sigil, dir)) =
+        completion_context::bare_node_path_committed_dir(tokens, byte)
+    {
+        // A bare `%…` reaching here (the classifier tags `%` as UniqueNodePath, so this is only the
+        // `$` sigil in practice); route a `%` defensively to the unique set.
+        if sigil == NodePathSigil::Unique {
+            return unique_node_path_items(state, uri, tokens, byte, render);
+        }
+        dir
+    } else if let Some(s) = completion_context::string_node_path_committed_dir(tokens, byte) {
+        if s.unique {
+            // `get_node("%Name")` is a unique-name access; `%Name/child` (deeper) is deferred.
+            return if s.deeper_unique {
+                Vec::new()
+            } else {
+                unique_items_from(state, uri, render)
+            };
+        }
+        s.committed_dir
+    } else {
+        return Vec::new();
+    };
+
+    let Some(script_res) = current_script_res(state, uri) else {
+        return Vec::new();
+    };
+    // Union children across every attaching scene; annotate a name whose type differs across scenes.
+    let mut candidates: NodeCandidates = NodeCandidates::default();
+    for scene_res in attaching_scenes_sorted(state, &script_res) {
+        let Some(scene) = state.workspace.scenes.scene(&scene_res) else {
+            continue;
+        };
+        let Some(attachment) = unique_attachment_path(scene, &script_res) else {
+            continue; // ambiguous (multi-attach) — skip this scene from the union
+        };
+        for (name, root) in
+            state
+                .workspace
+                .scenes
+                .children_relative_from(&scene_res, attachment, &committed_dir)
+        {
+            candidates.add(name, node_type_label(&root));
+        }
+    }
+    candidates.into_items(CompletionItemKind::FIELD, render)
+}
+
+/// `%<cursor>` (and `get_node("%<cursor>")`) — the owner-unique node names, unioned across every
+/// attaching scene. Empty when no scene attaches the script (W10). A `%Name/…` deeper traversal is
+/// classified as `UniqueNodePath` but lists nothing (a documented Phase-3 deferral).
+fn unique_node_path_items(
+    state: &ServerState,
+    uri: &lsp_types::Uri,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    // Guard the deeper `%Name/child` form (the back-scan crosses `/`, so the classifier still tags
+    // it UniqueNodePath): list unique names only when no `/` follows the `%`.
+    if bare_unique_has_trailing_path(tokens, byte) {
+        return Vec::new();
+    }
+    unique_items_from(state, uri, render)
+}
+
+/// The unique-name candidate set itself (shared by the bare `%` arm and the `get_node("%…")` string
+/// arm). Unioned across attaching scenes with cross-scene type ambiguity annotated.
+///
+/// Unlike [`node_path_items`], this does NOT skip a scene where the script attaches at multiple
+/// nodes: `%Name` is OWNER-scoped (resolved against the scene's owner-wide unique table, NOT relative
+/// to the attachment node — see [`gd_project::SceneIndex::resolve_unique_in`]), so the unique-name
+/// set is well-defined regardless of how many nodes a scene attaches the script to. The multi-attach
+/// ambiguity that forces a relative-`$`-path skip simply doesn't apply here.
+fn unique_items_from(
+    state: &ServerState,
+    uri: &lsp_types::Uri,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let Some(script_res) = current_script_res(state, uri) else {
+        return Vec::new();
+    };
+    let mut candidates: NodeCandidates = NodeCandidates::default();
+    for scene_res in attaching_scenes_sorted(state, &script_res) {
+        for (name, root) in state.workspace.scenes.unique_nodes_in(&scene_res) {
+            candidates.add(name, node_type_label(&root));
+        }
+    }
+    candidates.into_items(CompletionItemKind::FIELD, render)
+}
+
+/// Whether a bare `%Name/…` access has a `/` after the `%` sigil at the cursor (the deeper-traversal
+/// form to defer). Reuses the classifier's committed-dir walk: a non-empty committed directory for a
+/// `%` sigil means a `/` was crossed.
+fn bare_unique_has_trailing_path(tokens: &[gd_syntax::token::Token], byte: usize) -> bool {
+    matches!(
+        completion_context::bare_node_path_committed_dir(tokens, byte),
+        Some((NodePathSigil::Unique, dir)) if !dir.is_empty()
+    )
+}
+
+/// `load("res://…/<cursor>")` / `preload(...)` — `res://` project paths matching the typed directory
+/// prefix. Bounded to what is INDEXED: the `.gd` script index ([`gd_project::Index::iter_interfaces`])
+/// ∪ the `.tscn` scene index ([`gd_project::SceneIndex::iter`]). Other asset types (textures, audio,
+/// …) are indexed nowhere, so broadening the list to them (a project disk walk — new substrate)
+/// is a deliberate follow-up, out of scope for this read-only phase.
+///
+/// Each item's **insert text is the FULL `res://…` path** (a file's path, or a subdirectory's
+/// `res://…/` prefix). The classifier makes the edit span cover the WHOLE typed string content for a
+/// resource path ([`completion_context::string_arg_prefix`]), because a `res://` literal has a
+/// mandatory scheme: inserting only a tail would drop the scheme while the user is still typing it
+/// (`load("re|")` → `load("src/")`). Replacing the whole content with the full path is correct for
+/// any amount of typed prefix.
+fn resource_path_items(
+    state: &ServerState,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+    render: &RenderCtx,
+) -> Vec<CompletionItem> {
+    let Some(dir) = completion_context::resource_path_committed_dir(tokens, byte) else {
+        return Vec::new();
+    };
+    // The directory the listing is rooted at, always `res://`-rooted. Until the user has typed a
+    // committed `res://…/` directory we anchor at the project root (`res://`); a partial scheme
+    // (`re`, `res:/`) is still being typed, so it commits to nothing deeper than the root.
+    let prefix = if dir.starts_with("res://") {
+        dir
+    } else {
+        "res://".to_string()
+    };
+
+    // Collect every indexed res:// path: scripts (.gd) + scenes (.tscn).
+    let root = gd_project::normalize_path(&state.workspace.project.root);
+    let mut res_paths: Vec<String> = Vec::new();
+    for (fid, _iface) in state.workspace.index.iter_interfaces() {
+        if let Some(path) = state.workspace.index.path(fid) {
+            if let Some(res) = gd_project::path_to_res(&root, path) {
+                res_paths.push(res);
+            }
+        }
+    }
+    for (res, _scene) in state.workspace.scenes.iter() {
+        res_paths.push(res.to_string());
+    }
+
+    // The immediate entries directly under `prefix`, as their FULL res path: a direct file is its own
+    // path; a nested file contributes its subdirectory's `res://…/<seg>/` prefix (offered once).
+    // De-dup by full path. Only entries actually under `prefix` count.
+    let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    let mut entries: Vec<(String, bool)> = Vec::new(); // (full_res_path, is_dir)
+    for res in &res_paths {
+        let Some(rest) = res.strip_prefix(&prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+        match rest.find('/') {
+            // A nested file: offer the subdirectory's full prefix once (`res://…/<seg>/`).
+            Some(slash) => {
+                let dir_full = format!("{}{}/", prefix, &rest[..slash]);
+                if seen.insert(dir_full.clone()) {
+                    entries.push((dir_full, true));
+                }
+            }
+            // A direct file under the prefix: its own full res path.
+            None => {
+                if seen.insert(res.clone()) {
+                    entries.push((res.clone(), false));
+                }
+            }
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    entries
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (full, is_dir))| {
+            // Insert the FULL res path (the edit spans the whole typed content, so any partially-typed
+            // scheme/path is replaced wholesale — `load("re|")` accept `res://src/foo.gd` →
+            // `load("res://src/foo.gd")`). The label shows the path after `res://` for readability;
+            // the filter is the full path so a typed `res://…` prefix still narrows the list.
+            let label = full.strip_prefix("res://").unwrap_or(&full).to_string();
+            let kind = if is_dir {
+                CompletionItemKind::FOLDER
+            } else {
+                CompletionItemKind::FILE
+            };
+            build_item_with(
+                ItemText {
+                    label: &label,
+                    filter: &full,
+                },
+                kind,
+                ItemInsert {
+                    plain: full.clone(),
+                    snippet: None,
+                },
+                CompletionData::Keyword,
+                rank,
+                render,
+            )
+        })
+        .collect()
+}
+
+/// The type label a [`gd_project::ResolvedRoot`] presents in a node-path item's detail, SCRIPT-FIRST
+/// (mirrors `xfile::resolved_root_to_facts`): an attached script's basename (a `.gd` file the node
+/// owns — the more precise type) wins over the native `type=`; a node with only a native type shows
+/// that; a node with neither shows `Node` (the permissive bare type Godot itself assigns `$`/`%`).
+fn node_type_label(root: &gd_project::ResolvedRoot) -> String {
+    if let Some(script) = &root.script {
+        // The script basename (`res://ui/health_bar.gd` → `health_bar.gd`) — a stable, readable
+        // type hint without resolving the script's `class_name` (which may be absent).
+        let base = script.rsplit('/').next().unwrap_or(script.as_str());
+        return base.to_string();
+    }
+    root.native_type
+        .clone()
+        .unwrap_or_else(|| "Node".to_string())
+}
+
+/// Accumulates node-path candidates across scenes, keyed by node NAME, collecting the distinct type
+/// labels each name resolves to (so a multi-scene union annotates an ambiguous type as `A | B`).
+#[derive(Default)]
+struct NodeCandidates {
+    /// name → the distinct type labels seen for it (a `BTreeSet` so the joined detail is sorted and
+    /// deterministic regardless of scene visit order).
+    by_name: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+impl NodeCandidates {
+    /// Record that node `name` resolves to type `ty` in some attaching scene.
+    fn add(&mut self, name: String, ty: String) {
+        self.by_name.entry(name).or_default().insert(ty);
+    }
+
+    /// Render the accumulated candidates as completion items, name-sorted (the `BTreeMap` iterates in
+    /// key order). Each item's `detail` (and `labelDetails.description`) is the node's type — a
+    /// single type, or the distinct types joined ` | ` when they disagree across scenes. The insert
+    /// is the bare node name; `data` is [`CompletionData::Keyword`] so `resolve` leaves the detail
+    /// intact (it only fills a `None` detail). `kind` is clamped to the client's value set upstream.
+    fn into_items(self, kind: CompletionItemKind, render: &RenderCtx) -> Vec<CompletionItem> {
+        self.by_name
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (name, types))| {
+                let detail = types.into_iter().collect::<Vec<_>>().join(" | ");
+                let mut item = build_item_with(
+                    ItemText {
+                        label: &name,
+                        filter: &name,
+                    },
+                    kind,
+                    ItemInsert {
+                        plain: name.clone(),
+                        snippet: None,
+                    },
+                    CompletionData::Keyword,
+                    rank,
+                    render,
+                );
+                // The node's type as detail + structured labelDetails.description (the client
+                // advertised `labelDetailsSupport`); set post-build since `build_item_with` fixes
+                // `detail: None` for the lazy-resolve path the doc-bearing contexts use.
+                item.detail = Some(detail.clone());
+                item.label_details = Some(lsp_types::CompletionItemLabelDetails {
+                    detail: None,
+                    description: Some(detail),
+                });
+                item
+            })
+            .collect()
+    }
 }
 
 // ===================================================================================================

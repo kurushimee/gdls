@@ -503,6 +503,225 @@ fn deferred_resource_path_preload() {
     );
 }
 
+// --- M11 P3: string-form node paths (`get_node`/`get_node_or_null`/`NodePath`) ---
+
+#[test]
+fn deferred_node_path_get_node_string() {
+    // `get_node("A/B/Sp|")` → a node-path string, classified `Deferred(NodePath)` (NOT a generic
+    // CallArguments / ResourcePath). The cursor sits inside the string literal.
+    let ctx = at("func f():\n\tget_node(\"A/B/Sp|\")");
+    assert_eq!(
+        ctx.kind,
+        CompletionKind::Deferred(DeferredReason::NodePath),
+        "get_node(\"…\") is a node path: {:?}",
+        ctx.kind
+    );
+}
+
+#[test]
+fn deferred_node_path_get_node_or_null_and_nodepath() {
+    assert_eq!(
+        at("func f():\n\tget_node_or_null(\"Player|\")").kind,
+        CompletionKind::Deferred(DeferredReason::NodePath),
+        "get_node_or_null(\"…\") is a node path"
+    );
+    assert_eq!(
+        at("func f():\n\tNodePath(\"Player|\")").kind,
+        CompletionKind::Deferred(DeferredReason::NodePath),
+        "NodePath(\"…\") is a node path"
+    );
+}
+
+/// Splice an accepted item's text over the captured prefix span and return the post-edit source —
+/// the corruption oracle. With `prefix = None` (zero-width), the insert lands at the cursor.
+fn splice(marked: &str, insert: &str) -> String {
+    let byte = marked.find('|').unwrap();
+    let src = marked.replacen('|', "", 1);
+    let ctx = at(marked);
+    let (start, end) = ctx.prefix.map_or((byte, byte), |s| (s.start, s.end));
+    format!("{}{}{}", &src[..start], insert, &src[end..])
+}
+
+/// The path is always the FIRST argument: a string in a 2nd+ argument slot
+/// (`get_node(foo, "Bar|")`) is NOT a node path — it must fall through to the normal call context,
+/// not fire an empty/wrong node-path completion.
+#[test]
+fn string_node_path_only_fires_in_first_argument() {
+    let ctx = at("func f():\n\tget_node(foo, \"Bar|\")");
+    assert_ne!(
+        ctx.kind,
+        CompletionKind::Deferred(DeferredReason::NodePath),
+        "a 2nd-arg string is not a node path: {:?}",
+        ctx.kind
+    );
+    // `load(x, "y")` likewise — the resource path is arg 0 only.
+    let ctx2 = at("func f():\n\tload(x, \"y|\")");
+    assert_ne!(
+        ctx2.kind,
+        CompletionKind::Deferred(DeferredReason::ResourcePath),
+        "a 2nd-arg string is not a resource path: {:?}",
+        ctx2.kind
+    );
+}
+
+#[test]
+fn get_node_bare_identifier_arg_is_not_a_node_path() {
+    // `get_node(pa|)` — a BARE identifier arg (passing a NodePath/String variable), cursor NOT in a
+    // string — must fall through to normal identifier completion, NOT a node-path context (which
+    // would render an empty list and suppress completing the variable). Regression for the phase-3
+    // review's MEDIUM finding.
+    for call in ["get_node(pa|)", "get_node_or_null(pa|)", "NodePath(pa|)"] {
+        let ctx = at(&format!("func f():\n\t{call}"));
+        assert_ne!(
+            ctx.kind,
+            CompletionKind::Deferred(DeferredReason::NodePath),
+            "bare-identifier arg in {call:?} must not be a node path: {:?}",
+            ctx.kind
+        );
+    }
+    // But the in-string form still IS a node path.
+    let in_str = at("func f():\n\tget_node(\"pa|\")");
+    assert_eq!(
+        in_str.kind,
+        CompletionKind::Deferred(DeferredReason::NodePath),
+        "in-string get_node arg is still a node path: {:?}",
+        in_str.kind
+    );
+}
+
+/// THE corruption guard for string-form node paths: the prefix span covers EXACTLY the last
+/// `/`-segment, so accepting an item rewrites only that segment — never the whole path, never quotes.
+#[test]
+fn string_node_path_prefix_replaces_only_last_segment() {
+    let marked = "func f():\n\tget_node(\"A/B/Sp|\")";
+    let ctx = at(marked);
+    assert_eq!(ctx.kind, CompletionKind::Deferred(DeferredReason::NodePath));
+    assert_eq!(prefix_text(marked, &ctx).as_deref(), Some("Sp"));
+    assert_eq!(
+        splice(marked, "Sprite2D"),
+        "func f():\n\tget_node(\"A/B/Sprite2D\")"
+    );
+}
+
+/// The resource-path string prefix spans the WHOLE typed content (the renderer inserts the full
+/// `res://` path), so the splice replaces scheme + path wholesale — correct for any typed amount.
+#[test]
+fn string_resource_path_prefix_spans_whole_content() {
+    let marked = "func f():\n\tload(\"res://a/b/fo|\")";
+    let ctx = at(marked);
+    assert_eq!(
+        ctx.kind,
+        CompletionKind::Deferred(DeferredReason::ResourcePath)
+    );
+    // The prefix is the entire content `res://a/b/fo`, not just the `fo` segment.
+    assert_eq!(prefix_text(marked, &ctx).as_deref(), Some("res://a/b/fo"));
+    // Accepting the full path replaces the whole partial → the canonical literal.
+    assert_eq!(
+        splice(marked, "res://a/b/foo.gd"),
+        "func f():\n\tload(\"res://a/b/foo.gd\")"
+    );
+}
+
+/// CORRUPTION GUARD (advisor): a PARTIAL scheme `load("re|")` must NOT drop `res://`. The prefix
+/// spans the whole `re`, so inserting the full `res://src/foo.gd` replaces it → a valid literal,
+/// never `load("src/foo.gd")` (scheme dropped) or `load("reres://…")` (doubled).
+#[test]
+fn resource_path_partial_scheme_does_not_drop_res() {
+    for marked in [
+        "func f():\n\tload(\"|\")",
+        "func f():\n\tload(\"re|\")",
+        "func f():\n\tload(\"res://|\")",
+    ] {
+        let ctx = at(marked);
+        assert_eq!(
+            ctx.kind,
+            CompletionKind::Deferred(DeferredReason::ResourcePath),
+            "{marked:?}"
+        );
+        assert_eq!(
+            splice(marked, "res://src/foo.gd"),
+            format!("func f():\n\tload(\"res://src/foo.gd\")"),
+            "accepting the full path must yield the canonical literal for {marked:?}"
+        );
+    }
+}
+
+/// At the very start of an empty string argument the prefix is empty (a zero-width insertion).
+#[test]
+fn string_node_path_empty_prefix_at_open_quote() {
+    let marked = "func f():\n\tget_node(\"|\")";
+    let ctx = at(marked);
+    assert_eq!(ctx.kind, CompletionKind::Deferred(DeferredReason::NodePath));
+    match ctx.prefix {
+        None => {}
+        Some(s) => assert_eq!(s.start, s.end, "empty-argument prefix must be zero-width"),
+    }
+    assert_eq!(
+        splice(marked, "Health"),
+        "func f():\n\tget_node(\"Health\")"
+    );
+}
+
+// --- M11 P3 corruption regressions (fusion review): 3 doubling/quote-eating bugs ---
+
+/// BUG 1: a BARE quoted segment `$"Sp|"` puts the cursor inside a string-literal token, where the
+/// old `prefix_at` returned `None` → a zero-width edit that DOUBLED the inserted name (`$"SpSprite"`).
+/// The prefix must be the in-string `Sp` segment so the splice yields `$"Sprite"`. Multibyte too.
+#[test]
+fn bare_quoted_segment_prefix_does_not_double() {
+    let m = "func f():\n\t$\"Sp|\"";
+    assert_eq!(prefix_text(m, &at(m)).as_deref(), Some("Sp"));
+    assert_eq!(splice(m, "Sprite"), "func f():\n\t$\"Sprite\"");
+    // A committed earlier segment + a quoted partial: `$Player/"Sp|"`.
+    let m2 = "func f():\n\t$Player/\"Sp|\"";
+    assert_eq!(splice(m2, "Sprite"), "func f():\n\t$Player/\"Sprite\"");
+    // Multibyte segment inside the quotes.
+    let m3 = "func f():\n\t$\"Сп|\"";
+    assert_eq!(splice(m3, "Спрайт"), "func f():\n\t$\"Спрайт\"");
+}
+
+/// BUG 2: a cursor AFTER the closing quote (`get_node("abc"|)`) must NOT let the edit span swallow
+/// the closing quote. The cursor is not strictly inside the string, so the prefix is `None` (a
+/// zero-width edit at the cursor) — the renderer additionally offers nothing there (see the wire
+/// test `node_path_after_closing_quote_is_empty`). The quote is preserved either way.
+#[test]
+fn cursor_after_closing_quote_keeps_the_quote() {
+    let m = "func f():\n\tget_node(\"abc\"|)";
+    let ctx = at(m);
+    // The prefix must NOT cover the closing quote (no `abc"` span).
+    assert_ne!(
+        prefix_text(m, &ctx).as_deref(),
+        Some("abc\""),
+        "the edit span must never include the closing quote"
+    );
+    // Whatever the prefix, it is empty/at the cursor — the closing quote stays in the source.
+    let edited = splice(m, "");
+    assert!(
+        edited.contains("\"abc\""),
+        "the terminated string keeps both quotes; got {edited:?}"
+    );
+}
+
+/// BUG 3: a `%` in a resource path (`load("res://dir/a%b|")`) — `%` is a legal `res://` filename
+/// byte and must NOT be a segment boundary. With the whole-content ResourcePath span (the renderer
+/// inserts the full path), the `%` is just part of the content; accepting the full path replaces it
+/// wholesale — no `a%` doubling.
+#[test]
+fn resource_path_percent_in_segment_does_not_double() {
+    let m = "func f():\n\tload(\"res://dir/a%b|\")";
+    let ctx = at(m);
+    assert_eq!(
+        ctx.kind,
+        CompletionKind::Deferred(DeferredReason::ResourcePath)
+    );
+    // The prefix is the WHOLE content `res://dir/a%b` (no segment split for resource paths).
+    assert_eq!(prefix_text(m, &ctx).as_deref(), Some("res://dir/a%b"));
+    assert_eq!(
+        splice(m, "res://dir/a%b.gd"),
+        "func f():\n\tload(\"res://dir/a%b.gd\")"
+    );
+}
+
 // ===================================================================================================
 // No-panic robustness: classify at EVERY byte offset of every fixture (and existing corpus).
 // ===================================================================================================
@@ -535,6 +754,16 @@ const FIXTURES: &[&str] = &[
     "func f():\n\t%Health",
     "func f():\n\tload(\"res://x",
     "func f():\n\tpreload(\"res://x",
+    // M11 P3: string-form node paths + deeper / quoted / multibyte forms (corruption regressions).
+    "func f():\n\tget_node(\"A/B/Sp",
+    "func f():\n\tget_node_or_null(\"Player",
+    "func f():\n\tNodePath(\"%Uniq",
+    "func f():\n\t$A/B/",
+    "func f():\n\t%Uniq/child",
+    "func f():\n\t$\"Sp",
+    "func f():\n\t$Player/\"Sp",
+    "func f():\n\tload(\"res://dir/a%b",
+    "func f():\n\tget_node(\"abc\")",
     // A few pathological / mixed forms.
     "",
     "\t",
