@@ -102,10 +102,14 @@ parser, so it is not a standalone pre-pass.
   `GDLS_TRACE` profiler). Never write to stdout except LSP protocol — a stray `println!` corrupts the
   JSON-RPC stream.
 
-- **`$Node`/`%Unique` v1 policy (deliberate deviation, not a bug).** Until `.tscn` typing lands in Phase
-  2, `$`/`%` yield a *permissive deferred-node type* (assignable to any `Node`-derived var, dynamic on
-  member access) so the tool never false-positives on node access. Do not "fix" this to match Godot
-  exactly. See `docs/02` §11.
+- **`$Node`/`%Unique` typing — bare `NATIVE Node` (M11 #76, faithful to Godot).** Godot's *analyzer*
+  types `$`/`%`/`get_node` as a hard bare `NATIVE Node` (`gdscript_analyzer.cpp:3866-3886`), NOT a
+  scene-derived precise type — the precise per-node type the editor shows comes from a separate
+  scene-instantiation path. So `reduce_get_node` types valid `$`/`%` as bare `Node` (M11 retired the
+  old permissive-`Variant` deviation): a member miss fires `UNSAFE_PROPERTY_ACCESS`, sibling
+  downcasts/casts stay silent — matching Godot. Precise scene-derived node types are **navigation-only**
+  (phase-3 hover/completion via the dormant `scene_node_facts` seam), deliberately kept OUT of the
+  diagnostic path (feeding them in would false-positive on Godot-tolerated downcasts). See `docs/02` §11.
 
 - **Intentional deferrals, not dead code.** Phase 2 features are deliberately stubbed/deferred — check the
   milestone status below before assuming something is missing.
@@ -141,15 +145,19 @@ binding.
 **Current:** Phase 1 complete — **v1.0.7 shipped** (2026-06-13; the utility-as-Callable
 follow-ups #92, tagged on `release/v1.0.7` = v1.0.6 + #92, so the unreleased Phase 2 work on
 `main` stayed unreleased — #91's code was already in v1.0.6; v1.0.6 itself was the #88 hotfix off
-v1.0.5); Phase 2 underway: **M7 (protocol foundations), M8 (editing core — `completion` +
+v1.0.5); **Phase 2 COMPLETE — M7–M11 shipped and closed (#57–#80), no release cut** (deferred
+until the phase matures): **M7 (protocol foundations), M8 (editing core — `completion` +
 `signatureHelp`), M9 (navigation & refactoring — `documentHighlight`, `foldingRange`/
 `selectionRange`, `declaration`/`typeDefinition`, `typeHierarchy`, `workspaceSymbol/resolve`,
-`rename`/`prepareRename`), and M10 (presentation & code actions — `semanticTokens` full/delta/range
+`rename`/`prepareRename`), M10 (presentation & code actions — `semanticTokens` full/delta/range
 standard-legend-only, `inlayHint`+resolve, `documentColor`/`colorPresentation`, `codeAction`
-warning quickfixes + `source.fixAll`) complete** — M7's #57–#63 and M8's #64/#65 merged 2026-06-13,
-M9's #66–#71 and M10's #72–#75 merged 2026-06-14, all four milestones closed (M8 via PRs #94/#95,
-M9 via #100–#105, M10 via #110/#112/#116/#117, all adversarially reviewed; a Godot-headless-LSP
-differential showed 99.6% completion agreement on member access). M9 `rename` (#66) took **six
+warning quickfixes + `source.fixAll`), and M11 (scenes & file operations — `.tscn` scene index +
+`$`/`%` typing, scene-aware completion, autoload `uid://`→scene→root-script typing, `willRenameFiles`,
+external-formatter bridge)** — M7's #57–#63 and M8's #64/#65 merged 2026-06-13,
+M9's #66–#71 and M10's #72–#75 merged 2026-06-14, M11's #76–#80 merged 2026-06-15; all five
+milestones closed (M8 via PRs #94/#95, M9 via #100–#105, M10 via #110/#112/#116/#117, all
+adversarially reviewed; a Godot-headless-LSP differential showed 99.6% completion agreement on
+member access). M9 `rename` (#66) took **six
 adversarial review rounds** to close every proven source-corruption path — the lesson, captured in
 memory: `references`/`definition` are read-tuned, so their inaccuracies become silent corruption
 under rename, the first mutating consumer; the fix is a fail-closed positive-project-resolution
@@ -160,19 +168,35 @@ lesson — its warning quickfixes ship edits behind a fail-closed ERROR/shadow b
 offer-time gate proved safe is exactly what the client applies). `semanticTokens` advertises the
 STANDARD LSP legend only (zero custom token names — the #30 generic-LSP target), intersecting it
 per-client at emit time; `executeCommandProvider` lists EXACTLY the one real command
-(`gdls.applyWarningIgnore`), never an empty/broken list (anti-catalog W15). M9 deferred items filed:
-#106 (enum-value/autoload rename refuse), #107 (for-loop/match/inner-shadow). M10 deferred items
-filed: #111 (semanticTokens bare-call/for-loop/match-pattern decl sites), #114/#115 (inlayHint
-script-owned enum / `Array[<named-script>]` container hints), #118/#119 (codeAction `_`-prefix for
-`UNUSED_PRIVATE_CLASS_VARIABLE` / over-refuse when `_name` exists in an unrelated scope); plus #113
-(signatureHelp wrong inner-class-method signature — an M8 carry-over surfaced during M10 review).
+(`gdls.applyWarningIgnore`), never an empty/broken list (anti-catalog W15). **M11's key lesson —
+the bare-Node `$`/`%` premise correction (#76):** a fusion review (confirmed against the real
+4.6.3 binary) caught that Godot's analyzer types `$`/`%` as a hard bare `NATIVE Node`
+(`gdscript_analyzer.cpp:3866-3886`), NOT scene-precise — so feeding precise scene-derived types into
+the *diagnostic* path would manufacture false positives Godot never emits (sibling downcasts). The
+`.tscn` text-parsed `SceneIndex` ships, but `reduce_get_node` types valid `$`/`%` as bare `Node`
+(retiring the over-permissive `Variant` deviation, `docs/02 §11`); the precise scene types are kept
+DORMANT for phase-3 navigation, explicitly out of diagnostics. `willRenameFiles` (#79) reaffirmed
+the mutating-consumer firewall — a fusion review fixed an over-capture so it rewrites ONLY
+positively-identified `preload`/`load` args, never an arbitrary `res://` value string. M9 deferred
+items filed: #106 (enum-value/autoload rename refuse), #107 (for-loop/match/inner-shadow). M10
+deferred items filed: #111 (semanticTokens bare-call/for-loop/match-pattern decl sites), #114/#115
+(inlayHint script-owned enum / `Array[<named-script>]` container hints), #118/#119 (codeAction
+`_`-prefix for `UNUSED_PRIVATE_CLASS_VARIABLE` / over-refuse when `_name` exists in an unrelated
+scope); plus #113 (signatureHelp wrong inner-class-method signature — an M8 carry-over surfaced
+during M10 review). M11 deferred items filed: #123 (`UNSAFE_METHOD_ACCESS` analyzer-wide
+under-emission), #124 (`$`/`%` glyph), #125 (precise `$`/`%` navigation typing — the dormant
+substrate's consumer), #126 (`%` mid-string completion span), #127 (`res://` asset completion),
+#129 (scriptless autoload as a type annotation), #131 (`.tscn` `ext_resource` rewrite on rename),
+#132 (`willRenameFiles` write-set misses), #135/#136 (formatter head-of-line / cancel).
 Per-milestone interactive checks are batched into ONE end-of-Phase-2 trial by the user
 in real work (capability captures are Claude's, headless — inventory + gaps in
 `crates/gd_server/tests/fixtures/client_caps/README.md`; deferred feel-check items in
-`docs/09 §7.4`). Phase 2 ships no per-milestone releases (deferred until the phase matures). Release notes and the full history live in
+`docs/09 §7.4`). Phase 2 shipped no per-milestone releases; now that the phase is COMPLETE, a
+single release will be cut from `main` as a separate step (the v1.0.7 tag stands as the last
+release). Release notes and the full history live in
 `CHANGELOG.md`; per-milestone exit criteria in `docs/07`. Both conformance ratchets hold at
-**1.0** with empty known-failures lists; CI is green on both legs with the four-layer fuzz
-gate (`parse` + `analyze` + `index_invariants` + `complete_context`). Standing release gate: the
+**1.0** with empty known-failures lists; CI is green on both legs with the five-layer fuzz
+gate (`parse` + `analyze` + `index_invariants` + `complete_context` + `scene_parse`). Standing release gate: the
 `scripts/m6-acceptance/scan_diags.py` diagnostics sweep on both acceptance projects, run
 comparatively against the previous release binary (`--strict` + warning histogram; error
 baselines must hold; a nav-row walk is NOT a diagnostics gate), with the private project swept

@@ -139,6 +139,63 @@ M10 — Phase 2 presentation & code actions (#72–#75), merged 2026-06-14. No r
   is an allow-filter, not a remap table) — fixes a wire-index mishighlight on clients whose legend
   differs from gdls's in membership or order (#121).
 
+M11 — Phase 2 scenes & file operations (#76–#80), merged 2026-06-15. No release cut.
+
+### Added
+- **`.tscn` scene index + `$`/`%` typing** (#76): a panic-free `.tscn` **text** parser feeds a
+  `SceneIndex` in `gd_project` (node tree / types / script attachments / `%`-unique names /
+  instanced sub-scenes resolved by recursive TEXT, never engine instantiation — anti-catalog W16);
+  the warm-start cache bumps (v5 → v6), the watcher tracks `**/*.tscn`, and a new `scene_parse`
+  fuzz target joins the gate (now FIVE targets). **Premise correction (fusion- and
+  real-4.6.3-binary-verified):** Godot's analyzer types `$`/`%` as a hard bare `NATIVE Node`
+  (`gdscript_analyzer.cpp:3866-3886`), NOT scene-precise — feeding a precise scene type into the
+  diagnostic path would manufacture false positives Godot never emits (sibling downcasts). So
+  `reduce_get_node` types a valid `$`/`%` as bare `Node` (retiring the over-permissive `Variant`
+  deviation, `docs/02 §11`): a member miss now fires `UNSAFE_PROPERTY_ACCESS`, while sibling
+  downcasts/casts stay silent — exactly Godot. The precise scene-derived types are repurposed for
+  **phase-3 navigation** (the resolution substrate ships dormant); exit criterion #4 is reframed to
+  bare-Node parity.
+- **Scene-aware node-path completion** (#77): `$`/`%`/`get_node("…")`/`load`/`preload` complete from
+  the scene index — no scene ⇒ empty (anti-catalog W10), multiple scenes ⇒ the union with type
+  ambiguity annotated. The `textEdit` is a mutating surface; five edit/UX corruption bugs were found,
+  fixed, and guarded.
+- **Autoload `uid://` → scene → root-script typing** (#78): a scene-backed autoload (a direct path or
+  `uid://`) types as the scene root's attached script — matching Godot's analyzer, which dereferences
+  the singleton (UNLIKE `$`/`%`); a scriptless root falls to the bare `Node` floor, and the
+  `is_singleton` gate is honored. As a side benefit (oracle-verified on the acceptance project), an
+  autoload name is itself a valid type annotation in Godot, so this also removed a class of
+  `Could not find type "<autoload>"` false positives.
+- **`willRenameFiles` + `did*`** (#79): the gated `workspace.fileOperations.willRename` returns a
+  versioned `WorkspaceEdit` rewriting in-project `.gd` `preload`/`load` `res://` references (for `.gd`
+  and `.tscn` moves); a fusion review caught and fixed a corruption-class over-capture — it now
+  rewrites ONLY positively-identified `preload`/`load` arguments, never an arbitrary non-load `res://`
+  value string. A scene-attached `.gd` move emits a `showMessage(Warning)` for the dangling
+  `ext_resource`.
+- **External-formatter bridge** (#80): `documentFormattingProvider` is advertised **only when** a
+  `formatter.command` is configured (the rust-analyzer pattern — no formatter exists upstream to
+  port). The subprocess path is hardened: no shell, a bounded timeout, concurrent stdin/stdout (no
+  pipe deadlock), an output cap, and per-failure-class warning dedupe; edits are minimal-diff.
+
+### Changed
+- The warm-start cache format bumped (v5 → v6) for the `SceneIndex` — one cold re-index per project
+  on first launch after upgrading, self-healing.
+
+**Convergence (exit #4):** comparative `scan_diags.py` sweeps (prev-release v1.0.7 vs the M11 build)
+on BOTH acceptance projects — Pixelorama (Linux) and 3-souls (Windows, the Windows binary) — held the
+default-profile error baseline with **zero new false positives** (3-souls even shed a class of
+autoload-as-type FPs); the `--strict` increase is the convergent bare-Node `UNSAFE_*`-on-node-access
+family (Godot's analyzer emits the same). Both fidelity ratchets stay **1.0000**; the five-target
+fuzz gate is clean.
+
+**Deferred (filed):** #123 (`UNSAFE_METHOD_ACCESS` analyzer-wide under-emission), #124 (`$`/`%`
+glyph), #125 (precise `$`/`%` navigation typing — the dormant substrate's consumer), #126 (`%`
+mid-string completion span), #127 (`res://` asset completion), #129 (scriptless autoload as a type
+annotation), #131 (`.tscn` `ext_resource` rewrite on rename), #132 (`willRenameFiles` write-set
+misses), #135/#136 (formatter head-of-line / cancel). The M9 (#106/#107/#109) and M10
+(#111/#113/#114/#115/#118/#119) carryovers remain tracked.
+
+**Phase 2 is now COMPLETE (M7–M11 shipped); a release will be cut from `main` as a separate step.**
+
 ## [1.0.7] — 2026-06-13
 
 Follow-ups to the v1.0.6 utility-as-Callable hotfix, surfaced by its review (#92). Cut from
