@@ -957,10 +957,6 @@ fn dollar_property_write_miss_fires_unsafe_property_access() {
 }
 
 #[test]
-#[ignore = "blocked on #123: UNSAFE_METHOD_ACCESS under-emits on native-base method misses \
-            (it only fires for the untyped-param Variant shape) — a general M3 analyzer gap, NOT \
-            $-specific (a plain `var n: Node; n.miss()` is silent too). Godot fires it here \
-            (analyzer.cpp:3741). Assertion is the correct convergence target, ignored until #123."]
 fn dollar_method_miss_fires_unsafe_method_access() {
     // `$x.<method miss>()` → UNSAFE_METHOD_ACCESS (`Node` has no `bogus_method`). Godot
     // (analyzer.cpp:3741) warns on a non-self, non-builtin-hard base miss; bare `Node` qualifies.
@@ -971,6 +967,93 @@ fn dollar_method_miss_fires_unsafe_method_access() {
         got.iter()
             .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
         "a `$Child` method miss must fire UNSAFE_METHOD_ACCESS, got {got:?}"
+    );
+}
+
+// --- #123: UNSAFE_METHOD_ACCESS on a `$`/`%` (GetNode) base method miss ----------------------------
+// Scoped to the `$`/`%` GetNode base, whose bare-`Node` type gdls SYNTHESIZES (M11) — so the miss is
+// independent of native-dump method-list completeness. The GENERAL hard NATIVE/SCRIPT-instance case
+// is blocked by gdls's JSON-dump-vs-ClassDB gap (it over-emits on real-but-undumped methods) and is
+// deferred (a separate Completeness issue), asserted scoped-out below.
+
+/// A native DB with an ancestor method on `Object` and an instance method on `Node`, so the
+/// inherited-chain lookup (a `$Node` base reaching an `Object` method) can be exercised — the real
+/// false-positive class for #123 (warning on a VALID method the chain-walk missed).
+fn unsafe_method_native() -> NativeDb {
+    NativeDb::from_json(
+        r#"{
+            "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+            "classes": [
+                {"name": "Object", "methods": [
+                    {"name": "get_instance_id", "is_const": true, "is_static": false,
+                     "is_vararg": false, "is_virtual": false, "hash": 10,
+                     "return_value": {"type": "int"}, "arguments": []}
+                ]},
+                {"name": "Node", "inherits": "Object", "methods": [
+                    {"name": "get_parent", "is_const": true, "is_static": false, "is_vararg": false,
+                     "is_virtual": false, "hash": 1, "return_value": {"type": "Node"}, "arguments": []}
+                ]}
+            ]
+        }"#,
+    )
+    .expect("valid unsafe-method dump")
+}
+
+/// FP guard (the real risk class): a VALID method inherited from an ANCESTOR (`Object.get_instance_id`
+/// called on a `$Node` base) must stay SILENT — the native chain-walk must resolve it, not warn.
+#[test]
+fn dollar_valid_ancestor_method_is_silent() {
+    let src =
+        "extends Node\nfunc f() -> void:\n\tvar i = $Child.get_instance_id()\n\tprint_debug(i)\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &unsafe_method_native());
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "a valid ancestor (Object) method on a `$Node` base must NOT fire UNSAFE_METHOD_ACCESS, got {got:?}"
+    );
+}
+
+/// Reserved-error guard: the `$` miss fires the WARNING but introduces NO error (the hard "Function
+/// not found in base" error stays reserved for `is_self || (hard && BUILTIN)`, untouched here).
+#[test]
+fn dollar_method_miss_emits_no_error() {
+    let src = "extends Node\nfunc f() -> void:\n\t$Child.bogus_method()\n";
+    let errs = errors_in(src, &unsafe_method_native());
+    assert!(
+        errs.is_empty(),
+        "a `$Child` method miss must add NO error diagnostic (warning only), got {errs:?}"
+    );
+}
+
+/// Scope guard: the GENERAL hard-NATIVE-instance case (`var n: Node = …; n.bogus()`) is NOT emitted —
+/// only the `$`/`%` base is. gdls cannot distinguish a real-but-undumped native method from a
+/// fabricated one (JSON dump < ClassDB), so emitting on arbitrary native bases over-emits vs Godot;
+/// deferred to a Completeness follow-up. (Removing this guard's intent requires a dump-completeness
+/// signal first.)
+#[test]
+fn general_native_base_method_miss_is_scoped_out() {
+    let src = "extends Node\nfunc f() -> void:\n\tvar n: Node = get_parent()\n\tn.bogus_method()\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &unsafe_method_native());
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "general native-base miss is deferred ($/%-only scope) — must NOT fire yet, got {got:?}"
+    );
+}
+
+/// `is_self`-silent guard: a bare self-method miss must NOT fire UNSAFE_METHOD_ACCESS (Godot's
+/// `!is_self` excludes it; gdls also permissively silences the hard error under the #24 deviation).
+#[test]
+fn self_method_miss_no_unsafe_method_access() {
+    let src = "extends Node\nfunc f() -> void:\n\tbogus_self_method()\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &unsafe_method_native());
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "a bare self-method miss must NOT fire UNSAFE_METHOD_ACCESS, got {got:?}"
     );
 }
 

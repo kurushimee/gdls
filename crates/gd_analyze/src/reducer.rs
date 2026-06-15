@@ -4344,6 +4344,37 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 );
             }
         }
+        // analyzer.cpp:3740-3742 — UNSAFE_METHOD_ACCESS on a `$`/`%` (GetNode) base method miss. Godot
+        // warns on ANY unresolved non-`self`, non-hard-BUILTIN method; gdls can emit this SAFELY only
+        // for the `$`/`%` base, whose bare-`Node` type gdls SYNTHESIZES (M11, analyzer.cpp:3882-3886).
+        // The miss therefore does NOT depend on the native dump's method-list completeness the way an
+        // arbitrary `var x: SomeClass` does: the GENERAL hard NATIVE/SCRIPT-base case is blocked by
+        // gdls's JSON-dump-vs-ClassDB completeness gap — the conformance dump (trimmed, yet marked
+        // Exact) over-emits on real-but-undumped methods (`Script.get_script_constant_map`, a script's
+        // `new()`), indistinguishable from a fabricated name — so it stays silent here, like the hard
+        // "Function not found" error already silences native-instance misses. Exact-gated (a non-Exact
+        // dump can't be trusted even for `Node`); additive — no error path changes, so the hard
+        // "Function not found in base" error stays reserved for `is_self || (hard && BUILTIN)`.
+        let base_is_get_node = call
+            .callee
+            .and_then(|c| match &ctx.node(c).kind {
+                NodeKind::Subscript(s) => s.base,
+                _ => None,
+            })
+            .is_some_and(|bid| matches!(&ctx.node(bid).kind, NodeKind::GetNode(_)));
+        if base_is_get_node
+            && !name_is_value
+            && function_name != "new"
+            && base_type.is_hard_type()
+            && base_type.kind == DtKind::Native
+            && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+        {
+            ctx.push_warning(
+                crate::warnings::WarningCode::UnsafeMethodAccess,
+                &[function_name.clone(), base_type.to_string()],
+                id,
+            );
+        }
         call_type = DataType::variant();
     }
 
