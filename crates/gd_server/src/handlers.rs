@@ -6641,7 +6641,11 @@ pub fn rename(
         // `old_name.new()` (the global class), and a file-level guard cannot separate them. Refuse.
         // The shadow may live in the ORIGIN file itself (a global-class USE — `old_name.new()` /
         // `extends old_name` — in a file that also declares an inner `old_name`; checked here with the
-        // already-parsed origin tree, no re-parse) OR in any cross-file referencer.
+        // already-parsed origin tree, no re-parse) OR in any cross-file referencer. This guard's file
+        // fan-out is exactly the edit collector's: `{origin} ∪ name_referencers(old_name)` — the
+        // origin (always scanned for edits) plus the interface-pass referencer set. Keep that equality
+        // if either the edit-collection candidate set or `any_referencer_has_inner_scoped_type` ever
+        // changes, or a file the collector edits could escape the guard.
         if cursor_refers_global_class
             && (name_is_in_file_inner_scoped_type(&parsed.tree, &old_name)
                 || any_referencer_has_inner_scoped_type(state, &old_name, &uri))
