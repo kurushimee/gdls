@@ -2677,6 +2677,9 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     let unresolved_kind = if name_is_in_file_root_type(&parsed.tree, &name) {
         UnresolvedKind::InFileType
     } else if cursor_refers_global_class {
+        // `cursor_refers_global_class` already returned `false` when `global_class_file` is `None`
+        // (it short-circuits on a missing registry entry), so the `Some` arm is the live path; the
+        // `None` arm is a defensive belt-and-suspenders that can't be reached within one request.
         match global_class_file(state, &name) {
             Some(cf) => UnresolvedKind::GlobalClass(cf),
             None => UnresolvedKind::RawFloor,
@@ -4050,6 +4053,16 @@ fn push_global_class_locations(
     }
     // (2) Type-position base segments named `name` (carry no binding). Restricted to index 0 of an
     // `extends` chain / `TypeNode.type_chain`, so a `Foo.Inner` suffix is never collected.
+    //
+    // A file that locally declares `name` as a root `enum`/inner-class SHADOWS the global class, so
+    // every type position naming `name` in that file refers to the LOCAL type, not this class — skip
+    // them all. (Part 1 above contributes nothing for such a file either: a shadowed `name` reduces
+    // to the local type and records no Class use binding.) Without this guard, renaming a global
+    // `class_name Foo` would rewrite a CONSUMER's own `var y: Foo` whose `Foo` is its in-file enum —
+    // the candidate-side twin of the in-file-type collision.
+    if name_is_in_file_root_type(tree, name) {
+        return;
+    }
     for nid in tree.iter_ids() {
         let base_id = match &tree.get(nid).kind {
             NodeKind::Class(c) => c.extends.first().copied(),
