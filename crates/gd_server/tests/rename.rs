@@ -2366,3 +2366,120 @@ fn rename_inner_class_from_type_annotation_use_succeeds() {
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_in_file_const_and_signal_from_use_succeed() {
+    // SWEEP (main-vs-HEAD regression coverage): the remaining in-file symbol kinds whose USE-site
+    // anchor the name-based signal-1 used to provide. An in-file `const` from a bare use, and an
+    // in-file `signal` from a bare reference, must each rename from the USE site — not refuse.
+    //   line 1 `const MAX := 5`                  → const decl `MAX` at col 6
+    //   line 2 `signal hit`                      → signal decl `hit` at col 7
+    //   line 4 `\tvar x = MAX`                   → const bare use `MAX` at col 9
+    //   line 5 `\thit.connect(go)`               → signal bare ref `hit` at col 1
+    let src = "extends Node\nconst MAX := 5\nsignal hit\nfunc go() -> void:\n\tvar x = MAX\n\thit.connect(go)\n";
+    // const from bare use (line 4, col 9).
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    let sites = rename_sites(&client, 228, &main_uri, 4, 9, "LIMIT");
+    assert!(
+        sites.contains(&(1, 6)) && sites.contains(&(4, 9)),
+        "renaming an in-file const from a bare use must edit the const decl (1,6) + the use (4,9); \
+         got {sites:?}"
+    );
+    shutdown(&client, server);
+
+    // signal from bare ref (line 5, col 1).
+    let (client2, server2, main_uri2, _project2) = boot_native_member(src);
+    client2
+        .sender
+        .send(request(
+            229,
+            "textDocument/rename",
+            rename_params(&main_uri2, 5, 1, "struck"),
+        ))
+        .unwrap();
+    let resp2 = recv_response(&client2);
+    assert!(
+        resp2.error.is_none(),
+        "renaming an in-file signal from a bare reference must succeed: {:?}",
+        resp2.error
+    );
+    let view2 = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp2.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    assert!(
+        view2
+            .set
+            .iter()
+            .any(|(_, r)| r.start.line == 2 && r.start.character == 7),
+        "renaming the signal from its reference must edit the signal declaration (2,7): {:?}",
+        view2.set
+    );
+    shutdown(&client2, server2);
+}
+
+#[test]
+fn rename_in_file_type_from_expression_base_use_succeeds() {
+    // ANTI-OVER-NARROW REGRESSION GUARD (EXPRESSION position — the twin of the type-annotation case):
+    // an in-file enum TYPE clicked as the BASE of `MyEnum.A`, and an in-file inner CLASS clicked as
+    // the BASE of `Inner.new()`, must rename from the USE site — not refuse. (A subscript BASE naming
+    // an in-file type resolves to THIS file's type; only a subscript ATTRIBUTE resolving cross-file is
+    // the corruption case.)
+    //   line 1 `enum MyEnum { A }`        → enum TYPE decl `MyEnum` at col 5
+    //   line 2 `class Inner:`             → inner CLASS decl `Inner` at col 6
+    //   line 5 `\tvar a = MyEnum.A`       → `MyEnum` BASE at col 9
+    //   line 6 `\tvar i = Inner.new()`    → `Inner` BASE at col 9
+    let src = "extends Node\nenum MyEnum { A }\nclass Inner:\n\tvar v: int = 0\nfunc go() -> void:\n\tvar a = MyEnum.A\n\tvar i = Inner.new()\n";
+    // Enum type from `MyEnum.A` base (line 5, col 9).
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    client
+        .sender
+        .send(request(
+            226,
+            "textDocument/rename",
+            rename_params(&main_uri, 5, 9, "Dir"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming an in-file enum TYPE from a `MyEnum.A` expression base must succeed: {:?}",
+        resp.error
+    );
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    assert!(
+        view.set
+            .iter()
+            .any(|(_, r)| r.start.line == 1 && r.start.character == 5),
+        "renaming the enum type from `MyEnum.A` must edit the enum TYPE declaration (1,5): {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+
+    // Inner class from `Inner.new()` base (line 6, col 9).
+    let (client2, server2, main_uri2, _project2) = boot_native_member(src);
+    client2
+        .sender
+        .send(request(
+            227,
+            "textDocument/rename",
+            rename_params(&main_uri2, 6, 9, "Nested"),
+        ))
+        .unwrap();
+    let resp2 = recv_response(&client2);
+    assert!(
+        resp2.error.is_none(),
+        "renaming an in-file inner CLASS from an `Inner.new()` expression base must succeed: {:?}",
+        resp2.error
+    );
+    let view2 = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp2.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    assert!(
+        view2.set.iter().any(|(_, r)| r.start.line == 2 && r.start.character == 6),
+        "renaming the inner class from `Inner.new()` must edit the inner CLASS declaration (2,6): {:?}",
+        view2.set
+    );
+    shutdown(&client2, server2);
+}
