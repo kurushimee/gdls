@@ -1031,6 +1031,25 @@ fn precision_native() -> NativeDb {
     .expect("valid precision dump")
 }
 
+/// A native DB with `Object → RefCounted` carrying a NON-virtual `get_reference_count`, so the
+/// super-call-on-a-non-virtual case stays silent (the super-virtual error is `is_virtual`-gated).
+fn super_nonvirtual_native() -> NativeDb {
+    NativeDb::from_json(
+        r#"{
+            "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+            "classes": [
+                {"name": "Object", "is_instantiable": true},
+                {"name": "RefCounted", "inherits": "Object", "is_instantiable": true, "methods": [
+                    {"name": "get_reference_count", "is_const": true, "is_static": false,
+                     "is_vararg": false, "is_virtual": false, "hash": 7,
+                     "return_value": {"type": "int"}, "arguments": []}
+                ]}
+            ]
+        }"#,
+    )
+    .expect("valid super-nonvirtual dump")
+}
+
 /// FP guard (the real risk class): a VALID method inherited from an ANCESTOR (`Object.get_instance_id`
 /// called on a `$Node` base) must stay SILENT — the native chain-walk must resolve it, not warn.
 #[test]
@@ -1210,6 +1229,37 @@ fn native_metatype_new_constructor_is_silent() {
         !got.iter()
             .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
         "`Node.new()` (constructor-synthesis arm) must NOT fire UNSAFE_METHOD_ACCESS, got {got:?}"
+    );
+}
+
+/// #147 regression guard (oracle-confirmed, ratchet-blind): seeding the native virtuals must NOT
+/// silence the super-call error. `super._notification(0)` resolves the seeded `Object._notification`
+/// (a virtual), so Godot's analyzer.cpp:3630-3636 fires `Cannot call the parent class' virtual
+/// function "_notification()" because it hasn't been defined.` — a HARD ERROR, universal across native
+/// virtuals (not just `_init`; the corpus only exercises `_init`). The seed made `lookup_native_method`
+/// resolve `_notification`, which would otherwise have bypassed this error.
+#[test]
+fn super_native_virtual_call_errors() {
+    let src = "extends Node\nfunc _notification(what: int) -> void:\n\tsuper._notification(what)\n";
+    let errs = errors_in(src, &precision_native());
+    assert!(
+        errs.iter().any(|m| m
+            == r#"Cannot call the parent class' virtual function "_notification()" because it hasn't been defined."#),
+        "super-calling a seeded native virtual must error (analyzer.cpp:3630-3636), got {errs:?}"
+    );
+}
+
+/// #147 companion (oracle-confirmed): super-calling a real NON-virtual native method stays SILENT —
+/// the error is virtual-specific (`sig.is_virtual` gate). `get_reference_count` is a non-virtual
+/// `RefCounted` method, so `super.get_reference_count()` produces no diagnostic.
+#[test]
+fn super_native_nonvirtual_call_is_silent() {
+    let src =
+        "extends RefCounted\nfunc test() -> void:\n\tsuper.get_reference_count()\n\tprint_debug(1)\n";
+    let errs = errors_in(src, &super_nonvirtual_native());
+    assert!(
+        !errs.iter().any(|m| m.contains("virtual function")),
+        "super-calling a non-virtual native method must NOT error, got {errs:?}"
     );
 }
 
