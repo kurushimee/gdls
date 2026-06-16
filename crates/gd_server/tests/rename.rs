@@ -3523,3 +3523,222 @@ fn rename_167_inner_enum_decl_click_with_colliding_global_refuses() {
     let _ = holder_uri;
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_163_root_const_alias_shadow_excluded_precise() {
+    // #163 const-alias cell (root scope). A consumer types against a `class_name`-less script via the
+    // idiomatic `const Hero = preload("res://other.gd")` alias, then annotates `var x: Hero`. That
+    // `: Hero` refers to the LOCAL const (identity oracle below), NOT the global `class_name Hero`.
+    // Before the `Member::Constant` arm landed in `name_is_in_file_root_type`, the root-only shadow
+    // guard was blind to the const, so `push_global_class_locations`'s early-return SKIP never fired
+    // for this file and renaming the global `class_name Hero` emitted a WRONG edit to `var x: Hero`
+    // (corruption). The fix EXCLUDES the const-alias consumer entirely (precise, not over-refused):
+    // the rename edits only the global decl + genuine `extends Hero` consumers. #163.
+    let project = common::sample_project();
+    project.write("src/hero.gd", "class_name Hero\nextends Node\n");
+    project.write("src/other.gd", "class_name OtherThing\nextends Node\n");
+    project.write(
+        "src/c1.gd",
+        // `const Hero` shadows the global; `var x: Hero` resolves to the local const, not the class.
+        "extends Node\n\nconst Hero = preload(\"res://src/other.gd\")\n\nvar x: Hero = null\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/other.gd", "src/c1.gd"],
+        2,
+    );
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let enemy_uri = file_uri(&project.root.join("src/enemy.gd"));
+    let c1_uri = file_uri(&project.root.join("src/c1.gd"));
+
+    // Identity oracle: definition on `var x: Hero` (c1.gd line 4, `var x: `=cols0-6, `Hero`@7) must
+    // resolve to the LOCAL `const Hero` (c1.gd line 2), proving the annotation is NOT the global class
+    // — so editing it under the global-class rename would be wrong.
+    client
+        .sender
+        .send(request(
+            500,
+            "textDocument/definition",
+            position_params(&c1_uri, 4, 7),
+        ))
+        .unwrap();
+    let defresp = recv_response(&client);
+    let def: GotoDefinitionResponse =
+        serde_json::from_value(defresp.result.expect("definition result")).unwrap();
+    let GotoDefinitionResponse::Scalar(def_loc) = def else {
+        panic!("expected a single definition location; got {def:?}");
+    };
+    assert_eq!(
+        def_loc.uri.as_str(),
+        c1_uri.as_str(),
+        "`: Hero` must resolve to the LOCAL const in c1.gd, not the global class in hero.gd; got {:?}",
+        def_loc.uri
+    );
+    assert_eq!(
+        def_loc.range.start.line, 2,
+        "`: Hero` must resolve to the `const Hero` declaration on c1.gd line 2; got {:?}",
+        def_loc.range
+    );
+
+    // Rename the GLOBAL `class_name Hero` decl @ hero.gd line 0 col 11 → `Champion`.
+    client
+        .sender
+        .send(request(
+            501,
+            "textDocument/rename",
+            rename_params(&hero_uri, 0, 11, "Champion"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the global `class_name Hero` must SUCCEED (the const-alias consumer is precisely \
+         excluded, not over-refused); got {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+
+    // The const-alias consumer's `var x: Hero` must NOT be edited — it is the local const, not the
+    // global class. This is the corruption the `Member::Constant` arm closes.
+    assert!(
+        !view.set.iter().any(|(u, _)| *u == c1_uri.as_str()),
+        "renaming the global `class_name Hero` must EXCLUDE the const-alias consumer entirely \
+         (`var x: Hero` is the local `const Hero`, not the class); got {:?}",
+        view.set
+    );
+    // Precise positive edits: the global decl (hero.gd 0,11) + the genuine `extends Hero` (enemy.gd 0,8).
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == hero_uri.as_str() && r.start.line == 0 && r.start.character == 11),
+        "the `class_name Hero` declaration must be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == enemy_uri.as_str() && r.start.line == 0 && r.start.character == 8),
+        "the genuine `extends Hero` consumer (enemy.gd) must be edited; got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_167_inner_const_alias_shadow_refuses() {
+    // #163 const-alias cell (inner scope). Same idiomatic `const Hero = preload(...)` alias + its
+    // `var x: Hero` use, but INSIDE a `class Inner:` scope. Before the `Member::Constant` arm landed
+    // in `name_is_in_file_inner_scoped_type`, the inner-scope refuse-guard was blind to the const, so
+    // renaming the global `class_name Hero` emitted a WRONG edit to the inner `var x: Hero`
+    // (corruption — it does NOT refuse). The fix makes the refuse-guard (A) see the inner `const`, so
+    // the whole rename now REFUSES with zero edits. (#167 tracks restoring precise per-node scope-aware
+    // resolution so this case can rename precisely instead of refusing — over-refusal is the safe
+    // direction until then.) #163, #167.
+    let project = common::sample_project();
+    project.write("src/hero.gd", "class_name Hero\nextends Node\n");
+    project.write("src/other.gd", "class_name OtherThing\nextends Node\n");
+    project.write(
+        "src/c2.gd",
+        // Inner-scoped `const Hero` alias + `var x: Hero` (the inner const, not the global class).
+        "extends Node\n\nclass Inner:\n\tconst Hero = preload(\"res://src/other.gd\")\n\tvar x: Hero = null\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/other.gd", "src/c2.gd"],
+        2,
+    );
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let c2_uri = file_uri(&project.root.join("src/c2.gd"));
+
+    // Rename the GLOBAL `class_name Hero` decl @ hero.gd line 0 col 11 → `Champion`.
+    client
+        .sender
+        .send(request(
+            510,
+            "textDocument/rename",
+            rename_params(&hero_uri, 0, 11, "Champion"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    // Fail-closed: the inner-scoped `const Hero` shadow cannot be distinguished from a global
+    // reference by a file-level guard, so REFUSE the whole rename (zero edits).
+    assert!(
+        resp.result.is_none() && resp.error.is_some(),
+        "renaming a global `class_name Hero` must REFUSE when a consumer declares an inner-scoped \
+         `const Hero` alias (the inner `var x: Hero` cannot be safely separated from a global ref); \
+         got result={:?}, error={:?}",
+        resp.result,
+        resp.error
+    );
+    // Belt-and-suspenders: even if the refuse mechanism changes shape, the inner const-alias file must
+    // never be edited.
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == c2_uri.as_str()),
+            "the refuse-guard must emit ZERO edits to the inner const-alias file; got {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_163_func_local_const_alias_stays_safe() {
+    // Guard cell: a `const Hero = preload(...)` in a FUNCTION BODY is neither a root member nor an
+    // inner-class member, so neither `name_is_in_file_root_type` nor `name_is_in_file_inner_scoped_type`
+    // sees it — proving the `Member::Constant` arm did NOT over-broaden into local scope. A func-local
+    // const is not usable in a type-annotation position anyway, so there is no shadow to protect; the
+    // global-class rename must simply not edit this file. #163.
+    let project = common::sample_project();
+    project.write("src/hero.gd", "class_name Hero\nextends Node\n");
+    project.write("src/other.gd", "class_name OtherThing\nextends Node\n");
+    project.write(
+        "src/c3.gd",
+        // `const Hero` lives in a function body — a local binding, not a class member.
+        "extends Node\n\nfunc f() -> void:\n\tconst Hero = 1\n\tprint(Hero)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/other.gd", "src/c3.gd"],
+        2,
+    );
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let c3_uri = file_uri(&project.root.join("src/c3.gd"));
+
+    // Rename the GLOBAL `class_name Hero` decl @ hero.gd line 0 col 11 → `Champion`.
+    client
+        .sender
+        .send(request(
+            520,
+            "textDocument/rename",
+            rename_params(&hero_uri, 0, 11, "Champion"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the global `class_name Hero` must SUCCEED — the func-local `const Hero` is not a \
+         class-member shadow; got {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+    assert!(
+        !view.set.iter().any(|(u, _)| *u == c3_uri.as_str()),
+        "the func-local `const Hero` file must NOT be edited (no class-member shadow, no genuine \
+         class ref); got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}

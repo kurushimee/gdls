@@ -1957,12 +1957,15 @@ fn cursor_is_type_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
     })
 }
 
-/// `true` iff `name` is a root-class ENUM type or INNER CLASS declared in THIS file. The
-/// occurrence-positive in-file-TYPE anchor for the rename firewall: a `: MyEnum` / `: Inner` type
-/// annotation (or `extends Inner`) carries no `Binding::Use` and is not a global `class_name`, so it
-/// would otherwise wrongly REFUSE — the name-based signal-1 this replaced admitted it. Restricted to
-/// the type kinds (`Member::Enum` / `Member::Class`) whose references live in resolver-level type
-/// positions, so it cannot admit an unrelated value/member of the same name. #106.
+/// `true` iff `name` is a root-class ENUM type, INNER CLASS, or `const` alias declared in THIS file.
+/// The occurrence-positive in-file-TYPE anchor for the rename firewall: a `: MyEnum` / `: Inner` /
+/// `: Hero` (where `const Hero = preload(...)`) type annotation (or `extends Inner`) carries no
+/// `Binding::Use` and is not a global `class_name`, so it would otherwise wrongly REFUSE — the
+/// name-based signal-1 this replaced admitted it. Restricted to the member kinds usable in a
+/// type-annotation position — `{Enum, Class, Constant}`, the COMPLETE such set (var/func/signal
+/// cannot annotate) — so it cannot admit an unrelated value/member of the same name. `const` is in
+/// the set because `const Hero = preload("res://other.gd")` is the idiomatic alias for a script that
+/// has no `class_name`, then referenced as `var x: Hero`. #106, #163.
 fn name_is_in_file_root_type(tree: &ParseTree, name: &str) -> bool {
     let Some(root_id) = tree.root_id() else {
         return false;
@@ -1977,12 +1980,16 @@ fn name_is_in_file_root_type(tree: &ParseTree, name: &str) -> bool {
         Member::Class(id) => {
             matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
         }
+        Member::Constant(id) => {
+            matches!(&tree.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+        }
         _ => false,
     })
 }
 
-/// `true` iff `name` is an ENUM type or CLASS declared INSIDE an inner class (any class node that is
-/// not the file root) — the non-root analog of [`name_is_in_file_root_type`]. A type with this name
+/// `true` iff `name` is an ENUM type, CLASS, or `const` alias declared INSIDE an inner class (any
+/// class node that is not the file root) — the non-root analog of [`name_is_in_file_root_type`], over
+/// the same complete type-position member set `{Enum, Class, Constant}`. A type with this name
 /// is visible only in its enclosing inner scope, so a type-position `name` in this file may refer to
 /// the inner type rather than a same-named global `class_name`. The root-only guard cannot see it.
 ///
@@ -2008,6 +2015,9 @@ fn name_is_in_file_inner_scoped_type(tree: &ParseTree, name: &str) -> bool {
             }
             Member::Class(id) => {
                 matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+            }
+            Member::Constant(id) => {
+                matches!(&tree.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
             }
             _ => false,
         })
