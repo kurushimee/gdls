@@ -730,6 +730,61 @@ fn rename_refuses_member_collision() {
     shutdown(&client, server);
 }
 
+#[test]
+fn rename_local_to_member_name_refuses_shadow() {
+    // #155: a function-LOCAL renamed to the name of a CLASS MEMBER must refuse — the local-target arm
+    // checked only local-vs-local collision and accepted, silently creating a legal-but-confusing
+    // member shadow inside the function. The edit set was correct (only the local's own occurrences),
+    // but the missing-collision-warning is the gap. `var hp` (member, line 1) + a function-local
+    // `var x` (line 3): renaming the local `x` → `hp` must refuse with zero edits, and a free name
+    // must still succeed (no over-refusal of legitimate renames).
+    let src = "extends Node\nvar hp: int = 10\nfunc f() -> void:\n\tvar x = 1\n\tx += 1\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the local declaration `var x` (line 3, col 5). Rename → `hp` (a member name) must refuse.
+    assert_rename_refused(&client, 52, &main_uri, 3, 5, "hp");
+    // Over-refusal guard: renaming the same local → a non-colliding name still succeeds.
+    let ok_sites = rename_sites(&client, 53, &main_uri, 3, 5, "counter");
+    assert_eq!(
+        ok_sites,
+        vec![(3, 5), (4, 1)],
+        "renaming the local to a free name must edit exactly its decl + use; got {ok_sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_local_to_global_class_name_still_succeeds() {
+    // #155 boundary: the local-arm collision check is deliberately member-scope-only (the current
+    // file's root members), NOT the global `class_name` registry — extending it there would
+    // false-refuse the common, legal case of a local shadowing a project class. A project declares
+    // `class_name Foo` in another file; renaming a function-local `x` → `Foo` (which matches NO root
+    // member of the current file) must STILL SUCCEED. This pins the non-extension so a later
+    // "completeness" pass does not over-refuse it.
+    let project = common::sample_project();
+    project.write("src/foo.gd", "class_name Foo\nextends Node\n");
+    project.write(
+        "src/local.gd",
+        "extends Node\nfunc f() -> void:\n\tvar x = 1\n\tx += 1\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/foo.gd", "src/local.gd"],
+        2,
+    );
+    let local_uri = file_uri(&project.root.join("src/local.gd"));
+    // Click the local decl `var x` (line 2, col 5). Rename → `Foo` (a global class_name) must succeed.
+    let sites = rename_sites(&client, 54, &local_uri, 2, 5, "Foo");
+    assert_eq!(
+        sites,
+        vec![(2, 5), (3, 1)],
+        "renaming a local to a global class_name (no current-file member collision) must succeed; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
 // =================================================================================================
 // Corruption firewall on the MUTATING path: a native MEMBER access from a project file. This is the
 // catastrophic case the feature exists to refuse — `references` resolves a native member through a

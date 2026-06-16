@@ -6840,8 +6840,19 @@ fn rename_collision(
                     "Cannot rename to `{new_name}`: `{new_name}` is already declared in this scope"
                 )));
             }
-            // A local target: its scope is the function; the class-member check below would be the
-            // wrong scope, so stop here.
+            // The NEW name also shadows a root-class member: renaming the local to a member's name
+            // creates a legal-but-confusing member shadow inside the function — refuse it the same
+            // way the member arm does (same scope: the current file's root class). Member-scope only,
+            // NOT the global `class_name`/autoload registries — a local shadowing a project class is
+            // common and legal, so checking those would false-refuse legitimate renames (#155).
+            if root_class_declares(tree, new_name) {
+                return Some(RequestRefusal::invalid_name(format!(
+                    "Cannot rename to `{new_name}`: a member named `{new_name}` already exists in this class"
+                )));
+            }
+            // A local target whose new name collides with neither a function-local nor a root member:
+            // the member-role check below is for the OLD name's classification (member/attribute), the
+            // wrong scope for a local target, so stop here.
             return None;
         }
     }
