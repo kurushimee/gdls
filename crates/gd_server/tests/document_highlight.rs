@@ -486,3 +486,69 @@ fn document_highlight_enum_value_decl_and_use_not_unrelated_const() {
     );
     shutdown(&client, server_thread);
 }
+
+/// #164 (documentHighlight twin): a `Member` USE clicked at a CROSS-FILE attribute site (`a.hp`,
+/// target in another file) must NOT highlight the REQUEST file's own same-named `var hp` declaration.
+/// The decl-side `find_in_file_definition(name)` resolved by NAME and over-collected the request
+/// file's decl. documentHighlight is single-file: a cross-file member's declaration lives elsewhere,
+/// so it is simply not part of this buffer's highlight set.
+///
+/// `a.gd` declares `var hp` (the cursor's resolved target). `c.gd` has its OWN `var hp` PLUS the
+/// cross-file `a.hp` access. Click on `hp` in `c.gd`'s `a.hp`: c.gd's own `var hp` decl must NOT be
+/// highlighted (it is a different symbol); only c.gd's `a.hp` use is.
+#[test]
+fn document_highlight_cross_file_member_use_excludes_own_same_named_decl() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    // a.gd: `class_name AClass`, member `var hp` — the resolved target of `a.hp` below.
+    p.write("a.gd", "class_name AClass\nextends Node\nvar hp: int = 0\n");
+    // c.gd declares its OWN `var hp` (line 1, col 4..6 — the same-named decl #164 over-collected),
+    // and accesses A's `hp` cross-file via a body-local typed var.
+    // Line 0: `extends Node`
+    // Line 1: `var hp: int = 9`             — c.gd's OWN decl `hp` at cols 4..6 (must NOT highlight)
+    // Line 2: `func fc() -> int:`
+    // Line 3: `\tvar a: AClass = AClass.new()`
+    // Line 4: `\treturn a.hp`                — cross-file `a.hp` use, `hp` at cols 10..12 (target = A)
+    p.write(
+        "c.gd",
+        "extends Node\nvar hp: int = 9\nfunc fc() -> int:\n\tvar a: AClass = AClass.new()\n\treturn a.hp\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["a.gd", "c.gd"]);
+
+    let c_uri = file_uri(&p.root.join("c.gd"));
+    // Click on `hp` in c.gd's cross-file `a.hp` (line 4, col 10).
+    client
+        .sender
+        .send(request(
+            70,
+            "textDocument/documentHighlight",
+            highlight_params(&c_uri, 4, 10),
+        ))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "documentHighlight errored: {:?}",
+        resp.error
+    );
+    let hls: Vec<DocumentHighlight> =
+        serde_json::from_value(resp.result.expect("documentHighlight result")).unwrap();
+
+    // c.gd's OWN `var hp` decl (line 1, col 4) is a DIFFERENT symbol — must NOT be highlighted.
+    assert!(
+        !hls.iter().any(|h| h.range.start == Position::new(1, 4)),
+        "documentHighlight on the cross-file `a.hp` use must NOT highlight c.gd's own `var hp` \
+         declaration at (1,4); got {hls:?}"
+    );
+    // The genuine cross-file `a.hp` use in c.gd (line 4, col 10) IS this file's occurrence.
+    assert!(
+        hls.iter().any(|h| h.range.start == Position::new(4, 10)),
+        "documentHighlight must highlight c.gd's own `a.hp` access at (4,10); got {hls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
