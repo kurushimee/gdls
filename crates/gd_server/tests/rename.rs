@@ -3410,3 +3410,61 @@ fn rename_167_inner_scoped_type_colliding_with_global_class_refuses() {
     }
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_167_global_class_use_in_self_shadowing_origin_file_refuses() {
+    // (A) ORIGIN-SELF-SHADOW twin: the rename is driven from an EXPRESSION-position global-class use
+    // (`Foo.new()`) in a file that ALSO declares an inner-class-scoped `enum Foo`. The cursor is not a
+    // type-base segment (so the (B) guard does not apply) and the origin file is excluded from the
+    // cross-file fan-out (so the referencer scan does not apply) — yet `push_global_class_locations`
+    // would collect the origin's OWN inner `: Foo` (root-only shadow guard is blind to it) and rewrite
+    // it alongside the legit `Foo.new()`. The origin-symmetric arm of the (A) guard refuses.
+    let project = common::sample_project();
+    project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");
+    project.write(
+        "src/x.gd",
+        // `Foo.new()` is the GLOBAL class (legit). The inner `enum Foo` shadows it inside `Inner`.
+        "extends Node\n\nvar z = Foo.new()\n\nclass Inner:\n\tenum Foo { A }\n\tvar y: Foo = Foo.A\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/fooclass.gd", "src/x.gd"],
+        2,
+    );
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let x_uri = file_uri(&project.root.join("src/x.gd"));
+
+    // `var z = Foo.new()` on x.gd line 2: `var z = `(0-7) `Foo`(8). Click `Foo` at col 8.
+    client
+        .sender
+        .send(request(
+            402,
+            "textDocument/rename",
+            rename_params(&x_uri, 2, 8, "Bar"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.result.is_none() && resp.error.is_some(),
+        "renaming a global `class_name Foo` from an expression use in a file that ALSO declares an \
+         inner-scoped `Foo` must REFUSE (the origin's inner `: Foo` cannot be separated from the \
+         legit `Foo.new()`); got result={:?}, error={:?}",
+        resp.result,
+        resp.error
+    );
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view
+                .set
+                .iter()
+                .any(|(u, _)| *u == x_uri.as_str() || *u == fooclass_uri.as_str()),
+            "the refuse-guard must emit ZERO edits; got {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}

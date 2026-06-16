@@ -4066,6 +4066,10 @@ fn push_use_binding_locations_for(
 /// global-class rename. Parse-only (no analysis): the structural inner-scope check needs just the
 /// AST, and the candidate parses are content-addressed/cached. The interface-pass `name_referencers`
 /// set bounds the scan to the same candidate fan-out `references` uses for a class name.
+///
+/// `origin_uri` is EXCLUDED here on purpose: the rename caller checks the origin file's own inner
+/// shadow directly against its already-parsed tree (avoiding a redundant parse), so this scans only
+/// the cross-file referencers. Keep the split — re-merging it would re-parse the origin.
 fn any_referencer_has_inner_scoped_type(
     state: &mut ServerState,
     name: &str,
@@ -6631,16 +6635,21 @@ pub fn rename(
                  collides with the global class `{old_name}` and cannot be resolved per occurrence"
             )));
         }
-        // (A) The cursor positively refers to the global `class_name old_name`, and a consumer in the
-        // rename's fan-out declares `old_name` as an inner-scoped type. That consumer's inner
-        // `: old_name` would be wrongly rewritten alongside its legitimate `extends old_name`. Refuse.
+        // (A) The cursor positively refers to the global `class_name old_name`, and SOME file in the
+        // rename's reach declares `old_name` as an inner-scoped type. That file's inner `: old_name`
+        // (the inner type) would be wrongly rewritten alongside its legitimate `extends old_name` /
+        // `old_name.new()` (the global class), and a file-level guard cannot separate them. Refuse.
+        // The shadow may live in the ORIGIN file itself (a global-class USE — `old_name.new()` /
+        // `extends old_name` — in a file that also declares an inner `old_name`; checked here with the
+        // already-parsed origin tree, no re-parse) OR in any cross-file referencer.
         if cursor_refers_global_class
-            && any_referencer_has_inner_scoped_type(state, &old_name, &uri)
+            && (name_is_in_file_inner_scoped_type(&parsed.tree, &old_name)
+                || any_referencer_has_inner_scoped_type(state, &old_name, &uri))
         {
             return Err(RequestRefusal::not_editable(format!(
-                "Cannot safely rename the global class `{old_name}`: a referencing file declares an \
-                 inner-class-scoped type of the same name that cannot be distinguished from a \
-                 global reference per occurrence"
+                "Cannot safely rename the global class `{old_name}`: a file in the rename's reach \
+                 declares an inner-class-scoped type of the same name that cannot be distinguished \
+                 from a global reference per occurrence"
             )));
         }
     }
