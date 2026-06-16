@@ -970,11 +970,15 @@ fn dollar_method_miss_fires_unsafe_method_access() {
     );
 }
 
-// --- #123: UNSAFE_METHOD_ACCESS on a `$`/`%` (GetNode) base method miss ----------------------------
-// Scoped to the `$`/`%` GetNode base, whose bare-`Node` type gdls SYNTHESIZES (M11) — so the miss is
-// independent of native-dump method-list completeness. The GENERAL hard NATIVE/SCRIPT-instance case
-// is blocked by gdls's JSON-dump-vs-ClassDB gap (it over-emits on real-but-undumped methods) and is
-// deferred (a separate Completeness issue), asserted scoped-out below.
+// --- #147 / #149: UNSAFE_METHOD_ACCESS on any hard NATIVE-instance base method miss ----------------
+// Generalizes the #123 `$`/`%`-only arm to every hard NATIVE-instance base (`var t: Timer; t.bogus()`
+// as well as `$Node.bogus()`). The JSON-dump-vs-ClassDB gap that blocked the general case is closed:
+// `NativeDb` SEEDS the ClassDB-resolvable-but-dump-omitted methods (`free` + the per-class `_`-virtuals)
+// at ingest, so a real method resolves silently and only a genuinely absent name reaches the warning
+// arm. These tests are the ratchet-blind backstop (the conformance ratchet does NOT verify warning
+// emission): they pin fire/no-fire directly. The `_typo()` / per-class-precision cases (#149) prove the
+// seed is per-class, not a global `_`-prefix allowlist. The DtKind::Script (cross-file `.gd`) base
+// degrades silently (`found = true`) and never reaches this arm — NATIVE-only by construction.
 
 /// A native DB with an ancestor method on `Object` and an instance method on `Node`, so the
 /// inherited-chain lookup (a `$Node` base reaching an `Object` method) can be exercised — the real
@@ -997,6 +1001,34 @@ fn unsafe_method_native() -> NativeDb {
         }"#,
     )
     .expect("valid unsafe-method dump")
+}
+
+/// A native DB carrying `Object → Node` and `Object → CanvasItem`, so the per-class seed precision
+/// test can exercise `_edit_get_rect` (owned by `CanvasItem`, oracle-confirmed) resolving on a
+/// `CanvasItem` base and missing on a `Node` base. Production-shaped (no `free`/`_*`/`_edit_*` in the
+/// dump itself) — the `NativeDb` seed attaches the dump-omitted methods to their owning classes.
+fn precision_native() -> NativeDb {
+    NativeDb::from_json(
+        r#"{
+            "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+            "classes": [
+                {"name": "Object", "methods": [
+                    {"name": "get_instance_id", "is_const": true, "is_static": false,
+                     "is_vararg": false, "is_virtual": false, "hash": 10,
+                     "return_value": {"type": "int"}, "arguments": []}
+                ]},
+                {"name": "Node", "inherits": "Object", "is_instantiable": true, "methods": [
+                    {"name": "get_parent", "is_const": true, "is_static": false, "is_vararg": false,
+                     "is_virtual": false, "hash": 1, "return_value": {"type": "Node"}, "arguments": []}
+                ]},
+                {"name": "CanvasItem", "inherits": "Object", "is_instantiable": true, "methods": [
+                    {"name": "queue_redraw", "is_const": false, "is_static": false, "is_vararg": false,
+                     "is_virtual": false, "hash": 2, "arguments": []}
+                ]}
+            ]
+        }"#,
+    )
+    .expect("valid precision dump")
 }
 
 /// FP guard (the real risk class): a VALID method inherited from an ANCESTOR (`Object.get_instance_id`
@@ -1026,20 +1058,35 @@ fn dollar_method_miss_emits_no_error() {
     );
 }
 
-/// Scope guard: the GENERAL hard-NATIVE-instance case (`var n: Node = …; n.bogus()`) is NOT emitted —
-/// only the `$`/`%` base is. gdls cannot distinguish a real-but-undumped native method from a
-/// fabricated one (JSON dump < ClassDB), so emitting on arbitrary native bases over-emits vs Godot;
-/// deferred to a Completeness follow-up. (Removing this guard's intent requires a dump-completeness
-/// signal first.)
+/// True-positive (#147): the GENERAL hard-NATIVE-instance case (`var n: Node = …; n.bogus()`) now
+/// fires — the same arm as `$`/`%`, no longer scoped out. Exactly ONE warning (a double-emit from a
+/// stray parallel arm would also pass an `any()` check, so assert the count).
 #[test]
-fn general_native_base_method_miss_is_scoped_out() {
+fn general_native_base_method_miss_fires_unsafe_method_access() {
     let src = "extends Node\nfunc f() -> void:\n\tvar n: Node = get_parent()\n\tn.bogus_method()\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &unsafe_method_native());
+    let hits = got
+        .iter()
+        .filter(|(c, _)| *c == WarningCode::UnsafeMethodAccess)
+        .count();
+    assert_eq!(
+        hits, 1,
+        "a general hard-Native-base method miss must fire UNSAFE_METHOD_ACCESS exactly once, got {got:?}"
+    );
+}
+
+/// True-positive (#147): a valid native method on a typed native base (`n.get_parent()`) stays
+/// SILENT — the dump resolves it, so the general arm does not fire.
+#[test]
+fn general_native_base_valid_method_is_silent() {
+    let src = "extends Node\nfunc f() -> void:\n\tvar n: Node = get_parent()\n\tn.get_parent()\n";
     let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
     let got = warnings_with_lines_in(src, &policy, &unsafe_method_native());
     assert!(
         !got.iter()
             .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
-        "general native-base miss is deferred ($/%-only scope) — must NOT fire yet, got {got:?}"
+        "a valid native method on a typed native base must NOT fire, got {got:?}"
     );
 }
 
@@ -1057,9 +1104,10 @@ fn self_method_miss_no_unsafe_method_access() {
     );
 }
 
-/// FP guard (the dump-completeness class): `$X.free()` must stay SILENT. `free` is a real `Object`
-/// method that Godot resolves via ClassDB but `extension_api.json` OMITS — `unsafe_method_native()`
-/// is production-shaped (no `free`), so without the skip this would FALSE-POSITIVE. Oracle-confirmed:
+/// FP guard (the dump-completeness class, now closed by the seed): `$X.free()` must stay SILENT.
+/// `free` is a real `Object` method Godot resolves via ClassDB but `extension_api.json` OMITS —
+/// `unsafe_method_native()` is production-shaped (no `free`). The `NativeDb` seed adds `free` to
+/// `Object` at ingest, so `lookup_native_method` resolves it and the arm never fires. Oracle-confirmed:
 /// `godot` is silent on `$Child.free()`, and the dump-omitted set is exactly `free` + `_`-virtuals.
 #[test]
 fn dollar_free_method_is_silent() {
@@ -1069,12 +1117,14 @@ fn dollar_free_method_is_silent() {
     assert!(
         !got.iter()
             .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
-        "`$Child.free()` is a real (dump-omitted) Object method — must NOT fire, got {got:?}"
+        "`$Child.free()` is a real (seeded, dump-omitted) Object method — must NOT fire, got {got:?}"
     );
 }
 
-/// FP guard: a `_`-prefixed virtual (`$X._notification(0)`) must stay SILENT — Godot resolves every
-/// declared virtual via ClassDB, but the dump omits them; the skip covers all `_`-prefixed names.
+/// FP guard: a real `_`-prefixed Object-core virtual (`$X._notification(0)`) must stay SILENT — the
+/// seed adds the dump-omitted Object virtuals (`_notification`, …) to `Object`, so it resolves up the
+/// `Node → Object` chain. NOT a blanket `_`-prefix skip: a fabricated `_typo()` still misses (see
+/// `native_base_fabricated_underscore_method_fires`).
 #[test]
 fn dollar_underscore_virtual_method_is_silent() {
     let src = "extends Node\nfunc f() -> void:\n\t$Child._notification(0)\n";
@@ -1083,7 +1133,52 @@ fn dollar_underscore_virtual_method_is_silent() {
     assert!(
         !got.iter()
             .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
-        "a `_`-prefixed virtual on a `$Node` base must NOT fire, got {got:?}"
+        "a real (seeded) `_`-prefixed Object virtual on a `$Node` base must NOT fire, got {got:?}"
+    );
+}
+
+/// #149 true-positive: a FABRICATED `_`-prefixed name that no class owns (`$X._typo()`) must FIRE —
+/// the old arm blanket-skipped every `_`-prefixed name (a missed lint); the seed is per-class, so an
+/// invented virtual still misses the lookup and warns. This is the regression that #149 closes.
+#[test]
+fn native_base_fabricated_underscore_method_fires() {
+    let src = "extends Node\nfunc f() -> void:\n\t$Child._typo()\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &unsafe_method_native());
+    assert!(
+        got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "a fabricated `_typo()` no class owns must fire UNSAFE_METHOD_ACCESS (#149), got {got:?}"
+    );
+}
+
+/// #149 per-class precision: `_edit_get_rect` is owned by `CanvasItem` ONLY (oracle-confirmed). On a
+/// `CanvasItem` base it resolves (silent); on a base that does NOT own it (`Node`/`Object`) it misses
+/// and warns. Proves the seed is keyed by owning class, not a global `_`-prefix allowlist.
+#[test]
+fn native_per_class_virtual_precision() {
+    // The seed needs the real owning classes present; use a DB that has CanvasItem + Node + Object.
+    let db = precision_native();
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+
+    // Owned by CanvasItem → seeded there → silent on a CanvasItem base.
+    let on_canvas =
+        "extends CanvasItem\nfunc f() -> void:\n\tvar c: CanvasItem = self\n\tc._edit_get_rect()\n";
+    let got = warnings_with_lines_in(on_canvas, &policy, &db);
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "`_edit_get_rect()` on a CanvasItem base (owns it) must NOT fire, got {got:?}"
+    );
+
+    // NOT owned by Node → not seeded there → warns on a Node base.
+    let on_node =
+        "extends Node\nfunc f() -> void:\n\tvar n: Node = get_parent()\n\tn._edit_get_rect()\n";
+    let got = warnings_with_lines_in(on_node, &policy, &db);
+    assert!(
+        got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "`_edit_get_rect()` on a Node base (does not own it) must FIRE (per-class, not allowlist), got {got:?}"
     );
 }
 
@@ -1099,6 +1194,22 @@ fn dollar_new_method_fires_unsafe_method_access() {
         got.iter()
             .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
         "`$Child.new()` on a Node instance must fire UNSAFE_METHOD_ACCESS, got {got:?}"
+    );
+}
+
+/// #147 constructor-synthesis arm: `X.new()` on an instantiable NATIVE metatype (`Node.new()`)
+/// routes through the constructor-synthesis path (synthesizes a `Node` instance) — a DIFFERENT path
+/// from the instance-method fall-through — so it never reaches the UNSAFE_METHOD_ACCESS arm and stays
+/// SILENT. (Contrast `$Child.new()`, an INSTANCE base, which warns: `new` is on the metatype.)
+#[test]
+fn native_metatype_new_constructor_is_silent() {
+    let src = "extends Node\nfunc f() -> void:\n\tvar n := Node.new()\n\tprint_debug(n)\n";
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let got = warnings_with_lines_in(src, &policy, &precision_native());
+    assert!(
+        !got.iter()
+            .any(|(c, _)| *c == WarningCode::UnsafeMethodAccess),
+        "`Node.new()` (constructor-synthesis arm) must NOT fire UNSAFE_METHOD_ACCESS, got {got:?}"
     );
 }
 

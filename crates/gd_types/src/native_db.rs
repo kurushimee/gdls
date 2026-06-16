@@ -1711,4 +1711,97 @@ mod tests {
         );
         assert_eq!(db.builtin_color_constant("UP"), None);
     }
+
+    /// #147: the dump-omitted ClassDB methods are SEEDED per-class at ingest. A production-shaped
+    /// dump (no `free`/`_*`/`_edit_*`) gets those names attached to their owning classes, so a method
+    /// lookup matches Godot's ClassDB surface — but ONLY on the owning class (per-class precision,
+    /// not a global allowlist).
+    #[test]
+    fn dump_omitted_methods_are_seeded_per_class() {
+        // Production-shaped: Object/Node/CanvasItem with NONE of the omitted names in the dump.
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Object", "is_instantiable": true},
+                    {"name": "Node", "inherits": "Object", "is_instantiable": true},
+                    {"name": "CanvasItem", "inherits": "Object", "is_instantiable": true}
+                ]
+            }"#,
+        )
+        .expect("seed dump");
+
+        let is_method = |class: &str, m: &str| {
+            matches!(
+                db.lookup_member(class, m),
+                Some((_, NativeMember::Method(_)))
+            )
+        };
+
+        // `free` (the lone non-underscore omission) seeded on Object; reachable via inheritance.
+        assert!(is_method("Object", "free"), "free seeded on Object");
+        assert!(
+            is_method("Node", "free"),
+            "free reachable on Node via inheritance"
+        );
+        // Object-core virtual seeded on Object.
+        assert!(
+            is_method("Object", "_notification"),
+            "_notification seeded on Object"
+        );
+        // Per-class precision: `_edit_get_rect` is owned by CanvasItem ONLY (oracle-confirmed).
+        assert!(
+            is_method("CanvasItem", "_edit_get_rect"),
+            "_edit_get_rect seeded on CanvasItem (owner)"
+        );
+        assert!(
+            !is_method("Node", "_edit_get_rect"),
+            "_edit_get_rect must NOT resolve on Node (not the owner) — per-class, not a global allowlist"
+        );
+        // A genuinely absent name never resolves (the seed adds only the omitted set).
+        assert!(
+            !is_method("Object", "_totally_fabricated"),
+            "an unseeded fabricated name must still miss"
+        );
+
+        // The seeded method's virtual flag tracks the `_`-prefix convention.
+        let Some((_, NativeMember::Method(m))) = db.lookup_member("Object", "_notification") else {
+            panic!("_notification resolves as a method");
+        };
+        assert!(m.is_virtual, "a seeded `_`-virtual is marked is_virtual");
+        let Some((_, NativeMember::Method(free))) = db.lookup_member("Object", "free") else {
+            panic!("free resolves as a method");
+        };
+        assert!(!free.is_virtual, "seeded `free` is not virtual");
+    }
+
+    /// #147: the seed never SHADOWS a real dump method — if the dump already carries an omitted name
+    /// (e.g. a custom build that does export `free`), the existing entry wins and no duplicate is added.
+    #[test]
+    fn seed_does_not_shadow_a_dump_provided_method() {
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Object", "is_instantiable": true, "methods": [
+                        {"name": "free", "is_const": false, "is_static": false, "is_vararg": false,
+                         "is_virtual": false, "hash": 99, "return_value": {"type": "int"}}
+                    ]}
+                ]
+            }"#,
+        )
+        .expect("dump-with-free");
+        let obj = db.class_named("Object").expect("Object");
+        let frees: Vec<&Method> = obj
+            .methods
+            .iter()
+            .filter(|m| db.name_of(m.name) == "free")
+            .collect();
+        assert_eq!(frees.len(), 1, "exactly one `free` (no seed duplicate)");
+        // The DUMP's `free` (int return) is kept, not the synthesized one (Variant return).
+        assert!(
+            matches!(frees[0].return_type, TypeRef::Named(s) if db.name_of(s) == "int"),
+            "the dump-provided `free` is preserved, not shadowed by the seed"
+        );
+    }
 }
