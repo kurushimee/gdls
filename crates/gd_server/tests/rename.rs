@@ -785,6 +785,41 @@ fn rename_local_to_global_class_name_still_succeeds() {
     shutdown(&client, server);
 }
 
+#[test]
+fn rename_inner_local_to_root_member_name_still_succeeds() {
+    // #155 inner-class regression guard: the member-shadow check scopes to the local's ENCLOSING
+    // class, not always the ROOT. An inner-class method's local does NOT see the outer class's
+    // members, so renaming it to a ROOT member's name shadows nothing and must STILL SUCCEED — a
+    // root-only check would false-refuse it. `var hp` is a ROOT member; the local `var x` lives in
+    // `Inner.m()`; renaming `x` → `hp` must succeed (edit only the local's own sites).
+    //   line 1 `var hp: int = 10`   (ROOT member)
+    //   line 3 `\tvar w: int = 0`   (Inner member)
+    //   line 5 `\t\tvar x = 1`      → local decl `x` at col 6 (2 tabs + `var `)
+    //   line 6 `\t\tx += 1`         → local use  `x` at col 2 (2 tabs)
+    let src = "extends Node\nvar hp: int = 10\nclass Inner:\n\tvar w: int = 0\n\tfunc m() -> void:\n\t\tvar x = 1\n\t\tx += 1\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    let sites = rename_sites(&client, 55, &main_uri, 5, 6, "hp");
+    assert_eq!(
+        sites,
+        vec![(5, 6), (6, 2)],
+        "an inner-method local renamed to a ROOT member name shadows nothing and must succeed; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_inner_local_to_inner_member_name_refuses_shadow() {
+    // #155 inner-class real-shadow case: the inner-method local's enclosing class IS `Inner`, so
+    // renaming the local to `Inner`'s OWN member name creates a real member shadow and must refuse.
+    //   line 3 `\tvar w: int = 0`   (Inner member `w`)
+    //   line 5 `\t\tvar x = 1`      → local decl `x` at col 6
+    let src = "extends Node\nvar hp: int = 10\nclass Inner:\n\tvar w: int = 0\n\tfunc m() -> void:\n\t\tvar x = 1\n\t\tx += 1\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Rename inner local `x` → `w` (Inner's own member) must refuse with zero edits.
+    assert_rename_refused(&client, 56, &main_uri, 5, 6, "w");
+    shutdown(&client, server);
+}
+
 // =================================================================================================
 // Corruption firewall on the MUTATING path: a native MEMBER access from a project file. This is the
 // catastrophic case the feature exists to refuse — `references` resolves a native member through a
