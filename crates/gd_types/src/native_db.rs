@@ -256,6 +256,7 @@ impl NativeDb {
             let class = ingest_class(c, &mut it);
             classes.insert(class.name, class);
         }
+        seed_dump_omitted_methods(&mut classes, &mut it);
         let mut builtins = FxHashMap::default();
         for b in api.builtin_classes {
             let bt = ingest_builtin(b, &mut it);
@@ -732,6 +733,240 @@ impl NativeDb {
         true
     }
 }
+
+/// Seed the methods that Godot's `ClassDB` resolves but `extension_api.json` OMITS, so a method
+/// lookup against the native DB matches Godot's analyzer surface. Without this the analyzer's
+/// `UNSAFE_METHOD_ACCESS` arm false-positives on real-but-undumped methods (`obj.free()`,
+/// `obj._notification(...)`) — the dump is a strict subset of `ClassDB`. The omitted set is the
+/// non-underscore method `free` (on `Object`) plus the `_`-prefixed virtuals `ClassDB` exposes
+/// but the dump never carries (Object-core: `_get`/`_set`/`_notification`/…; editor virtuals:
+/// `_edit_get_rect`/…). It is **per-class** (keyed by the owning class), so a fabricated
+/// `_edit_get_rect()` on a class that does not own it still misses (and warns) — this is NOT a
+/// global `_`-prefix allowlist.
+///
+/// `DUMP_OMITTED_NATIVE_METHODS` is **mechanically derived**, not hand-authored, by diffing
+/// `ClassDB.class_get_method_list(cls, false)` (own methods) against the shipped stock dump for
+/// every class the dump carries, on the real Godot 4.6.3-stable binary (the oracle technique in
+/// `docs/02`). A seeded method has no real signature in the dump, so it is synthesized as a
+/// no-argument `Variant`-returning method — only its NAME participates in the method-existence
+/// lookup the warning arm consults; the analyzer never type-checks a seeded call's arguments
+/// (the lookup binds, the call stays permissive). `is_virtual` mirrors the `_`-prefix convention.
+/// Applied only when the class is present (a trimmed fixture omitting a class simply gets no seed
+/// for it).
+fn seed_dump_omitted_methods(classes: &mut FxHashMap<Sym, NativeClass>, it: &mut Interner) {
+    for &(class_name, method_name) in DUMP_OMITTED_NATIVE_METHODS {
+        let Some(class_sym) = it.get(class_name) else {
+            continue; // class not in this DB (e.g. a trimmed fixture) — nothing to seed
+        };
+        let method_sym = it.intern(method_name);
+        let Some(nc) = classes.get_mut(&class_sym) else {
+            continue;
+        };
+        if nc.methods.iter().any(|m| m.name == method_sym) {
+            continue; // already carried by the dump — never shadow the real entry
+        }
+        nc.methods.push(Method {
+            name: method_sym,
+            is_const: false,
+            is_static: false,
+            is_vararg: false,
+            is_virtual: method_name.starts_with('_'),
+            return_type: TypeRef::Variant,
+            params: Vec::new(),
+            description: String::new(),
+        });
+    }
+}
+
+/// The `(class, method)` pairs `ClassDB` resolves but `extension_api.json` omits — see
+/// [`seed_dump_omitted_methods`]. **GENERATED — do not hand-edit.** Derivation (Godot
+/// 4.6.3-stable binary): for every class in the shipped stock dump, the own-method set from
+/// `ClassDB.class_get_method_list(cls, false)` minus the dump's own-method set for that class.
+/// The only non-`_`-prefixed entry is `free` (on `Object`).
+const DUMP_OMITTED_NATIVE_METHODS: &[(&str, &str)] = &[
+    ("AnimatedSprite3D", "_res_changed"),
+    ("AnimationLibrary", "_get_data"),
+    ("AnimationLibrary", "_set_data"),
+    ("AnimationMixer", "_reset"),
+    ("AnimationMixer", "_restore"),
+    ("AnimationNode", "_get_filters"),
+    ("AnimationNode", "_set_filters"),
+    ("AnimationNodeBlendSpace1D", "_add_blend_point"),
+    ("AnimationNodeBlendSpace2D", "_add_blend_point"),
+    ("AnimationNodeBlendSpace2D", "_get_triangles"),
+    ("AnimationNodeBlendSpace2D", "_set_triangles"),
+    ("ArrayMesh", "_get_blend_shape_names"),
+    ("ArrayMesh", "_get_surfaces"),
+    ("ArrayMesh", "_set_blend_shape_names"),
+    ("ArrayMesh", "_set_surfaces"),
+    ("AudioStreamInteractive", "_get_linked_undo_properties"),
+    ("AudioStreamInteractive", "_get_transitions"),
+    ("AudioStreamInteractive", "_inspector_array_swap_clip"),
+    ("AudioStreamInteractive", "_set_transitions"),
+    ("BitMap", "_get_data"),
+    ("BitMap", "_set_data"),
+    ("CSGPolygon3D", "_has_editable_3d_polygon_no_depth"),
+    ("CSGPolygon3D", "_is_editable_3d_polygon"),
+    ("CSGShape3D", "_get_root_collision_instance"),
+    ("CSGShape3D", "_update_shape"),
+    ("Camera2D", "_make_current"),
+    ("Camera2D", "_set_limit_rect"),
+    ("Camera2D", "_update_scroll"),
+    ("CanvasItem", "_edit_get_pivot"),
+    ("CanvasItem", "_edit_get_position"),
+    ("CanvasItem", "_edit_get_rect"),
+    ("CanvasItem", "_edit_get_rotation"),
+    ("CanvasItem", "_edit_get_scale"),
+    ("CanvasItem", "_edit_get_state"),
+    ("CanvasItem", "_edit_get_transform"),
+    ("CanvasItem", "_edit_set_pivot"),
+    ("CanvasItem", "_edit_set_position"),
+    ("CanvasItem", "_edit_set_rect"),
+    ("CanvasItem", "_edit_set_rotation"),
+    ("CanvasItem", "_edit_set_scale"),
+    ("CanvasItem", "_edit_set_state"),
+    ("CanvasItem", "_edit_use_pivot"),
+    ("CanvasItem", "_edit_use_rect"),
+    ("CanvasItem", "_edit_use_rotation"),
+    ("CanvasItem", "_top_level_raise_self"),
+    ("CollisionPolygon3D", "_is_editable_3d_polygon"),
+    ("ColorPickerButton", "_about_to_popup"),
+    ("Control", "_get_anchors_layout_preset"),
+    ("Control", "_get_layout_mode"),
+    ("Control", "_set_anchor"),
+    ("Control", "_set_anchors_layout_preset"),
+    ("Control", "_set_global_position"),
+    ("Control", "_set_layout_mode"),
+    ("Control", "_set_position"),
+    ("Control", "_set_size"),
+    ("Curve", "_get_data"),
+    ("Curve", "_get_limits"),
+    ("Curve", "_set_data"),
+    ("Curve", "_set_limits"),
+    ("Curve2D", "_get_data"),
+    ("Curve2D", "_set_data"),
+    ("Curve3D", "_get_data"),
+    ("Curve3D", "_set_data"),
+    ("DisplayServer", "_accessibility_update_if_active"),
+    ("DisplayServer", "_tts_post_utterance_event"),
+    ("EditorExportPreset", "_get_property_warning"),
+    ("EditorInspector", "_edit_request_change"),
+    ("EditorProperty", "_update_editor_property_status"),
+    ("EditorSyntaxHighlighter", "_get_edited_resource"),
+    ("FastNoiseLite", "_changed"),
+    ("FileDialog", "_cancel_pressed"),
+    ("Image", "_get_data"),
+    ("Image", "_set_data"),
+    ("ImageTexture", "_set_image"),
+    ("ImageTexture3D", "_get_images"),
+    ("ImageTexture3D", "_set_images"),
+    ("ImageTextureLayered", "_get_images"),
+    ("ImageTextureLayered", "_set_images"),
+    ("ImporterMesh", "_get_data"),
+    ("ImporterMesh", "_set_data"),
+    ("LightmapGIData", "_get_light_textures_data"),
+    ("LightmapGIData", "_get_probe_data"),
+    ("LightmapGIData", "_get_user_data"),
+    ("LightmapGIData", "_is_using_packed_directional"),
+    ("LightmapGIData", "_set_light_textures_data"),
+    ("LightmapGIData", "_set_probe_data"),
+    ("LightmapGIData", "_set_user_data"),
+    ("LightmapGIData", "_set_uses_packed_directional"),
+    ("LimitAngularVelocityModifier3D", "_get_joint_count"),
+    ("LineEdit", "_set_text"),
+    ("MultiMesh", "_get_color_array"),
+    ("MultiMesh", "_get_custom_data_array"),
+    ("MultiMesh", "_get_transform_2d_array"),
+    ("MultiMesh", "_get_transform_array"),
+    ("MultiMesh", "_set_color_array"),
+    ("MultiMesh", "_set_custom_data_array"),
+    ("MultiMesh", "_set_transform_2d_array"),
+    ("MultiMesh", "_set_transform_array"),
+    ("MultiplayerSpawner", "_get_spawnable_scenes"),
+    ("MultiplayerSpawner", "_set_spawnable_scenes"),
+    ("NavigationAgent2D", "_avoidance_done"),
+    ("NavigationAgent3D", "_avoidance_done"),
+    ("NavigationMesh", "_get_polygons"),
+    ("NavigationMesh", "_set_polygons"),
+    ("NavigationPolygon", "_get_outlines"),
+    ("NavigationPolygon", "_get_polygons"),
+    ("NavigationPolygon", "_set_outlines"),
+    ("NavigationPolygon", "_set_polygons"),
+    ("NavigationRegion2D", "_navigation_polygon_changed"),
+    ("Node", "_set_property_pinned"),
+    ("Object", "_get"),
+    ("Object", "_get_property_list"),
+    ("Object", "_init"),
+    ("Object", "_iter_get"),
+    ("Object", "_iter_init"),
+    ("Object", "_iter_next"),
+    ("Object", "_notification"),
+    ("Object", "_property_can_revert"),
+    ("Object", "_property_get_revert"),
+    ("Object", "_set"),
+    ("Object", "_to_string"),
+    ("Object", "_validate_property"),
+    ("Object", "free"),
+    ("OccluderInstance3D", "_get_editable_3d_polygon_resource"),
+    ("OccluderInstance3D", "_is_editable_3d_polygon"),
+    ("OpenXRInteractionProfileEditorBase", "_add_binding"),
+    ("OpenXRInteractionProfileEditorBase", "_remove_binding"),
+    ("OptionButton", "_select_int"),
+    ("PackedDataContainer", "_get_data"),
+    ("PackedDataContainer", "_iter_get"),
+    ("PackedDataContainer", "_iter_init"),
+    ("PackedDataContainer", "_iter_next"),
+    ("PackedDataContainer", "_set_data"),
+    ("PackedDataContainerRef", "_iter_get"),
+    ("PackedDataContainerRef", "_iter_init"),
+    ("PackedDataContainerRef", "_iter_next"),
+    ("PackedScene", "_get_bundled_scene"),
+    ("PackedScene", "_set_bundled_scene"),
+    ("Parallax2D", "_camera_moved"),
+    ("ParallaxBackground", "_camera_moved"),
+    ("Polygon2D", "_get_bones"),
+    ("Polygon2D", "_set_bones"),
+    ("PolygonOccluder3D", "_has_editable_3d_polygon_no_depth"),
+    ("PolygonPathFinder", "_get_data"),
+    ("PolygonPathFinder", "_set_data"),
+    ("PortableCompressedTexture2D", "_get_data"),
+    ("PortableCompressedTexture2D", "_set_data"),
+    ("RDShaderFile", "_get_versions"),
+    ("RDShaderFile", "_set_versions"),
+    ("RDUniform", "_set_ids"),
+    ("ResourcePreloader", "_get_resources"),
+    ("ResourcePreloader", "_set_resources"),
+    ("ScriptEditor", "_help_tab_goto"),
+    ("ShaderGlobalsOverride", "_activate"),
+    ("SpriteFrames", "_get_animations"),
+    ("SpriteFrames", "_set_animations"),
+    ("TextEdit", "_set_text"),
+    ("Translation", "_get_messages"),
+    ("Translation", "_set_messages"),
+    ("Viewport", "_gui_remove_focus_for_window"),
+    ("Viewport", "_process_picking"),
+    ("VisualShader", "_get_preview_shader_parameter"),
+    ("VisualShader", "_has_preview_shader_parameter"),
+    ("VisualShader", "_set_preview_shader_parameter"),
+    ("VisualShader", "_update_shader"),
+    ("VisualShaderNode", "_get_output_ports_expanded"),
+    ("VisualShaderNode", "_is_output_port_expanded"),
+    ("VisualShaderNode", "_set_output_port_expanded"),
+    ("VisualShaderNode", "_set_output_ports_expanded"),
+    ("VisualShaderNodeCustom", "_get_properties"),
+    ("VisualShaderNodeCustom", "_is_initialized"),
+    ("VisualShaderNodeCustom", "_set_initialized"),
+    ("VisualShaderNodeCustom", "_set_input_port_default_value"),
+    ("VisualShaderNodeCustom", "_set_option_index"),
+    ("VisualShaderNodeCustom", "_set_properties"),
+    ("VisualShaderNodeParameterRef", "_get_parameter_type"),
+    ("VisualShaderNodeParameterRef", "_set_parameter_type"),
+    ("VisualShaderNodeReroute", "_set_port_type"),
+    ("VisualShaderNodeVec4Constant", "_get_constant_v4"),
+    ("VisualShaderNodeVec4Constant", "_set_constant_v4"),
+    ("VoxelGIData", "_get_data"),
+    ("VoxelGIData", "_set_data"),
+];
 
 fn ingest_class(c: api::ClassDef, it: &mut Interner) -> NativeClass {
     NativeClass {
