@@ -2291,3 +2291,78 @@ fn rename_class_name_from_type_annotation_and_constructor_still_succeed() {
     }
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_in_file_enum_type_from_type_annotation_use_succeeds() {
+    // ANTI-OVER-NARROW REGRESSION GUARD: an in-file enum TYPE name (`enum MyEnum { A }`) used as a
+    // type annotation (`var e: MyEnum`) must STILL rename from the USE site — not refuse. The
+    // occurrence-positive firewall must re-admit in-file (non-global-class) TYPE references; the
+    // name-based admit it replaced used to cover these.
+    //   line 1 `enum MyEnum { A }`              → enum TYPE decl `MyEnum` at col 5
+    //   line 3 `\tvar e: MyEnum = MyEnum.A`     → type-annot use `MyEnum` at col 8
+    let src = "extends Node\nenum MyEnum { A }\nfunc go() -> void:\n\tvar e: MyEnum = MyEnum.A\n\tprint(e)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the type-annotation USE `MyEnum` (line 3, col 8). Rename → `Dir`.
+    client
+        .sender
+        .send(request(
+            224,
+            "textDocument/rename",
+            rename_params(&main_uri, 3, 8, "Dir"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming an in-file enum TYPE from a `: MyEnum` annotation use must succeed (the firewall \
+         must re-admit in-file type references occurrence-positively): {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    // Must edit the enum TYPE declaration (line 1, col 5) — the symbol the cursor refers to.
+    assert!(
+        view.set
+            .iter()
+            .any(|(_, r)| r.start.line == 1 && r.start.character == 5),
+        "renaming the enum type from its use must edit the enum TYPE declaration (1,5): {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_inner_class_from_type_annotation_use_succeeds() {
+    // ANTI-OVER-NARROW REGRESSION GUARD: an in-file INNER CLASS name (`class Inner:`) used as a type
+    // annotation (`var x: Inner`) must STILL rename from the USE site — not refuse.
+    //   line 1 `class Inner:`            → inner class decl `Inner` at col 6
+    //   line 2 `\tvar v: int = 0`
+    //   line 4 `\tvar x: Inner = null`   → type-annot use `Inner` at col 8
+    let src = "extends Node\nclass Inner:\n\tvar v: int = 0\nfunc go() -> void:\n\tvar x: Inner = null\n\tprint(x)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the type-annotation USE `Inner` (line 4, col 8). Rename → `Nested`.
+    client
+        .sender
+        .send(request(
+            225,
+            "textDocument/rename",
+            rename_params(&main_uri, 4, 8, "Nested"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming an in-file inner CLASS from a `: Inner` annotation use must succeed: {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    assert!(
+        view.set
+            .iter()
+            .any(|(_, r)| r.start.line == 1 && r.start.character == 6),
+        "renaming the inner class from its use must edit the inner CLASS declaration (1,6): {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}

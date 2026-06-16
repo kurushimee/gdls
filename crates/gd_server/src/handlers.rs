@@ -1957,6 +1957,30 @@ fn cursor_is_type_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
     })
 }
 
+/// `true` iff `name` is a root-class ENUM type or INNER CLASS declared in THIS file. The
+/// occurrence-positive in-file-TYPE anchor for the rename firewall: a `: MyEnum` / `: Inner` type
+/// annotation (or `extends Inner`) carries no `Binding::Use` and is not a global `class_name`, so it
+/// would otherwise wrongly REFUSE — the name-based signal-1 this replaced admitted it. Restricted to
+/// the type kinds (`Member::Enum` / `Member::Class`) whose references live in resolver-level type
+/// positions, so it cannot admit an unrelated value/member of the same name. #106.
+fn name_is_in_file_root_type(tree: &ParseTree, name: &str) -> bool {
+    let Some(root_id) = tree.root_id() else {
+        return false;
+    };
+    let NodeKind::Class(root) = &tree.get(root_id).kind else {
+        return false;
+    };
+    root.members.iter().any(|m| match m {
+        Member::Enum(id) => {
+            matches!(&tree.get(*id).kind, NodeKind::Enum(en) if en.identifier.map(|i| ident_name(tree, i)) == Some(name))
+        }
+        Member::Class(id) => {
+            matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+        }
+        _ => false,
+    })
+}
+
 fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
     // Single pass: short-circuit on a func/signal declaration; otherwise remember the subscript
     // that owns this attribute identifier and collect every `Call` callee node, then decide.
@@ -6002,9 +6026,15 @@ fn rename_target_has_project_anchor(
         )
     });
     if class_use_anchored || cursor_is_type_base_segment(&parsed.tree, node_id) {
-        // Confirm the type-base segment actually names a project class (a native base — `extends Node`
-        // — must fall through to the engine refusal, not anchor as a project class).
-        if class_use_anchored || find_global_class_definition(state, name).is_some() {
+        // Confirm the type-base segment actually names a PROJECT type — a project `class_name` (a
+        // native base `extends Node` must fall through to the engine refusal), OR an IN-FILE root
+        // enum / inner-class declared in THIS file (`: MyEnum` / `: Inner` — its references set is
+        // collected in-file; the old name-based signal-1 admitted these, the occurrence-positive
+        // replacement must too, or a legit in-file-type rename from a USE site wrongly refuses).
+        if class_use_anchored
+            || find_global_class_definition(state, name).is_some()
+            || name_is_in_file_root_type(&parsed.tree, name)
+        {
             return true;
         }
     }
@@ -6025,7 +6055,6 @@ fn rename_target_has_project_anchor(
     false
 }
 
-/// `true` iff the cursor (at `byte`, named `name`) classifies as an in-file enum VALUE
 /// `true` iff the cursor (at `byte`, named `name`) classifies as an in-file enum VALUE
 /// ([`NonMethodTarget::EnumValue`]) — a `Direction.NORTH` use OR the value's declaration token.
 /// Used by `rename` to SKIP declaration-canonicalization (the enum value's reference set is already
