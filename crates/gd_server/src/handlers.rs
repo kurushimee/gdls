@@ -6869,13 +6869,30 @@ fn rename_collision(
                     "Cannot rename to `{new_name}`: `{new_name}` is already declared in this scope"
                 )));
             }
-            // A local target: its scope is the function; the class-member check below would be the
-            // wrong scope, so stop here.
+            // The NEW name also shadows a member of the local's ENCLOSING class: renaming the local to
+            // that member's name creates a legal-but-confusing member shadow inside the function —
+            // refuse it the same way the member arm does. Scoped to the smallest class containing the
+            // cursor (the root class for a root-method local, the INNER class for an inner-method
+            // local — an inner local does not see outer members, so a root check would false-refuse a
+            // rename that shadows nothing). Member-scope only, NOT the global `class_name`/autoload
+            // registries — a local shadowing a project class is common and legal, so checking those
+            // would false-refuse legitimate renames (#155).
+            if enclosing_class_declares(tree, byte, new_name) {
+                return Some(RequestRefusal::invalid_name(format!(
+                    "Cannot rename to `{new_name}`: a member named `{new_name}` already exists in this class"
+                )));
+            }
+            // A local target whose new name collides with neither a function-local nor a root member:
+            // the member-role check below is for the OLD name's classification (member/attribute), the
+            // wrong scope for a local target, so stop here.
             return None;
         }
     }
     // Member scope: a method/signal declaration, an attribute access, or a root-member declaration
-    // click → collision iff the current file's root class already declares `new_name`.
+    // click → collision iff the current file's root class already declares `new_name`. The root scope
+    // is correct here because inner-class members are refused UPSTREAM by the fail-closed firewall
+    // (they carry no head-interface anchor), so this arm only ever sees ROOT members; if inner members
+    // ever became renameable, this would need the local arm's `enclosing_class_declares` scoping (#155).
     let is_member_role =
         is_member_or_attribute_ident(tree, node_id) || node_is_root_member(tree, node_id);
     if is_member_role && root_class_declares(tree, new_name) {
@@ -6922,6 +6939,39 @@ fn root_class_declares(tree: &ParseTree, name: &str) -> bool {
         return false;
     };
     root.members
+        .iter()
+        .any(|m| member_named(tree, m, name).is_some())
+}
+
+/// `true` iff the SMALLEST class enclosing `byte` declares a member named `name` — the member-shadow
+/// predicate for a LOCAL target (the new-name side of the local arm in [`rename_collision`]). A local
+/// lives in the class whose method (or initializer) contains it, which is the root class for a
+/// root-method local but an INNER class for an inner-method local; an inner class is a distinct scope
+/// that does NOT see the outer class's members, so checking the root for an inner local would
+/// false-refuse a rename that shadows nothing (#155). For a root-method local the smallest enclosing
+/// class IS the root, so this reduces to [`root_class_declares`]. Walks that class's own members only
+/// (inner/inherited members are different scopes; an inherited shadow is GDScript-legal).
+fn enclosing_class_declares(tree: &ParseTree, byte: usize, name: &str) -> bool {
+    let mut best: Option<NodeId> = None;
+    let mut best_len = usize::MAX;
+    for id in tree.iter_ids() {
+        if let NodeKind::Class(_) = &tree.get(id).kind {
+            let span = tree.get(id).span;
+            let len = span.end - span.start;
+            if span.start <= byte && byte < span.end && len < best_len {
+                best = Some(id);
+                best_len = len;
+            }
+        }
+    }
+    let Some(class_id) = best else {
+        return false;
+    };
+    let NodeKind::Class(class) = &tree.get(class_id).kind else {
+        return false;
+    };
+    class
+        .members
         .iter()
         .any(|m| member_named(tree, m, name).is_some())
 }
