@@ -3065,3 +3065,99 @@ fn rename_163_regression_in_file_member_vs_same_named_class_name_edits_no_class_
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_162_in_file_enum_type_USE_cursor_does_not_rename_global_class() {
+    // #162 THE ACTUAL CELL: a cursor on the in-file `enum FOO` in TYPE-USE position (`: FOO`),
+    // where a same-named cross-file global `class_name FOO` exists. This is the ONLY cursor that
+    // exercises precedence: `cursor_references_global_class` form (c) is TRUE there (type-base
+    // segment naming a registered class) AND `name_is_in_file_root_type` is TRUE. The in-file enum
+    // must win — the rename must NEVER edit the global `class_name FOO` or its consumers, and must
+    // not canonicalize onto the global class via `definition()`.
+    let project = common::sample_project();
+    project.write(
+        "src/holder.gd",
+        "extends Node\n\nenum FOO { A, B }\n\nvar x: FOO = FOO.A\n",
+    );
+    project.write("src/fooclass.gd", "class_name FOO\nextends Node\n");
+    project.write(
+        "src/fooconsumer.gd",
+        "extends FOO\n\nfunc use_it(p: FOO) -> void:\n\tprint(p)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/holder.gd", "src/fooclass.gd", "src/fooconsumer.gd"],
+        2,
+    );
+    let holder_uri = file_uri(&project.root.join("src/holder.gd"));
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let fooconsumer_uri = file_uri(&project.root.join("src/fooconsumer.gd"));
+
+    // `var x: FOO = FOO.A` on holder.gd line 4: tab(0) `var x: `(1-7) `FOO`(8). Click the `: FOO`
+    // type-use segment at col 8.
+    client
+        .sender
+        .send(request(
+            305,
+            "textDocument/rename",
+            rename_params(&holder_uri, 4, 8, "BAR"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == fooclass_uri.as_str()),
+            "a `: FOO` type-use cursor on the IN-FILE enum must NEVER rename the unrelated global \
+             `class_name FOO` (fooclass.gd) — canonicalization must stay in-file; got {:?}",
+            view.set
+        );
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == fooconsumer_uri.as_str()),
+            "must NEVER edit the global class's `: FOO`/`extends FOO` consumer (fooconsumer.gd); \
+             got {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn references_162_in_file_enum_type_USE_cursor_excludes_global_class_consumers() {
+    // #162 read-surface twin (the issue is read-side AND mutating-side): a `references` request from
+    // the in-file `: FOO` type-use cursor must not over-collect the global class's cross-file
+    // consumers.
+    let project = common::sample_project();
+    project.write(
+        "src/holder.gd",
+        "extends Node\n\nenum FOO { A, B }\n\nvar x: FOO = FOO.A\n",
+    );
+    project.write("src/fooclass.gd", "class_name FOO\nextends Node\n");
+    project.write(
+        "src/fooconsumer.gd",
+        "extends FOO\n\nfunc use_it(p: FOO) -> void:\n\tprint(p)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/holder.gd", "src/fooclass.gd", "src/fooconsumer.gd"],
+        2,
+    );
+    let holder_uri = file_uri(&project.root.join("src/holder.gd"));
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let fooconsumer_uri = file_uri(&project.root.join("src/fooconsumer.gd"));
+
+    // Click `: FOO` at holder.gd line 4 col 8.
+    let refs = references_set(&client, 306, &holder_uri, 4, 8);
+    assert!(
+        !refs.iter().any(|(u, _)| *u == fooclass_uri.as_str() || *u == fooconsumer_uri.as_str()),
+        "references from an in-file `: FOO` type-use must not collect the global `class_name FOO` \
+         declaration or its cross-file consumers; got {refs:?}"
+    );
+    shutdown(&client, server);
+}
