@@ -1957,12 +1957,15 @@ fn cursor_is_type_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
     })
 }
 
-/// `true` iff `name` is a root-class ENUM type or INNER CLASS declared in THIS file. The
-/// occurrence-positive in-file-TYPE anchor for the rename firewall: a `: MyEnum` / `: Inner` type
-/// annotation (or `extends Inner`) carries no `Binding::Use` and is not a global `class_name`, so it
-/// would otherwise wrongly REFUSE — the name-based signal-1 this replaced admitted it. Restricted to
-/// the type kinds (`Member::Enum` / `Member::Class`) whose references live in resolver-level type
-/// positions, so it cannot admit an unrelated value/member of the same name. #106.
+/// `true` iff `name` is a root-class ENUM type, INNER CLASS, or `const` alias declared in THIS file.
+/// The occurrence-positive in-file-TYPE anchor for the rename firewall: a `: MyEnum` / `: Inner` /
+/// `: Hero` (where `const Hero = preload(...)`) type annotation (or `extends Inner`) carries no
+/// `Binding::Use` and is not a global `class_name`, so it would otherwise wrongly REFUSE — the
+/// name-based signal-1 this replaced admitted it. Restricted to the member kinds usable in a
+/// type-annotation position — `{Enum, Class, Constant}`, the COMPLETE such set (var/func/signal
+/// cannot annotate) — so it cannot admit an unrelated value/member of the same name. `const` is in
+/// the set because `const Hero = preload("res://other.gd")` is the idiomatic alias for a script that
+/// has no `class_name`, then referenced as `var x: Hero`. #106, #163.
 fn name_is_in_file_root_type(tree: &ParseTree, name: &str) -> bool {
     let Some(root_id) = tree.root_id() else {
         return false;
@@ -1977,7 +1980,47 @@ fn name_is_in_file_root_type(tree: &ParseTree, name: &str) -> bool {
         Member::Class(id) => {
             matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
         }
+        Member::Constant(id) => {
+            matches!(&tree.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+        }
         _ => false,
+    })
+}
+
+/// `true` iff `name` is an ENUM type, CLASS, or `const` alias declared INSIDE an inner class (any
+/// class node that is not the file root) — the non-root analog of [`name_is_in_file_root_type`], over
+/// the same complete type-position member set `{Enum, Class, Constant}`. A type with this name
+/// is visible only in its enclosing inner scope, so a type-position `name` in this file may refer to
+/// the inner type rather than a same-named global `class_name`. The root-only guard cannot see it.
+///
+/// The rename layer uses this as a fail-closed REFUSE signal: distinguishing a type-position `name`
+/// that means the inner type from one that means the global class needs per-node scope-aware
+/// resolution (the resolver's job), which gdls does not yet apply in the rename path. Until then,
+/// the presence of any inner-scoped shadow makes the global-class rename unsafe in this file (an
+/// inner `: name` would be wrongly rewritten alongside a legitimate `extends name`), and an inner
+/// type-position cursor would wrongly canonicalize onto the global class — so the rename refuses
+/// rather than emit a wrong edit.
+fn name_is_in_file_inner_scoped_type(tree: &ParseTree, name: &str) -> bool {
+    let root_id = tree.root_id();
+    tree.iter_ids().any(|nid| {
+        if Some(nid) == root_id {
+            return false;
+        }
+        let NodeKind::Class(class) = &tree.get(nid).kind else {
+            return false;
+        };
+        class.members.iter().any(|m| match m {
+            Member::Enum(id) => {
+                matches!(&tree.get(*id).kind, NodeKind::Enum(en) if en.identifier.map(|i| ident_name(tree, i)) == Some(name))
+            }
+            Member::Class(id) => {
+                matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+            }
+            Member::Constant(id) => {
+                matches!(&tree.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+            }
+            _ => false,
+        })
     })
 }
 
@@ -2659,6 +2702,35 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     let cursor_refers_global_class =
         cursor_references_global_class(state, &uri, &parsed.tree, &key, &text, byte, &name);
 
+    // Sub-discriminate the `NonMethodTarget::Unresolved` residue (Class/Enum/in-file-type cursors all
+    // land there — type positions carry no `Binding::Use` and are not member-decl clicks). The raw
+    // `push_identifier_locations` floor over-grabs EVERY same-spelled token in each consumer file (a
+    // collection-side W16 grep-rename hole), so route the two structured sub-cases off it:
+    //   - `InFileType`: an in-file root `enum`/inner-`class` used in TYPE position. It has no
+    //     legitimate cross-file bare-name reference, so it fans out EMPTY cross-file (like Local /
+    //     EnumValue) and keeps only the in-file raw scan for its own uses. Checked FIRST so a
+    //     `: FOO` cursor where a same-named global `class_name FOO` also exists stays on the in-file
+    //     type (`cursor_references_global_class` form (c) would otherwise also fire for it). #162.
+    //   - `GlobalClass`: the cursor positively refers (by identity) to a project `class_name` — a
+    //     decl-click, a `Class` use binding at the span, or a type-base segment. Collected via the
+    //     occurrence-positive [`push_global_class_locations`] (Class-use bindings by `target_file`
+    //     identity + type-base segments by position) instead of the raw floor, so an unrelated
+    //     same-named local/param/member in a consumer is never rewritten. #163.
+    //   - `RawFloor`: a genuinely unresolvable name — the documented over-approximate residue.
+    let unresolved_kind = if name_is_in_file_root_type(&parsed.tree, &name) {
+        UnresolvedKind::InFileType
+    } else if cursor_refers_global_class {
+        // `cursor_refers_global_class` already returned `false` when `global_class_file` is `None`
+        // (it short-circuits on a missing registry entry), so the `Some` arm is the live path; the
+        // `None` arm is a defensive belt-and-suspenders that can't be reached within one request.
+        match global_class_file(state, &name) {
+            Some(cf) => UnresolvedKind::GlobalClass(cf),
+            None => UnresolvedKind::RawFloor,
+        }
+    } else {
+        UnresolvedKind::RawFloor
+    };
+
     // Resolve the declaration site(s) UNCONDITIONALLY — `includeDeclaration` is a filter, not
     // just a prepend: when `true` the declaration joins the result up front, and when `false`
     // any scan hit on the declaration's own name token must be REMOVED at final assembly (the
@@ -2822,14 +2894,37 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                         &mapper,
                     );
                 }
-                NonMethodTarget::Unresolved => {
-                    // Residue floor (incl. autoload + Class/Enum targets): the binding scan
-                    // plus the raw identifier scan, which picks up `extends Foo`, type
-                    // annotations, `class_name`, and other parser-level refs the reducer
-                    // doesn't record. The dedup pass collapses overlap.
-                    push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
-                    push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
-                }
+                NonMethodTarget::Unresolved => match unresolved_kind {
+                    UnresolvedKind::GlobalClass(class_file) => {
+                        // Occurrence-positive: Class-use bindings by `target_file` identity +
+                        // type-base segments by position. A same-named local/member in THIS file
+                        // records no Class binding (it resolves to itself), so it is excluded.
+                        push_global_class_locations(
+                            &mut locations,
+                            &result,
+                            &parsed.tree,
+                            class_file,
+                            &name,
+                            &uri,
+                            &mapper,
+                        );
+                    }
+                    UnresolvedKind::InFileType | UnresolvedKind::RawFloor => {
+                        // Residue floor: the binding scan plus the raw identifier scan, which picks
+                        // up `extends Foo`, type annotations, `class_name`, and other parser-level
+                        // refs the reducer doesn't record. The dedup pass collapses overlap. An
+                        // in-file type keeps the in-file raw scan (its own `: FOO`/`FOO.A` uses are
+                        // genuine); only its CROSS-FILE fan-out is suppressed below.
+                        push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
+                        push_identifier_locations(
+                            &mut locations,
+                            &parsed.tree,
+                            &name,
+                            &uri,
+                            &mapper,
+                        );
+                    }
+                },
             }
         }
     }
@@ -2871,11 +2966,20 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             // cross-file enum metatype carries no `class_node` anchor), so a `class_name`'d enum's
             // `Foo.E.V` uses in other files are under-collected — loud under-rename, tracked #158.
             NonMethodTarget::Local { .. } | NonMethodTarget::EnumValue { .. } => Vec::new(),
+            // An in-file root type (`enum`/inner-class) used in a type position has NO cross-file
+            // bare-name reference — like a local/enum-value, it fans out EMPTY rather than riding the
+            // raw cross-file candidate scan (which would collect a same-named global `class_name`'s
+            // `: FOO`/`extends FOO` consumers). #162.
+            NonMethodTarget::Unresolved
+                if matches!(unresolved_kind, UnresolvedKind::InFileType) =>
+            {
+                Vec::new()
+            }
             NonMethodTarget::Unresolved => {
-                // Fast-path for class/type names: only files whose interface mentions `name`
-                // can reference it; `name_referencers` already has that set. (Autoloads are
-                // excluded — they take the project-wide textual scan above since they never
-                // appear in interface sets.)
+                // Fast-path for class/type names (incl. the occurrence-positive `GlobalClass` bucket):
+                // only files whose interface mentions `name` can reference it; `name_referencers`
+                // already has that set. (Autoloads are excluded — they take the project-wide textual
+                // scan above since they never appear in interface sets.)
                 let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
                 for fid in state.workspace.index.name_referencers(&name) {
                     candidate_fids.insert(fid);
@@ -2966,24 +3070,44 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 }
                 // Local + enum-value targets fan out no candidates (unreachable; kept exhaustive).
                 NonMethodTarget::Local { .. } | NonMethodTarget::EnumValue { .. } => {}
-                NonMethodTarget::Unresolved => {
-                    // Residue floor: identifier scan picks up `extends Foo` and other
-                    // parser-level refs the reducer doesn't record. De-dupes happen below.
-                    push_binding_locations(
-                        &mut locations,
-                        &cand_result,
-                        &name,
-                        &cand_uri,
-                        &cand_mapper,
-                    );
-                    push_identifier_locations(
-                        &mut locations,
-                        &parsed.tree,
-                        &name,
-                        &cand_uri,
-                        &cand_mapper,
-                    );
-                }
+                NonMethodTarget::Unresolved => match unresolved_kind {
+                    UnresolvedKind::GlobalClass(class_file) => {
+                        // Occurrence-positive cross-file collection: a `Class` use binding pointing
+                        // at THIS class file (`Foo.new()` base, bare `Foo`) + type-base segments
+                        // (`extends Foo`, `: Foo`) by position. A consumer's unrelated same-named
+                        // local/param/member records no Class binding and is excluded — the #163
+                        // over-grab fix on the candidate side.
+                        push_global_class_locations(
+                            &mut locations,
+                            &cand_result,
+                            &parsed.tree,
+                            class_file,
+                            &name,
+                            &cand_uri,
+                            &cand_mapper,
+                        );
+                    }
+                    // InFileType never reaches here (its candidate set is empty), but stay exhaustive.
+                    UnresolvedKind::InFileType => {}
+                    UnresolvedKind::RawFloor => {
+                        // Residue floor: identifier scan picks up `extends Foo` and other
+                        // parser-level refs the reducer doesn't record. De-dupes happen below.
+                        push_binding_locations(
+                            &mut locations,
+                            &cand_result,
+                            &name,
+                            &cand_uri,
+                            &cand_mapper,
+                        );
+                        push_identifier_locations(
+                            &mut locations,
+                            &parsed.tree,
+                            &name,
+                            &cand_uri,
+                            &cand_mapper,
+                        );
+                    }
+                },
             }
         }
     }
@@ -3698,6 +3822,24 @@ fn selection_chain_at(
     node.map(|b| *b)
 }
 
+/// Sub-discrimination of the [`NonMethodTarget::Unresolved`] residue for `references`/`rename`
+/// (computed locally in the references handler, where the registry + occurrence-positive class
+/// predicate are in scope — unlike [`classify_non_method_target`], which takes no `state`). Routes
+/// the two structured type/class sub-cases off the raw `push_identifier_locations` floor so a
+/// mutating rename never over-collects a same-spelled token. See the computation site for the
+/// precedence rationale (#162/#163).
+#[derive(Clone, Copy)]
+enum UnresolvedKind {
+    /// An in-file root `enum`/inner-`class` used in TYPE position — no cross-file bare reference, so
+    /// it fans out EMPTY cross-file and keeps only the in-file raw scan. #162.
+    InFileType,
+    /// The cursor positively refers (by identity) to the project `class_name` declared in this file —
+    /// collected via the occurrence-positive [`push_global_class_locations`]. #163.
+    GlobalClass(gd_project::FileId),
+    /// A genuinely unresolvable name — the documented over-approximate raw-identifier residue floor.
+    RawFloor,
+}
+
 /// How `references` should scan for a NON-method cursor target — resolved before any scan runs,
 /// so precision rides the binding layer where resolution succeeded and the raw-scan floor
 /// survives exactly where it can't decide.
@@ -3906,6 +4048,128 @@ fn push_use_binding_locations_for(
                     uri: uri.clone(),
                     range: mapper.span_to_range(*site),
                 });
+            }
+        }
+    }
+}
+
+/// Append a [`Location`] for every reference to the PROJECT `class_name` whose declaration lives in
+/// `class_file` — the occurrence-positive collection bucket for a global-class rename/references
+/// target. Two contributing positions, both anchored by identity to `class_file` (never a bare
+/// name-string scan); the dedup pass in [`references`] collapses any overlap between them.
+///
+/// EXPRESSION position — a `Binding::Use { kind: Class, target_file == class_file }` at each use span
+/// (`Foo.new()` base, bare `Foo`, `Foo.static_method()` base). A use shadowed by a local records NO
+/// Class binding (it resolves to the local), so the shadowed token is excluded by construction — the
+/// precision that closes the #163 over-grab.
+///
+/// TYPE position — `extends Foo` / `: Foo` carry no binding (resolver-level references), so the base
+/// segment (index 0 of [`ClassNode::extends`] / [`TypeNode::type_chain`]) is collected structurally,
+/// name-matched. A SUFFIX segment (`Foo.Inner`, index > 0) is an inner-class path, not a top-level
+/// class reference, and is excluded — the same carve-out [`cursor_is_type_base_segment`] applies at
+/// the cursor.
+/// `true` iff any file the interface index records as referencing `name` (other than `origin_uri`,
+/// the file driving the rename) declares `name` as an inner-class-scoped type
+/// ([`name_is_in_file_inner_scoped_type`]). Such a file may legitimately reference the global class
+/// `name` (`extends name`) WHILE its inner `: name` means the inner type — a distinction a file-level
+/// guard cannot draw, so the rename layer treats this as a fail-closed REFUSE signal for a
+/// global-class rename. Parse-only (no analysis): the structural inner-scope check needs just the
+/// AST, and the candidate parses are content-addressed/cached. The interface-pass `name_referencers`
+/// set bounds the scan to the same candidate fan-out `references` uses for a class name.
+///
+/// `origin_uri` is EXCLUDED here on purpose: the rename caller checks the origin file's own inner
+/// shadow directly against its already-parsed tree (avoiding a redundant parse), so this scans only
+/// the cross-file referencers. Keep the split — re-merging it would re-parse the origin.
+fn any_referencer_has_inner_scoped_type(
+    state: &mut ServerState,
+    name: &str,
+    origin_uri: &Uri,
+) -> bool {
+    let origin_path = crate::uri::uri_to_path(origin_uri);
+    let candidate_fids: Vec<gd_project::FileId> =
+        state.workspace.index.name_referencers(name).collect();
+    for fid in candidate_fids {
+        let Some(path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        if origin_path
+            .as_deref()
+            .is_some_and(|o| normalize_eq(o, &path))
+        {
+            continue;
+        }
+        let Some(cand_uri) = path_to_file_uri(&path) else {
+            continue;
+        };
+        let text = match state.vfs.get(cand_uri.as_str()).map(|d| d.text()) {
+            Some(t) => t,
+            None => match std::fs::read_to_string(path.as_std_path()) {
+                Ok(t) => t,
+                Err(_) => continue,
+            },
+        };
+        let cand_key = CanonicalKey::for_uri(&cand_uri);
+        let parsed = state.workspace.parse(&cand_key, &text);
+        if name_is_in_file_inner_scoped_type(&parsed.tree, name) {
+            return true;
+        }
+    }
+    false
+}
+
+fn push_global_class_locations(
+    out: &mut Vec<Location>,
+    result: &AnalysisResult,
+    tree: &ParseTree,
+    class_file: gd_project::FileId,
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
+    // (1) Class-kind use bindings pointing AT this class file — by identity.
+    for binding in result.bindings() {
+        if let Binding::Use {
+            target_kind: BindingTargetKind::Class,
+            target_file: Some(tf),
+            target_name,
+            site,
+        } = binding
+        {
+            if *tf == class_file && target_name == name {
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(*site),
+                });
+            }
+        }
+    }
+    // (2) Type-position base segments named `name` (carry no binding). Restricted to index 0 of an
+    // `extends` chain / `TypeNode.type_chain`, so a `Foo.Inner` suffix is never collected.
+    //
+    // A file that locally declares `name` as a root `enum`/inner-class SHADOWS the global class, so
+    // every type position naming `name` in that file refers to the LOCAL type, not this class — skip
+    // them all. (Part 1 above contributes nothing for such a file either: a shadowed `name` reduces
+    // to the local type and records no Class use binding.) Without this guard, renaming a global
+    // `class_name Foo` would rewrite a CONSUMER's own `var y: Foo` whose `Foo` is its in-file enum —
+    // the candidate-side twin of the in-file-type collision.
+    if name_is_in_file_root_type(tree, name) {
+        return;
+    }
+    for nid in tree.iter_ids() {
+        let base_id = match &tree.get(nid).kind {
+            NodeKind::Class(c) => c.extends.first().copied(),
+            NodeKind::Type(t) => t.type_chain.first().copied(),
+            _ => None,
+        };
+        if let Some(base_id) = base_id {
+            let base = tree.get(base_id);
+            if let NodeKind::Identifier(i) = &base.kind {
+                if i.name == name {
+                    out.push(Location {
+                        uri: uri.clone(),
+                        range: mapper.span_to_range(base.span),
+                    });
+                }
             }
         }
     }
@@ -6360,6 +6624,50 @@ pub fn rename(
     // unrelated class.
     let cursor_refers_global_class =
         cursor_references_global_class(state, &uri, &parsed.tree, &key, &text, byte, &old_name);
+
+    // (5a) Fail-closed inner-scope refuse-guard. A type-position reference to `old_name` carries no
+    // binding, so neither the firewall nor the edit collector can tell an inner-class-scoped `: Foo`
+    // (the inner enum/class) from a top-level `: Foo` (a same-named global `class_name`) without
+    // per-node scope-aware type-name resolution the resolver owns. Where an inner-scoped shadow and a
+    // global `class_name` of the same name coexist in the rename's reach, a file-level guard cannot
+    // separate the two — so the rename would emit a WRONG edit. Refuse the whole rename instead (zero
+    // wrong edits; the user renames the residue manually). Over-refusal is the safe direction.
+    if state.workspace.index.registry().contains(&old_name) {
+        // (B) The cursor itself is a type-base segment whose own file declares `old_name` as an
+        // inner-scoped type. The firewall admitted it as a global-class reference, but it may be the
+        // inner type — canonicalizing onto the global `class_name` decl would rewrite an unrelated
+        // class. Refuse.
+        if cursor_is_type_base_segment(&parsed.tree, node_id)
+            && name_is_in_file_inner_scoped_type(&parsed.tree, &old_name)
+        {
+            return Err(RequestRefusal::not_editable(format!(
+                "Cannot safely rename `{old_name}`: an inner-class-scoped type of the same name \
+                 collides with the global class `{old_name}` and cannot be resolved per occurrence"
+            )));
+        }
+        // (A) The cursor positively refers to the global `class_name old_name`, and SOME file in the
+        // rename's reach declares `old_name` as an inner-scoped type. That file's inner `: old_name`
+        // (the inner type) would be wrongly rewritten alongside its legitimate `extends old_name` /
+        // `old_name.new()` (the global class), and a file-level guard cannot separate them. Refuse.
+        // The shadow may live in the ORIGIN file itself (a global-class USE — `old_name.new()` /
+        // `extends old_name` — in a file that also declares an inner `old_name`; checked here with the
+        // already-parsed origin tree, no re-parse) OR in any cross-file referencer. This guard's file
+        // fan-out is exactly the edit collector's: `{origin} ∪ name_referencers(old_name)` — the
+        // origin (always scanned for edits) plus the interface-pass referencer set. Keep that equality
+        // if either the edit-collection candidate set or `any_referencer_has_inner_scoped_type` ever
+        // changes, or a file the collector edits could escape the guard.
+        if cursor_refers_global_class
+            && (name_is_in_file_inner_scoped_type(&parsed.tree, &old_name)
+                || any_referencer_has_inner_scoped_type(state, &old_name, &uri))
+        {
+            return Err(RequestRefusal::not_editable(format!(
+                "Cannot safely rename the global class `{old_name}`: a file in the rename's reach \
+                 declares an inner-class-scoped type of the same name that cannot be distinguished \
+                 from a global reference per occurrence"
+            )));
+        }
+    }
+
     let global_class_decl = (!cursor_refers_global_class)
         .then(|| find_global_class_definition(state, &old_name))
         .flatten();
