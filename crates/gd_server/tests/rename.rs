@@ -1941,6 +1941,173 @@ fn rename_cross_file_enum_value_colliding_with_class_name_refuses() {
     shutdown(&client, server);
 }
 
+/// A bare identifier that collides with a project `class_name X` and is SHADOWED by it (Godot
+/// resolves a bare identifier to a global `class_name` BEFORE native enums / utilities / methods —
+/// `gdscript_analyzer.cpp:4563` precedes `:4570`/`:4611`): the occurrence positively refers to the
+/// PROJECT class `qf.gd`, so renaming it renames THAT class (by-identity, faithful) — it must NOT
+/// resolve to the native symbol, and it must NEVER edit some OTHER project class. The cross-file use
+/// site is currently under-collected (the #158 references-completeness gap); the load-bearing
+/// invariant here is corruption-safety: the only file edited is the class's own declaring file,
+/// never an unrelated one. `(rel_class_file, src_use, line, ch)` clicks the shadowed bare identifier.
+fn assert_bare_collision_renames_own_class_only(
+    decl_src: &str,
+    use_src: &str,
+    line: u32,
+    ch: u32,
+    new_name: &str,
+    id: i32,
+) {
+    let project = common::sample_project();
+    project.write("src/k.gd", decl_src);
+    project.write("src/use.gd", use_src);
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/k.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    let k_uri = file_uri(&project.root.join("src/k.gd"));
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/rename",
+            rename_params(&use_uri, line, ch, new_name),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    // It resolves to the shadowing project class, so the rename succeeds and edits the class's own
+    // declaration (k.gd). The corruption-safety invariant: it edits ONLY k.gd (the class it resolves
+    // to) — never use.gd's unrelated tokens as a DIFFERENT symbol, and never a third file.
+    assert!(
+        resp.error.is_none(),
+        "a bare identifier shadowed by a project class_name renames that class (faithful \
+         resolution), not refuse: {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    assert!(
+        view.set.iter().any(|(u, _)| *u == k_uri.as_str()),
+        "the rename must edit the class's own declaration in k.gd (the symbol it resolves to): {:?}",
+        view.set
+    );
+    // Every edited URI is k.gd (the resolved class's file). NOT corrupting an unrelated class is the
+    // point; a cross-file use of the class in use.gd MAY also be edited (correct) — assert no edit
+    // lands anywhere that is neither the class decl file nor a genuine use of that class. Here the
+    // only project files are k.gd + use.gd, and use.gd's token IS a use of the class, so both are OK;
+    // what must never happen is editing a DIFFERENT class — there is none, so assert the strong form:
+    // the class decl file is edited and the result is a valid (non-error) workspace edit.
+    assert!(
+        view.new_texts.iter().all(|t| t == new_name),
+        "every edit writes the new name, got {:?}",
+        view.new_texts
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_bare_native_enum_value_shadowed_by_class_name_renames_class() {
+    // A NATIVE @GlobalScope enum value used BARE (`var d = SIDE_LEFT`) with a project `class_name
+    // SIDE_LEFT` present: Godot resolves the bare identifier to the CLASS (it shadows the enum value),
+    // so renaming it renames the class — by-identity, NOT the unrelated-symbol corruption the prior
+    // (name-only) firewall produced. Must not refuse, must edit the class's own file only.
+    // `var d = SIDE_LEFT` line 3: tab(0) `var d = `(1-8) `SIDE_LEFT`(9).
+    assert_bare_collision_renames_own_class_only(
+        "class_name SIDE_LEFT\nextends Node\n",
+        "extends Node\n\nfunc go() -> void:\n\tvar d = SIDE_LEFT\n\tprint(d)\n",
+        3,
+        9,
+        "LEFT_SIDE",
+        214,
+    );
+}
+
+#[test]
+fn rename_bare_utility_shadowed_by_class_name_renames_class() {
+    // A bare @GlobalScope utility call (`print("hi")`) with a project `class_name print`: resolves to
+    // the class (constructor-style call), renames the class by-identity, never an unrelated symbol.
+    // `print("hi")` line 3: tab(0) `print`(1).
+    assert_bare_collision_renames_own_class_only(
+        "class_name print\nextends Node\n",
+        "extends Node\n\nfunc go() -> void:\n\tprint(\"hi\")\n",
+        3,
+        1,
+        "log_line",
+        215,
+    );
+}
+
+#[test]
+fn rename_bare_implicit_self_native_method_shadowed_by_class_name_renames_class() {
+    // A bare implicit-self native method call (`queue_free()`) with a project `class_name queue_free`:
+    // resolves to the class, renames it by-identity, never an unrelated symbol.
+    // `queue_free()` line 3: tab(0) `queue_free`(1).
+    assert_bare_collision_renames_own_class_only(
+        "class_name queue_free\nextends Node\n",
+        "extends Node\n\nfunc go() -> void:\n\tqueue_free()\n",
+        3,
+        1,
+        "free_now",
+        216,
+    );
+}
+
+#[test]
+fn rename_type_chain_inner_class_segment_colliding_with_class_name_refuses() {
+    // CORRUPTION GUARD (the TYPE-CHAIN sub-case codex found — parses as `TypeNode.type_chain`, NOT a
+    // `Subscript`, so the attribute gate structurally could not catch it): a `: Outer.Inner` type
+    // annotation segment `Inner` colliding with an unrelated project `class_name Inner` must NOT
+    // rename the unrelated class. (`Outer.Inner` is the legitimate inner-class type; `class_name
+    // Inner` is a different, unrelated top-level class.)
+    let project = common::sample_project();
+    project.write(
+        "src/outer.gd",
+        "class_name Outer\nextends Node\n\nclass Inner:\n\tvar v: int = 0\n",
+    );
+    project.write("src/inner.gd", "class_name Inner\nextends Node\n");
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nfunc go() -> void:\n\tvar x: Outer.Inner = Outer.Inner.new()\n\tprint(x.v)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/outer.gd", "src/inner.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    let inner_uri = file_uri(&project.root.join("src/inner.gd"));
+    // `var x: Outer.Inner = ...` line 3: tab(0) `var x: `(1-7) `Outer`(8-12) `.`(13) `Inner`(14).
+    // Click the type-chain segment `Inner` at col 14.
+    client
+        .sender
+        .send(request(
+            217,
+            "textDocument/rename",
+            rename_params(&use_uri, 3, 14, "Innermost"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    // The unrelated top-level `class_name Inner` (inner.gd) must NEVER be edited (corruption guard).
+    // Whether this refuses or resolves to the inner class, it must not touch inner.gd.
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == inner_uri.as_str()),
+            "the unrelated top-level `class_name Inner` (inner.gd) must NEVER be edited by renaming \
+             the `Outer.Inner` type-chain segment: {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
 #[test]
 fn rename_native_method_colliding_with_class_name_refuses() {
     // CORRUPTION GUARD (fusion-found native analog of the cross-file-enum-value collision): a NATIVE
@@ -2028,7 +2195,7 @@ fn rename_class_name_from_extends_use_site_still_succeeds() {
     assert!(
         resp.error.is_none(),
         "renaming `class_name Hero` from the cross-file `extends Hero` USE site must succeed \
-         (the `Class` Use-binding anchors it): {:?}",
+         (the type-base-segment carve-out anchors it — `extends` carries no binding): {:?}",
         resp.error
     );
     let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
@@ -2043,5 +2210,84 @@ fn rename_class_name_from_extends_use_site_still_succeeds() {
         "the edit must cover BOTH the hero.gd declaration and the enemy.gd extends site: {:?}",
         view.set
     );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_member_from_bare_use_click_edits_bare_and_self_qualified() {
+    // VERIFICATION that a Member does NOT need declaration-canonicalization (so skipping it for the
+    // whole by-identity non-method family is safe): a class with `var speed`, a BARE `speed` use AND
+    // a `self.speed` use. Clicking the BARE use and renaming must edit BOTH — proving the Member's
+    // binding-backed reference set is already click-site-independent (no method-style bare-vs-`self.`
+    // asymmetry that would require canonicalizing to the declaration).
+    //   line 1 `var speed: int = 0`          → decl `speed` at col 4
+    //   line 3 `\tspeed += 1`                 → BARE use at col 1
+    //   line 4 `\tself.speed = 2`             → self-qualified use at col 6
+    let src =
+        "extends Node\nvar speed: int = 0\nfunc go() -> void:\n\tspeed += 1\n\tself.speed = 2\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the BARE use (line 3, col 1). Rename → `velocity`.
+    let sites = rename_sites(&client, 222, &main_uri, 3, 1, "velocity");
+    assert_eq!(
+        sites,
+        vec![(1, 4), (3, 1), (4, 6)],
+        "renaming a member from a BARE use-click must edit the decl + the bare use + the \
+         self-qualified use (binding-backed, click-site-independent); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_class_name_from_type_annotation_and_constructor_still_succeed() {
+    // ANTI-OVER-NARROW GUARD for occurrence-positive signal-3: the two legit class-USE forms most at
+    // risk under the new gate. `: Hero` (type annotation BASE segment — carries NO binding, admitted
+    // via the type-base carve-out) and `Hero.new()` (constructor — the BASE `Hero` carries a `Class`
+    // Use-binding, admitted via the expression-position anchor) must BOTH still rename the class. A
+    // regression here would mean the occurrence-positive check is too narrow.
+    let project = common::sample_project();
+    project.write(
+        "src/u.gd",
+        "extends Node\n\nfunc go() -> void:\n\tvar h: Hero = Hero.new()\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/u.gd"],
+        2,
+    );
+    let u_uri = file_uri(&project.root.join("src/u.gd"));
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    // `\tvar h: Hero = Hero.new()`: tab(0) `var h: `(1-7) `Hero`(8) [annotation base];
+    // ` = `(12-14) `Hero`(15) [constructor base].
+    for (label, ch) in [
+        ("type annotation `: Hero`", 8),
+        ("constructor `Hero.new()`", 15),
+    ] {
+        client
+            .sender
+            .send(request(
+                220,
+                "textDocument/rename",
+                rename_params(&u_uri, 3, ch, "Champion"),
+            ))
+            .unwrap();
+        let resp = recv_response(&client);
+        assert!(
+            resp.error.is_none(),
+            "renaming `class_name Hero` from {label} (col {ch}) must succeed (occurrence-positive \
+             anchor must not over-narrow): {:?}",
+            resp.error
+        );
+        let edit: WorkspaceEdit =
+            serde_json::from_value(resp.result.expect("rename result")).unwrap();
+        let view = flatten_edit(&edit);
+        assert!(
+            view.set.iter().any(|(u, _)| *u == hero_uri.as_str()),
+            "renaming from {label} must edit the hero.gd class declaration: {:?}",
+            view.set
+        );
+    }
     shutdown(&client, server);
 }

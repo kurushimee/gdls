@@ -1940,20 +1940,20 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 /// projection + project-wide text scan) or the non-method classification. Purely structural
 /// (O(#nodes), no analyzer involvement); works identically whether the cursor is on the
 /// declaration or a call site.
-/// `true` iff `ident_id` is the ATTRIBUTE identifier of a subscript (`base.ident` — the `.ident`
-/// child). Distinct from [`is_member_or_attribute_ident`]: this is purely positional (no call/decl
-/// classification) — it is `true` for ANY `obj.attr`/`Enum.VALUE`/`Class.STATIC` attribute and
-/// `false` for a bare identifier or a declaration token. The fail-closed rename firewall uses it to
-/// SKIP the name-only project-`class_name` anchor: a top-level project class is never reachable as
-/// `something.X`, so an attribute cursor that merely shares a class's NAME (a cross-file enum value /
-/// a native method) must not borrow that class's anchor (#106).
-fn cursor_is_subscript_attribute(tree: &ParseTree, ident_id: NodeId) -> bool {
-    tree.iter_ids().any(|nid| {
-        matches!(
-            &tree.get(nid).kind,
-            NodeKind::Subscript(s)
-                if matches!(s.access, Some(SubscriptAccess::Attribute(Some(aid))) if aid == ident_id)
-        )
+/// `true` iff `ident_id` is the BASE segment (index 0) of a class `extends` chain
+/// ([`ClassNode::extends`]) or a type annotation's chain ([`TypeNode::type_chain`]) — the only TYPE
+/// positions where a top-level project `class_name` is legitimately referenced (`extends Foo`,
+/// `: Foo`, `: Foo.Inner` on `Foo`). A SUFFIX segment (`Foo.Inner` on `Inner`, index > 0) is an
+/// inner-class path, NOT a top-level class reference, so it returns `false` — keeping a same-named
+/// unrelated top-level `class_name Inner` from being borrowed by the rename firewall's class anchor
+/// (the type-chain corruption case, #106). Type-position class references carry no `Binding::Use`
+/// (they resolve in the resolver pass, not as reduced expressions), so this positional check is what
+/// admits them — the expression-position class anchor uses the `Class` use-binding instead.
+fn cursor_is_type_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
+    tree.iter_ids().any(|nid| match &tree.get(nid).kind {
+        NodeKind::Class(c) => c.extends.first() == Some(&ident_id),
+        NodeKind::Type(t) => t.type_chain.first() == Some(&ident_id),
+        _ => false,
     })
 }
 
@@ -2073,6 +2073,15 @@ fn member_decl_location(
         uri,
         range: mapper.span_to_range(decl_span),
     })
+}
+
+/// The [`FileId`](gd_project::FileId) of the project `class_name` `name`, or `None` if `name` is not
+/// a registered project class (or its file isn't indexed). The file-level identity used to confirm
+/// that a `Binding::Use { kind: Class }` at a cursor span points at THIS class (the rename firewall's
+/// occurrence-positive class anchor — #106).
+fn global_class_file(state: &ServerState, name: &str) -> Option<gd_project::FileId> {
+    let entry = state.workspace.index.registry().get(name)?;
+    state.workspace.index.file_id(&entry.path)
 }
 
 fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<Location> {
@@ -5911,24 +5920,16 @@ fn rename_target_has_project_anchor(
     if resolve_local_binding(&parsed.tree, byte, name).is_some() {
         return true;
     }
-    // A project `class_name` reference — but ONLY when the cursor is NOT a subscript ATTRIBUTE. A
-    // top-level project class is ALWAYS referenced as a BARE identifier (`class_name X` decl, `extends
-    // X`, `: X`, `X.new()`/`X.STATIC` where X is the subscript BASE, or a standalone `X`); it can
-    // NEVER be reached as `something.X` (the attribute of a subscript). So the corrupting cursors —
-    // a cross-file `Foo.AnimState.Idle` on `Idle`, a native `n.hide()` on `hide` — are exactly the
-    // attribute-position ones, where no legitimate class reference lives. The old name-only check
-    // admitted them: their value/method NAME collided with some project `class_name`, so the cursor
-    // borrowed that class's anchor and `definition`'s name-only class fallback canonicalized onto the
-    // class → the rename rewrote the UNRELATED `class_name` project-wide (silent corruption, the
-    // signal-1 leak one anchor deeper). Skipping ATTRIBUTE cursors lets them fall through to the
-    // by-identity classify below (a real in-file enum value anchors via EnumValue; a genuinely
-    // unanchored cross-file value/native method refuses). #106.
-    if !cursor_is_subscript_attribute(&parsed.tree, node_id)
-        && find_global_class_definition(state, name).is_some()
+    // A `class_name X` DECLARATION click — the cursor is positionally on THIS file's own
+    // `class_name X` token. Analysis-free; the use-site / type-position class anchors are computed
+    // below (they need the binding stream). A class-name decl is not a `node_is_root_member`, so it
+    // needs its own positive case. #106.
+    if root_class_identifier_span(&parsed.tree) == Some(parsed.tree.get(node_id).span)
+        && state.workspace.index.registry().contains(name)
     {
         return true;
     }
-    // Analyze once for the call-callee + cross-file-member anchors below.
+    // Analyze once for the call-callee + cross-file-member + class anchors below.
     let current_path = crate::uri::uri_to_path(uri);
     let Some(p) = current_path
         .as_deref()
@@ -5968,12 +5969,51 @@ fn rename_target_has_project_anchor(
         return true;
     }
 
+    // A project `class_name` reference — admitted OCCURRENCE-POSITIVELY (this cursor actually refers
+    // to the class), never name-only. The old `find_global_class_definition(name).is_some()` was the
+    // signal-1 leak one anchor deeper: a cursor whose NAME merely collided with some `class_name`
+    // borrowed that class's anchor, and `definition`'s name-only class fallback then canonicalized the
+    // rename onto the UNRELATED class (silent wrong-symbol corruption). Two positive forms:
+    //
+    //   (a) EXPRESSION position — the analyzer recorded a `Binding::Use { kind: Class }` at the cursor
+    //       span pointing at a PROJECT class file. Godot resolves a bare identifier to a global
+    //       `class_name` BEFORE native enums/utilities/methods (gdscript_analyzer.cpp:4563 precedes
+    //       :4570/:4611), so bare `Hero` / `Hero.new()` AND a bare `SIDE_LEFT`/`print`/`queue_free`
+    //       SHADOWED by a same-named project `class_name` all carry this binding — and renaming the
+    //       class IS what they refer to (by-identity, faithful). A cursor that resolves to something
+    //       ELSE (an in-file member, an enum value, a native member on a typed base) carries a
+    //       DIFFERENT-kind binding and is NOT admitted here → it routes to its own anchor below.
+    //   (b) TYPE position — `extends X` / `: X` carry NO binding (resolver-level, no reduced Use), so
+    //       (a) can't see them. Admit when the cursor is the BASE segment (index 0) of the class's
+    //       `extends` chain or a `TypeNode.type_chain` (`extends Foo`, `: Foo`, `: Foo.Inner` on
+    //       `Foo`). A SUFFIX segment (`Outer.Inner` on `Inner`, index > 0) is an inner-class path, NOT
+    //       a top-level `class_name` reference, so it is NOT admitted → a same-named unrelated
+    //       top-level `class_name Inner` can't be borrowed (the type-chain corruption case).
+    let node_span = parsed.tree.get(node_id).span;
+    let class_use_anchored = result.bindings().iter().any(|b| {
+        matches!(
+            b,
+            Binding::Use {
+                target_kind: BindingTargetKind::Class,
+                target_file: Some(f),
+                site,
+                ..
+            } if *site == node_span && Some(*f) == global_class_file(state, name)
+        )
+    });
+    if class_use_anchored || cursor_is_type_base_segment(&parsed.tree, node_id) {
+        // Confirm the type-base segment actually names a project class (a native base — `extends Node`
+        // — must fall through to the engine refusal, not anchor as a project class).
+        if class_use_anchored || find_global_class_definition(state, name).is_some() {
+            return true;
+        }
+    }
+
     // A `Member`/`Local`/`EnumValue`-classified analyzer use at the cursor span: a cross-file member
     // read/write through a typed var (`other.speed`), a function-local, or an in-file named enum
     // VALUE (`Direction.NORTH`) — each positively resolved to a project declaration by IDENTITY (the
     // enum value via its `EnumValueLocal` binding / its `EnumNode.values` decl token, never a raw-text
     // scan), so admitting it cannot reopen the W16 grep-rename hole. #106.
-    let node_span = parsed.tree.get(node_id).span;
     if matches!(
         classify_non_method_target(&parsed.tree, &result, node_span, byte, name, current_fid),
         NonMethodTarget::Member(_)
@@ -5985,6 +6025,7 @@ fn rename_target_has_project_anchor(
     false
 }
 
+/// `true` iff the cursor (at `byte`, named `name`) classifies as an in-file enum VALUE
 /// `true` iff the cursor (at `byte`, named `name`) classifies as an in-file enum VALUE
 /// ([`NonMethodTarget::EnumValue`]) — a `Direction.NORTH` use OR the value's declaration token.
 /// Used by `rename` to SKIP declaration-canonicalization (the enum value's reference set is already
