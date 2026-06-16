@@ -1875,3 +1875,173 @@ fn rename_cross_file_class_name_enum_value_underrenames_from_declaration() {
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_cross_file_enum_value_colliding_with_class_name_refuses() {
+    // CORRUPTION GUARD (fusion-found, pre-existing signal-3 leak): a cross-file enum value whose name
+    // collides with a project `class_name` must REFUSE — it must NOT silently rename the unrelated
+    // class project-wide. Before the fix, the name-only signal-3 (`find_global_class_definition`)
+    // admitted the cursor and `definition`'s name-only class fallback canonicalized onto the class,
+    // so `references` rewrote `class_name Idle` instead of the enum value.
+    //   anim.gd:  `class_name Foo` + `enum AnimState { Idle, Walk }`
+    //   idle.gd:  `class_name Idle` (the unrelated state class that must NOT be touched)
+    //   use.gd:   `return Foo.AnimState.Idle`  (the cross-file enum value the user clicks)
+    let project = common::sample_project();
+    project.write(
+        "src/anim.gd",
+        "class_name Foo\nextends Node\n\nenum AnimState { Idle, Walk }\n",
+    );
+    project.write("src/idle.gd", "class_name Idle\nextends Node\n");
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nfunc f() -> int:\n\treturn Foo.AnimState.Idle\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/anim.gd", "src/idle.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    let idle_uri = file_uri(&project.root.join("src/idle.gd"));
+    // `Foo.AnimState.Idle` on line 3: tab(0) `return `(1-7) `Foo`(8-10) `.`(11) `AnimState`(12-20)
+    // `.`(21) `Idle`(22). Click the cross-file enum value `Idle` at col 22 — must REFUSE, zero edits,
+    // and NEVER rewrite `class_name Idle`.
+    client
+        .sender
+        .send(request(
+            210,
+            "textDocument/rename",
+            rename_params(&use_uri, 3, 22, "Resting"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.result.is_none(),
+        "a cross-file enum value colliding with a `class_name` must REFUSE with zero edits (never \
+         rename the unrelated `class_name Idle`); got result={:?}",
+        resp.result
+    );
+    assert!(
+        resp.error.is_some(),
+        "the refusal must be a typed error, not a silent null"
+    );
+    // Belt-and-suspenders: even if some result existed, the idle.gd class declaration must be absent.
+    if let Some(v) = resp.result.as_ref() {
+        let edit: WorkspaceEdit = serde_json::from_value(v.clone()).unwrap();
+        let view = flatten_edit(&edit);
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == idle_uri.as_str()),
+            "the `class_name Idle` declaration must NEVER be edited by an enum-value rename: {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_native_method_colliding_with_class_name_refuses() {
+    // CORRUPTION GUARD (fusion-found native analog of the cross-file-enum-value collision): a NATIVE
+    // method on an untyped base (`n.queue_free()`) whose name collides with a project `class_name`
+    // must REFUSE — NOT silently rename the unrelated class project-wide. Same attribute-position
+    // mechanism: `queue_free` is the `.queue_free` attribute of `n.queue_free`, so the hardened
+    // signal-3 skips the name-only `class_name` anchor and the native-method-on-untyped-base refuses.
+    let project = common::sample_project();
+    // Re-use the sample MINI_API (Object<-Node<-CanvasItem<-Node2D) plus a `queue_free` on Node would
+    // be ideal, but `n.queue_free()` on an UNTYPED `n` resolves as a native method regardless — the
+    // point is the project `class_name queue_free` must not be borrowed. A class literally named
+    // `queue_free` (a valid identifier) makes the name collision exact.
+    project.write("src/qf.gd", "class_name queue_free\nextends Node\n");
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nfunc go() -> void:\n\tvar n = self\n\tn.queue_free()\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/qf.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    let qf_uri = file_uri(&project.root.join("src/qf.gd"));
+    // `n.queue_free()` on line 4: tab(0) `n`(1) `.`(2) `queue_free`(3). Click `queue_free` at col 3.
+    client
+        .sender
+        .send(request(
+            213,
+            "textDocument/rename",
+            rename_params(&use_uri, 4, 3, "free_now"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.result.is_none() && resp.error.is_some(),
+        "a native method on an untyped base colliding with a `class_name` must REFUSE with zero \
+         edits (never rename the unrelated `class_name queue_free`); got result={:?}",
+        resp.result
+    );
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == qf_uri.as_str()),
+            "the `class_name queue_free` declaration must NEVER be edited: {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_class_name_from_extends_use_site_still_succeeds() {
+    // ANTI-OVER-NARROW GUARD for the signal-3 by-identity hardening: renaming a project `class_name`
+    // from a cross-file USE site (`extends Hero` in enemy.gd, NOT the decl in hero.gd) must STILL
+    // succeed and edit both the declaration and the `extends` site. The decl-click case (a) of the
+    // hardened signal-3 covers the declaration; this proves case (b) — the `Class` Use-binding anchor
+    // — keeps the use-site renameable (a regression here would mean the firewall under-refuses).
+    let project = common::sample_project();
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/enemy.gd"],
+        7,
+    );
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let enemy_uri = file_uri(&project.root.join("src/enemy.gd"));
+
+    // `extends Hero` in enemy.gd is line 0; `Hero` at col 8. Rename from THERE → `Champion`.
+    let ref_set = references_set(&client, 211, &enemy_uri, 0, 8);
+    client
+        .sender
+        .send(request(
+            212,
+            "textDocument/rename",
+            rename_params(&enemy_uri, 0, 8, "Champion"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming `class_name Hero` from the cross-file `extends Hero` USE site must succeed \
+         (the `Class` Use-binding anchors it): {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    assert_eq!(
+        view.set, ref_set,
+        "the use-site class rename edited set must equal the references set"
+    );
+    assert!(
+        view.set.iter().any(|(u, _)| *u == hero_uri.as_str())
+            && view.set.iter().any(|(u, _)| *u == enemy_uri.as_str()),
+        "the edit must cover BOTH the hero.gd declaration and the enemy.gd extends site: {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}

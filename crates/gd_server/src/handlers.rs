@@ -1940,6 +1940,23 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 /// projection + project-wide text scan) or the non-method classification. Purely structural
 /// (O(#nodes), no analyzer involvement); works identically whether the cursor is on the
 /// declaration or a call site.
+/// `true` iff `ident_id` is the ATTRIBUTE identifier of a subscript (`base.ident` — the `.ident`
+/// child). Distinct from [`is_member_or_attribute_ident`]: this is purely positional (no call/decl
+/// classification) — it is `true` for ANY `obj.attr`/`Enum.VALUE`/`Class.STATIC` attribute and
+/// `false` for a bare identifier or a declaration token. The fail-closed rename firewall uses it to
+/// SKIP the name-only project-`class_name` anchor: a top-level project class is never reachable as
+/// `something.X`, so an attribute cursor that merely shares a class's NAME (a cross-file enum value /
+/// a native method) must not borrow that class's anchor (#106).
+fn cursor_is_subscript_attribute(tree: &ParseTree, ident_id: NodeId) -> bool {
+    tree.iter_ids().any(|nid| {
+        matches!(
+            &tree.get(nid).kind,
+            NodeKind::Subscript(s)
+                if matches!(s.access, Some(SubscriptAccess::Attribute(Some(aid))) if aid == ident_id)
+        )
+    })
+}
+
 fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
     // Single pass: short-circuit on a func/signal declaration; otherwise remember the subscript
     // that owns this attribute identifier and collect every `Call` callee node, then decide.
@@ -5894,8 +5911,21 @@ fn rename_target_has_project_anchor(
     if resolve_local_binding(&parsed.tree, byte, name).is_some() {
         return true;
     }
-    // A project `class_name` (declared in any project file).
-    if find_global_class_definition(state, name).is_some() {
+    // A project `class_name` reference — but ONLY when the cursor is NOT a subscript ATTRIBUTE. A
+    // top-level project class is ALWAYS referenced as a BARE identifier (`class_name X` decl, `extends
+    // X`, `: X`, `X.new()`/`X.STATIC` where X is the subscript BASE, or a standalone `X`); it can
+    // NEVER be reached as `something.X` (the attribute of a subscript). So the corrupting cursors —
+    // a cross-file `Foo.AnimState.Idle` on `Idle`, a native `n.hide()` on `hide` — are exactly the
+    // attribute-position ones, where no legitimate class reference lives. The old name-only check
+    // admitted them: their value/method NAME collided with some project `class_name`, so the cursor
+    // borrowed that class's anchor and `definition`'s name-only class fallback canonicalized onto the
+    // class → the rename rewrote the UNRELATED `class_name` project-wide (silent corruption, the
+    // signal-1 leak one anchor deeper). Skipping ATTRIBUTE cursors lets them fall through to the
+    // by-identity classify below (a real in-file enum value anchors via EnumValue; a genuinely
+    // unanchored cross-file value/native method refuses). #106.
+    if !cursor_is_subscript_attribute(&parsed.tree, node_id)
+        && find_global_class_definition(state, name).is_some()
+    {
         return true;
     }
     // Analyze once for the call-callee + cross-file-member anchors below.
