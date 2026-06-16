@@ -3468,3 +3468,58 @@ fn rename_167_global_class_use_in_self_shadowing_origin_file_refuses() {
     }
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_167_inner_enum_decl_click_with_colliding_global_refuses() {
+    // (the 4th matrix position — inner-type DECL click): cursor on the inner `enum Foo` DECL token
+    // itself, with a same-named global `class_name Foo`. An inner-class member is not a root-class
+    // member, resolves to no local/Class/Member binding at the cursor, and is not a `class_name`
+    // decl — so the PRE-EXISTING fail-closed firewall (`rename_target_has_project_anchor` → false)
+    // already refuses it before the inner-scope guards are reached. Zero edits, the global decl
+    // untouched. Pinned so the matrix cell stays covered if the firewall's anchor logic ever changes.
+    let project = common::sample_project();
+    project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");
+    project.write(
+        "src/holder.gd",
+        "extends Node\n\nclass Inner:\n\tenum Foo { A }\n\tvar y: Foo = Foo.A\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/fooclass.gd", "src/holder.gd"],
+        2,
+    );
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let holder_uri = file_uri(&project.root.join("src/holder.gd"));
+
+    // `\tenum Foo { A }` on holder.gd line 3: tab(0) `enum `(1-5) `Foo`(6). Click the decl at col 6.
+    client
+        .sender
+        .send(request(
+            403,
+            "textDocument/rename",
+            rename_params(&holder_uri, 3, 6, "Bar"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.result.is_none() && resp.error.is_some(),
+        "renaming the inner `enum Foo` decl colliding with a global `class_name Foo` must REFUSE \
+         (zero edits); got result={:?}, error={:?}",
+        resp.result,
+        resp.error
+    );
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == fooclass_uri.as_str()),
+            "renaming the inner `enum Foo` decl must NEVER edit the global `class_name Foo` \
+             (fooclass.gd); got {:?}",
+            view.set
+        );
+    }
+    let _ = holder_uri;
+    shutdown(&client, server);
+}
