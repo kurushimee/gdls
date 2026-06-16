@@ -2659,6 +2659,32 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     let cursor_refers_global_class =
         cursor_references_global_class(state, &uri, &parsed.tree, &key, &text, byte, &name);
 
+    // Sub-discriminate the `NonMethodTarget::Unresolved` residue (Class/Enum/in-file-type cursors all
+    // land there — type positions carry no `Binding::Use` and are not member-decl clicks). The raw
+    // `push_identifier_locations` floor over-grabs EVERY same-spelled token in each consumer file (a
+    // collection-side W16 grep-rename hole), so route the two structured sub-cases off it:
+    //   - `InFileType`: an in-file root `enum`/inner-`class` used in TYPE position. It has no
+    //     legitimate cross-file bare-name reference, so it fans out EMPTY cross-file (like Local /
+    //     EnumValue) and keeps only the in-file raw scan for its own uses. Checked FIRST so a
+    //     `: FOO` cursor where a same-named global `class_name FOO` also exists stays on the in-file
+    //     type (`cursor_references_global_class` form (c) would otherwise also fire for it). #162.
+    //   - `GlobalClass`: the cursor positively refers (by identity) to a project `class_name` — a
+    //     decl-click, a `Class` use binding at the span, or a type-base segment. Collected via the
+    //     occurrence-positive [`push_global_class_locations`] (Class-use bindings by `target_file`
+    //     identity + type-base segments by position) instead of the raw floor, so an unrelated
+    //     same-named local/param/member in a consumer is never rewritten. #163.
+    //   - `RawFloor`: a genuinely unresolvable name — the documented over-approximate residue.
+    let unresolved_kind = if name_is_in_file_root_type(&parsed.tree, &name) {
+        UnresolvedKind::InFileType
+    } else if cursor_refers_global_class {
+        match global_class_file(state, &name) {
+            Some(cf) => UnresolvedKind::GlobalClass(cf),
+            None => UnresolvedKind::RawFloor,
+        }
+    } else {
+        UnresolvedKind::RawFloor
+    };
+
     // Resolve the declaration site(s) UNCONDITIONALLY — `includeDeclaration` is a filter, not
     // just a prepend: when `true` the declaration joins the result up front, and when `false`
     // any scan hit on the declaration's own name token must be REMOVED at final assembly (the
@@ -2822,14 +2848,37 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                         &mapper,
                     );
                 }
-                NonMethodTarget::Unresolved => {
-                    // Residue floor (incl. autoload + Class/Enum targets): the binding scan
-                    // plus the raw identifier scan, which picks up `extends Foo`, type
-                    // annotations, `class_name`, and other parser-level refs the reducer
-                    // doesn't record. The dedup pass collapses overlap.
-                    push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
-                    push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
-                }
+                NonMethodTarget::Unresolved => match unresolved_kind {
+                    UnresolvedKind::GlobalClass(class_file) => {
+                        // Occurrence-positive: Class-use bindings by `target_file` identity +
+                        // type-base segments by position. A same-named local/member in THIS file
+                        // records no Class binding (it resolves to itself), so it is excluded.
+                        push_global_class_locations(
+                            &mut locations,
+                            &result,
+                            &parsed.tree,
+                            class_file,
+                            &name,
+                            &uri,
+                            &mapper,
+                        );
+                    }
+                    UnresolvedKind::InFileType | UnresolvedKind::RawFloor => {
+                        // Residue floor: the binding scan plus the raw identifier scan, which picks
+                        // up `extends Foo`, type annotations, `class_name`, and other parser-level
+                        // refs the reducer doesn't record. The dedup pass collapses overlap. An
+                        // in-file type keeps the in-file raw scan (its own `: FOO`/`FOO.A` uses are
+                        // genuine); only its CROSS-FILE fan-out is suppressed below.
+                        push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
+                        push_identifier_locations(
+                            &mut locations,
+                            &parsed.tree,
+                            &name,
+                            &uri,
+                            &mapper,
+                        );
+                    }
+                },
             }
         }
     }
@@ -2871,11 +2920,20 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             // cross-file enum metatype carries no `class_node` anchor), so a `class_name`'d enum's
             // `Foo.E.V` uses in other files are under-collected — loud under-rename, tracked #158.
             NonMethodTarget::Local { .. } | NonMethodTarget::EnumValue { .. } => Vec::new(),
+            // An in-file root type (`enum`/inner-class) used in a type position has NO cross-file
+            // bare-name reference — like a local/enum-value, it fans out EMPTY rather than riding the
+            // raw cross-file candidate scan (which would collect a same-named global `class_name`'s
+            // `: FOO`/`extends FOO` consumers). #162.
+            NonMethodTarget::Unresolved
+                if matches!(unresolved_kind, UnresolvedKind::InFileType) =>
+            {
+                Vec::new()
+            }
             NonMethodTarget::Unresolved => {
-                // Fast-path for class/type names: only files whose interface mentions `name`
-                // can reference it; `name_referencers` already has that set. (Autoloads are
-                // excluded — they take the project-wide textual scan above since they never
-                // appear in interface sets.)
+                // Fast-path for class/type names (incl. the occurrence-positive `GlobalClass` bucket):
+                // only files whose interface mentions `name` can reference it; `name_referencers`
+                // already has that set. (Autoloads are excluded — they take the project-wide textual
+                // scan above since they never appear in interface sets.)
                 let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
                 for fid in state.workspace.index.name_referencers(&name) {
                     candidate_fids.insert(fid);
@@ -2966,24 +3024,44 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 }
                 // Local + enum-value targets fan out no candidates (unreachable; kept exhaustive).
                 NonMethodTarget::Local { .. } | NonMethodTarget::EnumValue { .. } => {}
-                NonMethodTarget::Unresolved => {
-                    // Residue floor: identifier scan picks up `extends Foo` and other
-                    // parser-level refs the reducer doesn't record. De-dupes happen below.
-                    push_binding_locations(
-                        &mut locations,
-                        &cand_result,
-                        &name,
-                        &cand_uri,
-                        &cand_mapper,
-                    );
-                    push_identifier_locations(
-                        &mut locations,
-                        &parsed.tree,
-                        &name,
-                        &cand_uri,
-                        &cand_mapper,
-                    );
-                }
+                NonMethodTarget::Unresolved => match unresolved_kind {
+                    UnresolvedKind::GlobalClass(class_file) => {
+                        // Occurrence-positive cross-file collection: a `Class` use binding pointing
+                        // at THIS class file (`Foo.new()` base, bare `Foo`) + type-base segments
+                        // (`extends Foo`, `: Foo`) by position. A consumer's unrelated same-named
+                        // local/param/member records no Class binding and is excluded — the #163
+                        // over-grab fix on the candidate side.
+                        push_global_class_locations(
+                            &mut locations,
+                            &cand_result,
+                            &parsed.tree,
+                            class_file,
+                            &name,
+                            &cand_uri,
+                            &cand_mapper,
+                        );
+                    }
+                    // InFileType never reaches here (its candidate set is empty), but stay exhaustive.
+                    UnresolvedKind::InFileType => {}
+                    UnresolvedKind::RawFloor => {
+                        // Residue floor: identifier scan picks up `extends Foo` and other
+                        // parser-level refs the reducer doesn't record. De-dupes happen below.
+                        push_binding_locations(
+                            &mut locations,
+                            &cand_result,
+                            &name,
+                            &cand_uri,
+                            &cand_mapper,
+                        );
+                        push_identifier_locations(
+                            &mut locations,
+                            &parsed.tree,
+                            &name,
+                            &cand_uri,
+                            &cand_mapper,
+                        );
+                    }
+                },
             }
         }
     }
@@ -3698,6 +3776,24 @@ fn selection_chain_at(
     node.map(|b| *b)
 }
 
+/// Sub-discrimination of the [`NonMethodTarget::Unresolved`] residue for `references`/`rename`
+/// (computed locally in the references handler, where the registry + occurrence-positive class
+/// predicate are in scope — unlike [`classify_non_method_target`], which takes no `state`). Routes
+/// the two structured type/class sub-cases off the raw `push_identifier_locations` floor so a
+/// mutating rename never over-collects a same-spelled token. See the computation site for the
+/// precedence rationale (#162/#163).
+#[derive(Clone, Copy)]
+enum UnresolvedKind {
+    /// An in-file root `enum`/inner-`class` used in TYPE position — no cross-file bare reference, so
+    /// it fans out EMPTY cross-file and keeps only the in-file raw scan. #162.
+    InFileType,
+    /// The cursor positively refers (by identity) to the project `class_name` declared in this file —
+    /// collected via the occurrence-positive [`push_global_class_locations`]. #163.
+    GlobalClass(gd_project::FileId),
+    /// A genuinely unresolvable name — the documented over-approximate raw-identifier residue floor.
+    RawFloor,
+}
+
 /// How `references` should scan for a NON-method cursor target — resolved before any scan runs,
 /// so precision rides the binding layer where resolution succeeded and the raw-scan floor
 /// survives exactly where it can't decide.
@@ -3906,6 +4002,69 @@ fn push_use_binding_locations_for(
                     uri: uri.clone(),
                     range: mapper.span_to_range(*site),
                 });
+            }
+        }
+    }
+}
+
+/// Append a [`Location`] for every reference to the PROJECT `class_name` whose declaration lives in
+/// `class_file` — the occurrence-positive collection bucket for a global-class rename/references
+/// target. Two contributing positions, both anchored by identity to `class_file` (never a bare
+/// name-string scan); the dedup pass in [`references`] collapses any overlap between them.
+///
+/// EXPRESSION position — a `Binding::Use { kind: Class, target_file == class_file }` at each use span
+/// (`Foo.new()` base, bare `Foo`, `Foo.static_method()` base). A use shadowed by a local records NO
+/// Class binding (it resolves to the local), so the shadowed token is excluded by construction — the
+/// precision that closes the #163 over-grab.
+///
+/// TYPE position — `extends Foo` / `: Foo` carry no binding (resolver-level references), so the base
+/// segment (index 0 of [`ClassNode::extends`] / [`TypeNode::type_chain`]) is collected structurally,
+/// name-matched. A SUFFIX segment (`Foo.Inner`, index > 0) is an inner-class path, not a top-level
+/// class reference, and is excluded — the same carve-out [`cursor_is_type_base_segment`] applies at
+/// the cursor.
+fn push_global_class_locations(
+    out: &mut Vec<Location>,
+    result: &AnalysisResult,
+    tree: &ParseTree,
+    class_file: gd_project::FileId,
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
+    // (1) Class-kind use bindings pointing AT this class file — by identity.
+    for binding in result.bindings() {
+        if let Binding::Use {
+            target_kind: BindingTargetKind::Class,
+            target_file: Some(tf),
+            target_name,
+            site,
+        } = binding
+        {
+            if *tf == class_file && target_name == name {
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(*site),
+                });
+            }
+        }
+    }
+    // (2) Type-position base segments named `name` (carry no binding). Restricted to index 0 of an
+    // `extends` chain / `TypeNode.type_chain`, so a `Foo.Inner` suffix is never collected.
+    for nid in tree.iter_ids() {
+        let base_id = match &tree.get(nid).kind {
+            NodeKind::Class(c) => c.extends.first().copied(),
+            NodeKind::Type(t) => t.type_chain.first().copied(),
+            _ => None,
+        };
+        if let Some(base_id) = base_id {
+            let base = tree.get(base_id);
+            if let NodeKind::Identifier(i) = &base.kind {
+                if i.name == name {
+                    out.push(Location {
+                        uri: uri.clone(),
+                        range: mapper.span_to_range(base.span),
+                    });
+                }
             }
         }
     }
