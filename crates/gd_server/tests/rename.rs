@@ -3275,3 +3275,138 @@ fn rename_162_global_class_does_not_overgrab_candidate_local_type_shadow() {
     );
     shutdown(&client, server);
 }
+
+// =================================================================================================
+// #167: inner-class-SCOPED type named like a global `class_name` — the scope-blind residual the
+// root-only `name_is_in_file_root_type` guard cannot see. The fail-closed refuse-guard eliminates
+// the corruption (zero wrong edits) at the cost of over-refusal (#167 tracks restoring precision).
+//
+// The position × collision matrix (inner-scope dimension):
+//   (A) global-class decl-click  + consumer has INNER same-name type   → REFUSE (was: WRONG edit)
+//   (B) inner-type annotation-click + colliding global class_name      → REFUSE (was: WRONG edit)
+//   root-shadow fan-out (existing rename_162_..._candidate_local_type_shadow) → still PRECISE
+//   inner type + NO global collision (existing rename_inner_class_..._succeeds) → still SUCCEEDS
+// =================================================================================================
+
+#[test]
+fn rename_167_global_class_refuses_when_consumer_has_inner_scoped_shadow() {
+    // (A) #163 dishonesty manifestation: a CONSUMER file legitimately `extends Foo` (the global
+    // class) AND declares an inner-class-scoped `enum Foo` whose `: Foo` annotation refers to the
+    // INNER enum, not the global class. The root-only candidate guard sees `extends Foo` is a legit
+    // global ref but cannot suppress the inner `: Foo` — so the global-class type-position collection
+    // rewrites the inner `: Foo` to `: Bar` (corruption: the inner type no longer compiles). Since a
+    // file-level guard cannot separate the two without per-node scope-aware resolution (#167), the
+    // safe move is to REFUSE the whole rename — zero wrong edits.
+    let project = common::sample_project();
+    project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");
+    project.write(
+        "src/consumer.gd",
+        // `extends Foo` is the GLOBAL class (legit). The inner `enum Foo` shadows it INSIDE `Inner`;
+        // `var y: Foo` / `Foo.A` there refer to the inner enum, NOT the global class.
+        "extends Foo\n\nclass Inner:\n\tenum Foo { A }\n\tvar y: Foo = Foo.A\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/fooclass.gd", "src/consumer.gd"],
+        2,
+    );
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    // `class_name Foo` on fooclass.gd line 0: `Foo` at col 11. Rename the GLOBAL class → `Bar`.
+    client
+        .sender
+        .send(request(
+            400,
+            "textDocument/rename",
+            rename_params(&fooclass_uri, 0, 11, "Bar"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    // Fail-closed: REFUSE the entire rename with zero edits — the consumer's inner `: Foo`/`Foo.A`
+    // cannot be safely distinguished from a global ref by a file-level guard (#167).
+    assert!(
+        resp.result.is_none() && resp.error.is_some(),
+        "renaming a global `class_name Foo` must REFUSE when a consumer declares an inner-scoped \
+         `Foo` shadow (the inner `: Foo` cannot be safely separated from the legit `extends Foo`); \
+         got result={:?}, error={:?}",
+        resp.result,
+        resp.error
+    );
+    // Belt-and-suspenders: even if the refuse mechanism ever changes shape, NEITHER file may be
+    // edited (the global decl IS a legit edit, but a partial edit set is still a corruption since the
+    // consumer's inner `: Foo` would be wrongly rewritten alongside it).
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view
+                .set
+                .iter()
+                .any(|(u, _)| *u == consumer_uri.as_str() || *u == fooclass_uri.as_str()),
+            "the refuse-guard must emit ZERO edits; got {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_167_inner_scoped_type_colliding_with_global_class_refuses() {
+    // (B) #162 dishonesty manifestation: the cursor is on the inner-class-scoped `var y: Foo`
+    // annotation, whose `Foo` is the INNER enum — but a same-named global `class_name Foo` is
+    // registered. The firewall's `cursor_is_type_base_segment` + `find_global_class_definition`
+    // admit it as referring to the global class, then canonicalization rewrites the GLOBAL
+    // `class_name Foo` declaration (corruption: renaming an inner enum mutates an unrelated global
+    // class). Fail-closed: REFUSE — the inner type cannot be scoped precisely without #167.
+    let project = common::sample_project();
+    project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");
+    project.write(
+        "src/holder.gd",
+        // No top-level `extends Foo` — the only `Foo`s are the inner enum + its in-file uses.
+        "extends Node\n\nclass Inner:\n\tenum Foo { A }\n\tvar y: Foo = Foo.A\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/fooclass.gd", "src/holder.gd"],
+        2,
+    );
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let holder_uri = file_uri(&project.root.join("src/holder.gd"));
+
+    // `var y: Foo = Foo.A` on holder.gd line 4: tab(0) `var y: `(1-7) `Foo`(8). Click `: Foo` col 8.
+    client
+        .sender
+        .send(request(
+            401,
+            "textDocument/rename",
+            rename_params(&holder_uri, 4, 8, "Bar"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    // The hard invariant: the global `class_name Foo` decl must NEVER be edited (cross-symbol
+    // corruption). Fail-closed refuse is the safe outcome.
+    assert!(
+        resp.result.is_none() && resp.error.is_some(),
+        "renaming an inner-scoped `: Foo` annotation that collides with a global `class_name Foo` \
+         must REFUSE — never canonicalize onto and rewrite the unrelated global class; got \
+         result={:?}, error={:?}",
+        resp.result,
+        resp.error
+    );
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == fooclass_uri.as_str()),
+            "renaming the inner `: Foo` must NEVER edit the global `class_name Foo` decl \
+             (fooclass.gd); got {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
