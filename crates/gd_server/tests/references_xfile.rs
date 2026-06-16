@@ -815,3 +815,91 @@ fn references_on_local_variable_stays_in_function() {
 
     shutdown(&client, server_thread);
 }
+
+/// #164: a `Member` USE clicked at a cross-file attribute site (`x.speed` where the cursor resolves
+/// by identity to a member declared in ANOTHER file) must NOT pull in the CURRENT file's own
+/// same-named `var speed` declaration. The decl-side `find_in_file_definition(name)` resolved by NAME
+/// and over-collected `b.gd`'s `var speed` — a spurious duplicate-declaration hit in the references
+/// panel (read-only; not the mutating rename path, which canonicalizes via `definition()` first).
+///
+/// Fixture: `a.gd` declares `var speed` (the cursor's resolved target); `b.gd` has its OWN `var speed`
+/// PLUS `x.speed` whose target is A. Click on `speed` in `x.speed`. The result must include A's decl
+/// (the resolved declaration), not B's same-named decl.
+#[test]
+fn references_member_use_excludes_current_file_same_named_decl() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+
+    // a.gd: declares the member the cursor resolves to.
+    // Line 0: `class_name A`
+    // Line 1: `var speed = 1`   — `speed` decl ident at col 4..9
+    p.write("a.gd", "class_name A\nvar speed = 1\n");
+
+    // b.gd: has its OWN same-named `var speed`, plus an attribute USE `x.speed` whose target is A.
+    // Line 0: `class_name B`
+    // Line 1: `var speed = 2`   — B's own decl ident at col 4..9 (the spurious one #164 over-collected)
+    // Line 2: `func f(x: A):`
+    // Line 3: `\tx.speed`        — `speed` attribute use at col 3..8 (target = A)
+    p.write(
+        "b.gd",
+        "class_name B\nvar speed = 2\nfunc f(x: A):\n\tx.speed\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["a.gd", "b.gd"]);
+
+    let a_uri = file_uri(&p.root.join("a.gd"));
+    let b_uri = file_uri(&p.root.join("b.gd"));
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: b_uri.clone() },
+            // Cursor on `speed` in `x.speed` at line 3, col 4.
+            position: Position {
+                line: 3,
+                character: 4,
+            },
+        },
+        context: ReferenceContext {
+            include_declaration: true,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(60, "textDocument/references", params))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    // The spurious hit: B's own `var speed = 2` decl ident at line 1, col 4 — must NOT appear.
+    assert!(
+        !locs
+            .iter()
+            .any(|l| l.uri == b_uri && l.range.start.line == 1 && l.range.start.character == 4),
+        "references on B's `x.speed` (target A) must NOT include B's own `var speed` decl at \
+         line 1, col 4; got: {locs:?}"
+    );
+
+    // The genuine use `x.speed` in B (line 3, col 3) must still be present.
+    assert!(
+        locs.iter()
+            .any(|l| l.uri == b_uri && l.range.start.line == 3 && l.range.start.character == 3),
+        "references must still include B's genuine `x.speed` use at line 3, col 3; got: {locs:?}"
+    );
+
+    // The RESOLVED declaration — A's `var speed = 1` at line 1, col 4 in a.gd — must be present
+    // (include_declaration:true), proving the decl is sourced from the declaring file, not dropped.
+    assert!(
+        locs.iter()
+            .any(|l| l.uri == a_uri && l.range.start.line == 1 && l.range.start.character == 4),
+        "references must include A's resolved `var speed` declaration at a.gd line 1, col 4; \
+         got: {locs:?}"
+    );
+
+    shutdown(&client, server_thread);
+}

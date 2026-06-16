@@ -1782,6 +1782,33 @@ fn find_in_file_definition(
     })
 }
 
+/// Resolve the narrow declaration-identifier [`Location`] for member `name` in the file that
+/// DECLARES it (`tf`), reading the declaring file's text (VFS, then disk) and running
+/// [`find_in_file_definition`] on its own tree. This is the occurrence-positive decl source for a
+/// cross-file `Member` cursor: the cursor resolved by identity to a member in `tf`, so the
+/// declaration must come from `tf` — never from a same-named decl in the cursor's own file. Mirrors
+/// the method/signal cross-file decl block. Returns `None` if the file is unindexed/unreadable or
+/// declares no member of that name. #164.
+fn find_decl_in_declaring_file(
+    state: &mut ServerState,
+    tf: gd_project::FileId,
+    name: &str,
+    enc: crate::position::PositionEncoding,
+) -> Option<Location> {
+    let decl_path = state.workspace.index.path(tf).map(|p| p.to_path_buf())?;
+    let decl_uri = path_to_file_uri(&decl_path)?;
+    let text = match state.vfs.get(decl_uri.as_str()).map(|d| d.text()) {
+        Some(t) => t,
+        None => std::fs::read_to_string(decl_path.as_std_path()).ok()?,
+    };
+    let decl_parsed = state
+        .workspace
+        .parse(&CanonicalKey::for_uri(&decl_uri), &text);
+    let decl_rope = Rope::from_str(&text);
+    let decl_mapper = PositionMapper::new(&decl_rope, enc);
+    find_in_file_definition(&decl_parsed.tree, name, &decl_uri, &decl_mapper)
+}
+
 /// Resolve a class member to a candidate declaration `NodeId` iff its declared name matches.
 /// Mirrors [`ClassNode::Member`]'s variant set — every member kind that exposes a name is
 /// inspected.
@@ -2755,30 +2782,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                     }
                 } else {
                     // Cross-file call-site click: read the declaring file and locate the identifier.
-                    let decl_loc = state
-                        .workspace
-                        .index
-                        .path(tf)
-                        .map(|p| p.to_path_buf())
-                        .and_then(|decl_path| path_to_file_uri(&decl_path).map(|u| (decl_path, u)))
-                        .and_then(|(decl_path, decl_uri)| {
-                            let text = match state.vfs.get(decl_uri.as_str()).map(|d| d.text()) {
-                                Some(t) => t,
-                                None => std::fs::read_to_string(decl_path.as_std_path()).ok()?,
-                            };
-                            let decl_parsed = state
-                                .workspace
-                                .parse(&CanonicalKey::for_uri(&decl_uri), &text);
-                            let decl_rope = Rope::from_str(&text);
-                            let decl_mapper = PositionMapper::new(&decl_rope, enc);
-                            find_in_file_definition(
-                                &decl_parsed.tree,
-                                &name,
-                                &decl_uri,
-                                &decl_mapper,
-                            )
-                        });
-                    if let Some(loc) = decl_loc {
+                    if let Some(loc) = find_decl_in_declaring_file(state, tf, &name, enc) {
                         decls.push(loc);
                         true
                     } else {
@@ -2810,6 +2814,20 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                     uri: uri.clone(),
                     range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
                 });
+            } else if let NonMethodTarget::Member(tf) = &non_method_target {
+                // Occurrence-positive member decl: the cursor resolved by identity to a member in
+                // `tf` (its DECLARING file). When `tf` is the current file (a same-file decl click or
+                // use) the in-file lookup is correct. When `tf` is ANOTHER file (a cross-file
+                // attribute use, `x.speed`), the name-only `find_in_file_definition(&parsed.tree, …)`
+                // would return THIS file's same-named decl — a spurious duplicate. Resolve the decl
+                // in `tf` instead, so a same-named local decl is never pulled in. #164.
+                if current_fid.is_some_and(|cf| cf == *tf) {
+                    if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
+                        decls.push(loc);
+                    }
+                } else if let Some(loc) = find_decl_in_declaring_file(state, *tf, &name, enc) {
+                    decls.push(loc);
+                }
             } else if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
                 decls.push(loc);
             } else if cursor_refers_global_class {
@@ -3351,6 +3369,17 @@ fn collect_in_file_highlight_sites(
             uri: uri.clone(),
             range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
         });
+    } else if let NonMethodTarget::Member(tf) = &non_method_target {
+        // Occurrence-positive member decl: highlight the decl token only when THIS file declares the
+        // resolved member (`tf == current_fid`). A cross-file attribute use (`x.speed`, target in
+        // another file) has its declaration elsewhere — highlight nothing for it here, never THIS
+        // file's same-named decl via the name-only `find_in_file_definition`. documentHighlight is
+        // single-file, so a cross-file decl simply isn't part of this buffer's highlight set. #164.
+        if current_fid.is_some_and(|cf| cf == *tf) {
+            if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, &mapper) {
+                locations.push(loc);
+            }
+        }
     } else if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, &mapper) {
         locations.push(loc);
     } else if let Some(loc) = find_global_class_definition(state, name) {
