@@ -2761,3 +2761,307 @@ fn rename_bare_method_call_with_colliding_class_name_keeps_self_qualified_site()
     );
     shutdown(&client, server);
 }
+
+// =============================================================================================
+// #162 / #163 — occurrence-positive Unresolved-arm collection for global-class + in-file-type
+// rename. The Unresolved arm's raw `push_identifier_locations` scan grabbed EVERY same-spelled
+// token in each consumer file (the W16 grep-rename hole, collection-side). These pin the
+// position×collision matrix.
+// =============================================================================================
+
+/// Build a consumer file that genuinely extends `class_name Hero` AND independently contains
+/// unrelated same-named symbols (`func g(Hero)` param, `var Hero` local, `print(Hero)` uses).
+/// Renaming the class must rewrite ONLY the genuine `extends Hero` ref (+ the decl), never the
+/// unrelated occurrences. Shared by the decl-click and expr-use cells.
+const HERO_CONSUMER_WITH_COLLISIONS: &str = "extends Hero\n\nfunc g(Hero):\n\tprint(Hero)\n\nfunc h() -> void:\n\tvar Hero = 1\n\tprint(Hero)\n";
+
+#[test]
+fn rename_163_global_class_decl_click_does_not_overgrab_colliding_tokens_in_consumer() {
+    // #163 cell (a): a `class_name Hero` DECL-click with a consumer that does `extends Hero` AND
+    // has unrelated `func g(Hero)` / `var Hero` / `print(Hero)`. On `main` the Unresolved raw scan
+    // rewrites ALL of them in the consumer (indiscriminate over-grab). The fix collects only the
+    // type-base `extends Hero` segment by position + Class-use bindings by identity.
+    let project = common::sample_project(); // src/hero.gd = `class_name Hero` … ; src/enemy.gd = `extends Hero`
+    project.write("src/consumer.gd", HERO_CONSUMER_WITH_COLLISIONS);
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/enemy.gd", "src/consumer.gd"],
+        2,
+    );
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    // `class_name Hero` on hero.gd line 0: `Hero` at col 11. Rename → `Champion`.
+    client
+        .sender
+        .send(request(
+            300,
+            "textDocument/rename",
+            rename_params(&hero_uri, 0, 11, "Champion"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "class rename should succeed: {:?}", resp.error);
+    let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+
+    // Genuine refs that MUST be edited in consumer.gd: only `extends Hero` (line 0, col 8).
+    let consumer_edits: Vec<Range> = view
+        .set
+        .iter()
+        .filter(|(u, _)| *u == consumer_uri.as_str())
+        .map(|(_, r)| *r)
+        .collect();
+    assert_eq!(
+        consumer_edits,
+        vec![Range {
+            start: Position { line: 0, character: 8 },
+            end: Position { line: 0, character: 12 },
+        }],
+        "renaming `class_name Hero` must edit ONLY `extends Hero` in the consumer — never the \
+         unrelated `func g(Hero)` param / `var Hero` local / `print(Hero)` uses (the W16 over-grab); \
+         got {consumer_edits:?}"
+    );
+    // The declaration site is also edited (in hero.gd).
+    assert!(
+        view.set.iter().any(|(u, r)| *u == hero_uri.as_str()
+            && r.start.line == 0
+            && r.start.character == 11),
+        "the `class_name Hero` declaration must be edited; got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_163_global_class_expr_use_does_not_overgrab_colliding_tokens() {
+    // #163 cell (b): an EXPRESSION-position class use `Hero.new()` (records a Class use binding by
+    // identity) in a file that ALSO has an unrelated same-named local in a DIFFERENT function. The
+    // rename must edit the genuine `Hero` class refs by identity, never the unrelated local. On
+    // `main` the raw scan grabbed every `Hero` token in the file.
+    let project = common::sample_project();
+    project.write(
+        "src/maker.gd",
+        // `Hero.new()` is a genuine class use (function `make`); `var Hero`/`print(Hero)` in
+        // `other` is an unrelated local. extends Hero is also a genuine ref.
+        "extends Hero\n\nfunc make() -> Hero:\n\treturn Hero.new()\n\nfunc other() -> void:\n\tvar Hero = 1\n\tprint(Hero)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/maker.gd"],
+        2,
+    );
+    let maker_uri = file_uri(&project.root.join("src/maker.gd"));
+
+    // Click `Hero` of `return Hero.new()` on line 3: tab(0) `return `(1-7) `Hero`(8). Rename →
+    // `Champion`.
+    client
+        .sender
+        .send(request(
+            301,
+            "textDocument/rename",
+            rename_params(&maker_uri, 3, 8, "Champion"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "class expr-use rename should succeed: {:?}", resp.error);
+    let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+
+    let maker_edits: Vec<Range> = view
+        .set
+        .iter()
+        .filter(|(u, _)| *u == maker_uri.as_str())
+        .map(|(_, r)| *r)
+        .collect();
+    // Genuine class refs in maker.gd: `extends Hero` (0,8), the return type `-> Hero` (2,15),
+    // `Hero.new()` base (3,8). The unrelated local `Hero` at (6,5) and `print(Hero)` at (7,7)
+    // must NOT appear.
+    assert!(
+        maker_edits.iter().any(|r| r.start.line == 0 && r.start.character == 8),
+        "must edit `extends Hero`; got {maker_edits:?}"
+    );
+    assert!(
+        maker_edits.iter().any(|r| r.start.line == 3 && r.start.character == 8),
+        "must edit the `Hero.new()` class use; got {maker_edits:?}"
+    );
+    assert!(
+        !maker_edits.iter().any(|r| r.start.line == 6 || r.start.line == 7),
+        "must NOT edit the unrelated `var Hero` local / `print(Hero)` use in `other()` \
+         (lines 6-7); got {maker_edits:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_162_in_file_enum_type_does_not_collect_global_class_consumers() {
+    // #162 cell (c): three-file shape. `src/holder.gd` declares an in-file root `enum FOO`. A
+    // DIFFERENT file declares a global `class_name FOO`. A THIRD file uses `: FOO` (the global
+    // class) in a type annotation. Renaming the IN-FILE `enum FOO` must fan out EMPTY cross-file —
+    // it must NOT collect the global class's `: FOO` / `extends FOO` consumers. On `main` the
+    // in-file-type cursor falls to the Unresolved arm and rides the cross-file candidate scan over
+    // `name_referencers("FOO")`, collecting the unrelated consumer's `: FOO`.
+    let project = common::sample_project();
+    project.write(
+        "src/holder.gd",
+        // In-file root enum FOO, used in-file as `: FOO` / `FOO.A`.
+        "extends Node\n\nenum FOO { A, B }\n\nvar x: FOO = FOO.A\n",
+    );
+    project.write("src/fooclass.gd", "class_name FOO\nextends Node\n");
+    project.write(
+        "src/fooconsumer.gd",
+        // Uses the GLOBAL class FOO in a type annotation + extends.
+        "extends FOO\n\nfunc use_it(p: FOO) -> void:\n\tprint(p)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/holder.gd", "src/fooclass.gd", "src/fooconsumer.gd"],
+        2,
+    );
+    let holder_uri = file_uri(&project.root.join("src/holder.gd"));
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let fooconsumer_uri = file_uri(&project.root.join("src/fooconsumer.gd"));
+
+    // `enum FOO { A, B }` on holder.gd line 2: `FOO` at col 5. Rename the in-file enum → `BAR`.
+    client
+        .sender
+        .send(request(
+            302,
+            "textDocument/rename",
+            rename_params(&holder_uri, 2, 5, "BAR"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    // It either refuses or edits — but in NO case may it touch the unrelated global class FOO's
+    // declaration or its consumer's `: FOO` / `extends FOO`.
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == fooclass_uri.as_str()),
+            "renaming the in-file `enum FOO` must NEVER edit the unrelated global `class_name FOO` \
+             declaration (fooclass.gd); got {:?}",
+            view.set
+        );
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == fooconsumer_uri.as_str()),
+            "renaming the in-file `enum FOO` must NEVER edit the global class's `: FOO` / \
+             `extends FOO` consumer (fooconsumer.gd) — in-file types have no cross-file bare refs; \
+             got {:?}",
+            view.set
+        );
+        // It SHOULD still edit its own in-file uses (FOO.A on line 4, : FOO on line 4) when it
+        // proceeds.
+        assert!(
+            view.set.iter().all(|(u, _)| *u == holder_uri.as_str()),
+            "an in-file enum rename must stay entirely in its own file; got {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_162_in_file_inner_class_type_does_not_collect_global_class_consumers() {
+    // #162 cell (c) sibling: an in-file INNER CLASS used in TYPE position, with a same-named global
+    // `class_name`. Renaming the in-file inner class must not collect the global class's consumers.
+    let project = common::sample_project();
+    project.write(
+        "src/holder.gd",
+        "extends Node\n\nclass Widget:\n\tvar v: int = 0\n\nvar w: Widget = Widget.new()\n",
+    );
+    project.write("src/widgetclass.gd", "class_name Widget\nextends Node\n");
+    project.write(
+        "src/widgetconsumer.gd",
+        "extends Widget\n\nfunc use_it(p: Widget) -> void:\n\tprint(p)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/holder.gd", "src/widgetclass.gd", "src/widgetconsumer.gd"],
+        2,
+    );
+    let holder_uri = file_uri(&project.root.join("src/holder.gd"));
+    let widgetclass_uri = file_uri(&project.root.join("src/widgetclass.gd"));
+    let widgetconsumer_uri = file_uri(&project.root.join("src/widgetconsumer.gd"));
+
+    // `class Widget:` on holder.gd line 2: `Widget` at col 6. Rename the in-file inner class.
+    client
+        .sender
+        .send(request(
+            303,
+            "textDocument/rename",
+            rename_params(&holder_uri, 2, 6, "Gadget"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == widgetclass_uri.as_str()
+                || *u == widgetconsumer_uri.as_str()),
+            "renaming the in-file `class Widget` must NEVER edit the unrelated global \
+             `class_name Widget` or its consumers; got {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_163_regression_in_file_member_vs_same_named_class_name_edits_no_class_decl() {
+    // #163 cell (d) regression pin: an in-file MEMBER (`var Hero`) whose name collides with a
+    // project `class_name Hero` must rename ONLY its own member, NEVER the global class declaration
+    // or the class's `extends Hero` consumers. (Member classification already routes binding-backed,
+    // but pin it so the new global-class bucket can't leak the class decl in.)
+    let project = common::sample_project(); // hero.gd: class_name Hero; enemy.gd: extends Hero
+    project.write(
+        "src/holder.gd",
+        "extends Node\n\nvar Hero: int = 1\n\nfunc use_it() -> void:\n\tHero = 2\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/enemy.gd", "src/holder.gd"],
+        2,
+    );
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let enemy_uri = file_uri(&project.root.join("src/enemy.gd"));
+    let holder_uri = file_uri(&project.root.join("src/holder.gd"));
+
+    // `var Hero: int = 1` on holder.gd line 2: `Hero` at col 4. Rename the member.
+    client
+        .sender
+        .send(request(
+            304,
+            "textDocument/rename",
+            rename_params(&holder_uri, 2, 4, "Health"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "member rename should succeed: {:?}", resp.error);
+    let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+    assert!(
+        !view.set.iter().any(|(u, _)| *u == hero_uri.as_str() || *u == enemy_uri.as_str()),
+        "renaming the in-file member `var Hero` must NEVER edit the unrelated `class_name Hero` \
+         declaration (hero.gd) or its `extends Hero` consumer (enemy.gd); got {:?}",
+        view.set
+    );
+    // It DOES edit its own member sites in holder.gd (decl + `Hero = 2`).
+    assert!(
+        view.set.iter().all(|(u, _)| *u == holder_uri.as_str()) && view.set.len() == 2,
+        "the member rename must edit exactly its own two sites in holder.gd; got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
