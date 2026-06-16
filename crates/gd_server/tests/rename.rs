@@ -820,6 +820,100 @@ fn rename_inner_local_to_inner_member_name_refuses_shadow() {
     shutdown(&client, server);
 }
 
+#[test]
+fn rename_method_decl_in_out_of_project_file_stays_in_file_no_byname_leak() {
+    // #165 (verify-and-close): a `.gd` opened in the editor but OUTSIDE the project's `res://` tree
+    // is STILL interned on `didOpen` (`reindex_open_buffer` → `Workspace::reindex` → `intern`,
+    // unconditional — no project-root guard), so `current_fid` (= `index.file_id(path)`) is `Some`
+    // for it. The issue's feared `target_file = current_fid = None` on a method-decl click is
+    // therefore unreachable: a method/signal rename always has the file open (it reads from the
+    // VFS), and an open `.gd` is always interned. So `references` filters cross-file candidates by
+    // `target_file` IDENTITY, never the forbidden `push_identifier_locations` raw by-name scan.
+    //
+    // This pins that safety property concretely: the indexed `enemy.gd` declares `func flee()`, and
+    // an out-of-project file ALSO declares `func flee()` + calls it. Renaming the out-of-project
+    // `flee` edits EXACTLY its own in-file decl + call, and `enemy.gd`'s same-named `flee` is NOT
+    // touched (a by-name mass-rename would have rewritten it). The presence of `enemy.gd::flee` is
+    // load-bearing: it is the same-name decoy that a grep-rename would corrupt.
+    let project = common::sample_project(); // src/enemy.gd declares `func flee():`
+    let (client, server) = boot();
+    init_open(&project, &client, caps_full(), &["src/enemy.gd"], 2);
+    let enemy_uri = file_uri(&project.root.join("src/enemy.gd"));
+
+    // Open a second file at a path OUTSIDE the project root (inline text — never on disk under
+    // `res://`). It also declares `func flee()` so a raw by-name scan would collide with the
+    // indexed `enemy.gd::flee`.
+    let outside_uri: Uri = "file:///external/outside.gd".parse().unwrap();
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: outside_uri.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 1,
+                    text: "extends Node\n\nfunc flee() -> void:\n\tpass\n\nfunc go() -> void:\n\tflee()\n".to_string(),
+                },
+            },
+        ))
+        .unwrap();
+    while common::try_recv(&client, std::time::Duration::from_millis(300)).is_some() {}
+
+    // Click the method DECLARATION `func flee` (line 2, `flee` at col 5). Rename → `retreat`.
+    client
+        .sender
+        .send(request(
+            57,
+            "textDocument/rename",
+            rename_params(&outside_uri, 2, 5, "retreat"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming a method decl in an out-of-project open file must succeed (it is interned); got {:?}",
+        resp.error
+    );
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+
+    // The edit set is EXACTLY the out-of-project file's own decl (line 2) + its in-file call
+    // (line 6) — never `enemy.gd`. `flatten_edit` carries the per-edit URI, so a cross-file leak
+    // into `enemy.gd` would surface here.
+    let enemy_uri_str = enemy_uri.as_str().to_string();
+    let outside_uri_str = outside_uri.as_str().to_string();
+    assert!(
+        view.set.iter().all(|(u, _)| *u == outside_uri_str),
+        "every edit must land in the out-of-project file, never the indexed `enemy.gd` (a by-name \
+         leak); got {:?}",
+        view.set
+    );
+    assert!(
+        view.set.iter().all(|(u, _)| *u != enemy_uri_str),
+        "the indexed same-named `enemy.gd::flee` must NOT be edited (no W16 grep-rename); got {:?}",
+        view.set
+    );
+    let sites: Vec<(u32, u32)> = {
+        let mut s: Vec<(u32, u32)> = view
+            .set
+            .iter()
+            .map(|(_, r)| (r.start.line, r.start.character))
+            .collect();
+        s.sort();
+        s
+    };
+    assert_eq!(
+        sites,
+        vec![(2, 5), (6, 1)],
+        "rename must edit exactly the out-of-project decl `func flee` (line 2, col 5) + its in-file \
+         call `flee()` (line 6, col 1); got {sites:?}"
+    );
+
+    shutdown(&client, server);
+}
+
 // =================================================================================================
 // Corruption firewall on the MUTATING path: a native MEMBER access from a project file. This is the
 // catastrophic case the feature exists to refuse — `references` resolves a native member through a
