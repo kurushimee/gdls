@@ -3122,13 +3122,22 @@ fn collect_in_file_highlight_sites(
 
     // Declaration site — always part of the highlight set (no includeDeclaration flag). Locals are
     // handled by the within-scope identifier scan below (which already emits the decl token), so
-    // they're excluded here to avoid a duplicate the caller would then have to dedup.
+    // they're excluded here to avoid a duplicate the caller would then have to dedup; an enum VALUE's
+    // decl is added explicitly (its use scan does not emit it).
     if is_autoload {
         if let Some(loc) = find_autoload_definition(state, name) {
             locations.push(loc);
         }
     } else if let NonMethodTarget::Local { .. } = &non_method_target {
         // decl token is emitted by push_local_binding_locations below.
+    } else if let NonMethodTarget::EnumValue { decl_ident, .. } = &non_method_target {
+        // An enum value's declaration is its precise token in `EnumNode.values` — the
+        // `push_enum_value_binding_locations` scan below emits USE sites only, so the decl is added
+        // here (NOT via find_in_file_definition, which matches the enum's NAME / a same-named member).
+        locations.push(Location {
+            uri: uri.clone(),
+            range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
+        });
     } else if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, &mapper) {
         locations.push(loc);
     } else if let Some(loc) = find_global_class_definition(state, name) {

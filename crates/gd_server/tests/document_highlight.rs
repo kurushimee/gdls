@@ -433,3 +433,56 @@ fn document_highlight_member_read_write() {
 
     shutdown(&client, server_thread);
 }
+
+/// #106: documentHighlight on an in-file enum VALUE highlights its declaration token AND its use,
+/// by-identity — never an unrelated same-named `const`. Guards the references/documentHighlight decl
+/// parity (the EnumValue decl token is emitted explicitly; the use scan emits use sites only).
+#[test]
+fn document_highlight_enum_value_decl_and_use_not_unrelated_const() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    // Line 1 `enum Direction { NORTH }`  → value decl `NORTH` at col 17
+    // Line 2 `const NORTH := 99`         → UNRELATED const decl `NORTH` at col 6
+    // Line 4 `\tvar a = Direction.NORTH` → enum value use `NORTH` at col 19
+    // Line 5 `\tvar b = NORTH`           → UNRELATED const use `NORTH` at col 9
+    p.write(
+        "e.gd",
+        "extends Node\nenum Direction { NORTH }\nconst NORTH := 99\nfunc go() -> void:\n\tvar a = Direction.NORTH\n\tvar b = NORTH\n\tprint(a + b)\n",
+    );
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["e.gd"]);
+    let uri = file_uri(&p.root.join("e.gd"));
+    // Click the enum value USE `Direction.NORTH` (line 4, col 19).
+    client
+        .sender
+        .send(request(
+            10,
+            "textDocument/documentHighlight",
+            highlight_params(&uri, 4, 19),
+        ))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "documentHighlight errored: {:?}",
+        resp.error
+    );
+    let mut hls: Vec<DocumentHighlight> =
+        serde_json::from_value(resp.result.expect("documentHighlight result")).unwrap();
+    hls.sort_by_key(|h| (h.range.start.line, h.range.start.character));
+    let starts: Vec<(u32, u32)> = hls
+        .iter()
+        .map(|h| (h.range.start.line, h.range.start.character))
+        .collect();
+    // Exactly the enum value's decl (1,17) + its use (4,19) — never the unrelated `const NORTH`
+    // decl (2,6) or its use (5,9).
+    assert_eq!(
+        starts,
+        vec![(1, 17), (4, 19)],
+        "documentHighlight on the enum value must highlight its decl + use only, never the \
+         unrelated `const NORTH` (2,6)/(5,9); got {hls:?}"
+    );
+    shutdown(&client, server_thread);
+}
