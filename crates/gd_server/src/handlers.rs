@@ -6860,7 +6860,10 @@ fn rename_collision(
         }
     }
     // Member scope: a method/signal declaration, an attribute access, or a root-member declaration
-    // click → collision iff the current file's root class already declares `new_name`.
+    // click → collision iff the current file's root class already declares `new_name`. The root scope
+    // is correct here because inner-class members are refused UPSTREAM by the fail-closed firewall
+    // (they carry no head-interface anchor), so this arm only ever sees ROOT members; if inner members
+    // ever became renameable, this would need the local arm's `enclosing_class_declares` scoping (#155).
     let is_member_role =
         is_member_or_attribute_ident(tree, node_id) || node_is_root_member(tree, node_id);
     if is_member_role && root_class_declares(tree, new_name) {
