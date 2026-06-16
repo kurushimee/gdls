@@ -1559,3 +1559,927 @@ fn rename_local_does_not_rewrite_lua_style_dict_key() {
     );
     shutdown(&client, server);
 }
+
+// =================================================================================================
+// #106: a PROJECT enum VALUE renames (positive analyzer anchor), an unrelated same-named symbol
+// does NOT, and a native @GlobalScope enum value still refuses.
+//
+// The fail-closed firewall (#66) refused a project enum VALUE because the analyzer recorded NO
+// `Binding::Use` for a named-enum value access (`E.NORTH`) and `member_named` matches an enum's NAME
+// not its values — so `rename_target_has_project_anchor` found no positive project anchor. The fix
+// pins the value's binding by IDENTITY (the file declaring the enum) so the gate can admit ONLY the
+// value's own occurrences, never a raw-text scan.
+// =================================================================================================
+
+#[test]
+fn rename_in_file_enum_value_from_declaration_renames_precisely() {
+    // `enum Direction { NORTH, SOUTH }` declared in this file; `NORTH` read as `Direction.NORTH`.
+    // Renaming the value from its DECLARATION must edit the decl + the qualified use, and refuse
+    // nothing. (Pre-#106 this refused with -32803: no project anchor for a named-enum value.)
+    //   line 1 `enum Direction { NORTH, SOUTH }` → decl `NORTH` at col 17
+    //   line 3 `\tvar d = Direction.NORTH`        → use  `NORTH` at col 19
+    let src = "extends Node\nenum Direction { NORTH, SOUTH }\nfunc go() -> void:\n\tvar d = Direction.NORTH\n\tprint(d)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the value DECLARATION (line 1, col 17). Rename → `UP`.
+    let sites = rename_sites(&client, 200, &main_uri, 1, 17, "UP");
+    assert_eq!(
+        sites,
+        vec![(1, 17), (3, 19)],
+        "renaming an in-file enum value from its declaration must edit the decl + the \
+         `Direction.NORTH` use, never the sibling `SOUTH`; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_in_file_enum_value_from_use_renames_precisely() {
+    // Same enum, but clicked on the `Direction.NORTH` USE site. The edit set must be identical
+    // (click-site-independent) — the analyzer anchor canonicalizes to the declaration.
+    let src = "extends Node\nenum Direction { NORTH, SOUTH }\nfunc go() -> void:\n\tvar d = Direction.NORTH\n\tprint(d)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the USE `NORTH` (line 3, col 19). Rename → `UP`.
+    let sites = rename_sites(&client, 201, &main_uri, 3, 19, "UP");
+    assert_eq!(
+        sites,
+        vec![(1, 17), (3, 19)],
+        "renaming an in-file enum value from a use site must edit the same set as the declaration \
+         click (decl + use); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_enum_value_does_not_touch_unrelated_same_named_symbol() {
+    // CORRUPTION GUARD (by-identity, not by-name): a `const NORTH` in the SAME file shares the enum
+    // value's name but is a DISTINCT symbol. Renaming the enum value must NOT rewrite the unrelated
+    // `const NORTH` (its decl or its use) — that would be the W16 raw-text-scan corruption the
+    // fail-closed firewall exists to prevent.
+    //   line 1 `enum Direction { NORTH }`     → enum value decl `NORTH` at col 17
+    //   line 2 `const NORTH := 99`            → UNRELATED const decl `NORTH` at col 6
+    //   line 4 `\tvar a = Direction.NORTH`    → enum value use at col 19
+    //   line 5 `\tvar b = NORTH`              → UNRELATED const use at col 9
+    let src = "extends Node\nenum Direction { NORTH }\nconst NORTH := 99\nfunc go() -> void:\n\tvar a = Direction.NORTH\n\tvar b = NORTH\n\tprint(a + b)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Rename the ENUM VALUE from its decl (line 1, col 17) → `UP`.
+    let sites = rename_sites(&client, 202, &main_uri, 1, 17, "UP");
+    assert_eq!(
+        sites,
+        vec![(1, 17), (4, 19)],
+        "renaming the enum value must edit ONLY its decl + `Direction.NORTH` use, never the \
+         unrelated `const NORTH` decl (line 2) or its use (line 5); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_enum_value_from_use_does_not_touch_unrelated_same_named_const() {
+    // The symmetric guard to the above, clicked at the enum value's USE site (`Direction.NORTH`)
+    // rather than its declaration: the `EnumValueLocal` binding at the use site anchors by identity,
+    // so the unrelated `const NORTH` (decl + use) is still untouched.
+    //   line 1 `enum Direction { NORTH }`     → enum value decl `NORTH` at col 17
+    //   line 2 `const NORTH := 99`            → UNRELATED const decl `NORTH` at col 6
+    //   line 4 `\tvar a = Direction.NORTH`    → enum value use at col 19
+    //   line 5 `\tvar b = NORTH`              → UNRELATED const use at col 9
+    let src = "extends Node\nenum Direction { NORTH }\nconst NORTH := 99\nfunc go() -> void:\n\tvar a = Direction.NORTH\n\tvar b = NORTH\n\tprint(a + b)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Rename the ENUM VALUE from its USE (line 4, col 19) → `UP`.
+    let sites = rename_sites(&client, 208, &main_uri, 4, 19, "UP");
+    assert_eq!(
+        sites,
+        vec![(1, 17), (4, 19)],
+        "renaming the enum value from its use must edit ONLY its decl + `Direction.NORTH` use, \
+         never the unrelated `const NORTH`; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_refuses_global_scope_enum_value_still() {
+    // The firewall must STILL refuse a NATIVE @GlobalScope enum value (`SIDE_LEFT`) — the #106 fix
+    // admits only PROJECT enum values (positively anchored), never native ones. (Mirrors the
+    // pre-existing `rename_refuses_global_enum_value`, re-asserted here so the #106 widening can't
+    // silently let native enum values through.)
+    let src = "extends Node\nfunc go() -> void:\n\tvar d = SIDE_LEFT\n";
+    let (client, server, main_uri, _project) = boot_native_member_with_api(src, RICH_NATIVE_API);
+    // `SIDE_LEFT` at line 2, col 9.
+    assert_rename_refused_native(&client, 203, &main_uri, 2, 9);
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_enum_value_distinguishes_two_enums_with_same_value_name() {
+    // COMPOSITE-IDENTITY GUARD: `enum A { X }` and `enum B { X }` (both legal) declare the SAME value
+    // name `X` in DIFFERENT enums. Renaming `A.X` must edit ONLY `A`'s `X` (decl + `A.X` use), never
+    // `B`'s `X` — the binding is keyed on `<EnumName>.<value>`, not the bare value name, so the two
+    // never conflate. (A bare-name collector would corrupt here.)
+    //   line 1 `enum A { X }`            → A's value decl `X` at col 9
+    //   line 2 `enum B { X }`            → B's value decl `X` at col 9
+    //   line 4 `\tvar a = A.X`           → A's use `X` at col 11
+    //   line 5 `\tvar b = B.X`           → B's use `X` at col 11
+    let src = "extends Node\nenum A { X }\nenum B { X }\nfunc go() -> void:\n\tvar a = A.X\n\tvar b = B.X\n\tprint(a + b)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Rename A.X from its decl (line 1, col 9) → `Y`.
+    let sites = rename_sites(&client, 204, &main_uri, 1, 9, "Y");
+    assert_eq!(
+        sites,
+        vec![(1, 9), (4, 11)],
+        "renaming `A.X` must edit ONLY A's decl + `A.X` use, never `B.X` (decl line 2 / use line 5); \
+         got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_refuses_cross_file_enum_value() {
+    // A cross-file enum value (`Lib.Dir.NORTH`, where `enum Dir { NORTH }` is declared in lib.gd)
+    // currently REFUSES: the analyzer records no positive in-file anchor for it (the cross-file enum
+    // metatype carries `script_type`, not `class_node`, so reduce_identifier_from_base records no
+    // `EnumValueLocal` binding) — so the fail-closed firewall refuses rather than raw-scan-and-edit.
+    // This is the documented #106 boundary (in-file enum values only); refusing is safe (no
+    // corruption), and admitting cross-file would require an anchor the analyzer does not yet carry.
+    let project = common::sample_project();
+    project.write(
+        "src/lib.gd",
+        "class_name Lib\nextends Node\n\nenum Dir { NORTH, SOUTH }\n",
+    );
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nfunc go() -> void:\n\tvar d = Lib.Dir.NORTH\n\tprint(d)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/lib.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    // `Lib.Dir.NORTH` on line 3: tab(0) `var d = `(1-8) `Lib`(9-11) `.`(12) `Dir`(13-15) `.`(16)
+    // `NORTH`(17). Click `NORTH` at col 17.
+    assert_rename_refused(&client, 205, &use_uri, 3, 17, "UP");
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_cross_file_enum_value_does_not_retarget_same_named_local_symbol() {
+    // CORRUPTION GUARD (the dangerous cross-file case): `Lib.Dir.NORTH` clicked WHILE the current file
+    // ALSO declares a `const NORTH`. The rename must REFUSE (the cross-file enum value has no positive
+    // anchor) — it must NOT silently retarget to the local `const NORTH` and rename that instead.
+    let project = common::sample_project();
+    project.write(
+        "src/lib.gd",
+        "class_name Lib\nextends Node\n\nenum Dir { NORTH }\n",
+    );
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nconst NORTH := 7\n\nfunc go() -> void:\n\tvar d = Lib.Dir.NORTH\n\tprint(d + NORTH)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/lib.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    // `Lib.Dir.NORTH` on line 5: tab(0) `var d = `(1-8) `Lib`(9-11) `.`(12) `Dir`(13-15) `.`(16)
+    // `NORTH`(17). Click the cross-file enum value `NORTH` at col 17 — must refuse, ZERO edits.
+    client
+        .sender
+        .send(request(
+            206,
+            "textDocument/rename",
+            rename_params(&use_uri, 5, 17, "UP"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_some() && resp.result.is_none(),
+        "a cross-file enum value must REFUSE with zero edits (never retarget the local `const NORTH`); \
+         got result={:?} error={:?}",
+        resp.result,
+        resp.error
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn definition_on_enum_value_use_resolves_to_declaration() {
+    // Lock the canonicalize behavior the rename use-click relies on: `definition` on an enum-value USE
+    // (`Direction.NORTH`) must resolve to the value's DECLARATION token (line 1), not the enum name or
+    // a same-named member. (If `definition` returned the enum name or a `const NORTH`, the rename
+    // use-click set could be wrong — this is why rename SKIPS definition-canonicalization for enum
+    // values, but the read behavior must still be correct.)
+    let src = "extends Node\nenum Direction { NORTH, SOUTH }\nfunc go() -> void:\n\tvar d = Direction.NORTH\n\tprint(d)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the USE `NORTH` (line 3, col 19).
+    let def_params = lsp_types::GotoDefinitionParams {
+        text_document_position_params: position_params(&main_uri, 3, 19),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: lsp_types::PartialResultParams::default(),
+    };
+    client
+        .sender
+        .send(request(207, "textDocument/definition", def_params))
+        .unwrap();
+    let resp = recv_response(&client);
+    let def: Option<GotoDefinitionResponse> =
+        serde_json::from_value(resp.result.expect("definition result")).unwrap();
+    let loc = match def {
+        Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+        other => panic!(
+            "definition on an enum-value use must resolve to a scalar location, got {other:?}"
+        ),
+    };
+    // The value declaration `NORTH` is on line 1 at col 17.
+    assert_eq!(
+        (loc.range.start.line, loc.range.start.character),
+        (1, 17),
+        "definition on `Direction.NORTH` use must jump to the value declaration (1,17), got {:?}",
+        loc.range.start
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_cross_file_class_name_enum_value_underrenames_from_declaration() {
+    // BOUNDARY PIN (#158): renaming a `class_name`'d script's enum value FROM ITS DECLARATION edits
+    // the declaring file but UNDER-collects the cross-file `Foo.Dir.NORTH` use (its base is a
+    // cross-file enum metatype carrying `script_type`, not `class_node`, so no `EnumValueLocal` is
+    // recorded there and there is no fan-out). This is loud UNDER-rename (the other file fails to
+    // compile), NOT corruption — the documented #106 fail-closed boundary. The edit must still be
+    // PRECISE in the declaring file (decl + its own in-file use), never touch an unrelated symbol,
+    // and must NOT error. Pinned so the behavior is intentional; flip to full coverage when #158 lands.
+    let project = common::sample_project();
+    project.write(
+        "src/lib.gd",
+        "class_name Lib\nextends Node\n\nenum Dir { NORTH }\n\nfunc here() -> int:\n\treturn Dir.NORTH\n",
+    );
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nfunc there() -> int:\n\treturn Lib.Dir.NORTH\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/lib.gd", "src/use.gd"],
+        2,
+    );
+    let lib_uri = file_uri(&project.root.join("src/lib.gd"));
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+
+    // Rename `NORTH` from its declaration in lib.gd (line 3 `enum Dir { NORTH }`, `NORTH` at col 11).
+    client
+        .sender
+        .send(request(
+            209,
+            "textDocument/rename",
+            rename_params(&lib_uri, 3, 11, "UP"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming a class_name'd enum value from its declaration must succeed (not error): {:?}",
+        resp.error
+    );
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    // The edited set is EXACTLY lib.gd's decl (3,11) + its in-file use (6,8 — `\treturn Dir.NORTH`,
+    // tab + `return Dir.`(cols1-10) → `NORTH` at col 11... recompute: tab(0) `return `(1-7) `Dir`(8-10)
+    // `.`(11) `NORTH`(12)). The cross-file use.gd site is NOT collected (the documented boundary).
+    let mut sites: Vec<(String, u32, u32)> = view
+        .set
+        .iter()
+        .map(|(u, r)| (u.clone(), r.start.line, r.start.character))
+        .collect();
+    sites.sort();
+    assert_eq!(
+        sites,
+        vec![
+            (lib_uri.as_str().to_string(), 3, 11),
+            (lib_uri.as_str().to_string(), 6, 12),
+        ],
+        "the edit must be precise in the declaring file (decl + in-file use) and NOT touch the \
+         cross-file use.gd site (documented #158 under-rename boundary); got {sites:?}"
+    );
+    assert!(
+        !view.set.iter().any(|(u, _)| *u == use_uri.as_str()),
+        "the cross-file `Lib.Dir.NORTH` site must NOT be edited (documented boundary): {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_cross_file_enum_value_colliding_with_class_name_refuses() {
+    // CORRUPTION GUARD (fusion-found, pre-existing signal-3 leak): a cross-file enum value whose name
+    // collides with a project `class_name` must REFUSE — it must NOT silently rename the unrelated
+    // class project-wide. Before the fix, the name-only signal-3 (`find_global_class_definition`)
+    // admitted the cursor and `definition`'s name-only class fallback canonicalized onto the class,
+    // so `references` rewrote `class_name Idle` instead of the enum value.
+    //   anim.gd:  `class_name Foo` + `enum AnimState { Idle, Walk }`
+    //   idle.gd:  `class_name Idle` (the unrelated state class that must NOT be touched)
+    //   use.gd:   `return Foo.AnimState.Idle`  (the cross-file enum value the user clicks)
+    let project = common::sample_project();
+    project.write(
+        "src/anim.gd",
+        "class_name Foo\nextends Node\n\nenum AnimState { Idle, Walk }\n",
+    );
+    project.write("src/idle.gd", "class_name Idle\nextends Node\n");
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nfunc f() -> int:\n\treturn Foo.AnimState.Idle\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/anim.gd", "src/idle.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    let idle_uri = file_uri(&project.root.join("src/idle.gd"));
+    // `Foo.AnimState.Idle` on line 3: tab(0) `return `(1-7) `Foo`(8-10) `.`(11) `AnimState`(12-20)
+    // `.`(21) `Idle`(22). Click the cross-file enum value `Idle` at col 22 — must REFUSE, zero edits,
+    // and NEVER rewrite `class_name Idle`.
+    client
+        .sender
+        .send(request(
+            210,
+            "textDocument/rename",
+            rename_params(&use_uri, 3, 22, "Resting"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.result.is_none(),
+        "a cross-file enum value colliding with a `class_name` must REFUSE with zero edits (never \
+         rename the unrelated `class_name Idle`); got result={:?}",
+        resp.result
+    );
+    assert!(
+        resp.error.is_some(),
+        "the refusal must be a typed error, not a silent null"
+    );
+    // Belt-and-suspenders: even if some result existed, the idle.gd class declaration must be absent.
+    if let Some(v) = resp.result.as_ref() {
+        let edit: WorkspaceEdit = serde_json::from_value(v.clone()).unwrap();
+        let view = flatten_edit(&edit);
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == idle_uri.as_str()),
+            "the `class_name Idle` declaration must NEVER be edited by an enum-value rename: {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+/// A bare identifier that collides with a project `class_name X` and is SHADOWED by it (Godot
+/// resolves a bare identifier to a global `class_name` BEFORE native enums / utilities / methods —
+/// `gdscript_analyzer.cpp:4563` precedes `:4570`/`:4611`): the occurrence positively refers to the
+/// PROJECT class `qf.gd`, so renaming it renames THAT class (by-identity, faithful) — it must NOT
+/// resolve to the native symbol, and it must NEVER edit some OTHER project class. The cross-file use
+/// site is currently under-collected (the #158 references-completeness gap); the load-bearing
+/// invariant here is corruption-safety: the only file edited is the class's own declaring file,
+/// never an unrelated one. `(rel_class_file, src_use, line, ch)` clicks the shadowed bare identifier.
+fn assert_bare_collision_renames_own_class_only(
+    decl_src: &str,
+    use_src: &str,
+    line: u32,
+    ch: u32,
+    new_name: &str,
+    id: i32,
+) {
+    let project = common::sample_project();
+    project.write("src/k.gd", decl_src);
+    project.write("src/use.gd", use_src);
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/k.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    let k_uri = file_uri(&project.root.join("src/k.gd"));
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/rename",
+            rename_params(&use_uri, line, ch, new_name),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    // It resolves to the shadowing project class, so the rename succeeds and edits the class's own
+    // declaration (k.gd). The corruption-safety invariant: it edits ONLY k.gd (the class it resolves
+    // to) — never use.gd's unrelated tokens as a DIFFERENT symbol, and never a third file.
+    assert!(
+        resp.error.is_none(),
+        "a bare identifier shadowed by a project class_name renames that class (faithful \
+         resolution), not refuse: {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    assert!(
+        view.set.iter().any(|(u, _)| *u == k_uri.as_str()),
+        "the rename must edit the class's own declaration in k.gd (the symbol it resolves to): {:?}",
+        view.set
+    );
+    // Every edited URI is k.gd (the resolved class's file). NOT corrupting an unrelated class is the
+    // point; a cross-file use of the class in use.gd MAY also be edited (correct) — assert no edit
+    // lands anywhere that is neither the class decl file nor a genuine use of that class. Here the
+    // only project files are k.gd + use.gd, and use.gd's token IS a use of the class, so both are OK;
+    // what must never happen is editing a DIFFERENT class — there is none, so assert the strong form:
+    // the class decl file is edited and the result is a valid (non-error) workspace edit.
+    assert!(
+        view.new_texts.iter().all(|t| t == new_name),
+        "every edit writes the new name, got {:?}",
+        view.new_texts
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_bare_native_enum_value_shadowed_by_class_name_renames_class() {
+    // A NATIVE @GlobalScope enum value used BARE (`var d = SIDE_LEFT`) with a project `class_name
+    // SIDE_LEFT` present: Godot resolves the bare identifier to the CLASS (it shadows the enum value),
+    // so renaming it renames the class — by-identity, NOT the unrelated-symbol corruption the prior
+    // (name-only) firewall produced. Must not refuse, must edit the class's own file only.
+    // `var d = SIDE_LEFT` line 3: tab(0) `var d = `(1-8) `SIDE_LEFT`(9).
+    assert_bare_collision_renames_own_class_only(
+        "class_name SIDE_LEFT\nextends Node\n",
+        "extends Node\n\nfunc go() -> void:\n\tvar d = SIDE_LEFT\n\tprint(d)\n",
+        3,
+        9,
+        "LEFT_SIDE",
+        214,
+    );
+}
+
+#[test]
+fn rename_bare_utility_shadowed_by_class_name_renames_class() {
+    // A bare @GlobalScope utility call (`print("hi")`) with a project `class_name print`: resolves to
+    // the class (constructor-style call), renames the class by-identity, never an unrelated symbol.
+    // `print("hi")` line 3: tab(0) `print`(1).
+    assert_bare_collision_renames_own_class_only(
+        "class_name print\nextends Node\n",
+        "extends Node\n\nfunc go() -> void:\n\tprint(\"hi\")\n",
+        3,
+        1,
+        "log_line",
+        215,
+    );
+}
+
+#[test]
+fn rename_bare_implicit_self_native_method_shadowed_by_class_name_renames_class() {
+    // A bare implicit-self native method call (`queue_free()`) with a project `class_name queue_free`:
+    // resolves to the class, renames it by-identity, never an unrelated symbol.
+    // `queue_free()` line 3: tab(0) `queue_free`(1).
+    assert_bare_collision_renames_own_class_only(
+        "class_name queue_free\nextends Node\n",
+        "extends Node\n\nfunc go() -> void:\n\tqueue_free()\n",
+        3,
+        1,
+        "free_now",
+        216,
+    );
+}
+
+#[test]
+fn rename_type_chain_inner_class_segment_colliding_with_class_name_refuses() {
+    // CORRUPTION GUARD (the TYPE-CHAIN sub-case codex found — parses as `TypeNode.type_chain`, NOT a
+    // `Subscript`, so the attribute gate structurally could not catch it): a `: Outer.Inner` type
+    // annotation segment `Inner` colliding with an unrelated project `class_name Inner` must NOT
+    // rename the unrelated class. (`Outer.Inner` is the legitimate inner-class type; `class_name
+    // Inner` is a different, unrelated top-level class.)
+    let project = common::sample_project();
+    project.write(
+        "src/outer.gd",
+        "class_name Outer\nextends Node\n\nclass Inner:\n\tvar v: int = 0\n",
+    );
+    project.write("src/inner.gd", "class_name Inner\nextends Node\n");
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nfunc go() -> void:\n\tvar x: Outer.Inner = Outer.Inner.new()\n\tprint(x.v)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/outer.gd", "src/inner.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    let inner_uri = file_uri(&project.root.join("src/inner.gd"));
+    // `var x: Outer.Inner = ...` line 3: tab(0) `var x: `(1-7) `Outer`(8-12) `.`(13) `Inner`(14).
+    // Click the type-chain segment `Inner` at col 14.
+    client
+        .sender
+        .send(request(
+            217,
+            "textDocument/rename",
+            rename_params(&use_uri, 3, 14, "Innermost"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    // The unrelated top-level `class_name Inner` (inner.gd) must NEVER be edited (corruption guard).
+    // Whether this refuses or resolves to the inner class, it must not touch inner.gd.
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == inner_uri.as_str()),
+            "the unrelated top-level `class_name Inner` (inner.gd) must NEVER be edited by renaming \
+             the `Outer.Inner` type-chain segment: {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_native_method_colliding_with_class_name_refuses() {
+    // CORRUPTION GUARD (fusion-found native analog of the cross-file-enum-value collision): a NATIVE
+    // method on an untyped base (`n.queue_free()`) whose name collides with a project `class_name`
+    // must REFUSE — NOT silently rename the unrelated class project-wide. Same attribute-position
+    // mechanism: `queue_free` is the `.queue_free` attribute of `n.queue_free`, so the hardened
+    // signal-3 skips the name-only `class_name` anchor and the native-method-on-untyped-base refuses.
+    let project = common::sample_project();
+    // Re-use the sample MINI_API (Object<-Node<-CanvasItem<-Node2D) plus a `queue_free` on Node would
+    // be ideal, but `n.queue_free()` on an UNTYPED `n` resolves as a native method regardless — the
+    // point is the project `class_name queue_free` must not be borrowed. A class literally named
+    // `queue_free` (a valid identifier) makes the name collision exact.
+    project.write("src/qf.gd", "class_name queue_free\nextends Node\n");
+    project.write(
+        "src/use.gd",
+        "extends Node\n\nfunc go() -> void:\n\tvar n = self\n\tn.queue_free()\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/qf.gd", "src/use.gd"],
+        2,
+    );
+    let use_uri = file_uri(&project.root.join("src/use.gd"));
+    let qf_uri = file_uri(&project.root.join("src/qf.gd"));
+    // `n.queue_free()` on line 4: tab(0) `n`(1) `.`(2) `queue_free`(3). Click `queue_free` at col 3.
+    client
+        .sender
+        .send(request(
+            213,
+            "textDocument/rename",
+            rename_params(&use_uri, 4, 3, "free_now"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.result.is_none() && resp.error.is_some(),
+        "a native method on an untyped base colliding with a `class_name` must REFUSE with zero \
+         edits (never rename the unrelated `class_name queue_free`); got result={:?}",
+        resp.result
+    );
+    if let Some(v) = resp.result.as_ref() {
+        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+        assert!(
+            !view.set.iter().any(|(u, _)| *u == qf_uri.as_str()),
+            "the `class_name queue_free` declaration must NEVER be edited: {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_class_name_from_extends_use_site_still_succeeds() {
+    // ANTI-OVER-NARROW GUARD for the signal-3 by-identity hardening: renaming a project `class_name`
+    // from a cross-file USE site (`extends Hero` in enemy.gd, NOT the decl in hero.gd) must STILL
+    // succeed and edit both the declaration and the `extends` site. The decl-click case (a) of the
+    // hardened signal-3 covers the declaration; this proves case (b) — the `Class` Use-binding anchor
+    // — keeps the use-site renameable (a regression here would mean the firewall under-refuses).
+    let project = common::sample_project();
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/enemy.gd"],
+        7,
+    );
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let enemy_uri = file_uri(&project.root.join("src/enemy.gd"));
+
+    // `extends Hero` in enemy.gd is line 0; `Hero` at col 8. Rename from THERE → `Champion`.
+    let ref_set = references_set(&client, 211, &enemy_uri, 0, 8);
+    client
+        .sender
+        .send(request(
+            212,
+            "textDocument/rename",
+            rename_params(&enemy_uri, 0, 8, "Champion"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming `class_name Hero` from the cross-file `extends Hero` USE site must succeed \
+         (the type-base-segment carve-out anchors it — `extends` carries no binding): {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    assert_eq!(
+        view.set, ref_set,
+        "the use-site class rename edited set must equal the references set"
+    );
+    assert!(
+        view.set.iter().any(|(u, _)| *u == hero_uri.as_str())
+            && view.set.iter().any(|(u, _)| *u == enemy_uri.as_str()),
+        "the edit must cover BOTH the hero.gd declaration and the enemy.gd extends site: {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_member_from_bare_use_click_edits_bare_and_self_qualified() {
+    // VERIFICATION that a Member does NOT need declaration-canonicalization (so skipping it for the
+    // whole by-identity non-method family is safe): a class with `var speed`, a BARE `speed` use AND
+    // a `self.speed` use. Clicking the BARE use and renaming must edit BOTH — proving the Member's
+    // binding-backed reference set is already click-site-independent (no method-style bare-vs-`self.`
+    // asymmetry that would require canonicalizing to the declaration).
+    //   line 1 `var speed: int = 0`          → decl `speed` at col 4
+    //   line 3 `\tspeed += 1`                 → BARE use at col 1
+    //   line 4 `\tself.speed = 2`             → self-qualified use at col 6
+    let src =
+        "extends Node\nvar speed: int = 0\nfunc go() -> void:\n\tspeed += 1\n\tself.speed = 2\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the BARE use (line 3, col 1). Rename → `velocity`.
+    let sites = rename_sites(&client, 222, &main_uri, 3, 1, "velocity");
+    assert_eq!(
+        sites,
+        vec![(1, 4), (3, 1), (4, 6)],
+        "renaming a member from a BARE use-click must edit the decl + the bare use + the \
+         self-qualified use (binding-backed, click-site-independent); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_class_name_from_type_annotation_and_constructor_still_succeed() {
+    // ANTI-OVER-NARROW GUARD for occurrence-positive signal-3: the two legit class-USE forms most at
+    // risk under the new gate. `: Hero` (type annotation BASE segment — carries NO binding, admitted
+    // via the type-base carve-out) and `Hero.new()` (constructor — the BASE `Hero` carries a `Class`
+    // Use-binding, admitted via the expression-position anchor) must BOTH still rename the class. A
+    // regression here would mean the occurrence-positive check is too narrow.
+    let project = common::sample_project();
+    project.write(
+        "src/u.gd",
+        "extends Node\n\nfunc go() -> void:\n\tvar h: Hero = Hero.new()\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/hero.gd", "src/u.gd"],
+        2,
+    );
+    let u_uri = file_uri(&project.root.join("src/u.gd"));
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    // `\tvar h: Hero = Hero.new()`: tab(0) `var h: `(1-7) `Hero`(8) [annotation base];
+    // ` = `(12-14) `Hero`(15) [constructor base].
+    for (label, ch) in [
+        ("type annotation `: Hero`", 8),
+        ("constructor `Hero.new()`", 15),
+    ] {
+        client
+            .sender
+            .send(request(
+                220,
+                "textDocument/rename",
+                rename_params(&u_uri, 3, ch, "Champion"),
+            ))
+            .unwrap();
+        let resp = recv_response(&client);
+        assert!(
+            resp.error.is_none(),
+            "renaming `class_name Hero` from {label} (col {ch}) must succeed (occurrence-positive \
+             anchor must not over-narrow): {:?}",
+            resp.error
+        );
+        let edit: WorkspaceEdit =
+            serde_json::from_value(resp.result.expect("rename result")).unwrap();
+        let view = flatten_edit(&edit);
+        assert!(
+            view.set.iter().any(|(u, _)| *u == hero_uri.as_str()),
+            "renaming from {label} must edit the hero.gd class declaration: {:?}",
+            view.set
+        );
+    }
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_in_file_enum_type_from_type_annotation_use_succeeds() {
+    // ANTI-OVER-NARROW REGRESSION GUARD: an in-file enum TYPE name (`enum MyEnum { A }`) used as a
+    // type annotation (`var e: MyEnum`) must STILL rename from the USE site — not refuse. The
+    // occurrence-positive firewall must re-admit in-file (non-global-class) TYPE references; the
+    // name-based admit it replaced used to cover these.
+    //   line 1 `enum MyEnum { A }`              → enum TYPE decl `MyEnum` at col 5
+    //   line 3 `\tvar e: MyEnum = MyEnum.A`     → type-annot use `MyEnum` at col 8
+    let src = "extends Node\nenum MyEnum { A }\nfunc go() -> void:\n\tvar e: MyEnum = MyEnum.A\n\tprint(e)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the type-annotation USE `MyEnum` (line 3, col 8). Rename → `Dir`.
+    client
+        .sender
+        .send(request(
+            224,
+            "textDocument/rename",
+            rename_params(&main_uri, 3, 8, "Dir"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming an in-file enum TYPE from a `: MyEnum` annotation use must succeed (the firewall \
+         must re-admit in-file type references occurrence-positively): {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    // Must edit the enum TYPE declaration (line 1, col 5) — the symbol the cursor refers to.
+    assert!(
+        view.set
+            .iter()
+            .any(|(_, r)| r.start.line == 1 && r.start.character == 5),
+        "renaming the enum type from its use must edit the enum TYPE declaration (1,5): {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_inner_class_from_type_annotation_use_succeeds() {
+    // ANTI-OVER-NARROW REGRESSION GUARD: an in-file INNER CLASS name (`class Inner:`) used as a type
+    // annotation (`var x: Inner`) must STILL rename from the USE site — not refuse.
+    //   line 1 `class Inner:`            → inner class decl `Inner` at col 6
+    //   line 2 `\tvar v: int = 0`
+    //   line 4 `\tvar x: Inner = null`   → type-annot use `Inner` at col 8
+    let src = "extends Node\nclass Inner:\n\tvar v: int = 0\nfunc go() -> void:\n\tvar x: Inner = null\n\tprint(x)\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the type-annotation USE `Inner` (line 4, col 8). Rename → `Nested`.
+    client
+        .sender
+        .send(request(
+            225,
+            "textDocument/rename",
+            rename_params(&main_uri, 4, 8, "Nested"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming an in-file inner CLASS from a `: Inner` annotation use must succeed: {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    assert!(
+        view.set
+            .iter()
+            .any(|(_, r)| r.start.line == 1 && r.start.character == 6),
+        "renaming the inner class from its use must edit the inner CLASS declaration (1,6): {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_in_file_const_and_signal_from_use_succeed() {
+    // SWEEP (main-vs-HEAD regression coverage): the remaining in-file symbol kinds whose USE-site
+    // anchor the name-based signal-1 used to provide. An in-file `const` from a bare use, and an
+    // in-file `signal` from a bare reference, must each rename from the USE site — not refuse.
+    //   line 1 `const MAX := 5`                  → const decl `MAX` at col 6
+    //   line 2 `signal hit`                      → signal decl `hit` at col 7
+    //   line 4 `\tvar x = MAX`                   → const bare use `MAX` at col 9
+    //   line 5 `\thit.connect(go)`               → signal bare ref `hit` at col 1
+    let src = "extends Node\nconst MAX := 5\nsignal hit\nfunc go() -> void:\n\tvar x = MAX\n\thit.connect(go)\n";
+    // const from bare use (line 4, col 9).
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    let sites = rename_sites(&client, 228, &main_uri, 4, 9, "LIMIT");
+    assert!(
+        sites.contains(&(1, 6)) && sites.contains(&(4, 9)),
+        "renaming an in-file const from a bare use must edit the const decl (1,6) + the use (4,9); \
+         got {sites:?}"
+    );
+    shutdown(&client, server);
+
+    // signal from bare ref (line 5, col 1).
+    let (client2, server2, main_uri2, _project2) = boot_native_member(src);
+    client2
+        .sender
+        .send(request(
+            229,
+            "textDocument/rename",
+            rename_params(&main_uri2, 5, 1, "struck"),
+        ))
+        .unwrap();
+    let resp2 = recv_response(&client2);
+    assert!(
+        resp2.error.is_none(),
+        "renaming an in-file signal from a bare reference must succeed: {:?}",
+        resp2.error
+    );
+    let view2 = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp2.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    assert!(
+        view2
+            .set
+            .iter()
+            .any(|(_, r)| r.start.line == 2 && r.start.character == 7),
+        "renaming the signal from its reference must edit the signal declaration (2,7): {:?}",
+        view2.set
+    );
+    shutdown(&client2, server2);
+}
+
+#[test]
+fn rename_in_file_type_from_expression_base_use_succeeds() {
+    // ANTI-OVER-NARROW REGRESSION GUARD (EXPRESSION position — the twin of the type-annotation case):
+    // an in-file enum TYPE clicked as the BASE of `MyEnum.A`, and an in-file inner CLASS clicked as
+    // the BASE of `Inner.new()`, must rename from the USE site — not refuse. (A subscript BASE naming
+    // an in-file type resolves to THIS file's type; only a subscript ATTRIBUTE resolving cross-file is
+    // the corruption case.)
+    //   line 1 `enum MyEnum { A }`        → enum TYPE decl `MyEnum` at col 5
+    //   line 2 `class Inner:`             → inner CLASS decl `Inner` at col 6
+    //   line 5 `\tvar a = MyEnum.A`       → `MyEnum` BASE at col 9
+    //   line 6 `\tvar i = Inner.new()`    → `Inner` BASE at col 9
+    let src = "extends Node\nenum MyEnum { A }\nclass Inner:\n\tvar v: int = 0\nfunc go() -> void:\n\tvar a = MyEnum.A\n\tvar i = Inner.new()\n";
+    // Enum type from `MyEnum.A` base (line 5, col 9).
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    client
+        .sender
+        .send(request(
+            226,
+            "textDocument/rename",
+            rename_params(&main_uri, 5, 9, "Dir"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming an in-file enum TYPE from a `MyEnum.A` expression base must succeed: {:?}",
+        resp.error
+    );
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    assert!(
+        view.set
+            .iter()
+            .any(|(_, r)| r.start.line == 1 && r.start.character == 5),
+        "renaming the enum type from `MyEnum.A` must edit the enum TYPE declaration (1,5): {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+
+    // Inner class from `Inner.new()` base (line 6, col 9).
+    let (client2, server2, main_uri2, _project2) = boot_native_member(src);
+    client2
+        .sender
+        .send(request(
+            227,
+            "textDocument/rename",
+            rename_params(&main_uri2, 6, 9, "Nested"),
+        ))
+        .unwrap();
+    let resp2 = recv_response(&client2);
+    assert!(
+        resp2.error.is_none(),
+        "renaming an in-file inner CLASS from an `Inner.new()` expression base must succeed: {:?}",
+        resp2.error
+    );
+    let view2 = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp2.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    assert!(
+        view2.set.iter().any(|(_, r)| r.start.line == 2 && r.start.character == 6),
+        "renaming the inner class from `Inner.new()` must edit the inner CLASS declaration (2,6): {:?}",
+        view2.set
+    );
+    shutdown(&client2, server2);
+}

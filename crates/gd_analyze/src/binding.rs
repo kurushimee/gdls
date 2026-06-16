@@ -65,8 +65,9 @@ pub struct MemberXref {
 /// Emitted today: `Class` and `Member` from `reduce_identifier` (in-file members, cross-file
 /// `class_name`s, autoloads) and from `reduce_identifier_from_base`'s in-file CLASS branch;
 /// the precise kinds (`Variable` / `Constant` / `Function` / `Signal` / `Enum` / `EnumValue`)
-/// from `record_member_use` for every cross-file script-chain member hit. `Parameter` stays
-/// reserved (locals/params are function-scoped and never cross-file). The enum stays
+/// from `record_member_use` for every cross-file script-chain member hit; `EnumValueLocal`
+/// (qualified name) from `reduce_identifier_from_base`'s in-file ENUM-meta value arm. `Parameter`
+/// stays reserved (locals/params are function-scoped and never cross-file). The enum stays
 /// `#[non_exhaustive]` so a handler match on it remains correct when new variants land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -80,6 +81,21 @@ pub enum BindingTargetKind {
     EnumValue,
     Parameter,
     Member,
+    /// A value of a NAMED enum declared in THIS file (`enum Direction { NORTH }`, use site
+    /// `Direction.NORTH`). Distinct from [`Self::EnumValue`] (which is the cross-file / anonymous-enum
+    /// hoist kind, deliberately excluded from the kind-precise reference filter because its uses also
+    /// live in annotations/match-patterns the reducer doesn't record).
+    ///
+    /// **Composite-identity convention (deliberate):** a [`Binding::Use`] of this kind carries the
+    /// QUALIFIED `target_name` `"<EnumName>.<value>"` (e.g. `"Direction.NORTH"`), NOT the bare value
+    /// name. Both halves are dot-free GDScript identifiers, so the dotted join is unambiguous. This
+    /// keys two same-named values in different enums of one file (`enum A { X }` + `enum B { X }`,
+    /// both legal) apart, AND makes the binding structurally INVISIBLE to every bare-name matcher
+    /// (`push_binding_locations`, `push_use_binding_locations_for`, [`Binding::matches_use`]) — so a
+    /// method/signal/member that happens to be named `NORTH` can never collect an enum value's use
+    /// under a mutating rename. The qualified name is consumed only by the enum-qualified collector;
+    /// no consumer DISPLAYS it.
+    EnumValueLocal,
 }
 
 /// What a resolved call site dispatches to — the callee classification the reducer derives from

@@ -567,6 +567,41 @@ pub fn definition(
         }
     }
 
+    // (1.55) In-file named enum VALUE use (`Direction.NORTH`) → its declaration token (#106). The
+    // `EnumValueLocal` binding at the cursor span carries the QUALIFIED `<EnumName>.<value>`; the
+    // value is declared in THIS file (the binding records only in-file enums), so locate the
+    // declaration ident in `EnumNode.values`. Coherent with `references`/`rename` resolving the same
+    // value by identity. Runs before the call-callee block (an enum value is not a call).
+    {
+        let node_span = parsed.tree.get(node_id).span;
+        let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+        let qualified = analyzed.as_deref().and_then(|a| {
+            a.bindings().iter().find_map(|b| match b {
+                Binding::Use {
+                    target_kind: BindingTargetKind::EnumValueLocal,
+                    target_name,
+                    site,
+                    ..
+                } if *site == node_span => Some(target_name.clone()),
+                _ => None,
+            })
+        });
+        if let Some(qualified) = qualified {
+            if let Some((enum_name, value_name)) = qualified.split_once('.') {
+                if let Some(decl_ident) =
+                    find_enum_value_decl_ident(&parsed.tree, enum_name, value_name)
+                {
+                    let doc = state.vfs.get(uri.as_str())?;
+                    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+                    return Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: uri.clone(),
+                        range: mapper.span_to_range(parsed.tree.get(decl_ident).span),
+                    }));
+                }
+            }
+        }
+    }
+
     // (1.6) Cross-file dotted method call (`obj.method()` through a typed var): the attribute
     // identifier inside a call callee records no `Binding::Use` (the reducer's attribute paths
     // are a deliberate recording scope cut — see `AnalysisResult::bindings`), but `reduce_call`
@@ -1804,6 +1839,74 @@ fn ident_name(tree: &ParseTree, id: NodeId) -> &str {
     }
 }
 
+/// Locate the declaration identifier of the value `value_name` in the NAMED enum `enum_name`, both
+/// declared at the root-class scope of `tree`. Returns the value's declaration-identifier `NodeId`
+/// (the precise token an enum-value rename edits) — `None` if no such value exists.
+///
+/// Anonymous enums (`enum { ... }`, `EnumNode.identifier == None`) are skipped: their values hoist
+/// to class constants and resolve through the member path, not this enum-value path. The
+/// (enum-name, value-name) pair is the composite identity that keeps `enum A { X }` and
+/// `enum B { X }` distinct (#106).
+fn find_enum_value_decl_ident(
+    tree: &ParseTree,
+    enum_name: &str,
+    value_name: &str,
+) -> Option<NodeId> {
+    let root_id = tree.root_id()?;
+    let NodeKind::Class(root) = &tree.get(root_id).kind else {
+        return None;
+    };
+    for m in &root.members {
+        let gd_syntax::ast::Member::Enum(enum_id) = m else {
+            continue;
+        };
+        let NodeKind::Enum(en) = &tree.get(*enum_id).kind else {
+            continue;
+        };
+        // NAMED enums only — the value path's anchor is `<EnumName>.<value>`.
+        if en.identifier.map(|i| ident_name(tree, i)) != Some(enum_name) {
+            continue;
+        }
+        for v in &en.values {
+            if let Some(vid) = v.identifier {
+                if ident_name(tree, vid) == value_name {
+                    return Some(vid);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If `ident_id` is the declaration identifier of a value in a NAMED enum at the root-class scope,
+/// return `(value_decl_ident, "<EnumName>.<value>")` — the composite-identity anchor a
+/// declaration-site click on an enum value resolves to (#106). `None` otherwise (the click is not on
+/// an enum value declaration). Anonymous-enum values are skipped (they hoist to member constants).
+fn enum_value_decl_at(tree: &ParseTree, ident_id: NodeId) -> Option<(NodeId, String)> {
+    let root_id = tree.root_id()?;
+    let NodeKind::Class(root) = &tree.get(root_id).kind else {
+        return None;
+    };
+    for m in &root.members {
+        let gd_syntax::ast::Member::Enum(enum_id) = m else {
+            continue;
+        };
+        let NodeKind::Enum(en) = &tree.get(*enum_id).kind else {
+            continue;
+        };
+        let Some(enum_name) = en.identifier.map(|i| ident_name(tree, i).to_owned()) else {
+            continue; // anonymous enum
+        };
+        for v in &en.values {
+            if v.identifier == Some(ident_id) {
+                let value_name = ident_name(tree, ident_id);
+                return Some((ident_id, format!("{enum_name}.{value_name}")));
+            }
+        }
+    }
+    None
+}
+
 /// The identifier name of the node at `id`, or `None` if it isn't an [`NodeKind::Identifier`]. The
 /// cursor-resolution gate every position-based nav handler shares (`definition`, `references`,
 /// `implementation`, `prepareCallHierarchy`): the request degrades to the LSP `null` wire response
@@ -1837,6 +1940,47 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 /// projection + project-wide text scan) or the non-method classification. Purely structural
 /// (O(#nodes), no analyzer involvement); works identically whether the cursor is on the
 /// declaration or a call site.
+/// `true` iff `ident_id` is the BASE segment (index 0) of a class `extends` chain
+/// ([`ClassNode::extends`]) or a type annotation's chain ([`TypeNode::type_chain`]) — the only TYPE
+/// positions where a top-level project `class_name` is legitimately referenced (`extends Foo`,
+/// `: Foo`, `: Foo.Inner` on `Foo`). A SUFFIX segment (`Foo.Inner` on `Inner`, index > 0) is an
+/// inner-class path, NOT a top-level class reference, so it returns `false` — keeping a same-named
+/// unrelated top-level `class_name Inner` from being borrowed by the rename firewall's class anchor
+/// (the type-chain corruption case, #106). Type-position class references carry no `Binding::Use`
+/// (they resolve in the resolver pass, not as reduced expressions), so this positional check is what
+/// admits them — the expression-position class anchor uses the `Class` use-binding instead.
+fn cursor_is_type_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
+    tree.iter_ids().any(|nid| match &tree.get(nid).kind {
+        NodeKind::Class(c) => c.extends.first() == Some(&ident_id),
+        NodeKind::Type(t) => t.type_chain.first() == Some(&ident_id),
+        _ => false,
+    })
+}
+
+/// `true` iff `name` is a root-class ENUM type or INNER CLASS declared in THIS file. The
+/// occurrence-positive in-file-TYPE anchor for the rename firewall: a `: MyEnum` / `: Inner` type
+/// annotation (or `extends Inner`) carries no `Binding::Use` and is not a global `class_name`, so it
+/// would otherwise wrongly REFUSE — the name-based signal-1 this replaced admitted it. Restricted to
+/// the type kinds (`Member::Enum` / `Member::Class`) whose references live in resolver-level type
+/// positions, so it cannot admit an unrelated value/member of the same name. #106.
+fn name_is_in_file_root_type(tree: &ParseTree, name: &str) -> bool {
+    let Some(root_id) = tree.root_id() else {
+        return false;
+    };
+    let NodeKind::Class(root) = &tree.get(root_id).kind else {
+        return false;
+    };
+    root.members.iter().any(|m| match m {
+        Member::Enum(id) => {
+            matches!(&tree.get(*id).kind, NodeKind::Enum(en) if en.identifier.map(|i| ident_name(tree, i)) == Some(name))
+        }
+        Member::Class(id) => {
+            matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+        }
+        _ => false,
+    })
+}
+
 fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
     // Single pass: short-circuit on a func/signal declaration; otherwise remember the subscript
     // that owns this attribute identifier and collect every `Call` callee node, then decide.
@@ -1953,6 +2097,15 @@ fn member_decl_location(
         uri,
         range: mapper.span_to_range(decl_span),
     })
+}
+
+/// The [`FileId`](gd_project::FileId) of the project `class_name` `name`, or `None` if `name` is not
+/// a registered project class (or its file isn't indexed). The file-level identity used to confirm
+/// that a `Binding::Use { kind: Class }` at a cursor span points at THIS class (the rename firewall's
+/// occurrence-positive class anchor — #106).
+fn global_class_file(state: &ServerState, name: &str) -> Option<gd_project::FileId> {
+    let entry = state.workspace.index.registry().get(name)?;
+    state.workspace.index.file_id(&entry.path)
 }
 
 fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<Location> {
@@ -2487,10 +2640,13 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 if let Some(loc) = find_autoload_definition(state, &name) {
                     decls.push(loc);
                 }
-            } else if let NonMethodTarget::Local { decl_ident, .. } = &non_method_target {
-                // A local's declaration is its own binding identifier (resolved respecting nested
-                // scopes) — find_in_file_definition would wrongly return a same-named class member's,
-                // and a same-named sibling binding's token must not be reported either.
+            } else if let NonMethodTarget::Local { decl_ident, .. }
+            | NonMethodTarget::EnumValue { decl_ident, .. } = &non_method_target
+            {
+                // A local's / enum value's declaration is its own resolved identifier —
+                // find_in_file_definition would wrongly return a same-named class member's (or, for
+                // an enum value, the enum's own NAME token), and a same-named sibling must not be
+                // reported. The enum value's decl ident is the precise value token in `EnumNode.values`.
                 decls.push(Location {
                     uri: uri.clone(),
                     range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
@@ -2564,6 +2720,19 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                         &mapper,
                     );
                 }
+                NonMethodTarget::EnumValue { qualified, .. } => {
+                    // Enum-qualified binding scan: only `EnumValueLocal` uses of THIS value
+                    // (`<EnumName>.<value>`), never the bare-name scan — keeps an unrelated
+                    // `const NORTH` / a second enum's same-named value out of the set. The
+                    // declaration token is added separately via `declaration_locations`.
+                    push_enum_value_binding_locations(
+                        &mut locations,
+                        &result,
+                        qualified,
+                        &uri,
+                        &mapper,
+                    );
+                }
                 NonMethodTarget::Unresolved => {
                     // Residue floor (incl. autoload + Class/Enum targets): the binding scan
                     // plus the raw identifier scan, which picks up `extends Foo`, type
@@ -2608,8 +2777,11 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             NonMethodTarget::Member(_) => {
                 method_scan_candidate_uris(state, &name, current_fid, "references")
             }
-            // Locals can never be referenced from another file — no fan-out at all.
-            NonMethodTarget::Local { .. } => Vec::new(),
+            // Locals are never referenced cross-file. Enum values do no fan-out either: the
+            // `EnumValueLocal` binding is recorded only in the DECLARING file (the referencing file's
+            // cross-file enum metatype carries no `class_node` anchor), so a `class_name`'d enum's
+            // `Foo.E.V` uses in other files are under-collected — loud under-rename, tracked #158.
+            NonMethodTarget::Local { .. } | NonMethodTarget::EnumValue { .. } => Vec::new(),
             NonMethodTarget::Unresolved => {
                 // Fast-path for class/type names: only files whose interface mentions `name`
                 // can reference it; `name_referencers` already has that set. (Autoloads are
@@ -2703,8 +2875,8 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                         &cand_mapper,
                     );
                 }
-                // Local targets fan out no candidates (unreachable; kept exhaustive).
-                NonMethodTarget::Local { .. } => {}
+                // Local + enum-value targets fan out no candidates (unreachable; kept exhaustive).
+                NonMethodTarget::Local { .. } | NonMethodTarget::EnumValue { .. } => {}
                 NonMethodTarget::Unresolved => {
                     // Residue floor: identifier scan picks up `extends Foo` and other
                     // parser-level refs the reducer doesn't record. De-dupes happen below.
@@ -2950,13 +3122,22 @@ fn collect_in_file_highlight_sites(
 
     // Declaration site — always part of the highlight set (no includeDeclaration flag). Locals are
     // handled by the within-scope identifier scan below (which already emits the decl token), so
-    // they're excluded here to avoid a duplicate the caller would then have to dedup.
+    // they're excluded here to avoid a duplicate the caller would then have to dedup; an enum VALUE's
+    // decl is added explicitly (its use scan does not emit it).
     if is_autoload {
         if let Some(loc) = find_autoload_definition(state, name) {
             locations.push(loc);
         }
     } else if let NonMethodTarget::Local { .. } = &non_method_target {
         // decl token is emitted by push_local_binding_locations below.
+    } else if let NonMethodTarget::EnumValue { decl_ident, .. } = &non_method_target {
+        // An enum value's declaration is its precise token in `EnumNode.values` — the
+        // `push_enum_value_binding_locations` scan below emits USE sites only, so the decl is added
+        // here (NOT via find_in_file_definition, which matches the enum's NAME / a same-named member).
+        locations.push(Location {
+            uri: uri.clone(),
+            range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
+        });
     } else if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, &mapper) {
         locations.push(loc);
     } else if let Some(loc) = find_global_class_definition(state, name) {
@@ -3011,6 +3192,15 @@ fn collect_in_file_highlight_sites(
                         &parsed.tree,
                         *decl_ident,
                         *fn_span,
+                        uri,
+                        &mapper,
+                    );
+                }
+                NonMethodTarget::EnumValue { qualified, .. } => {
+                    push_enum_value_binding_locations(
+                        &mut locations,
+                        &result,
+                        qualified,
                         uri,
                         &mapper,
                     );
@@ -3437,6 +3627,20 @@ enum NonMethodTarget {
         decl_ident: NodeId,
         fn_span: ByteSpan,
     },
+    /// A value of a NAMED enum declared in THIS file (`enum Direction { NORTH }`, used as
+    /// `Direction.NORTH`). `decl_ident` is the value's declaration token; `qualified` is the
+    /// composite identity `"<EnumName>.<value>"`. Use sites are the `EnumValueLocal` bindings whose
+    /// `target_name` equals `qualified` (an enum-qualified scan, never a bare-name one — `enum A { X }`
+    /// and `enum B { X }` stay distinct, and an unrelated `const NORTH`/method `NORTH` is never
+    /// collected). Current-file-only: the `EnumValueLocal` binding is recorded only in the declaring
+    /// file (a cross-file enum metatype carries `script_type`, not `class_node`, so the referencing
+    /// file records nothing), so there is no cross-file fan-out. For a `class_name`'d script this
+    /// UNDER-renames `Foo.E.V` uses in OTHER files when renaming from the declaration — a loud
+    /// compile error, not corruption (tracked #158). #106.
+    EnumValue {
+        decl_ident: NodeId,
+        qualified: String,
+    },
     /// Couldn't resolve — the documented "over-approximate, never under-report" residue floor
     /// (raw identifier scan). Class/Enum/EnumValue targets classify here DELIBERATELY:
     /// `extends Foo`, `class_name`, and type annotations are resolver-level references with no
@@ -3456,6 +3660,44 @@ fn classify_non_method_target(
     name: &str,
     current_fid: Option<gd_project::FileId>,
 ) -> NonMethodTarget {
+    // (0a) Enum-value USE-site click (`Direction.NORTH`): the `EnumValueLocal` binding at the cursor
+    // span carries the QUALIFIED `<EnumName>.<value>` as its `target_name`. Recover the value name to
+    // locate the declaration token; the binding is recorded only for IN-FILE named enums, so the decl
+    // lives in this tree. Runs before the member loop (an enum value is not a member). #106.
+    for b in result.bindings() {
+        if let Binding::Use {
+            target_kind: BindingTargetKind::EnumValueLocal,
+            target_name,
+            site,
+            ..
+        } = b
+        {
+            if *site == node_span {
+                if let Some((enum_name, value_name)) = target_name.split_once('.') {
+                    if let Some(decl_ident) =
+                        find_enum_value_decl_ident(tree, enum_name, value_name)
+                    {
+                        return NonMethodTarget::EnumValue {
+                            decl_ident,
+                            qualified: target_name.clone(),
+                        };
+                    }
+                }
+            }
+        }
+    }
+    // (0b) Enum-value DECLARATION-site click (`NORTH` inside `enum Direction { NORTH }`): no binding
+    // exists at a declaration, so resolve via the AST. #106.
+    if let Some(ident_id) = tree.innermost_node_at(node_span.start) {
+        if let Some((decl_ident, qualified)) = enum_value_decl_at(tree, ident_id) {
+            if tree.get(decl_ident).span == node_span {
+                return NonMethodTarget::EnumValue {
+                    decl_ident,
+                    qualified,
+                };
+            }
+        }
+    }
     for b in result.bindings() {
         if let Binding::Use {
             target_file: Some(f),
@@ -3571,6 +3813,38 @@ fn push_use_binding_locations_for(
         } = binding
         {
             if *tf == target_file && target_name == name {
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(*site),
+                });
+            }
+        }
+    }
+}
+
+/// Append a [`Location`] for every `EnumValueLocal` use binding whose QUALIFIED `target_name` equals
+/// `qualified` (`"<EnumName>.<value>"`) — the by-identity occurrence set of an in-file named enum
+/// value (#106). Matching on the enum-qualified name (NOT the bare value name) keeps two same-named
+/// values in different enums (`enum A { X }` / `enum B { X }`) distinct and never collects an
+/// unrelated `const NORTH` / method `NORTH` — the corruption the kind-precise collector exists to
+/// prevent under a mutating rename. The `site` is the bare value token, so the rename edit replaces
+/// exactly the value identifier.
+fn push_enum_value_binding_locations(
+    out: &mut Vec<Location>,
+    result: &AnalysisResult,
+    qualified: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
+    for binding in result.bindings() {
+        if let Binding::Use {
+            target_kind: BindingTargetKind::EnumValueLocal,
+            target_name,
+            site,
+            ..
+        } = binding
+        {
+            if target_name == qualified {
                 out.push(Location {
                     uri: uri.clone(),
                     range: mapper.span_to_range(*site),
@@ -5633,19 +5907,19 @@ fn rename_name_is_engine_symbol(state: &ServerState, name: &str) -> bool {
 /// `true` iff the cursor target positively resolves to an editable PROJECT declaration — the
 /// fail-closed gate's signal 4. A method/signal ROLE (declaration click or dotted call) is treated
 /// as anchored (native methods were already refused by signals 2/3; project methods have an in-file
-/// declaration). Otherwise require one of: an in-file root-class member declaration, a project
-/// `class_name`, an enclosing-function local/param, or a `Member`-classified analyzer use at the
-/// cursor span. The genuinely-unresolvable residue (unknown identifiers, `extends UnknownThing`)
-/// returns `false` → the caller refuses.
+/// declaration). Otherwise require one of: an in-file root-class member DECLARATION click
+/// ([`node_is_root_member`] — cursor-positional, NOT name-based, so a cross-file `X.NAME` can't
+/// borrow a same-named member's anchor), a project `class_name`, an enclosing-function local/param,
+/// or a `Member`/`EnumValue`-classified analyzer use at the cursor span (an in-file named enum VALUE
+/// anchors here by IDENTITY — its `EnumValueLocal` binding / `EnumNode.values` decl token). The
+/// genuinely-unresolvable residue (unknown identifiers, `extends UnknownThing`) returns `false` →
+/// the caller refuses.
 ///
-/// KNOWN LIMITATION (deliberate, fail-closed side effect — track as a follow-up issue): a *project*
-/// `@GlobalScope`-style enum VALUE (`enum E { NORTH }`; cursor on `NORTH`) and an autoload singleton
-/// NAME both lack a project anchor here — `classify_non_method_target` excludes `EnumValue`, and
-/// `member_named` matches an enum's own name, not its values — so they now REFUSE where the prior
-/// fail-open path raw-scanned and edited them. This is the refuse-rather-than-corrupt stance
-/// (renaming an enum value by raw text scan is exactly the W16 grep-rename), not a regression to fix
-/// by widening the gate (which would reopen the native-enum-value hole). Enum TYPE names and
-/// members rename normally.
+/// KNOWN LIMITATION (deliberate, fail-closed): an autoload singleton NAME lacks a project anchor here
+/// (its only declaration is the `project.godot` `[autoload]` key, not a `.gd` symbol), so it REFUSES
+/// rather than raw-scan-and-edit — the refuse-rather-than-corrupt stance (a name-scan rename is
+/// exactly the W16 grep-rename). A proper autoload rename (config-file rewrite) is tracked in #157.
+/// Enum TYPE names, enum members, and in-file enum VALUES rename normally.
 fn rename_target_has_project_anchor(
     state: &mut ServerState,
     uri: &Uri,
@@ -5664,9 +5938,14 @@ fn rename_target_has_project_anchor(
         return false;
     };
 
-    // In-file root-class member declaration / use (covers methods + vars declared in THIS file —
-    // a method-declaration click anchors here, not via the call probe below).
-    if find_in_file_definition(&parsed.tree, name, uri, &mapper).is_some() {
+    // In-file root-class member DECLARATION click (a `var`/`func`/`signal`/`const`/`enum`/inner-class
+    // declaration token) — cursor-POSITIONALLY on the declaration, NOT merely "a same-named member
+    // exists". The earlier name-based `find_in_file_definition(name)` admitted ANY cursor whose name
+    // matched an in-file member — so a cross-file `Lib.Dir.NORTH` (or any `X.NAME`) borrowed an
+    // unrelated `const NORTH`'s anchor and the rename retargeted the const (silent corruption, #106
+    // guard). In-file member USES are still admitted — they classify→Member via signal 5 below — so
+    // this only narrows the leak: a same-name non-member cursor now correctly refuses.
+    if node_is_root_member(&parsed.tree, node_id) {
         return true;
     }
     // Enclosing-function local, parameter, `for` iterator, or `match` bind (resolved respecting
@@ -5674,11 +5953,16 @@ fn rename_target_has_project_anchor(
     if resolve_local_binding(&parsed.tree, byte, name).is_some() {
         return true;
     }
-    // A project `class_name` (declared in any project file).
-    if find_global_class_definition(state, name).is_some() {
+    // A `class_name X` DECLARATION click — the cursor is positionally on THIS file's own
+    // `class_name X` token. Analysis-free; the use-site / type-position class anchors are computed
+    // below (they need the binding stream). A class-name decl is not a `node_is_root_member`, so it
+    // needs its own positive case. #106.
+    if root_class_identifier_span(&parsed.tree) == Some(parsed.tree.get(node_id).span)
+        && state.workspace.index.registry().contains(name)
+    {
         return true;
     }
-    // Analyze once for the call-callee + cross-file-member anchors below.
+    // Analyze once for the call-callee + cross-file-member + class anchors below.
     let current_path = crate::uri::uri_to_path(uri);
     let Some(p) = current_path
         .as_deref()
@@ -5718,16 +6002,99 @@ fn rename_target_has_project_anchor(
         return true;
     }
 
-    // A `Member`/`Local`-classified analyzer use at the cursor span (cross-file member read/write
-    // through a typed var — `other.speed`): the analyzer resolved it to a declaring project file.
+    // A project `class_name` reference — admitted OCCURRENCE-POSITIVELY (this cursor actually refers
+    // to the class), never name-only. The old `find_global_class_definition(name).is_some()` was the
+    // signal-1 leak one anchor deeper: a cursor whose NAME merely collided with some `class_name`
+    // borrowed that class's anchor, and `definition`'s name-only class fallback then canonicalized the
+    // rename onto the UNRELATED class (silent wrong-symbol corruption). Two positive forms:
+    //
+    //   (a) EXPRESSION position — the analyzer recorded a `Binding::Use { kind: Class }` at the cursor
+    //       span pointing at a PROJECT class file. Godot resolves a bare identifier to a global
+    //       `class_name` BEFORE native enums/utilities/methods (gdscript_analyzer.cpp:4563 precedes
+    //       :4570/:4611), so bare `Hero` / `Hero.new()` AND a bare `SIDE_LEFT`/`print`/`queue_free`
+    //       SHADOWED by a same-named project `class_name` all carry this binding — and renaming the
+    //       class IS what they refer to (by-identity, faithful). A cursor that resolves to something
+    //       ELSE (an in-file member, an enum value, a native member on a typed base) carries a
+    //       DIFFERENT-kind binding and is NOT admitted here → it routes to its own anchor below.
+    //   (b) TYPE position — `extends X` / `: X` carry NO binding (resolver-level, no reduced Use), so
+    //       (a) can't see them. Admit when the cursor is the BASE segment (index 0) of the class's
+    //       `extends` chain or a `TypeNode.type_chain` (`extends Foo`, `: Foo`, `: Foo.Inner` on
+    //       `Foo`). A SUFFIX segment (`Outer.Inner` on `Inner`, index > 0) is an inner-class path, NOT
+    //       a top-level `class_name` reference, so it is NOT admitted → a same-named unrelated
+    //       top-level `class_name Inner` can't be borrowed (the type-chain corruption case).
     let node_span = parsed.tree.get(node_id).span;
+    let class_use_anchored = result.bindings().iter().any(|b| {
+        matches!(
+            b,
+            Binding::Use {
+                target_kind: BindingTargetKind::Class,
+                target_file: Some(f),
+                site,
+                ..
+            } if *site == node_span && Some(*f) == global_class_file(state, name)
+        )
+    });
+    if class_use_anchored || cursor_is_type_base_segment(&parsed.tree, node_id) {
+        // Confirm the type-base segment actually names a PROJECT type — a project `class_name` (a
+        // native base `extends Node` must fall through to the engine refusal), OR an IN-FILE root
+        // enum / inner-class declared in THIS file (`: MyEnum` / `: Inner` — its references set is
+        // collected in-file; the old name-based signal-1 admitted these, the occurrence-positive
+        // replacement must too, or a legit in-file-type rename from a USE site wrongly refuses).
+        if class_use_anchored
+            || find_global_class_definition(state, name).is_some()
+            || name_is_in_file_root_type(&parsed.tree, name)
+        {
+            return true;
+        }
+    }
+
+    // A `Member`/`Local`/`EnumValue`-classified analyzer use at the cursor span: a cross-file member
+    // read/write through a typed var (`other.speed`), a function-local, or an in-file named enum
+    // VALUE (`Direction.NORTH`) — each positively resolved to a project declaration by IDENTITY (the
+    // enum value via its `EnumValueLocal` binding / its `EnumNode.values` decl token, never a raw-text
+    // scan), so admitting it cannot reopen the W16 grep-rename hole. #106.
     if matches!(
         classify_non_method_target(&parsed.tree, &result, node_span, byte, name, current_fid),
-        NonMethodTarget::Member(_) | NonMethodTarget::Local { .. }
+        NonMethodTarget::Member(_)
+            | NonMethodTarget::Local { .. }
+            | NonMethodTarget::EnumValue { .. }
     ) {
         return true;
     }
     false
+}
+
+/// `true` iff the cursor (at `byte`, named `name`) classifies as an in-file enum VALUE
+/// ([`NonMethodTarget::EnumValue`]) — a `Direction.NORTH` use OR the value's declaration token.
+/// Used by `rename` to SKIP declaration-canonicalization (the enum value's reference set is already
+/// click-site-symmetric, and `definition()` is member-first so canonicalizing would risk jumping to
+/// a same-named member). Computes the analysis the same way the firewall does. #106.
+fn cursor_is_enum_value(
+    state: &mut ServerState,
+    uri: &Uri,
+    tree: &ParseTree,
+    key: &CanonicalKey,
+    text: &str,
+    byte: usize,
+    name: &str,
+) -> bool {
+    let current_path = crate::uri::uri_to_path(uri);
+    let Some(p) = current_path
+        .as_deref()
+        .filter(|p| p.extension() == Some("gd"))
+    else {
+        return false;
+    };
+    let Some(node_id) = tree.innermost_node_at(byte) else {
+        return false;
+    };
+    let current_fid = state.workspace.index.file_id(p);
+    let result = analyze_with_request_token(state, key, p, tree, text);
+    let node_span = tree.get(node_id).span;
+    matches!(
+        classify_non_method_target(tree, &result, node_span, byte, name, current_fid),
+        NonMethodTarget::EnumValue { .. }
+    )
 }
 
 /// `textDocument/prepareRename` (#66): pre-flight a rename at the cursor. Resolves the symbol under
@@ -5807,7 +6174,8 @@ pub fn rename(
     let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
         return Ok(None);
     };
-    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let key = CanonicalKey::for_uri(&uri);
+    let parsed = state.workspace.parse(&key, &text);
     let rope = Rope::from_str(&text);
     let mapper = PositionMapper::new(&rope, state.encoding);
     let byte = mapper.position_to_byte(tdp.position);
@@ -5878,8 +6246,16 @@ pub fn rename(
     // would jump to the member and rename the WRONG symbol project-wide, leaving the local broken.
     // Only methods / members (which carry the bare-vs-qualified asymmetry) need the declaration
     // anchor. Resolving respects nested scopes, so the cursor stays on its own binding.
-    let is_local_or_param = resolve_local_binding(&parsed.tree, byte, &old_name).is_some();
-    let edit_tdp = if is_local_or_param {
+    //
+    // An in-file enum VALUE (#106) skips canonicalization for the SAME reason a local does: its
+    // references set is already click-site-symmetric (the decl token from `declaration_locations` +
+    // its `EnumValueLocal` uses from the enum-qualified collector, identical from a decl-click or a
+    // `Direction.NORTH` use-click), and `definition()` is member-FIRST — canonicalizing a value that
+    // shares its name with a `const NORTH`/member would jump to that member and rename the WRONG
+    // symbol. So treat it like a local: collect from the cursor, which is complete.
+    let skip_canonicalization = resolve_local_binding(&parsed.tree, byte, &old_name).is_some()
+        || cursor_is_enum_value(state, &uri, &parsed.tree, &key, &text, byte, &old_name);
+    let edit_tdp = if skip_canonicalization {
         tdp.clone()
     } else {
         match definition(

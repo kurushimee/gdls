@@ -5440,6 +5440,27 @@ fn reduce_identifier_from_base(
     if base.kind == DtKind::Enum {
         if base.is_meta_type {
             if let Some(&val) = base.enum_values.get(&name) {
+                // gdls-only nav anchor (additive; Godot records nothing here — it just types the
+                // value, analyzer.cpp:4054-4068): a value of an IN-FILE named enum gets a
+                // by-identity `Binding::Use` so `references`/`rename` can resolve it to its
+                // declaration without a raw-text scan. `class_node.is_some()` ⟺ the enum is declared
+                // in THIS file (`make_class_enum_type`, resolver.rs:2893); a cross-file enum metatype
+                // carries `script_type`, NOT `class_node` (reducer.rs:5228), so it records nothing
+                // here and the rename firewall refuses it (no positive in-file anchor). The
+                // `target_name` is the QUALIFIED `<EnumName>.<value>` (composite-identity convention
+                // on `BindingTargetKind::EnumValueLocal`), and `site` is the bare VALUE token span —
+                // the exact range an edit replaces. Read `class_node`/`enum_type` BEFORE
+                // `type_from_metatype(base)` consumes `base`.
+                if base.class_node.is_some() {
+                    let qualified = format!("{}.{}", base.enum_type, name);
+                    let site = ctx.node(identifier_id).span;
+                    ctx.record_binding(Binding::use_(
+                        ctx.file,
+                        BindingSymbolKind::EnumValueLocal,
+                        qualified,
+                        site,
+                    ));
+                }
                 ctx.set_type(identifier_id, type_from_metatype(base));
                 ctx.folds.set(identifier_id, FoldedValue::Int(val));
             }
