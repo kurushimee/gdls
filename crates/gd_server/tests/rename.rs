@@ -2623,6 +2623,80 @@ fn rename_class_name_from_expression_use_with_colliding_member_renames_the_class
 }
 
 #[test]
+fn rename_autoload_name_with_colliding_class_name_targets_the_class_not_corrupt() {
+    // Case-2 of #159, the ACTUAL autoload combo (the member-collision test above is the in-file
+    // twin): an `[autoload] Global` AND a project `class_name Global` both exist, and `Global` is
+    // used in an expression (`Global.foo()`). Godot resolves a bare identifier to the global
+    // `class_name` BEFORE the autoload (`gdscript_analyzer.cpp:4563` is_global_class precedes `:4570`
+    // has_autoload), so `Global` IS the class by identity — renaming it edits the `class_name Global`
+    // declaration (correct), and must NEVER corrupt it via a name-only sink while also not over-
+    // refusing. The issue's "autoload name + class_name corrupts the class" hypothesis is thereby
+    // disproven: the cursor IS the class.
+    //   globalcls.gd line 0 `class_name Global`     → class decl `Global` at col 11 (MUST edit)
+    //   consumer.gd  line 2 `\tGlobal.foo()`        → expression use `Global` at col 1
+    let project = common::sample_project();
+    // Re-declare an autoload Global in project.godot (sample_project's own project.godot is replaced).
+    project.write(
+        "project.godot",
+        "config_version=5\n\n[autoload]\nGlobal=\"*res://src/global.gd\"\n",
+    );
+    project.write(
+        "src/global.gd",
+        "extends Node\nfunc foo() -> void:\n\tpass\n",
+    );
+    project.write("src/globalcls.gd", "class_name Global\nextends Node\n");
+    project.write(
+        "src/consumer.gd",
+        "extends Node\nfunc go() -> void:\n\tGlobal.foo()\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/global.gd", "src/globalcls.gd", "src/consumer.gd"],
+        2,
+    );
+    let globalcls_uri = file_uri(&project.root.join("src/globalcls.gd"));
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    // Rename `Global` from the expression use (line 2, col 1) → `Globals`.
+    client
+        .sender
+        .send(request(
+            306,
+            "textDocument/rename",
+            rename_params(&consumer_uri, 2, 1, "Globals"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming `Global` (which resolves to the class) must succeed, not over-refuse: {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.expect("edit")).unwrap());
+    // The class IS the referent — its declaration must be edited, by identity.
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == globalcls_uri.as_str() && r.start.line == 0 && r.start.character == 11),
+        "the `class_name Global` declaration (globalcls.gd 0,11) IS the referent and must be edited; \
+         got {:?}",
+        view.set
+    );
+    assert!(
+        view.new_texts.iter().all(|t| t == "Globals"),
+        "every edit writes the new name; got {:?}",
+        view.new_texts
+    );
+    // NB: the `Global.foo()` use site is NOT collected (the same pre-existing class-use-in-expression
+    // under-rename as the member-collision test; orthogonal to #159's corruption fix).
+    shutdown(&client, server);
+}
+
+#[test]
 fn rename_bare_method_call_with_colliding_class_name_keeps_self_qualified_site() {
     // REGRESSION GUARD for the method-canonicalization asymmetry (#106's broadening lost the
     // `self.method()` site): a bare in-file method call classifies as Member, and the

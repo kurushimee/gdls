@@ -6350,6 +6350,14 @@ pub fn rename(
     // fallback: a same-named in-file symbol (an anon-enum hoisted const) would otherwise jump to the
     // unrelated `class_name` declaration and the rename would rewrite it (#159). The guard below
     // rejects exactly that jump and keeps the cursor's own (complete) reference set.
+    //
+    // This is a FAIL-CLOSED backstop, not the primary fix for the anon-enum case: there, the
+    // `declaration_locations` gate already removes the class, and `definition()` itself resolves the
+    // Member in-file (step 1.5) before its name-only class fallback, so canonicalization stays
+    // in-file. The backstop decouples rename's safety from `definition()`'s step ordering — if a
+    // binding-recording gap leaves a cursor with no in-file Use binding, or `definition()`'s own
+    // name-only class resolution changes (#158), the rename still cannot canonicalize onto an
+    // unrelated class.
     let cursor_refers_global_class =
         cursor_references_global_class(state, &uri, &parsed.tree, &key, &text, byte, &old_name);
     let global_class_decl = (!cursor_refers_global_class)
