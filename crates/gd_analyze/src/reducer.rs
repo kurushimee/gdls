@@ -4344,37 +4344,28 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 );
             }
         }
-        // analyzer.cpp:3740-3742 — UNSAFE_METHOD_ACCESS on a `$`/`%` (GetNode) base method miss. Godot
-        // warns on ANY unresolved non-`self`, non-hard-BUILTIN method; gdls emits this SAFELY only for
-        // the `$`/`%` base, whose bare-`Node` type gdls SYNTHESIZES (M11, analyzer.cpp:3882-3886) — so
-        // the base type is not dump-dependent. The METHOD LOOKUP still walks the native dump, and
-        // `extension_api.json` OMITS the Object-core methods Godot resolves via ClassDB: `free` and the
-        // `_`-prefixed virtuals (`_notification`, `_get`, `_set`, `_to_string`, `_init`, …). Diffing
-        // `ClassDB.class_get_method_list(Object/Node)` against the dump shows the omitted set is EXACTLY
-        // `free` + every `_`-prefixed name (zero non-underscore omissions besides `free`), so skipping
-        // those is the COMPLETE FP-avoidance for this fixed `Node` chain — a miss on them is a dump gap,
-        // not a real miss (Godot stays silent). `new()` is NOT skipped: `$X` is a Node INSTANCE and
-        // `new()` lives on the metatype, so Godot warns on it. The GENERAL hard NATIVE/SCRIPT-instance
-        // case is blocked by the same dump-vs-ClassDB gap across arbitrary classes (deferred). Exact-
-        // gated (a non-Exact dump can't be trusted even for `Node`); additive — no error path changes,
-        // so the hard "Function not found in base" error stays reserved for `is_self || (hard && BUILTIN)`.
-        // The `_`-prefix skip is deliberately BROAD: it also silences a FABRICATED `_typo()` (a missed
-        // lint on invalid code — the safe under-emit direction), traded for zero blast radius + forward
-        // safety as future Godot adds Object-core virtuals. Seeding the dump-omitted Object-core set
-        // into the native DB would let this skip drop (real virtuals resolve, fabricated `_`-names warn).
-        let base_is_get_node = call
-            .callee
-            .and_then(|c| match &ctx.node(c).kind {
-                NodeKind::Subscript(s) => s.base,
-                _ => None,
-            })
-            .is_some_and(|bid| matches!(&ctx.node(bid).kind, NodeKind::GetNode(_)));
-        if base_is_get_node
-            && !name_is_value
-            && function_name != "free"
-            && !function_name.starts_with('_')
+        // analyzer.cpp:3740-3742 — UNSAFE_METHOD_ACCESS on a method miss. Godot warns on ANY
+        // unresolved non-`self`, non-hard-BUILTIN method whose base carries a static type. gdls
+        // emits on a hard NATIVE-instance base (`var t: Timer = …; t.bogus()`, `$Node.bogus()`):
+        // the method lookup above walked the native dump's `inherits` chain and missed. The dump
+        // used to be a strict subset of Godot's ClassDB (`free` + the `_`-prefixed virtuals Godot
+        // resolves but `extension_api.json` omits), so a miss on those was a DUMP GAP, not a real
+        // miss — over-emitting vs Godot. That gap is now closed: [`NativeDb`] seeds the
+        // ClassDB-resolvable-but-dump-omitted methods (`free` + the per-class `_`-virtuals) at
+        // ingest, so `lookup_native_method` resolves them silently and only a genuinely absent
+        // name (a fabricated `_typo()`, a real method miss) reaches here. The DtKind::Script
+        // (cross-file `.gd` instance) base never reaches this arm — its miss degrades to a silent
+        // `Variant` return with `found = true` (the "Unknown stays dynamic" rule), so this stays
+        // NATIVE-only by construction. Exact-gated (a non-Exact dump can't be trusted to prove a
+        // method's absence — a custom engine build may define it). Additive — no error path
+        // changes; the hard "Function not found in base" error stays reserved for
+        // `is_self || (hard && BUILTIN)`. `!is_self` mirrors analyzer.cpp:3741; `!is_meta_type`
+        // excludes the static-call-on-a-metatype shape handled by the in-file `Class` arm above.
+        if !name_is_value
+            && !is_self
             && base_type.is_hard_type()
             && base_type.kind == DtKind::Native
+            && !base_type.is_meta_type
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
         {
             ctx.push_warning(
