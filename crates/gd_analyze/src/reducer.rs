@@ -4259,32 +4259,23 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             && call.is_super
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
         {
-            // v1.0.2 (issue #24): both super-miss templates below are negative claims whose
-            // lookup bottoms out in the native chain — under a `Generic`/`Absent` DB a custom
-            // engine build may define the member the stock surface lacks, so they only fire
-            // with `Exact` provenance.
+            // v1.0.2 (issue #24): the super-miss template below is a negative claim whose lookup
+            // bottoms out in the native chain — under a `Generic`/`Absent` DB a custom engine build
+            // may define the member the stock surface lacks, so it only fires with `Exact` provenance.
             //
-            // analyzer.cpp:3742-3744 — super-call fall-through. When the function name is
-            // `_init` and the parent is a native class that doesn't define a custom `_init`,
-            // Godot classifies it as the virtual-constructor case and emits
-            // `Cannot call the parent class' virtual function "_init()" because it hasn't been
-            // defined.` (analyzer.cpp's super-call virtual-detection arm). Object's `_init` is
-            // implicitly virtual on every native class, so any `super()` from `_init` against a
-            // base that doesn't override it triggers this template.
-            if function_name == "_init" && base_type.kind == DtKind::Native {
-                ctx.push_error(
-                    r#"Cannot call the parent class' virtual function "_init()" because it hasn't been defined."#.to_owned(),
-                    id,
-                );
-            } else {
-                ctx.push_error(
-                    format!(
-                        r#"Function "{function_name}()" not found in base {}."#,
-                        base_type
-                    ),
-                    id,
-                );
-            }
+            // analyzer.cpp:3758 — super-call fall-through "Function not found in base". The native
+            // super-VIRTUAL case (`super._init()`, `super._notification()`, …) is resolved by the
+            // seeded native methods and handled at its resolution site (the `call.is_super &&
+            // sig.is_virtual` arm in the `if found` block, analyzer.cpp:3630-3636), so it never
+            // reaches here. This arm covers only a super-call to a name the native chain genuinely
+            // lacks (a real method miss).
+            ctx.push_error(
+                format!(
+                    r#"Function "{function_name}()" not found in base {}."#,
+                    base_type
+                ),
+                id,
+            );
         } else if !name_is_value
             && !call.is_super
             && !is_self
