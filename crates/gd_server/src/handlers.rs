@@ -2151,6 +2151,83 @@ fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<L
     })
 }
 
+/// `true` iff the cursor at `node_id` (named `name`) positively refers to the PROJECT `class_name`
+/// `name` — i.e. the analyzer resolved THIS span to that global class, not merely a same-named
+/// symbol that exists elsewhere. The occurrence-positive predicate guarding every MUTATING-path use
+/// of the name-only `find_global_class_definition(name)` fallback (rename's declaration
+/// canonicalization and the `references`/`declaration_locations` class fallback): without it, a
+/// cursor whose name collides with a `class_name` (an anon-enum hoisted const, etc.) borrows that
+/// class's declaration into the edit set and the rename rewrites the unrelated class.
+///
+/// The three positive forms mirror the rename firewall's class anchor:
+///   (a) EXPRESSION position — a `Binding::Use { kind: Class }` at the cursor span whose
+///       `target_file` is THIS `name`'s registered class file (the cursor reduced TO that class;
+///       Godot resolves a bare identifier to a global `class_name` before native/autoload, so a
+///       shadowed name legitimately refers to the class).
+///   (b) DECLARATION click — the cursor is positionally the root class's own `class_name` token AND
+///       `name` is a registered project class.
+///   (c) TYPE position — `extends X` / `: X` carry no binding; admit the BASE segment (index 0 of an
+///       `extends` chain / `TypeNode.type_chain`) only when `name` is a registered global class (an
+///       in-file enum / inner class is NOT a `class_name` and resolves through other paths).
+/// A cursor resolving to anything else (an in-file member, an enum value, a native member) is NOT
+/// admitted, so the class fallback is suppressed for it and the rename stays on the cursor's own
+/// symbol.
+///
+/// Self-contained (analyzes the current file via the cached request-token path, like
+/// [`cursor_is_enum_value`]) so it is callable from the `references`/`declaration_locations` fallback
+/// and the `rename` canonicalization site, neither of which has the analysis result in scope.
+fn cursor_references_global_class(
+    state: &mut ServerState,
+    uri: &Uri,
+    tree: &ParseTree,
+    key: &CanonicalKey,
+    text: &str,
+    byte: usize,
+    name: &str,
+) -> bool {
+    let Some(node_id) = tree.innermost_node_at(byte) else {
+        return false;
+    };
+    let node_span = tree.get(node_id).span;
+    let class_file = global_class_file(state, name);
+    // class_file is None (no such project class_name) ⇒ the name-only fallback could never resolve
+    // anyway, so no admission is required.
+    if class_file.is_none() {
+        return false;
+    }
+    // (b) DECLARATION click on this file's own `class_name name` — analysis-free.
+    if root_class_identifier_span(tree) == Some(node_span)
+        && state.workspace.index.registry().contains(name)
+    {
+        return true;
+    }
+    // (c) TYPE position base segment (`extends X` / `: X`) naming a registered global class — type
+    // positions carry no binding, so they are recognized structurally.
+    if cursor_is_type_base_segment(tree, node_id) {
+        return true;
+    }
+    // (a) EXPRESSION position: a Class-kind use binding at the cursor span pointing at THIS class.
+    let current_path = crate::uri::uri_to_path(uri);
+    let Some(p) = current_path
+        .as_deref()
+        .filter(|p| p.extension() == Some("gd"))
+    else {
+        return false;
+    };
+    let result = analyze_with_request_token(state, key, p, tree, text);
+    result.bindings().iter().any(|b| {
+        matches!(
+            b,
+            Binding::Use {
+                target_kind: BindingTargetKind::Class,
+                target_file: Some(f),
+                site,
+                ..
+            } if *site == node_span && Some(*f) == class_file
+        )
+    })
+}
+
 /// M6-C1: resolve a `res://`-path string literal to a [`Location`] at the start of the target
 /// file. Called when the cursor's innermost node is a [`NodeKind::Literal`] whose value is a
 /// [`Literal::String`] starting with `"res://"`. Non-res strings (e.g. `"user://x"`,
@@ -2572,6 +2649,16 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         }
     }
 
+    // The name-only `find_global_class_definition(name)` fallback in `declaration_locations` below
+    // is admitted ONLY when THIS cursor positively refers to the project `class_name name` — a
+    // `class_name` decl-click, a `Binding::Use { kind: Class }` at the span, or a type-position base
+    // segment. A cursor whose name merely COLLIDES with a `class_name` (an anon-enum hoisted const
+    // typed `Member` to its own file) resolves elsewhere, so the class declaration must NOT enter
+    // the set — otherwise the mutating `rename` consumer rewrites the unrelated class (#159). Read
+    // surface only; `definition()`'s own name-only step-2 is the separately-tracked read twin (#158).
+    let cursor_refers_global_class =
+        cursor_references_global_class(state, &uri, &parsed.tree, &key, &text, byte, &name);
+
     // Resolve the declaration site(s) UNCONDITIONALLY — `includeDeclaration` is a filter, not
     // just a prepend: when `true` the declaration joins the result up front, and when `false`
     // any scan hit on the declaration's own name token must be REMOVED at final assembly (the
@@ -2653,8 +2740,10 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 });
             } else if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
                 decls.push(loc);
-            } else if let Some(loc) = find_global_class_definition(state, &name) {
-                decls.push(loc);
+            } else if cursor_refers_global_class {
+                if let Some(loc) = find_global_class_definition(state, &name) {
+                    decls.push(loc);
+                }
             }
         }
         decls
@@ -6255,6 +6344,25 @@ pub fn rename(
     // symbol. So treat it like a local: collect from the cursor, which is complete.
     let skip_canonicalization = resolve_local_binding(&parsed.tree, byte, &old_name).is_some()
         || cursor_is_enum_value(state, &uri, &parsed.tree, &key, &text, byte, &old_name);
+    // Whether THIS cursor positively refers to the project `class_name old_name` (a class decl-click,
+    // a Class-kind use binding at the span, or a type-position base). When it does NOT, `definition()`
+    // must not be allowed to canonicalize the rename onto that class via its name-only step-2
+    // fallback: a same-named in-file symbol (an anon-enum hoisted const) would otherwise jump to the
+    // unrelated `class_name` declaration and the rename would rewrite it (#159). The guard below
+    // rejects exactly that jump and keeps the cursor's own (complete) reference set.
+    //
+    // This is a FAIL-CLOSED backstop, not the primary fix for the anon-enum case: there, the
+    // `declaration_locations` gate already removes the class, and `definition()` itself resolves the
+    // Member in-file (step 1.5) before its name-only class fallback, so canonicalization stays
+    // in-file. The backstop decouples rename's safety from `definition()`'s step ordering — if a
+    // binding-recording gap leaves a cursor with no in-file Use binding, or `definition()`'s own
+    // name-only class resolution changes (#158), the rename still cannot canonicalize onto an
+    // unrelated class.
+    let cursor_refers_global_class =
+        cursor_references_global_class(state, &uri, &parsed.tree, &key, &text, byte, &old_name);
+    let global_class_decl = (!cursor_refers_global_class)
+        .then(|| find_global_class_definition(state, &old_name))
+        .flatten();
     let edit_tdp = if skip_canonicalization {
         tdp.clone()
     } else {
@@ -6266,6 +6374,14 @@ pub fn rename(
                 partial_result_params: lsp_types::PartialResultParams::default(),
             },
         ) {
+            // Reject a canonicalization that landed on the project `class_name old_name` declaration
+            // when the cursor does not positively refer to that class (the name-only step-2 leak) —
+            // fall back to the cursor, whose own resolved reference set is complete and correct.
+            Some(GotoDefinitionResponse::Scalar(loc))
+                if global_class_decl.as_ref() == Some(&loc) =>
+            {
+                tdp.clone()
+            }
             Some(GotoDefinitionResponse::Scalar(loc)) => TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri: loc.uri },
                 position: loc.range.start,

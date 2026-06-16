@@ -2483,3 +2483,281 @@ fn rename_in_file_type_from_expression_base_use_succeeds() {
     );
     shutdown(&client2, server2);
 }
+
+// =================================================================================================
+// #159: a rename of a cursor whose NAME collides with a project `class_name` must NEVER rewrite that
+// unrelated `class_name` declaration through a name-only sink in the MUTATING path. The cursor
+// resolves (by identity) to its OWN symbol — an anon-enum hoisted const here — so the edit set must
+// be exactly that symbol's sites, never the same-named class. The corruption (pre-existing on `main`)
+// was the name-only `find_global_class_definition(name)` fallback in `declaration_locations` AND the
+// `definition()`-based rename canonicalization, both now gated occurrence-positively.
+// =================================================================================================
+
+#[test]
+fn rename_anon_enum_value_does_not_rewrite_unrelated_class_name() {
+    // `enum { FOO }; return FOO` in consumer.gd, with an UNRELATED `class_name FOO` in foo.gd. The
+    // bare `FOO` use resolves to the in-file anon-enum CONST (a Member to consumer.gd), NOT the class.
+    // Renaming it from the USE site (`return FOO`) must edit ONLY the two consumer.gd sites (decl +
+    // use); foo.gd's `class_name FOO` must be untouched. On `main` this rewrote `class_name FOO` too.
+    //   consumer.gd line 1 `enum { FOO }`     → anon-enum value decl `FOO` at col 7
+    //   consumer.gd line 3 `\treturn FOO`     → use `FOO` at col 8
+    //   foo.gd     line 0 `class_name FOO`    → UNRELATED class decl `FOO` at col 11 (must NOT edit)
+    let project = common::sample_project();
+    project.write(
+        "src/consumer.gd",
+        "extends Node\nenum { FOO }\nfunc go() -> int:\n\treturn FOO\n",
+    );
+    project.write("src/foo.gd", "class_name FOO\nextends Node\n");
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/consumer.gd", "src/foo.gd"],
+        2,
+    );
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+    let foo_uri = file_uri(&project.root.join("src/foo.gd"));
+
+    // Rename `FOO` from the USE site (line 3, col 8) → `BAR`.
+    client
+        .sender
+        .send(request(
+            300,
+            "textDocument/rename",
+            rename_params(&consumer_uri, 3, 8, "BAR"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the anon-enum value must succeed: {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.expect("edit")).unwrap());
+    assert!(
+        view.set.iter().all(|(u, _)| *u != foo_uri.as_str()),
+        "renaming the anon-enum value `FOO` must NOT edit the unrelated `class_name FOO` in foo.gd \
+         — wrong-symbol corruption; got {:?}",
+        view.set
+    );
+    let consumer_sites: Vec<(u32, u32)> = view
+        .set
+        .iter()
+        .filter(|(u, _)| *u == consumer_uri.as_str())
+        .map(|(_, r)| (r.start.line, r.start.character))
+        .collect();
+    assert_eq!(
+        consumer_sites,
+        vec![(1, 7), (3, 8)],
+        "the edit must be exactly the anon-enum decl (1,7) + its use (3,8); got {consumer_sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_class_name_from_expression_use_with_colliding_member_renames_the_class() {
+    // The POSITIVE twin (case-2 of #159, reframed): when a bare identifier is SHADOWED by a project
+    // `class_name`, it resolves to the CLASS faithfully (Godot `gdscript_analyzer.cpp:4563`
+    // is_global_class precedes the autoload/native paths), so renaming it from an EXPRESSION use site
+    // (`Global.new()`) DOES rename the class — by identity, via the `Binding::Use { kind: Class }`
+    // anchor (distinct from the existing decl-click test). The occurrence-positive gate must KEEP this
+    // working, not over-refuse it.
+    //   globalcls.gd line 0 `class_name Global` → class decl `Global` at col 11 (MUST edit)
+    //   consumer.gd  line 2 `\tvar g = Global.new()` → expression use `Global` at col 9 (MUST edit)
+    let project = common::sample_project();
+    project.write("src/globalcls.gd", "class_name Global\nextends Node\n");
+    project.write(
+        "src/consumer.gd",
+        "extends Node\nfunc go() -> void:\n\tvar g = Global.new()\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/globalcls.gd", "src/consumer.gd"],
+        2,
+    );
+    let globalcls_uri = file_uri(&project.root.join("src/globalcls.gd"));
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    // Rename `Global` from the EXPRESSION use (line 2, col 9) → `Globals`.
+    client
+        .sender
+        .send(request(
+            302,
+            "textDocument/rename",
+            rename_params(&consumer_uri, 2, 9, "Globals"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming a class from a shadowing expression use must succeed: {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.expect("edit")).unwrap());
+    // The corruption-relevant invariant for #159: the cursor RESOLVES to the class (it is not
+    // over-refused), so the class declaration IS edited — by identity, never an unrelated symbol.
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == globalcls_uri.as_str() && r.start.line == 0 && r.start.character == 11),
+        "the class `class_name Global` declaration (globalcls.gd 0,11) IS the referent and must be \
+         edited (the occurrence-positive gate must NOT over-refuse a legitimate class use); got {:?}",
+        view.set
+    );
+    assert!(
+        view.new_texts.iter().all(|t| t == "Globals"),
+        "every edit writes the new name; got {:?}",
+        view.new_texts
+    );
+    // NB: the `Global.new()` expression use site is NOT collected here — a pre-existing
+    // references-completeness gap for class uses in expression position, orthogonal to #159's
+    // wrong-symbol-corruption fix (tracked separately). This test pins only that the class is the
+    // correct, by-identity target.
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_autoload_name_with_colliding_class_name_targets_the_class_not_corrupt() {
+    // Case-2 of #159, the ACTUAL autoload combo (the member-collision test above is the in-file
+    // twin): an `[autoload] Global` AND a project `class_name Global` both exist, and `Global` is
+    // used in an expression (`Global.foo()`). Godot resolves a bare identifier to the global
+    // `class_name` BEFORE the autoload (`gdscript_analyzer.cpp:4563` is_global_class precedes `:4570`
+    // has_autoload), so `Global` IS the class by identity — renaming it edits the `class_name Global`
+    // declaration (correct), and must NEVER corrupt it via a name-only sink while also not over-
+    // refusing. The issue's "autoload name + class_name corrupts the class" hypothesis is thereby
+    // disproven: the cursor IS the class.
+    //   globalcls.gd line 0 `class_name Global`     → class decl `Global` at col 11 (MUST edit)
+    //   consumer.gd  line 2 `\tGlobal.foo()`        → expression use `Global` at col 1
+    let project = common::sample_project();
+    // Re-declare an autoload Global in project.godot (sample_project's own project.godot is replaced).
+    project.write(
+        "project.godot",
+        "config_version=5\n\n[autoload]\nGlobal=\"*res://src/global.gd\"\n",
+    );
+    project.write(
+        "src/global.gd",
+        "extends Node\nfunc foo() -> void:\n\tpass\n",
+    );
+    project.write("src/globalcls.gd", "class_name Global\nextends Node\n");
+    project.write(
+        "src/consumer.gd",
+        "extends Node\nfunc go() -> void:\n\tGlobal.foo()\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/global.gd", "src/globalcls.gd", "src/consumer.gd"],
+        2,
+    );
+    let globalcls_uri = file_uri(&project.root.join("src/globalcls.gd"));
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    // Rename `Global` from the expression use (line 2, col 1) → `Globals`.
+    client
+        .sender
+        .send(request(
+            306,
+            "textDocument/rename",
+            rename_params(&consumer_uri, 2, 1, "Globals"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming `Global` (which resolves to the class) must succeed, not over-refuse: {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.expect("edit")).unwrap());
+    // The class IS the referent — its declaration must be edited, by identity.
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == globalcls_uri.as_str() && r.start.line == 0 && r.start.character == 11),
+        "the `class_name Global` declaration (globalcls.gd 0,11) IS the referent and must be edited; \
+         got {:?}",
+        view.set
+    );
+    assert!(
+        view.new_texts.iter().all(|t| t == "Globals"),
+        "every edit writes the new name; got {:?}",
+        view.new_texts
+    );
+    // NB: the `Global.foo()` use site is NOT collected (the same pre-existing class-use-in-expression
+    // under-rename as the member-collision test; orthogonal to #159's corruption fix).
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_bare_method_call_with_colliding_class_name_keeps_self_qualified_site() {
+    // REGRESSION GUARD for the method-canonicalization asymmetry (#106's broadening lost the
+    // `self.method()` site): a bare in-file method call classifies as Member, and the
+    // occurrence-positive class gate must NOT suppress its declaration-canonicalization. Even with an
+    // UNRELATED `class_name helper` present, renaming `helper` from the BARE call site must still
+    // canonicalize to the declaration and collect the `self.helper()` sibling — AND must not touch
+    // the class.
+    //   m.gd       line 1 `func helper() -> void:` → decl `helper` at col 5
+    //   m.gd       line 4 `\thelper()`             → bare call at col 1 (click here)
+    //   m.gd       line 5 `\tself.helper()`        → self-qualified call at col 6
+    //   helper.gd  line 0 `class_name helper`      → UNRELATED class decl (must NOT edit)
+    let project = common::sample_project();
+    project.write(
+        "src/m.gd",
+        "extends Node\nfunc helper() -> void:\n\tpass\nfunc go() -> void:\n\thelper()\n\tself.helper()\n",
+    );
+    project.write("src/helper.gd", "class_name helper\nextends Node\n");
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/m.gd", "src/helper.gd"],
+        2,
+    );
+    let m_uri = file_uri(&project.root.join("src/m.gd"));
+    let helper_uri = file_uri(&project.root.join("src/helper.gd"));
+
+    // Rename `helper` from the BARE call site (line 4, col 1) → `helper2`.
+    client
+        .sender
+        .send(request(
+            304,
+            "textDocument/rename",
+            rename_params(&m_uri, 4, 1, "helper2"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the method from a bare call site must succeed: {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.expect("edit")).unwrap());
+    assert!(
+        view.set.iter().all(|(u, _)| *u != helper_uri.as_str()),
+        "the unrelated `class_name helper` must NOT be edited; got {:?}",
+        view.set
+    );
+    let m_sites: Vec<(u32, u32)> = view
+        .set
+        .iter()
+        .filter(|(u, _)| *u == m_uri.as_str())
+        .map(|(_, r)| (r.start.line, r.start.character))
+        .collect();
+    assert_eq!(
+        m_sites,
+        vec![(1, 5), (4, 1), (5, 6)],
+        "the method rename must still be click-site-INDEPENDENT — decl (1,5) + bare call (4,1) + \
+         self.helper() (5,6); the self-qualified site must NOT be dropped; got {m_sites:?}"
+    );
+    shutdown(&client, server);
+}
