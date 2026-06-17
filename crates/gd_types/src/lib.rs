@@ -19,7 +19,7 @@ pub use doc_xml::{parse_class as parse_doc_class, DocXmlError};
 pub use intern::{Interner, Sym};
 pub use native_db::{
     ApiProvenance, ApiType, BuiltinType, LoadError, Method, NamedConst, NativeClass, NativeDb,
-    NativeEnum, NativeMember, Param, Property, Signal, UtilityFn,
+    NativeEnum, NativeMember, Param, Property, Signal, UtilityFn, DUMP_OMITTED_NATIVE_METHODS,
 };
 pub use type_ref::{decode as decode_type, TypeRef};
 pub use utility_functions::{is_variant_utility, VARIANT_UTILITY_FUNCTIONS};

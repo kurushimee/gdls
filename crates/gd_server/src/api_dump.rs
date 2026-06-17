@@ -723,6 +723,86 @@ mod tests {
         );
     }
 
+    /// The RAW, un-seeded embedded stock dump (parsed straight into [`gd_types::api::ExtensionApi`],
+    /// NOT via `embedded_stock_db()` — `NativeDb::from_json` runs the seed *during* ingest, so the
+    /// seeded names would already be present and the subset check below would be vacuous).
+    fn raw_stock_extension_api() -> gd_types::api::ExtensionApi {
+        use std::io::Read;
+        const EMBEDDED_GZ: &[u8] =
+            include_bytes!("../assets/extension_api_4.6.3_stock.min.json.gz");
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(EMBEDDED_GZ)
+            .read_to_string(&mut text)
+            .expect("embedded stock dump must decompress");
+        serde_json::from_str(&text).expect("embedded stock dump must parse as ExtensionApi")
+    }
+
+    /// #172: cross-dump drift/corruption tripwire for `DUMP_OMITTED_NATIVE_METHODS`. The table is
+    /// regenerated against a Godot binary by `scripts/regen-dump-omitted-methods.sh` (binary-only,
+    /// so not a CI step); these invariants run binary-free against the REAL embedded stock dump
+    /// (only reachable from `gd_server`) so a bump of the vendored dump that leaves the table stale
+    /// fails CI. The complementary structural invariants live in `gd_types::native_db` tests.
+    #[test]
+    fn dump_omitted_methods_are_the_strict_omitted_set_of_the_stock_dump() {
+        use std::collections::{HashMap, HashSet};
+
+        let api = raw_stock_extension_api();
+
+        // The table must be regenerated FOR the version the vendored dump ships — a bump that does
+        // not regenerate the table is exactly the silent drift #172 guards against.
+        assert_eq!(
+            (
+                api.header.version_major,
+                api.header.version_minor,
+                api.header.version_patch
+            ),
+            (4, 6, 3),
+            "embedded stock dump version != the version DUMP_OMITTED_NATIVE_METHODS was generated \
+             for — regenerate the table with scripts/regen-dump-omitted-methods.sh"
+        );
+
+        // Raw per-class OWN-method name sets, straight from the un-seeded dump.
+        let raw_own: HashMap<&str, HashSet<&str>> = api
+            .classes
+            .iter()
+            .map(|c| {
+                (
+                    c.name.as_str(),
+                    c.methods.iter().map(|m| m.name.as_str()).collect(),
+                )
+            })
+            .collect();
+
+        for &(class, method, _) in gd_types::DUMP_OMITTED_NATIVE_METHODS {
+            // (a) every table class is present in the stock dump (a seed for an absent class is dead).
+            let own = raw_own.get(class).unwrap_or_else(|| {
+                panic!("DUMP_OMITTED_NATIVE_METHODS class {class:?} is absent from the stock dump")
+            });
+            // (b) no table row is ALREADY an own-method of the dump — the table is strictly the
+            //     OMITTED set; a row the dump now carries means the dump moved and the table is stale.
+            assert!(
+                !own.contains(method),
+                "{class}::{method} is already an own-method of the stock dump — it is no longer \
+                 omitted; regenerate DUMP_OMITTED_NATIVE_METHODS"
+            );
+        }
+
+        // The seed END-TO-END: known omitted methods the RAW dump lacks resolve on the SEEDED DB.
+        // `Object::free` (the lone non-`_` omission) and `CanvasItem::_edit_get_rect` (a per-class
+        // editor method) both miss the raw dump but must resolve post-seed.
+        let seeded = embedded_stock_db().expect("embedded stock dump must ingest");
+        for (class, method) in [("Object", "free"), ("CanvasItem", "_edit_get_rect")] {
+            assert!(
+                !raw_own[class].contains(method),
+                "{class}::{method} unexpectedly present in the raw dump — pick another seed probe"
+            );
+            assert!(
+                seeded.lookup_member(class, method).is_some(),
+                "{class}::{method} must resolve on the seeded embedded DB"
+            );
+        }
+    }
+
     /// `run_dump` behavior against fake "godot" binaries (issue #25). Shell-script fixtures, so
     /// unix-only — the logic under test (drain threads, deadline kill, artifact-decides) is
     /// platform-independent; Windows runs the embedded/discovery tests above.
