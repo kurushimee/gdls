@@ -761,7 +761,58 @@ impl ParseTree {
     ///   return the first in-scope binding of `name` whose declaration **completes at or before**
     ///   `byte` (`source.span.end <= byte`) — the same not-yet-declared rule as `locals_in_scope_at`,
     ///   which also makes a use inside a binding's own initializer (`var x = x`) resolve outward.
+    /// `true` iff the identifier node `ident_id` occupies a position that SHARES a local's name but
+    /// is NOT a reference to it, so a consumer of local resolution must never treat it as the local:
+    /// - an ATTRIBUTE identifier (`obj.x` / `self.x` — the `x` is a member access, a different symbol);
+    /// - a LUA-STYLE dictionary KEY (`{ x = value }` — the analyzer folds the key to a string literal,
+    ///   recording no binding, so it is not a reference; a Python-style key `{ x: value }` IS a real
+    ///   expression and is kept). The single-element ambiguous case (`style == None`) is parsed
+    ///   Lua-style, so treat it so.
+    ///
+    /// One arena pass. This is the SINGLE source of the two exclusions both the cursor-anchor
+    /// ([`Self::resolve_local_binding_at`]) and the occurrence collector
+    /// ([`Self::local_binding_occurrences`]) must apply — rewriting either position under a rename is
+    /// silent corruption (a member access turned dangling / a folded key string silently changed).
+    fn ident_is_non_local_position(&self, ident_id: NodeId) -> bool {
+        for id in self.iter_ids() {
+            match &self.get(id).kind {
+                NodeKind::Subscript(s) => {
+                    if let Some(SubscriptAccess::Attribute(Some(aid))) = s.access {
+                        if aid == ident_id {
+                            return true;
+                        }
+                    }
+                }
+                NodeKind::Dictionary(d) => {
+                    if matches!(d.style, Some(DictStyle::LuaTable) | None) {
+                        for kv in &d.elements {
+                            if kv.key == Some(ident_id) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     pub fn resolve_local_binding_at(&self, byte: usize, name: &str) -> Option<NodeId> {
+        // Anchor-side exclusion (#181): if the cursor lands on an identifier that merely SHARES a
+        // local's name but is not a reference to it — an attribute ident (`obj.x` / `self.x`) or a
+        // Lua-style dict key (`{ x = v }`) — it must NOT resolve to that local. The occurrence
+        // collector below already excludes these; without the same guard here the cursor-anchor (the
+        // rename firewall's local check) admits an `obj.NAME` use that collides with a `var NAME` as
+        // the local and renames the WRONG symbol. Returning None lets the member/enum classifier own
+        // the cursor.
+        if let Some(node_id) = self.innermost_node_at(byte) {
+            if matches!(self.get(node_id).kind, NodeKind::Identifier(_))
+                && self.ident_is_non_local_position(node_id)
+            {
+                return None;
+            }
+        }
         // Declaration click: the cursor is on a binding's own declaration identifier. A `for`/`match`
         // bind's declaration token sits textually OUTSIDE the body block that owns its `Local`, so
         // this scans every block's locals (not just the blocks containing `byte`) for the binding
@@ -815,45 +866,20 @@ impl ParseTree {
     /// (`{ x = value }` — a folded string literal, not a reference to the local). The returned spans
     /// are the identifier token extents, in arena (source) order.
     ///
-    /// Cost: one arena pass to collect attribute idents, then one to scan candidates; each candidate
-    /// that matches the name is re-resolved (another suite-chain walk). The re-resolve runs only for
-    /// identifiers that already share the target name, so the quadratic factor is bounded by that
-    /// name's occurrence count (small in practice), not the node count — and this runs at most once
-    /// per LSP request on a single file.
+    /// Cost: one arena pass to scan candidates; each candidate that matches the name is then checked
+    /// for a non-local position ([`Self::ident_is_non_local_position`] — an arena pass) and, if a
+    /// reference, re-resolved (a suite-chain walk). Both the position check and the re-resolve run
+    /// only for identifiers that already share the target name, so the quadratic factor is bounded by
+    /// that name's occurrence count (small in practice), not the node count — and this runs at most
+    /// once per LSP request on a single file.
     pub fn local_binding_occurrences(&self, decl_ident: NodeId, scope: ByteSpan) -> Vec<ByteSpan> {
-        // Collect identifier nodes that LOOK like a same-named local but are NOT a reference to one,
-        // so renaming/highlighting the local never rewrites them (a wrong-symbol/dangling edit under
-        // rename). Two non-reference positions:
-        //   - an ATTRIBUTE identifier (`obj.x` / `self.x`) — that `x` is a member, a different symbol.
-        //   - a LUA-STYLE dictionary KEY (`{ x = value }`) — the analyzer folds the key to a STRING
-        //     literal and records no binding, so it is not a reference to the local `x`; rewriting it
-        //     would silently change the key string. A Python-style key (`{ expr: value }`) IS an
-        //     expression, so its identifiers stay (normal references). The single-element ambiguous
-        //     case (`style == None`) is parsed Lua-style, so treat it so. (Mirrors the same exclusion
-        //     in the read-only semantic-tokens local-use fallback.)
-        let mut excluded_idents: std::collections::HashSet<NodeId> =
-            std::collections::HashSet::new();
-        for id in self.iter_ids() {
-            match &self.get(id).kind {
-                NodeKind::Subscript(s) => {
-                    if let Some(SubscriptAccess::Attribute(Some(aid))) = s.access {
-                        excluded_idents.insert(aid);
-                    }
-                }
-                NodeKind::Dictionary(d) => {
-                    if matches!(d.style, Some(DictStyle::LuaTable) | None) {
-                        for kv in &d.elements {
-                            if let Some(k) = kv.key {
-                                if let NodeKind::Identifier(_) = &self.get(k).kind {
-                                    excluded_idents.insert(k);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        // Identifier nodes that LOOK like a same-named local but are NOT a reference to one are
+        // excluded so renaming/highlighting the local never rewrites them (a wrong-symbol/dangling
+        // edit under rename) — attribute idents (`obj.x` / `self.x`) and Lua-style dict keys
+        // (`{ x = value }`). The shared [`Self::ident_is_non_local_position`] predicate is the single
+        // source of those two exclusions (also applied at the cursor anchor in
+        // [`Self::resolve_local_binding_at`], #181); it is queried per candidate below. (The same
+        // exclusion lives in the read-only semantic-tokens local-use fallback.)
         let target_name = match &self.get(decl_ident).kind {
             NodeKind::Identifier(i) => i.name.as_str(),
             _ => return Vec::new(),
@@ -864,13 +890,13 @@ impl ParseTree {
             if node.span.start < scope.start || node.span.end > scope.end {
                 continue;
             }
-            if excluded_idents.contains(&id) {
-                continue;
-            }
             let NodeKind::Identifier(i) = &node.kind else {
                 continue;
             };
             if i.name != target_name {
+                continue;
+            }
+            if self.ident_is_non_local_position(id) {
                 continue;
             }
             if self.resolve_local_binding_at(node.span.start, target_name) == Some(decl_ident) {
