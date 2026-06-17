@@ -482,26 +482,27 @@ pub(crate) fn classify_document(
         if analysis.is_some() && call_callee_spans.contains(&key) {
             if let Some(Binding::Use { target_kind, .. }) = use_index.get(&key).copied() {
                 // The callee resolved to an in-file member (a script IS its root class, so a bare
-                // sibling call is a method call) — but ONLY when that member is a `func`. A `Member`
-                // binding is recorded for BOTH a real method (`func foo`) and a property holding a
-                // Callable invoked directly (`var cb: Callable` called as `cb()`); the binding kind and
-                // resolved type (`Callable`) are identical, so the in-file declaration kind is the only
-                // signal. Re-map to `method` only when the callee resolves to an in-file `Member::
-                // Function`; a Callable-property callee is NOT re-mapped and falls through to the
-                // generic `Member → property` arm — coloring it as what `cb` IS (#176). Only IN-FILE
-                // members reach this arm (an inherited bare call records no `Use` binding — the
-                // reducer's callee-position cross-file skip — so it never enters here). The `Function`
-                // arm is defensive (a `Function`-kind use is recorded only in non-callee position).
+                // sibling call is a method call). Re-map a callable target kind to `method` — EXCEPT
+                // the one case #111 mislabels: a property holding a Callable invoked directly (`var cb:
+                // Callable` called as `cb()`). A `Member` binding is recorded for BOTH a real method
+                // and a Callable property, and the resolved type (`Callable`) is identical, so the
+                // in-file declaration kind is the only signal. So re-map to `method` UNLESS the callee
+                // is a positively-identified `Member::Variable` in its enclosing class — in which case
+                // fall through to the generic `Member → property` arm, coloring it as what `cb` IS
+                // (#176). The default is `method` (the conservative #111 behavior): a real method, an
+                // inherited method, or anything not provably a same-class property stays `method`, so
+                // the narrowing can never drop a genuine method to `property`. The `Function` arm is
+                // defensive (a `Function`-kind use is recorded only in non-callee position).
                 if matches!(
                     target_kind,
                     BindingTargetKind::Function | BindingTargetKind::Member
-                ) && callee_resolves_to_in_file_method(tree, span.start, &ident.name)
+                ) && !callee_is_in_file_callable_property(tree, span.start, &ident.name)
                 {
                     push_span(&mut out, span, TokType::Method, 0);
                     continue;
                 }
-                // else: a Callable property (`Member`, not a `func`) or a non-callable resolution
-                // (`CONST(123)`) — left to the generic member-use path below.
+                // else: a same-class Callable property (`Member::Variable`) or a non-callable
+                // resolution (`CONST(123)`) — left to the generic member-use path below.
             } else if is_callee_utility(&ident.name, db) {
                 // A recognized engine utility callee with no in-file binding (`print`, `len`, …) →
                 // `function` (the M8 completion convention: native free functions are FUNCTION).
@@ -617,16 +618,21 @@ fn local_use_kind(tree: &ParseTree, byte: usize, name: &str) -> Option<TokType> 
     })
 }
 
-/// Whether a bare callee at `byte` (the callee identifier's start) resolves to an in-file
-/// `Member::Function` (a real method) rather than a `Member::Variable` holding a Callable. Used to
-/// narrow #111's `Member`→`method` re-map: only a genuine method colors `method`; a directly-invoked
-/// Callable property (`var cb: Callable` called as `cb()`) is left for the generic `Member → property`
-/// arm (#176). Resolution is scoped to the INNERMOST enclosing `ClassNode` containing the byte —
-/// GDScript inner classes don't see outer members, so a same-named `func foo` in an unrelated class
-/// can't be mistaken for this call's target (the binding carries only the bare `name`, no class path).
-/// Returns `true` only when the name is found there AND is a `Member::Function`; `false` if it's a
-/// non-function member or not found in the enclosing class.
-fn callee_resolves_to_in_file_method(tree: &ParseTree, byte: usize, name: &str) -> bool {
+/// Whether a bare callee at `byte` (the callee identifier's start) is a directly-invoked
+/// `Member::Variable` (a property holding a Callable, e.g. `var cb: Callable` called as `cb()`) in its
+/// enclosing class — the ONE case #111's `Member`→`method` re-map mislabels (#176 part 1). Used to
+/// NARROW that re-map: a positively-identified Callable property is left for the generic `Member →
+/// property` arm; EVERYTHING ELSE keeps #111's `method` (the conservative default — a real method, an
+/// INHERITED method not declared in this class, etc., all stay `method`, so the narrowing can never
+/// drop a genuine method to `property`).
+///
+/// The lookup is scoped to the INNERMOST enclosing `ClassNode` containing the byte — GDScript inner
+/// classes don't see outer members, so a same-named `var foo` in an unrelated class can't be mistaken
+/// for this call's target (the binding carries only the bare `name`, no class path). Inheritance needs
+/// no chain walk: a `var cb` inherited from an in-file base is NOT in this class's own members, so the
+/// default (`method`) applies — and Godot resolves an inherited Callable property's bare call the same
+/// way an inherited method does, so `method` there is the consistent (non-regressing) choice.
+fn callee_is_in_file_callable_property(tree: &ParseTree, byte: usize, name: &str) -> bool {
     // The innermost enclosing class (smallest class span containing the callee byte).
     let mut best: Option<(ByteSpan, &gd_syntax::ast::ClassNode)> = None;
     for id in tree.iter_ids() {
@@ -644,7 +650,7 @@ fn callee_resolves_to_in_file_method(tree: &ParseTree, byte: usize, name: &str) 
         return false;
     };
     match class.members_indices.get(name) {
-        Some(&idx) => matches!(class.members.get(idx), Some(Member::Function(_))),
+        Some(&idx) => matches!(class.members.get(idx), Some(Member::Variable(_))),
         None => false,
     }
 }
@@ -1921,6 +1927,45 @@ mod tests {
             inner_call.ty,
             TokType::Property,
             "the inner `foo()` resolves to the inner `var foo` (property) — scoped to its own class"
+        );
+    }
+
+    /// A bare call to an in-file INHERITED method still colors `method` — the Callable-property
+    /// narrowing must NOT drop it to `property`. The narrowing diverts to `property` ONLY for a
+    /// positively-identified same-class `Member::Variable`; an inherited `func` is not in the calling
+    /// class's own members, so the conservative default (`method`) applies. Covers both inheritance
+    /// shapes: a root `extends`-ing an in-file base, and an inner `Derived extends Base`.
+    /// DISCRIMINATING: an "is it a same-class `func`?" narrowing (returning false when not found in the
+    /// innermost class) would wrongly color these `property` — this pins the `method` default.
+    #[test]
+    fn inherited_in_file_method_callee_stays_method() {
+        let db = trimmed_db();
+
+        // Shape A: the root class extends an in-file base; bare call to the inherited method.
+        let src_a =
+            "extends Base\nclass Base:\n\tfunc foo() -> void:\n\t\tpass\nfunc run() -> void:\n\tfoo()\n";
+        let (p_a, a_a) = analyze_for(src_a, &db);
+        let raw_a = classify_document(&p_a.tree, Some(&a_a), &db);
+        let call_a = src_a.rfind("foo()").unwrap();
+        let tok_a = tok_at(&raw_a, call_a)
+            .expect("the inherited-method callee (root extends in-file base) must be colored");
+        assert_eq!(
+            tok_a.ty,
+            TokType::Method,
+            "an inherited in-file method callee stays `method`, not `property` (root extends base)"
+        );
+
+        // Shape B: an inner `Derived extends Base`; bare call to the inherited method.
+        let src_b = "class Base:\n\tfunc foo() -> void:\n\t\tpass\nclass Derived extends Base:\n\tfunc run() -> void:\n\t\tfoo()\n";
+        let (p_b, a_b) = analyze_for(src_b, &db);
+        let raw_b = classify_document(&p_b.tree, Some(&a_b), &db);
+        let call_b = src_b.rfind("foo()").unwrap();
+        let tok_b = tok_at(&raw_b, call_b)
+            .expect("the inherited-method callee (inner Derived extends Base) must be colored");
+        assert_eq!(
+            tok_b.ty,
+            TokType::Method,
+            "an inherited in-file method callee stays `method`, not `property` (inner Derived)"
         );
     }
 
