@@ -1988,14 +1988,14 @@ fn definition_on_enum_value_use_resolves_to_declaration() {
 }
 
 #[test]
-fn rename_cross_file_class_name_enum_value_underrenames_from_declaration() {
-    // BOUNDARY PIN (#158): renaming a `class_name`'d script's enum value FROM ITS DECLARATION edits
-    // the declaring file but UNDER-collects the cross-file `Foo.Dir.NORTH` use (its base is a
-    // cross-file enum metatype carrying `script_type`, not `class_node`, so no `EnumValueLocal` is
-    // recorded there and there is no fan-out). This is loud UNDER-rename (the other file fails to
-    // compile), NOT corruption — the documented #106 fail-closed boundary. The edit must still be
-    // PRECISE in the declaring file (decl + its own in-file use), never touch an unrelated symbol,
-    // and must NOT error. Pinned so the behavior is intentional; flip to full coverage when #158 lands.
+fn rename_cross_file_class_name_enum_value_from_declaration_covers_cross_file_use() {
+    // #158 (was a BOUNDARY PIN under #106): renaming a `class_name`'d script's enum value FROM ITS
+    // DECLARATION now edits BOTH the declaring file (decl + its own in-file use) AND the cross-file
+    // `Lib.Dir.NORTH` use sites — collected OCCURRENCE-POSITIVELY (each cross-file site records an
+    // `EnumValueLocal` binding keyed on the declaring file + qualified `Dir.NORTH`, so only THIS
+    // value's accesses are rewritten). The previous behavior (under-rename: cross-file site dropped)
+    // was loud-but-fail-closed; the fix expands the edit set in the over-rename direction, so the
+    // decoy matrix below proves the expansion is identity-bounded.
     let project = common::sample_project();
     project.write(
         "src/lib.gd",
@@ -2034,9 +2034,10 @@ fn rename_cross_file_class_name_enum_value_underrenames_from_declaration() {
     let view = flatten_edit(
         &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
     );
-    // The edited set is EXACTLY lib.gd's decl (3,11) + its in-file use (6,8 — `\treturn Dir.NORTH`,
-    // tab + `return Dir.`(cols1-10) → `NORTH` at col 11... recompute: tab(0) `return `(1-7) `Dir`(8-10)
-    // `.`(11) `NORTH`(12)). The cross-file use.gd site is NOT collected (the documented boundary).
+    // The edited set is lib.gd's decl (3,11) + its in-file use (6,12 — `\treturn Dir.NORTH`: tab(0)
+    // `return `(1-7) `Dir`(8-10) `.`(11) `NORTH`(12)) AND the cross-file use.gd site (3,15 —
+    // `\treturn Lib.Dir.NORTH`: tab(0) `return `(1-7) `Lib`(8-10) `.`(11) `Dir`(12-14) `.`(15)...
+    // recompute: `NORTH` at col 15). Now covered (#158).
     let mut sites: Vec<(String, u32, u32)> = view
         .set
         .iter()
@@ -2048,14 +2049,108 @@ fn rename_cross_file_class_name_enum_value_underrenames_from_declaration() {
         vec![
             (lib_uri.as_str().to_string(), 3, 11),
             (lib_uri.as_str().to_string(), 6, 12),
+            (use_uri.as_str().to_string(), 3, 15),
         ],
-        "the edit must be precise in the declaring file (decl + in-file use) and NOT touch the \
-         cross-file use.gd site (documented #158 under-rename boundary); got {sites:?}"
+        "the edit must cover the declaring file (decl + in-file use) AND the cross-file \
+         `Lib.Dir.NORTH` use (#158 full coverage); got {sites:?}"
     );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_cross_file_class_name_enum_value_decoy_matrix_is_occurrence_positive() {
+    // #158 OCCURRENCE-POSITIVE CORRUPTION GUARD — the dangerous over-rename direction. Renaming
+    // `Foo`'s `enum Direction { NORTH }` value FROM ITS DECLARATION must edit, by IDENTITY, ONLY the
+    // accesses that resolve to THIS value (declaring file `foo.gd` + qualified `Direction.NORTH`):
+    //   - foo.gd:   the decl `NORTH`                          → EDITED
+    //   - cons.gd:  `Foo.Direction.NORTH`                     → EDITED   (resolves to foo's value)
+    //   - cons.gd:  `Bar.Direction.NORTH`  (DECOY, diff class)→ NOT edited (resolves to bar's value)
+    //   - cons.gd:  bare `NORTH`            (DECOY, unrelated) → NOT edited (a local/unresolved name)
+    //   - cons.gd:  `const NORTH := 1`      (DECOY, unrelated)→ NOT edited (a same-named const)
+    //   - bar.gd:   `enum Direction { NORTH }` decl (DECOY)   → NOT edited (a different class's value)
+    let project = common::sample_project();
+    project.write(
+        "src/foo.gd",
+        "class_name Foo\nextends Node\n\nenum Direction { NORTH, SOUTH }\n",
+    );
+    project.write(
+        "src/bar.gd",
+        "class_name Bar\nextends Node\n\nenum Direction { NORTH }\n",
+    );
+    project.write(
+        "src/cons.gd",
+        "extends Node\n\nconst NORTH := 1\n\nfunc f() -> void:\n\t\
+         var a = Foo.Direction.NORTH\n\t\
+         var b = Bar.Direction.NORTH\n\t\
+         var c = NORTH\n\t\
+         print([a, b, c])\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/foo.gd", "src/bar.gd", "src/cons.gd"],
+        2,
+    );
+    let foo_uri = file_uri(&project.root.join("src/foo.gd"));
+    let bar_uri = file_uri(&project.root.join("src/bar.gd"));
+    let cons_uri = file_uri(&project.root.join("src/cons.gd"));
+
+    // Rename `NORTH` from foo.gd's decl (line 3 `enum Direction { NORTH, SOUTH }`, `NORTH` at col 16).
+    client
+        .sender
+        .send(request(
+            220,
+            "textDocument/rename",
+            rename_params(&foo_uri, 3, 16, "UP"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
     assert!(
-        !view.set.iter().any(|(u, _)| *u == use_uri.as_str()),
-        "the cross-file `Lib.Dir.NORTH` site must NOT be edited (documented boundary): {:?}",
+        resp.error.is_none(),
+        "renaming Foo.Direction.NORTH from its declaration must succeed: {:?}",
+        resp.error
+    );
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
+    );
+    let mut sites: Vec<(String, u32, u32)> = view
+        .set
+        .iter()
+        .map(|(u, r)| (u.clone(), r.start.line, r.start.character))
+        .collect();
+    sites.sort();
+    // foo.gd decl (3,16); cons.gd `Foo.Direction.NORTH` use. On cons.gd line 5
+    // (`\tvar a = Foo.Direction.NORTH`): tab(0) `var a = `(1-8) `Foo`(9-11) `.`(12) `Direction`(13-21)
+    // `.`(22) `NORTH`(23). So (5,23).
+    assert_eq!(
+        sites,
+        vec![
+            (cons_uri.as_str().to_string(), 5, 23),
+            (foo_uri.as_str().to_string(), 3, 16),
+        ],
+        "the edit must cover ONLY foo's value decl + the `Foo.Direction.NORTH` use, by identity; \
+         got {sites:?}"
+    );
+    // Decoy proof: nothing in bar.gd is touched, and cons.gd's `Bar.Direction.NORTH` / bare `NORTH` /
+    // `const NORTH` are all untouched (only the one (5,23) site in cons.gd is edited).
+    assert!(
+        !view.set.iter().any(|(u, _)| *u == bar_uri.as_str()),
+        "a DIFFERENT class's same-named enum value (bar.gd) must NOT be edited: {:?}",
         view.set
+    );
+    let cons_sites: Vec<(u32, u32)> = view
+        .set
+        .iter()
+        .filter(|(u, _)| *u == cons_uri.as_str())
+        .map(|(_, r)| (r.start.line, r.start.character))
+        .collect();
+    assert_eq!(
+        cons_sites,
+        vec![(5, 23)],
+        "in the consumer, ONLY `Foo.Direction.NORTH` may be edited — never `Bar.Direction.NORTH` \
+         (line 6), bare `NORTH` (line 7), or `const NORTH` (lines 2/7); got {cons_sites:?}"
     );
     shutdown(&client, server);
 }
