@@ -526,7 +526,7 @@ pub(crate) fn classify_document(
         // A DOTTED-attribute call callee (`obj.foo()` / `self.foo()` / `X.new()`): the attribute ident
         // in a subscript-callee position records no `Binding::Use` when the call resolves, so it would
         // stay uncolored. Color it `method` syntactically, mirroring the bare in-file callee and the
-        // dotted member-USE color (#176). `super.*` was excluded at collection. KNOWN residual (#180):
+        // dotted member-USE color (#176). `super.*` was excluded at collection. KNOWN residual (#184):
         // `obj.cb()` where `cb` is a Callable property is also colored `method` — the dotted analogue of
         // the #176 part-1 mislabel — accepted here (the issue specifies `method` for dotted callees).
         // Analysis-priced for parity with the bare-callee block (omitted under `range`-Hard, not
