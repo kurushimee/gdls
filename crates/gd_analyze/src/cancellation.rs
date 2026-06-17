@@ -37,6 +37,15 @@ impl CancellationToken {
     pub fn is_cancelled(&self) -> bool {
         self.inner.load(Ordering::Acquire)
     }
+
+    /// `true` iff `self` and `other` are clones of the SAME token (share the inner `Arc`), as
+    /// opposed to two independent tokens that merely have equal cancelled state. Used by the LSP
+    /// server's per-document format supersession to remove an in-flight entry only when it is still
+    /// the entry this request inserted (a newer request may have replaced it).
+    #[must_use]
+    pub fn same_token(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 #[cfg(test)]

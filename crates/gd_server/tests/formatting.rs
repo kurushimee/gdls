@@ -26,11 +26,12 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{file_uri, notification, recv_response, request, shutdown, try_recv, TempProject};
-use lsp_server::{Connection, Message, Response};
+use lsp_server::{Connection, Message, RequestId, Response};
 use lsp_types::{
-    ClientCapabilities, DidOpenTextDocumentParams, DocumentFormattingParams, FormattingOptions,
-    InitializeParams, InitializeResult, InitializedParams, TextDocumentIdentifier,
-    TextDocumentItem, TextEdit, Uri, WorkDoneProgressParams,
+    CancelParams, ClientCapabilities, DidOpenTextDocumentParams, DocumentFormattingParams,
+    DocumentSymbolParams, FormattingOptions, InitializeParams, InitializeResult, InitializedParams,
+    NumberOrString, PartialResultParams, TextDocumentIdentifier, TextDocumentItem, TextEdit, Uri,
+    WorkDoneProgressParams,
 };
 
 /// Absolute path to the cross-platform stub formatter bin (Cargo provides it for the package under
@@ -516,6 +517,182 @@ fn large_document_does_not_deadlock() {
     assert!(
         formatted.len() < src.len() && !formatted.contains("    "),
         "squeeze must collapse the space runs across the whole large doc"
+    );
+
+    shutdown(&client, thread);
+}
+
+// ---------------------------------------------------------------------------------------------
+// #135 — head-of-line blocking: a slow format must NOT stall an unrelated request
+// ---------------------------------------------------------------------------------------------
+
+/// A `formatter` config running the stub in `mode` with an extra `arg` (the delay / marker path).
+fn formatter_cfg_arg(mode: &str, arg: &str) -> serde_json::Value {
+    serde_json::json!({ "command": STUB, "args": [mode, arg] })
+}
+
+/// Send a `textDocument/documentSymbol` request — a fast, formatter-independent request used to
+/// prove the worker is free while a slow format runs off-worker (#135).
+fn send_document_symbol(client: &Connection, id: i32, uri: &Uri) {
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier { uri: uri.clone() },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    client
+        .sender
+        .send(request(id, "textDocument/documentSymbol", params))
+        .unwrap();
+}
+
+/// Send a `$/cancelRequest` for the numeric request `id`.
+fn send_cancel(client: &Connection, id: i32) {
+    client
+        .sender
+        .send(notification(
+            "$/cancelRequest",
+            CancelParams {
+                id: NumberOrString::Number(id),
+            },
+        ))
+        .unwrap();
+}
+
+/// Receive the next `Response` with `id`, skipping notifications/other ids, within `timeout`.
+/// Returns the response and the elapsed time from the call.
+fn recv_response_id(client: &Connection, id: i32, timeout: Duration) -> (Response, Duration) {
+    let start = Instant::now();
+    let deadline = start + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "response for id {id} never arrived within {timeout:?}"
+        );
+        match try_recv(client, remaining.min(Duration::from_millis(200))) {
+            Some(Message::Response(r)) if r.id == RequestId::from(id) => {
+                return (r, start.elapsed())
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// #135 head-of-line blocking. A SLOW format (`delaysqueeze 2000` — sleeps 2s before formatting)
+/// must run OFF the request worker, so a `documentSymbol` sent right after it is answered promptly
+/// rather than waiting out the 2s format. Against the prior on-worker code the format blocked the
+/// single worker for the full 2s, so `documentSymbol` could not be answered until the format
+/// finished — i.e. the slow format's response would arrive FIRST. With the off-worker move the fast
+/// request answers within a fraction of the format's runtime, and BEFORE the format response.
+#[test]
+fn slow_format_does_not_block_unrelated_request() {
+    let p = bare_project();
+    let src = "func  f():\n\tvar   x   =   1\n";
+    let (client, thread) = boot();
+    init_open(
+        &p,
+        &client,
+        Some(formatter_cfg_arg("delaysqueeze", "2000")),
+        &[("a.gd", src)],
+    );
+    let uri = file_uri(&p.root.join("a.gd"));
+
+    // Fire the slow format (id 10), then immediately a fast documentSymbol (id 11).
+    send_format(&client, 10, &uri);
+    send_document_symbol(&client, 11, &uri);
+
+    // The fast request must answer well inside the 2s format sleep — proof the worker is free.
+    let (symbol_resp, symbol_elapsed) = recv_response_id(&client, 11, Duration::from_secs(2));
+    assert!(
+        symbol_resp.error.is_none(),
+        "documentSymbol must succeed while the slow format runs off-worker; got {:?}",
+        symbol_resp.error
+    );
+    assert!(
+        symbol_elapsed < Duration::from_millis(1500),
+        "documentSymbol took {symbol_elapsed:?} — the slow format blocked the worker (HOL); it \
+         must answer well inside the 2s format sleep"
+    );
+
+    // The slow format still completes correctly afterwards (off-worker, on its own timeline).
+    let (format_resp, _) = recv_response_id(&client, 10, Duration::from_secs(10));
+    assert!(
+        format_resp.error.is_none(),
+        "the slow format must still succeed; got {:?}",
+        format_resp.error
+    );
+    let edits = edits_of_response(&format_resp).expect("delaysqueeze changes the doc → edits");
+    assert_eq!(apply_edits(src, &edits), "func f():\n\tvar x = 1\n");
+
+    shutdown(&client, thread);
+}
+
+// ---------------------------------------------------------------------------------------------
+// #136 — cancel preempts an in-flight format subprocess (prompt child-kill, no late edit, no orphan)
+// ---------------------------------------------------------------------------------------------
+
+/// #136. A `$/cancelRequest` for an in-flight format must KILL the subprocess promptly and answer
+/// `RequestCancelled` — not run the child out to the handler's 5s timeout. The stub's `markerafter`
+/// mode sleeps 30s, then (only if it survives) writes a MARKER file. The discriminators:
+///   * the response is `RequestCancelled` (-32800), arriving WELL UNDER the 5s format timeout —
+///     proving the child was killed by the cancel poll, not by the timeout backstop (the latency
+///     discriminator: against the prior code with no poll-kill, a cancel landed only at the
+///     post-handler gate AFTER the 5s timeout fired, so the response would take ~5s);
+///   * the marker file NEVER appears — proving no orphaned subprocess completed and no late edit
+///     was produced after the cancel (the mutating-consumer firewall).
+#[test]
+fn cancel_kills_inflight_format_promptly_no_late_edit() {
+    let p = bare_project();
+    let src = "func  f():\n\tpass\n";
+    let marker = p.root.join("FORMAT_MARKER");
+    let (client, thread) = boot();
+    init_open(
+        &p,
+        &client,
+        Some(formatter_cfg_arg("markerafter", marker.as_str())),
+        &[("a.gd", src)],
+    );
+    let uri = file_uri(&p.root.join("a.gd"));
+
+    // Fire the (30s-sleeping) format, then cancel it almost immediately.
+    send_format(&client, 10, &uri);
+    // A brief beat so the subprocess is actually spawned and the format thread is in its wait loop.
+    std::thread::sleep(Duration::from_millis(150));
+    send_cancel(&client, 10);
+
+    // The cancel must be answered RequestCancelled FAR inside the 5s timeout (the poll-kill fired).
+    let (resp, elapsed) = recv_response_id(&client, 10, Duration::from_secs(5));
+    assert_eq!(
+        resp.error.as_ref().map(|e| e.code),
+        Some(-32800),
+        "a cancelled in-flight format must answer RequestCancelled (-32800); got {:?}",
+        resp.error
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "cancel took {elapsed:?} — the child was not killed promptly (it ran toward the 5s \
+         timeout instead of the cancel poll). #136 requires a prompt kill, not a timeout."
+    );
+
+    // No edit can have been applied: the response is an error, never edits. And the marker must
+    // never appear — the child was killed mid-sleep, so it never reached its write. Poll a short
+    // window to be sure no late write lands after the response.
+    let marker_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < marker_deadline {
+        assert!(
+            !marker.exists(),
+            "the format subprocess wrote its marker AFTER cancel — an orphan completed / a late \
+             edit was produced (no-orphan / mutating-consumer firewall violated)"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The session is still healthy: a follow-up request answers.
+    send_document_symbol(&client, 11, &uri);
+    let (after, _) = recv_response_id(&client, 11, Duration::from_secs(5));
+    assert!(
+        after.error.is_none(),
+        "session must survive a cancelled format"
     );
 
     shutdown(&client, thread);
