@@ -2178,7 +2178,6 @@ fn global_class_file(state: &ServerState, name: &str) -> Option<gd_project::File
     state.workspace.index.file_id(&entry.path)
 }
 
-
 fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<Location> {
     let entry = state.workspace.index.registry().get(name)?;
     let path = entry.path.clone();
