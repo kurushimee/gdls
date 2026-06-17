@@ -2014,43 +2014,6 @@ fn name_is_in_file_root_type(tree: &ParseTree, name: &str) -> bool {
     })
 }
 
-/// `true` iff `name` is an ENUM type, CLASS, or `const` alias declared INSIDE an inner class (any
-/// class node that is not the file root) — the non-root analog of [`name_is_in_file_root_type`], over
-/// the same complete type-position member set `{Enum, Class, Constant}`. A type with this name
-/// is visible only in its enclosing inner scope, so a type-position `name` in this file may refer to
-/// the inner type rather than a same-named global `class_name`. The root-only guard cannot see it.
-///
-/// The rename layer uses this as a fail-closed REFUSE signal: distinguishing a type-position `name`
-/// that means the inner type from one that means the global class needs per-node scope-aware
-/// resolution (the resolver's job), which gdls does not yet apply in the rename path. Until then,
-/// the presence of any inner-scoped shadow makes the global-class rename unsafe in this file (an
-/// inner `: name` would be wrongly rewritten alongside a legitimate `extends name`), and an inner
-/// type-position cursor would wrongly canonicalize onto the global class — so the rename refuses
-/// rather than emit a wrong edit.
-fn name_is_in_file_inner_scoped_type(tree: &ParseTree, name: &str) -> bool {
-    let root_id = tree.root_id();
-    tree.iter_ids().any(|nid| {
-        if Some(nid) == root_id {
-            return false;
-        }
-        let NodeKind::Class(class) = &tree.get(nid).kind else {
-            return false;
-        };
-        class.members.iter().any(|m| match m {
-            Member::Enum(id) => {
-                matches!(&tree.get(*id).kind, NodeKind::Enum(en) if en.identifier.map(|i| ident_name(tree, i)) == Some(name))
-            }
-            Member::Class(id) => {
-                matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
-            }
-            Member::Constant(id) => {
-                matches!(&tree.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
-            }
-            _ => false,
-        })
-    })
-}
-
 fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
     // Single pass: short-circuit on a func/signal declaration; otherwise remember the subscript
     // that owns this attribute identifier and collect every `Call` callee node, then decide.
@@ -4161,55 +4124,6 @@ fn push_use_binding_locations_for(
 /// name-matched. A SUFFIX segment (`Foo.Inner`, index > 0) is an inner-class path, not a top-level
 /// class reference, and is excluded — the same carve-out [`cursor_is_type_base_segment`] applies at
 /// the cursor.
-/// `true` iff any file the interface index records as referencing `name` (other than `origin_uri`,
-/// the file driving the rename) declares `name` as an inner-class-scoped type
-/// ([`name_is_in_file_inner_scoped_type`]). Such a file may legitimately reference the global class
-/// `name` (`extends name`) WHILE its inner `: name` means the inner type — a distinction a file-level
-/// guard cannot draw, so the rename layer treats this as a fail-closed REFUSE signal for a
-/// global-class rename. Parse-only (no analysis): the structural inner-scope check needs just the
-/// AST, and the candidate parses are content-addressed/cached. The interface-pass `name_referencers`
-/// set bounds the scan to the same candidate fan-out `references` uses for a class name.
-///
-/// `origin_uri` is EXCLUDED here on purpose: the rename caller checks the origin file's own inner
-/// shadow directly against its already-parsed tree (avoiding a redundant parse), so this scans only
-/// the cross-file referencers. Keep the split — re-merging it would re-parse the origin.
-fn any_referencer_has_inner_scoped_type(
-    state: &mut ServerState,
-    name: &str,
-    origin_uri: &Uri,
-) -> bool {
-    let origin_path = crate::uri::uri_to_path(origin_uri);
-    let candidate_fids: Vec<gd_project::FileId> =
-        state.workspace.index.name_referencers(name).collect();
-    for fid in candidate_fids {
-        let Some(path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
-            continue;
-        };
-        if origin_path
-            .as_deref()
-            .is_some_and(|o| normalize_eq(o, &path))
-        {
-            continue;
-        }
-        let Some(cand_uri) = path_to_file_uri(&path) else {
-            continue;
-        };
-        let text = match state.vfs.get(cand_uri.as_str()).map(|d| d.text()) {
-            Some(t) => t,
-            None => match std::fs::read_to_string(path.as_std_path()) {
-                Ok(t) => t,
-                Err(_) => continue,
-            },
-        };
-        let cand_key = CanonicalKey::for_uri(&cand_uri);
-        let parsed = state.workspace.parse(&cand_key, &text);
-        if name_is_in_file_inner_scoped_type(&parsed.tree, name) {
-            return true;
-        }
-    }
-    false
-}
-
 fn push_global_class_locations(
     out: &mut Vec<Location>,
     result: &AnalysisResult,
@@ -6492,14 +6406,25 @@ fn rename_target_has_project_anchor(
         )
     });
     if class_use_anchored || cursor_is_type_base_segment(&parsed.tree, node_id) {
-        // Confirm the type-base segment actually names a PROJECT type — a project `class_name` (a
-        // native base `extends Node` must fall through to the engine refusal), OR an IN-FILE root
-        // enum / inner-class declared in THIS file (`: MyEnum` / `: Inner` — its references set is
-        // collected in-file; the old name-based signal-1 admitted these, the occurrence-positive
-        // replacement must too, or a legit in-file-type rename from a USE site wrongly refuses).
+        // Confirm the type-base segment actually names a PROJECT type the rename can collect:
+        //   - an EXPRESSION-position Class use (`class_use_anchored`) — by identity, always editable;
+        //   - an IN-FILE ROOT enum / inner-class declared in THIS file (`name_is_in_file_root_type`)
+        //     — its references set is collected in-file (`UnresolvedKind::InFileType`), so a legit
+        //     in-file root-type rename from a USE site is admitted;
+        //   - a GLOBAL `class_name name` reference — but ONLY when this occurrence is NOT shadowed by
+        //     an enclosing scope (`!type_name_shadowed_by_enclosing_scope`). A shadowed inner
+        //     `: Foo`/`extends Foo` (its enclosing `class Inner` declares `enum Foo`, or a func-local
+        //     `const Foo` aliases it) is NOT a global reference — admitting it via the name-only
+        //     `find_global_class_definition` would let `definition()` canonicalize the rename onto the
+        //     unrelated global `class_name` decl (cell-(B) corruption). An inner-scoped type is not a
+        //     root type, so it has no precise collection path here and FALLS THROUGH to the
+        //     no-anchor refusal — fail-closed, the documented #167 (B) limitation.
         if class_use_anchored
-            || find_global_class_definition(state, name).is_some()
             || name_is_in_file_root_type(&parsed.tree, name)
+            || (find_global_class_definition(state, name).is_some()
+                && !parsed
+                    .tree
+                    .type_name_shadowed_by_enclosing_scope(node_span.start, name))
         {
             return true;
         }
@@ -6729,48 +6654,21 @@ pub fn rename(
     let cursor_refers_global_class =
         cursor_references_global_class(state, &uri, &parsed.tree, &key, &text, byte, &old_name);
 
-    // (5a) Fail-closed inner-scope refuse-guard. A type-position reference to `old_name` carries no
-    // binding, so neither the firewall nor the edit collector can tell an inner-class-scoped `: Foo`
-    // (the inner enum/class) from a top-level `: Foo` (a same-named global `class_name`) without
-    // per-node scope-aware type-name resolution the resolver owns. Where an inner-scoped shadow and a
-    // global `class_name` of the same name coexist in the rename's reach, a file-level guard cannot
-    // separate the two — so the rename would emit a WRONG edit. Refuse the whole rename instead (zero
-    // wrong edits; the user renames the residue manually). Over-refusal is the safe direction.
-    if state.workspace.index.registry().contains(&old_name) {
-        // (B) The cursor itself is a type-base segment whose own file declares `old_name` as an
-        // inner-scoped type. The firewall admitted it as a global-class reference, but it may be the
-        // inner type — canonicalizing onto the global `class_name` decl would rewrite an unrelated
-        // class. Refuse.
-        if cursor_is_type_base_segment(&parsed.tree, node_id)
-            && name_is_in_file_inner_scoped_type(&parsed.tree, &old_name)
-        {
-            return Err(RequestRefusal::not_editable(format!(
-                "Cannot safely rename `{old_name}`: an inner-class-scoped type of the same name \
-                 collides with the global class `{old_name}` and cannot be resolved per occurrence"
-            )));
-        }
-        // (A) The cursor positively refers to the global `class_name old_name`, and SOME file in the
-        // rename's reach declares `old_name` as an inner-scoped type. That file's inner `: old_name`
-        // (the inner type) would be wrongly rewritten alongside its legitimate `extends old_name` /
-        // `old_name.new()` (the global class), and a file-level guard cannot separate them. Refuse.
-        // The shadow may live in the ORIGIN file itself (a global-class USE — `old_name.new()` /
-        // `extends old_name` — in a file that also declares an inner `old_name`; checked here with the
-        // already-parsed origin tree, no re-parse) OR in any cross-file referencer. This guard's file
-        // fan-out is exactly the edit collector's: `{origin} ∪ name_referencers(old_name)` — the
-        // origin (always scanned for edits) plus the interface-pass referencer set. Keep that equality
-        // if either the edit-collection candidate set or `any_referencer_has_inner_scoped_type` ever
-        // changes, or a file the collector edits could escape the guard.
-        if cursor_refers_global_class
-            && (name_is_in_file_inner_scoped_type(&parsed.tree, &old_name)
-                || any_referencer_has_inner_scoped_type(state, &old_name, &uri))
-        {
-            return Err(RequestRefusal::not_editable(format!(
-                "Cannot safely rename the global class `{old_name}`: a file in the rename's reach \
-                 declares an inner-class-scoped type of the same name that cannot be distinguished \
-                 from a global reference per occurrence"
-            )));
-        }
-    }
+    // (5a) Inner-class-scoped vs global-`class_name` type-name collision is now resolved PER
+    // OCCURRENCE by the scope-aware resolver ([`ParseTree::type_name_shadowed_by_enclosing_scope`]),
+    // not by a file-level fail-closed refuse-guard (the #166 coarse guard #167 supersedes):
+    //   - A GLOBAL-class rename collects only UNSHADOWED type-position references (genuine
+    //     `extends Foo` / `: Foo`) and suppresses any occurrence shadowed by an enclosing scope (an
+    //     inner `: Foo` whose `class Inner` declares `enum Foo`, or a func-local `const Foo` alias) —
+    //     `push_global_class_locations` does this per base segment. The global decl + genuine
+    //     consumers are edited; the shadowed inner/local occurrences are left to rebind to their local
+    //     type once the global is renamed away. No whole-rename refusal needed.
+    //   - An INNER-SCOPED `: Foo` cursor (cell B) resolves SHADOWED, so the firewall's type-base
+    //     carve-out ([`rename_target_has_project_anchor`]) does NOT admit it as a global reference and
+    //     `cursor_references_global_class` returns `false` for it — the cursor cannot canonicalize onto
+    //     the unrelated global `class_name` decl. An inner-scoped type has no precise rename target
+    //     today, so it falls through to the no-anchor refusal (`rename_native_or_stub_refusal` step 5):
+    //     fail-closed, the documented #167 inner-precise limitation (tracked as a follow-up).
 
     let global_class_decl = (!cursor_refers_global_class)
         .then(|| find_global_class_definition(state, &old_name))
