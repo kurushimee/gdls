@@ -172,7 +172,7 @@ pub(crate) struct FormatDone {
 /// document SUPERSEDES (cancels) the older one (the editor's format-on-save + fast typing case).
 pub(crate) struct FormatBridge {
     done_tx: crossbeam_channel::Sender<FormatDone>,
-    /// Received by the event loop's `recv(format_done_rx)` select arm; see
+    /// Received by the event loop's `recv(format_bridge_rx)` select arm; see
     /// [`crate::formatter::apply_format_done`].
     pub(crate) done_rx: crossbeam_channel::Receiver<FormatDone>,
     /// Per-document in-flight format token, for supersession. Keyed by the URI string (the same key
@@ -366,34 +366,45 @@ fn spawn_format(spawn_args: SpawnArgs) {
         encoding,
         token,
     } = spawn_args;
-    // The closure moves its own copies of `command`/`args`/`original`/`token`; keep separate copies
-    // for the spawn-failure fallback below (the closure is consumed by `Builder::spawn` either way).
+    // Keep a separate copy of the request identity for the spawn-failure fallback below. The
+    // FormatResponder guard is constructed INSIDE the closure (never before the spawn) so a failed
+    // spawn — which drops the closure WITHOUT running it — cannot drop an un-disarmed responder and
+    // double-send: on spawn failure the ONLY send is the explicit fallback here. On the spawn-ok
+    // path the responder sends exactly once (normal `send`) or fires its Drop fallback once (panic).
     let fallback = FormatDone {
         id: id.clone(),
-        uri_key,
+        uri_key: uri_key.clone(),
         token: token.clone(),
         command: command.clone(),
         result: Ok(None),
     };
-    let responder = FormatResponder {
-        done_tx: done_tx.clone(),
-        id: id.clone(),
-        uri_key: fallback.uri_key.clone(),
-        token: token.clone(),
-        command: command.clone(),
-    };
+    // A `done_tx` clone reserved for the spawn-failure send; the original is moved into the closure.
+    let fallback_tx = done_tx.clone();
     let spawn = std::thread::Builder::new()
         .name("gdls-format".to_string())
         .spawn(move || {
-            // The guard fires its fallback if this closure panics before `send`.
+            // Build the guard here, inside the running thread: it fires its fallback if this closure
+            // panics before `send`, but never exists if the spawn itself failed.
+            let responder = FormatResponder {
+                done_tx,
+                id,
+                uri_key,
+                token: token.clone(),
+                command: command.clone(),
+            };
             let result = run_format_job(&command, &args, &original, encoding, &token);
             responder.send(result);
         });
     if let Err(e) = spawn {
         // The OS refused a new thread (FD/thread-count exhaustion). Do NOT panic the worker — answer
-        // the request with no edits via the bridge so the client is never left hanging.
-        log::error!("could not spawn format thread for request {id:?}: {e}; answering no edits");
-        let _ = done_tx.send(fallback);
+        // the request with no edits via the bridge so the client is never left hanging. The closure
+        // (and any responder it would have built) was dropped by the failed spawn without running,
+        // so this is the sole send for the request.
+        log::error!(
+            "could not spawn format thread for request {:?}: {e}; answering no edits",
+            fallback.id
+        );
+        let _ = fallback_tx.send(fallback);
     }
 }
 
@@ -850,5 +861,52 @@ mod tests {
         ] {
             assert!(f.message("gdformat").contains("gdformat"));
         }
+    }
+
+    /// A fresh `FormatResponder` over a one-off channel, plus the receiving end. Mirrors how
+    /// `spawn_format` builds the guard inside the format thread.
+    fn responder() -> (FormatResponder, crossbeam_channel::Receiver<FormatDone>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let r = FormatResponder {
+            done_tx: tx,
+            id: RequestId::from(7),
+            uri_key: "file:///a.gd".to_string(),
+            token: CancellationToken::new(),
+            command: "gdformat".to_string(),
+        };
+        (r, rx)
+    }
+
+    /// The response-once invariant on the normal path: `send` produces EXACTLY ONE `FormatDone`
+    /// (and disarms the Drop guard, so no second message follows).
+    #[test]
+    fn responder_send_emits_exactly_one() {
+        let (r, rx) = responder();
+        r.send(Ok(Some(vec![])));
+        assert!(
+            matches!(rx.try_recv(), Ok(FormatDone { id, .. }) if id == RequestId::from(7)),
+            "send must emit one FormatDone for the request"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "send must NOT emit a second FormatDone (the Drop guard was disarmed)"
+        );
+    }
+
+    /// The response-once invariant on the panic/early-return path: dropping a responder WITHOUT
+    /// `send` (what a panic in the format thread does) fires the fallback ONCE — never zero (the
+    /// client would hang) and never twice (an LSP protocol violation).
+    #[test]
+    fn responder_drop_without_send_emits_exactly_one_fallback() {
+        let (r, rx) = responder();
+        drop(r);
+        assert!(
+            matches!(rx.try_recv(), Ok(FormatDone { id, result: Ok(None), .. }) if id == RequestId::from(7)),
+            "an un-sent responder's Drop must emit one no-edits fallback"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "Drop must emit exactly one fallback, not two"
+        );
     }
 }

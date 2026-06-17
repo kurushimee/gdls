@@ -2659,7 +2659,7 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Option<Response> {
     }
     // M11 (#135/#136): `textDocument/formatting` runs OFF the request worker. It is handled before
     // the synchronous dispatch table because its control flow is different: a real format returns
-    // `Pending` — the worker sends NO response now (it arrives via the `recv(format_done_rx)` arm
+    // `Pending` — the worker sends NO response now (it arrives via the `recv(format_bridge_rx)` arm
     // once the off-worker thread finishes) and the lifecycle stays REGISTERED across the gap, so a
     // cancel/edit the router trips meanwhile is still applied by `finish_request` on the done arm.
     // Only the defensive `Immediate` paths (no command / no buffer) answer synchronously here.
