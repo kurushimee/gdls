@@ -49,7 +49,8 @@ use lsp_types::{
 
 use gd_analyze::{AnalysisResult, Binding, BindingTargetKind, DtKind};
 use gd_syntax::ast::{
-    DictStyle, EnumValue, LocalKind, Member, NodeId, NodeKind, ParseTree, SubscriptAccess,
+    DictStyle, EnumValue, LocalKind, Member, NodeId, NodeKind, ParseTree, PatternKind,
+    SubscriptAccess,
 };
 use gd_syntax::ByteSpan;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -189,6 +190,13 @@ pub(crate) fn classify_document(
     // binding pass owns; an unresolved one stays uncolored rather than mis-colored) and Lua-style
     // dict keys (`{ x = v }` — a string literal, not a reference).
     let mut not_a_local_use: FxHashSet<(usize, usize)> = FxHashSet::default();
+
+    // (5) Bare-identifier call-callee identifier spans (`foo()` / `print()` — NOT `obj.foo()` whose
+    // callee is a subscript, nor `super(...)`). A callee in this set is classified specially in the
+    // use pass: an in-file method resolves via the analyzer's member binding to `method` (fixing the
+    // bare callee that otherwise mis-colored `property`); a recognized engine utility (`print`, `len`,
+    // …) colors `function`; anything else falls through to the local/omit path (#111).
+    let mut call_callee_spans: FxHashSet<(usize, usize)> = FxHashSet::default();
 
     // First pass: declarations (structural — always emitted) + collect decl/type/attribute span sets.
     for id in tree.iter_ids() {
@@ -361,6 +369,55 @@ pub(crate) fn classify_document(
                     }
                 }
             }
+            NodeKind::For(f) => {
+                // The `for <var> in …:` iterator is a local DECLARATION (`LocalKind::ForVariable` in
+                // the suite's locals); its USE sites already color `variable`, but the decl-site ident
+                // in the loop header was uncolored (the parser keeps it on the header, not the body
+                // suite). Tag it `variable` + declaration, mirroring every other local decl (#111).
+                if let Some(idn) = f.variable {
+                    emit_decl(
+                        &mut out,
+                        &mut decl_spans,
+                        tree,
+                        idn,
+                        TokType::Variable,
+                        MOD_DECL,
+                    );
+                }
+                // `for x: T in …` — the iterator's datatype is a type position.
+                if let Some(ts) = f.datatype_specifier {
+                    mark_type_node(tree, ts, &mut type_spans);
+                }
+            }
+            NodeKind::Pattern(p) => {
+                // A `match` pattern bind (`var y:`) is a local DECLARATION
+                // (`LocalKind::PatternBind`). Use the per-pattern `Bind(idn)` — NOT the root pattern's
+                // accumulated `binds` map — so a bind is emitted exactly once at its own ident span
+                // (`decl_spans` then suppresses the use-pass token there). Use sites already color
+                // `variable` (#111).
+                if let PatternKind::Bind(Some(idn)) = p.pattern_type {
+                    emit_decl(
+                        &mut out,
+                        &mut decl_spans,
+                        tree,
+                        idn,
+                        TokType::Variable,
+                        MOD_DECL,
+                    );
+                }
+            }
+            NodeKind::Call(c) => {
+                // Record a BARE-identifier callee span (`foo()` / `print()`). A subscript callee
+                // (`obj.foo()`, `X.new()`) has a non-identifier callee, so it's excluded
+                // automatically; `super(...)` is excluded explicitly (its callee dispatches to the
+                // parent, not a same-file identifier). See the use pass for classification.
+                if let Some(callee) = c.callee.filter(|_| !c.is_super) {
+                    if let NodeKind::Identifier(_) = &tree.get(callee).kind {
+                        let s = tree.get(callee).span;
+                        call_callee_spans.insert((s.start, s.end));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -386,6 +443,43 @@ pub(crate) fn classify_document(
             let (ty, modifiers) = type_use_token(&ident.name, analysis, id, db);
             push_span(&mut out, span, ty, modifiers);
             continue;
+        }
+        // A BARE call callee (`foo()` / `print()`) — classified ahead of the generic member-use path
+        // so an in-file method callee colors `method`, not the `property` the raw `Member` binding
+        // would yield (#111). Precedence (faithful to a user-defined `func print()` shadowing the
+        // engine utility): an in-file method/function binding wins; a recognized engine utility is
+        // next; otherwise fall through (a local callable colors `variable`, an unknown stays omitted —
+        // "never lie").
+        //
+        // Analysis-priced: gated on `analysis.is_some()` so the same callee never flips method↔function
+        // between `full` (member binding present → `method`) and `range`-under-Hard-pressure (no
+        // analysis → would name-match the utility table → `function`). Under `None` the callee falls
+        // through to the local path (a local callable still colors `variable`); the utility/method
+        // coloring is omitted, exactly as cross-file member/enum-value uses already are (never guessed).
+        if analysis.is_some() && call_callee_spans.contains(&key) {
+            if let Some(Binding::Use { target_kind, .. }) = use_index.get(&key).copied() {
+                // The callee resolved to an in-file member/method (a script IS its root class, so a
+                // bare sibling call is a method call). Re-map any callable target kind to `method`,
+                // matching the declaration and the dotted-use color. A non-callable resolution
+                // (`CONST(123)`) is left to the generic path below. A bare callee records `Member`
+                // (the unconditional `reduce_identifier` arm); the `Function` arm is defensive (the
+                // `Function`-kind use is recorded only in non-callee position) and re-maps to the
+                // same correct `method` color anyway.
+                if matches!(
+                    target_kind,
+                    BindingTargetKind::Function | BindingTargetKind::Member
+                ) {
+                    push_span(&mut out, span, TokType::Method, 0);
+                    continue;
+                }
+            } else if is_callee_utility(&ident.name, db) {
+                // A recognized engine utility callee with no in-file binding (`print`, `len`, …) →
+                // `function` (the M8 completion convention: native free functions are FUNCTION).
+                push_span(&mut out, span, TokType::Function, 0);
+                continue;
+            }
+            // else: fall through to the generic member-use / local paths (a local callable callee
+            // colors `variable`; an unresolved callee stays uncolored).
         }
         // A resolved member/enum/method/cross-file use — from the analyzer binding.
         if let Some(Binding::Use {
@@ -495,6 +589,16 @@ fn use_token(kind: BindingTargetKind, native: bool) -> Option<(TokType, u32)> {
         modifiers |= MOD_DEFAULT_LIBRARY;
     }
     Some((ty, modifiers))
+}
+
+/// Whether `name` is a recognized engine utility callee — Godot's two-pronged check at a call site
+/// (`Variant::has_utility_function` + `GDScriptUtilityFunctions::function_exists`,
+/// `gdscript_analyzer.cpp:3481`/`:3517`), mirrored here as the NativeDb's Variant-utility table
+/// (`abs`, `print`, …) OR the GDScript-only table (`len`, `range`, `load`, …). DB/table-driven, so it
+/// holds even without analysis — but a bare callee is only colored when in `call_callee_spans` AND
+/// not bound to an in-file member, so a user-defined `func print()` still wins (#111).
+fn is_callee_utility(name: &str, db: &gd_types::NativeDb) -> bool {
+    db.utility(name).is_some() || gd_analyze::is_gdscript_utility(name)
 }
 
 /// The `(TokType, modifiers)` for an identifier in a TYPE position (`name` is the identifier text).
@@ -935,6 +1039,38 @@ mod tests {
     use super::*;
     use lsp_types::SemanticTokensDelta;
 
+    /// Build a NativeDb from the committed trimmed-API fixture (carries the Variant utility table:
+    /// `print`, `abs`, …) so bare-utility-callee tests resolve `print` like production.
+    fn trimmed_db() -> gd_types::NativeDb {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../gd_types/tests/fixtures/trimmed_api.json");
+        gd_types::NativeDb::load(path.to_str().expect("utf-8 path"))
+            .unwrap_or_else(|e| panic!("load trimmed native DB at {}: {e}", path.display()))
+    }
+
+    /// Parse + analyze `src` (no cross-file) so a classifier test can run the analysis-priced path.
+    fn analyze_for(src: &str, db: &gd_types::NativeDb) -> (gd_syntax::ParseResult, AnalysisResult) {
+        let parsed = gd_syntax::parse(src);
+        let policy = gd_analyze::WarnPolicy::build(
+            &gd_project::WarningConfig::default(),
+            &gd_analyze::StrictSettings::default(),
+        );
+        let analysis = gd_analyze::analyze(
+            &parsed.tree,
+            None,
+            "t.gd",
+            db,
+            &gd_analyze::NoCrossFile,
+            &policy,
+        );
+        (parsed, analysis)
+    }
+
+    /// The token at the identifier starting at `byte`, or `None` if uncolored.
+    fn tok_at(raw: &[RawToken], byte: usize) -> Option<&RawToken> {
+        raw.iter().find(|t| t.span.start == byte)
+    }
+
     /// The legend is STANDARD-only: every advertised name is a known LSP 3.17 standard token
     /// type/modifier. This is the #30 generic-LSP guarantee — it FAILS the moment a custom
     /// (`gdscript/`-prefixed or otherwise non-standard) name is added to either table. The exact
@@ -1346,5 +1482,216 @@ mod tests {
             legend.project_modifiers(MOD_DECL | MOD_READONLY),
             MOD_DECL | MOD_READONLY
         );
+    }
+
+    // ===========================================================================================
+    // #111 — bare-call callees + for-loop / match-pattern decl sites.
+    // ===========================================================================================
+
+    /// A bare in-file call callee (`foo()` — no base) colors `method`, NOT `property` (#111). A
+    /// GDScript script IS its root class, so a bare sibling call is a method call — the callee must
+    /// agree with the method's DECLARATION color (`method`) and its dotted-use color, not the
+    /// `property` the raw in-file `Member` binding would yield. DISCRIMINATING: the pre-fix code
+    /// colored this `Property`, so asserting `Method` (not merely "colored") is what proves the fix.
+    #[test]
+    fn bare_in_file_call_callee_colors_method() {
+        let db = trimmed_db();
+        let src = "extends Node\nfunc foo() -> void:\n\tpass\nfunc test() -> void:\n\tfoo()\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        // The callee `foo` in `\tfoo()` (the LAST `foo` occurrence — the call site).
+        let callee_byte = src.rfind("foo").unwrap();
+        let callee =
+            tok_at(&raw, callee_byte).expect("the bare in-file call callee must be colored (#111)");
+        assert_eq!(
+            callee.ty,
+            TokType::Method,
+            "a bare sibling call callee colors `method`, matching its declaration — not `property`"
+        );
+        assert_eq!(
+            callee.modifiers & MOD_DECLARATION,
+            0,
+            "a callee is a USE, not a declaration"
+        );
+        // The method's own declaration (`func foo`) still colors `method` + declaration.
+        let decl_byte = src.find("func foo").unwrap() + "func ".len();
+        let decl = tok_at(&raw, decl_byte).expect("the method declaration must be colored");
+        assert_eq!(decl.ty, TokType::Method);
+        assert_ne!(decl.modifiers & MOD_DECLARATION, 0);
+    }
+
+    /// A bare native-utility callee colors `function` (#111) — both a Variant utility (`print`, in
+    /// the NativeDb) and a GDScript-only utility (`len`/`range`, recognized by name via
+    /// `gd_analyze::is_gdscript_utility`). `function` matches the M8 completion convention (native
+    /// free functions → FUNCTION). DISCRIMINATING: these were entirely uncolored pre-fix.
+    #[test]
+    fn bare_utility_call_callee_colors_function() {
+        let db = trimmed_db();
+        let src = "func test() -> void:\n\tprint(\"hi\")\n\tlen([1])\n\trange(3)\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        for name in ["print", "len", "range"] {
+            let byte = src.find(&format!("{name}(")).unwrap();
+            let tok = tok_at(&raw, byte).unwrap_or_else(|| {
+                panic!("the bare utility callee `{name}` must be colored (#111)")
+            });
+            assert_eq!(
+                tok.ty,
+                TokType::Function,
+                "the utility callee `{name}` colors `function`"
+            );
+            assert_eq!(
+                tok.modifiers, 0,
+                "a utility callee is a USE with no modifiers"
+            );
+        }
+    }
+
+    /// A `for <var> in …:` iterator declaration site colors `variable` + declaration (#111). The USE
+    /// sites already colored `variable`; the decl-site ident in the loop header was uncolored.
+    /// DISCRIMINATING: the decl site was uncolored pre-fix, and a USE colors `variable` WITHOUT the
+    /// declaration modifier — so asserting the modifier is what distinguishes the fix.
+    #[test]
+    fn for_loop_iterator_decl_colors_variable_declaration() {
+        let db = trimmed_db();
+        let src = "func test() -> void:\n\tfor item in [1, 2]:\n\t\tprint(item)\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        // The decl-site `item` (in `for item in`).
+        let decl_byte = src.find("for item").unwrap() + "for ".len();
+        let decl = tok_at(&raw, decl_byte)
+            .expect("the for-loop iterator declaration must be colored (#111)");
+        assert_eq!(decl.ty, TokType::Variable);
+        assert_ne!(
+            decl.modifiers & MOD_DECLARATION,
+            0,
+            "the for-loop iterator DECLARATION carries the declaration modifier"
+        );
+        // The USE `item` in `print(item)` still colors `variable` WITHOUT the declaration modifier.
+        let use_byte = src.find("print(item)").unwrap() + "print(".len();
+        let use_tok = tok_at(&raw, use_byte).expect("the for-var use must be colored");
+        assert_eq!(use_tok.ty, TokType::Variable);
+        assert_eq!(
+            use_tok.modifiers & MOD_DECLARATION,
+            0,
+            "a USE is not a declaration"
+        );
+    }
+
+    /// A `match` pattern bind (`var y:`) declaration site colors `variable` + declaration (#111),
+    /// emitted once at its own ident span (per-pattern `Bind`, not the root pattern's `binds` map).
+    /// DISCRIMINATING: the bind decl was uncolored pre-fix; the modifier distinguishes decl from use.
+    #[test]
+    fn match_pattern_bind_decl_colors_variable_declaration() {
+        let db = trimmed_db();
+        let src = "func test() -> void:\n\tmatch 5:\n\t\tvar y:\n\t\t\tprint(y)\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        let decl_byte = src.find("var y").unwrap() + "var ".len();
+        let decl = tok_at(&raw, decl_byte)
+            .expect("the match-pattern bind declaration must be colored (#111)");
+        assert_eq!(decl.ty, TokType::Variable);
+        assert_ne!(
+            decl.modifiers & MOD_DECLARATION,
+            0,
+            "the match bind DECLARATION carries the declaration modifier"
+        );
+        // The bind ident is emitted EXACTLY ONCE (no double-emit from the root `binds` map).
+        let decl_count = raw.iter().filter(|t| t.span.start == decl_byte).count();
+        assert_eq!(
+            decl_count, 1,
+            "the match bind must be emitted once, not duplicated"
+        );
+        // The USE `y` in `print(y)` still colors `variable` without the declaration modifier.
+        let use_byte = src.find("print(y)").unwrap() + "print(".len();
+        let use_tok = tok_at(&raw, use_byte).expect("the match-bind use must be colored");
+        assert_eq!(use_tok.ty, TokType::Variable);
+        assert_eq!(use_tok.modifiers & MOD_DECLARATION, 0);
+    }
+
+    /// A user-defined `func print()` SHADOWS the engine utility: the bare `print()` callee resolves
+    /// to the in-file method binding and colors `method`, never `function`. Pins the precedence
+    /// (in-file member binding wins over the name-matched utility table) — faithful to GDScript.
+    #[test]
+    fn user_defined_func_shadows_utility_callee() {
+        let db = trimmed_db();
+        let src = "func print() -> void:\n\tpass\nfunc test() -> void:\n\tprint()\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        let callee_byte = src.rfind("print").unwrap();
+        let callee =
+            tok_at(&raw, callee_byte).expect("the shadowing-method callee must be colored");
+        assert_eq!(
+            callee.ty,
+            TokType::Method,
+            "an in-file `func print()` shadows the engine utility — the callee is `method`"
+        );
+    }
+
+    /// The bare-callee classification is analysis-priced: under `None` analysis
+    /// (`range`-while-shedding), bare method/utility callees are OMITTED (never guessed) — exactly
+    /// like cross-file member / enum-value uses — so a callee never flips method↔function between
+    /// `full` and degraded `range`. The for/match DECL sites stay structural (always emitted).
+    /// DISCRIMINATING: without the `analysis.is_some()` gate, the utility callee would emit
+    /// `function` here (DB-driven), and the method callee would be omitted anyway — so asserting the
+    /// utility callee is OMITTED is what proves the gate.
+    #[test]
+    fn bare_callees_omitted_without_analysis_but_for_match_decls_emit() {
+        let db = trimmed_db();
+        let src = "func foo() -> void:\n\tpass\nfunc test() -> void:\n\tfoo()\n\tprint(\"hi\")\n\tlen([1])\n\tfor item in [1, 2]:\n\t\tpass\n\tmatch 5:\n\t\tvar y:\n\t\t\tpass\n";
+        let parsed = gd_syntax::parse(src);
+        let raw = classify_document(&parsed.tree, None, &db);
+
+        // Bare callees (method + utilities alike) are OMITTED under no analysis.
+        for (label, needle, off) in [
+            ("foo() method callee", "\tfoo()", 1),
+            ("print() utility callee", "print(", 0),
+            ("len() utility callee", "len(", 0),
+        ] {
+            let byte = src.find(needle).unwrap() + off;
+            assert!(
+                tok_at(&raw, byte).is_none(),
+                "{label} must be OMITTED under no analysis (never guessed)"
+            );
+        }
+        // The for/match DECL sites are STRUCTURAL — still emitted with the declaration modifier.
+        let for_byte = src.find("for item").unwrap() + "for ".len();
+        let for_decl = tok_at(&raw, for_byte)
+            .expect("the for-loop iterator decl is structural — emitted with no analysis");
+        assert_eq!(for_decl.ty, TokType::Variable);
+        assert_ne!(for_decl.modifiers & MOD_DECLARATION, 0);
+        let match_byte = src.find("var y").unwrap() + "var ".len();
+        let match_decl = tok_at(&raw, match_byte)
+            .expect("the match-bind decl is structural — emitted with no analysis");
+        assert_eq!(match_decl.ty, TokType::Variable);
+        assert_ne!(match_decl.modifiers & MOD_DECLARATION, 0);
+    }
+
+    /// The new #111 coverage reuses ONLY standard-legend token types already advertised — every
+    /// emitted `TokType` for these sites (`method`, `function`, `variable`) is in `LEGEND_TYPES`, so
+    /// NO custom token leaks (the #30 generic-LSP guarantee). Belt-and-suspenders alongside
+    /// `legend_is_standard_names_only`: classify a doc exercising all #111 sites and assert every
+    /// raw token's type is a legal legend index.
+    #[test]
+    fn hundred_eleven_sites_emit_only_legend_types() {
+        let db = trimmed_db();
+        let src = "func foo() -> void:\n\tpass\nfunc test() -> void:\n\tfoo()\n\tprint(\"hi\")\n\tfor item in [1]:\n\t\tprint(item)\n\tmatch 5:\n\t\tvar y:\n\t\t\tprint(y)\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        assert!(!raw.is_empty());
+        for t in &raw {
+            // `TokType as usize` must index a real legend slot — a custom type would be out of range
+            // or (impossibly) map to a non-standard name, both caught by this + the legend snapshot.
+            assert!(
+                (t.ty as usize) < LEGEND_TYPES.len(),
+                "every emitted token type must be a standard legend entry; got {:?}",
+                t.ty
+            );
+        }
     }
 }

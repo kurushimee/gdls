@@ -45,6 +45,7 @@ pub use cross_file::{CrossFileQuery, NoCrossFile, NodePathQuery, SceneNodeFacts,
 pub use data_type::{DataType, DtKind, MethodSig, ScriptRef, TypeSource, VariantType};
 pub use diagnostic::{Diagnostic, DiagnosticSink, RelatedInfo, Severity};
 pub use foldtable::{FoldTable, FoldedValue, UtilityCallableId, UtilityScope};
+pub use reducer::is_gdscript_utility;
 pub use typetable::TypeTable;
 pub use warn_policy::{StrictProfile, StrictSettings, WarnPolicy};
 pub use warnings::{code_from_name, name_from_code, WarnLevel, WarningCode, WARNING_MAX};
