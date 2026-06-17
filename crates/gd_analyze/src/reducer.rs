@@ -4610,6 +4610,17 @@ pub(crate) fn gd_utility_return_type(name: &str) -> Option<DataType> {
     })
 }
 
+/// Whether `name` is a GDScript-only utility function (`len`, `range`, `load`, …) — the
+/// `GDScriptUtilityFunctions::function_exists` half of Godot's two-pronged callee-utility check
+/// (`Variant::has_utility_function` is the other, covered by [`gd_types::is_variant_utility`] /
+/// `NativeDb::utility`). Symmetric public twin of `gd_types::is_variant_utility`, deriving from the
+/// single [`gd_utility_return_type`] table so the two can't drift. Used by `gd_server`'s
+/// `semanticTokens` to color a bare GDScript-only utility callee as `function` (#111).
+#[must_use]
+pub fn is_gdscript_utility(name: &str) -> bool {
+    gd_utility_return_type(name).is_some()
+}
+
 /// Look up a method on a builtin type (Array, Dictionary, String, etc.) via the NativeDb's
 /// `builtin_named` table. Returns a [`CallSig`] if found, `None` otherwise.
 fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> Option<CallSig> {
@@ -6935,5 +6946,50 @@ mod tests {
         // over builtin constants usable as a constant expression.
         let src = "extends RefCounted\nconst SCALED = Vector3.ONE * 2.0\n";
         assert_eq!(analyze_error_messages(src), Vec::<String>::new());
+    }
+
+    /// `is_gdscript_utility` recognizes exactly the GDScript-only utility names (the
+    /// `gdscript_utility_functions.cpp:570-592` registration set, mirrored by `gd_utility_return_type`)
+    /// and rejects Variant utilities (handled by `gd_types::is_variant_utility`) and unknown names.
+    /// The public twin used by `gd_server`'s `semanticTokens` to color bare GDScript-only utility
+    /// callees as `function` (#111); it must stay in lockstep with the return-type table.
+    #[test]
+    fn is_gdscript_utility_recognizes_only_the_gdscript_only_set() {
+        // Every GDScript-only utility (the registration set) is recognized.
+        for name in [
+            "convert",
+            "type_exists",
+            "char",
+            "_char",
+            "ord",
+            "range",
+            "load",
+            "inst_to_dict",
+            "dict_to_inst",
+            "Color8",
+            "print_debug",
+            "print_stack",
+            "get_stack",
+            "len",
+            "is_instance_of",
+        ] {
+            assert!(
+                is_gdscript_utility(name),
+                "`{name}` is a GDScript-only utility and must be recognized"
+            );
+            assert_eq!(
+                is_gdscript_utility(name),
+                gd_utility_return_type(name).is_some(),
+                "is_gdscript_utility must stay in lockstep with gd_utility_return_type for `{name}`"
+            );
+        }
+        // Variant utilities (in extension_api.json, recognized by gd_types::is_variant_utility) and
+        // genuinely-unknown names are NOT GDScript-only utilities.
+        for name in ["print", "abs", "floor", "not_a_function", ""] {
+            assert!(
+                !is_gdscript_utility(name),
+                "`{name}` is NOT a GDScript-only utility"
+            );
+        }
     }
 }
