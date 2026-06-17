@@ -9,7 +9,8 @@
 # Usage:
 #     scripts/regen-dump-omitted-methods.sh [godot-binary]
 #
-# `godot-binary` defaults to `godot` on PATH. The binary's version MUST match the vendored stock
+# `godot-binary` defaults to `godot` on PATH (pass an absolute path or a PATH name, not a
+# CWD-relative one). The binary's version MUST match the vendored stock
 # dump's version (the .gd refuses on a mismatch). Output (the paste-ready table body) goes to STDOUT;
 # diagnostics go to STDERR. Paste the rows between the `&[` / `];` markers of
 # DUMP_OMITTED_NATIVE_METHODS, then run `cargo fmt --all` (rustfmt re-wraps the few >100-col rows).
@@ -39,7 +40,11 @@ gunzip -c "$STOCK_GZ" >"$DUMP_JSON"
 
 # `--headless` so no window/GL; the .gd writes the table to OUT_TXT (NOT stdout) so Godot's boot
 # banner never contaminates it. Do NOT pass `--quiet` — it also suppresses the script's diagnostics.
+# Let the OUTPUT ARTIFACT decide success, not Godot's exit code: some Godot builds return non-zero
+# even on a clean headless `--script` exit, so `set -e` here would abort on a perfectly good run.
+set +e
 "$GODOT" --headless --script "$GD_TOOL" -- "$DUMP_JSON" "$OUT_TXT" >&2
+set -e
 
 if [[ ! -s "$OUT_TXT" ]]; then
 	echo "error: regeneration produced no rows (see the Godot diagnostics above)" >&2
