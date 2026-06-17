@@ -212,8 +212,11 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
         CompletionKind::PropertyMethod => {
             property_method_items(state, &parsed.tree, analyzed.as_deref(), &render)
         }
+        CompletionKind::PropertyAccessor => property_accessor_items(&render),
         CompletionKind::OverrideMethod => {
-            override_method_items(state, &parsed.tree, analyzed.as_deref(), &render)
+            let own_file =
+                crate::uri::uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
+            override_method_items(state, &parsed.tree, analyzed.as_deref(), own_file, &render)
         }
         // Deferred (`$`/`%`/`get_node`/path) — scene-aware node-path + resource-path completion
         // (M11 Phase 3). Each arm returns an empty list when nothing concrete is known (no scene
@@ -975,28 +978,38 @@ fn type_attribute_members(
             return enumerate_members(state, tree, dt);
         }
     }
-    // Path 2: resolve the base token name before the dot directly. The type chain's segment type
-    // isn't pinned ending-at-the-dot, so read the name and look it up as a native class / a project
-    // `class_name`.
+    // Path 2: resolve the dotted type chain before the dot by NAME (the chain's segment types aren't
+    // pinned ending-at-the-dot). The FIRST segment is a native class or a project `class_name`; any
+    // remaining segments (`Outer.Inner.<cursor>`) descend the project class's inner-class chain
+    // (Godot's `COMPLETION_TYPE_ATTRIBUTE` segment-by-segment walk, `gdscript_editor.cpp:3652-3663`).
+    // Pure type-NAME resolution — degrade to empty on any unresolved segment (never a wrong set).
     let Some(dot_start) = nearest_dot_start(tokens, byte) else {
         return Vec::new();
     };
-    let Some(name) = base_name_before(tokens, dot_start) else {
+    let chain = dotted_type_chain_before(tokens, dot_start);
+    let Some((head, rest)) = chain.split_first() else {
         return Vec::new();
     };
     let native = &state.workspace.native;
-    if native.class_named(&name).is_some() {
-        return enumerate::native_class_members(native, &name);
+    if native.class_named(head).is_some() {
+        // A native class. Multi-segment native chains (a native nested type) are not modeled here;
+        // only the single-segment `Native.<cursor>` case resolves (faithful: never wrong, just
+        // incomplete past the first native segment).
+        if rest.is_empty() {
+            return enumerate::native_class_members(native, head);
+        }
+        return Vec::new();
     }
-    // A project `class_name` → enumerate the declaring file's script type's members.
-    if let Some(entry) = state.workspace.index.registry().get(&name) {
+    // A project `class_name` head → enumerate the declaring file's script type, descending the
+    // remaining segments as the inner-class path.
+    if let Some(entry) = state.workspace.index.registry().get(head) {
         if let Some(fid) = state.workspace.index.file_id(&entry.path) {
             let dt = DataType {
                 kind: DtKind::Script,
                 type_source: gd_analyze::TypeSource::AnnotatedExplicit,
                 script_type: Some(gd_analyze::ScriptRef {
                     file: fid,
-                    inner: Vec::new(),
+                    inner: rest.to_vec(),
                 }),
                 ..Default::default()
             };
@@ -1006,28 +1019,51 @@ fn type_attribute_members(
     Vec::new()
 }
 
-/// The identifier text of the token immediately before the dot at `dot_start` (the base name in
-/// `Base.<cursor>` / `Base.partial`), if it is a simple name token. `None` otherwise.
-fn base_name_before(tokens: &[gd_syntax::token::Token], dot_start: usize) -> Option<String> {
+/// The dotted type-name chain immediately before `dot_start` (`["Outer", "Inner"]` for
+/// `Outer.Inner.<cursor>`), reading contiguous `name (. name)*` tokens leftward. Stops at the first
+/// non-identifier / non-`.` token (so `foo().Inner.` or `a + B.` only yields the trailing run), and
+/// drops a chain whose run is interrupted by a non-`.` separator. Returns the segments in source
+/// order. Empty when the token before the dot isn't a simple name.
+fn dotted_type_chain_before(tokens: &[gd_syntax::token::Token], dot_start: usize) -> Vec<String> {
     use gd_syntax::token::TokenKind;
-    tokens
+    let mut segments: Vec<String> = Vec::new();
+    // Index of the token whose end is at-or-before `dot_start` — walk leftward from there.
+    let mut idx = tokens
         .iter()
-        .rev()
-        .filter(|t| {
-            t.span.end <= dot_start
-                && !matches!(
-                    t.kind,
-                    TokenKind::Newline
-                        | TokenKind::Indent
-                        | TokenKind::Dedent
-                        | TokenKind::Eof
-                        | TokenKind::Error
-                )
-        })
-        .find_map(|t| {
-            (t.kind == TokenKind::Identifier || t.kind.is_identifier())
-                .then(|| t.source.to_string())
-        })
+        .rposition(|t| t.span.end <= dot_start && is_meaningful(t.kind));
+    // Alternate: expect a name, then a `.`, then a name, … leftward.
+    let mut expect_name = true;
+    while let Some(i) = idx {
+        let t = &tokens[i];
+        if expect_name {
+            if t.kind == TokenKind::Identifier || t.kind.is_identifier() {
+                segments.push(t.source.to_string());
+                expect_name = false;
+            } else {
+                break;
+            }
+        } else if t.kind == TokenKind::Period {
+            expect_name = true;
+        } else {
+            break;
+        }
+        idx = tokens[..i].iter().rposition(|t| is_meaningful(t.kind));
+    }
+    segments.reverse();
+    segments
+}
+
+/// Whether a token is a meaningful (non-layout, non-error) token for a leftward name-chain scan.
+fn is_meaningful(kind: gd_syntax::token::TokenKind) -> bool {
+    use gd_syntax::token::TokenKind;
+    !matches!(
+        kind,
+        TokenKind::Newline
+            | TokenKind::Indent
+            | TokenKind::Dedent
+            | TokenKind::Eof
+            | TokenKind::Error
+    )
 }
 
 // ===================================================================================================
@@ -1370,31 +1406,55 @@ fn property_method_items(
         .collect()
 }
 
+/// `var x: T:\n\t<cursor>` — the bare property-accessor keywords `get`/`set` (Godot
+/// `COMPLETION_PROPERTY_DECLARATION`, `gdscript_editor.cpp:3543`, which inserts exactly those two as
+/// plain text). A fixed two-item list; the keyword inserts the bare word (no parens — the accessor
+/// block continues with `:` or `=` after it, which the user types).
+fn property_accessor_items(render: &RenderCtx) -> Vec<CompletionItem> {
+    ["get", "set"]
+        .into_iter()
+        .enumerate()
+        .map(|(rank, kw)| {
+            keyword_item(
+                kw,
+                CompletionItemKind::KEYWORD,
+                CompletionData::Keyword,
+                rank,
+                render,
+            )
+        })
+        .collect()
+}
+
 // ===================================================================================================
 // OVERRIDE_METHOD — `func <cursor>` in a class body: overridable virtuals with a signature stub.
 // ===================================================================================================
 
-/// `func <cursor>` at class-body statement start — the overridable parent **virtuals**, each
-/// rendered as a full signature stub (Godot `COMPLETION_OVERRIDE_METHOD`,
-/// `gdscript_editor.cpp:3681`).
+/// `func <cursor>` at class-body statement start — the overridable parent methods, each rendered as
+/// a full signature stub (Godot `COMPLETION_OVERRIDE_METHOD`, `gdscript_editor.cpp:3681`).
 ///
-/// **Scope (Phase 4):** only the native tail's `is_virtual` methods (`_ready`, `_process`,
-/// `_input`, … — the overridable set people actually use) are offered, with their real
-/// `(params) -> Ret` signature from the native DB. Script-parent method overrides are a documented
-/// limitation this phase: the cross-file [`gd_project::Interface`] records a member's parameter
-/// *types* but not their *names*, so a faithful `func name(param: T):` stub can't be rendered — and
-/// offering `name():` with the wrong arity would be a "never lie" breach.
+/// **Two sources, in Godot's order** (`gdscript_editor.cpp:3685-3759`):
+/// - **Script-parent methods.** Godot's CLASS branch (`:3688-3708`) walks the `extends` chain
+///   inserting **every** inherited `FUNCTION` member (not just virtuals — any parent `func` is
+///   overridable), skipping ones already seen or already defined in the current class. The
+///   `static`-ness must match the cursor's (`:3701`); this context only fires for a bare
+///   non-`static` `func` (the classifier's [`is_class_body_func_position`] requires `func` to open
+///   the line), so only non-`static` parent funcs are offered. The stub is rendered from the
+///   declaring file's real parsed signature (params with their **written** default text, never a
+///   fabricated default — see [`script_override_stub_item`]).
+/// - **Native virtuals** (the chain's native tail, `:3729+`): the `is_virtual` methods (`_ready`,
+///   `_process`, …), with their real `(params) -> Ret` from the native DB.
 ///
-/// **A virtual the class already overrides is skipped** (Godot's `has_function(...) continue`,
-/// `gdscript_editor.cpp:3744`). `self_chain_members` yields the chain **name-first** (the in-file
-/// override's own `_ready` before the native `Node._ready`), but it does **not** dedup its native
-/// tail against the script members, so both can appear. A first-wins name-dedup here makes the
-/// own/inherited-script method shadow the same-named native virtual, which the native-only filter
-/// then drops — so an already-overridden `_ready` is not re-offered while a fresh `_process` is.
+/// **A method the class already overrides is skipped** (Godot's `has_function(...) continue`,
+/// `:3697`/`:3744`). `self_chain_members` yields the chain **name-first** (the in-file override's own
+/// `_ready` before the inherited one), so a first-wins name-dedup makes the own/inherited method
+/// shadow the same-named parent method — an already-overridden `_ready` is not re-offered while a
+/// fresh `_process` is. The dedup runs across the whole chain (script members + the native tail).
 fn override_method_items(
     state: &ServerState,
     tree: &ParseTree,
     analyzed: Option<&AnalysisResult>,
+    own_file: Option<gd_project::FileId>,
     render: &RenderCtx,
 ) -> Vec<CompletionItem> {
     let Some(analyzed) = analyzed else {
@@ -1403,20 +1463,223 @@ fn override_method_items(
     let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
     self_chain_members(state, tree, analyzed)
         .into_iter()
-        // First-wins name-dedup across the whole chain (incl. the native tail): an own/inherited
-        // script method shadows the native virtual of the same name (the already-overridden skip).
+        // First-wins name-dedup across the whole chain (script members + the native tail): an
+        // own/inherited method shadows the same-named parent method (the already-overridden skip).
+        // The in-file class's own members come first, so a method it already defines is consumed
+        // here (the `seen.insert`) and never re-offered.
         .filter(|m| seen.insert(m.name.clone()))
-        .filter(|m| {
-            // Native virtual methods only. `is_virtual` is set only for native members; a script /
-            // in-file method has `is_virtual = false`, so it (and any native virtual it shadowed
-            // above) is excluded — exactly the already-overridden and own-method skips.
-            matches!(m.kind, MemberItemKind::Method)
-                && matches!(m.owner, MemberOwner::Native(_))
-                && m.is_virtual
+        .filter_map(|m| match &m.owner {
+            // Native virtuals: `is_virtual` is set only for native members. Rendered from the
+            // member's `detail` (`(params) -> Ret`).
+            MemberOwner::Native(_) if matches!(m.kind, MemberItemKind::Method) && m.is_virtual => {
+                Some(OverrideStub::Native(m))
+            }
+            // The class's OWN methods (declared in this very file) are not override candidates —
+            // they are already defined here (Godot's `current_class->has_function` skip,
+            // `gdscript_editor.cpp:3697`). They still consumed their name in `seen` above, so an
+            // inherited same-named method is shadowed; they are simply not offered.
+            MemberOwner::Script(file) if Some(*file) == own_file => None,
+            // Script-PARENT methods: any inherited `func`. `is_static` is not tracked on the
+            // enumerated `MemberItem` (always `false`), so the declaring file's interface is the
+            // source of truth for the `static`-match filter and the `name_span` the stub renders
+            // from. A method whose declarer can't be resolved is dropped (never a fabricated stub).
+            MemberOwner::Script(file) if matches!(m.kind, MemberItemKind::Method) => {
+                let stub = script_override_stub(state, *file, &m.name)?;
+                Some(OverrideStub::Script(m, stub))
+            }
+            _ => None,
         })
         .enumerate()
-        .map(|(rank, m)| override_stub_item(&m, rank, render))
+        .map(|(rank, stub)| match stub {
+            OverrideStub::Native(m) => override_stub_item(&m, rank, render),
+            OverrideStub::Script(m, signature) => {
+                script_override_stub_item(&m.name, &signature, rank, render)
+            }
+        })
         .collect()
+}
+
+/// One resolved override-completion entry, tagged by source so the rank-and-render pass can build
+/// the right item (a native virtual from its `detail`, a script parent from its reparsed signature).
+enum OverrideStub {
+    Native(MemberItem),
+    Script(MemberItem, String),
+}
+
+/// The `name<signature>` override-stub text for a script-parent method (e.g.
+/// `do_it(times: int, who, loud: bool = true) -> String`), or `None` when the method is `static` (it
+/// can't be overridden from a non-`static` `func` cursor — Godot's `is_static !=
+/// member.function->is_static` skip, `gdscript_editor.cpp:3701`), or when the declaring file / its
+/// `func` node / its signature span can't be resolved.
+///
+/// The signature is the **verbatim source substring** the author wrote — Godot renders
+/// `identifier->name + member.function->signature + ":"`, where `signature` is the literal source
+/// from the parameter list through the return type, captured by `substr` (`gdscript_parser.cpp:1736`,
+/// `gdscript_editor.cpp:3705`). So an untyped parameter stays bare (no synthesized `: Variant`), an
+/// absent return annotation appends nothing (no synthesized `-> void`), and every default expression
+/// is exactly as typed. The trailing block-opening `:` is dropped here ([`script_override_stub_item`]
+/// re-appends it).
+fn script_override_stub(
+    state: &ServerState,
+    file: gd_project::FileId,
+    name: &str,
+) -> Option<String> {
+    let iface = state.workspace.index.interface(file)?;
+    let decl = iface
+        .members
+        .iter()
+        .find(|m| m.name == name && m.kind == gd_project::MemberKind::Func)?;
+    // The `OverrideMethod` context only fires for a bare (non-`static`) `func` cursor, so a `static`
+    // parent method does not match and is skipped (faithful to the `is_static !=` gate).
+    if decl.flags.is_static {
+        return None;
+    }
+    let name_span = decl.name_span;
+    let path = state.workspace.index.path(file)?;
+    let src = file_text_at(state, path)?;
+    let parsed = gd_syntax::parse(&src);
+    let (func_id, func) = function_at_name_span(&parsed.tree, name_span, name)?;
+    let signature = verbatim_signature(&parsed.tree, &src, func_id, func)?;
+    Some(format!("{name}{signature}"))
+}
+
+/// The verbatim `(params) -> Ret` signature source of a `FunctionNode` — the substring from just
+/// after the name (the `(`) through the return type, with the block-opening `:` and trailing layout
+/// removed. Mirrors Godot's `signature` capture (`gdscript_parser.cpp:1733-1737`): the literal
+/// author text, never a reconstruction. `None` when the spans are unusable.
+fn verbatim_signature(
+    tree: &ParseTree,
+    src: &str,
+    func_id: NodeId,
+    func: &gd_syntax::ast::FunctionNode,
+) -> Option<String> {
+    let name_id = func.identifier?;
+    let after_name = tree.get(name_id).span.end;
+    // The slice `name.end..end` is `(params) -> Ret:<layout>` (the parser re-anchors the body Suite
+    // *after* the block colon + newline + indent, even for an `@abstract` func that has no real
+    // body, so `body.start` always lands past the signature). `func_id` span end is the fallback.
+    let end = func
+        .body
+        .map(|b| tree.get(b).span.start)
+        .unwrap_or_else(|| tree.get(func_id).span.end);
+    if after_name > end || end > src.len() {
+        return None;
+    }
+    let slice = src.get(after_name..end)?;
+    // Cut at the block-opening `:` — the FIRST `:` at bracket depth 0 (a parameter type colon is
+    // inside the `(...)` at depth ≥ 1; a dict-literal default `{"a": 1}` is at depth ≥ 1 too; the
+    // return arrow `->` carries no colon). An `@abstract` func has NO block colon (no depth-0 `:`),
+    // so the whole structural slice is kept — never truncated at a param colon.
+    let cut = block_colon_offset(slice).unwrap_or(slice.len());
+    Some(slice[..cut].trim_end().to_string())
+}
+
+/// The byte offset of the first bracket-depth-0 `:` in a function signature slice (`(params) -> Ret:`)
+/// — the block-opening colon — or `None` when there is none (an abstract func). Tracks `()`/`[]`/`{}`
+/// depth so a parameter-type colon or a dict-literal-default colon (both at depth ≥ 1) is skipped,
+/// and string literals (with `\`-escapes) so a `:`/bracket/quote inside a string default never
+/// confuses the scan. A `#` line comment inside a multi-line signature is NOT special-cased (rare;
+/// Godot's `substr` would keep the comment verbatim too) — a `:` in such a comment is a known gap.
+fn block_colon_offset(slice: &str) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let mut in_str: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in slice.char_indices() {
+        match in_str {
+            Some(q) => {
+                // A `\`-escaped char (incl. an escaped quote `\"`) does not terminate the string —
+                // skip it so an odd number of escaped quotes can't corrupt the in-string state.
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    in_str = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => in_str = Some(c),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                ':' if depth == 0 => return Some(i),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// One script-parent override-method stub item. Mirrors [`override_stub_item`] but takes a
+/// pre-rendered `name(params) -> Ret` signature (the native path reads it from `detail`); the label
+/// and plain insert are `signature:` and the snippet drops the cursor into an indented body.
+fn script_override_stub_item(
+    name: &str,
+    signature: &str,
+    rank: usize,
+    render: &RenderCtx,
+) -> CompletionItem {
+    let display = format!("{signature}:");
+    let snippet =
+        (render.caps.snippet_support && render.config.snippets).then(|| format!("{display}\n\t$0"));
+    build_item_with(
+        ItemText {
+            label: &display,
+            filter: name,
+        },
+        CompletionItemKind::METHOD,
+        ItemInsert {
+            plain: display.clone(),
+            snippet,
+        },
+        CompletionData::Keyword,
+        rank,
+        render,
+    )
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Declaring-file lookup helpers (override stubs). `file_text_at` / `function_at_name_span` /
+// `ident_text_node` mirror small private equivalents in `signature_help.rs`; kept local so the two
+// cursor features stay decoupled (signature_help is a separate concern). The signature itself is
+// the VERBATIM source substring (see `verbatim_signature`), not a reconstruction.
+// ---------------------------------------------------------------------------------------------------
+
+/// The text of file `path`: the live VFS buffer if open, else the on-disk contents. `None` when the
+/// file is neither open nor readable.
+fn file_text_at(state: &ServerState, path: &camino::Utf8Path) -> Option<String> {
+    let uri = crate::uri::path_to_file_uri(path)?;
+    if let Some(d) = state.vfs.get(uri.as_str()) {
+        return Some(d.text());
+    }
+    std::fs::read_to_string(path.as_std_path()).ok()
+}
+
+/// The `FunctionNode` whose identifier span equals `name_span` AND whose identifier text equals
+/// `name` (the precise declaring function — the name re-check guards against a coincidental span
+/// collision after a re-parse of the possibly-newer declaring file, per `MemberDecl::name_span`'s
+/// "validate against live text" contract). `None` when no function matches.
+fn function_at_name_span<'a>(
+    tree: &'a ParseTree,
+    name_span: gd_syntax::ByteSpan,
+    name: &str,
+) -> Option<(NodeId, &'a gd_syntax::ast::FunctionNode)> {
+    use gd_syntax::ast::NodeKind;
+    tree.iter_ids().find_map(|id| {
+        let NodeKind::Function(f) = &tree.get(id).kind else {
+            return None;
+        };
+        let ident = f.identifier?;
+        (tree.get(ident).span == name_span && ident_text_node(tree, ident) == name)
+            .then_some((id, f))
+    })
+}
+
+/// The identifier text of an `Identifier` node, or `""` for any other kind.
+fn ident_text_node(tree: &ParseTree, id: gd_syntax::ast::NodeId) -> String {
+    match &tree.get(id).kind {
+        gd_syntax::ast::NodeKind::Identifier(i) => i.name.clone(),
+        _ => String::new(),
+    }
 }
 
 /// One override-method stub item. The label is `name(params) -> Ret:` (the Godot

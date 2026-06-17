@@ -343,6 +343,58 @@ fn property_accessor_method_is_not_assign() {
 }
 
 #[test]
+fn bare_accessor_keyword_is_property_accessor() {
+    // `var x: int:\n\t<partial>` at the accessor-keyword position offers the `get`/`set` keywords
+    // (Godot COMPLETION_PROPERTY_DECLARATION). Both the first accessor and a second one (after a
+    // completed `get:` body) classify as PropertyAccessor.
+    for m in [
+        "var x: int:\n\tg|",
+        "var x: int:\n\ts|",
+        "var x: int:\n\tget:\n\t\treturn 0\n\ts|",
+    ] {
+        let ctx = at(m);
+        assert_eq!(
+            ctx.kind,
+            CompletionKind::PropertyAccessor,
+            "`{m}` must be PropertyAccessor"
+        );
+    }
+}
+
+#[test]
+fn accessor_body_expression_is_not_property_accessor() {
+    // INSIDE an accessor body (`get:\n\t\tprin|`, `set(v):\n\t\tv|`) the cursor is in the body's
+    // Function/Suite, NOT at the keyword position — it is a plain Identifier context, never
+    // PropertyAccessor. Guards the AST barrier (a Function/Suite between the cursor and the
+    // property Variable rejects the match).
+    for m in [
+        "var x: int:\n\tget:\n\t\tprin|",
+        "var x: int:\n\tset(v):\n\t\tv|",
+    ] {
+        let ctx = at(m);
+        assert_ne!(
+            ctx.kind,
+            CompletionKind::PropertyAccessor,
+            "an accessor-body expression `{m}` must NOT be PropertyAccessor"
+        );
+    }
+}
+
+#[test]
+fn ordinary_body_word_is_not_property_accessor() {
+    // A partial word at a function-body / class-body statement start (not an accessor block) must
+    // never be PropertyAccessor — the property-style Variable signal is absent there.
+    for m in ["func foo():\n\tg|", "var y := 1\nfunc foo():\n\tg|"] {
+        let ctx = at(m);
+        assert_ne!(
+            ctx.kind,
+            CompletionKind::PropertyAccessor,
+            "an ordinary-body word `{m}` must NOT be PropertyAccessor"
+        );
+    }
+}
+
+#[test]
 fn get_call_is_not_property_method() {
     // `x = get(` is a *call* to a `get` method, NOT a property accessor (the `get` follows `=`, not a
     // line start). Must not be PropertyMethod.

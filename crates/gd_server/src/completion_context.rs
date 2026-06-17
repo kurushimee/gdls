@@ -135,6 +135,13 @@ pub enum CompletionKind {
     /// so this is distinct from [`CompletionKind::Assign`].
     PropertyMethod,
 
+    /// The bare accessor-keyword position of an inline property block: `var x: int:\n\t|` /
+    /// `var x: int:\n\tg|` — Godot's `COMPLETION_PROPERTY_DECLARATION` (`gdscript_parser.cpp:1288`),
+    /// which offers exactly the plain-text keywords `get`/`set` (`gdscript_editor.cpp:3543`). Distinct
+    /// from [`CompletionKind::PropertyMethod`] (the `get = <method>` binding side) and from a generic
+    /// [`CompletionKind::Identifier`] in an ordinary class/function body.
+    PropertyAccessor,
+
     /// A context gdls deliberately does not serve in v1: `$`/`%`/`get_node(...)` node paths and
     /// `load`/`preload` file paths (the scene/resource index lands in M11). Carried explicitly so a
     /// handler returns an empty list here instead of misclassifying it as a member or identifier.
@@ -988,6 +995,19 @@ fn classify_anchored(
                 _ => {}
             }
         }
+        // A partial word at the start of an inline property-accessor line (`var x: int:\n\tg|`) →
+        // the bare `get`/`set` keyword completion. Gated on the word opening the line (its raw
+        // predecessor is layout, so an in-body expression `get:\n\t\tprin|` is excluded) AND the AST
+        // showing a property-style `Variable` enclosing the cursor.
+        if i.checked_sub(1)
+            .is_none_or(|prev| is_layout(tokens[prev].kind))
+            && ast_is_property_accessor_position(tree, byte)
+        {
+            return Some(CompletionContext::new(
+                CompletionKind::PropertyAccessor,
+                prefix,
+            ));
+        }
     }
     // `extends ` with a trailing space (anchor is the `extends` keyword itself).
     if anchor_kind == Extends {
@@ -1153,6 +1173,43 @@ fn is_declaration_colon(tokens: &[Token], i: usize) -> bool {
             _ => {}
         }
         j -= 1;
+    }
+    false
+}
+
+/// Whether the cursor sits at the bare accessor-keyword position of an inline property block
+/// (`var x: T:\n\t<cursor>`, `var x: T:\n\tget:\n\t\t…\n\t<cursor>`) — where Godot offers the `get`/
+/// `set` keywords (`COMPLETION_PROPERTY_DECLARATION`). The reliable signal is the AST: a `Variable`
+/// node whose `property` is a property style (`Inline`/`SetGet`, never `None`) **encloses** the
+/// cursor (probing `byte` and `byte-1`, since the partial accessor identifier sits at the node's
+/// trailing edge). This distinguishes the accessor block from an ordinary class body (where the
+/// enclosing node is the `Class`) or a function body (a `Suite`), which the property-style Variable
+/// never covers. The caller additionally gates on the word being at line start (the accessor-name
+/// position), so an in-accessor-body expression (`get:\n\t\tprin|`) does not match.
+fn ast_is_property_accessor_position(tree: &ParseTree, byte: usize) -> bool {
+    if tree.is_empty() {
+        return false;
+    }
+    for probe in [byte, byte.saturating_sub(1)] {
+        if let Some(id) = tree.innermost_node_at(probe) {
+            // Walk from the cursor's innermost node outward. The accessor-KEYWORD position reaches a
+            // property `Variable` directly (chain `Identifier → Variable`). A position INSIDE an
+            // accessor BODY (`get:\n\t\tprin|`) instead reaches the body's `Function`/`Suite` first
+            // (chain `Identifier → Suite → Function → Variable`) — so a `Function`/`Suite` between
+            // the cursor and the property `Variable` means we are in an accessor body, NOT at the
+            // keyword position. Reject the moment one is seen.
+            let mut cur = Some(id);
+            while let Some(n) = cur {
+                match &tree.get(n).kind {
+                    NodeKind::Function(_) | NodeKind::Suite(_) => break,
+                    NodeKind::Variable(v) if v.property != gd_syntax::ast::PropertyStyle::None => {
+                        return true
+                    }
+                    _ => {}
+                }
+                cur = smallest_node_strictly_containing(tree, n);
+            }
+        }
     }
     false
 }
