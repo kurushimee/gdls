@@ -2272,8 +2272,15 @@ fn cursor_references_global_class(
         return true;
     }
     // (c) TYPE position base segment (`extends X` / `: X`) naming a registered global class — type
-    // positions carry no binding, so they are recognized structurally.
-    if cursor_is_type_base_segment(tree, node_id) {
+    // positions carry no binding, so they are recognized structurally. Occurrence-positive: a base
+    // segment whose nearest enclosing class scope (root OR any inner class) declares its OWN type
+    // `name` (`enum`/inner `class`/`const` alias) refers to that LOCAL type, NOT the global class —
+    // so it is NOT admitted here (it must resolve to the inner type, never canonicalize onto the
+    // global `class_name` decl). Only an unshadowed base segment is a genuine global-class reference.
+    // #167.
+    if cursor_is_type_base_segment(tree, node_id)
+        && !tree.type_name_shadowed_by_enclosing_scope(node_span.start, name)
+    {
         return true;
     }
     // (a) EXPRESSION position: a Class-kind use binding at the cursor span pointing at THIS class.
@@ -4232,15 +4239,21 @@ fn push_global_class_locations(
     // (2) Type-position base segments named `name` (carry no binding). Restricted to index 0 of an
     // `extends` chain / `TypeNode.type_chain`, so a `Foo.Inner` suffix is never collected.
     //
-    // A file that locally declares `name` as a root `enum`/inner-class SHADOWS the global class, so
-    // every type position naming `name` in that file refers to the LOCAL type, not this class — skip
-    // them all. (Part 1 above contributes nothing for such a file either: a shadowed `name` reduces
-    // to the local type and records no Class use binding.) Without this guard, renaming a global
-    // `class_name Foo` would rewrite a CONSUMER's own `var y: Foo` whose `Foo` is its in-file enum —
-    // the candidate-side twin of the in-file-type collision.
-    if name_is_in_file_root_type(tree, name) {
-        return;
-    }
+    // Each base segment is resolved PER OCCURRENCE through the nested class scopes lexically enclosing
+    // it ([`ParseTree::type_name_shadowed_by_enclosing_scope`]): a `: Foo` / `extends Foo` whose
+    // nearest enclosing class scope (root OR any inner class) declares its OWN type `Foo` (an `enum`,
+    // an inner `class`, or a `const Foo = preload(...)` alias) refers to that LOCAL type — NOT the
+    // global `class_name Foo` — and is SUPPRESSED. Only an occurrence that resolves to the global
+    // (no enclosing scope shadows it) is collected. This is occurrence-positive: a base segment is
+    // edited because per-node scope resolution proves it names the global class, never merely because
+    // no file-level shadow was found.
+    //
+    // (This replaces the former file-level early-return skip — `name_is_in_file_root_type(tree, name)`
+    // → suppress the WHOLE file — which over-suppressed a legitimate `extends Foo` (the global) in a
+    // file that ALSO declared an inner `enum Foo`, forcing the rename to refuse. The per-occurrence
+    // walk separates the two. #167. Part (1) above stays occurrence-positive by construction: a `Foo`
+    // expression inside a scope that shadows it reduces to the local type and records no Class-use
+    // binding pointing at this class file, so it is already excluded there.)
     for nid in tree.iter_ids() {
         let base_id = match &tree.get(nid).kind {
             NodeKind::Class(c) => c.extends.first().copied(),
@@ -4250,7 +4263,9 @@ fn push_global_class_locations(
         if let Some(base_id) = base_id {
             let base = tree.get(base_id);
             if let NodeKind::Identifier(i) = &base.kind {
-                if i.name == name {
+                if i.name == name
+                    && !tree.type_name_shadowed_by_enclosing_scope(base.span.start, name)
+                {
                     out.push(Location {
                         uri: uri.clone(),
                         range: mapper.span_to_range(base.span),

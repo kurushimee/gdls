@@ -905,6 +905,91 @@ impl ParseTree {
         }
         out
     }
+
+    /// `true` iff the class node `class_id` declares a member named `name` usable in a TYPE-annotation
+    /// position — a nested `enum`, an inner `class`, or a `const` alias (`const Hero = preload(...)`).
+    /// The COMPLETE type-position member set is `{Enum, Class, Constant}` (a `var`/`func`/`signal`
+    /// cannot annotate a type), so a hit here is unambiguously a TYPE named `name` declared in that
+    /// scope — never an unrelated value/member that happens to share the spelling. The shared building
+    /// block of [`Self::type_name_shadowed_by_enclosing_scope`].
+    fn class_declares_type_named(&self, class_id: NodeId, name: &str) -> bool {
+        let NodeKind::Class(class) = &self.get(class_id).kind else {
+            return false;
+        };
+        class.members.iter().any(|m| match m {
+            Member::Enum(id) => {
+                matches!(&self.get(*id).kind, NodeKind::Enum(en) if en.identifier.map(|i| self.ident_text(i)) == Some(name))
+            }
+            Member::Class(id) => {
+                matches!(&self.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| self.ident_text(i)) == Some(name))
+            }
+            Member::Constant(id) => {
+                matches!(&self.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| self.ident_text(i)) == Some(name))
+            }
+            _ => false,
+        })
+    }
+
+    /// The text of an identifier node, or `""` if `id` is not an [`NodeKind::Identifier`]. A small
+    /// borrow helper for the member-name comparisons above (`Some(self.ident_text(i)) == Some(name)`
+    /// stays a cheap `&str` compare).
+    fn ident_text(&self, id: NodeId) -> &str {
+        match &self.get(id).kind {
+            NodeKind::Identifier(i) => i.name.as_str(),
+            _ => "",
+        }
+    }
+
+    /// **Per-occurrence scope-aware type-name resolution.** Given a TYPE-position identifier at `byte`
+    /// (textually `name` — the base segment of an `extends`/`: T` chain, e.g. `extends Foo` / `: Foo` /
+    /// `: Foo.Inner` on `Foo`), decide whether `name` resolves to a TYPE declared in some enclosing
+    /// CLASS scope (root or any inner class) rather than to a global `class_name` of the same name.
+    ///
+    /// Returns `true` iff the NEAREST enclosing class scope that declares a type named `name`
+    /// (`enum`/inner `class`/`const` alias) exists — i.e. a LOCAL shadow is in scope at `byte`. Godot
+    /// resolves a type name through nested class scopes inner-out: an inner-class member shadows the
+    /// enclosing class's member, which shadows the global registry. So if ANY class lexically enclosing
+    /// `byte` declares the name as a type, the occurrence means that local type, NOT the global class —
+    /// and a global-`class_name` rename must SUPPRESS it (it is not a reference to the class). When no
+    /// enclosing scope declares it, the occurrence falls through to the global registry → `false`, and
+    /// the caller (which has already confirmed a global `class_name name` exists) collects it.
+    ///
+    /// This is the TYPE-position analogue of [`Self::resolve_local_binding_at`]: same scope-walk
+    /// discipline (innermost-first, first declaring scope wins), but over CLASS scopes (nested by span
+    /// containment in the arena — children are pushed after parents, so the smallest-span `Class` node
+    /// containing `byte` is the innermost enclosing class) rather than block/suite scopes. The walk is
+    /// purely lexical/structural (no analyzer pass): a type-position class reference carries no
+    /// `Binding::Use`, so this positional resolution is what a mutating consumer must use to tell an
+    /// inner `: Foo` (the inner enum/class/`const`) from a top-level `: Foo` (the global `class_name`)
+    /// per occurrence, instead of refusing the whole rename when both coexist in reach.
+    ///
+    /// `byte` should be inside the type-position identifier token. When `byte` is at class scope (no
+    /// enclosing `Class` node beyond the file root — the root always encloses everything) the root's
+    /// own members are still consulted, so a root-scope `: Foo` shadowed by a root `enum Foo` resolves
+    /// to the local. Returns `false` for a `byte` outside any class (an empty/degenerate tree).
+    pub fn type_name_shadowed_by_enclosing_scope(&self, byte: usize, name: &str) -> bool {
+        // Collect every class scope whose span contains `byte`, innermost (smallest span) first. The
+        // root class contains the whole file, so it is always included when present. A type member
+        // declared in ANY of these enclosing scopes shadows the global registry for this occurrence
+        // (members are visible throughout their class body, including its nested inner classes).
+        let mut enclosing: Vec<(NodeId, u32)> = Vec::new();
+        for id in self.iter_ids() {
+            let node = self.get(id);
+            if !matches!(node.kind, NodeKind::Class(_)) {
+                continue;
+            }
+            if node.span.start <= byte && byte < node.span.end {
+                enclosing.push((id, (node.span.end - node.span.start) as u32));
+            }
+        }
+        // Innermost-first: smallest enclosing span wins the shadow race, matching Godot's inner-out
+        // scope resolution. (The decision is a boolean "is it shadowed at all", so order only documents
+        // the resolution semantics — a single declaring scope anywhere in the chain returns `true`.)
+        enclosing.sort_by_key(|&(_, width)| width);
+        enclosing
+            .iter()
+            .any(|&(class_id, _)| self.class_declares_type_named(class_id, name))
+    }
 }
 
 impl std::ops::Index<NodeId> for ParseTree {
