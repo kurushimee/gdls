@@ -2061,17 +2061,24 @@ fn rename_cross_file_class_name_enum_value_from_declaration_covers_cross_file_us
 fn rename_cross_file_class_name_enum_value_decoy_matrix_is_occurrence_positive() {
     // #158 OCCURRENCE-POSITIVE CORRUPTION GUARD — the dangerous over-rename direction. Renaming
     // `Foo`'s `enum Direction { NORTH }` value FROM ITS DECLARATION must edit, by IDENTITY, ONLY the
-    // accesses that resolve to THIS value (declaring file `foo.gd` + qualified `Direction.NORTH`):
+    // accesses that resolve to THIS value (declaring file `foo.gd` + qualified `Foo.Direction.NORTH`).
+    // Every other same-named token is a DECOY that must stay untouched:
     //   - foo.gd:   the decl `NORTH`                          → EDITED
     //   - cons.gd:  `Foo.Direction.NORTH`                     → EDITED   (resolves to foo's value)
     //   - cons.gd:  `Bar.Direction.NORTH`  (DECOY, diff class)→ NOT edited (resolves to bar's value)
     //   - cons.gd:  bare `NORTH`            (DECOY, unrelated) → NOT edited (a local/unresolved name)
     //   - cons.gd:  `const NORTH := 1`      (DECOY, unrelated)→ NOT edited (a same-named const)
     //   - bar.gd:   `enum Direction { NORTH }` decl (DECOY)   → NOT edited (a different class's value)
+    // PLUS the 4 #181 decoys (same target_file `Foo`, so the file discriminator alone can't reject —
+    // identity must):
+    //   - cons.gd:  `Foo.OtherEnum.NORTH`   (DECOY, same class, OTHER enum) → NOT edited
+    //   - cons.gd:  `Foo.Direction.SOUTH`   (DECOY, same enum, OTHER value) → NOT edited
+    //   - cons.gd:  a local `var NORTH`     (DECOY, shadows the name)       → NOT edited
+    //   - cons.gd:  the consumer's OWN `enum Direction { NORTH }` decl      → NOT edited
     let project = common::sample_project();
     project.write(
         "src/foo.gd",
-        "class_name Foo\nextends Node\n\nenum Direction { NORTH, SOUTH }\n",
+        "class_name Foo\nextends Node\n\nenum Direction { NORTH, SOUTH }\nenum OtherEnum { NORTH }\n",
     );
     project.write(
         "src/bar.gd",
@@ -2079,11 +2086,14 @@ fn rename_cross_file_class_name_enum_value_decoy_matrix_is_occurrence_positive()
     );
     project.write(
         "src/cons.gd",
-        "extends Node\n\nconst NORTH := 1\n\nfunc f() -> void:\n\t\
+        "extends Node\n\nconst NORTH := 1\n\nenum Direction { NORTH }\n\nfunc f() -> void:\n\t\
+         var NORTH := 9\n\t\
          var a = Foo.Direction.NORTH\n\t\
          var b = Bar.Direction.NORTH\n\t\
          var c = NORTH\n\t\
-         print([a, b, c])\n",
+         var d = Foo.OtherEnum.NORTH\n\t\
+         var e = Foo.Direction.SOUTH\n\t\
+         print([a, b, c, d, e])\n",
     );
     let (client, server) = boot();
     init_open(
@@ -2122,20 +2132,22 @@ fn rename_cross_file_class_name_enum_value_decoy_matrix_is_occurrence_positive()
         .map(|(u, r)| (u.clone(), r.start.line, r.start.character))
         .collect();
     sites.sort();
-    // foo.gd decl (3,16); cons.gd `Foo.Direction.NORTH` use. On cons.gd line 5
+    // foo.gd decl (3,17); cons.gd `Foo.Direction.NORTH` use. On cons.gd line 8
     // (`\tvar a = Foo.Direction.NORTH`): tab(0) `var a = `(1-8) `Foo`(9-11) `.`(12) `Direction`(13-21)
-    // `.`(22) `NORTH`(23). So (5,23).
+    // `.`(22) `NORTH`(23). So (8,23).
     assert_eq!(
         sites,
         vec![
-            (cons_uri.as_str().to_string(), 5, 23),
+            (cons_uri.as_str().to_string(), 8, 23),
             (foo_uri.as_str().to_string(), 3, 17),
         ],
         "the edit must cover ONLY foo's value decl + the `Foo.Direction.NORTH` use, by identity; \
          got {sites:?}"
     );
     // Decoy proof: nothing in bar.gd is touched, and cons.gd's `Bar.Direction.NORTH` / bare `NORTH` /
-    // `const NORTH` are all untouched (only the one (5,23) site in cons.gd is edited).
+    // `const NORTH` / the #181 decoys (`Foo.OtherEnum.NORTH`, `Foo.Direction.SOUTH`, a local
+    // `var NORTH`, the consumer's own `enum Direction { NORTH }`) are all untouched (only the one
+    // (8,23) site in cons.gd is edited).
     assert!(
         !view.set.iter().any(|(u, _)| *u == bar_uri.as_str()),
         "a DIFFERENT class's same-named enum value (bar.gd) must NOT be edited: {:?}",
@@ -2149,9 +2161,11 @@ fn rename_cross_file_class_name_enum_value_decoy_matrix_is_occurrence_positive()
         .collect();
     assert_eq!(
         cons_sites,
-        vec![(5, 23)],
-        "in the consumer, ONLY `Foo.Direction.NORTH` may be edited — never `Bar.Direction.NORTH` \
-         (line 6), bare `NORTH` (line 7), or `const NORTH` (lines 2/7); got {cons_sites:?}"
+        vec![(8, 23)],
+        "in the consumer, ONLY `Foo.Direction.NORTH` (line 8) may be edited — never \
+         `Bar.Direction.NORTH` (line 9), bare `NORTH` (line 10), `const NORTH` (line 2), the local \
+         `var NORTH` (line 7), the consumer's own `enum Direction {{ NORTH }}` (line 4), \
+         `Foo.OtherEnum.NORTH` (line 11), or `Foo.Direction.SOUTH` (line 12); got {cons_sites:?}"
     );
     shutdown(&client, server);
 }
@@ -4021,4 +4035,241 @@ fn rename_163_func_local_const_alias_stays_safe() {
         view.set
     );
     shutdown(&client, server);
+}
+
+// =================================================================================================
+// #181: anchor-side local over-capture. A rename use-click on an ATTRIBUTE-position identifier
+// (`self.NAME` / `obj.NAME` / a qualified `A.B.NAME` suffix) — or a Lua-style dict key — whose
+// `NAME` ALSO matches an in-scope local `var NAME` (param / `for` iterator) must NEVER resolve the
+// cursor to the LOCAL and rename it. The clicked symbol is a member / enum value, so the rename
+// either edits THAT (by identity) or fail-closed REFUSES — the colliding local's decl+uses stay
+// UNTOUCHED in every cell. Before the fix the firewall anchored the cursor as the local and silently
+// renamed the wrong symbol (corruption-class 5 at the cursor-anchor sink, the twin of #159).
+// =================================================================================================
+
+/// Drive a single rename at `(line, ch)` in `cons.gd` (the consumer file) against an optional
+/// `foo.gd` provider, returning `(error_is_some, edited_sites_in_cons)`. `provider` is written to
+/// `src/foo.gd` (with `class_name Foo`) when `Some`; `cons` is `src/cons.gd`. The caller asserts the
+/// colliding local is untouched.
+fn rename_cons_sites(
+    provider: Option<&str>,
+    cons: &str,
+    line: u32,
+    ch: u32,
+    new_name: &str,
+    id: i32,
+) -> (bool, Vec<(u32, u32)>) {
+    let project = common::sample_project();
+    let mut files: Vec<&str> = Vec::new();
+    if let Some(p) = provider {
+        project.write("src/foo.gd", p);
+        files.push("src/foo.gd");
+    }
+    project.write("src/cons.gd", cons);
+    files.push("src/cons.gd");
+    let (client, server) = boot();
+    init_open(&project, &client, caps_full(), &files, 2);
+    let cons_uri = file_uri(&project.root.join("src/cons.gd"));
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/rename",
+            rename_params(&cons_uri, line, ch, new_name),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    let err = resp.error.is_some();
+    let sites: Vec<(u32, u32)> = resp
+        .result
+        .as_ref()
+        .map(|v| {
+            let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
+            let mut s: Vec<(u32, u32)> = view
+                .set
+                .iter()
+                .filter(|(u, _)| *u == cons_uri.as_str())
+                .map(|(_, r)| (r.start.line, r.start.character))
+                .collect();
+            s.sort();
+            s
+        })
+        .unwrap_or_default();
+    shutdown(&client, server);
+    (err, sites)
+}
+
+#[test]
+fn rename_181_qualified_enum_suffix_with_colliding_local_var_refuses_never_local() {
+    // THE #181 reproducer. `Foo.Direction.NORTH` use-click with a colliding `var NORTH := 2` in
+    // scope: the cross-file enum value cannot project-anchor (the documented #158 cross-file boundary
+    // — it records no `class_node`), so the firewall REFUSES. The load-bearing invariant: it must
+    // NEVER edit the local `var NORTH` decl (line 2) or its uses (lines 4, 5).
+    let (err, sites) = rename_cons_sites(
+        Some("class_name Foo\nextends Node\nenum Direction { NORTH, SOUTH }\n"),
+        // line0 extends; line1 func; line2 `\tvar NORTH := 2`; line3 `\tvar a = Foo.Direction.NORTH`;
+        // line4 `\tvar c = NORTH`; line5 `\tprint([a, c, NORTH])`.
+        "extends Node\nfunc f() -> void:\n\tvar NORTH := 2\n\tvar a = Foo.Direction.NORTH\n\tvar c = NORTH\n\tprint([a, c, NORTH])\n",
+        // line3 `\tvar a = Foo.Direction.NORTH`: tab(0) `var a = `(1-8) `Foo`(9-11) `.`(12)
+        // `Direction`(13-21) `.`(22) `NORTH`(23). Click the qualified suffix at col 23.
+        3,
+        23,
+        "UP",
+        300,
+    );
+    assert!(
+        err,
+        "the cross-file enum-value suffix cannot project-anchor → must REFUSE (the #158 boundary)"
+    );
+    assert!(
+        sites.is_empty(),
+        "REFUSE means ZERO edits — the colliding local `var NORTH` must NOT be touched: {sites:?}"
+    );
+}
+
+#[test]
+fn rename_181_self_member_attr_with_colliding_local_var_renames_member_never_local() {
+    // ENUM-INCIDENTAL twin: `self.NORTH = 5` (a plain MEMBER attribute) with a colliding `var NORTH`
+    // local in scope. The cursor is the member attribute, so it renames the MEMBER (decl + the
+    // `self.NORTH` use) by identity — NEVER the colliding local.
+    let (err, sites) = rename_cons_sites(
+        None,
+        // line0 extends; line1 `var NORTH := 0` (MEMBER); line2 func; line3 `\tvar NORTH := 2`
+        // (LOCAL); line4 `\tself.NORTH = 5`; line5 `\tprint(NORTH)` (LOCAL use).
+        "extends Node\nvar NORTH := 0\nfunc g() -> void:\n\tvar NORTH := 2\n\tself.NORTH = 5\n\tprint(NORTH)\n",
+        // line4 `\tself.NORTH = 5`: tab(0) `self`(1-4) `.`(5) `NORTH`(6). Click the attribute at col 6.
+        4,
+        6,
+        "UP",
+        301,
+    );
+    assert!(
+        !err,
+        "a member attribute click resolves to the member and renames it (no refuse)"
+    );
+    // The edited cons sites: the MEMBER decl (line 1, col 4) + the `self.NORTH` attribute (line 4,
+    // col 6). The LOCAL decl (line 3) and the bare `print(NORTH)` local use (line 5) are UNTOUCHED.
+    assert_eq!(
+        sites,
+        vec![(1, 4), (4, 6)],
+        "must edit the member decl + the self.NORTH attribute ONLY — never the local `var NORTH` \
+         (line 3) or its bare use (line 5): {sites:?}"
+    );
+}
+
+#[test]
+fn rename_181_obj_member_attr_with_colliding_local_param_renames_member_never_local() {
+    // `obj.speed` MEMBER attribute (cross-file, through a typed var) with a colliding PARAMETER
+    // `speed` in scope. The attribute renames the cross-file member by identity; the colliding param
+    // is never touched. (Param collides with the member name.)
+    let (err, sites) = rename_cons_sites(
+        Some("class_name Foo\nextends Node\nvar speed := 0\n"),
+        // line0 extends; line1 `func h(speed: int) -> void:` (PARAM speed); line2 `\tvar o := Foo.new()`;
+        // line3 `\to.speed = speed`; line4 `\tprint(speed)`.
+        "extends Node\nfunc h(speed: int) -> void:\n\tvar o := Foo.new()\n\to.speed = speed\n\tprint(speed)\n",
+        // line3 `\to.speed = speed`: tab(0) `o`(1) `.`(2) `speed`(3). Click the attribute at col 3.
+        3,
+        3,
+        "velocity",
+        302,
+    );
+    // Whether it edits the cross-file member or refuses, the colliding PARAM `speed` (line1 decl +
+    // line3 RHS + line4 use) must NEVER be in the cons edit set as a local rename. The o.speed
+    // attribute (line3 col3) MAY be edited (a genuine member use). Assert: no local-param site is
+    // edited — i.e. the param decl (1,7) and the bare uses (3,11)/(4,8) are absent.
+    let _ = err;
+    let forbidden = [(1u32, 7u32), (3, 11), (4, 8)];
+    for f in forbidden {
+        assert!(
+            !sites.contains(&f),
+            "the colliding param `speed` (decl/bare uses) must NEVER be edited by an `o.speed` \
+             member rename; site {f:?} present in {sites:?}"
+        );
+    }
+}
+
+#[test]
+fn rename_181_qualified_enum_suffix_with_colliding_for_iter_refuses_never_local() {
+    // Qualified `Foo.Direction.NORTH` suffix click with a colliding `for NORTH in ...` iterator in
+    // scope. Same as the var case: cross-file enum value refuses; the `for` iterator binding (decl +
+    // body uses) is NEVER touched.
+    let (err, sites) = rename_cons_sites(
+        Some("class_name Foo\nextends Node\nenum Direction { NORTH, SOUTH }\n"),
+        // line0 extends; line1 func; line2 `\tfor NORTH in [1, 2]:`; line3 `\t\tprint(NORTH)`;
+        // line4 `\tvar a = Foo.Direction.NORTH`.
+        "extends Node\nfunc f() -> void:\n\tfor NORTH in [1, 2]:\n\t\tprint(NORTH)\n\tvar a = Foo.Direction.NORTH\n",
+        // line4 `\tvar a = Foo.Direction.NORTH`: tab(0) `var a = `(1-8) `Foo`(9-11) `.`(12)
+        // `Direction`(13-21) `.`(22) `NORTH`(23).
+        4,
+        23,
+        "UP",
+        303,
+    );
+    assert!(
+        err,
+        "cross-file enum-value suffix refuses (the #158 boundary)"
+    );
+    assert!(
+        sites.is_empty(),
+        "REFUSE → zero edits; the colliding `for NORTH` iterator must NOT be touched: {sites:?}"
+    );
+}
+
+#[test]
+fn rename_181_lua_dict_key_with_colliding_local_var_never_local() {
+    // A Lua-style dict KEY `{ NORTH = 1 }` (a folded string literal, not a reference) with a colliding
+    // `var NORTH` local. Clicking the key must NEVER rename the local. The key cannot project-anchor
+    // (it carries no binding), so the rename refuses — and the local `var NORTH` is untouched.
+    let (err, sites) = rename_cons_sites(
+        None,
+        // line0 extends; line1 func; line2 `\tvar NORTH := 2`; line3 `\tvar d = { NORTH = 1 }`;
+        // line4 `\tprint([NORTH, d])`.
+        "extends Node\nfunc f() -> void:\n\tvar NORTH := 2\n\tvar d = { NORTH = 1 }\n\tprint([NORTH, d])\n",
+        // line3 `\tvar d = { NORTH = 1 }`: tab(0) `var d = `(1-8) `{`(9) ` `(10) `NORTH`(11). Click the
+        // Lua key at col 11.
+        3,
+        11,
+        "UP",
+        304,
+    );
+    // The key is not an editable project symbol → refuse. Either way, the colliding local `var NORTH`
+    // (line 2 decl + line 4 use) must NOT be edited.
+    let _ = err;
+    let forbidden = [(2u32, 5u32), (4, 8)];
+    for f in forbidden {
+        assert!(
+            !sites.contains(&f),
+            "the colliding local `var NORTH` (decl/use) must NEVER be edited by clicking the Lua \
+             dict key; site {f:?} present in {sites:?}"
+        );
+    }
+}
+
+#[test]
+fn rename_181_no_collision_member_attr_still_renames() {
+    // ANTI-OVER-REFUSE: with NO colliding local, a `self.member` attribute click must STILL rename
+    // the member (the fix must not break the normal member-rename path). Edits the member decl + the
+    // attribute use.
+    let (err, sites) = rename_cons_sites(
+        None,
+        // line0 extends; line1 `var member := 0`; line2 func; line3 `\tself.member = 5`;
+        // line4 `\tprint(self.member)`.
+        "extends Node\nvar member := 0\nfunc g() -> void:\n\tself.member = 5\n\tprint(self.member)\n",
+        // line3 `\tself.member = 5`: tab(0) `self`(1-4) `.`(5) `member`(6). Click at col 6.
+        3,
+        6,
+        "amount",
+        305,
+    );
+    assert!(
+        !err,
+        "a member attribute with no colliding local must rename (not refuse)"
+    );
+    // member decl (1,4) + the two `self.member` attributes (3,6) and (4,12 — `\tprint(self.member)`:
+    // tab(0) `print(`(1-6) `self`(7-10) `.`(11) `member`(12)).
+    assert_eq!(
+        sites,
+        vec![(1, 4), (3, 6), (4, 12)],
+        "the normal member rename must still edit the decl + both self.member attributes: {sites:?}"
+    );
 }
