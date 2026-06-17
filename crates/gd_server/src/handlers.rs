@@ -2899,14 +2899,20 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                         &mapper,
                     );
                 }
-                NonMethodTarget::EnumValue { qualified, .. } => {
+                NonMethodTarget::EnumValue {
+                    qualified,
+                    decl_file,
+                    ..
+                } => {
                     // Enum-qualified binding scan: only `EnumValueLocal` uses of THIS value
-                    // (`<EnumName>.<value>`), never the bare-name scan — keeps an unrelated
-                    // `const NORTH` / a second enum's same-named value out of the set. The
-                    // declaration token is added separately via `declaration_locations`.
+                    // (keyed on `(decl_file, <EnumName>.<value>)`), never the bare-name scan —
+                    // keeps an unrelated `const NORTH` / a second enum's same-named value / a
+                    // different class's same-named value out of the set. The declaration token is
+                    // added separately via `declaration_locations`.
                     push_enum_value_binding_locations(
                         &mut locations,
                         &result,
+                        *decl_file,
                         qualified,
                         &uri,
                         &mapper,
@@ -2979,11 +2985,19 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             NonMethodTarget::Member(_) => {
                 method_scan_candidate_uris(state, &name, current_fid, "references")
             }
-            // Locals are never referenced cross-file. Enum values do no fan-out either: the
-            // `EnumValueLocal` binding is recorded only in the DECLARING file (the referencing file's
-            // cross-file enum metatype carries no `class_node` anchor), so a `class_name`'d enum's
-            // `Foo.E.V` uses in other files are under-collected — loud under-rename, tracked #158.
-            NonMethodTarget::Local { .. } | NonMethodTarget::EnumValue { .. } => Vec::new(),
+            // Locals are never referenced cross-file.
+            NonMethodTarget::Local { .. } => Vec::new(),
+            // A named enum value's cross-file uses (`Foo.Direction.NORTH`) live in function BODIES,
+            // which the shallow interface pass does NOT record — so `name_referencers` (extends +
+            // type annotations only) would miss them. Use the same project-wide textual prefilter the
+            // method/member path uses, keyed on the VALUE NAME (`NORTH`): any file textually containing
+            // it is a candidate, and the per-candidate scan below collects ONLY the
+            // `(decl_file, qualified)`-keyed `EnumValueLocal` bindings — so a `Bar.Direction.NORTH`
+            // (different declaring file) or a bare/`const NORTH` (no `EnumValueLocal`) is excluded by
+            // identity, never by the textual hit. Occurrence-positive. #158.
+            NonMethodTarget::EnumValue { .. } => {
+                method_scan_candidate_uris(state, &name, current_fid, "references")
+            }
             // An in-file root type (`enum`/inner-class) used in a type position has NO cross-file
             // bare-name reference — like a local/enum-value, it fans out EMPTY rather than riding the
             // raw cross-file candidate scan (which would collect a same-named global `class_name`'s
@@ -3086,8 +3100,27 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                         &cand_mapper,
                     );
                 }
-                // Local + enum-value targets fan out no candidates (unreachable; kept exhaustive).
-                NonMethodTarget::Local { .. } | NonMethodTarget::EnumValue { .. } => {}
+                // Locals fan out no candidates (unreachable; kept exhaustive).
+                NonMethodTarget::Local { .. } => {}
+                // Cross-file enum-value collection (#158): a candidate's `Foo.Direction.NORTH` use
+                // records an `EnumValueLocal` binding keyed on `(decl_file, qualified)`. Collect ONLY
+                // those — a `Bar.Direction.NORTH` in the same candidate records `bar.gd` as its
+                // `target_file` and is excluded; a bare `NORTH` / `const NORTH` records no
+                // `EnumValueLocal` at all. Occurrence-positive, never a raw-name scan.
+                NonMethodTarget::EnumValue {
+                    qualified,
+                    decl_file,
+                    ..
+                } => {
+                    push_enum_value_binding_locations(
+                        &mut locations,
+                        &cand_result,
+                        *decl_file,
+                        qualified,
+                        &cand_uri,
+                        &cand_mapper,
+                    );
+                }
                 NonMethodTarget::Unresolved => match unresolved_kind {
                     UnresolvedKind::GlobalClass(class_file) => {
                         // Occurrence-positive cross-file collection: a `Class` use binding pointing
@@ -3438,10 +3471,15 @@ fn collect_in_file_highlight_sites(
                         &mapper,
                     );
                 }
-                NonMethodTarget::EnumValue { qualified, .. } => {
+                NonMethodTarget::EnumValue {
+                    qualified,
+                    decl_file,
+                    ..
+                } => {
                     push_enum_value_binding_locations(
                         &mut locations,
                         &result,
+                        *decl_file,
                         qualified,
                         uri,
                         &mapper,
@@ -3889,17 +3927,19 @@ enum NonMethodTarget {
     },
     /// A value of a NAMED enum declared in THIS file (`enum Direction { NORTH }`, used as
     /// `Direction.NORTH`). `decl_ident` is the value's declaration token; `qualified` is the
-    /// composite identity `"<EnumName>.<value>"`. Use sites are the `EnumValueLocal` bindings whose
-    /// `target_name` equals `qualified` (an enum-qualified scan, never a bare-name one — `enum A { X }`
-    /// and `enum B { X }` stay distinct, and an unrelated `const NORTH`/method `NORTH` is never
-    /// collected). Current-file-only: the `EnumValueLocal` binding is recorded only in the declaring
-    /// file (a cross-file enum metatype carries `script_type`, not `class_node`, so the referencing
-    /// file records nothing), so there is no cross-file fan-out. For a `class_name`'d script this
-    /// UNDER-renames `Foo.E.V` uses in OTHER files when renaming from the declaration — a loud
-    /// compile error, not corruption (tracked #158). #106.
+    /// composite identity `"<EnumName>.<value>"`; `decl_file` is the file DECLARING the enum (this
+    /// file — a decl-click or in-file use resolves here). Use sites are the `EnumValueLocal` bindings
+    /// whose `(target_file, target_name)` equals `(decl_file, qualified)` (an enum-qualified scan keyed
+    /// on the declaring file, never a bare-name one — `enum A { X }`/`enum B { X }` stay distinct, a
+    /// `Bar.Direction.NORTH` in a DIFFERENT class records a different `target_file` and is excluded,
+    /// and an unrelated `const NORTH`/method `NORTH` is never collected). Cross-file fan-out: a
+    /// `class_name`'d script's value is reachable from other files only via `<ClassName>.<Enum>.<value>`,
+    /// so the candidate set is the files referencing `decl_file`'s `class_name` and each contributes
+    /// ONLY its `(decl_file, qualified)`-keyed `EnumValueLocal` bindings (#158). #106 (in-file).
     EnumValue {
         decl_ident: NodeId,
         qualified: String,
+        decl_file: gd_project::FileId,
     },
     /// Couldn't resolve — the documented "over-approximate, never under-report" residue floor
     /// (raw identifier scan). Class/Enum/EnumValue targets classify here DELIBERATELY:
@@ -3921,18 +3961,24 @@ fn classify_non_method_target(
     current_fid: Option<gd_project::FileId>,
 ) -> NonMethodTarget {
     // (0a) Enum-value USE-site click (`Direction.NORTH`): the `EnumValueLocal` binding at the cursor
-    // span carries the QUALIFIED `<EnumName>.<value>` as its `target_name`. Recover the value name to
-    // locate the declaration token; the binding is recorded only for IN-FILE named enums, so the decl
-    // lives in this tree. Runs before the member loop (an enum value is not a member). #106.
+    // span carries the QUALIFIED `<EnumName>.<value>` as its `target_name` and the DECLARING file as
+    // its `target_file`. This path admits ONLY an IN-FILE click — `find_enum_value_decl_ident` locates
+    // the value's declaration token in THIS tree, which succeeds iff the enum is declared here. A
+    // CROSS-FILE use-click (`Foo.Direction.NORTH` where `Foo` is another file) records a binding whose
+    // `target_file != current_fid` and whose declaration is NOT in this tree, so it FALLS THROUGH here
+    // (and the member loop below excludes `EnumValueLocal`, so it never misclassifies as a Member) →
+    // `Unresolved` → the firewall refuses it (fail-closed: a cross-file use-click stays a refuse, the
+    // documented safe boundary). Renaming from the DECLARATION (#158) is the supported cross-file
+    // entry point. Runs before the member loop (an enum value is not a member). #106 / #158.
     for b in result.bindings() {
         if let Binding::Use {
             target_kind: BindingTargetKind::EnumValueLocal,
+            target_file: Some(tf),
             target_name,
             site,
-            ..
         } = b
         {
-            if *site == node_span {
+            if *site == node_span && current_fid == Some(*tf) {
                 if let Some((enum_name, value_name)) = target_name.split_once('.') {
                     if let Some(decl_ident) =
                         find_enum_value_decl_ident(tree, enum_name, value_name)
@@ -3940,6 +3986,7 @@ fn classify_non_method_target(
                         return NonMethodTarget::EnumValue {
                             decl_ident,
                             qualified: target_name.clone(),
+                            decl_file: *tf,
                         };
                     }
                 }
@@ -3947,14 +3994,18 @@ fn classify_non_method_target(
         }
     }
     // (0b) Enum-value DECLARATION-site click (`NORTH` inside `enum Direction { NORTH }`): no binding
-    // exists at a declaration, so resolve via the AST. #106.
-    if let Some(ident_id) = tree.innermost_node_at(node_span.start) {
-        if let Some((decl_ident, qualified)) = enum_value_decl_at(tree, ident_id) {
-            if tree.get(decl_ident).span == node_span {
-                return NonMethodTarget::EnumValue {
-                    decl_ident,
-                    qualified,
-                };
+    // exists at a declaration, so resolve via the AST. The declaring file is THIS file (`current_fid`);
+    // without a known FileId the cross-file fan-out has no identity to key on, so fall through. #106.
+    if let Some(fid) = current_fid {
+        if let Some(ident_id) = tree.innermost_node_at(node_span.start) {
+            if let Some((decl_ident, qualified)) = enum_value_decl_at(tree, ident_id) {
+                if tree.get(decl_ident).span == node_span {
+                    return NonMethodTarget::EnumValue {
+                        decl_ident,
+                        qualified,
+                        decl_file: fid,
+                    };
+                }
             }
         }
     }
@@ -3966,14 +4017,19 @@ fn classify_non_method_target(
             site,
         } = b
         {
-            // Kind guard: only Class/Enum/EnumValue are excluded (their references live in
+            // Kind guard: Class/Enum/EnumValue are excluded (their references live in
             // annotations/extends/match-patterns the reducer doesn't record — binding-only
-            // would under-report them). Function/Signal/Variable/Constant/Member DELIBERATELY
-            // pass: a function or signal reaching here is a NON-call-position reference
-            // (`var f = obj.method`, `obj.sig` reads — call positions took the method path),
-            // and record_member_use's precise kinds resolve exactly those. Parameter never
-            // reaches here today (locals/params record no Use) — if it ever does, it belongs
-            // with the passing set, not the exclusions.
+            // would under-report them). `EnumValueLocal` is ALSO excluded: a cross-file
+            // `EnumValueLocal` use-click already fell through (0a) (its decl is not in this tree),
+            // and it carries the QUALIFIED `<Enum>.<value>` as `target_name` (never the bare
+            // `name`), so it would not match `target_name == name` anyway — but excluding the kind
+            // makes the fail-closed intent explicit (a cross-file enum-value use-click must NOT be
+            // retargeted as a Member of the declaring class, the #158 corruption guard).
+            // Function/Signal/Variable/Constant/Member DELIBERATELY pass: a function or signal
+            // reaching here is a NON-call-position reference (`var f = obj.method`, `obj.sig`
+            // reads — call positions took the method path), and record_member_use's precise kinds
+            // resolve exactly those. Parameter never reaches here today (locals/params record no
+            // Use) — if it ever does, it belongs with the passing set, not the exclusions.
             if *site == node_span
                 && target_name == name
                 && !matches!(
@@ -3981,6 +4037,7 @@ fn classify_non_method_target(
                     BindingTargetKind::Class
                         | BindingTargetKind::Enum
                         | BindingTargetKind::EnumValue
+                        | BindingTargetKind::EnumValueLocal
                 )
             {
                 return NonMethodTarget::Member(*f);
@@ -4204,16 +4261,19 @@ fn push_global_class_locations(
     }
 }
 
-/// Append a [`Location`] for every `EnumValueLocal` use binding whose QUALIFIED `target_name` equals
-/// `qualified` (`"<EnumName>.<value>"`) — the by-identity occurrence set of an in-file named enum
-/// value (#106). Matching on the enum-qualified name (NOT the bare value name) keeps two same-named
-/// values in different enums (`enum A { X }` / `enum B { X }`) distinct and never collects an
-/// unrelated `const NORTH` / method `NORTH` — the corruption the kind-precise collector exists to
-/// prevent under a mutating rename. The `site` is the bare value token, so the rename edit replaces
-/// exactly the value identifier.
+/// Append a [`Location`] for every `EnumValueLocal` use binding whose identity equals
+/// `(decl_file, qualified)` — the by-identity occurrence set of a named enum value (#106 in-file /
+/// #158 cross-file). The match is on BOTH the declaring file (`target_file`) AND the qualified
+/// `<EnumName>.<value>` name: keying on the declaring file keeps a `Bar.Direction.NORTH` (a DIFFERENT
+/// class's value, recording `bar.gd` as its `target_file`) out of `Foo.Direction.NORTH`'s set, and
+/// the qualified name keeps `enum A { X }` / `enum B { X }` of one file distinct and never collects an
+/// unrelated `const NORTH` / method `NORTH`. This is the corruption the kind-precise collector exists
+/// to prevent under a mutating rename. The `site` is the bare value token, so the rename edit replaces
+/// exactly the value identifier. Used for the current file AND every cross-file candidate.
 fn push_enum_value_binding_locations(
     out: &mut Vec<Location>,
     result: &AnalysisResult,
+    decl_file: gd_project::FileId,
     qualified: &str,
     uri: &Uri,
     mapper: &PositionMapper,
@@ -4221,12 +4281,12 @@ fn push_enum_value_binding_locations(
     for binding in result.bindings() {
         if let Binding::Use {
             target_kind: BindingTargetKind::EnumValueLocal,
+            target_file: Some(tf),
             target_name,
             site,
-            ..
         } = binding
         {
-            if target_name == qualified {
+            if *tf == decl_file && target_name == qualified {
                 out.push(Location {
                     uri: uri.clone(),
                     range: mapper.span_to_range(*site),
