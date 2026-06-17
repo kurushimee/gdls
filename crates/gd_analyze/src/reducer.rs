@@ -3956,6 +3956,26 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     }
 
     if found {
+        // analyzer.cpp:3630-3636 — super-call virtual check. When `get_function_signature` resolves
+        // a method for a `super.<v>()` call AND that method is a parent-class virtual the parent does
+        // not override, Godot emits `Cannot call the parent class' virtual function "<v>()" because
+        // it hasn't been defined.`. The class hierarchy is fully known for a super-call, so the
+        // `METHOD_FLAG_VIRTUAL` flag is trustworthy here (Godot only runs this for super-calls). gdls
+        // mirrors it for a NATIVE-resolved sig: `lookup_native_method` carries the dump's `is_virtual`
+        // (= `METHOD_FLAG_VIRTUAL`). This subsumes the old `_init`-only not-found arm — every native
+        // virtual (`_init`, `_notification`, `_enter_tree`, …) errors the same way when super-called.
+        // In-file abstract/virtual super-calls are handled at their resolution site (the `Class` arm
+        // emits the abstract-function variant); this arm is the NATIVE counterpart. Abstract
+        // (`VIRTUAL_REQUIRED`) native methods don't exist in the dump model, so only the virtual
+        // message applies.
+        if call.is_super && sig.is_virtual {
+            ctx.push_error(
+                format!(
+                    r#"Cannot call the parent class' virtual function "{function_name}()" because it hasn't been defined."#
+                ),
+                id,
+            );
+        }
         // analyzer.cpp:3644-3655 — static-context call check. `is_self` (call has no explicit
         // base, or the base is `self`) + we're in a `static_context` (a static function or a
         // static-var initializer) + the resolved target is *not* static ⇒ Godot emits
@@ -4239,32 +4259,23 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             && call.is_super
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
         {
-            // v1.0.2 (issue #24): both super-miss templates below are negative claims whose
-            // lookup bottoms out in the native chain — under a `Generic`/`Absent` DB a custom
-            // engine build may define the member the stock surface lacks, so they only fire
-            // with `Exact` provenance.
+            // v1.0.2 (issue #24): the super-miss template below is a negative claim whose lookup
+            // bottoms out in the native chain — under a `Generic`/`Absent` DB a custom engine build
+            // may define the member the stock surface lacks, so it only fires with `Exact` provenance.
             //
-            // analyzer.cpp:3742-3744 — super-call fall-through. When the function name is
-            // `_init` and the parent is a native class that doesn't define a custom `_init`,
-            // Godot classifies it as the virtual-constructor case and emits
-            // `Cannot call the parent class' virtual function "_init()" because it hasn't been
-            // defined.` (analyzer.cpp's super-call virtual-detection arm). Object's `_init` is
-            // implicitly virtual on every native class, so any `super()` from `_init` against a
-            // base that doesn't override it triggers this template.
-            if function_name == "_init" && base_type.kind == DtKind::Native {
-                ctx.push_error(
-                    r#"Cannot call the parent class' virtual function "_init()" because it hasn't been defined."#.to_owned(),
-                    id,
-                );
-            } else {
-                ctx.push_error(
-                    format!(
-                        r#"Function "{function_name}()" not found in base {}."#,
-                        base_type
-                    ),
-                    id,
-                );
-            }
+            // analyzer.cpp:3758 — super-call fall-through "Function not found in base". The native
+            // super-VIRTUAL case (`super._init()`, `super._notification()`, …) is resolved by the
+            // seeded native methods and handled at its resolution site (the `call.is_super &&
+            // sig.is_virtual` arm in the `if found` block, analyzer.cpp:3630-3636), so it never
+            // reaches here. This arm covers only a super-call to a name the native chain genuinely
+            // lacks (a real method miss).
+            ctx.push_error(
+                format!(
+                    r#"Function "{function_name}()" not found in base {}."#,
+                    base_type
+                ),
+                id,
+            );
         } else if !name_is_value
             && !call.is_super
             && !is_self
@@ -4344,37 +4355,28 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 );
             }
         }
-        // analyzer.cpp:3740-3742 — UNSAFE_METHOD_ACCESS on a `$`/`%` (GetNode) base method miss. Godot
-        // warns on ANY unresolved non-`self`, non-hard-BUILTIN method; gdls emits this SAFELY only for
-        // the `$`/`%` base, whose bare-`Node` type gdls SYNTHESIZES (M11, analyzer.cpp:3882-3886) — so
-        // the base type is not dump-dependent. The METHOD LOOKUP still walks the native dump, and
-        // `extension_api.json` OMITS the Object-core methods Godot resolves via ClassDB: `free` and the
-        // `_`-prefixed virtuals (`_notification`, `_get`, `_set`, `_to_string`, `_init`, …). Diffing
-        // `ClassDB.class_get_method_list(Object/Node)` against the dump shows the omitted set is EXACTLY
-        // `free` + every `_`-prefixed name (zero non-underscore omissions besides `free`), so skipping
-        // those is the COMPLETE FP-avoidance for this fixed `Node` chain — a miss on them is a dump gap,
-        // not a real miss (Godot stays silent). `new()` is NOT skipped: `$X` is a Node INSTANCE and
-        // `new()` lives on the metatype, so Godot warns on it. The GENERAL hard NATIVE/SCRIPT-instance
-        // case is blocked by the same dump-vs-ClassDB gap across arbitrary classes (deferred). Exact-
-        // gated (a non-Exact dump can't be trusted even for `Node`); additive — no error path changes,
-        // so the hard "Function not found in base" error stays reserved for `is_self || (hard && BUILTIN)`.
-        // The `_`-prefix skip is deliberately BROAD: it also silences a FABRICATED `_typo()` (a missed
-        // lint on invalid code — the safe under-emit direction), traded for zero blast radius + forward
-        // safety as future Godot adds Object-core virtuals. Seeding the dump-omitted Object-core set
-        // into the native DB would let this skip drop (real virtuals resolve, fabricated `_`-names warn).
-        let base_is_get_node = call
-            .callee
-            .and_then(|c| match &ctx.node(c).kind {
-                NodeKind::Subscript(s) => s.base,
-                _ => None,
-            })
-            .is_some_and(|bid| matches!(&ctx.node(bid).kind, NodeKind::GetNode(_)));
-        if base_is_get_node
-            && !name_is_value
-            && function_name != "free"
-            && !function_name.starts_with('_')
+        // analyzer.cpp:3740-3742 — UNSAFE_METHOD_ACCESS on a method miss. Godot warns on ANY
+        // unresolved non-`self`, non-hard-BUILTIN method whose base carries a static type. gdls
+        // emits on a hard NATIVE-instance base (`var t: Timer = …; t.bogus()`, `$Node.bogus()`):
+        // the method lookup above walked the native dump's `inherits` chain and missed. The dump
+        // used to be a strict subset of Godot's ClassDB (`free` + the `_`-prefixed virtuals Godot
+        // resolves but `extension_api.json` omits), so a miss on those was a DUMP GAP, not a real
+        // miss — over-emitting vs Godot. That gap is now closed: [`NativeDb`] seeds the
+        // ClassDB-resolvable-but-dump-omitted methods (`free` + the per-class `_`-virtuals) at
+        // ingest, so `lookup_native_method` resolves them silently and only a genuinely absent
+        // name (a fabricated `_typo()`, a real method miss) reaches here. The DtKind::Script
+        // (cross-file `.gd` instance) base never reaches this arm — its miss degrades to a silent
+        // `Variant` return with `found = true` (the "Unknown stays dynamic" rule), so this stays
+        // NATIVE-only by construction. Exact-gated (a non-Exact dump can't be trusted to prove a
+        // method's absence — a custom engine build may define it). Additive — no error path
+        // changes; the hard "Function not found in base" error stays reserved for
+        // `is_self || (hard && BUILTIN)`. `!is_self` mirrors analyzer.cpp:3741; `!is_meta_type`
+        // excludes the static-call-on-a-metatype shape handled by the in-file `Class` arm above.
+        if !name_is_value
+            && !is_self
             && base_type.is_hard_type()
             && base_type.kind == DtKind::Native
+            && !base_type.is_meta_type
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
         {
             ctx.push_warning(
@@ -4489,6 +4491,12 @@ struct CallSig {
     /// and `get_function_signature` stamps it onto the return type at analyzer.cpp:6012 so
     /// `reduce_call` can fire MISSING_AWAIT / "must be called with await".
     is_coroutine: bool,
+    /// Whether the resolved NATIVE method is declared `virtual` (the dump's `is_virtual`, mapped to
+    /// Godot's `METHOD_FLAG_VIRTUAL`). Drives the super-call check at analyzer.cpp:3630-3636: a
+    /// `super.<v>()` that resolves to a parent-class virtual that the parent doesn't override emits
+    /// `Cannot call the parent class' virtual function "<v>()" because it hasn't been defined.`.
+    /// Only `lookup_native_method` sets it; in-file/script sigs leave it `false`.
+    is_virtual: bool,
 }
 
 /// Read an in-file function's signature snapshot for the count + per-arg compat checks. Needs
@@ -4634,6 +4642,8 @@ fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> 
         is_vararg: m.is_vararg,
         is_static: m.is_static,
         is_coroutine: false,
+        // Builtin (Variant) methods are never virtual and have no super-call path.
+        is_virtual: false,
     })
 }
 
@@ -4670,6 +4680,7 @@ fn lookup_native_method(ctx: &AnalysisContext, native: &str, name: &str) -> Opti
                 // Native methods never carry a coroutine flag in the dump — only in-file
                 // GDScript functions can be coroutines.
                 is_coroutine: false,
+                is_virtual: m.is_virtual,
             });
         }
         cur = nc.inherits.map(|s| ctx.native.name_of(s).to_owned());
@@ -5047,6 +5058,9 @@ fn script_chain_call(
             is_vararg: false,
             is_static: member.flags.is_static,
             is_coroutine: member.flags.is_coroutine,
+            // A cross-file GDScript method is not a native virtual; the super-virtual check is the
+            // NATIVE-resolution counterpart only.
+            is_virtual: false,
         }),
         link,
     )

@@ -8680,14 +8680,40 @@
       "inherits": "Resource",
       "is_refcounted": true,
       "is_instantiable": false,
-      "api_type": "core"
+      "api_type": "core",
+      "methods": [
+        {
+          "name": "get_script_constant_map",
+          "is_const": false,
+          "is_static": false,
+          "is_vararg": false,
+          "is_virtual": false,
+          "hash": 2382534195,
+          "return_value": {
+            "type": "Dictionary"
+          }
+        }
+      ]
     },
     {
       "name": "GDScript",
       "inherits": "Script",
       "is_refcounted": true,
       "is_instantiable": true,
-      "api_type": "core"
+      "api_type": "core",
+      "methods": [
+        {
+          "name": "new",
+          "is_const": false,
+          "is_static": false,
+          "is_vararg": true,
+          "is_virtual": false,
+          "hash": 1545262638,
+          "return_value": {
+            "type": "Variant"
+          }
+        }
+      ]
     },
     {
       "name": "Node3D",

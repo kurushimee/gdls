@@ -256,6 +256,7 @@ impl NativeDb {
             let class = ingest_class(c, &mut it);
             classes.insert(class.name, class);
         }
+        seed_dump_omitted_methods(&mut classes, &mut it);
         let mut builtins = FxHashMap::default();
         for b in api.builtin_classes {
             let bt = ingest_builtin(b, &mut it);
@@ -732,6 +733,274 @@ impl NativeDb {
         true
     }
 }
+
+/// Seed the methods that Godot's `ClassDB` resolves but `extension_api.json` OMITS, so a method
+/// lookup against the native DB matches Godot's analyzer surface. Without this the analyzer's
+/// `UNSAFE_METHOD_ACCESS` arm false-positives on real-but-undumped methods (`obj.free()`,
+/// `obj._notification(...)`) — the dump is a strict subset of `ClassDB`. The omitted set is the
+/// non-underscore method `free` (on `Object`) plus the `_`-prefixed virtuals `ClassDB` exposes
+/// but the dump never carries (Object-core: `_get`/`_set`/`_notification`/…; editor virtuals:
+/// `_edit_get_rect`/…). It is **per-class** (keyed by the owning class), so a fabricated
+/// `_edit_get_rect()` on a class that does not own it still misses (and warns) — this is NOT a
+/// global `_`-prefix allowlist.
+///
+/// `DUMP_OMITTED_NATIVE_METHODS` is **mechanically derived**, not hand-authored, by diffing
+/// `ClassDB.class_get_method_list(cls, false)` (own methods) against the shipped stock dump for
+/// every class the dump carries, on the real Godot 4.6.3-stable binary (the oracle technique in
+/// `docs/02`). A seeded method has no real signature in the dump, so it is synthesized as a
+/// no-argument `Variant`-returning method — only its NAME participates in the method-existence
+/// lookup the warning arm consults; the analyzer never type-checks a seeded call's arguments
+/// (the lookup binds, the call stays permissive). `is_virtual` is the method's real
+/// `METHOD_FLAG_VIRTUAL` bit, carried per-row in the table (NOT the `_`-prefix — most `_`-prefixed
+/// internal/editor methods are real non-virtual `MethodBind`s, not engine virtuals). It is the same
+/// flag Godot's super-call virtual check (`gdscript_analyzer.cpp:3630-3636`) and `native_base`
+/// override gate read, so the firing conditions match Godot by construction.
+/// Applied only when the class is present (a trimmed fixture omitting a class simply gets no seed
+/// for it).
+fn seed_dump_omitted_methods(classes: &mut FxHashMap<Sym, NativeClass>, it: &mut Interner) {
+    for &(class_name, method_name, is_virtual) in DUMP_OMITTED_NATIVE_METHODS {
+        let Some(class_sym) = it.get(class_name) else {
+            continue; // class not in this DB (e.g. a trimmed fixture) — nothing to seed
+        };
+        let method_sym = it.intern(method_name);
+        let Some(nc) = classes.get_mut(&class_sym) else {
+            continue;
+        };
+        if nc.methods.iter().any(|m| m.name == method_sym) {
+            continue; // already carried by the dump — never shadow the real entry
+        }
+        nc.methods.push(Method {
+            name: method_sym,
+            is_const: false,
+            is_static: false,
+            is_vararg: false,
+            is_virtual,
+            return_type: TypeRef::Variant,
+            params: Vec::new(),
+            description: String::new(),
+        });
+    }
+}
+
+/// The `(class, method, is_virtual)` triples `ClassDB` resolves but `extension_api.json` omits —
+/// see [`seed_dump_omitted_methods`]. **GENERATED — do not hand-edit.** Derivation (Godot
+/// 4.6.3-stable binary): for every class in the shipped stock dump, the own-method set from
+/// `ClassDB.class_get_method_list(cls, true)` (own methods) minus the dump's own-method set for
+/// that class. The third element is the method's real `METHOD_FLAG_VIRTUAL` bit (value `8`) read
+/// from that same `class_get_method_list` entry's `flags` — NOT inferred from the `_`-prefix. Only
+/// 12 rows are `true` (the `Object`-core virtuals: `_get`/`_set`/`_init`/`_notification`/
+/// `_to_string`/`_get_property_list`/`_property_can_revert`/`_property_get_revert`/
+/// `_validate_property`/`_iter_init`/`_iter_get`/`_iter_next`); the other 169 `_`-prefixed entries
+/// are real non-virtual internal/editor `MethodBind`s (e.g. `_set_position`, `_select_int`,
+/// `_edit_get_rect`), and `free` (the lone non-`_`-prefixed entry) is `false`.
+const DUMP_OMITTED_NATIVE_METHODS: &[(&str, &str, bool)] = &[
+    ("AnimatedSprite3D", "_res_changed", false),
+    ("AnimationLibrary", "_get_data", false),
+    ("AnimationLibrary", "_set_data", false),
+    ("AnimationMixer", "_reset", false),
+    ("AnimationMixer", "_restore", false),
+    ("AnimationNode", "_get_filters", false),
+    ("AnimationNode", "_set_filters", false),
+    ("AnimationNodeBlendSpace1D", "_add_blend_point", false),
+    ("AnimationNodeBlendSpace2D", "_add_blend_point", false),
+    ("AnimationNodeBlendSpace2D", "_get_triangles", false),
+    ("AnimationNodeBlendSpace2D", "_set_triangles", false),
+    ("ArrayMesh", "_get_blend_shape_names", false),
+    ("ArrayMesh", "_get_surfaces", false),
+    ("ArrayMesh", "_set_blend_shape_names", false),
+    ("ArrayMesh", "_set_surfaces", false),
+    (
+        "AudioStreamInteractive",
+        "_get_linked_undo_properties",
+        false,
+    ),
+    ("AudioStreamInteractive", "_get_transitions", false),
+    (
+        "AudioStreamInteractive",
+        "_inspector_array_swap_clip",
+        false,
+    ),
+    ("AudioStreamInteractive", "_set_transitions", false),
+    ("BitMap", "_get_data", false),
+    ("BitMap", "_set_data", false),
+    ("CSGPolygon3D", "_has_editable_3d_polygon_no_depth", false),
+    ("CSGPolygon3D", "_is_editable_3d_polygon", false),
+    ("CSGShape3D", "_get_root_collision_instance", false),
+    ("CSGShape3D", "_update_shape", false),
+    ("Camera2D", "_make_current", false),
+    ("Camera2D", "_set_limit_rect", false),
+    ("Camera2D", "_update_scroll", false),
+    ("CanvasItem", "_edit_get_pivot", false),
+    ("CanvasItem", "_edit_get_position", false),
+    ("CanvasItem", "_edit_get_rect", false),
+    ("CanvasItem", "_edit_get_rotation", false),
+    ("CanvasItem", "_edit_get_scale", false),
+    ("CanvasItem", "_edit_get_state", false),
+    ("CanvasItem", "_edit_get_transform", false),
+    ("CanvasItem", "_edit_set_pivot", false),
+    ("CanvasItem", "_edit_set_position", false),
+    ("CanvasItem", "_edit_set_rect", false),
+    ("CanvasItem", "_edit_set_rotation", false),
+    ("CanvasItem", "_edit_set_scale", false),
+    ("CanvasItem", "_edit_set_state", false),
+    ("CanvasItem", "_edit_use_pivot", false),
+    ("CanvasItem", "_edit_use_rect", false),
+    ("CanvasItem", "_edit_use_rotation", false),
+    ("CanvasItem", "_top_level_raise_self", false),
+    ("CollisionPolygon3D", "_is_editable_3d_polygon", false),
+    ("ColorPickerButton", "_about_to_popup", false),
+    ("Control", "_get_anchors_layout_preset", false),
+    ("Control", "_get_layout_mode", false),
+    ("Control", "_set_anchor", false),
+    ("Control", "_set_anchors_layout_preset", false),
+    ("Control", "_set_global_position", false),
+    ("Control", "_set_layout_mode", false),
+    ("Control", "_set_position", false),
+    ("Control", "_set_size", false),
+    ("Curve", "_get_data", false),
+    ("Curve", "_get_limits", false),
+    ("Curve", "_set_data", false),
+    ("Curve", "_set_limits", false),
+    ("Curve2D", "_get_data", false),
+    ("Curve2D", "_set_data", false),
+    ("Curve3D", "_get_data", false),
+    ("Curve3D", "_set_data", false),
+    ("DisplayServer", "_accessibility_update_if_active", false),
+    ("DisplayServer", "_tts_post_utterance_event", false),
+    ("EditorExportPreset", "_get_property_warning", false),
+    ("EditorInspector", "_edit_request_change", false),
+    ("EditorProperty", "_update_editor_property_status", false),
+    ("EditorSyntaxHighlighter", "_get_edited_resource", false),
+    ("FastNoiseLite", "_changed", false),
+    ("FileDialog", "_cancel_pressed", false),
+    ("Image", "_get_data", false),
+    ("Image", "_set_data", false),
+    ("ImageTexture", "_set_image", false),
+    ("ImageTexture3D", "_get_images", false),
+    ("ImageTexture3D", "_set_images", false),
+    ("ImageTextureLayered", "_get_images", false),
+    ("ImageTextureLayered", "_set_images", false),
+    ("ImporterMesh", "_get_data", false),
+    ("ImporterMesh", "_set_data", false),
+    ("LightmapGIData", "_get_light_textures_data", false),
+    ("LightmapGIData", "_get_probe_data", false),
+    ("LightmapGIData", "_get_user_data", false),
+    ("LightmapGIData", "_is_using_packed_directional", false),
+    ("LightmapGIData", "_set_light_textures_data", false),
+    ("LightmapGIData", "_set_probe_data", false),
+    ("LightmapGIData", "_set_user_data", false),
+    ("LightmapGIData", "_set_uses_packed_directional", false),
+    ("LimitAngularVelocityModifier3D", "_get_joint_count", false),
+    ("LineEdit", "_set_text", false),
+    ("MultiMesh", "_get_color_array", false),
+    ("MultiMesh", "_get_custom_data_array", false),
+    ("MultiMesh", "_get_transform_2d_array", false),
+    ("MultiMesh", "_get_transform_array", false),
+    ("MultiMesh", "_set_color_array", false),
+    ("MultiMesh", "_set_custom_data_array", false),
+    ("MultiMesh", "_set_transform_2d_array", false),
+    ("MultiMesh", "_set_transform_array", false),
+    ("MultiplayerSpawner", "_get_spawnable_scenes", false),
+    ("MultiplayerSpawner", "_set_spawnable_scenes", false),
+    ("NavigationAgent2D", "_avoidance_done", false),
+    ("NavigationAgent3D", "_avoidance_done", false),
+    ("NavigationMesh", "_get_polygons", false),
+    ("NavigationMesh", "_set_polygons", false),
+    ("NavigationPolygon", "_get_outlines", false),
+    ("NavigationPolygon", "_get_polygons", false),
+    ("NavigationPolygon", "_set_outlines", false),
+    ("NavigationPolygon", "_set_polygons", false),
+    ("NavigationRegion2D", "_navigation_polygon_changed", false),
+    ("Node", "_set_property_pinned", false),
+    ("Object", "_get", true),
+    ("Object", "_get_property_list", true),
+    ("Object", "_init", true),
+    ("Object", "_iter_get", true),
+    ("Object", "_iter_init", true),
+    ("Object", "_iter_next", true),
+    ("Object", "_notification", true),
+    ("Object", "_property_can_revert", true),
+    ("Object", "_property_get_revert", true),
+    ("Object", "_set", true),
+    ("Object", "_to_string", true),
+    ("Object", "_validate_property", true),
+    ("Object", "free", false),
+    (
+        "OccluderInstance3D",
+        "_get_editable_3d_polygon_resource",
+        false,
+    ),
+    ("OccluderInstance3D", "_is_editable_3d_polygon", false),
+    ("OpenXRInteractionProfileEditorBase", "_add_binding", false),
+    (
+        "OpenXRInteractionProfileEditorBase",
+        "_remove_binding",
+        false,
+    ),
+    ("OptionButton", "_select_int", false),
+    ("PackedDataContainer", "_get_data", false),
+    ("PackedDataContainer", "_iter_get", false),
+    ("PackedDataContainer", "_iter_init", false),
+    ("PackedDataContainer", "_iter_next", false),
+    ("PackedDataContainer", "_set_data", false),
+    ("PackedDataContainerRef", "_iter_get", false),
+    ("PackedDataContainerRef", "_iter_init", false),
+    ("PackedDataContainerRef", "_iter_next", false),
+    ("PackedScene", "_get_bundled_scene", false),
+    ("PackedScene", "_set_bundled_scene", false),
+    ("Parallax2D", "_camera_moved", false),
+    ("ParallaxBackground", "_camera_moved", false),
+    ("Polygon2D", "_get_bones", false),
+    ("Polygon2D", "_set_bones", false),
+    (
+        "PolygonOccluder3D",
+        "_has_editable_3d_polygon_no_depth",
+        false,
+    ),
+    ("PolygonPathFinder", "_get_data", false),
+    ("PolygonPathFinder", "_set_data", false),
+    ("PortableCompressedTexture2D", "_get_data", false),
+    ("PortableCompressedTexture2D", "_set_data", false),
+    ("RDShaderFile", "_get_versions", false),
+    ("RDShaderFile", "_set_versions", false),
+    ("RDUniform", "_set_ids", false),
+    ("ResourcePreloader", "_get_resources", false),
+    ("ResourcePreloader", "_set_resources", false),
+    ("ScriptEditor", "_help_tab_goto", false),
+    ("ShaderGlobalsOverride", "_activate", false),
+    ("SpriteFrames", "_get_animations", false),
+    ("SpriteFrames", "_set_animations", false),
+    ("TextEdit", "_set_text", false),
+    ("Translation", "_get_messages", false),
+    ("Translation", "_set_messages", false),
+    ("Viewport", "_gui_remove_focus_for_window", false),
+    ("Viewport", "_process_picking", false),
+    ("VisualShader", "_get_preview_shader_parameter", false),
+    ("VisualShader", "_has_preview_shader_parameter", false),
+    ("VisualShader", "_set_preview_shader_parameter", false),
+    ("VisualShader", "_update_shader", false),
+    ("VisualShaderNode", "_get_output_ports_expanded", false),
+    ("VisualShaderNode", "_is_output_port_expanded", false),
+    ("VisualShaderNode", "_set_output_port_expanded", false),
+    ("VisualShaderNode", "_set_output_ports_expanded", false),
+    ("VisualShaderNodeCustom", "_get_properties", false),
+    ("VisualShaderNodeCustom", "_is_initialized", false),
+    ("VisualShaderNodeCustom", "_set_initialized", false),
+    (
+        "VisualShaderNodeCustom",
+        "_set_input_port_default_value",
+        false,
+    ),
+    ("VisualShaderNodeCustom", "_set_option_index", false),
+    ("VisualShaderNodeCustom", "_set_properties", false),
+    ("VisualShaderNodeParameterRef", "_get_parameter_type", false),
+    ("VisualShaderNodeParameterRef", "_set_parameter_type", false),
+    ("VisualShaderNodeReroute", "_set_port_type", false),
+    ("VisualShaderNodeVec4Constant", "_get_constant_v4", false),
+    ("VisualShaderNodeVec4Constant", "_set_constant_v4", false),
+    ("VoxelGIData", "_get_data", false),
+    ("VoxelGIData", "_set_data", false),
+];
 
 fn ingest_class(c: api::ClassDef, it: &mut Interner) -> NativeClass {
     NativeClass {
@@ -1475,5 +1744,113 @@ mod tests {
             "a non-Color constant carries no decoded color"
         );
         assert_eq!(db.builtin_color_constant("UP"), None);
+    }
+
+    /// #147: the dump-omitted ClassDB methods are SEEDED per-class at ingest. A production-shaped
+    /// dump (no `free`/`_*`/`_edit_*`) gets those names attached to their owning classes, so a method
+    /// lookup matches Godot's ClassDB surface — but ONLY on the owning class (per-class precision,
+    /// not a global allowlist).
+    #[test]
+    fn dump_omitted_methods_are_seeded_per_class() {
+        // Production-shaped: Object/Node/CanvasItem with NONE of the omitted names in the dump.
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Object", "is_instantiable": true},
+                    {"name": "Node", "inherits": "Object", "is_instantiable": true},
+                    {"name": "CanvasItem", "inherits": "Object", "is_instantiable": true}
+                ]
+            }"#,
+        )
+        .expect("seed dump");
+
+        let is_method = |class: &str, m: &str| {
+            matches!(
+                db.lookup_member(class, m),
+                Some((_, NativeMember::Method(_)))
+            )
+        };
+
+        // `free` (the lone non-underscore omission) seeded on Object; reachable via inheritance.
+        assert!(is_method("Object", "free"), "free seeded on Object");
+        assert!(
+            is_method("Node", "free"),
+            "free reachable on Node via inheritance"
+        );
+        // Object-core virtual seeded on Object.
+        assert!(
+            is_method("Object", "_notification"),
+            "_notification seeded on Object"
+        );
+        // Per-class precision: `_edit_get_rect` is owned by CanvasItem ONLY (oracle-confirmed).
+        assert!(
+            is_method("CanvasItem", "_edit_get_rect"),
+            "_edit_get_rect seeded on CanvasItem (owner)"
+        );
+        assert!(
+            !is_method("Node", "_edit_get_rect"),
+            "_edit_get_rect must NOT resolve on Node (not the owner) — per-class, not a global allowlist"
+        );
+        // A genuinely absent name never resolves (the seed adds only the omitted set).
+        assert!(
+            !is_method("Object", "_totally_fabricated"),
+            "an unseeded fabricated name must still miss"
+        );
+
+        // The seeded method's virtual flag is the method's real `METHOD_FLAG_VIRTUAL` bit (carried
+        // per-row), NOT the `_`-prefix. `_notification` is a genuine `Object`-core virtual ⇒ true.
+        let Some((_, NativeMember::Method(m))) = db.lookup_member("Object", "_notification") else {
+            panic!("_notification resolves as a method");
+        };
+        assert!(
+            m.is_virtual,
+            "a seeded Object-core virtual (`_notification`) is marked is_virtual"
+        );
+        // `_edit_get_rect` is `_`-prefixed but a real non-virtual `MethodBind` (an editor method),
+        // so the seed marks it NON-virtual — the `_`-prefix heuristic would wrongly mark it virtual.
+        let Some((_, NativeMember::Method(edit))) =
+            db.lookup_member("CanvasItem", "_edit_get_rect")
+        else {
+            panic!("_edit_get_rect resolves as a method");
+        };
+        assert!(
+            !edit.is_virtual,
+            "a seeded non-virtual `_`-prefixed editor method (`_edit_get_rect`) must NOT be is_virtual"
+        );
+        let Some((_, NativeMember::Method(free))) = db.lookup_member("Object", "free") else {
+            panic!("free resolves as a method");
+        };
+        assert!(!free.is_virtual, "seeded `free` is not virtual");
+    }
+
+    /// #147: the seed never SHADOWS a real dump method — if the dump already carries an omitted name
+    /// (e.g. a custom build that does export `free`), the existing entry wins and no duplicate is added.
+    #[test]
+    fn seed_does_not_shadow_a_dump_provided_method() {
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Object", "is_instantiable": true, "methods": [
+                        {"name": "free", "is_const": false, "is_static": false, "is_vararg": false,
+                         "is_virtual": false, "hash": 99, "return_value": {"type": "int"}}
+                    ]}
+                ]
+            }"#,
+        )
+        .expect("dump-with-free");
+        let obj = db.class_named("Object").expect("Object");
+        let frees: Vec<&Method> = obj
+            .methods
+            .iter()
+            .filter(|m| db.name_of(m.name) == "free")
+            .collect();
+        assert_eq!(frees.len(), 1, "exactly one `free` (no seed duplicate)");
+        // The DUMP's `free` (int return) is kept, not the synthesized one (Variant return).
+        assert!(
+            matches!(frees[0].return_type, TypeRef::Named(s) if db.name_of(s) == "int"),
+            "the dump-provided `free` is preserved, not shadowed by the seed"
+        );
     }
 }
