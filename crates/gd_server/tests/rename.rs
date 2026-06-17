@@ -3667,7 +3667,7 @@ fn rename_167_inner_scoped_type_colliding_with_global_class_refuses() {
     // `cursor_references_global_class` returns false for it — it can NEVER canonicalize onto the
     // global `class_name Foo` decl (the cell-(B) corruption). An inner-scoped type has no precise
     // rename target today, so the cursor falls through to the occurrence-positive no-anchor refusal:
-    // fail-closed REFUSE, the documented #167 inner-precise limitation (tracked as a follow-up). The
+    // fail-closed REFUSE, the documented #167 inner-precise limitation (tracked in gdls#189). The
     // hard invariant the test pins: the global `class_name Foo` decl is NEVER edited.
     let project = common::sample_project();
     project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");

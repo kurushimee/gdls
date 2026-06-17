@@ -6668,7 +6668,7 @@ pub fn rename(
     //     `cursor_references_global_class` returns `false` for it — the cursor cannot canonicalize onto
     //     the unrelated global `class_name` decl. An inner-scoped type has no precise rename target
     //     today, so it falls through to the no-anchor refusal (`rename_native_or_stub_refusal` step 5):
-    //     fail-closed, the documented #167 inner-precise limitation (tracked as a follow-up).
+    //     fail-closed, the documented #167 inner-precise limitation (tracked in gdls#189).
 
     let global_class_decl = (!cursor_refers_global_class)
         .then(|| find_global_class_definition(state, &old_name))
