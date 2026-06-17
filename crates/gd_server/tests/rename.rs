@@ -4037,7 +4037,6 @@ fn rename_163_func_local_const_alias_stays_safe() {
     shutdown(&client, server);
 }
 
-
 // =================================================================================================
 // #181: anchor-side local over-capture. A rename use-click on an ATTRIBUTE-position identifier
 // (`self.NAME` / `obj.NAME` / a qualified `A.B.NAME` suffix) — or a Lua-style dict key — whose
@@ -4144,7 +4143,10 @@ fn rename_181_self_member_attr_with_colliding_local_var_renames_member_never_loc
         "UP",
         301,
     );
-    assert!(!err, "a member attribute click resolves to the member and renames it (no refuse)");
+    assert!(
+        !err,
+        "a member attribute click resolves to the member and renames it (no refuse)"
+    );
     // The edited cons sites: the MEMBER decl (line 1, col 4) + the `self.NORTH` attribute (line 4,
     // col 6). The LOCAL decl (line 3) and the bare `print(NORTH)` local use (line 5) are UNTOUCHED.
     assert_eq!(
@@ -4203,7 +4205,10 @@ fn rename_181_qualified_enum_suffix_with_colliding_for_iter_refuses_never_local(
         "UP",
         303,
     );
-    assert!(err, "cross-file enum-value suffix refuses (the #158 boundary)");
+    assert!(
+        err,
+        "cross-file enum-value suffix refuses (the #158 boundary)"
+    );
     assert!(
         sites.is_empty(),
         "REFUSE → zero edits; the colliding `for NORTH` iterator must NOT be touched: {sites:?}"
@@ -4256,7 +4261,10 @@ fn rename_181_no_collision_member_attr_still_renames() {
         "amount",
         305,
     );
-    assert!(!err, "a member attribute with no colliding local must rename (not refuse)");
+    assert!(
+        !err,
+        "a member attribute with no colliding local must rename (not refuse)"
+    );
     // member decl (1,4) + the two `self.member` attributes (3,6) and (4,12 — `\tprint(self.member)`:
     // tab(0) `print(`(1-6) `self`(7-10) `.`(11) `member`(12)).
     assert_eq!(

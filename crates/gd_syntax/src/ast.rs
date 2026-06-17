@@ -747,32 +747,18 @@ impl ParseTree {
         }
     }
 
-    /// Resolve the identifier at `byte` (textually `name`) to the **declaration identifier** of the
-    /// local binding it refers to, respecting nested `var`/`for`/`match`-bind/`param`/lambda scopes —
-    /// the precise (binding-based) analog of [`Self::locals_in_scope_at`]. `None` when `byte` is not
-    /// inside any block, or `name` is not a local there (a member / global / unresolved identifier).
-    ///
-    /// Two cases, in order:
-    /// - **Declaration click:** `byte` lands on a binding's own declaration identifier (which for a
-    ///   `for`/`match` bind sits textually OUTSIDE the body block that owns the `Local`, so the suite
-    ///   walk below would miss it) → that binding. The nearest enclosing block to the click is used
-    ///   to disambiguate same-named bindings, so clicking an inner `var x` resolves to the inner one.
-    /// - **Use:** walk the block chain innermost-first (so an inner binding shadows an outer one) and
-    ///   return the first in-scope binding of `name` whose declaration **completes at or before**
-    ///   `byte` (`source.span.end <= byte`) — the same not-yet-declared rule as `locals_in_scope_at`,
-    ///   which also makes a use inside a binding's own initializer (`var x = x`) resolve outward.
-    /// `true` iff the identifier node `ident_id` occupies a position that SHARES a local's name but
-    /// is NOT a reference to it, so a consumer of local resolution must never treat it as the local:
-    /// - an ATTRIBUTE identifier (`obj.x` / `self.x` — the `x` is a member access, a different symbol);
-    /// - a LUA-STYLE dictionary KEY (`{ x = value }` — the analyzer folds the key to a string literal,
-    ///   recording no binding, so it is not a reference; a Python-style key `{ x: value }` IS a real
-    ///   expression and is kept). The single-element ambiguous case (`style == None`) is parsed
-    ///   Lua-style, so treat it so.
+    /// Whether the identifier node `ident_id` occupies a position that SHARES a local's name but is
+    /// NOT a reference to it, so a consumer of local resolution must never treat it as the local. Two
+    /// such positions are excluded. An ATTRIBUTE identifier (the trailing ident of `obj.x` / `self.x`)
+    /// is a member access — a different symbol. A LUA-STYLE dictionary KEY (`x` in `{ x = value }`) is
+    /// folded by the analyzer to a string literal recording no binding, so it is not a reference; a
+    /// Python-style key (`x` in `{ x: value }`) IS a real expression and is kept, and the
+    /// single-element ambiguous case (`style == None`) is parsed Lua-style, so it is excluded too.
     ///
     /// One arena pass. This is the SINGLE source of the two exclusions both the cursor-anchor
     /// ([`Self::resolve_local_binding_at`]) and the occurrence collector
     /// ([`Self::local_binding_occurrences`]) must apply — rewriting either position under a rename is
-    /// silent corruption (a member access turned dangling / a folded key string silently changed).
+    /// silent corruption (a member access turned dangling, or a folded key string silently changed).
     fn ident_is_non_local_position(&self, ident_id: NodeId) -> bool {
         for id in self.iter_ids() {
             match &self.get(id).kind {
@@ -798,6 +784,20 @@ impl ParseTree {
         false
     }
 
+    /// Resolve the identifier at `byte` (textually `name`) to the **declaration identifier** of the
+    /// local binding it refers to, respecting nested `var`/`for`/`match`-bind/`param`/lambda scopes —
+    /// the precise (binding-based) analog of [`Self::locals_in_scope_at`]. `None` when `byte` is not
+    /// inside any block, or `name` is not a local there (a member / global / unresolved identifier).
+    ///
+    /// Two cases, in order:
+    /// - **Declaration click:** `byte` lands on a binding's own declaration identifier (which for a
+    ///   `for`/`match` bind sits textually OUTSIDE the body block that owns the `Local`, so the suite
+    ///   walk below would miss it) → that binding. The nearest enclosing block to the click is used
+    ///   to disambiguate same-named bindings, so clicking an inner `var x` resolves to the inner one.
+    /// - **Use:** walk the block chain innermost-first (so an inner binding shadows an outer one) and
+    ///   return the first in-scope binding of `name` whose declaration **completes at or before**
+    ///   `byte` (`source.span.end <= byte`) — the same not-yet-declared rule as `locals_in_scope_at`,
+    ///   which also makes a use inside a binding's own initializer (`var x = x`) resolve outward.
     pub fn resolve_local_binding_at(&self, byte: usize, name: &str) -> Option<NodeId> {
         // Anchor-side exclusion (#181): if the cursor lands on an identifier that merely SHARES a
         // local's name but is not a reference to it — an attribute ident (`obj.x` / `self.x`) or a

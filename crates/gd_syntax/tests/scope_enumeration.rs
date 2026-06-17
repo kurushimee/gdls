@@ -415,7 +415,8 @@ fn attribute_use_cursor_does_not_resolve_to_colliding_local() {
     // `self.member` / `obj.member` — the cursor is ON the attribute identifier, which is a MEMBER
     // access, not the local. Even with a same-named `var member` in scope, the anchor must return
     // None (so the rename firewall routes the cursor to the member/enum classifier, never the local).
-    const SRC: &str = "func f(obj) -> void:\n\tvar member := 1\n\tself.member = member\n\tobj.member = 2\n";
+    const SRC: &str =
+        "func f(obj) -> void:\n\tvar member := 1\n\tself.member = member\n\tobj.member = 2\n";
     let tree = parse(SRC).tree;
     // Cursor on the `member` of `self.member` (LHS attribute, first occurrence after `self.`).
     let self_attr = after(SRC, "self."); // start of the attribute `member`
