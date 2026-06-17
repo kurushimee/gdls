@@ -23,13 +23,25 @@
 //! * `binary` — drain stdin, write invalid UTF-8 bytes to stdout, exit 0 (the non-UTF-8 path).
 //! * (anything else / missing) — exit 2 without reading, an unknown-mode guard.
 //!
+//! Two parameterized modes exercise the off-worker scheduling (#135 head-of-line blocking) and the
+//! cancel-driven child kill (#136). They take a SECOND CLI argument:
+//!
+//! * `delaysqueeze <ms>` — sleep `<ms>` milliseconds, THEN squeeze (a successful but SLOW format).
+//!   Used by the HOL test: a long format must not stall an unrelated request — the slow `delaysqueeze`
+//!   occupies the bridge while a fast request races past it.
+//! * `markerafter <path>` — sleep a long time (past any cancel window), then create the file at
+//!   `<path>` and squeeze. The marker file appears ONLY if the child ran to completion; a cancel that
+//!   kills the child mid-sleep leaves no marker — that absence is the no-orphan / no-late-write proof.
+//!
 //! Every mode drains stdin first (a real filter does), so the parent's stdin write never blocks on a
 //! full pipe.
 
 use std::io::{Read, Write};
 
 fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_default();
+    let mut args = std::env::args().skip(1);
+    let mode = args.next().unwrap_or_default();
+    let arg2 = args.next();
 
     // Drain stdin first in every mode (a real stdin→stdout filter consumes its input). Using a byte
     // buffer so the `binary` mode can also read non-text input without a decode error.
@@ -75,6 +87,28 @@ fn main() {
         "binary" => {
             // Invalid UTF-8 (a lone continuation byte / bare 0xFF) — the handler must reject it.
             write_stdout(&[0x66, 0x6f, 0x6f, 0xff, 0xfe, 0x00, 0x80]);
+        }
+        "delaysqueeze" => {
+            // A SUCCESSFUL but slow format: sleep the requested ms, then squeeze. Drives the #135
+            // head-of-line test — this format must run off the request worker so a concurrent
+            // request answers without waiting out this sleep.
+            let ms: u64 = arg2.as_deref().unwrap_or("0").parse().unwrap_or(0);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            let text = String::from_utf8_lossy(&input);
+            let out = squeeze_spaces(&text);
+            write_stdout(out.as_bytes());
+        }
+        "markerafter" => {
+            // No-orphan proof for #136: sleep well past the test's cancel window, then write a
+            // marker file and squeeze. A cancel that kills this child mid-sleep leaves NO marker and
+            // NO stdout — the test asserts the marker's absence (no orphaned process completed, no
+            // late edit was produced). The path is the second arg.
+            let marker = arg2.expect("markerafter requires a marker path");
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            let _ = std::fs::write(&marker, b"done");
+            let text = String::from_utf8_lossy(&input);
+            let out = squeeze_spaces(&text);
+            write_stdout(out.as_bytes());
         }
         _ => {
             // Unknown / missing mode — fail loudly so a mis-wired test is obvious.

@@ -646,6 +646,11 @@ pub struct ServerState {
     /// the borrow on `state.workspace` to avoid an aliasing borrow. `Some` only while inside
     /// the [`dispatch_request`] macro; cleared back to `None` on handler return.
     pub(crate) current_token: Option<CancellationToken>,
+    /// The id of the currently-dispatching request, alongside [`Self::current_token`]. Read by the
+    /// off-worker formatter bridge (M11 #135/#136) to tag the [`crate::formatter::FormatDone`] it
+    /// sends back from the format thread. `Some` only while inside [`dispatch_request`]; cleared to
+    /// `None` on handler return (same lifetime as `current_token`).
+    pub(crate) current_request_id: Option<RequestId>,
     /// M5 WP-H1: resolved memory budget owned by the session. Read by the WP-H1 ticker arm to
     /// classify the current peak RSS into a [`MemoryPressure`] level (via
     /// [`RssSampler::pressure`]) and act on the transition. Resolved once at startup from
@@ -686,6 +691,13 @@ pub struct ServerState {
     /// / timeout / non-UTF-8 output) — the first occurrence shows the message and records the class
     /// here; later occurrences of the same class stay silent (the full detail still goes to stderr).
     pub(crate) formatter_warned: FxHashSet<crate::formatter::FormatterFailure>,
+    /// M11 (#135/#136): the off-worker external-formatter bridge. `textDocument/formatting` runs the
+    /// subprocess on a dedicated thread (not the request worker) so a slow/blocked format can't stall
+    /// unrelated requests (#135 head-of-line blocking); the worker applies each result back on the
+    /// event-loop thread via the [`crate::formatter::FormatBridge::done_rx`] `select!` arm. A
+    /// `$/cancelRequest` for an in-flight format kills its subprocess promptly (#136). Holds the
+    /// long-lived result channel + the per-document supersession map.
+    pub(crate) format_bridge: crate::formatter::FormatBridge,
 }
 
 /// M10 (#72): one entry of [`ServerState::semantic_tokens_cache`] — the last result id + token array
@@ -901,6 +913,7 @@ fn serve_inner(
         rss,
         shared: Arc::clone(&shared),
         current_token: None,
+        current_request_id: None,
         budget,
         memory_pressure: MemoryPressure::Normal,
         outbound: FxHashMap::default(),
@@ -908,6 +921,7 @@ fn serve_inner(
         semantic_tokens_cache: FxHashMap::default(),
         semantic_tokens_result_seq: 0,
         formatter_warned: FxHashSet::default(),
+        format_bridge: crate::formatter::FormatBridge::default(),
     };
 
     // M7 (#60): the one dynamic registration, sent once the session state exists (the
@@ -974,6 +988,11 @@ fn serve_inner(
     let dummy = crossbeam_channel::never::<DebounceEventResult>();
     // One-shot arm for the background auto-dump (issue #25); `never` once it has fired/closed.
     let dump_dummy = crossbeam_channel::never::<crate::api_dump::DumpOutcome>();
+    // M11 (#135/#136): a clone of the off-worker formatter result channel. The `select!` arm below
+    // can't name `state.format_bridge.done_rx` directly (the arm body also takes `&mut state`), so
+    // bind a long-lived clone here. The original receiver stays owned by `state.format_bridge`; both
+    // ends of the channel persist for the whole session.
+    let format_bridge_rx = state.format_bridge.done_rx.clone();
     // WP-RD11 (4): liveness ticks elapsed since the watcher arm was disabled. Once the watcher is
     // down (MaxFilesWatch / root-loss), the index would otherwise freeze until restart; this counts
     // 3-second ticks so a low-frequency reconcile fallback can re-sync on-disk drift.
@@ -986,6 +1005,27 @@ fn serve_inner(
         let watcher_arm = watcher_rx.as_ref().unwrap_or(&dummy);
         let dump_arm = dump_rx.as_ref().unwrap_or(&dump_dummy);
         select! {
+            // M11 (#135/#136): an off-worker format finished. Apply it on the event-loop thread:
+            // warn-once on a real failure, drop the supersession entry, then route the response
+            // through `finish_request` (so a cancel/edit the router tripped while the format ran
+            // overrides it with RequestCancelled/ContentModified — the mutating-consumer firewall:
+            // no late edit after cancel/stale) and send it. Stays active during `shutting_down`: a
+            // format that predated `shutdown` must still be answered + deregistered.
+            recv(format_bridge_rx) -> done => match done {
+                Ok(done) => {
+                    let (id, value) = crate::formatter::apply_format_done(&mut state, done);
+                    let resp = finish_request(&state.shared, Response::new_ok(id, value));
+                    if let Err(e) = state.sender.send(Message::Response(resp)) {
+                        log::warn!(
+                            "format response send failed (client likely disconnected): {e}; \
+                             loop will exit on next receiver tick"
+                        );
+                    }
+                }
+                // Both ends live in `state.format_bridge` for the whole session, so the channel
+                // never disconnects while the loop runs; a recv error is unreachable but handled.
+                Err(_) => log::warn!("format bridge channel closed unexpectedly"),
+            },
             recv(dump_arm) -> outcome => {
                 // One-shot: whether it reported or the thread died, retire the arm.
                 dump_rx = None;
@@ -1028,28 +1068,33 @@ fn serve_inner(
                     // now consumes (a guaranteed 30 s hang per shutdown). Spec-equivalent
                     // handling inline: answer `shutdown` with null and keep looping until the
                     // `exit` notification breaks the loop.
+                    // `None` ⇒ the handler answers asynchronously (the off-worker formatter — M11
+                    // #135/#136 — sends its response later via the `recv(format_bridge_rx)` arm
+                    // below); send nothing now.
                     let resp = if req.method == "shutdown" {
                         shutting_down = true;
-                        Response::new_ok(req.id, serde_json::Value::Null)
+                        Some(Response::new_ok(req.id, serde_json::Value::Null))
                     } else if shutting_down {
                         // Deregister the lifecycle the router opened for it, then refuse.
                         let _ = state.shared.finish(&req.id);
-                        Response::new_err(
+                        Some(Response::new_err(
                             req.id,
                             ERR_INVALID_REQUEST,
                             "request received after shutdown".to_string(),
-                        )
+                        ))
                     } else {
                         dispatch_request(&mut state, req)
                     };
-                    if let Err(e) = state.sender.send(Message::Response(resp)) {
-                        // Send only errors when the receiver is closed. The next select! tick
-                        // will hit the Err(_) arm on the forwarded stream and break.
-                        // Once-per-session event; warn so production logs surface it.
-                        log::warn!(
-                            "response send failed (client likely disconnected): {e}; \
-                             loop will exit on next receiver tick"
-                        );
+                    if let Some(resp) = resp {
+                        if let Err(e) = state.sender.send(Message::Response(resp)) {
+                            // Send only errors when the receiver is closed. The next select! tick
+                            // will hit the Err(_) arm on the forwarded stream and break.
+                            // Once-per-session event; warn so production logs surface it.
+                            log::warn!(
+                                "response send failed (client likely disconnected): {e}; \
+                                 loop will exit on next receiver tick"
+                            );
+                        }
                     }
                 }
                 Ok(Message::Notification(note)) => {
@@ -2422,7 +2467,10 @@ fn invalid_params_response(
     Response::new_err(id, ERR_INVALID_PARAMS, format!("invalid params: {e}"))
 }
 
-fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
+/// Dispatch one request. Returns `Some(response)` to send immediately, or `None` when the request
+/// was handed off-worker and its response will arrive later (the `textDocument/formatting` bridge —
+/// M11 #135/#136 — is the only handler that returns `None`; every other arm returns `Some`).
+fn dispatch_request(state: &mut ServerState, req: Request) -> Option<Response> {
     let Request { id, method, params } = req;
     // M5 WP-O1: every request handler runs inside a `handle_request` span. The macro is the
     // single span-injection chokepoint that covers all 9 LSP handlers at once (the highest-
@@ -2459,9 +2507,10 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
             interrupt = ?interrupt,
             "request short-circuited before dispatch"
         );
-        return interrupt_response(interrupt, req_id);
+        return Some(interrupt_response(interrupt, req_id));
     }
     state.current_token = Some(lifecycle.token());
+    state.current_request_id = Some(req_id.clone());
     macro_rules! handle {
         ($h:path) => {{
             let _start = std::time::Instant::now();
@@ -2592,20 +2641,55 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // (deregister via `finish_request`, clear current_token), so jump straight to the end
         // via early return.
         state.current_token = None;
+        state.current_request_id = None;
         tracing::warn!(
             target: "shed",
             id = %req_id,
             method = %method,
             "request shed at Hard memory pressure",
         );
-        return finish_request(
+        return Some(finish_request(
             &state.shared,
             Response::new_err(
                 req_id,
                 ERR_CONTENT_MODIFIED,
                 "server is shedding requests under memory pressure; please retry".to_string(),
             ),
-        );
+        ));
+    }
+    // M11 (#135/#136): `textDocument/formatting` runs OFF the request worker. It is handled before
+    // the synchronous dispatch table because its control flow is different: a real format returns
+    // `Pending` — the worker sends NO response now (it arrives via the `recv(format_done_rx)` arm
+    // once the off-worker thread finishes) and the lifecycle stays REGISTERED across the gap, so a
+    // cancel/edit the router trips meanwhile is still applied by `finish_request` on the done arm.
+    // Only the defensive `Immediate` paths (no command / no buffer) answer synchronously here.
+    if method == "textDocument/formatting" {
+        let _span = tracing::info_span!("handle_request", method = %method, id = %id);
+        let _enter = _span.enter();
+        let dispatch = match serde_json::from_value(params) {
+            Ok(p) => crate::formatter::formatting(state, p),
+            Err(e) => {
+                // A malformed formatting request: answer the param error synchronously (and clear
+                // the per-request scratch like every other arm).
+                state.current_token = None;
+                state.current_request_id = None;
+                return Some(finish_request(
+                    &state.shared,
+                    invalid_params_response(id, &method, e),
+                ));
+            }
+        };
+        state.current_token = None;
+        state.current_request_id = None;
+        return match dispatch {
+            crate::formatter::FormatDispatch::Immediate(edits) => {
+                let value = serde_json::to_value(edits).unwrap_or(serde_json::Value::Null);
+                Some(finish_request(&state.shared, Response::new_ok(id, value)))
+            }
+            // Pending: do NOT finish the lifecycle and do NOT send a response — both happen on the
+            // done arm. The off-worker thread now owns answering this id.
+            crate::formatter::FormatDispatch::Pending => None,
+        };
     }
     let resp = match method.as_str() {
         "textDocument/documentSymbol" => handle!(handlers::document_symbol),
@@ -2655,14 +2739,8 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
         // set above), served like foldingRange.
         "textDocument/documentColor" => handle!(handlers::document_color),
         "textDocument/colorPresentation" => handle!(handlers::color_presentation),
-        // M11 (#80): the external-formatter bridge. Pipes the open buffer through the configured
-        // command (no shell, bounded timeout) and returns minimal-diff `TextEdit`s, or `null` (no
-        // edits) + a deduped showMessage(Warning) on any failure — the buffer is never corrupted.
-        // NOT analysis-priced (it never runs the analyzer — just reads buffer text and shells out),
-        // so it is absent from the Hard-pressure `analyze_using` shed set above; the bounded
-        // subprocess timeout is its own backstop. Only reached when `documentFormattingProvider` was
-        // advertised (a command is configured); a non-conforming client gets `null` defensively.
-        "textDocument/formatting" => handle!(crate::formatter::formatting),
+        // M11 (#80, #135/#136): `textDocument/formatting` is handled BEFORE this match (it runs
+        // off-worker; see the dedicated branch above), so it never reaches the synchronous table.
         // M10 (#72): semanticTokens. `full` returns the whole delta-encoded token set (fresh result
         // id); `full/delta` returns flat-array edits vs the prior id (or a fresh full on an unknown
         // id); `range` returns only the intersecting tokens. `full`/`full/delta` are analysis-priced
@@ -2742,7 +2820,8 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Response {
     // is discarded along with the rest of the response, and `Workspace::analyze_with_options`
     // never caches a bailed result).
     state.current_token = None;
-    finish_request(&state.shared, resp)
+    state.current_request_id = None;
+    Some(finish_request(&state.shared, resp))
 }
 
 /// M7 (#57) interrupt gate: deregister the response's request from the in-flight registry —
@@ -3476,6 +3555,7 @@ mod tests {
             rss: RssSampler::new(),
             shared: Arc::new(SessionShared::default()),
             current_token: None,
+            current_request_id: None,
             // The watcher-path tests don't exercise the WP-H1 ladder; a synthetic budget with
             // caps far above what a small tempdir workspace will ever observe keeps the ticker
             // arm at MemoryPressure::Normal across the run.
@@ -3486,6 +3566,7 @@ mod tests {
             semantic_tokens_cache: FxHashMap::default(),
             semantic_tokens_result_seq: 0,
             formatter_warned: FxHashSet::default(),
+            format_bridge: crate::formatter::FormatBridge::default(),
         };
         (state, rx)
     }
@@ -3528,6 +3609,7 @@ mod tests {
             rss,
             shared: Arc::new(SessionShared::default()),
             current_token: None,
+            current_request_id: None,
             budget,
             memory_pressure: MemoryPressure::Normal,
             outbound: FxHashMap::default(),
@@ -3535,6 +3617,7 @@ mod tests {
             semantic_tokens_cache: FxHashMap::default(),
             semantic_tokens_result_seq: 0,
             formatter_warned: FxHashSet::default(),
+            format_bridge: crate::formatter::FormatBridge::default(),
         };
         (state, rx)
     }
@@ -3605,7 +3688,7 @@ mod tests {
                 "position": { "line": 0, "character": 0 }
             }),
         };
-        let resp = dispatch_request(&mut state, hover);
+        let resp = dispatch_request(&mut state, hover).expect("non-formatting → Some(response)");
         let err = resp.error.expect("hover must be shed at Hard pressure");
         assert_eq!(
             err.code, ERR_CONTENT_MODIFIED,
@@ -3628,7 +3711,8 @@ mod tests {
             method: "textDocument/documentSymbol".to_string(),
             params: serde_json::json!({ "textDocument": { "uri": "file:///test/a.gd" } }),
         };
-        let resp = dispatch_request(&mut state, doc_symbol);
+        let resp =
+            dispatch_request(&mut state, doc_symbol).expect("non-formatting → Some(response)");
         assert_ne!(
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
@@ -3647,7 +3731,8 @@ mod tests {
                 "position": { "line": 0, "character": 0 }
             }),
         };
-        let resp = dispatch_request(&mut state, definition);
+        let resp =
+            dispatch_request(&mut state, definition).expect("non-formatting → Some(response)");
         assert_ne!(
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
@@ -3665,7 +3750,8 @@ mod tests {
                 "position": { "line": 0, "character": 0 }
             }),
         };
-        let resp = dispatch_request(&mut state, completion);
+        let resp =
+            dispatch_request(&mut state, completion).expect("non-formatting → Some(response)");
         assert_eq!(
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
@@ -3683,7 +3769,8 @@ mod tests {
                 "position": { "line": 0, "character": 0 }
             }),
         };
-        let resp = dispatch_request(&mut state, signature_help);
+        let resp =
+            dispatch_request(&mut state, signature_help).expect("non-formatting → Some(response)");
         assert_eq!(
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
@@ -3699,7 +3786,7 @@ mod tests {
             method: "completionItem/resolve".to_string(),
             params: serde_json::json!({ "label": "x" }),
         };
-        let resp = dispatch_request(&mut state, resolve);
+        let resp = dispatch_request(&mut state, resolve).expect("non-formatting → Some(response)");
         assert_ne!(
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
@@ -3732,7 +3819,7 @@ mod tests {
             method: "textDocument/semanticTokens/full".to_string(),
             params: serde_json::json!({ "textDocument": { "uri": "file:///test/a.gd" } }),
         };
-        let resp = dispatch_request(&mut state, full);
+        let resp = dispatch_request(&mut state, full).expect("non-formatting → Some(response)");
         assert_eq!(
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
@@ -3749,7 +3836,7 @@ mod tests {
                 "previousResultId": "st-1"
             }),
         };
-        let resp = dispatch_request(&mut state, delta);
+        let resp = dispatch_request(&mut state, delta).expect("non-formatting → Some(response)");
         assert_eq!(
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
@@ -3770,7 +3857,7 @@ mod tests {
                 }
             }),
         };
-        let resp = dispatch_request(&mut state, range);
+        let resp = dispatch_request(&mut state, range).expect("non-formatting → Some(response)");
         assert_ne!(
             resp.error.as_ref().map(|e| e.code),
             Some(ERR_CONTENT_MODIFIED),
@@ -3940,6 +4027,7 @@ mod tests {
             rss,
             shared: Arc::new(SessionShared::default()),
             current_token: None,
+            current_request_id: None,
             budget,
             memory_pressure: MemoryPressure::Normal,
             outbound: FxHashMap::default(),
@@ -3947,6 +4035,7 @@ mod tests {
             semantic_tokens_cache: FxHashMap::default(),
             semantic_tokens_result_seq: 0,
             formatter_warned: FxHashSet::default(),
+            format_bridge: crate::formatter::FormatBridge::default(),
         };
 
         // Pre-populate the cache via the dev/test debug-insert helpers. Without entries to

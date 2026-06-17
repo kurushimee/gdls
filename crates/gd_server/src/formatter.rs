@@ -48,12 +48,15 @@
 
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use lsp_server::RequestId;
 use lsp_types::{DocumentFormattingParams, MessageType, OneOf, TextEdit};
+use ropey::Rope;
 
+use crate::cancellation::CancellationToken;
 use crate::config::FormatterConfig;
-use crate::position::PositionMapper;
+use crate::position::{PositionEncoding, PositionMapper};
 use crate::server::{show_message, ServerState};
 
 /// How long the external formatter may run before gdls kills it and treats the format as failed.
@@ -61,6 +64,14 @@ use crate::server::{show_message, ServerState};
 /// any real file while still bounding a wedged child so the worker can never hang. Not yet
 /// configurable — a `formatter.timeoutMs` knob can be added if a project needs a longer bound.
 const FORMAT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the format wait re-checks the request's cancellation token while the subprocess runs
+/// (#136). The wait blocks on the I/O channel in slices of this length; on each wake it consults the
+/// token and KILLS the child the instant a `$/cancelRequest` (or an intervening edit) trips it,
+/// rather than running the child out to [`FORMAT_TIMEOUT`]. Small enough to feel immediate, large
+/// enough that the poll overhead is negligible against a per-save format. The total bound on a
+/// non-cancelled run is unchanged — the slices still sum to [`FORMAT_TIMEOUT`].
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Upper bound on the bytes gdls will buffer from the formatter's STDOUT. A formatted GDScript file
 /// is at most a small multiple of its source; 64 MiB is orders of magnitude above any real `.gd`
@@ -131,38 +142,312 @@ pub(crate) fn document_formatting_provider(
     formatter.is_configured().then_some(OneOf::Left(true))
 }
 
-/// `textDocument/formatting`: pipe the document's current text through the configured external
-/// formatter and return minimal-diff [`TextEdit`]s for the changed region, or `None` (LSP `null`) on
-/// any failure. NEVER mutates the buffer on failure; emits a deduped `window/showMessage(Warning)`
-/// per failure class.
-///
-/// Returns `None` (no edits) when:
-///   * no formatter is configured (defensive — the capability isn't advertised, so a conforming
-///     client never sends this), or the buffer isn't open;
-///   * the format fails (spawn error / non-zero exit / timeout / non-UTF-8 output) — plus a warning;
-///   * the formatter's output is byte-identical to the input (nothing to change — not a failure).
+/// The result of an off-worker format run, sent from the format thread back to the event loop over
+/// [`FormatBridge::done_rx`]. The worker applies it on its own thread with `&mut ServerState`
+/// (warn-once on failure, then [`crate::server::finish_request`] before sending the response) — the
+/// format thread NEVER touches `ServerState`, so the analysis caches need no synchronization and the
+/// emitted edits are computed entirely from the owned snapshot.
+pub(crate) struct FormatDone {
+    /// The originating `textDocument/formatting` request id, to route the response + deregister the
+    /// lifecycle.
+    pub(crate) id: RequestId,
+    /// The formatted document's URI key, to remove the per-document supersession entry on apply.
+    uri_key: String,
+    /// This request's cancellation token, so apply removes the supersession entry only when it is
+    /// STILL this request's (a newer format may have superseded it).
+    token: CancellationToken,
+    /// The configured command, for the failure `window/showMessage`.
+    pub(crate) command: String,
+    /// `Ok(Some(edits))` — minimal-diff edits to apply; `Ok(None)` — no edits (output unchanged, OR
+    /// the request was cancelled mid-run: a cancel yields no edits and NO warning, and
+    /// `finish_request` overwrites the null response with `RequestCancelled`); `Err(failure)` — the
+    /// format failed, warn-once + no edits.
+    pub(crate) result: Result<Option<Vec<TextEdit>>, FormatterFailure>,
+}
+
+/// The bridge owned by [`crate::server::ServerState`] that carries off-worker formatting (#135/#136).
+/// `done_rx` is a LONG-LIVED channel (not a one-shot `Option`) because multiple format requests can
+/// be in flight at once — each spawned thread holds a clone of `done_tx`. `in_flight` maps an open
+/// document's URI key to the in-flight format's [`CancellationToken`] so a newer format for the same
+/// document SUPERSEDES (cancels) the older one (the editor's format-on-save + fast typing case).
+pub(crate) struct FormatBridge {
+    done_tx: crossbeam_channel::Sender<FormatDone>,
+    /// Received by the event loop's `recv(format_done_rx)` select arm; see
+    /// [`crate::formatter::apply_format_done`].
+    pub(crate) done_rx: crossbeam_channel::Receiver<FormatDone>,
+    /// Per-document in-flight format token, for supersession. Keyed by the URI string (the same key
+    /// the VFS uses). Entry is inserted at spawn and removed when the result is applied.
+    in_flight: rustc_hash::FxHashMap<String, CancellationToken>,
+}
+
+impl Default for FormatBridge {
+    fn default() -> Self {
+        let (done_tx, done_rx) = crossbeam_channel::unbounded();
+        Self {
+            done_tx,
+            done_rx,
+            in_flight: rustc_hash::FxHashMap::default(),
+        }
+    }
+}
+
+/// Outcome of dispatching a `textDocument/formatting` request: either it was answered SYNCHRONOUSLY
+/// (a defensive no-op — no command configured, or no open buffer — answered with no edits), or it
+/// was handed to an off-worker thread and the response will arrive later via the
+/// [`FormatBridge::done_rx`] select arm.
 #[must_use]
+pub(crate) enum FormatDispatch {
+    /// Answer now with these edits (`None` ⇒ LSP `null`). The defensive paths only.
+    Immediate(Option<Vec<TextEdit>>),
+    /// The format is running off-worker; the worker must NOT send a response now (it will come from
+    /// the done arm). The request's lifecycle stays registered across the gap.
+    Pending,
+}
+
+/// A drop guard that GUARANTEES the format thread sends exactly one [`FormatDone`] for its request,
+/// even if the thread panics or takes an early return before the normal send. Without it, a panicked
+/// thread would drop its `done_tx` clone WITHOUT closing the (long-lived) channel — the worker's
+/// `recv` arm would never fire for that id, the client would hang forever, and the lifecycle would
+/// leak in `SessionShared::in_flight` (only `finish_request`, on the done arm, removes it). On a
+/// normal completion [`Self::send`] consumes the guard; on an unwind/early-return its `Drop` sends a
+/// fallback `Ok(None)` (no edits — `finish_request` still maps any cancel/stale interrupt) and logs
+/// at error so the panic is visible, never silent (the "never crash, never lie" rule).
+struct FormatResponder {
+    done_tx: crossbeam_channel::Sender<FormatDone>,
+    id: RequestId,
+    uri_key: String,
+    token: CancellationToken,
+    command: String,
+}
+
+impl FormatResponder {
+    /// Send the real result and disarm the guard (so `Drop` does not also send).
+    fn send(self, result: Result<Option<Vec<TextEdit>>, FormatterFailure>) {
+        let done = FormatDone {
+            id: self.id.clone(),
+            uri_key: self.uri_key.clone(),
+            token: self.token.clone(),
+            command: self.command.clone(),
+            result,
+        };
+        // The receiver lives as long as the event loop. A send error only happens if the loop has
+        // already exited (`exit`) — the session is ending, so a lost response is acceptable.
+        let _ = self.done_tx.send(done);
+        // Disarm: consume without running the panic-fallback Drop.
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for FormatResponder {
+    fn drop(&mut self) {
+        // Reached only on an unwind or early return that bypassed `send` — our code path always
+        // calls `send`, so this firing means the format thread panicked. Emit a fallback response so
+        // the client is never left hanging, and log at error so the panic is not invisible.
+        log::error!(
+            "format thread for request {:?} (command {:?}) ended without sending a result; \
+             emitting a no-edits fallback so the request is still answered",
+            self.id,
+            self.command
+        );
+        let done = FormatDone {
+            id: self.id.clone(),
+            uri_key: self.uri_key.clone(),
+            token: self.token.clone(),
+            command: self.command.clone(),
+            result: Ok(None),
+        };
+        let _ = self.done_tx.send(done);
+    }
+}
+
+/// `textDocument/formatting`: pipe the document's current text through the configured external
+/// formatter OFF the request worker (#135 — a slow/blocked format must not stall unrelated
+/// requests), returning [`FormatDispatch::Pending`] while the subprocess runs. The result is applied
+/// later, on the worker, by [`apply_format_done`]. NEVER mutates the buffer on failure; emits a
+/// deduped `window/showMessage(Warning)` per failure class (from the done arm). A `$/cancelRequest`
+/// for an in-flight format kills its subprocess promptly (#136).
+///
+/// Answers SYNCHRONOUSLY with no edits ([`FormatDispatch::Immediate`]) only on the defensive paths:
+///   * no formatter is configured (the capability isn't advertised, so a conforming client never
+///     sends this), or the buffer isn't open.
+///
+/// Every real format runs off-worker; its `None`/edits/failure outcome is decided there.
 pub(crate) fn formatting(
     state: &mut ServerState,
     params: DocumentFormattingParams,
-) -> Option<Vec<TextEdit>> {
-    // Defensive: the capability is gated on this, so a conforming client never reaches here without
-    // a command — but a non-conforming one might, and we must answer with no edits, never spawn a
-    // bogus command nor panic.
-    let formatter = state.options.formatter.clone();
-    let command = formatter.command.clone()?;
+) -> FormatDispatch {
+    // Defensive: the capability is gated on a configured command, so a conforming client never
+    // reaches here without one — but a non-conforming one might, and we must answer with no edits,
+    // never spawn a bogus command nor panic.
+    let Some(command) = state.options.formatter.command.clone() else {
+        return FormatDispatch::Immediate(None);
+    };
+    let args = state.options.formatter.args.clone();
 
     let uri = params.text_document.uri;
+    let uri_key = uri.as_str().to_string();
     // The current buffer is the source of truth (docs/01 vfs.rs). No open buffer ⇒ nothing to format
-    // (we never read disk here — formatting acts on what the user sees).
-    let doc = state.vfs.get(uri.as_str())?;
+    // (we never read disk here — formatting acts on what the user sees). Snapshot its text NOW (owned)
+    // so the off-worker thread never touches `state.vfs`.
+    let Some(doc) = state.vfs.get(&uri_key) else {
+        return FormatDispatch::Immediate(None);
+    };
     let original = doc.text();
-    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+    let encoding = state.encoding;
 
-    match run_formatter(&command, &formatter.args, &original) {
-        Ok(formatted) => minimal_edits(&original, &formatted, &mapper),
+    // The request's lifecycle/token — kept REGISTERED across the async gap (do NOT `finish` here), so
+    // a cancel or an intervening edit the router trips while the format runs is still applied by
+    // `finish_request` on the done arm (the mutating-consumer firewall: no late edit after
+    // cancel/stale). `current_token` was set by `dispatch_request`; clone the token for the thread.
+    let id = state
+        .current_request_id
+        .clone()
+        .expect("invariant: formatting is dispatched inside a request, so an id is set");
+    let token = state
+        .current_token
+        .clone()
+        .expect("invariant: dispatch_request set current_token before the handler ran");
+
+    // Supersession (#135): a newer format for the SAME document cancels the older in-flight one so a
+    // pile-up of format-on-save + fast-typing requests doesn't keep N stale `gdformat` children
+    // alive. The superseded run's poll-kill reaps its child; its done arm answers `RequestCancelled`
+    // only if the client also cancelled — otherwise it answers no-edits (Ok(None)), which is the
+    // correct "this format is obsolete" outcome for a buffer that has since changed.
+    if let Some(prev) = state
+        .format_bridge
+        .in_flight
+        .insert(uri_key.clone(), token.clone())
+    {
+        prev.cancel();
+    }
+
+    let done_tx = state.format_bridge.done_tx.clone();
+    spawn_format(SpawnArgs {
+        done_tx,
+        id,
+        uri_key,
+        command,
+        args,
+        original,
+        encoding,
+        token,
+    });
+    FormatDispatch::Pending
+}
+
+/// The owned snapshot handed to [`spawn_format`] (grouped to avoid a too-many-arguments fn — all
+/// fields are moved onto the off-worker thread).
+struct SpawnArgs {
+    done_tx: crossbeam_channel::Sender<FormatDone>,
+    id: RequestId,
+    uri_key: String,
+    command: String,
+    args: Vec<String>,
+    original: String,
+    encoding: PositionEncoding,
+    token: CancellationToken,
+}
+
+/// Spawn the off-worker format thread. It holds ONLY owned data (text, command, args, encoding) plus
+/// the request id, the cancellation token, and a `done_tx` clone — never `ServerState`. It builds a
+/// fresh `Rope`/`PositionMapper` from the owned text, runs the (verbatim) subprocess + minimal-diff,
+/// and sends the outcome back via the [`FormatResponder`] guard (exactly one [`FormatDone`], even on
+/// panic). A spawn FAILURE is answered synchronously by the caller path — `spawn_format` uses
+/// [`std::thread::Builder`] and, if the OS refuses the thread, sends the fallback itself rather than
+/// panicking the worker.
+fn spawn_format(spawn_args: SpawnArgs) {
+    let SpawnArgs {
+        done_tx,
+        id,
+        uri_key,
+        command,
+        args,
+        original,
+        encoding,
+        token,
+    } = spawn_args;
+    // The closure moves its own copies of `command`/`args`/`original`/`token`; keep separate copies
+    // for the spawn-failure fallback below (the closure is consumed by `Builder::spawn` either way).
+    let fallback = FormatDone {
+        id: id.clone(),
+        uri_key,
+        token: token.clone(),
+        command: command.clone(),
+        result: Ok(None),
+    };
+    let responder = FormatResponder {
+        done_tx: done_tx.clone(),
+        id: id.clone(),
+        uri_key: fallback.uri_key.clone(),
+        token: token.clone(),
+        command: command.clone(),
+    };
+    let spawn = std::thread::Builder::new()
+        .name("gdls-format".to_string())
+        .spawn(move || {
+            // The guard fires its fallback if this closure panics before `send`.
+            let result = run_format_job(&command, &args, &original, encoding, &token);
+            responder.send(result);
+        });
+    if let Err(e) = spawn {
+        // The OS refused a new thread (FD/thread-count exhaustion). Do NOT panic the worker — answer
+        // the request with no edits via the bridge so the client is never left hanging.
+        log::error!("could not spawn format thread for request {id:?}: {e}; answering no edits");
+        let _ = done_tx.send(fallback);
+    }
+}
+
+/// The pure off-worker body: build a `Rope`/`PositionMapper` from the owned text, run the formatter
+/// subprocess, and diff into minimal edits. Identical edit computation to the prior synchronous path
+/// (relocated verbatim) — the emitted edits cannot change.
+fn run_format_job(
+    command: &str,
+    args: &[String],
+    original: &str,
+    encoding: PositionEncoding,
+    token: &CancellationToken,
+) -> Result<Option<Vec<TextEdit>>, FormatterFailure> {
+    let rope = Rope::from_str(original);
+    let mapper = PositionMapper::new(&rope, encoding);
+    match run_formatter(command, args, original, token) {
+        // A clean run: diff into minimal edits (None when output == input — nothing to change).
+        Ok(Some(formatted)) => Ok(minimal_edits(original, &formatted, &mapper)),
+        // Cancelled mid-run: no edits, no warning (the done arm leaves it to `finish_request`).
+        Ok(None) => Ok(None),
+        Err(failure) => Err(failure),
+    }
+}
+
+/// Apply an off-worker [`FormatDone`] on the event-loop thread (`&mut ServerState`). Deregisters the
+/// in-flight supersession entry, warns-once on a real failure, then returns the response VALUE to the
+/// caller, which routes it through [`crate::server::finish_request`] (so a cancel/stale interrupt the
+/// router tripped while the format ran overrides it with `RequestCancelled`/`ContentModified` — no
+/// late edit applied after cancel/stale) before sending it. Returns `(id, response_value)`.
+pub(crate) fn apply_format_done(
+    state: &mut ServerState,
+    done: FormatDone,
+) -> (RequestId, serde_json::Value) {
+    let FormatDone {
+        id,
+        uri_key,
+        token,
+        command,
+        result,
+    } = done;
+    // Drop this request's supersession entry ONLY when it is STILL this request's token. A newer
+    // format for the same document may have already overwritten the entry (supersession); removing
+    // it then would delete the NEWER format's token and leak it. Matching by pointer identity keeps
+    // the map to exactly the genuinely-in-flight formats.
+    if let std::collections::hash_map::Entry::Occupied(e) =
+        state.format_bridge.in_flight.entry(uri_key)
+    {
+        if e.get().same_token(&token) {
+            e.remove();
+        }
+    }
+    let edits = match result {
+        Ok(edits) => edits,
         Err(failure) => {
-            // Log the full detail to stderr always; the user-facing showMessage is deduped.
             log::warn!(
                 "textDocument/formatting: formatter {command:?} failed ({failure:?}); returning no \
                  edits (buffer unchanged)"
@@ -170,7 +455,9 @@ pub(crate) fn formatting(
             warn_once(state, failure, &command);
             None
         }
-    }
+    };
+    let value = serde_json::to_value(edits).unwrap_or(serde_json::Value::Null);
+    (id, value)
 }
 
 /// Emit the `window/showMessage(Warning)` for a failure class AT MOST ONCE PER SESSION. The
@@ -183,15 +470,29 @@ fn warn_once(state: &mut ServerState, failure: FormatterFailure, command: &str) 
 }
 
 /// Spawn `command args…` with NO shell, write `input` to its STDIN, and read its STDOUT under a
-/// bounded timeout. Returns the formatted text on a clean run (exit 0 + valid UTF-8 stdout), or the
-/// matching [`FormatterFailure`] otherwise. The child is killed on timeout. Never panics.
+/// bounded timeout. Returns `Ok(Some(text))` on a clean run (exit 0 + valid UTF-8 stdout),
+/// `Ok(None)` when `cancel` tripped mid-run (the child was killed; no edits, no warning — a
+/// user-initiated cancel is not a failure), or the matching [`FormatterFailure`] otherwise. The
+/// child is killed on timeout OR cancel. Never panics.
 ///
 /// The stdin-write and stdout-read run CONCURRENTLY — stdin on its own thread while the worker
 /// drains stdout — so a formatter that writes a large result (filling the OS pipe buffer) before
 /// draining its stdin can't deadlock against us: neither side blocks the other, and the main thread
-/// only blocks on a channel `recv_timeout`. On timeout the child handle (kept on the main thread) is
-/// killed, which breaks both pipes and unblocks both I/O threads so they exit.
-fn run_formatter(command: &str, args: &[String], input: &str) -> Result<String, FormatterFailure> {
+/// only blocks on a channel `recv_timeout` in [`CANCEL_POLL_INTERVAL`] slices. On timeout OR cancel
+/// the child handle (kept on the main thread) is killed, which breaks both pipes and unblocks both
+/// I/O threads so they exit.
+///
+/// `cancel` is the request's [`CancellationToken`] (#136): the wait polls it every
+/// [`CANCEL_POLL_INTERVAL`] and kills the child the moment it trips, so a cancelled format does not
+/// run its child out to [`FORMAT_TIMEOUT`] (no orphaned subprocess). The non-cancelled path is
+/// behavior-identical to a single `recv_timeout(FORMAT_TIMEOUT)` — the slices sum to the same bound
+/// and yield the same result.
+fn run_formatter(
+    command: &str,
+    args: &[String],
+    input: &str,
+    cancel: &CancellationToken,
+) -> Result<Option<String>, FormatterFailure> {
     let mut child = Command::new(command)
         .args(args)
         .stdin(Stdio::piped())
@@ -244,34 +545,59 @@ fn run_formatter(command: &str, args: &[String], input: &str) -> Result<String, 
         let _ = tx.send(result);
     });
 
-    // Block on the worker for at most FORMAT_TIMEOUT. On timeout, KILL the child (which unblocks the
-    // worker's I/O) and report a timeout — never wait on `worker.join()` here (that could re-block
-    // for as long as the OS takes to tear the child down; the kill is enough and the detached worker
-    // exits on its own once its pipes break).
-    let stdout_bytes = match rx.recv_timeout(FORMAT_TIMEOUT) {
-        Ok(Ok(bytes)) => bytes,
-        Ok(Err(e)) => {
-            log::warn!("formatter I/O error for {command:?}: {e}");
-            let _ = child.kill();
-            let _ = child.wait();
-            // An I/O error talking to the child is, from the buffer's perspective, the same as a
-            // failed run: classify by exit status if the child already died, else treat as non-zero.
-            return classify_io_failure(&mut child);
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            log::warn!("formatter {command:?} timed out after {FORMAT_TIMEOUT:?}; killing it");
+    // Block on the worker for at most FORMAT_TIMEOUT, waking every CANCEL_POLL_INTERVAL to check the
+    // request's cancellation token (#136). On timeout OR cancel, KILL the child (which unblocks the
+    // worker's I/O) — never wait on `worker.join()` here (that could re-block for as long as the OS
+    // takes to tear the child down; the kill is enough and the detached worker exits on its own once
+    // its pipes break). The non-cancelled path is behavior-identical to a single
+    // `recv_timeout(FORMAT_TIMEOUT)`: the slices sum to the same bound, the same bytes arrive.
+    let deadline = Instant::now() + FORMAT_TIMEOUT;
+    let stdout_bytes = loop {
+        // Cancel takes priority over a just-arrived result: if the client retracted the request,
+        // discard whatever the child produced and kill it (no edits, no warning — see Ok(None)).
+        if cancel.is_cancelled() {
+            log::debug!("formatter {command:?} cancelled mid-run; killing it");
             let _ = child.kill();
             let _ = child.wait();
             drop(worker); // detached; it returns once its pipes break from the kill
-            return Err(FormatterFailure::Timeout);
+            return Ok(None);
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            // The worker dropped the sender without sending — only possible on a panic in the worker
-            // (which our code doesn't do). Treat as a failed run, fail-closed.
-            log::warn!("formatter worker for {command:?} disconnected unexpectedly");
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(FormatterFailure::Spawn);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // The wait slice is the smaller of "time left to the deadline" and one poll interval, so the
+        // total non-cancelled bound stays exactly FORMAT_TIMEOUT while the cancel check fires often.
+        let slice = remaining.min(CANCEL_POLL_INTERVAL);
+        match rx.recv_timeout(slice) {
+            Ok(Ok(bytes)) => break bytes,
+            Ok(Err(e)) => {
+                log::warn!("formatter I/O error for {command:?}: {e}");
+                let _ = child.kill();
+                let _ = child.wait();
+                // An I/O error talking to the child is, from the buffer's perspective, the same as a
+                // failed run: classify by exit status if the child already died, else non-zero.
+                return classify_io_failure(&mut child);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // A slice elapsed with no result. Loop back to re-check cancel + the deadline; only
+                // when the FULL FORMAT_TIMEOUT has passed do we treat it as a timeout failure.
+                if Instant::now() >= deadline {
+                    log::warn!(
+                        "formatter {command:?} timed out after {FORMAT_TIMEOUT:?}; killing it"
+                    );
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    drop(worker); // detached; it returns once its pipes break from the kill
+                    return Err(FormatterFailure::Timeout);
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The worker dropped the sender without sending — only possible on a panic in the
+                // worker (which our code doesn't do). Treat as a failed run, fail-closed.
+                log::warn!("formatter worker for {command:?} disconnected unexpectedly");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(FormatterFailure::Spawn);
+            }
         }
     };
 
@@ -297,7 +623,9 @@ fn run_formatter(command: &str, args: &[String], input: &str) -> Result<String, 
         log::warn!("formatter {command:?} output exceeded {MAX_OUTPUT_BYTES} bytes; discarding");
         return Err(FormatterFailure::OversizedOutput);
     }
-    String::from_utf8(stdout_bytes).map_err(|_| FormatterFailure::NonUtf8Output)
+    String::from_utf8(stdout_bytes)
+        .map(Some)
+        .map_err(|_| FormatterFailure::NonUtf8Output)
 }
 
 /// Read up to [`MAX_OUTPUT_BYTES`] + 1 bytes from `reader`. The one extra byte over the cap lets the
@@ -314,7 +642,9 @@ fn read_capped(reader: &mut impl Read) -> std::io::Result<Vec<u8>> {
 
 /// Classify a child that hit an I/O error mid-talk: if it already exited, honor its status; otherwise
 /// it's a failed run. Always returns an `Err` (an I/O failure never yields formatted output).
-fn classify_io_failure(child: &mut std::process::Child) -> Result<String, FormatterFailure> {
+fn classify_io_failure(
+    child: &mut std::process::Child,
+) -> Result<Option<String>, FormatterFailure> {
     match child.try_wait() {
         Ok(Some(status)) if status.success() => {
             // Exited 0 but we couldn't read its output — discard, fail-closed (don't apply a
