@@ -1936,10 +1936,9 @@ mod tests {
         }
     }
 
-    /// The exact 4.6.3-stable derivation size: 182 rows, of which 12 are virtual. A regen against a
-    /// future Godot version will move these; a silent truncation/dup that the sort check misses will
-    /// not (the count is the cheapest bad-merge tripwire). Update both numbers only via the regen
-    /// script, never by hand.
+    /// The exact 4.6.3-stable derivation size: 182 rows. A regen against a future Godot version will
+    /// move this; a silent truncation/dup that the sort check misses will not (the count is the
+    /// cheapest bad-merge tripwire). Update only via the regen script, never by hand.
     #[test]
     fn dump_omitted_table_size_is_the_4_6_3_derivation() {
         assert_eq!(
@@ -1947,13 +1946,39 @@ mod tests {
             182,
             "DUMP_OMITTED_NATIVE_METHODS row count drifted from the 4.6.3-stable derivation"
         );
-        let virtual_rows = DUMP_OMITTED_NATIVE_METHODS
+    }
+
+    /// The `is_virtual==true` rows are the SAFETY-RELEVANT subset: they drive Godot's super-call
+    /// virtual check (`gdscript_analyzer.cpp:3630-3636`), so a mis-flagged or typo'd virtual is the
+    /// corruption with real diagnostic consequence. Pin the EXACT set (all 12 are `Object`-core
+    /// virtuals in 4.6.3) so a typo WITHIN it — a virtual name changed to another plausible
+    /// `_`-prefixed dump-omitted name — fails CI, which the count + `_`-prefix sanity checks alone
+    /// would miss. Update only via the regen script.
+    #[test]
+    fn dump_omitted_virtual_set_is_the_4_6_3_object_core_virtuals() {
+        let mut virtuals: Vec<(&str, &str)> = DUMP_OMITTED_NATIVE_METHODS
             .iter()
             .filter(|&&(_, _, is_virtual)| is_virtual)
-            .count();
+            .map(|&(class, method, _)| (class, method))
+            .collect();
+        virtuals.sort_unstable();
         assert_eq!(
-            virtual_rows, 12,
-            "the count of is_virtual=true rows drifted from the 4.6.3-stable derivation"
+            virtuals,
+            [
+                ("Object", "_get"),
+                ("Object", "_get_property_list"),
+                ("Object", "_init"),
+                ("Object", "_iter_get"),
+                ("Object", "_iter_init"),
+                ("Object", "_iter_next"),
+                ("Object", "_notification"),
+                ("Object", "_property_can_revert"),
+                ("Object", "_property_get_revert"),
+                ("Object", "_set"),
+                ("Object", "_to_string"),
+                ("Object", "_validate_property"),
+            ],
+            "the is_virtual=true set drifted from the 4.6.3-stable Object-core virtuals"
         );
     }
 
