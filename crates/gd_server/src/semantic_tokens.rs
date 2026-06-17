@@ -461,7 +461,10 @@ pub(crate) fn classify_document(
                 // The callee resolved to an in-file member/method (a script IS its root class, so a
                 // bare sibling call is a method call). Re-map any callable target kind to `method`,
                 // matching the declaration and the dotted-use color. A non-callable resolution
-                // (`CONST(123)`) is left to the generic path below.
+                // (`CONST(123)`) is left to the generic path below. A bare callee records `Member`
+                // (the unconditional `reduce_identifier` arm); the `Function` arm is defensive (the
+                // `Function`-kind use is recorded only in non-callee position) and re-maps to the
+                // same correct `method` color anyway.
                 if matches!(
                     target_kind,
                     BindingTargetKind::Function | BindingTargetKind::Member
