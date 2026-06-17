@@ -400,3 +400,98 @@ fn python_style_dict_string_key_leaves_value_reference() {
         "local decl + dict value ref + print (the string key is a literal, not an ident): {occ:?}"
     );
 }
+
+// =================================================================================================
+// ANCHOR-side exclusions (#181): a CURSOR landing on an attribute-position identifier (`self.NAME`,
+// `obj.NAME`, the suffix of a qualified `A.B.NAME`) or a Lua-style dict KEY must NOT resolve to a
+// same-named in-scope local. `resolve_local_binding_at` is the cursor→binding anchor consumed by the
+// rename firewall: before #181 it matched the local by name there too, so a rename use-click on
+// `obj.NAME` with a colliding `var NAME` in scope silently renamed the LOCAL (wrong-symbol
+// corruption). These pin the anchor exclusion as the twin of the collection-side exclusions above.
+// =================================================================================================
+
+#[test]
+fn attribute_use_cursor_does_not_resolve_to_colliding_local() {
+    // `self.member` / `obj.member` — the cursor is ON the attribute identifier, which is a MEMBER
+    // access, not the local. Even with a same-named `var member` in scope, the anchor must return
+    // None (so the rename firewall routes the cursor to the member/enum classifier, never the local).
+    const SRC: &str = "func f(obj) -> void:\n\tvar member := 1\n\tself.member = member\n\tobj.member = 2\n";
+    let tree = parse(SRC).tree;
+    // Cursor on the `member` of `self.member` (LHS attribute, first occurrence after `self.`).
+    let self_attr = after(SRC, "self."); // start of the attribute `member`
+    assert_eq!(
+        tree.resolve_local_binding_at(self_attr, "member"),
+        None,
+        "the `self.member` attribute must NOT resolve to the colliding local"
+    );
+    // Cursor on the `member` of `obj.member`.
+    let obj_attr = after(SRC, "obj."); // start of the attribute `member`
+    assert_eq!(
+        tree.resolve_local_binding_at(obj_attr, "member"),
+        None,
+        "the `obj.member` attribute must NOT resolve to the colliding local"
+    );
+    // Sanity: the BARE `member` use (RHS of `self.member = member`) still resolves to the local.
+    let bare_use = after(SRC, "self.member = "); // start of the bare RHS `member`
+    assert!(
+        tree.resolve_local_binding_at(bare_use, "member").is_some(),
+        "the bare RHS `member` is a real reference to the local and still resolves"
+    );
+}
+
+#[test]
+fn qualified_member_suffix_cursor_does_not_resolve_to_colliding_local() {
+    // `Foo.Direction.NORTH` — the `NORTH` is the suffix of a qualified attribute chain (a member /
+    // enum value), not the local. With a `var NORTH` in scope, the anchor must return None — the
+    // exact #181 reproducer at the gd_syntax layer.
+    const SRC: &str =
+        "func f() -> void:\n\tvar NORTH := 2\n\tvar a = Foo.Direction.NORTH\n\tprint(NORTH)\n";
+    let tree = parse(SRC).tree;
+    let suffix = after(SRC, "Foo.Direction."); // start of the qualified suffix `NORTH`
+    assert_eq!(
+        tree.resolve_local_binding_at(suffix, "NORTH"),
+        None,
+        "the qualified `Foo.Direction.NORTH` suffix must NOT resolve to the colliding local"
+    );
+    // Sanity: the bare `NORTH` in `print(NORTH)` still resolves to the local.
+    let bare = after(SRC, "print(");
+    assert!(
+        tree.resolve_local_binding_at(bare, "NORTH").is_some(),
+        "the bare `NORTH` use still resolves to the local"
+    );
+}
+
+#[test]
+fn lua_dict_key_cursor_does_not_resolve_to_colliding_local() {
+    // `{ name = value }` — the cursor on the Lua-style KEY must NOT resolve to a same-named local
+    // (the key folds to a string literal, not a reference). Renaming via this anchor would silently
+    // rewrite the colliding local.
+    const SRC: &str = "func f() -> void:\n\tvar name = 1\n\tvar d = { name = name }\n";
+    let tree = parse(SRC).tree;
+    let key = after(SRC, "{ "); // start of the Lua key `name`
+    assert_eq!(
+        tree.resolve_local_binding_at(key, "name"),
+        None,
+        "the Lua-style dict KEY must NOT resolve to the colliding local"
+    );
+    // Sanity: the VALUE `name` (a real reference) still resolves.
+    let value = after(SRC, "{ name = "); // start of the value `name`
+    assert!(
+        tree.resolve_local_binding_at(value, "name").is_some(),
+        "the dict VALUE reference still resolves to the local"
+    );
+}
+
+#[test]
+fn python_dict_key_cursor_still_resolves_to_local() {
+    // `{ name: value }` — a Python-style key is a real expression (an identifier reference), so a
+    // cursor ON it MUST still resolve to the local (excluding it would trade over-rename for an
+    // under-rename / dangling-reference regression). Guards against over-exclusion.
+    const SRC: &str = "func f() -> void:\n\tvar name = 1\n\tvar d = { name: 2 }\n";
+    let tree = parse(SRC).tree;
+    let key = after(SRC, "{ "); // start of the Python key `name`
+    assert!(
+        tree.resolve_local_binding_at(key, "name").is_some(),
+        "a Python-style dict key is a real reference and MUST still resolve to the local"
+    );
+}
