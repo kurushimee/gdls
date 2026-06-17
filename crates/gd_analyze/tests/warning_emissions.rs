@@ -1263,6 +1263,113 @@ fn super_native_nonvirtual_call_is_silent() {
     );
 }
 
+/// A native DB carrying the real classes the super-virtual regression cases extend, each chained to
+/// `Object`. The seed adds the dump-omitted `_`-prefixed methods (`_set_position`, `_select_int`,
+/// `_edit_get_rect`, `_set_data`, `_init`, `_notification`, …) to the class that OWNS each, with the
+/// real `METHOD_FLAG_VIRTUAL` flag — so a `super.<m>()` super-call resolves the seeded method and the
+/// `is_virtual`-gated super-virtual arm fires iff Godot's does.
+fn super_virtual_regression_native() -> NativeDb {
+    NativeDb::from_json(
+        r#"{
+            "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+            "classes": [
+                {"name": "Object", "is_instantiable": true},
+                {"name": "RefCounted", "inherits": "Object", "is_instantiable": true},
+                {"name": "Resource", "inherits": "RefCounted", "is_instantiable": true},
+                {"name": "Curve", "inherits": "Resource", "is_instantiable": true},
+                {"name": "Node", "inherits": "Object", "is_instantiable": true},
+                {"name": "CanvasItem", "inherits": "Node", "is_instantiable": true},
+                {"name": "Control", "inherits": "CanvasItem", "is_instantiable": true},
+                {"name": "BaseButton", "inherits": "Control", "is_instantiable": true},
+                {"name": "Button", "inherits": "BaseButton", "is_instantiable": true},
+                {"name": "OptionButton", "inherits": "Button", "is_instantiable": true}
+            ]
+        }"#,
+    )
+    .expect("valid super-virtual regression dump")
+}
+
+/// Returns whether `src` produces the super-call virtual-function error (analyzer.cpp:3630-3636)
+/// for ANY method — the silent-case assertions want "no super-virtual error at all".
+fn has_super_virtual_error(src: &str, native: &NativeDb) -> bool {
+    errors_in(src, native)
+        .iter()
+        .any(|m| m.starts_with(r#"Cannot call the parent class' virtual function ""#))
+}
+
+/// #147 BLOCKING FP fix (oracle-confirmed): `super._set_position(...)` on `extends Control` is a
+/// real NON-virtual internal `MethodBind` (`METHOD_FLAG_VIRTUAL` clear) — Godot is SILENT, so gdls
+/// must be too. The old `_`-prefix heuristic mis-flagged it virtual and fired the super-virtual
+/// error where Godot never does (blast radius ~70 Control/Node/CanvasItem/… classes).
+#[test]
+fn super_native_nonvirtual_underscore_set_position_is_silent() {
+    let src = "extends Control\nfunc f() -> void:\n\tsuper._set_position(Vector2())\n";
+    assert!(
+        !has_super_virtual_error(src, &super_virtual_regression_native()),
+        "super._set_position() on Control (a real non-virtual MethodBind) must NOT error — Godot is silent"
+    );
+}
+
+/// #147 FP fix: `super._select_int(0)` on `extends OptionButton` — real non-virtual editor method,
+/// Godot silent.
+#[test]
+fn super_native_nonvirtual_underscore_select_int_is_silent() {
+    let src = "extends OptionButton\nfunc f() -> void:\n\tsuper._select_int(0)\n";
+    assert!(
+        !has_super_virtual_error(src, &super_virtual_regression_native()),
+        "super._select_int() on OptionButton (non-virtual) must NOT error — Godot is silent"
+    );
+}
+
+/// #147 FP fix: `super._edit_get_rect()` on `extends CanvasItem` — real non-virtual editor method,
+/// Godot silent.
+#[test]
+fn super_native_nonvirtual_underscore_edit_get_rect_is_silent() {
+    let src = "extends CanvasItem\nfunc f() -> void:\n\tsuper._edit_get_rect()\n";
+    assert!(
+        !has_super_virtual_error(src, &super_virtual_regression_native()),
+        "super._edit_get_rect() on CanvasItem (non-virtual) must NOT error — Godot is silent"
+    );
+}
+
+/// #147 FP fix: `super._set_data([])` on `extends Curve` — real non-virtual method, Godot silent.
+#[test]
+fn super_native_nonvirtual_underscore_set_data_is_silent() {
+    let src = "extends Curve\nfunc f() -> void:\n\tsuper._set_data([])\n";
+    assert!(
+        !has_super_virtual_error(src, &super_virtual_regression_native()),
+        "super._set_data() on Curve (non-virtual) must NOT error — Godot is silent"
+    );
+}
+
+/// #147 load-bearing case: `super._init()` on `extends RefCounted` — `_init` is a genuine
+/// `Object`-core virtual (`METHOD_FLAG_VIRTUAL` set), so the super-virtual arm STILL fires. Removing
+/// the arm or mis-flagging `_init` would silence the pre-existing `super._init()` error
+/// (under-emission); the flag fix keeps it firing.
+#[test]
+fn super_native_virtual_init_still_errors() {
+    let src = "extends RefCounted\nfunc _init() -> void:\n\tsuper._init()\n";
+    let errs = errors_in(src, &super_virtual_regression_native());
+    assert!(
+        errs.iter().any(|m| m
+            == r#"Cannot call the parent class' virtual function "_init()" because it hasn't been defined."#),
+        "super._init() (a true Object-core virtual) must STILL error, got {errs:?}"
+    );
+}
+
+/// #147 load-bearing case: `super._notification(0)` on `extends Node` — `_notification` is a true
+/// `Object`-core virtual, so the super-virtual arm STILL fires.
+#[test]
+fn super_native_virtual_notification_still_errors() {
+    let src = "extends Node\nfunc _notification(what: int) -> void:\n\tsuper._notification(0)\n";
+    let errs = errors_in(src, &super_virtual_regression_native());
+    assert!(
+        errs.iter().any(|m| m
+            == r#"Cannot call the parent class' virtual function "_notification()" because it hasn't been defined."#),
+        "super._notification() (a true Object-core virtual) must STILL error, got {errs:?}"
+    );
+}
+
 #[test]
 fn dollar_valid_node_method_is_silent() {
     // `$x.get_parent()` (a real `Node` method) → silent under both unsafe-access warnings enabled.

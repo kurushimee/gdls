@@ -92,3 +92,42 @@ class B extends A:
         "NMO must fire on A.get only, not re-fire on B.get down the override chain",
     );
 }
+
+#[test]
+fn native_override_fires_on_a_seeded_nonvirtual_underscore_method() {
+    // #147 cross-effect (oracle-confirmed): `_edit_get_rect` is a dump-omitted, SEEDED `_`-prefixed
+    // method on `CanvasItem` — but a real non-virtual `MethodBind`, so its seeded `is_virtual` is
+    // `false` (the real `METHOD_FLAG_VIRTUAL` bit). `find_native_class_with_method` only resolves
+    // non-virtual methods (Godot's `native_base` gate), so overriding it now fires NMO — exactly as
+    // Godot does (`The method "_edit_get_rect()" overrides a method from native class "CanvasItem"`).
+    // The old `_`-prefix heuristic wrongly marked it virtual, suppressing this (an under-emission).
+    let src = "\
+extends CanvasItem
+
+func _edit_get_rect() -> Rect2:
+\treturn Rect2()
+";
+    assert_eq!(
+        nmo_count(src),
+        1,
+        "overriding a seeded non-virtual `_`-prefixed native method (`_edit_get_rect`) must warn (matches Godot)"
+    );
+}
+
+#[test]
+fn native_override_is_silent_on_a_true_object_core_virtual() {
+    // The flip side: `_notification` is a genuine `Object`-core virtual (`METHOD_FLAG_VIRTUAL` set),
+    // so its seeded `is_virtual` is `true`. `find_native_class_with_method` skips virtuals (no
+    // `MethodBind` ⇒ `native_base` empty), so overriding it stays SILENT — exactly as Godot does.
+    let src = "\
+extends Node
+
+func _notification(_what: int) -> void:
+\tpass
+";
+    assert_eq!(
+        nmo_count(src),
+        0,
+        "overriding a true Object-core virtual (`_notification`) must NOT warn (matches Godot)"
+    );
+}
