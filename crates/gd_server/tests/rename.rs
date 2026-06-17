@@ -2035,9 +2035,9 @@ fn rename_cross_file_class_name_enum_value_from_declaration_covers_cross_file_us
         &serde_json::from_value::<WorkspaceEdit>(resp.result.expect("a WorkspaceEdit")).unwrap(),
     );
     // The edited set is lib.gd's decl (3,11) + its in-file use (6,12 — `\treturn Dir.NORTH`: tab(0)
-    // `return `(1-7) `Dir`(8-10) `.`(11) `NORTH`(12)) AND the cross-file use.gd site (3,15 —
-    // `\treturn Lib.Dir.NORTH`: tab(0) `return `(1-7) `Lib`(8-10) `.`(11) `Dir`(12-14) `.`(15)...
-    // recompute: `NORTH` at col 15). Now covered (#158).
+    // `return `(1-7) `Dir`(8-10) `.`(11) `NORTH`(12)) AND the cross-file use.gd site (3,16 —
+    // `\treturn Lib.Dir.NORTH`: tab(0) `return `(1-7) `Lib`(8-10) `.`(11) `Dir`(12-14) `.`(15)
+    // `NORTH`(16)). Now covered (#158).
     let mut sites: Vec<(String, u32, u32)> = view
         .set
         .iter()
@@ -2049,7 +2049,7 @@ fn rename_cross_file_class_name_enum_value_from_declaration_covers_cross_file_us
         vec![
             (lib_uri.as_str().to_string(), 3, 11),
             (lib_uri.as_str().to_string(), 6, 12),
-            (use_uri.as_str().to_string(), 3, 15),
+            (use_uri.as_str().to_string(), 3, 16),
         ],
         "the edit must cover the declaring file (decl + in-file use) AND the cross-file \
          `Lib.Dir.NORTH` use (#158 full coverage); got {sites:?}"
@@ -2097,13 +2097,14 @@ fn rename_cross_file_class_name_enum_value_decoy_matrix_is_occurrence_positive()
     let bar_uri = file_uri(&project.root.join("src/bar.gd"));
     let cons_uri = file_uri(&project.root.join("src/cons.gd"));
 
-    // Rename `NORTH` from foo.gd's decl (line 3 `enum Direction { NORTH, SOUTH }`, `NORTH` at col 16).
+    // Rename `NORTH` from foo.gd's decl (line 3 `enum Direction { NORTH, SOUTH }`: `enum `(0-4)
+    // `Direction`(5-13) ` `(14) `{`(15) ` `(16) `NORTH`(17) → `NORTH` at col 17).
     client
         .sender
         .send(request(
             220,
             "textDocument/rename",
-            rename_params(&foo_uri, 3, 16, "UP"),
+            rename_params(&foo_uri, 3, 17, "UP"),
         ))
         .unwrap();
     let resp = recv_response(&client);
@@ -2128,7 +2129,7 @@ fn rename_cross_file_class_name_enum_value_decoy_matrix_is_occurrence_positive()
         sites,
         vec![
             (cons_uri.as_str().to_string(), 5, 23),
-            (foo_uri.as_str().to_string(), 3, 16),
+            (foo_uri.as_str().to_string(), 3, 17),
         ],
         "the edit must cover ONLY foo's value decl + the `Foo.Direction.NORTH` use, by identity; \
          got {sites:?}"

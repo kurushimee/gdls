@@ -5466,21 +5466,33 @@ fn reduce_identifier_from_base(
         if base.is_meta_type {
             if let Some(&val) = base.enum_values.get(&name) {
                 // gdls-only nav anchor (additive; Godot records nothing here — it just types the
-                // value, analyzer.cpp:4054-4068): a value of an IN-FILE named enum gets a
-                // by-identity `Binding::Use` so `references`/`rename` can resolve it to its
-                // declaration without a raw-text scan. `class_node.is_some()` ⟺ the enum is declared
-                // in THIS file (`make_class_enum_type`, resolver.rs:2893); a cross-file enum metatype
-                // carries `script_type`, NOT `class_node` (reducer.rs:5228), so it records nothing
-                // here and the rename firewall refuses it (no positive in-file anchor). The
-                // `target_name` is the QUALIFIED `<EnumName>.<value>` (composite-identity convention
-                // on `BindingTargetKind::EnumValueLocal`), and `site` is the bare VALUE token span —
-                // the exact range an edit replaces. Read `class_node`/`enum_type` BEFORE
-                // `type_from_metatype(base)` consumes `base`.
-                if base.class_node.is_some() {
+                // value, analyzer.cpp:4054-4068): a value of a named enum gets a by-identity
+                // `Binding::Use` so `references`/`rename` can resolve it to its DECLARING file
+                // without a raw-text scan. The composite identity is `(target_file, qualified)`:
+                //   - `target_file` is the file DECLARING the enum (not the access-site file) — so a
+                //     cross-file `Foo.Direction.NORTH` use records `foo.gd` and a `Bar.Direction.NORTH`
+                //     use records `bar.gd`, keeping two same-named values in DIFFERENT classes apart.
+                //   - `target_name` is the QUALIFIED `<EnumName>.<value>` (composite-identity
+                //     convention on `BindingTargetKind::EnumValueLocal`) — keeping `enum A { X }` and
+                //     `enum B { X }` of one file apart, and structurally invisible to bare-name
+                //     matchers.
+                // Two metatype shapes carry the declaring file: an IN-FILE enum has
+                // `class_node.is_some()` (`make_class_enum_type`, resolver.rs:2893) and its declaring
+                // file is the current file (`ctx.file`); a CROSS-FILE enum metatype carries
+                // `script_type`, NOT `class_node` (reducer.rs:5228/cross_file_named_enum), and its
+                // declaring file is `script_type.file`. `site` is the bare VALUE token span — the
+                // exact range an edit replaces. Read `class_node`/`script_type`/`enum_type` BEFORE
+                // `type_from_metatype(base)` consumes `base`. #106 (in-file) / #158 (cross-file).
+                let decl_file: Option<gd_project::FileId> = if base.class_node.is_some() {
+                    ctx.file
+                } else {
+                    base.script_type.as_ref().map(|s| s.file)
+                };
+                if let Some(decl_file) = decl_file {
                     let qualified = format!("{}.{}", base.enum_type, name);
                     let site = ctx.node(identifier_id).span;
                     ctx.record_binding(Binding::use_(
-                        ctx.file,
+                        Some(decl_file),
                         BindingSymbolKind::EnumValueLocal,
                         qualified,
                         site,
