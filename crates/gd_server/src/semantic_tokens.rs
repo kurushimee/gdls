@@ -198,6 +198,13 @@ pub(crate) fn classify_document(
     // …) colors `function`; anything else falls through to the local/omit path (#111).
     let mut call_callee_spans: FxHashSet<(usize, usize)> = FxHashSet::default();
 
+    // (6) Dotted-attribute call-callee identifier spans (`obj.foo()` / `self.foo()` — the callee is a
+    // `Subscript` whose attribute is `foo`). A resolved dotted member CALL records no `Binding::Use` at
+    // the attribute ident (the reducer's callee pre-reduce skips it), so it stays uncolored; this set
+    // lets the use pass color it `method` syntactically, mirroring the bare in-file callee. `super.*`
+    // is excluded (its callee dispatches to the parent). `X.new()` is included (a `method` use). (#176)
+    let mut dotted_callee_spans: FxHashSet<(usize, usize)> = FxHashSet::default();
+
     // First pass: declarations (structural — always emitted) + collect decl/type/attribute span sets.
     for id in tree.iter_ids() {
         let node = tree.get(id);
@@ -412,9 +419,24 @@ pub(crate) fn classify_document(
                 // automatically; `super(...)` is excluded explicitly (its callee dispatches to the
                 // parent, not a same-file identifier). See the use pass for classification.
                 if let Some(callee) = c.callee.filter(|_| !c.is_super) {
-                    if let NodeKind::Identifier(_) = &tree.get(callee).kind {
-                        let s = tree.get(callee).span;
-                        call_callee_spans.insert((s.start, s.end));
+                    match &tree.get(callee).kind {
+                        NodeKind::Identifier(_) => {
+                            let s = tree.get(callee).span;
+                            call_callee_spans.insert((s.start, s.end));
+                        }
+                        // A dotted-attribute callee (`obj.foo()`, `self.foo()`, `X.new()`): the callee
+                        // is a `Subscript` with an `Attribute` access; record the attribute ident span
+                        // so the use pass colors it `method` (#176). An index subscript callee
+                        // (`arr[0]()`) has no attribute ident, so it's naturally excluded.
+                        NodeKind::Subscript(s) => {
+                            if let Some(SubscriptAccess::Attribute(Some(attr))) = s.access {
+                                if let NodeKind::Identifier(_) = &tree.get(attr).kind {
+                                    let a = tree.get(attr).span;
+                                    dotted_callee_spans.insert((a.start, a.end));
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -444,42 +466,75 @@ pub(crate) fn classify_document(
             push_span(&mut out, span, ty, modifiers);
             continue;
         }
-        // A BARE call callee (`foo()` / `print()`) — classified ahead of the generic member-use path
-        // so an in-file method callee colors `method`, not the `property` the raw `Member` binding
-        // would yield (#111). Precedence (faithful to a user-defined `func print()` shadowing the
-        // engine utility): an in-file method/function binding wins; a recognized engine utility is
-        // next; otherwise fall through (a local callable colors `variable`, an unknown stays omitted —
-        // "never lie").
+        // A BARE call callee (`foo()` / `print()` / `Vector2()`) — classified ahead of the generic
+        // member-use path so an in-file method callee colors `method`, not the `property` the raw
+        // `Member` binding would yield (#111). Precedence (faithful to a user-defined `func print()`
+        // shadowing the engine utility): an in-file method binding wins; a recognized engine utility is
+        // next; a builtin-type constructor callee (`Vector2()`/`Color()`) is next; otherwise fall
+        // through (a Callable-property callee → `property`, a local callable → `variable`, an unknown
+        // stays omitted — "never lie").
         //
-        // Analysis-priced: gated on `analysis.is_some()` so the same callee never flips method↔function
+        // Analysis-priced: gated on `analysis.is_some()` so the same callee never flips classification
         // between `full` (member binding present → `method`) and `range`-under-Hard-pressure (no
-        // analysis → would name-match the utility table → `function`). Under `None` the callee falls
-        // through to the local path (a local callable still colors `variable`); the utility/method
+        // analysis → would name-match the utility/builtin tables). Under `None` the callee falls through
+        // to the local path (a local callable still colors `variable`); the utility/method/constructor
         // coloring is omitted, exactly as cross-file member/enum-value uses already are (never guessed).
         if analysis.is_some() && call_callee_spans.contains(&key) {
             if let Some(Binding::Use { target_kind, .. }) = use_index.get(&key).copied() {
-                // The callee resolved to an in-file member/method (a script IS its root class, so a
-                // bare sibling call is a method call). Re-map any callable target kind to `method`,
-                // matching the declaration and the dotted-use color. A non-callable resolution
-                // (`CONST(123)`) is left to the generic path below. A bare callee records `Member`
-                // (the unconditional `reduce_identifier` arm); the `Function` arm is defensive (the
-                // `Function`-kind use is recorded only in non-callee position) and re-maps to the
-                // same correct `method` color anyway.
+                // The callee resolved to an in-file member (a script IS its root class, so a bare
+                // sibling call is a method call). Re-map a callable target kind to `method` — EXCEPT
+                // the one case #111 mislabels: a property holding a Callable invoked directly (`var cb:
+                // Callable` called as `cb()`). A `Member` binding is recorded for BOTH a real method
+                // and a Callable property, and the resolved type (`Callable`) is identical, so the
+                // in-file declaration kind is the only signal. So re-map to `method` UNLESS the callee
+                // is a positively-identified `Member::Variable` in its enclosing class — in which case
+                // fall through to the generic `Member → property` arm, coloring it as what `cb` IS
+                // (#176). The default is `method` (the conservative #111 behavior): a real method, an
+                // inherited method, or anything not provably a same-class property stays `method`, so
+                // the narrowing can never drop a genuine method to `property`. The `Function` arm is
+                // defensive (a `Function`-kind use is recorded only in non-callee position).
                 if matches!(
                     target_kind,
                     BindingTargetKind::Function | BindingTargetKind::Member
-                ) {
+                ) && !callee_is_in_file_callable_property(tree, span.start, &ident.name)
+                {
                     push_span(&mut out, span, TokType::Method, 0);
                     continue;
                 }
+                // else: a same-class Callable property (`Member::Variable`) or a non-callable
+                // resolution (`CONST(123)`) — left to the generic member-use path below.
             } else if is_callee_utility(&ident.name, db) {
                 // A recognized engine utility callee with no in-file binding (`print`, `len`, …) →
                 // `function` (the M8 completion convention: native free functions are FUNCTION).
                 push_span(&mut out, span, TokType::Function, 0);
                 continue;
+            } else if db.builtin_named(&ident.name).is_some() {
+                // A builtin Variant-type constructor callee (`Vector2()`, `Color()`, `Rect2()`, …) with
+                // no in-file binding and not a utility → `class` + defaultLibrary, consistent with how a
+                // `: Vector2` annotation colors the type name (`type_use_token`). Godot has no separate
+                // "constructor" token; the type being constructed IS a builtin class. Ordered AFTER the
+                // utility check so `Color8()` (a GDScript utility, not a Variant type) stays `function`,
+                // and AFTER the in-file-member check so a user `func Vector2()` shadow wins. This also
+                // colors `int(x)`/`String(x)`/`Array(...)` as the builtin type — consistent (#175).
+                push_span(&mut out, span, TokType::Class, MOD_DEFAULT_LIBRARY);
+                continue;
             }
-            // else: fall through to the generic member-use / local paths (a local callable callee
-            // colors `variable`; an unresolved callee stays uncolored).
+            // else: fall through to the generic member-use / local paths (a Callable-property callee
+            // colors `property`; a local callable callee colors `variable`; an unresolved callee stays
+            // uncolored).
+        }
+        // A DOTTED-attribute call callee (`obj.foo()` / `self.foo()` / `X.new()`): the attribute ident
+        // in a subscript-callee position records no `Binding::Use` when the call resolves, so it would
+        // stay uncolored. Color it `method` syntactically, mirroring the bare in-file callee and the
+        // dotted member-USE color (#176). `super.*` was excluded at collection. KNOWN residual (#184):
+        // `obj.cb()` where `cb` is a Callable property is also colored `method` — the dotted analogue of
+        // the #176 part-1 mislabel — accepted here (the issue specifies `method` for dotted callees).
+        // Analysis-priced for parity with the bare-callee block (omitted under `range`-Hard, not
+        // guessed); a same-named property/local `foo` would NOT reach here (it isn't a subscript
+        // attribute), so this can't disturb a non-call member use.
+        if analysis.is_some() && dotted_callee_spans.contains(&key) {
+            push_span(&mut out, span, TokType::Method, 0);
+            continue;
         }
         // A resolved member/enum/method/cross-file use — from the analyzer binding.
         if let Some(Binding::Use {
@@ -561,6 +616,43 @@ fn local_use_kind(tree: &ParseTree, byte: usize, name: &str) -> Option<TokType> 
         | LocalKind::ForVariable
         | LocalKind::PatternBind => TokType::Variable,
     })
+}
+
+/// Whether a bare callee at `byte` (the callee identifier's start) is a directly-invoked
+/// `Member::Variable` (a property holding a Callable, e.g. `var cb: Callable` called as `cb()`) in its
+/// enclosing class — the ONE case #111's `Member`→`method` re-map mislabels (#176 part 1). Used to
+/// NARROW that re-map: a positively-identified Callable property is left for the generic `Member →
+/// property` arm; EVERYTHING ELSE keeps #111's `method` (the conservative default — a real method, an
+/// INHERITED method not declared in this class, etc., all stay `method`, so the narrowing can never
+/// drop a genuine method to `property`).
+///
+/// The lookup is scoped to the INNERMOST enclosing `ClassNode` containing the byte — GDScript inner
+/// classes don't see outer members, so a same-named `var foo` in an unrelated class can't be mistaken
+/// for this call's target (the binding carries only the bare `name`, no class path). Inheritance needs
+/// no chain walk: a `var cb` inherited from an in-file base is NOT in this class's own members, so the
+/// default (`method`) applies — and Godot resolves an inherited Callable property's bare call the same
+/// way an inherited method does, so `method` there is the consistent (non-regressing) choice.
+fn callee_is_in_file_callable_property(tree: &ParseTree, byte: usize, name: &str) -> bool {
+    // The innermost enclosing class (smallest class span containing the callee byte).
+    let mut best: Option<(ByteSpan, &gd_syntax::ast::ClassNode)> = None;
+    for id in tree.iter_ids() {
+        if let NodeKind::Class(c) = &tree.get(id).kind {
+            let s = tree.get(id).span;
+            if s.start <= byte
+                && byte < s.end
+                && best.is_none_or(|(b, _)| s.end - s.start < b.end - b.start)
+            {
+                best = Some((s, c));
+            }
+        }
+    }
+    let Some((_, class)) = best else {
+        return false;
+    };
+    match class.members_indices.get(name) {
+        Some(&idx) => matches!(class.members.get(idx), Some(Member::Variable(_))),
+        None => false,
+    }
 }
 
 /// The `(TokType, modifiers)` for a resolved [`Binding::Use`], or `None` for kinds with no standard
@@ -1691,6 +1783,293 @@ mod tests {
                 (t.ty as usize) < LEGEND_TYPES.len(),
                 "every emitted token type must be a standard legend entry; got {:?}",
                 t.ty
+            );
+        }
+    }
+
+    // ===========================================================================================
+    // #175 / #176 — builtin-constructor callees, dotted-attr callees, Callable-property callees.
+    // ===========================================================================================
+
+    /// A bare builtin-type constructor callee (`Vector2()`, `Color()`) colors `class` +
+    /// defaultLibrary (#175) — consistent with how a `: Vector2` annotation colors the type name. The
+    /// builtin type IS the class being constructed; Godot has no separate "constructor" token.
+    /// DISCRIMINATING: the callee was entirely uncolored pre-fix, and `class`+defaultLibrary is the
+    /// exact `(ty, modifiers)` a builtin type carries in annotation position — so asserting both is
+    /// what proves the fix matches the type-position convention.
+    #[test]
+    fn builtin_constructor_callee_colors_class_default_library() {
+        let db = trimmed_db();
+        let src = "func test() -> void:\n\tvar v = Vector2(1, 2)\n\tvar c = Color(1, 1, 1)\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        for name in ["Vector2", "Color"] {
+            let byte = src.find(&format!("{name}(")).unwrap();
+            let tok = tok_at(&raw, byte).unwrap_or_else(|| {
+                panic!("the builtin-constructor callee `{name}` must be colored (#175)")
+            });
+            assert_eq!(
+                tok.ty,
+                TokType::Class,
+                "a builtin-constructor callee `{name}` colors `class`, like its annotation use"
+            );
+            assert_ne!(
+                tok.modifiers & MOD_DEFAULT_LIBRARY,
+                0,
+                "a builtin type is a defaultLibrary symbol"
+            );
+            assert_eq!(
+                tok.modifiers & MOD_DECLARATION,
+                0,
+                "a constructor callee is a USE, not a declaration"
+            );
+        }
+    }
+
+    /// `Color8()` is a GDScript UTILITY function (in `gdscript_utility_functions.cpp`), NOT a Variant
+    /// type — so it colors `function`, never `class`. Pins the precedence: the utility check runs
+    /// BEFORE the builtin-type check, so a utility whose name resembles a type doesn't get mis-colored
+    /// `class`. DISCRIMINATING: a naive "name in builtin table" check would not see `Color8` (it isn't
+    /// a builtin type), but this guards the ordering against a future broadening.
+    #[test]
+    fn color8_utility_callee_stays_function_not_class() {
+        let db = trimmed_db();
+        let src = "func test() -> void:\n\tvar c = Color8(255, 0, 0)\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        let byte = src.find("Color8(").unwrap();
+        let tok = tok_at(&raw, byte).expect("the `Color8` utility callee must be colored");
+        assert_eq!(
+            tok.ty,
+            TokType::Function,
+            "`Color8` is a GDScript utility, not a Variant type — it colors `function`, not `class`"
+        );
+    }
+
+    /// A user-defined `func Vector2()` SHADOWS the builtin type: the bare `Vector2()` callee resolves
+    /// to the in-file method binding and colors `method`, never `class`. Pins the precedence (in-file
+    /// member binding wins over the name-matched builtin table), mirroring the utility-shadow test.
+    #[test]
+    fn user_defined_func_shadows_builtin_constructor_callee() {
+        let db = trimmed_db();
+        let src = "func Vector2() -> void:\n\tpass\nfunc test() -> void:\n\tVector2()\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        let callee_byte = src.rfind("Vector2").unwrap();
+        let callee =
+            tok_at(&raw, callee_byte).expect("the shadowing-method callee must be colored");
+        assert_eq!(
+            callee.ty,
+            TokType::Method,
+            "an in-file `func Vector2()` shadows the builtin type — the callee is `method`"
+        );
+    }
+
+    /// A directly-invoked Callable PROPERTY (`var cb: Callable` called as `cb()`) colors `property`,
+    /// NOT `method` (#176 part 1) — it's a property holding a Callable, not a method. #111 re-mapped
+    /// ANY `Member` callee to `method`; this narrows the re-map to in-file `func` callees only, so the
+    /// Callable property falls through to the generic `Member → property` arm. DISCRIMINATING: the
+    /// pre-fix code colored this `method`; asserting `property` (and that it MATCHES a plain `cb` read)
+    /// is what proves the narrowing. The sibling `foo()` real-method call still colors `method`.
+    #[test]
+    fn direct_callable_property_call_colors_property_not_method() {
+        let db = trimmed_db();
+        let src = "extends Node\nvar cb: Callable = func(): pass\nfunc foo() -> void:\n\tpass\nfunc test() -> void:\n\tcb()\n\tfoo()\n\tvar read = cb\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        // The `cb()` callee colors `property` (what `cb` IS), NOT `method`.
+        let cb_call_byte = src.find("\tcb()").unwrap() + 1;
+        let cb_call = tok_at(&raw, cb_call_byte)
+            .expect("the Callable-property callee must be colored (#176)");
+        assert_eq!(
+            cb_call.ty,
+            TokType::Property,
+            "a directly-invoked Callable property colors `property`, not `method` — it's a property"
+        );
+        // It MATCHES how a plain `cb` read colors (a non-call property use) — the consistency check.
+        let cb_read_byte = src.find("var read = cb").unwrap() + "var read = ".len();
+        let cb_read = tok_at(&raw, cb_read_byte).expect("a plain `cb` read must be colored");
+        assert_eq!(
+            cb_read.ty, cb_call.ty,
+            "the Callable-property CALLEE must color the same as a plain READ of it (`property`)"
+        );
+        // The sibling REAL-method call `foo()` still colors `method` (#111 preserved).
+        let foo_call_byte = src.find("\tfoo()").unwrap() + 1;
+        let foo_call = tok_at(&raw, foo_call_byte).expect("the real-method callee must be colored");
+        assert_eq!(
+            foo_call.ty,
+            TokType::Method,
+            "a real in-file `func foo()` callee still colors `method` — the narrowing must not regress"
+        );
+    }
+
+    /// The Callable-property-vs-method discrimination is scoped to the ENCLOSING class (GDScript inner
+    /// classes don't see outer members). A root `func foo` and an inner-class `var foo: Callable` are
+    /// distinct symbols; an inner `foo()` call colors `property` (the inner var), NOT `method` (the
+    /// root func). DISCRIMINATING: a name-only walk over ALL classes would find the root `func foo`
+    /// and wrongly color the inner call `method`; this proves the enclosing-class scoping.
+    #[test]
+    fn callable_property_discrimination_is_enclosing_class_scoped() {
+        let db = trimmed_db();
+        let src = "func foo() -> void:\n\tpass\nclass Inner:\n\tvar foo: Callable = func(): pass\n\tfunc run() -> void:\n\t\tfoo()\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        // The inner `foo()` call resolves to the inner `var foo` (a property), not the root `func foo`.
+        let inner_call_byte = src.rfind("foo()").unwrap();
+        let inner_call = tok_at(&raw, inner_call_byte)
+            .expect("the inner-class Callable-property callee must be colored");
+        assert_eq!(
+            inner_call.ty,
+            TokType::Property,
+            "the inner `foo()` resolves to the inner `var foo` (property) — scoped to its own class"
+        );
+    }
+
+    /// A bare call to an in-file INHERITED method still colors `method` — the Callable-property
+    /// narrowing must NOT drop it to `property`. The narrowing diverts to `property` ONLY for a
+    /// positively-identified same-class `Member::Variable`; an inherited `func` is not in the calling
+    /// class's own members, so the conservative default (`method`) applies. Covers both inheritance
+    /// shapes: a root `extends`-ing an in-file base, and an inner `Derived extends Base`.
+    /// DISCRIMINATING: an "is it a same-class `func`?" narrowing (returning false when not found in the
+    /// innermost class) would wrongly color these `property` — this pins the `method` default.
+    #[test]
+    fn inherited_in_file_method_callee_stays_method() {
+        let db = trimmed_db();
+
+        // Shape A: the root class extends an in-file base; bare call to the inherited method.
+        let src_a =
+            "extends Base\nclass Base:\n\tfunc foo() -> void:\n\t\tpass\nfunc run() -> void:\n\tfoo()\n";
+        let (p_a, a_a) = analyze_for(src_a, &db);
+        let raw_a = classify_document(&p_a.tree, Some(&a_a), &db);
+        let call_a = src_a.rfind("foo()").unwrap();
+        let tok_a = tok_at(&raw_a, call_a)
+            .expect("the inherited-method callee (root extends in-file base) must be colored");
+        assert_eq!(
+            tok_a.ty,
+            TokType::Method,
+            "an inherited in-file method callee stays `method`, not `property` (root extends base)"
+        );
+
+        // Shape B: an inner `Derived extends Base`; bare call to the inherited method.
+        let src_b = "class Base:\n\tfunc foo() -> void:\n\t\tpass\nclass Derived extends Base:\n\tfunc run() -> void:\n\t\tfoo()\n";
+        let (p_b, a_b) = analyze_for(src_b, &db);
+        let raw_b = classify_document(&p_b.tree, Some(&a_b), &db);
+        let call_b = src_b.rfind("foo()").unwrap();
+        let tok_b = tok_at(&raw_b, call_b)
+            .expect("the inherited-method callee (inner Derived extends Base) must be colored");
+        assert_eq!(
+            tok_b.ty,
+            TokType::Method,
+            "an inherited in-file method callee stays `method`, not `property` (inner Derived)"
+        );
+    }
+
+    /// A dotted-attribute call callee (`obj.foo()` / `self.foo()`) colors `method` (#176 part 2). A
+    /// resolved dotted member CALL records no `Binding::Use` at the attribute ident (the reducer's
+    /// callee pre-reduce skips it), so it was uncolored; this colors it syntactically, mirroring the
+    /// bare in-file callee. DISCRIMINATING: the attribute callee was uncolored pre-fix.
+    #[test]
+    fn dotted_attribute_call_callee_colors_method() {
+        let db = trimmed_db();
+        let src =
+            "extends Node\nfunc helper() -> void:\n\tpass\nfunc test() -> void:\n\tself.helper()\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        let attr_byte = src.find("self.helper()").unwrap() + "self.".len();
+        let attr = tok_at(&raw, attr_byte)
+            .expect("the dotted-attr call callee `helper` must be colored (#176)");
+        assert_eq!(
+            attr.ty,
+            TokType::Method,
+            "a dotted-attr call callee colors `method`, mirroring the bare in-file callee"
+        );
+        assert_eq!(
+            attr.modifiers & MOD_DECLARATION,
+            0,
+            "a dotted callee is a USE, not a declaration"
+        );
+    }
+
+    /// `super.foo()` is EXCLUDED from the dotted-callee SYNTACTIC `method` coloring (its callee
+    /// dispatches to the parent, so it's filtered at collection by `is_super`). The attribute is left
+    /// to whatever the generic member-use arm resolves (here `property`, the pre-existing behavior the
+    /// fix must not disturb) — crucially NOT force-colored `method` by the new dotted-callee path.
+    /// DISCRIMINATING: without the `is_super` guard, the new path would force `method` here; asserting
+    /// the token is NOT `method` is what proves the guard.
+    #[test]
+    fn super_dotted_call_callee_excluded_from_syntactic_method_coloring() {
+        let db = trimmed_db();
+        let src = "extends Node\nfunc test() -> void:\n\tsuper.test()\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        // The `test` attribute in `super.test()` must NOT be the `method` the dotted-callee path emits.
+        // (The generic member-use arm may color it `property` — pre-existing, untouched by this fix.)
+        let attr_byte = src.find("super.test()").unwrap() + "super.".len();
+        if let Some(tok) = tok_at(&raw, attr_byte) {
+            assert_ne!(
+                tok.ty,
+                TokType::Method,
+                "`super.foo()` must be excluded from the dotted-callee `method` coloring (got method)"
+            );
+        }
+    }
+
+    /// The new #175/#176 callee classifications are analysis-priced (gated on `analysis.is_some()`),
+    /// like the #111 bare-callee block — under `None` analysis (`range`-while-shedding) they are
+    /// OMITTED (never guessed), so a callee never flips classification between `full` and degraded
+    /// `range`. DISCRIMINATING: without the gate, the builtin-constructor (DB-driven) and dotted-attr
+    /// (syntactic) callees would emit here; asserting they're OMITTED proves the gate.
+    #[test]
+    fn new_callees_omitted_without_analysis() {
+        let db = trimmed_db();
+        let src = "func helper() -> void:\n\tpass\nfunc test() -> void:\n\tvar v = Vector2(1, 2)\n\tself.helper()\n";
+        let parsed = gd_syntax::parse(src);
+        let raw = classify_document(&parsed.tree, None, &db);
+
+        let vec_byte = src.find("Vector2(").unwrap();
+        assert!(
+            tok_at(&raw, vec_byte).is_none(),
+            "the builtin-constructor callee must be OMITTED under no analysis (never guessed)"
+        );
+        let attr_byte = src.find("self.helper()").unwrap() + "self.".len();
+        assert!(
+            tok_at(&raw, attr_byte).is_none(),
+            "the dotted-attr callee must be OMITTED under no analysis (never guessed)"
+        );
+    }
+
+    /// The new #175/#176 coverage reuses ONLY standard-legend token types already advertised — every
+    /// emitted `TokType` for these sites (`class`, `method`, `property`, `function`) is in
+    /// `LEGEND_TYPES`, and the `defaultLibrary` modifier is a standard one — so NO custom token leaks
+    /// (the #30 generic-LSP guarantee). Belt-and-suspenders alongside `legend_is_standard_names_only`:
+    /// classify a doc exercising all new sites and assert every raw token indexes a legal legend slot.
+    #[test]
+    fn new_callee_sites_emit_only_legend_types() {
+        let db = trimmed_db();
+        let src = "extends Node\nvar cb: Callable = func(): pass\nfunc helper() -> void:\n\tpass\nfunc test() -> void:\n\tvar v = Vector2(1, 2)\n\tvar c = Color(1, 1, 1)\n\tcb()\n\thelper()\n\tself.helper()\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        assert!(!raw.is_empty());
+        for t in &raw {
+            assert!(
+                (t.ty as usize) < LEGEND_TYPES.len(),
+                "every emitted token type must be a standard legend entry; got {:?}",
+                t.ty
+            );
+            // The only modifiers these sites use are declaration/definition (decls) and defaultLibrary
+            // (builtin constructor) — all standard legend bits.
+            assert_eq!(
+                t.modifiers & !(MOD_DECL | MOD_READONLY | MOD_STATIC | MOD_DEFAULT_LIBRARY),
+                0,
+                "no out-of-legend modifier bit may be set; got {:#b}",
+                t.modifiers
             );
         }
     }
