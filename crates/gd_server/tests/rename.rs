@@ -5072,6 +5072,53 @@ fn rename_inner_class_member_does_not_touch_root_member_153() {
     shutdown(&client, server);
 }
 
+#[test]
+fn rename_inner_class_method_collision_refuses_not_corrupts_153() {
+    // #153 method surface (fusion-found, the corruption the var-member tests above do NOT cover):
+    // the method/call rename collection keys on (declaring FILE, name) ONLY — `CalleeTarget` drops
+    // the inner-class `class_path` — so a same-file ROOT `func hit` and inner `func hit` cannot be
+    // discriminated. Renaming via the inner `x.hit()` CALL gesture canonicalizes onto the ROOT decl
+    // (`find_in_file_definition` walks root members only) and would rewrite the ROOT method + every
+    // same-named call site while leaving the clicked inner decl untouched (over-capture AND
+    // under-capture). Until the call surface carries `class_path` (#213), the fail-closed gate must
+    // REFUSE this ambiguous rename (zero edits) rather than corrupt.
+    //   line 0 `extends Node`
+    //   line 1 `func hit() -> void:`     ROOT method
+    //   line 2 `\tpass`
+    //   line 3 `class Inner:`
+    //   line 4 `\tfunc hit() -> void:`   INNER method (same name)
+    //   line 5 `\t\tpass`
+    //   line 6 `func use_it() -> void:`
+    //   line 7 `\tvar x := Inner.new()`
+    //   line 8 `\tx.hit()`               INNER call, `hit` at col 3
+    let src = "extends Node\nfunc hit() -> void:\n\tpass\nclass Inner:\n\tfunc hit() -> void:\n\t\tpass\nfunc use_it() -> void:\n\tvar x := Inner.new()\n\tx.hit()\n";
+    let (client, server, uri, _project) = boot_project_file(src);
+
+    // Rename via the inner `x.hit()` call gesture (line 8, col 3) → `smash`. Must REFUSE (the
+    // collision is undiscriminable on the call surface), not silently rewrite the ROOT method.
+    client
+        .sender
+        .send(request(
+            704,
+            "textDocument/rename",
+            rename_params(&uri, 8, 3, "smash"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_some(),
+        "an undiscriminable same-file root-vs-inner method rename must REFUSE with a typed error, \
+         not corrupt; got result {:?}",
+        resp.result
+    );
+    assert!(
+        resp.result.is_none(),
+        "a refused ambiguous-method rename must carry ZERO edits, got {:?}",
+        resp.result
+    );
+    shutdown(&client, server);
+}
+
 // NOTE on cross-file inner-class instance members (`Lib.Box.new(); b.field` where `Lib` is a
 // path-preloaded const): gdls's analyzer does NOT currently resolve an inner class accessed through a
 // preloaded-const identifier — `Lib.Box.new()` ends `Unresolved`, so `b` types as Variant and no

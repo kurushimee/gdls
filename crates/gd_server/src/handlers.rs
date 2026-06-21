@@ -6673,6 +6673,21 @@ fn rename_target_has_project_anchor(
         false
     });
     if call_anchored {
+        // FAIL-CLOSED (#153 method surface): the method/call rename collection
+        // (`push_callee_ident_locations`) keys on (declaring FILE, name) ONLY — `CalleeTarget`
+        // drops the inner-class `class_path` — so when the SAME method name is declared in more than
+        // one class of THIS file (root + an inner class, or two inner classes), it cannot
+        // discriminate which class's `x.m()` call sites belong to the renamed method. #153 made the
+        // non-call `var`/`const` member surface (`Binding::Use.target_class_path`) inner-aware, but
+        // the call surface is still inner-blind: admitting the anchor here would canonicalize the
+        // inner `func` onto the ROOT decl (`find_in_file_definition` walks root members only) and
+        // rewrite the unrelated ROOT method + every same-named call site, leaving the clicked inner
+        // decl untouched (the issue's headline corruption). Until the call collection carries
+        // `class_path` (#213), refuse the ambiguous same-file collision rather than corrupt — zero
+        // edits beats a wrong edit. A name declared in exactly ONE class of the file stays editable.
+        if same_file_method_name_is_class_ambiguous(&parsed.tree, name) {
+            return false;
+        }
         return true;
     }
 
@@ -7226,6 +7241,38 @@ fn member_decl_id(member: &Member) -> Option<NodeId> {
         Class(id) | Constant(id) | Function(id) | Signal(id) | Variable(id) | Enum(id) => Some(*id),
         EnumValue(_) | Group(_) => None,
     }
+}
+
+/// `true` iff `name` is declared as a `func` (method) in MORE THAN ONE class of this file — the
+/// root class plus an inner class, or two inner classes. This is the same-file collision the method
+/// rename collection cannot discriminate: `push_callee_ident_locations` keys on (declaring FILE,
+/// name) only (`CalleeTarget` drops the inner `class_path`), so every same-named `x.m()` call across
+/// those classes collapses into one set, and `find_in_file_definition` canonicalizes any of them to
+/// the ROOT decl (it walks root members only). #153 made the non-call `var`/`const` member surface
+/// inner-aware (`Binding::Use.target_class_path`) but left the call surface inner-blind, so a rename
+/// of an ambiguous method would over-capture the root method + under-capture the clicked inner decl.
+/// The fail-closed gate denies the project anchor for such a name → the rename refuses (#213 tracks
+/// threading `class_path` onto the call surface to make these renameable). A name in exactly one
+/// class is unambiguous and stays editable. Only `func` members count — `var`/`const`/`signal`/
+/// `enum`/inner-`class` collisions resolve through the class-path-aware `Binding::Use` surface.
+fn same_file_method_name_is_class_ambiguous(tree: &ParseTree, name: &str) -> bool {
+    let mut classes_declaring = 0usize;
+    for id in tree.iter_ids() {
+        let NodeKind::Class(class) = &tree.get(id).kind else {
+            continue;
+        };
+        let declares_method = class
+            .members
+            .iter()
+            .any(|m| matches!(m, Member::Function(_)) && member_named(tree, m, name).is_some());
+        if declares_method {
+            classes_declaring += 1;
+            if classes_declaring > 1 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `true` iff the current file's ROOT class declares a member named `name` — the member-collision
