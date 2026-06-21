@@ -619,16 +619,16 @@ fn resolve_inner_class_instance_member_uses_inner_doc_not_root() {
     // Root `cfg` and inner `Inner.cfg` share a name but carry DISTINCT `##` docs. The instance
     // `var x := Inner.new()` types `x` as the inner class (#146), so `x.cfg` resolves on `Inner`.
     let src = concat!(
-        "## ROOT_CONFIG_MARKER\n",  // 0
-        "var cfg: int = 1\n",       // 1  root cfg
-        "\n",                       // 2
-        "class Inner:\n",           // 3
+        "## ROOT_CONFIG_MARKER\n",    // 0
+        "var cfg: int = 1\n",         // 1  root cfg
+        "\n",                         // 2
+        "class Inner:\n",             // 3
         "\t## INNER_CONFIG_MARKER\n", // 4
-        "\tvar cfg: int = 2\n",     // 5  inner cfg (the target)
-        "\n",                       // 6
-        "func use_it() -> void:\n", // 7
-        "\tvar x := Inner.new()\n", // 8
-        "\tx.\n",                   // 9  `\tx.` → column 3
+        "\tvar cfg: int = 2\n",       // 5  inner cfg (the target)
+        "\n",                         // 6
+        "func use_it() -> void:\n",   // 7
+        "\tvar x := Inner.new()\n",   // 8
+        "\tx.\n",                     // 9  `\tx.` → column 3
     );
     let uri = file_uri(&p.root.join("src/inner_resolve.gd"));
     let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
@@ -659,6 +659,69 @@ fn resolve_inner_class_instance_member_uses_inner_doc_not_root() {
     assert!(
         !doc.contains("ROOT_CONFIG_MARKER"),
         "resolve must NOT attach the root member's doc for an inner-class instance member; got {doc}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// #152 (deeper nesting): the resolve descent walks the FULL inner chain, not just one segment.
+/// A doubly-nested `Outer.Inner` instance member whose name collides at every level must attach the
+/// DEEPEST (`Inner`) doc — locking the multi-segment `for seg in inner` loop directly.
+#[test]
+fn resolve_inner_class_instance_member_descends_multi_segment_chain() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"T\"\n",
+    );
+    p.write("extension_api.json", common::MINI_API);
+    // `cfg` is declared at the root, on `Outer`, and on `Outer.Inner` — all distinct docs. A typed
+    // `Outer.Inner` instance member must resolve its doc on the deepest interface (`["Outer","Inner"]`).
+    let src = concat!(
+        "## ROOT_CONFIG_MARKER\n",        // 0
+        "var cfg: int = 0\n",             // 1  root cfg
+        "\n",                             // 2
+        "class Outer:\n",                 // 3
+        "\t## OUTER_CONFIG_MARKER\n",     // 4
+        "\tvar cfg: int = 1\n",           // 5  outer cfg
+        "\n",                             // 6
+        "\tclass Inner:\n",               // 7
+        "\t\t## INNER_CONFIG_MARKER\n",   // 8
+        "\t\tvar cfg: int = 2\n",         // 9  inner cfg (the target)
+        "\n",                             // 10
+        "func use_it() -> void:\n",       // 11
+        "\tvar x := Outer.Inner.new()\n", // 12
+        "\tx.\n",                         // 13 `\tx.` → column 3
+    );
+    let uri = file_uri(&p.root.join("src/nested_resolve.gd"));
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 62, &uri, Position::new(13, 3));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let pre = list
+        .items
+        .iter()
+        .find(|i| i.label == "cfg")
+        .expect("cfg present on the nested instance")
+        .clone();
+
+    client
+        .sender
+        .send(request(63, "completionItem/resolve", &pre))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "resolve errored: {:?}", resp.error);
+    let post: CompletionItem =
+        serde_json::from_value(resp.result.expect("resolve result")).unwrap();
+
+    let doc = format!("{:?}", post.documentation);
+    assert!(
+        doc.contains("INNER_CONFIG_MARKER"),
+        "resolve must descend the full inner chain to the deepest member's doc; got {doc}"
+    );
+    assert!(
+        !doc.contains("OUTER_CONFIG_MARKER") && !doc.contains("ROOT_CONFIG_MARKER"),
+        "resolve must NOT attach an ancestor's doc for a deeply-nested instance member; got {doc}"
     );
 
     shutdown(&client, server_thread);

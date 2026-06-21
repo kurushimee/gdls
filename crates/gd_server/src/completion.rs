@@ -438,8 +438,11 @@ fn data_owner(owner: &MemberOwner, render: &RenderCtx) -> CompletionDataOwner {
         MemberOwner::Native(class) => CompletionDataOwner::NativeClass {
             class: class.clone(),
         },
-        MemberOwner::Script(file) => match render.file_uri(*file) {
-            Some(uri) => CompletionDataOwner::ScriptFile { uri },
+        MemberOwner::Script { file, inner } => match render.file_uri(*file) {
+            Some(uri) => CompletionDataOwner::ScriptFile {
+                uri,
+                inner: inner.clone(),
+            },
             None => CompletionDataOwner::Unknown,
         },
         MemberOwner::Unknown => CompletionDataOwner::Unknown,
@@ -1484,12 +1487,14 @@ fn override_method_items(
             // they are already defined here (Godot's `current_class->has_function` skip,
             // `gdscript_editor.cpp:3697`). They still consumed their name in `seen` above, so an
             // inherited same-named method is shadowed; they are simply not offered.
-            MemberOwner::Script(file) if Some(*file) == own_file => None,
+            MemberOwner::Script { file, .. } if Some(*file) == own_file => None,
             // Script-PARENT methods: any inherited `func`. `is_static` is not tracked on the
             // enumerated `MemberItem` (always `false`), so the declaring file's interface is the
             // source of truth for the `static`-match filter and the `name_span` the stub renders
             // from. A method whose declarer can't be resolved is dropped (never a fabricated stub).
-            MemberOwner::Script(file) if matches!(m.kind, MemberItemKind::Method) => {
+            // The owner's `inner` chain is intentionally ignored (`..`): override stubs are resolved
+            // by file + name (`script_override_stub`), not per-inner-class.
+            MemberOwner::Script { file, .. } if matches!(m.kind, MemberItemKind::Method) => {
                 let stub = script_override_stub(state, *file, &m.name)?;
                 Some(OverrideStub::Script(m, stub))
             }
@@ -2439,8 +2444,16 @@ enum CompletionData {
 enum CompletionDataOwner {
     /// Declared on a native (engine / builtin) class.
     NativeClass { class: String },
-    /// Declared in a project GDScript file (the declaring file's URI).
-    ScriptFile { uri: String },
+    /// Declared in a project GDScript file: the declaring file's URI plus the inner-class chain
+    /// the member lives on (`[]` = the file's top-level class, `["Inner"]` = a nested class). Resolve
+    /// descends the chain so an inner-class instance member's doc is read from the inner interface,
+    /// not the file root (#152). `inner` is absent on the wire when empty (round-trip compatible with
+    /// an older client's data that carried only `uri`).
+    ScriptFile {
+        uri: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        inner: Vec<String>,
+    },
     /// No recoverable declarer — resolve has no doc to add.
     Unknown,
 }
@@ -2519,8 +2532,8 @@ fn resolve_member_doc(
         CompletionDataOwner::NativeClass { class } => {
             resolve_native_member_doc(state, class, name, format)
         }
-        CompletionDataOwner::ScriptFile { uri } => {
-            resolve_script_member_doc(state, uri, name, format)
+        CompletionDataOwner::ScriptFile { uri, inner } => {
+            resolve_script_member_doc(state, uri, inner, name, format)
         }
         CompletionDataOwner::Unknown => None,
     }
@@ -2562,18 +2575,28 @@ fn native_member_description(member: gd_types::NativeMember<'_>) -> Option<&str>
 }
 
 /// A script member's `##` doc comment, from the **declaring** file's interface (the file the
-/// `CompletionDataOwner::ScriptFile` URI names). `None` when the file isn't indexed, the member
-/// isn't found, or it carries no doc.
+/// `CompletionDataOwner::ScriptFile` URI names), descending `inner` to the inner class the member
+/// lives on (`[]` = the file's top-level class). An inner-class instance member whose name collides
+/// with a root member must read its doc from the inner interface, not the file root (#152). `None`
+/// when the file isn't indexed, a chain segment is missing, the member isn't found, or it carries no
+/// doc.
 fn resolve_script_member_doc(
     state: &ServerState,
     uri: &str,
+    inner: &[String],
     name: &str,
     format: ProseFormat,
 ) -> Option<Documentation> {
     let uri = uri.parse::<lsp_types::Uri>().ok()?;
     let path = crate::uri::uri_to_path(&uri)?;
     let fid = state.workspace.index.file_id(&path)?;
-    let iface = state.workspace.index.interface(fid)?;
+    let mut iface = state.workspace.index.interface(fid)?;
+    for seg in inner {
+        iface = iface
+            .inner
+            .iter()
+            .find(|c| c.class_name.as_deref() == Some(seg.as_str()))?;
+    }
     let decl = iface.members.iter().find(|m| m.name == name)?;
     let doc = decl.doc.as_ref()?;
     if doc.description.is_empty() {
