@@ -3659,6 +3659,137 @@ fn rename_167_global_class_with_consumer_inner_scoped_shadow_edits_precisely() {
 }
 
 #[test]
+fn rename_167_inner_class_extends_global_despite_own_type_shadow_edits_extends() {
+    // `extends Foo` uses the inheritance resolver, whose Godot precedence checks global
+    // `class_name`s before current-scope class members. So even inside `class Inner`, where an inner
+    // `enum Foo` exists, `class Inner extends Foo:` is a genuine global-class reference and must be
+    // edited. The `var y: Foo` annotation remains suppressed by the #167 type-annotation shadow
+    // policy. This pins the inheritance/type-annotation split.
+    let project = common::sample_project();
+    project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");
+    project.write(
+        "src/consumer.gd",
+        "extends Node\n\nclass Inner extends Foo:\n\tenum Foo { A }\n\tvar y: Foo = Foo.A\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/fooclass.gd", "src/consumer.gd"],
+        2,
+    );
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    client
+        .sender
+        .send(request(
+            4001,
+            "textDocument/rename",
+            rename_params(&fooclass_uri, 0, 11, "Bar"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the global `class_name Foo` must edit `class Inner extends Foo`; got {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+
+    assert!(
+        view.set.iter().any(|(u, r)| *u == fooclass_uri.as_str()
+            && r.start.line == 0
+            && r.start.character == 11),
+        "the `class_name Foo` declaration must be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        view.set.iter().any(|(u, r)| *u == consumer_uri.as_str()
+            && r.start.line == 2
+            && r.start.character == 20),
+        "the inner class inheritance base `extends Foo` (consumer.gd 2,20) must be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        !view
+            .set
+            .iter()
+            .any(|(u, r)| *u == consumer_uri.as_str() && r.start.line == 4),
+        "the inner `var y: Foo` / `Foo.A` (consumer.gd line 4) must remain suppressed; got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_167_extends_cursor_canonicalizes_to_global_despite_root_type_collision() {
+    // Cursor-side twin of the inheritance precedence split: `extends Foo` resolves through Godot's
+    // global-class-first inheritance path even when the same file also declares a root `enum Foo`.
+    // Rename canonicalization must therefore anchor on the global `class_name Foo`, not on the
+    // name-first in-file enum definition.
+    let project = common::sample_project();
+    project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");
+    project.write(
+        "src/consumer.gd",
+        "extends Foo\n\nenum Foo { A }\n\nvar y: Foo = Foo.A\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/fooclass.gd", "src/consumer.gd"],
+        2,
+    );
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    client
+        .sender
+        .send(request(
+            4002,
+            "textDocument/rename",
+            rename_params(&consumer_uri, 0, 8, "Bar"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming from `extends Foo` must canonicalize to the global class; got {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+
+    assert!(
+        view.set.iter().any(|(u, r)| *u == fooclass_uri.as_str()
+            && r.start.line == 0
+            && r.start.character == 11),
+        "the global `class_name Foo` declaration must be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        view.set.iter().any(|(u, r)| *u == consumer_uri.as_str()
+            && r.start.line == 0
+            && r.start.character == 8),
+        "the `extends Foo` cursor site must be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        !view
+            .set
+            .iter()
+            .any(|(u, r)| *u == consumer_uri.as_str() && r.start.line >= 2),
+        "the root enum `Foo` declaration and its `: Foo`/`Foo.A` uses must remain suppressed; got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
 fn rename_167_inner_scoped_type_colliding_with_global_class_refuses() {
     // (B) cursor on the inner-class-scoped `var y: Foo` annotation, whose `Foo` is the INNER enum —
     // but a same-named global `class_name Foo` is registered. Per-occurrence scope resolution
@@ -4150,6 +4281,139 @@ fn rename_167_func_local_const_type_annotation_excluded_precisely() {
             .any(|(u, r)| *u == origin_uri.as_str() && r.start.line == 4),
         "the func-local `var x: Foo`/`Foo.new()` (origin.gd line 4) must be SUPPRESSED (the local \
          const shadows the global in type position); got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_167_later_func_local_const_type_annotation_excluded_precisely() {
+    // Godot's type resolver checks a suite-local const before the global class registry even when the
+    // const is declared LATER in the same function. That `var x: Foo` is already an analyzer error
+    // ("Local constant `Foo` is not resolved at this point."), but it is still not a global-class
+    // reference. A global `class_name Foo` rename must therefore suppress it rather than silently
+    // retarget the broken local-const annotation to the renamed global.
+    let project = common::sample_project();
+    project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");
+    project.write("src/other.gd", "class_name OtherThing\nextends Node\n");
+    project.write(
+        "src/origin.gd",
+        "extends Foo\n\nfunc f() -> void:\n\tvar x: Foo = null\n\tconst Foo = preload(\"res://src/other.gd\")\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/fooclass.gd", "src/other.gd", "src/origin.gd"],
+        2,
+    );
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let origin_uri = file_uri(&project.root.join("src/origin.gd"));
+
+    client
+        .sender
+        .send(request(
+            531,
+            "textDocument/rename",
+            rename_params(&origin_uri, 0, 8, "Bar"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the global `class_name Foo` from `extends Foo` must SUCCEED; got {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == fooclass_uri.as_str() && r.start.line == 0),
+        "the `class_name Foo` declaration must be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == origin_uri.as_str() && r.start.line == 0 && r.start.character == 8),
+        "the genuine `extends Foo` (origin.gd 0,8) must be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        !view
+            .set
+            .iter()
+            .any(|(u, r)| *u == origin_uri.as_str() && r.start.line == 3),
+        "the earlier `var x: Foo` (origin.gd line 3) must be SUPPRESSED because the later local \
+         `const Foo` shadows global type resolution; got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_167_func_local_non_const_type_annotation_excluded_precisely() {
+    // Non-const locals are not valid types, but Godot still checks suite locals before the global
+    // class registry and errors on the local (`Local variable "Foo" cannot be used as a type.`).
+    // Therefore this `: Foo` is not a global-class reference and must not be edited by a global
+    // `class_name Foo` rename.
+    let project = common::sample_project();
+    project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");
+    project.write(
+        "src/origin.gd",
+        "extends Foo\n\nfunc f() -> void:\n\tvar Foo = 1\n\tvar x: Foo = null\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/fooclass.gd", "src/origin.gd"],
+        2,
+    );
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let origin_uri = file_uri(&project.root.join("src/origin.gd"));
+
+    client
+        .sender
+        .send(request(
+            532,
+            "textDocument/rename",
+            rename_params(&origin_uri, 0, 8, "Bar"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the global `class_name Foo` from `extends Foo` must SUCCEED; got {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == fooclass_uri.as_str() && r.start.line == 0),
+        "the `class_name Foo` declaration must be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == origin_uri.as_str() && r.start.line == 0 && r.start.character == 8),
+        "the genuine `extends Foo` (origin.gd 0,8) must be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        !view
+            .set
+            .iter()
+            .any(|(u, r)| *u == origin_uri.as_str() && r.start.line == 4),
+        "the erroring local-var `var x: Foo` annotation (origin.gd line 4) must be SUPPRESSED; got {:?}",
         view.set
     );
     shutdown(&client, server);

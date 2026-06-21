@@ -943,20 +943,22 @@ impl ParseTree {
     /// **Per-occurrence scope-aware type-name resolution.** Given a TYPE-position identifier at `byte`
     /// (textually `name` — the base segment of an `extends`/`: T` chain, e.g. `extends Foo` / `: Foo` /
     /// `: Foo.Inner` on `Foo`), decide whether `name` resolves to a TYPE declared in a SCOPE lexically
-    /// enclosing `byte` (a function-local `const` alias, or a member of some enclosing CLASS) rather
-    /// than to a global `class_name` of the same name.
+    /// enclosing `byte` (a suite local, or a member of some enclosing CLASS) rather than to a global
+    /// `class_name` of the same name.
     ///
     /// Returns `true` iff some such local declaration is in scope at `byte`. Two scopes are checked —
     /// and they suppress the occurrence for TWO DISTINCT reasons (both verified against the 4.6.3
     /// binary), which a maintainer must keep separate or risk reverting one in the corrupting
     /// direction:
     ///
-    ///   1. **Function-local `const NAME` — a TRUE IDENTITY SHADOW (faithful).** Godot checks a
+    ///   1. **Suite-local `NAME` — a TRUE IDENTITY/ERROR SHADOW (faithful).** Godot checks a
     ///      suite-local before the global class registry (`SuiteNode::has_local` precedes
     ///      `is_global_class` in `resolve_datatype`), so the idiomatic `const Other = preload(...)`
     ///      used as `var x: Other` resolves to the CONST, not a same-named global class — even while
-    ///      the global exists. Its `: NAME` is NEVER a global reference, so editing it under a
-    ///      global-class rename is unconditionally wrong. Suppression here is identity resolution.
+    ///      the global exists. A non-const local is rejected as "cannot be used as a type" at the
+    ///      same precedence point, still without falling through to the global. Its `: NAME` is NEVER
+    ///      a global reference, so editing it under a global-class rename is unconditionally wrong.
+    ///      Suppression here is identity/error resolution.
     ///
     ///   2. **Same-file class-scope type member (`enum`/inner `class`/`const`) — a deliberate
     ///      FORWARD-REBIND POLICY (not identity resolution).** Counter-intuitively, while the global
@@ -979,7 +981,7 @@ impl ParseTree {
     ///
     /// This is the TYPE-position analogue of [`Self::resolve_local_binding_at`]: same scope-walk
     /// discipline (innermost-first, the first declaring scope decides), reusing its suite-chain walk
-    /// for the func-local-const case and adding a CLASS-scope walk (nested by span containment in the
+    /// for the suite-local case and adding a CLASS-scope walk (nested by span containment in the
     /// arena — children are pushed after parents, so the smallest-span `Class` node containing `byte`
     /// is the innermost enclosing class). The walk is purely lexical/structural (no analyzer pass): a
     /// type-position class reference carries no `Binding::Use`, so this positional resolution is what a
@@ -989,26 +991,25 @@ impl ParseTree {
     /// KNOWN GAP (over-collect, never over-suppress): a `const NAME` INHERITED from a base class
     /// (`extends`-chain) is in scope in Godot but is invisible to this lexical/span walk, so such a
     /// `: NAME` would be (wrongly) collected. Narrow (base-class const alias + same-named global +
-    /// a `: NAME` in the derived class); tracked in gdls#188. The func-local and same-file
+    /// a `: NAME` in the derived class); tracked in gdls#188. The suite-local and same-file
     /// class-scope cases — the ones that arise in the #167 collision matrix — are covered.
     pub fn type_name_shadowed_by_enclosing_scope(&self, byte: usize, name: &str) -> bool {
-        // (1) Function-local `const NAME` in the enclosing suite chain. Godot's analyzer checks a
+        // (1) Suite-local `NAME` in the enclosing suite chain. Godot's analyzer checks a
         // suite-local before the global class registry (`SuiteNode::has_local` precedes
         // `is_global_class`), so a `const Other = preload(...)` used as `: Other` resolves to the
-        // const — editing it under a global-`class_name Other` rename is corruption. Only a CONSTANT
-        // local can stand in a type-annotation position (a `var`/param/for/match bind cannot name a
-        // type), so the kind filter keeps this from over-suppressing an unrelated same-named runtime
-        // local. The not-yet-declared rule (`source.span.end <= byte`) mirrors `locals_in_scope_at`.
+        // const — editing it under a global-`class_name Other` rename is corruption. Unlike normal
+        // expression-local lookup, Godot's `resolve_datatype` uses `SuiteNode::has_local` before the
+        // global registry, so a same-named local declared later in the suite still shadows here. A
+        // CONSTANT may be a valid type alias; any other local kind still shadows the global but
+        // produces Godot's "Local ... cannot be used as a type." Either way, the type annotation is
+        // not a global-class reference and must be suppressed under a global rename.
         let mut cur = self.innermost_suite_at(byte);
         while let Some(id) = cur {
             let NodeKind::Suite(s) = &self.get(id).kind else {
                 break;
             };
             for local in &s.locals {
-                if local.kind == LocalKind::Constant
-                    && local.name == name
-                    && self.get(local.source).span.end <= byte
-                {
+                if local.name == name {
                     return true;
                 }
             }
@@ -1186,13 +1187,28 @@ mod tests {
         // A function-local `const Foo = preload(...)` shadows a same-named global `class_name` in
         // type-annotation position (Godot checks suite locals before the global registry), so a
         // `var x: Foo` in that body must NOT be collected for a global-class rename. The class-scope
-        // walk alone (NodeKind::Class only) would miss this — the func-local-const branch covers it.
+        // walk alone (NodeKind::Class only) would miss this — the suite-local branch covers it.
         let src = "extends Node\n\nfunc f() -> void:\n\tconst Foo = preload(\"res://other.gd\")\n\tvar x: Foo = null\n";
         let tree = crate::parse(src).tree;
         let anno = type_anno_byte(src, "var x", "Foo");
         assert!(
             tree.type_name_shadowed_by_enclosing_scope(anno, "Foo"),
             "the func-local `const Foo` shadows the global in `var x: Foo`; it must resolve LOCAL"
+        );
+    }
+
+    #[test]
+    fn type_name_func_local_const_declared_later_still_shadows_global() {
+        // `resolve_datatype` checks `SuiteNode::has_local` before the global class registry without
+        // declaration-order filtering. A later `const Foo` therefore still shadows `var x: Foo`
+        // (Godot reports that the local constant is not resolved yet) and must be suppressed under a
+        // global-class rename.
+        let src = "extends Node\n\nfunc f() -> void:\n\tvar x: Foo = null\n\tconst Foo = preload(\"res://other.gd\")\n";
+        let tree = crate::parse(src).tree;
+        let anno = type_anno_byte(src, "var x", "Foo");
+        assert!(
+            tree.type_name_shadowed_by_enclosing_scope(anno, "Foo"),
+            "a later func-local `const Foo` still shadows `var x: Foo` in Godot type resolution"
         );
     }
 
@@ -1215,19 +1231,17 @@ mod tests {
     }
 
     #[test]
-    fn type_name_func_local_non_const_does_not_shadow() {
-        // A func-local `var Foo` (runtime variable, not a type) must NOT be treated as a type shadow —
-        // only a `const` can name a type. In Godot a non-const local in type position is an ERROR
-        // (`Local "Foo" cannot be used as a type`), not a global reference; the resolver returns
-        // `false` (collect) anyway, which is harmless — the rename rewrites the already-erroring
-        // `: Foo` to the renamed global. Guards the `LocalKind::Constant` filter against
-        // over-suppressing an unrelated runtime local of the same name.
+    fn type_name_func_local_non_const_shadows_global_as_error() {
+        // A func-local `var Foo` (runtime variable, not a type) still shadows a same-named global in
+        // Godot type resolution; the analyzer reports `Local variable "Foo" cannot be used as a
+        // type.` instead of falling through to the global registry. A global-class rename must
+        // suppress this already-erroring `: Foo`, not silently retarget it to the renamed global.
         let src = "extends Node\n\nfunc f() -> void:\n\tvar Foo = 1\n\tvar x: Foo = null\n";
         let tree = crate::parse(src).tree;
         let anno = type_anno_byte(src, "var x", "Foo");
         assert!(
-            !tree.type_name_shadowed_by_enclosing_scope(anno, "Foo"),
-            "a func-local `var Foo` (non-const) is not a type and must not shadow the global"
+            tree.type_name_shadowed_by_enclosing_scope(anno, "Foo"),
+            "a func-local `var Foo` is an erroring local type shadow, not a global class reference"
         );
     }
 }
