@@ -781,9 +781,11 @@ fn build_underscore_prefix_edit(
             // is NOT in the set), so a correct rename is already one edit — but a 2nd edit here would
             // mean a resolver drift slipped a DIFFERENT binding in, and renaming it could silently
             // rebind a read to the wrong symbol when `_name` collides with a cross-file
-            // global/autoload/class_name — error-free (the ERROR backstop is blind) and not-in-file
-            // (the `file_contains_identifier` firewall misses it). So keep the gate as a fail-closed
-            // backstop: accept ONLY a one-edit rename, position- and file-blind. PRECONDITION: count==1
+            // global/autoload/class_name — error-free (the ERROR backstop is blind). The scope-aware
+            // firewall refuses that case (a cross-file `_name` use resolves to no local ⇒ refuse), but
+            // keep this gate as a fail-closed backstop: accept ONLY a one-edit rename, position- and
+            // file-blind, so any future resolver drift past the firewall still can't multi-edit.
+            // PRECONDITION: count==1
             // is correct ONLY because the `_`-prefix is offered solely for the two FUNCTION-SCOPED
             // warnings (UNUSED_VARIABLE/UNUSED_PARAMETER; see the dispatch in `push_mutating_actions`).
             // A future member-variable warning would drive a project-wide multi-file rename — many

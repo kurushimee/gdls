@@ -2737,3 +2737,41 @@ fn underscore_prefix_refused_when_name_in_same_function() {
     );
     shutdown(&client, t);
 }
+
+/// SOUNDNESS (#119): the narrowed firewall must refuse when `_name` lives in a NESTED LAMBDA inside the
+/// renamed binding's OWN function. A lambda body parses as a nested `Function`, so the `_name` local's
+/// enclosing-function span is INSIDE (not disjoint from) the renamed binding's function span — the fix
+/// must NOT be offered. Locks in the nested-`Function`-span reasoning the disjoint-span check relies on.
+#[test]
+fn underscore_prefix_refused_when_name_in_nested_lambda() {
+    // Outer unused local `count` in `f`; `_count` is a local of a lambda nested INSIDE `f`.
+    const SRC: &str =
+        "extends Node\n\nfunc f() -> void:\n\tvar count = 1\n\tvar cb = func() -> void:\n\t\tvar _count = 2\n\t\tprint(_count)\n\tcb.call()\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == Some(NumberOrString::String("UNUSED_VARIABLE".to_string()))
+                && d.range.start.line == 3
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the unused local `count` (line 3) must warn; got {:?}",
+                diags.diagnostics
+            )
+        });
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Prefix unused name").is_none(),
+        "a `_`-prefix whose `_count` lives in a nested lambda of the SAME function must be REFUSED \
+         (the lambda span is nested, not disjoint); got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
