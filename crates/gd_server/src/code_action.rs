@@ -743,17 +743,16 @@ fn build_underscore_prefix_edit(
     // at offer time, so this always runs against the same buffer the action was offered for.)
     let old_name = identifier_name_at(state, &uri, data.anchor())?;
     let new_name = format!("_{old_name}");
-    // SILENT-CAPTURE FIREWALL (sound, conservative): refuse if `_name` ALREADY occurs as an identifier
-    // anywhere in the file. A capture (the renamed declaration shadowing an existing `_name`, or an
-    // existing `_name` reference rebinding to it) is only POSSIBLE when an `_name` identifier already
-    // exists — and the `references`/rename local resolution over-captures forward-references (a
-    // `print(y)` that binds to a MEMBER `y` is in the local `y`'s rename set), so renaming to a name
-    // that collides can silently rebind a read with NO error (the error/shadow backstops miss a shadow
-    // that merely MOVES targets, count unchanged). If no `_name` identifier exists, the new name is
-    // genuinely fresh and every post-rename `_name` reference binds to the renamed declaration — no
-    // capture is possible. This over-refuses when `_name` is used only in an unrelated scope (a benign
-    // under-offer, filed as a limitation), but it is SOUND: a capturing rename is never offered.
-    if file_contains_identifier(state, &uri, &new_name) {
+    // SILENT-CAPTURE FIREWALL (sound, scope-aware): refuse if `_name` is VISIBLE in the renamed
+    // binding's relevant scope. A capture (the renamed declaration shadowing a visible `_name`, or a
+    // visible `_name` reference rebinding to the renamed declaration) is only possible when `_name`
+    // is reachable from the binding's function — as a member, a global, an unresolved bare name, or a
+    // local of the binding's own / an enclosing function. When every `_name` occurrence instead
+    // resolves to a local confined to a genuinely UNRELATED function, no capture can reach the renamed
+    // binding, so the fix is offered. The member/global case (which the scope-aware local check can't
+    // see) is additionally covered by the shadow backstop in `edit_is_safe`. Buffer gone / anchor not
+    // on an identifier ⇒ treat as visible ⇒ refuse (fail-closed).
+    if name_visible_in_binding_scope(state, &uri, data.anchor(), &new_name) {
         return None;
     }
     let params = RenameParams {
@@ -782,9 +781,11 @@ fn build_underscore_prefix_edit(
             // is NOT in the set), so a correct rename is already one edit — but a 2nd edit here would
             // mean a resolver drift slipped a DIFFERENT binding in, and renaming it could silently
             // rebind a read to the wrong symbol when `_name` collides with a cross-file
-            // global/autoload/class_name — error-free (the ERROR backstop is blind) and not-in-file
-            // (the `file_contains_identifier` firewall misses it). So keep the gate as a fail-closed
-            // backstop: accept ONLY a one-edit rename, position- and file-blind. PRECONDITION: count==1
+            // global/autoload/class_name — error-free (the ERROR backstop is blind). The scope-aware
+            // firewall refuses that case (a cross-file `_name` use resolves to no local ⇒ refuse), but
+            // keep this gate as a fail-closed backstop: accept ONLY a one-edit rename, position- and
+            // file-blind, so any future resolver drift past the firewall still can't multi-edit.
+            // PRECONDITION: count==1
             // is correct ONLY because the `_`-prefix is offered solely for the two FUNCTION-SCOPED
             // warnings (UNUSED_VARIABLE/UNUSED_PARAMETER; see the dispatch in `push_mutating_actions`).
             // A future member-variable warning would drive a project-wide multi-file rename — many
@@ -828,20 +829,78 @@ fn identifier_name_at(state: &mut ServerState, uri: &Uri, pos: Position) -> Opti
     }
 }
 
-/// `true` iff `name` occurs as ANY [`NodeKind::Identifier`] in `uri`'s current parse tree — the
-/// silent-capture firewall's existence check for the `_`-prefix fix. Whole-file (not scope-limited) so
-/// it is SOUND: any pre-existing occurrence of the would-be new name is a potential capture target, so
-/// the rename is refused. Buffer gone ⇒ `true` (fail-closed: treat as "exists" ⇒ refuse).
-fn file_contains_identifier(state: &mut ServerState, uri: &Uri, name: &str) -> bool {
-    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
+/// `true` iff the candidate `name` (the would-be `_`-prefixed new name) is VISIBLE in the scope of the
+/// binding being renamed — the silent-capture firewall's scope-aware existence check for the `_`-prefix
+/// fix. `anchor` is the renamed binding's DECLARATION identifier position.
+///
+/// The renamed binding is function-local (the `_`-prefix fix is offered only for the two
+/// function-scoped warnings, UNUSED_VARIABLE / UNUSED_PARAMETER). A capture is possible iff `name` can
+/// be reached from that function: as a member, a global, an unresolved bare name, or a local of the
+/// binding's OWN or an ENCLOSING function. So the firewall PASSES (offers the fix) only when EVERY
+/// occurrence of `name` resolves to a local binding declared in a function whose span is DISJOINT from
+/// the renamed binding's enclosing-function span — a genuinely unrelated scope, from which no `name`
+/// reference can rebind to the renamed declaration and the renamed declaration cannot shadow it. Any
+/// `name` occurrence that is NOT such a local — a member/attribute access, a global/native/autoload, an
+/// unresolved identifier, or a local of the same / an enclosing function — forces a refuse.
+///
+/// `resolve_local_binding_at` already excludes the two non-reference identifier positions (attribute
+/// idents `obj.x`, Lua-style dict keys `{ x = v }`): for those it returns `None`, so they read as
+/// "not an unrelated local" ⇒ refuse — fail-closed, never a missed capture.
+///
+/// Buffer gone, or `anchor` not on an identifier (no enclosing function to bound) ⇒ `true` (refuse,
+/// fail-closed). The member/global capture the local resolver cannot see is additionally backstopped by
+/// the new-shadow check in [`edit_is_safe`].
+fn name_visible_in_binding_scope(
+    state: &mut ServerState,
+    uri: &Uri,
+    anchor: Position,
+    name: &str,
+) -> bool {
+    let Some(doc) = state.vfs.get(uri.as_str()) else {
         return true; // Fail-closed.
     };
+    let text = doc.text();
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+    let anchor_byte = mapper.position_to_byte(anchor);
     let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
-    let found = parsed
-        .tree
-        .iter_ids()
-        .any(|id| matches!(&parsed.tree.get(id).kind, NodeKind::Identifier(i) if i.name == name));
-    found
+    let tree = &parsed.tree;
+
+    // The renamed binding's enclosing function — the scope a captured `name` would have to reach. The
+    // `_`-prefix fix is function-scoped, so this is always `Some`; a `None` (anchor at class scope, or
+    // off any function) is unexpected ⇒ refuse, fail-closed.
+    let Some(binding_fn) = crate::handlers::enclosing_function_span(tree, anchor_byte) else {
+        return true;
+    };
+
+    // Every `name` identifier occurrence must be a local confined to a function DISJOINT from the
+    // renamed binding's function; the first occurrence that is not forces a refuse.
+    for id in tree.iter_ids() {
+        let node = tree.get(id);
+        let NodeKind::Identifier(i) = &node.kind else {
+            continue;
+        };
+        if i.name != name {
+            continue;
+        }
+        // Resolve this `name` occurrence to its declaring local binding (attribute idents / Lua-style
+        // dict keys resolve to `None` and are treated as visible ⇒ refuse, fail-closed). A `None`
+        // means member / global / unresolved / non-reference position — all potential captures.
+        let Some(decl_ident) = tree.resolve_local_binding_at(node.span.start, name) else {
+            return true;
+        };
+        let decl_byte = tree.get(decl_ident).span.start;
+        // A local declared in a function DISJOINT from the renamed binding's function is unreachable
+        // (an unrelated scope). Anything else — same function, or an enclosing function (whose span
+        // contains the renamed binding's, e.g. an outer local captured by a nested lambda) — is
+        // visible ⇒ refuse.
+        match crate::handlers::enclosing_function_span(tree, decl_byte) {
+            Some(occ_fn) if occ_fn.end <= binding_fn.start || binding_fn.end <= occ_fn.start => {
+                // Disjoint function spans — genuinely unrelated, no capture path. Keep scanning.
+            }
+            _ => return true,
+        }
+    }
+    false
 }
 
 // =================================================================================================
