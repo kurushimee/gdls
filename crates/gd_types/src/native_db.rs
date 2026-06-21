@@ -55,6 +55,12 @@ pub struct Method {
     pub is_static: bool,
     pub is_vararg: bool,
     pub is_virtual: bool,
+    /// Whether `params` reflects the method's real signature. `true` for every dump/XML-ingested
+    /// method; `false` only for the name-only stubs [`seed_dump_omitted_methods`] injects so the
+    /// method-existence lookup binds (the dump omits these `_`-prefixed virtuals / `free`). A
+    /// seeded stub carries `params: []`, which is NOT its real arity — callers that count
+    /// parameters (the call-arity check) must skip seeded methods rather than read `0`.
+    pub arity_known: bool,
     pub return_type: TypeRef,
     pub params: Vec<Param>,
     /// Long-form docstring from `--dump-extension-api-with-docs` or the class-reference XML. Empty
@@ -779,6 +785,10 @@ fn seed_dump_omitted_methods(classes: &mut FxHashMap<Sym, NativeClass>, it: &mut
             return_type: TypeRef::Variant,
             params: Vec::new(),
             description: String::new(),
+            // Seed carries NO real parameter list (the dump omitted the method; only the name
+            // participates in the existence lookup). Its empty `params` is not the true arity, so
+            // the call must never be arity-checked against it — ClassDB has the real signature.
+            arity_known: false,
         });
     }
 }
@@ -1069,6 +1079,8 @@ fn ingest_method(m: api::MethodDef, it: &mut Interner) -> Method {
         return_type,
         params: ingest_args(m.arguments, it),
         description: m.description,
+        // Real dump entry — its parameter list is authoritative, so callers may arity-check it.
+        arity_known: true,
     }
 }
 
@@ -1120,6 +1132,8 @@ fn ingest_builtin(b: api::BuiltinClass, it: &mut Interner) -> BuiltinType {
                     return_type,
                     params: ingest_args(m.arguments, it),
                     description: String::new(),
+                    // Real dump entry — parameter list authoritative, arity-checkable.
+                    arity_known: true,
                 }
             })
             .collect(),

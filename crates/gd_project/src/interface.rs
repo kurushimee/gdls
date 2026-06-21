@@ -73,6 +73,11 @@ pub struct MemberFlags {
     pub onready: bool,
     pub is_abstract: bool,
     pub is_coroutine: bool,
+    /// `func` members: whether the declaration has a rest parameter (`func f(a, ...rest)`). A
+    /// vararg method accepts any number of trailing arguments, so a cross-file caller must
+    /// suppress the too-many arity check — the in-file path reads the same bit via
+    /// `FunctionNode::rest_parameter`. Hashed: gaining/losing varargs changes call compatibility.
+    pub is_vararg: bool,
 }
 
 /// One exposed member of a class.
@@ -469,6 +474,7 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
             is_static: f.is_static,
             is_abstract: has_annotation(tree, &node.annotations, |n| n == "@abstract"),
             is_coroutine: f.is_coroutine,
+            is_vararg: f.rest_parameter.is_some(),
             ..MemberFlags::default()
         },
         span: node.span,
