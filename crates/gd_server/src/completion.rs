@@ -1903,10 +1903,12 @@ fn bare_unique_has_trailing_path(tokens: &[gd_syntax::token::Token], byte: usize
 }
 
 /// `load("res://…/<cursor>")` / `preload(...)` — `res://` project paths matching the typed directory
-/// prefix. Bounded to what is INDEXED: the `.gd` script index ([`gd_project::Index::iter_interfaces`])
-/// ∪ the `.tscn` scene index ([`gd_project::SceneIndex::iter`]). Other asset types (textures, audio,
-/// …) are indexed nowhere, so broadening the list to them (a project disk walk — new substrate)
-/// is a deliberate follow-up, out of scope for this read-only phase.
+/// prefix. The listing is the union of every project resource Godot's `_get_directory_contents`
+/// surfaces with no type filter: the `.gd` script index ([`gd_project::Index::iter_interfaces`]) ∪
+/// the `.tscn` scene index ([`gd_project::SceneIndex::iter`]) ∪ arbitrary assets — textures, audio,
+/// `.tres`, `.scn`, … — held by the [`gd_project::AssetIndex`]. The asset index covers exactly the
+/// files the other two don't (it excludes `.gd`/`.tscn`), so the three sources partition the project
+/// tree with no double-listing.
 ///
 /// Each item's **insert text is the FULL `res://…` path** (a file's path, or a subdirectory's
 /// `res://…/` prefix). The classifier makes the edit span cover the WHOLE typed string content for a
@@ -1932,7 +1934,7 @@ fn resource_path_items(
         "res://".to_string()
     };
 
-    // Collect every indexed res:// path: scripts (.gd) + scenes (.tscn).
+    // Collect every project res:// path: scripts (.gd) + scenes (.tscn) + arbitrary assets.
     let root = gd_project::normalize_path(&state.workspace.project.root);
     let mut res_paths: Vec<String> = Vec::new();
     for (fid, _iface) in state.workspace.index.iter_interfaces() {
@@ -1943,6 +1945,9 @@ fn resource_path_items(
         }
     }
     for (res, _scene) in state.workspace.scenes.iter() {
+        res_paths.push(res.to_string());
+    }
+    for res in state.workspace.assets().iter() {
         res_paths.push(res.to_string());
     }
 

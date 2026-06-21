@@ -25,6 +25,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
 
+use crate::asset_index::{AssetIndex, AssetIndexCache};
 use crate::index::{Index, IndexCache};
 use crate::scene_index::{SceneIndex, SceneIndexCache};
 
@@ -63,7 +64,15 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// method. A v6 cache predates the field; rather than `#[serde(default)]`-load a `false` that would
 /// resurface the very false positive this fixes (a vararg method warm-loaded as non-vararg), v6
 /// files are ignored and rebuilt. One cold re-index per project on upgrade, self-healing.
-pub const CACHE_FORMAT_VERSION: u32 = 7;
+///
+/// v8 (#127): `CacheFile` gained the `assets` field (the persisted [`AssetIndex`] — the `res://`
+/// paths of arbitrary project files, non-`.gd`/non-`.tscn`, that `load`/`preload` path completion
+/// lists alongside scripts and scenes). A v7 cache predates the field. Deliberately NOT
+/// `#[serde(default)]`: a defaulted empty asset index warm-loaded from an old cache would serve a
+/// project with NO arbitrary-asset completions until each asset's first on-disk touch — the same
+/// "warm-load serves stale/empty derived state" hazard the v6 note guards against. So v7 files are
+/// ignored and rebuilt. One cold re-index per project on upgrade, self-healing.
+pub const CACHE_FORMAT_VERSION: u32 = 8;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
@@ -127,6 +136,11 @@ pub struct LoadedCache {
     /// while gdls was off is re-parsed by the caller's stat-diff pass (the scene index does not get
     /// its own validity key; the `CacheKey` only covers binary/native-DB/project.godot state).
     pub scenes: SceneIndex,
+    /// The deserialized asset index (`res://` paths of arbitrary project files). Asset freshness on
+    /// warm-start rides the same [`FileStat`] stat-diff as scripts and scenes — asset entries are
+    /// included in [`Self::files`], so an asset added/removed while gdls was off is reconciled by the
+    /// caller's stat-diff pass. Paths only (no parse); [`AssetIndex::from_cache`] is total.
+    pub assets: AssetIndex,
 }
 
 // ---------------------------------------------------------------------------
@@ -140,6 +154,9 @@ struct CacheFile {
     index: IndexCache,
     /// M11 #76: the persisted scene index (`.tscn` relations). See [`CACHE_FORMAT_VERSION`] v6.
     scenes: SceneIndexCache,
+    /// #127: the persisted asset index (arbitrary `res://` asset paths). See
+    /// [`CACHE_FORMAT_VERSION`] v8.
+    assets: AssetIndexCache,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +233,7 @@ pub fn save(
     root: &Utf8Path,
     index: &Index,
     scenes: &SceneIndex,
+    assets: &AssetIndex,
     files: &[FileStat],
     key: CacheKey,
 ) {
@@ -229,6 +247,7 @@ pub fn save(
         files: files.to_vec(),
         index: index.to_cache(),
         scenes: scenes.to_cache(),
+        assets: assets.to_cache(),
     };
     let bytes = match serde_json::to_vec(&cache) {
         Ok(b) => b,
@@ -299,10 +318,15 @@ pub fn load(root: &Utf8Path, expected_key: &CacheKey) -> Option<LoadedCache> {
     // path needed beyond the whole-file JSON-parse guard above.
     let scenes = SceneIndex::from_cache(cache.scenes);
 
+    // The asset index is a flat set of res:// paths with no cross-table invariants; `from_cache` is
+    // total (it can't fail), so no quarantine path beyond the whole-file JSON-parse guard above.
+    let assets = AssetIndex::from_cache(cache.assets);
+
     Some(LoadedCache {
         index,
         files: cache.files,
         scenes,
+        assets,
     })
 }
 
