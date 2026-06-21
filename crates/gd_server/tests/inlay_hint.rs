@@ -412,18 +412,17 @@ fn no_text_edit_for_unnamed_script_enum_container_element() {
     shutdown(&client, server_thread);
 }
 
-/// Companion to the corruption case: a `var := …` that infers a container whose ELEMENT is a
-/// `class_name`'d script (`Array[Hero]`) currently produces NO hint AT ALL — a safe FALSE-NEGATIVE.
+/// #115: a `var := …` that infers a container whose ELEMENT is a `class_name`'d script
+/// (`Array[Hero]`) MUST get a `Array[Hero]` TYPE hint AND a correct auto-insert `textEdit`.
 ///
-/// This pins the actual behavior. The inference IS correct (hover on the var renders
-/// `Array[<Script #4>]`), but the hint is dropped UPSTREAM of `annotation_type`, at the label gate:
-/// `hintable_type_label` renders via `human_type_label`, which does not recurse name-substitution into
-/// container elements, so a script element falls through to `Display`'s `<Script #N>` placeholder; the
-/// `<`-guard then drops the whole hint. The net effect is safe (no edit ⇒ no corruption). Surfacing a
-/// correct `Array[Hero]` edit would require recursing `human_type_label` into element types (shared
-/// with hover) — a separate, larger change, tracked as a follow-up rather than done here.
+/// Inference is correct (hover renders `Array[<Script #N>]`); the bug was that the shared label
+/// renderer `human_type_label` did not recurse name-substitution into container element types, so a
+/// script element fell through to `Display`'s `<Script #N>` placeholder and the `<`-guard in
+/// `hintable_type_label` dropped the whole hint. With the fix, the label is `Array[Hero]` (no `<`),
+/// so the hint survives, and the edit path (`annotation_type`, which already recurses) emits
+/// `: Array[Hero] = `. Verified by apply→reanalyze-by-identity (no new diagnostic on insert).
 #[test]
-fn named_script_container_element_currently_no_hint() {
+fn named_script_container_element_emits_hint() {
     let p = base_project();
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
@@ -436,24 +435,56 @@ fn named_script_container_element_currently_no_hint() {
         inlay_caps(false, false),
     );
     let uri = file_uri(&p.root.join("t.gd"));
+
+    // Baseline diagnostics for the unedited source (by code+message identity).
+    let base_diags = reopen_and_get_diags(&client, &uri, t, 100);
+    let base_set: std::collections::HashSet<(Option<lsp_types::NumberOrString>, String)> =
+        base_diags
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.clone(), d.message.clone()))
+            .collect();
+
     let hints = request_hints(&client, 10, &uri, whole_doc());
 
-    // No TYPE hint on the `var h := arr` line (5) — the `<Script #N>` element render is dropped by the
-    // label gate. Crucially: whatever the future label behavior, there must NEVER be a corrupting
-    // textEdit here, so assert no hint carries one regardless.
-    let line5_type_hints: Vec<&InlayHint> = hints
+    // The `var h := arr` line (5) must now carry a TYPE hint labelled `: Array[Hero] = `.
+    let type_hint = hints
         .iter()
-        .filter(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 5)
-        .collect();
-    assert!(
-        line5_type_hints.is_empty(),
-        "Array[Hero] currently yields no TYPE hint (label gate drops the `<Script #N>` render); \
-         got {line5_type_hints:?}"
+        .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 5)
+        .expect("Array[Hero] must now yield a TYPE hint (label recurses name-substitution)");
+    assert_eq!(
+        label_of(type_hint),
+        ": Array[Hero]",
+        "the label must render the named-script element as `Hero`, not `<Script #N>`"
     );
-    assert!(
-        line5_type_hints.iter().all(|h| h.text_edits.is_none()),
-        "a script-element container must never carry a textEdit; got {line5_type_hints:?}"
+
+    // …and a correct auto-insert textEdit. Verify by apply→reanalyze-by-identity, not a string-only
+    // compare: applying the edit must introduce NO new diagnostic.
+    let edit = type_hint
+        .text_edits
+        .as_ref()
+        .and_then(|e| e.first())
+        .expect("a named-script container element must carry a textEdit");
+    assert_eq!(
+        edit.new_text, ": Array[Hero] = ",
+        "the edit must insert the parametrized container annotation; got {:?}",
+        edit.new_text
     );
+
+    let edited = apply_edits(t, std::slice::from_ref(edit));
+    assert!(
+        edited.contains("var h: Array[Hero] = arr"),
+        "the edit must produce `var h: Array[Hero] = arr`; got:\n{edited}"
+    );
+    let new_diags = reopen_and_get_diags(&client, &uri, &edited, 101);
+    for d in &new_diags.diagnostics {
+        assert!(
+            base_set.contains(&(d.code.clone(), d.message.clone())),
+            "applying the Array[Hero] hint edit introduced a NEW diagnostic: {d:?}\n\
+             baseline was {:?}\nedited source:\n{edited}",
+            base_diags.diagnostics
+        );
+    }
 
     shutdown(&client, server_thread);
 }

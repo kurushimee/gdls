@@ -1668,8 +1668,36 @@ pub(crate) fn human_type_label(
     tree: &ParseTree,
     dt: &gd_analyze::DataType,
 ) -> String {
-    use gd_analyze::DtKind;
+    use gd_analyze::data_type::variant_type_name;
+    use gd_analyze::{DtKind, VariantType};
     match dt.kind {
+        // #115: a typed container (`Array[T]` / `Dictionary[K, V]`) whose element is itself a
+        // script type renders, via `Display`, as the `<Script #N>` placeholder (`Array[<Script #4>]`)
+        // — which the inlay `<`-guard drops, killing the whole hint. Recurse name-substitution into
+        // the element types through THIS function (not `Display`), so a named-script element becomes
+        // its `class_name` (`Array[Hero]`), an unnamed-script element its basename, and a still-
+        // unresolved `<...>` element propagates up to be dropped by the guard. Mirrors the recursion
+        // `inlay_hint::annotation_type` already does for the EDIT path. Shared with hover.
+        DtKind::Builtin
+            if dt.builtin_type == VariantType::Array && !dt.container_element_types.is_empty() =>
+        {
+            format!(
+                "Array[{}]",
+                human_type_label(state, tree, &dt.container_element_types[0])
+            )
+        }
+        DtKind::Builtin
+            if dt.builtin_type == VariantType::Dictionary
+                && dt.container_element_types.len() >= 2 =>
+        {
+            format!(
+                "Dictionary[{}, {}]",
+                human_type_label(state, tree, &dt.container_element_types[0]),
+                human_type_label(state, tree, &dt.container_element_types[1])
+            )
+        }
+        // A scalar builtin (or an untyped container) — `Display` renders its exact source name.
+        DtKind::Builtin => variant_type_name(dt.builtin_type).to_string(),
         DtKind::Script => {
             let Some(sr) = &dt.script_type else {
                 return dt.to_string();
