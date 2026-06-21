@@ -1018,6 +1018,23 @@ fn classify_anchored(
         return Some(CompletionContext::new(CompletionKind::OverrideMethod, None));
     }
 
+    // Empty bare accessor-keyword position (`var x: int:\n\t|`, or a second blank accessor line after
+    // a completed `get:` body). There is no word token, so the partial-word branch above cannot see
+    // it; the AST signal still proves we are in the property declaration context, not an ordinary
+    // class/function body.
+    if prefix.is_none()
+        && (ast_is_property_accessor_position(tree, byte)
+            || (anchor_kind == Colon
+                && is_property_block_colon(tokens, i)
+                && no_meaningful_token_between(tokens, i, byte))
+            || token_is_property_accessor_position(tokens, byte))
+    {
+        return Some(CompletionContext::new(
+            CompletionKind::PropertyAccessor,
+            None,
+        ));
+    }
+
     // Type hint after a `:` in a declaration (`var t: Vec`, `var t: `). The AST is the reliable
     // signal — a `Type` node (under a Variable/Constant/Parameter `datatype_specifier`) survives
     // even mid-name. Token-level: anchor is `:` or a word whose enclosing AST node is a `Type`.
@@ -1175,6 +1192,89 @@ fn is_declaration_colon(tokens: &[Token], i: usize) -> bool {
         j -= 1;
     }
     false
+}
+
+/// Token/layout fallback for an EMPTY accessor-keyword line. The parser does not always stretch the
+/// property `Variable` node far enough to cover `var x: int:\n\t|` before the `get`/`set` word exists,
+/// so the AST-only signal above misses the exact bare position Godot's
+/// `COMPLETION_PROPERTY_DECLARATION` is made for. Track indentation up to the cursor and remember a
+/// depth-0 `var ...:` property-block colon; the cursor must be on a still-empty line exactly one
+/// indent deeper than that colon.
+fn token_is_property_accessor_position(tokens: &[Token], byte: usize) -> bool {
+    use TokenKind::*;
+    let mut indent_depth: i32 = 0;
+    let mut property_depth: Option<i32> = None;
+    let mut line_has_meaningful = false;
+
+    for (i, t) in tokens.iter().enumerate() {
+        if t.span.end > byte {
+            break;
+        }
+        match t.kind {
+            Newline => line_has_meaningful = false,
+            Indent => {
+                indent_depth += 1;
+                line_has_meaningful = false;
+            }
+            Dedent => {
+                if t.span.end == byte
+                    && !line_has_meaningful
+                    && property_depth.is_some_and(|depth| indent_depth.saturating_sub(1) <= depth)
+                {
+                    continue;
+                }
+                indent_depth = indent_depth.saturating_sub(1);
+                if property_depth.is_some_and(|depth| indent_depth <= depth) {
+                    property_depth = None;
+                }
+                line_has_meaningful = false;
+            }
+            Eof | Error => {}
+            Colon if is_property_block_colon(tokens, i) => {
+                property_depth = Some(indent_depth);
+                line_has_meaningful = true;
+            }
+            _ => line_has_meaningful = true,
+        }
+    }
+
+    !line_has_meaningful
+        && property_depth
+            .map(|depth| indent_depth == depth + 1)
+            .unwrap_or(false)
+}
+
+/// Whether `tokens[i]` is the depth-0 block-opening colon in a property declaration line
+/// (`var x: int:` / `var x = 1:`), not the type-hint colon or a colon inside a default/dict literal.
+fn is_property_block_colon(tokens: &[Token], i: usize) -> bool {
+    use TokenKind::*;
+    if tokens.get(i).map(|t| t.kind) != Some(Colon) {
+        return false;
+    }
+    let line_start = tokens[..i]
+        .iter()
+        .rposition(|t| matches!(t.kind, Newline | Indent | Dedent))
+        .map_or(0, |idx| idx + 1);
+    let mut depth: i32 = 0;
+    let mut saw_var = false;
+    let mut saw_value_or_type = false;
+    for t in &tokens[line_start..i] {
+        match t.kind {
+            ParenthesisOpen | BracketOpen | BraceOpen => depth += 1,
+            ParenthesisClose | BracketClose | BraceClose => depth -= 1,
+            Var if depth == 0 => saw_var = true,
+            Colon | Equal if depth == 0 => saw_value_or_type = true,
+            _ => {}
+        }
+    }
+    depth == 0 && saw_var && saw_value_or_type
+}
+
+fn no_meaningful_token_between(tokens: &[Token], i: usize, byte: usize) -> bool {
+    tokens[i + 1..]
+        .iter()
+        .take_while(|t| t.span.end <= byte)
+        .all(|t| is_anchor_skippable(t.kind))
 }
 
 /// Whether the cursor sits at the bare accessor-keyword position of an inline property block

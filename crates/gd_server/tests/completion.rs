@@ -1823,6 +1823,40 @@ fn override_method_skips_already_overridden_script_parent_method() {
     shutdown(&client, server_thread);
 }
 
+/// CORRUPTION GUARD: accepting an override stub while a partial function skeleton already has a
+/// `():` tail must replace that tail too. Prefix-only edits produce
+/// `func do_it(...):\n\t$0():`, which is source-invalid.
+#[test]
+fn override_method_stub_replaces_existing_signature_tail() {
+    let p = p4_project();
+    p.write(
+        "src/base3.gd",
+        "class_name OvBase3\nextends Node2D\n\nfunc do_it(times: int) -> void:\n\tpass\n",
+    );
+    let uri = file_uri(&p.root.join("src/child3.gd"));
+    let src = "extends OvBase3\n\nfunc do():\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 163, &uri, Position::new(2, 7));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let item = list
+        .items
+        .iter()
+        .find(|i| i.filter_text.as_deref() == Some("do_it"))
+        .expect("script-parent override offered");
+    let patched = apply_completion_edit(src, item);
+    assert!(
+        patched.starts_with("extends OvBase3\n\nfunc do_it(times: int) -> void:\n\t$0\n"),
+        "override stub must consume the stale `():` skeleton tail; got {patched:?}"
+    );
+    assert!(
+        !patched.contains("$0():"),
+        "prefix-only edit leaves a duplicate stale skeleton tail: {patched:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 // --- PROPERTY ACCESSOR (bare get/set keyword) ---
 
 /// `var x: int:\n\t<cursor>` at the accessor-keyword position offers exactly the `get`/`set`
@@ -1831,12 +1865,12 @@ fn override_method_skips_already_overridden_script_parent_method() {
 fn property_accessor_offers_get_and_set_keywords() {
     let p = p4_project();
     let uri = file_uri(&p.root.join("src/pa.gd"));
-    // `var x: int:` then a partial `g` on the indented accessor line.
-    let src = "extends Node\n\nvar x: int:\n\tg\n";
+    // `var x: int:` then an empty indented accessor line.
+    let src = "extends Node\n\nvar x: int:\n\t\n";
     let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
 
-    // `\tg` on line 3 → cursor right after `g` at column 2.
-    let raw = complete_raw(&client, 170, &uri, Position::new(3, 2));
+    // Empty accessor line: after the tab, before any `get`/`set` prefix.
+    let raw = complete_raw(&client, 170, &uri, Position::new(3, 1));
     let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
     let ls = labels(&list);
     assert!(
@@ -2451,6 +2485,26 @@ fn edit_new_text(item: &CompletionItem) -> String {
         CompletionTextEdit::Edit(e) => e.new_text.clone(),
         CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
     }
+}
+
+/// Apply one completion item's replace edit to an ASCII fixture. Completion tests use ASCII source,
+/// so LSP character offsets equal byte offsets here.
+fn apply_completion_edit(src: &str, item: &CompletionItem) -> String {
+    let (range, new_text) = match item.text_edit.as_ref().expect("an item has a textEdit") {
+        CompletionTextEdit::Edit(e) => (e.range, e.new_text.as_str()),
+        CompletionTextEdit::InsertAndReplace(e) => (e.replace, e.new_text.as_str()),
+    };
+    let mut line_starts = vec![0usize];
+    for (i, b) in src.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let to_byte =
+        |pos: Position| -> usize { line_starts[pos.line as usize] + pos.character as usize };
+    let start = to_byte(range.start);
+    let end = to_byte(range.end);
+    format!("{}{}{}", &src[..start], new_text, &src[end..])
 }
 
 /// #146 regression (completion arm): member completion on an **inner-class instance** lists the

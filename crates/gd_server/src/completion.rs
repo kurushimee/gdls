@@ -114,8 +114,14 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
 
     let ctx = classify(&parsed.tree, &tokens, byte);
     // The single-line replace range = the typed-prefix span (empty ⇒ a zero-width range at the
-    // cursor, so the client inserts without deleting). Built once and shared by every item.
-    let edit_range = prefix_range(&mapper, ctx.prefix, tdp.position);
+    // cursor, so the client inserts without deleting). Override stubs are the one exception: accepting
+    // a full signature over an existing `func name():` skeleton must consume that stale same-line
+    // signature tail too, or the client applies source-invalid `func name(...):\n\t$0():`.
+    let edit_range = if matches!(ctx.kind, CompletionKind::OverrideMethod) {
+        override_method_range(&mapper, &tokens, &text, ctx.prefix, byte, tdp.position)
+    } else {
+        prefix_range(&mapper, ctx.prefix, tdp.position)
+    };
 
     let render = RenderCtx {
         caps: &state.caps.completion,
@@ -2283,6 +2289,110 @@ fn prefix_range(mapper: &PositionMapper, prefix: Option<ByteSpan>, cursor: Posit
         Some(span) => mapper.span_to_range(span),
         None => Range::new(cursor, cursor),
     }
+}
+
+/// Override stubs insert a complete function signature. If the user requests completion inside an
+/// existing partial skeleton (`func do():`, `func ():`, `func do() -> void:`), replacing only the
+/// typed prefix leaves stale syntax after the snippet. Widen only this context's edit to the
+/// same-line signature tail proven to belong to the declaration.
+fn override_method_range(
+    mapper: &PositionMapper,
+    tokens: &[gd_syntax::token::Token],
+    text: &str,
+    prefix: Option<ByteSpan>,
+    byte: usize,
+    cursor: Position,
+) -> Range {
+    let (start, name_end) = override_name_span(tokens, prefix, byte);
+    let end = override_signature_tail_end(text, name_end).unwrap_or(name_end);
+    if start <= end {
+        mapper.span_to_range(ByteSpan::new(start, end))
+    } else {
+        prefix_range(mapper, prefix, cursor)
+    }
+}
+
+/// The name fragment to replace for an override-method completion. `prefix` covers the usual
+/// cursor-at-end case; the token fallback covers a client invoking completion with the cursor in the
+/// middle of the still-current identifier.
+fn override_name_span(
+    tokens: &[gd_syntax::token::Token],
+    prefix: Option<ByteSpan>,
+    byte: usize,
+) -> (usize, usize) {
+    if let Some(span) = prefix {
+        return (span.start, span.end);
+    }
+    if let Some(t) = tokens.iter().find(|t| {
+        t.span.start <= byte
+            && byte <= t.span.end
+            && (t.kind == gd_syntax::token::TokenKind::Identifier || t.kind.is_identifier())
+    }) {
+        return (t.span.start, t.span.end);
+    }
+    (byte, byte)
+}
+
+/// End byte of a same-line function-signature tail after the name (`()`, `() -> void`, trailing
+/// block `:`), or `None` when the text after the name is not a recognizable signature tail. Stops at
+/// comments/newlines and tracks strings/bracket depth so default values cannot fake the block colon.
+fn override_signature_tail_end(text: &str, from: usize) -> Option<usize> {
+    let from = from.min(text.len());
+    let line_end = text[from..]
+        .find('\n')
+        .map(|rel| from + rel)
+        .unwrap_or(text.len());
+    let slice = text.get(from..line_end)?;
+    let mut depth: i32 = 0;
+    let mut in_str: Option<char> = None;
+    let mut escaped = false;
+    let mut saw_tail = false;
+    let mut tail_end = from;
+    let mut saw_first = false;
+
+    for (rel, c) in slice.char_indices() {
+        let abs = from + rel;
+        match in_str {
+            Some(q) => {
+                saw_tail = true;
+                tail_end = abs + c.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == q {
+                    in_str = None;
+                }
+            }
+            None => {
+                if depth == 0 && c == '#' {
+                    break;
+                }
+                if !saw_first {
+                    if c.is_whitespace() {
+                        continue;
+                    }
+                    if !matches!(c, '(' | '-' | ':') {
+                        return None;
+                    }
+                    saw_first = true;
+                }
+                if !c.is_whitespace() {
+                    saw_tail = true;
+                    tail_end = abs + c.len_utf8();
+                }
+                match c {
+                    '"' | '\'' => in_str = Some(c),
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth -= 1,
+                    ':' if depth == 0 => return Some(abs + c.len_utf8()),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    saw_tail.then_some(tail_end)
 }
 
 // ===================================================================================================

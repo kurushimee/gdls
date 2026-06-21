@@ -348,8 +348,10 @@ fn bare_accessor_keyword_is_property_accessor() {
     // (Godot COMPLETION_PROPERTY_DECLARATION). Both the first accessor and a second one (after a
     // completed `get:` body) classify as PropertyAccessor.
     for m in [
+        "var x: int:\n\t|",
         "var x: int:\n\tg|",
         "var x: int:\n\ts|",
+        "var x: int:\n\tget:\n\t\treturn 0\n\t|",
         "var x: int:\n\tget:\n\t\treturn 0\n\ts|",
     ] {
         let ctx = at(m);
