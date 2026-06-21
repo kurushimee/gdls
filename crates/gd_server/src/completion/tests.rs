@@ -164,3 +164,41 @@ fn commit_chars_gated_on_capability() {
         "suppress ⇒ no commit chars even when supported"
     );
 }
+
+#[test]
+fn block_colon_offset_finds_depth0_block_colon() {
+    // Bare params + return → the block colon is the only depth-0 `:`.
+    assert_eq!(block_colon_offset("(x):"), Some(3));
+    assert_eq!(block_colon_offset("(x: int, y) -> int:"), Some(18));
+    // A dict-literal default's inner colon is at depth ≥ 1 — skipped; the depth-0 block colon wins.
+    let s = "(d := {\"a\": 1}) -> void:";
+    assert_eq!(block_colon_offset(s), Some(s.len() - 1));
+    // A string default containing a colon (inside the parens, depth ≥ 1) is skipped.
+    assert_eq!(block_colon_offset("(s := \":\"):"), Some(10));
+    // No block colon (an @abstract func) → None, so the caller keeps the whole structural slice.
+    assert_eq!(block_colon_offset("(x: int, y) -> int"), None);
+    assert_eq!(block_colon_offset("(x)"), None);
+    // An escaped quote `\"` inside a string default must NOT terminate the string — an odd count
+    // would otherwise corrupt the depth/in-string state. The depth-0 block colon is still found.
+    let esc = "(s := \"a\\\":b\") -> void:";
+    assert_eq!(block_colon_offset(esc), Some(esc.len() - 1));
+    // An escaped quote followed by a `)` and `:` inside the string stays inert (no early cut).
+    let esc2 = "(s := \"a\\\")b:c\"):";
+    assert_eq!(block_colon_offset(esc2), Some(esc2.len() - 1));
+}
+
+#[test]
+fn dotted_type_chain_before_reads_contiguous_name_chain() {
+    use gd_syntax::tokenize;
+    let probe = |src: &str| {
+        let (tokens, _) = tokenize(src);
+        // The dot before the trailing cursor position (end of source).
+        let dot = nearest_dot_start(&tokens, src.len()).expect("a dot");
+        dotted_type_chain_before(&tokens, dot)
+    };
+    assert_eq!(probe("Outer.Inner."), vec!["Outer", "Inner"]);
+    assert_eq!(probe("A.B.C."), vec!["A", "B", "C"]);
+    assert_eq!(probe("Single."), vec!["Single"]);
+    // A run interrupted by a non-name token yields only the trailing contiguous segment.
+    assert_eq!(probe("foo().Inner."), vec!["Inner"]);
+}

@@ -1672,6 +1672,226 @@ fn override_method_stub_without_snippet_is_plain_signature() {
     shutdown(&client, server_thread);
 }
 
+/// A **script-parent** method is offered for override too (Godot's CLASS-branch walk over inherited
+/// `FUNCTION` members, `gdscript_editor.cpp:3688-3708`), not only native virtuals. A child `extends
+/// Hero` completing `func <cursor>` offers `attack` (the parent's own method) with its real
+/// `name(params) -> Ret:` signature — rendered from the **declaring** file's parsed signature, so the
+/// parameter name and the written default text are faithful (never fabricated).
+#[test]
+fn override_method_offers_script_parent_methods() {
+    let p = p4_project();
+    // A parent with a richly-signed method: a typed param, an untyped param, and a default whose
+    // expression text must be reproduced verbatim (never fabricated).
+    p.write(
+        "src/parent.gd",
+        "class_name OvParent\nextends Node2D\n\nfunc do_it(times: int, who, loud: bool = true) -> String:\n\treturn \"\"\n",
+    );
+    let uri = file_uri(&p.root.join("src/child.gd"));
+    let src = "extends OvParent\n\nfunc \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `func ` → cursor at column 5 on line 2.
+    let raw = complete_raw(&client, 160, &uri, Position::new(2, 5));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+
+    let do_it = list
+        .items
+        .iter()
+        .find(|i| i.filter_text.as_deref() == Some("do_it"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the script parent's `do_it` is offered for override; got {:?}",
+                list.items
+                    .iter()
+                    .filter_map(|i| i.filter_text.clone())
+                    .collect::<Vec<_>>()
+            )
+        });
+    // The label is the VERBATIM author signature (Godot's `name + signature + ":"`): the real
+    // parameter names, the untyped param left BARE (no synthesized `: Variant`), the written default
+    // expression text (`= true`, never fabricated), and the return type — ending in `:`.
+    assert_eq!(
+        do_it.label, "do_it(times: int, who, loud: bool = true) -> String:",
+        "the script-parent override stub reproduces the declaring signature verbatim"
+    );
+    assert_eq!(
+        do_it.kind,
+        Some(lsp_types::CompletionItemKind::METHOD),
+        "an override stub is a METHOD item"
+    );
+    // The native virtuals are still offered alongside the script-parent method.
+    assert!(
+        list.items
+            .iter()
+            .any(|i| i.filter_text.as_deref() == Some("_ready")),
+        "native virtuals are still offered alongside script-parent methods"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Verbatim-signature edge cases (Godot reproduces the source `signature` substring, never a
+/// reconstruction, and the cut is bracket-depth-aware): a parent method with NO return annotation
+/// appends no `-> void`; an `@abstract` method (no body, hence no block colon) is NOT truncated at a
+/// parameter-type colon; a dict-literal default's inner `:` does not cut the signature early; and a
+/// `static` parent method is NOT offered (the non-`static` `func` cursor's `is_static`-match skip).
+#[test]
+fn override_method_script_parent_verbatim_edges() {
+    let p = p4_project();
+    p.write(
+        "src/edges.gd",
+        "class_name OvEdges\nextends Node\n\nfunc no_ret(x):\n\tpass\n\nstatic func a_static() -> void:\n\tpass\n\n@abstract func must_do(x: int, y) -> int\n\nfunc with_dict(d := {\"a\": 1}) -> void:\n\tpass\n\nfunc with_esc(s := \"a\\\":b\") -> void:\n\tpass\n",
+    );
+    let uri = file_uri(&p.root.join("src/edge_child.gd"));
+    let src = "extends OvEdges\n\nfunc \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 162, &uri, Position::new(2, 5));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let label_of = |name: &str| {
+        list.items
+            .iter()
+            .find(|i| i.filter_text.as_deref() == Some(name))
+            .map(|i| i.label.clone())
+    };
+
+    // No return annotation in source ⇒ none synthesized; untyped param stays bare.
+    assert_eq!(
+        label_of("no_ret").as_deref(),
+        Some("no_ret(x):"),
+        "an absent return annotation must NOT append `-> void`"
+    );
+    // An @abstract method has no block colon — its signature must NOT be truncated at the `x:` colon.
+    assert_eq!(
+        label_of("must_do").as_deref(),
+        Some("must_do(x: int, y) -> int:"),
+        "an abstract method's verbatim signature must not be truncated at a param colon"
+    );
+    // A dict-literal default's inner `:` must not cut the signature early (depth-aware block colon).
+    assert_eq!(
+        label_of("with_dict").as_deref(),
+        Some("with_dict(d := {\"a\": 1}) -> void:"),
+        "a dict-default's inner colon must not truncate the signature"
+    );
+    // An ESCAPED quote in a string default must not corrupt the string scan (no double colon / no
+    // early truncation): the signature is reproduced verbatim and ends in exactly one block colon.
+    assert_eq!(
+        label_of("with_esc").as_deref(),
+        Some("with_esc(s := \"a\\\":b\") -> void:"),
+        "an escaped quote in a string default must not break the block-colon scan"
+    );
+    // A `static` parent method is not an override candidate from a non-`static` `func` cursor.
+    assert!(
+        label_of("a_static").is_none(),
+        "a static parent method must NOT be offered for a non-static override"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A script-parent method the child **already overrides** is not re-offered (the first-wins name
+/// dedup / Godot's `has_function` skip), while a sibling parent method that is not yet overridden is.
+#[test]
+fn override_method_skips_already_overridden_script_parent_method() {
+    let p = p4_project();
+    p.write(
+        "src/base2.gd",
+        "class_name OvBase2\nextends Node2D\n\nfunc alpha() -> void:\n\tpass\n\nfunc beta() -> void:\n\tpass\n",
+    );
+    let uri = file_uri(&p.root.join("src/child2.gd"));
+    // The child already overrides `alpha`; completing `func ` must offer `beta` but not `alpha`.
+    let src = "extends OvBase2\n\nfunc alpha() -> void:\n\tpass\n\nfunc \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `func ` on line 5 → cursor at column 5.
+    let raw = complete_raw(&client, 161, &uri, Position::new(5, 5));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let filters: Vec<String> = list
+        .items
+        .iter()
+        .filter_map(|i| i.filter_text.clone())
+        .collect();
+    assert!(
+        !filters.contains(&"alpha".to_string()),
+        "an already-overridden script-parent method must NOT be re-offered; got {filters:?}"
+    );
+    assert!(
+        filters.contains(&"beta".to_string()),
+        "a not-yet-overridden script-parent method is still offered; got {filters:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// CORRUPTION GUARD: accepting an override stub while a partial function skeleton already has a
+/// `():` tail must replace that tail too. Prefix-only edits produce
+/// `func do_it(...):\n\t$0():`, which is source-invalid.
+#[test]
+fn override_method_stub_replaces_existing_signature_tail() {
+    let p = p4_project();
+    p.write(
+        "src/base3.gd",
+        "class_name OvBase3\nextends Node2D\n\nfunc do_it(times: int) -> void:\n\tpass\n",
+    );
+    let uri = file_uri(&p.root.join("src/child3.gd"));
+    let src = "extends OvBase3\n\nfunc do():\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 163, &uri, Position::new(2, 7));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let item = list
+        .items
+        .iter()
+        .find(|i| i.filter_text.as_deref() == Some("do_it"))
+        .expect("script-parent override offered");
+    let patched = apply_completion_edit(src, item);
+    assert!(
+        patched.starts_with("extends OvBase3\n\nfunc do_it(times: int) -> void:\n\t$0\n"),
+        "override stub must consume the stale `():` skeleton tail; got {patched:?}"
+    );
+    assert!(
+        !patched.contains("$0():"),
+        "prefix-only edit leaves a duplicate stale skeleton tail: {patched:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- PROPERTY ACCESSOR (bare get/set keyword) ---
+
+/// `var x: int:\n\t<cursor>` at the accessor-keyword position offers exactly the `get`/`set`
+/// keywords (Godot `COMPLETION_PROPERTY_DECLARATION`), as plain-word inserts.
+#[test]
+fn property_accessor_offers_get_and_set_keywords() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/pa.gd"));
+    // `var x: int:` then an empty indented accessor line.
+    let src = "extends Node\n\nvar x: int:\n\t\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // Empty accessor line: after the tab, before any `get`/`set` prefix.
+    let raw = complete_raw(&client, 170, &uri, Position::new(3, 1));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"get".to_string()) && ls.contains(&"set".to_string()),
+        "the accessor-keyword position offers `get` and `set`; got {ls:?}"
+    );
+    // The inserts are the bare keyword words (no parens, not a snippet).
+    let get = list
+        .items
+        .iter()
+        .find(|i| i.label == "get")
+        .expect("get item");
+    assert_eq!(
+        get.insert_text_format, None,
+        "the keyword is a plain insert"
+    );
+    assert_eq!(edit_new_text(get), "get", "the insert is the bare keyword");
+
+    shutdown(&client, server_thread);
+}
+
 // --- SUPER METHOD ---
 
 /// `super.<cursor>` offers the **parent** class's methods (`queue_free` from the native `Node`
@@ -1725,6 +1945,43 @@ fn type_attribute_lists_nested_types_not_instance_members() {
     assert!(
         !ls.contains(&"set_state".to_string()),
         "an instance method (set_state) must NOT appear in a type-attribute position: {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// `var x: Outer.Inner.<cursor>` — a MULTI-segment type-attribute chain descends the project class's
+/// inner-class path, offering `Inner`'s nested types/constants (Godot's segment-by-segment
+/// `COMPLETION_TYPE_ATTRIBUTE` walk). Resolution is by NAME through the inner chain — the previous
+/// single-token base lookup fell through to empty here.
+#[test]
+fn type_attribute_multi_segment_descends_inner_chain() {
+    let p = p4_project();
+    // A project class with a nested inner class carrying a nested type (a deeper inner class) +
+    // a const — the type-scoped members `Outer.Inner.<cursor>` should offer.
+    p.write(
+        "src/outer.gd",
+        "class_name TaOuter\nextends Node\n\nclass TaInner:\n\tconst INNER_K := 7\n\tclass Deepest:\n\t\tpass\n",
+    );
+    let uri = file_uri(&p.root.join("src/use_outer.gd"));
+    let src = "extends Node\n\nfunc f() -> void:\n\tvar x: TaOuter.TaInner.\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar x: TaOuter.TaInner.` — compute the cursor column: `\t`=1 col, then
+    // `var x: TaOuter.TaInner.` — the trailing `.` is the last char. Column = byte length of the
+    // line content after the tab + 1 (tab counts as 1 column in LSP UTF-16 here).
+    let line = "\tvar x: TaOuter.TaInner.";
+    let col = line.chars().count() as u32;
+    let raw = complete_raw(&client, 201, &uri, Position::new(3, col));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"INNER_K".to_string()),
+        "the inner class's const INNER_K is offered for `Outer.Inner.`: {ls:?}"
+    );
+    assert!(
+        ls.contains(&"Deepest".to_string()),
+        "the inner class's nested type Deepest is offered for `Outer.Inner.`: {ls:?}"
     );
 
     shutdown(&client, server_thread);
@@ -2228,6 +2485,26 @@ fn edit_new_text(item: &CompletionItem) -> String {
         CompletionTextEdit::Edit(e) => e.new_text.clone(),
         CompletionTextEdit::InsertAndReplace(e) => e.new_text.clone(),
     }
+}
+
+/// Apply one completion item's replace edit to an ASCII fixture. Completion tests use ASCII source,
+/// so LSP character offsets equal byte offsets here.
+fn apply_completion_edit(src: &str, item: &CompletionItem) -> String {
+    let (range, new_text) = match item.text_edit.as_ref().expect("an item has a textEdit") {
+        CompletionTextEdit::Edit(e) => (e.range, e.new_text.as_str()),
+        CompletionTextEdit::InsertAndReplace(e) => (e.replace, e.new_text.as_str()),
+    };
+    let mut line_starts = vec![0usize];
+    for (i, b) in src.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let to_byte =
+        |pos: Position| -> usize { line_starts[pos.line as usize] + pos.character as usize };
+    let start = to_byte(range.start);
+    let end = to_byte(range.end);
+    format!("{}{}{}", &src[..start], new_text, &src[end..])
 }
 
 /// #146 regression (completion arm): member completion on an **inner-class instance** lists the

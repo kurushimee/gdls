@@ -135,6 +135,13 @@ pub enum CompletionKind {
     /// so this is distinct from [`CompletionKind::Assign`].
     PropertyMethod,
 
+    /// The bare accessor-keyword position of an inline property block: `var x: int:\n\t|` /
+    /// `var x: int:\n\tg|` — Godot's `COMPLETION_PROPERTY_DECLARATION` (`gdscript_parser.cpp:1288`),
+    /// which offers exactly the plain-text keywords `get`/`set` (`gdscript_editor.cpp:3543`). Distinct
+    /// from [`CompletionKind::PropertyMethod`] (the `get = <method>` binding side) and from a generic
+    /// [`CompletionKind::Identifier`] in an ordinary class/function body.
+    PropertyAccessor,
+
     /// A context gdls deliberately does not serve in v1: `$`/`%`/`get_node(...)` node paths and
     /// `load`/`preload` file paths (the scene/resource index lands in M11). Carried explicitly so a
     /// handler returns an empty list here instead of misclassifying it as a member or identifier.
@@ -988,6 +995,19 @@ fn classify_anchored(
                 _ => {}
             }
         }
+        // A partial word at the start of an inline property-accessor line (`var x: int:\n\tg|`) →
+        // the bare `get`/`set` keyword completion. Gated on the word opening the line (its raw
+        // predecessor is layout, so an in-body expression `get:\n\t\tprin|` is excluded) AND the AST
+        // showing a property-style `Variable` enclosing the cursor.
+        if i.checked_sub(1)
+            .is_none_or(|prev| is_layout(tokens[prev].kind))
+            && ast_is_property_accessor_position(tree, byte)
+        {
+            return Some(CompletionContext::new(
+                CompletionKind::PropertyAccessor,
+                prefix,
+            ));
+        }
     }
     // `extends ` with a trailing space (anchor is the `extends` keyword itself).
     if anchor_kind == Extends {
@@ -996,6 +1016,23 @@ fn classify_anchored(
     // `func ` with a trailing space at class-body statement start.
     if anchor_kind == Func && is_class_body_func_position(tokens, i) {
         return Some(CompletionContext::new(CompletionKind::OverrideMethod, None));
+    }
+
+    // Empty bare accessor-keyword position (`var x: int:\n\t|`, or a second blank accessor line after
+    // a completed `get:` body). There is no word token, so the partial-word branch above cannot see
+    // it; the AST signal still proves we are in the property declaration context, not an ordinary
+    // class/function body.
+    if prefix.is_none()
+        && (ast_is_property_accessor_position(tree, byte)
+            || (anchor_kind == Colon
+                && is_property_block_colon(tokens, i)
+                && no_meaningful_token_between(tokens, i, byte))
+            || token_is_property_accessor_position(tokens, byte))
+    {
+        return Some(CompletionContext::new(
+            CompletionKind::PropertyAccessor,
+            None,
+        ));
     }
 
     // Type hint after a `:` in a declaration (`var t: Vec`, `var t: `). The AST is the reliable
@@ -1153,6 +1190,126 @@ fn is_declaration_colon(tokens: &[Token], i: usize) -> bool {
             _ => {}
         }
         j -= 1;
+    }
+    false
+}
+
+/// Token/layout fallback for an EMPTY accessor-keyword line. The parser does not always stretch the
+/// property `Variable` node far enough to cover `var x: int:\n\t|` before the `get`/`set` word exists,
+/// so the AST-only signal above misses the exact bare position Godot's
+/// `COMPLETION_PROPERTY_DECLARATION` is made for. Track indentation up to the cursor and remember a
+/// depth-0 `var ...:` property-block colon; the cursor must be on a still-empty line exactly one
+/// indent deeper than that colon.
+fn token_is_property_accessor_position(tokens: &[Token], byte: usize) -> bool {
+    use TokenKind::*;
+    let mut indent_depth: i32 = 0;
+    let mut property_depth: Option<i32> = None;
+    let mut line_has_meaningful = false;
+
+    for (i, t) in tokens.iter().enumerate() {
+        if t.span.end > byte {
+            break;
+        }
+        match t.kind {
+            Newline => line_has_meaningful = false,
+            Indent => {
+                indent_depth += 1;
+                line_has_meaningful = false;
+            }
+            Dedent => {
+                if t.span.end == byte
+                    && !line_has_meaningful
+                    && property_depth.is_some_and(|depth| indent_depth.saturating_sub(1) <= depth)
+                {
+                    continue;
+                }
+                indent_depth = indent_depth.saturating_sub(1);
+                if property_depth.is_some_and(|depth| indent_depth <= depth) {
+                    property_depth = None;
+                }
+                line_has_meaningful = false;
+            }
+            Eof | Error => {}
+            Colon if is_property_block_colon(tokens, i) => {
+                property_depth = Some(indent_depth);
+                line_has_meaningful = true;
+            }
+            _ => line_has_meaningful = true,
+        }
+    }
+
+    !line_has_meaningful
+        && property_depth
+            .map(|depth| indent_depth == depth + 1)
+            .unwrap_or(false)
+}
+
+/// Whether `tokens[i]` is the depth-0 block-opening colon in a property declaration line
+/// (`var x: int:` / `var x = 1:`), not the type-hint colon or a colon inside a default/dict literal.
+fn is_property_block_colon(tokens: &[Token], i: usize) -> bool {
+    use TokenKind::*;
+    if tokens.get(i).map(|t| t.kind) != Some(Colon) {
+        return false;
+    }
+    let line_start = tokens[..i]
+        .iter()
+        .rposition(|t| matches!(t.kind, Newline | Indent | Dedent))
+        .map_or(0, |idx| idx + 1);
+    let mut depth: i32 = 0;
+    let mut saw_var = false;
+    let mut saw_value_or_type = false;
+    for t in &tokens[line_start..i] {
+        match t.kind {
+            ParenthesisOpen | BracketOpen | BraceOpen => depth += 1,
+            ParenthesisClose | BracketClose | BraceClose => depth -= 1,
+            Var if depth == 0 => saw_var = true,
+            Colon | Equal if depth == 0 => saw_value_or_type = true,
+            _ => {}
+        }
+    }
+    depth == 0 && saw_var && saw_value_or_type
+}
+
+fn no_meaningful_token_between(tokens: &[Token], i: usize, byte: usize) -> bool {
+    tokens[i + 1..]
+        .iter()
+        .take_while(|t| t.span.end <= byte)
+        .all(|t| is_anchor_skippable(t.kind))
+}
+
+/// Whether the cursor sits at the bare accessor-keyword position of an inline property block
+/// (`var x: T:\n\t<cursor>`, `var x: T:\n\tget:\n\t\t…\n\t<cursor>`) — where Godot offers the `get`/
+/// `set` keywords (`COMPLETION_PROPERTY_DECLARATION`). The reliable signal is the AST: a `Variable`
+/// node whose `property` is a property style (`Inline`/`SetGet`, never `None`) **encloses** the
+/// cursor (probing `byte` and `byte-1`, since the partial accessor identifier sits at the node's
+/// trailing edge). This distinguishes the accessor block from an ordinary class body (where the
+/// enclosing node is the `Class`) or a function body (a `Suite`), which the property-style Variable
+/// never covers. The caller additionally gates on the word being at line start (the accessor-name
+/// position), so an in-accessor-body expression (`get:\n\t\tprin|`) does not match.
+fn ast_is_property_accessor_position(tree: &ParseTree, byte: usize) -> bool {
+    if tree.is_empty() {
+        return false;
+    }
+    for probe in [byte, byte.saturating_sub(1)] {
+        if let Some(id) = tree.innermost_node_at(probe) {
+            // Walk from the cursor's innermost node outward. The accessor-KEYWORD position reaches a
+            // property `Variable` directly (chain `Identifier → Variable`). A position INSIDE an
+            // accessor BODY (`get:\n\t\tprin|`) instead reaches the body's `Function`/`Suite` first
+            // (chain `Identifier → Suite → Function → Variable`) — so a `Function`/`Suite` between
+            // the cursor and the property `Variable` means we are in an accessor body, NOT at the
+            // keyword position. Reject the moment one is seen.
+            let mut cur = Some(id);
+            while let Some(n) = cur {
+                match &tree.get(n).kind {
+                    NodeKind::Function(_) | NodeKind::Suite(_) => break,
+                    NodeKind::Variable(v) if v.property != gd_syntax::ast::PropertyStyle::None => {
+                        return true
+                    }
+                    _ => {}
+                }
+                cur = smallest_node_strictly_containing(tree, n);
+            }
+        }
     }
     false
 }
