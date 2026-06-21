@@ -558,3 +558,56 @@ func f():
         "a lambda referencing an inherited signal (ping) through a cross-file base must mark use_self (#141)"
     );
 }
+
+/// #173 cross-file arity: a VARARG script method inherited through a cross-file base must NOT
+/// arity-error when over-supplied. The interface extractor now carries the rest-parameter flag
+/// (`MemberFlags::is_vararg`), so `script_chain_call` reports `is_vararg = true` and the too-many
+/// check is suppressed — Godot stamps `METHOD_FLAG_VARARG` on script functions
+/// (gdscript_analyzer.cpp:5866-5868), so the call is valid.
+#[test]
+fn cross_file_vararg_method_over_supply_is_silent() {
+    let base = "\
+class_name VarargBase
+extends Node
+func emit_many(first, ...rest) -> void:
+\tpass
+";
+    let child = "\
+extends VarargBase
+func _ready() -> void:
+\temit_many(1, 2, 3, 4)
+";
+    let project = Project::new(&[("res://varargbase.gd", base), ("res://child.gd", "")]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    let errors = error_messages(&result);
+    assert!(
+        !errors.iter().any(|m| m.contains("Too many arguments")),
+        "a cross-file vararg method over-supplied must not arity-error; got {errors:?}"
+    );
+}
+
+/// #173 cross-file arity, positive control: a NON-vararg script method inherited through a
+/// cross-file base IS arity-checked. `required()` takes exactly one param; supplying three is too
+/// many — proving the cross-file count check is genuinely live (not vacuously silent).
+#[test]
+fn cross_file_fixed_arity_method_over_supply_fires() {
+    let base = "\
+class_name FixedBase
+extends Node
+func required(only) -> void:
+\tpass
+";
+    let child = "\
+extends FixedBase
+func _ready() -> void:
+\trequired(1, 2, 3)
+";
+    let project = Project::new(&[("res://fixedbase.gd", base), ("res://child.gd", "")]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    let errors = error_messages(&result);
+    assert!(
+        errors.iter().any(|m| m
+            == "Too many arguments for \"required()\" call. Expected at most 1 but received 3."),
+        "a cross-file fixed-arity method over-supplied must arity-error; got {errors:?}"
+    );
+}

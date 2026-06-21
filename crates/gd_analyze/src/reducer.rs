@@ -4123,9 +4123,13 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // value-callable error while leaving `sig` at its zero-arg default, and arity-checking
         // those would manufacture a phantom "Expected at most 0" Godot never emits (it skips
         // validate_call_arg whenever get_function_signature returns false — analyzer.cpp:3626).
+        // `sig.arity_known` additionally excludes name-only seeded native stubs (the `_get`/`_set`/
+        // `_notification` virtuals `ClassDB` resolves but the dump omits — seeded with zero params
+        // purely for the existence lookup): Godot arity-checks them against ClassDB's real params,
+        // which gdls lacks, so the faithful degrade is silence, not a phantom "Expected at most 0".
         // Too-few anchors on the whole call; too-many anchors on the first excess argument
         // (`p_call->arguments[par_types.size()]`).
-        if sig_resolved {
+        if sig_resolved && sig.arity_known {
             if arg_count < sig.min_params {
                 ctx.push_error(
                     format!(
@@ -4536,6 +4540,17 @@ struct CallSig {
     /// `Cannot call the parent class' virtual function "<v>()" because it hasn't been defined.`.
     /// Only `lookup_native_method` sets it; in-file/script sigs leave it `false`.
     is_virtual: bool,
+    /// Whether `(min_params, max_params)` reflect the method's REAL parameter list and may drive
+    /// the arity check (analyzer.cpp:5944). `false` for a native method seeded by
+    /// `seed_dump_omitted_methods` — those carry an empty `params` purely so the name-existence
+    /// lookup binds (#123), NOT the true arity. Arity-checking a seed would fire a phantom
+    /// "Too many arguments... Expected at most 0" on a valid call to a dump-omitted virtual
+    /// (`_notification`, `_get`, …) that ClassDB resolves with real parameters. Every
+    /// real-signature builder (in-file `function_signature`, cross-file `script_chain_call`,
+    /// dumped native/builtin lookups) sets it `true`; the derived `Default` leaves it `false`,
+    /// which is safe because the `CallSig::default()` stubs (constructor, Variant-degrade) are
+    /// already excluded from the arity check by `sig_resolved`.
+    arity_known: bool,
 }
 
 /// Read an in-file function's signature snapshot for the count + per-arg compat checks. Needs
@@ -4551,6 +4566,8 @@ fn function_signature(ctx: &AnalysisContext, fn_id: NodeId) -> CallSig {
         sig.is_vararg = f.rest_parameter.is_some();
         sig.is_static = f.is_static;
         sig.is_coroutine = f.is_coroutine;
+        // In-file declared parameters are authoritative — arity-checkable.
+        sig.arity_known = true;
         let defaults = f
             .parameters
             .iter()
@@ -4704,6 +4721,9 @@ fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> 
         is_coroutine: false,
         // Builtin (Variant) methods are never virtual and have no super-call path.
         is_virtual: false,
+        // Builtin methods are always real dump entries (never seeded); `arity_known` rides the
+        // ingest flag for symmetry with the native path.
+        arity_known: m.arity_known,
     })
 }
 
@@ -4746,6 +4766,10 @@ fn lookup_native_method(ctx: &AnalysisContext, native: &str, name: &str) -> Opti
                 // GDScript functions can be coroutines.
                 is_coroutine: false,
                 is_virtual: m.is_virtual,
+                // `false` for a `seed_dump_omitted_methods` stub (empty `params` is a name-only
+                // placeholder, not the real arity) — keeps the arity check off dump-omitted
+                // virtuals ClassDB resolves with real parameters.
+                arity_known: m.arity_known,
             });
         }
         cur = nc.inherits.map(|s| ctx.native.name_of(s).to_owned());
@@ -5120,12 +5144,18 @@ fn script_chain_call(
             par_types: vec![DataType::variant(); par_n],
             min_params: member.required_params,
             max_params: par_n,
-            is_vararg: false,
+            // The interface carries the func's rest-parameter (`...args`) flag — a vararg method
+            // must suppress the too-many check exactly as the in-file path does (reducer.rs
+            // `function_signature`: `is_vararg = f.rest_parameter.is_some()`).
+            is_vararg: member.flags.is_vararg,
             is_static: member.flags.is_static,
             is_coroutine: member.flags.is_coroutine,
             // A cross-file GDScript method is not a native virtual; the super-virtual check is the
             // NATIVE-resolution counterpart only.
             is_virtual: false,
+            // Resolved through the cross-file interface — `required_params`/`par_n` are the real
+            // declared arity, so the call is arity-checkable.
+            arity_known: true,
         }),
         link,
     )

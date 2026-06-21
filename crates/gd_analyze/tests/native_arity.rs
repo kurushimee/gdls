@@ -216,3 +216,28 @@ func run(thing) -> void:
         "unresolved dynamic call must not arity-error; got {msgs:?}"
     );
 }
+
+// --- SEEDED DUMP-OMITTED NATIVE METHOD: SILENT (no real param metadata) ----------------------
+
+#[test]
+fn seeded_dump_omitted_native_method_over_call_is_silent() {
+    // `_notification`/`_get`/`_set` are `Object`-core virtuals `ClassDB` resolves but
+    // `extension_api.json` omits; gdls seeds them as name-only stubs (zero params) purely so the
+    // method-existence lookup binds (suppressing the #123 Callable warning). Those stubs carry no
+    // real arity, so the count check must NOT run on them — Godot DOES arity-check these (ClassDB
+    // has the params) but gdls lacks them, so silent under-emission is the faithful degrade
+    // ("never lie"), never a phantom `Too many arguments... Expected at most 0`.
+    let src = "\
+extends Node
+
+func _ready() -> void:
+\t_notification(0)
+\t_get(\"prop\")
+\t_set(\"prop\", 1)
+";
+    let msgs = error_messages(src);
+    assert!(
+        !msgs.iter().any(|m| m.contains("arguments for")),
+        "seeded dump-omitted native methods must not arity-error; got {msgs:?}"
+    );
+}

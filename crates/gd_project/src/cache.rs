@@ -57,7 +57,13 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// loaded from an old cache would silently serve a project with no scene relations until each
 /// `.tscn`'s first edit — the same "warm-load serves stale/empty derived state" hazard the v4 note
 /// guards against. One cold re-index per project on upgrade, self-healing.
-pub const CACHE_FORMAT_VERSION: u32 = 6;
+///
+/// v7 (#173): `MemberFlags` gained `is_vararg` (whether a `func` declares a `...rest` parameter),
+/// so cross-file/super-chain calls can suppress the too-many arity error on a vararg script
+/// method. A v6 cache predates the field; rather than `#[serde(default)]`-load a `false` that would
+/// resurface the very false positive this fixes (a vararg method warm-loaded as non-vararg), v6
+/// files are ignored and rebuilt. One cold re-index per project on upgrade, self-healing.
+pub const CACHE_FORMAT_VERSION: u32 = 7;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
