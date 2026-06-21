@@ -3814,9 +3814,16 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     let mut native_callee: Option<String> = None;
 
     if is_constructor {
-        // `X.new()` returns an instance of X (analyzer.cpp's flow ends up there via
-        // `get_function_signature` finding `_init`). Synthesize directly to skip the
-        // signature walk.
+        // `X.new()` returns an instance of X. The return type is synthesized directly (Godot's
+        // `get_function_signature` with `p_is_constructor=true` sets `r_return_type = p_base_type`
+        // at analyzer.cpp:5869 rather than `_init`'s declared return), so we don't take the
+        // method's return type. But the SAME call resolves `_init`'s parameter list +
+        // default-arg count (analyzer.cpp:5829-5869: `function_name = _init`, then walk the class
+        // chain) and runs `validate_call_arg` against it, so a mis-arity `X.new(...)` errors. For
+        // an in-file Class base we resolve `_init` here and bind its arity into `sig`; a base with
+        // no `_init` (the native default constructor, analyzer.cpp:5897-5903 → empty par_types)
+        // leaves `sig` at its zero-arg default with `sig_resolved = false`, so the arity check
+        // stays silent — matching Godot's never-arity-checked native construction.
         let mut instance = base_type.clone();
         instance.is_meta_type = false;
         instance.is_constant = false;
@@ -3826,6 +3833,23 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         }
         return_type = Some(instance);
         found = true;
+        if base_type.kind == DtKind::Class {
+            if let Some(class_id) = base_type.class_node {
+                if let ClassCallLookup::Function(init_id, _) =
+                    lookup_class_function_or_member(ctx, class_id, "_init")
+                {
+                    let init_sig = function_signature(ctx, init_id);
+                    // Keep the synthesized instance return type (Godot returns the base, not
+                    // `_init`'s return); take only the arity fields so the count check fires.
+                    sig.par_types = init_sig.par_types;
+                    sig.min_params = init_sig.min_params;
+                    sig.max_params = init_sig.max_params;
+                    sig.is_vararg = init_sig.is_vararg;
+                    sig.arity_known = true;
+                    sig_resolved = true;
+                }
+            }
+        }
     } else if base_type.kind == DtKind::Class {
         // In-file class method (`self.method()`, `child.method()`, `Class.method()`).
         if let Some(class_id) = base_type.class_node {
