@@ -214,8 +214,9 @@ func make() -> void:
 ";
     let msgs = error_messages(src);
     assert!(
-        msgs.iter().any(|m| m
-            == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."),
+        msgs.iter()
+            .any(|m| m
+                == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."),
         "constructor over-call must emit Too many arguments; got {msgs:?}"
     );
 }
@@ -237,8 +238,9 @@ func make() -> void:
 ";
     let msgs = error_messages(src);
     assert!(
-        msgs.iter().any(|m| m
-            == "Too few arguments for \"new()\" call. Expected at least 2 but received 1."),
+        msgs.iter()
+            .any(|m| m
+                == "Too few arguments for \"new()\" call. Expected at least 2 but received 1."),
         "constructor under-call must emit Too few arguments; got {msgs:?}"
     );
 }
@@ -266,13 +268,15 @@ func make() -> void:
     );
 }
 
-// --- NATIVE constructor (no in-file `_init`): SILENT ------------------------------------------
+// --- NATIVE constructor over-call: TOO MANY (Expected at most 0) -----------------------------
 
 #[test]
-fn native_constructor_with_arguments_is_silent() {
-    // Godot's native constructor path returns empty par_types (gdscript_analyzer.cpp:5897-5903),
-    // so a bare-native `RefCounted.new(1)` is NEVER arity-checked. gdls must match — no in-file
-    // `_init` ⇒ no real signature ⇒ no arity error.
+fn native_constructor_over_call_fires_expected_at_most_zero() {
+    // Godot's constructor fallback for a base with no `_init` (analyzer.cpp:5897-5903) `return
+    // true` with EMPTY par_types, so `validate_call_arg` (analyzer.cpp:5948-5950) fires
+    // "Too many arguments... Expected at most 0" on `RefCounted.new(1, 2, 3)` — the message uses
+    // `p_call->function_name`, which is `new`. gdls must match: a resolvable native base is
+    // constructible, so the zero-arg arity bound applies.
     let src = "\
 extends Node
 
@@ -281,8 +285,53 @@ func _ready() -> void:
 ";
     let msgs = error_messages(src);
     assert!(
+        msgs.iter().any(|m| m
+            == "Too many arguments for \"new()\" call. Expected at most 0 but received 3."),
+        "native constructor over-call must emit Too many arguments (Expected at most 0); got {msgs:?}"
+    );
+}
+
+// --- NATIVE constructor zero-arg: SILENT -----------------------------------------------------
+
+#[test]
+fn native_constructor_zero_args_is_silent() {
+    // `RefCounted.new()` supplies 0 args against the zero-arg native fallback — correct arity,
+    // no error (too-few can never fire since min == 0).
+    let src = "\
+extends Node
+
+func _ready() -> void:
+\tvar _x = RefCounted.new()
+";
+    let msgs = error_messages(src);
+    assert!(
         !msgs.iter().any(|m| m.contains("arguments for")),
-        "native constructor must not arity-error; got {msgs:?}"
+        "native constructor with no args must be silent; got {msgs:?}"
+    );
+}
+
+// --- IN-FILE class with NO `_init`, over-call: TOO MANY (Expected at most 0) -----------------
+
+#[test]
+fn in_file_class_no_init_over_call_fires_expected_at_most_zero() {
+    // An in-file class that declares no `_init` hits the same constructor fallback
+    // (analyzer.cpp:5897-5903 → empty par_types), so `Inner.new(1)` over-supplies a zero-arg
+    // constructor and must emit "Too many arguments... Expected at most 0".
+    let src = "\
+extends RefCounted
+
+class Inner:
+\tvar x := 1
+
+func make() -> void:
+\tvar _x = Inner.new(1)
+";
+    let msgs = error_messages(src);
+    assert!(
+        msgs.iter()
+            .any(|m| m
+                == "Too many arguments for \"new()\" call. Expected at most 0 but received 1."),
+        "in-file class without _init must arity-error on over-call; got {msgs:?}"
     );
 }
 
