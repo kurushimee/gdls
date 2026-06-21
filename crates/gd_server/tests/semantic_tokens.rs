@@ -442,6 +442,39 @@ fn full_request_maps_every_kind() {
     shutdown(&client, server_thread);
 }
 
+/// #184: a dotted call through a Callable property (`obj.cb()`) must color the callee as the
+/// property it is, not as a method. A real dotted method call beside it stays `method`.
+#[test]
+fn dotted_callable_property_call_colors_property_not_method() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let source = "class_name Target\nextends Node\nvar cb: Callable\nfunc real() -> void:\n\tpass\nfunc use() -> void:\n\tvar obj: Target = Target.new()\n\tobj.cb()\n\tobj.real()\n";
+    let init = init_and_open_caps(
+        &p,
+        &client,
+        &[("target.gd", source)],
+        full_legend_caps(None),
+    );
+    let legend = server_legend(&init);
+    let uri = file_uri(&p.root.join("target.gd"));
+    let tokens = request_full(&client, 10, &uri);
+    let d = decode(&tokens, &legend);
+
+    let cb = at(&d, 7, 5);
+    assert_eq!(
+        cb.ty, "property",
+        "`obj.cb()` must color `cb` as the Callable property, not as a method; got {d:#?}"
+    );
+    let real = at(&d, 8, 5);
+    assert_eq!(
+        real.ty, "method",
+        "`obj.real()` must keep coloring a genuine dotted method callee as method; got {d:#?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 /// Apply a `SemanticTokensDelta` over the FLAT integer array exactly as a conformant client does
 /// (the offsets are tokenIndex*5). This is the reference the round-trip is verified against — kept
 /// independent of the server's own diff/apply so the test can't be self-consistent-but-wrong.

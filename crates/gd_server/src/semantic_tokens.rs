@@ -523,18 +523,39 @@ pub(crate) fn classify_document(
             // colors `property`; a local callable callee colors `variable`; an unresolved callee stays
             // uncolored).
         }
-        // A DOTTED-attribute call callee (`obj.foo()` / `self.foo()` / `X.new()`): the attribute ident
-        // in a subscript-callee position records no `Binding::Use` when the call resolves, so it would
-        // stay uncolored. Color it `method` syntactically, mirroring the bare in-file callee and the
-        // dotted member-USE color (#176). `super.*` was excluded at collection. KNOWN residual (#184):
-        // `obj.cb()` where `cb` is a Callable property is also colored `method` — the dotted analogue of
-        // the #176 part-1 mislabel — accepted here (the issue specifies `method` for dotted callees).
+        // A DOTTED-attribute call callee (`obj.foo()` / `self.foo()` / `X.new()`): a genuine method
+        // call resolves to a `Binding::Call` and records NO `Binding::Use` at the attribute ident, so
+        // it would stay uncolored — color it `method` syntactically, mirroring the bare in-file callee
+        // and the dotted member-USE color (#176). `super.*` was excluded at collection.
+        //
+        // The ONE exception (#184): when the attribute is a property holding a Callable invoked
+        // directly (`var cb: Callable` called as `obj.cb()`), the reducer reduces the attribute as a
+        // member ACCESS (it yields the Callable value the call then invokes) and DOES record a
+        // `Binding::Use` at the attribute span — keyed as the property it is (`Member`/`Variable`). So
+        // a property-ish use-binding present at this span proves a Callable-property call: fall through
+        // to the generic member-use path below, coloring it `property` (what `cb` IS), the dotted
+        // analogue of the bare-callee narrowing. Everything else (a real method, with no use-binding
+        // here) keeps `method` — the narrowing can never drop a genuine method, which records no
+        // use-binding at its callee attribute.
+        //
         // Analysis-priced for parity with the bare-callee block (omitted under `range`-Hard, not
         // guessed); a same-named property/local `foo` would NOT reach here (it isn't a subscript
         // attribute), so this can't disturb a non-call member use.
         if analysis.is_some() && dotted_callee_spans.contains(&key) {
-            push_span(&mut out, span, TokType::Method, 0);
-            continue;
+            let is_callable_property = matches!(
+                use_index.get(&key).copied(),
+                Some(Binding::Use { target_kind, .. })
+                    if matches!(
+                        target_kind,
+                        BindingTargetKind::Member | BindingTargetKind::Variable
+                    )
+            );
+            if !is_callable_property {
+                push_span(&mut out, span, TokType::Method, 0);
+                continue;
+            }
+            // else: a Callable property invoked through `obj.cb()` — left to the generic member-use
+            // path below, which colors it `property`.
         }
         // A resolved member/enum/method/cross-file use — from the analyzer binding.
         if let Some(Binding::Use {
@@ -1993,6 +2014,41 @@ mod tests {
             attr.modifiers & MOD_DECLARATION,
             0,
             "a dotted callee is a USE, not a declaration"
+        );
+    }
+
+    /// A dotted call through a Callable PROPERTY (`obj.cb()` where `cb: Callable` is a member of
+    /// `obj`'s type) colors the callee `property`, NOT `method` (#184) — the dotted analogue of the
+    /// #176-part-1 narrowing. A real method called the same way (`obj.real()`) records no
+    /// `Binding::Use` at the callee attribute (it resolves to a `Binding::Call`), so it keeps
+    /// `method`; a Callable property reduces as a member ACCESS yielding the Callable value, so it
+    /// DOES record a `Member` use-binding at the attribute span — that binding is the discriminator.
+    /// DISCRIMINATING: the pre-fix code colored `obj.cb()` `method`; asserting `property` (and that
+    /// the sibling `obj.real()` stays `method`) is what proves the narrowing.
+    #[test]
+    fn dotted_callable_property_call_callee_colors_property_not_method() {
+        let db = trimmed_db();
+        let src = "class_name Target\nextends Node\nvar cb: Callable\nfunc real() -> void:\n\tpass\nfunc use() -> void:\n\tvar obj: Target = Target.new()\n\tobj.cb()\n\tobj.real()\n";
+        let (parsed, analysis) = analyze_for(src, &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+
+        // `obj.cb()` — the Callable-property callee colors `property` (what `cb` IS).
+        let cb_byte = src.find("obj.cb()").unwrap() + "obj.".len();
+        let cb = tok_at(&raw, cb_byte)
+            .expect("the dotted Callable-property callee `cb` must be colored (#184)");
+        assert_eq!(
+            cb.ty,
+            TokType::Property,
+            "`obj.cb()` colors `cb` as the Callable property, not `method`"
+        );
+        // `obj.real()` — a genuine dotted method callee stays `method` (no use-binding to divert it).
+        let real_byte = src.find("obj.real()").unwrap() + "obj.".len();
+        let real =
+            tok_at(&raw, real_byte).expect("the dotted real-method callee `real` must be colored");
+        assert_eq!(
+            real.ty,
+            TokType::Method,
+            "`obj.real()` keeps coloring a genuine dotted method callee `method` — no regression"
         );
     }
 
