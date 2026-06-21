@@ -905,6 +905,81 @@ impl ParseTree {
         }
         out
     }
+
+    /// **Per-occurrence scope-aware type-name resolution.** Given a TYPE-position identifier at `byte`
+    /// (textually `name` — the base segment of an `extends`/`: T` chain, e.g. `extends Foo` / `: Foo` /
+    /// `: Foo.Inner` on `Foo`), decide whether `name` resolves to a SUITE-LOCAL type declared in a
+    /// block lexically enclosing `byte` rather than to a global `class_name` of the same name.
+    ///
+    /// Returns `true` iff a suite-local `name` is in scope at `byte`. Type resolution checks scopes in
+    /// this order (verified against the 4.6.3 binary AND gdls's own `resolve_datatype`):
+    ///
+    ///   1. **suite-local** (`SuiteNode::has_local`, gdscript_analyzer.cpp:689 / resolver.rs's
+    ///      `lookup_local`) — checked FIRST, BEFORE the global registry;
+    ///   2. **global `class_name`** (`ScriptServer::is_global_class`, :787 / resolver.rs's
+    ///      `global_class_file`) — checked SECOND;
+    ///   3. **current-scope class members** — an `enum`/inner `class`/`const` declared in an enclosing
+    ///      CLASS scope (`get_class_node_current_scope_classes`, :845 / resolver.rs's
+    ///      `datatype_in_scope`) — checked THIRD, LAST.
+    ///
+    /// So ONLY a suite-local (1) precedes the global (2). A class-scope type member (3) loses to the
+    /// global: while the global exists, a class-scope `: name` binds the GLOBAL class, not the
+    /// same-named `enum`/inner-`class`/`const` member. (The EXPRESSION position is the reverse —
+    /// `name.VALUE` resolves the class member first via `reduce_identifier_from_base`, :4467, before
+    /// the global at :4563 — so `Foo.A` binds the inner enum while `: Foo` binds the global. That
+    /// asymmetry is handled by the binding-based collection, not here.)
+    ///
+    /// Therefore this returns `true` ONLY for the suite-local case — the one scope that genuinely
+    /// shadows the global:
+    ///
+    ///   - a func-local `const Other = preload(...)` used as `var x: Other` resolves to the CONST, not
+    ///     a same-named global class — even while the global exists, and even when declared LATER in
+    ///     the suite (Godot uses `SuiteNode::has_local`, order-insensitive). Editing it under a
+    ///     `class_name Other` rename is corruption.
+    ///   - a non-const suite-local is rejected as "Local ... cannot be used as a type." at the same
+    ///     precedence point, still without falling through to the global — so its `: NAME` is not a
+    ///     global reference either.
+    ///
+    /// A class-scope `: name` (enclosing-class `enum`/inner-`class`/`const` member) returns `false`:
+    /// it IS a genuine global reference and the caller (which has already confirmed a global
+    /// `class_name name` exists) collects/edits it. Suppressing it would leave a now-dangling `: name`
+    /// after the global is renamed away — the annotated variable silently RETYPES to the class-scope
+    /// member, a clean-diff meaning change.
+    ///
+    /// This is the TYPE-position analogue of [`Self::resolve_local_binding_at`]: the same suite-chain
+    /// walk (innermost-first), purely lexical/structural (no analyzer pass) — a type-position class
+    /// reference carries no `Binding::Use`, so this positional resolution is what a mutating consumer
+    /// uses to tell a suite-local `: Foo` from a global `: Foo` per occurrence.
+    pub fn type_name_shadowed_by_enclosing_scope(&self, byte: usize, name: &str) -> bool {
+        // (1) Suite-local `NAME` in the enclosing suite chain. Godot's analyzer checks a
+        // suite-local before the global class registry (`SuiteNode::has_local` precedes
+        // `is_global_class`), so a `const Other = preload(...)` used as `: Other` resolves to the
+        // const — editing it under a global-`class_name Other` rename is corruption. Unlike normal
+        // expression-local lookup, Godot's `resolve_datatype` uses `SuiteNode::has_local` before the
+        // global registry, so a same-named local declared later in the suite still shadows here. A
+        // CONSTANT may be a valid type alias; any other local kind still shadows the global but
+        // produces Godot's "Local ... cannot be used as a type." Either way, the type annotation is
+        // not a global-class reference and must be suppressed under a global rename.
+        let mut cur = self.innermost_suite_at(byte);
+        while let Some(id) = cur {
+            let NodeKind::Suite(s) = &self.get(id).kind else {
+                break;
+            };
+            for local in &s.locals {
+                if local.name == name {
+                    return true;
+                }
+            }
+            cur = s.parent_block;
+        }
+        // No suite-local shadow. A type member (`enum`/inner `class`/`const`) declared in an enclosing
+        // CLASS scope does NOT shadow here: the global registry is checked BEFORE current-scope class
+        // members (resolver.rs `global_class_file` precedes `datatype_in_scope`, mirroring
+        // gdscript_analyzer.cpp:787 before :845), so while the global exists a class-scope `: name`
+        // binds the GLOBAL, not the class-scope member. The occurrence is therefore a genuine global
+        // reference and is NOT suppressed.
+        false
+    }
 }
 
 impl std::ops::Index<NodeId> for ParseTree {
@@ -1017,6 +1092,99 @@ mod tests {
             "trailing-newline source has eof_line >= no-newline source; got with={} no={}",
             with_nl.eof_line,
             no_nl.eof_line
+        );
+    }
+
+    /// Byte offset of the type-annotation `name` in `var <v>: <name>` (the first occurrence of
+    /// `: name` after a `var`), used by the scope-resolution tests below.
+    fn type_anno_byte(src: &str, decl: &str, name: &str) -> usize {
+        let needle = format!("{decl}: {name}");
+        src.find(&needle).expect("decl not found") + decl.len() + 2
+    }
+
+    #[test]
+    fn type_name_class_scope_member_does_not_shadow_global() {
+        // A class-scope `enum Foo` does NOT shadow the global in TYPE-annotation position: the global
+        // registry is checked BEFORE current-scope class members (analyzer.cpp:787 before :845), so
+        // both the inner `: Foo` and a top-level `extends Foo` bind the GLOBAL class (shadowed=false →
+        // collect under a global-class rename). Only a SUITE-LOCAL would shadow.
+        let src = "extends Foo\n\nclass Inner:\n\tenum Foo { A }\n\tvar y: Foo = Foo.A\n";
+        let tree = crate::parse(src).tree;
+        // `extends Foo`: the `Foo` after "extends ".
+        let extends_byte = src.find("extends Foo").unwrap() + "extends ".len();
+        assert!(
+            !tree.type_name_shadowed_by_enclosing_scope(extends_byte, "Foo"),
+            "the top-level `extends Foo` is the GLOBAL class (unshadowed)"
+        );
+        // inner `var y: Foo` — the class-scope `enum Foo` does NOT shadow it; it binds the GLOBAL.
+        let inner_anno = type_anno_byte(src, "var y", "Foo");
+        assert!(
+            !tree.type_name_shadowed_by_enclosing_scope(inner_anno, "Foo"),
+            "the inner `: Foo` binds the GLOBAL class (the class-scope `enum Foo` loses to the global \
+             registry in type position), so it is NOT shadowed"
+        );
+    }
+
+    #[test]
+    fn type_name_func_local_const_alias_shadows_global() {
+        // A function-local `const Foo = preload(...)` shadows a same-named global `class_name` in
+        // type-annotation position (Godot checks suite locals before the global registry), so a
+        // `var x: Foo` in that body must NOT be collected for a global-class rename. The class-scope
+        // walk alone (NodeKind::Class only) would miss this — the suite-local branch covers it.
+        let src = "extends Node\n\nfunc f() -> void:\n\tconst Foo = preload(\"res://other.gd\")\n\tvar x: Foo = null\n";
+        let tree = crate::parse(src).tree;
+        let anno = type_anno_byte(src, "var x", "Foo");
+        assert!(
+            tree.type_name_shadowed_by_enclosing_scope(anno, "Foo"),
+            "the func-local `const Foo` shadows the global in `var x: Foo`; it must resolve LOCAL"
+        );
+    }
+
+    #[test]
+    fn type_name_func_local_const_declared_later_still_shadows_global() {
+        // `resolve_datatype` checks `SuiteNode::has_local` before the global class registry without
+        // declaration-order filtering. A later `const Foo` therefore still shadows `var x: Foo`
+        // (Godot reports that the local constant is not resolved yet) and must be suppressed under a
+        // global-class rename.
+        let src = "extends Node\n\nfunc f() -> void:\n\tvar x: Foo = null\n\tconst Foo = preload(\"res://other.gd\")\n";
+        let tree = crate::parse(src).tree;
+        let anno = type_anno_byte(src, "var x", "Foo");
+        assert!(
+            tree.type_name_shadowed_by_enclosing_scope(anno, "Foo"),
+            "a later func-local `const Foo` still shadows `var x: Foo` in Godot type resolution"
+        );
+    }
+
+    #[test]
+    fn type_name_unshadowed_resolves_global() {
+        // No enclosing scope declares `Foo` → an `extends Foo` / `: Foo` is a genuine global reference
+        // (shadowed=false → collect under a global-class rename).
+        let src = "extends Foo\n\nfunc f() -> void:\n\tvar x: Foo = null\n";
+        let tree = crate::parse(src).tree;
+        let extends_byte = src.find("extends Foo").unwrap() + "extends ".len();
+        let anno = type_anno_byte(src, "var x", "Foo");
+        assert!(
+            !tree.type_name_shadowed_by_enclosing_scope(extends_byte, "Foo"),
+            "`extends Foo` with no local `Foo` is the global class"
+        );
+        assert!(
+            !tree.type_name_shadowed_by_enclosing_scope(anno, "Foo"),
+            "`var x: Foo` with no enclosing `Foo` declaration is the global class"
+        );
+    }
+
+    #[test]
+    fn type_name_func_local_non_const_shadows_global_as_error() {
+        // A func-local `var Foo` (runtime variable, not a type) still shadows a same-named global in
+        // Godot type resolution; the analyzer reports `Local variable "Foo" cannot be used as a
+        // type.` instead of falling through to the global registry. A global-class rename must
+        // suppress this already-erroring `: Foo`, not silently retarget it to the renamed global.
+        let src = "extends Node\n\nfunc f() -> void:\n\tvar Foo = 1\n\tvar x: Foo = null\n";
+        let tree = crate::parse(src).tree;
+        let anno = type_anno_byte(src, "var x", "Foo");
+        assert!(
+            tree.type_name_shadowed_by_enclosing_scope(anno, "Foo"),
+            "a func-local `var Foo` is an erroring local type shadow, not a global class reference"
         );
     }
 }

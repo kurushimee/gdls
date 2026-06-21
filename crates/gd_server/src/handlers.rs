@@ -1968,17 +1968,25 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 /// (O(#nodes), no analyzer involvement); works identically whether the cursor is on the
 /// declaration or a call site.
 /// `true` iff `ident_id` is the BASE segment (index 0) of a class `extends` chain
-/// ([`ClassNode::extends`]) or a type annotation's chain ([`TypeNode::type_chain`]) — the only TYPE
-/// positions where a top-level project `class_name` is legitimately referenced (`extends Foo`,
-/// `: Foo`, `: Foo.Inner` on `Foo`). A SUFFIX segment (`Foo.Inner` on `Inner`, index > 0) is an
-/// inner-class path, NOT a top-level class reference, so it returns `false` — keeping a same-named
-/// unrelated top-level `class_name Inner` from being borrowed by the rename firewall's class anchor
-/// (the type-chain corruption case, #106). Type-position class references carry no `Binding::Use`
-/// (they resolve in the resolver pass, not as reduced expressions), so this positional check is what
-/// admits them — the expression-position class anchor uses the `Class` use-binding instead.
-fn cursor_is_type_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
+/// ([`ClassNode::extends`]). Godot resolves inheritance through the global `class_name` registry
+/// before same-file class-scope members, so a matching base segment is a global-class reference when
+/// that class exists even if the extending class also declares an enum/inner class/const with the
+/// same name.
+fn cursor_is_extends_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
     tree.iter_ids().any(|nid| match &tree.get(nid).kind {
         NodeKind::Class(c) => c.extends.first() == Some(&ident_id),
+        _ => false,
+    })
+}
+
+/// `true` iff `ident_id` is the BASE segment (index 0) of a type annotation's chain
+/// ([`TypeNode::type_chain`]) — the type position where a top-level project `class_name` may be
+/// referenced (`: Foo`, `: Foo.Inner` on `Foo`). A SUFFIX segment (`Foo.Inner` on `Inner`, index > 0)
+/// is an inner-class path, NOT a top-level class reference, so it returns `false` — keeping a
+/// same-named unrelated top-level `class_name Inner` from being borrowed by the rename firewall's
+/// class anchor (the type-chain corruption case, #106).
+fn cursor_is_type_annotation_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
+    tree.iter_ids().any(|nid| match &tree.get(nid).kind {
         NodeKind::Type(t) => t.type_chain.first() == Some(&ident_id),
         _ => false,
     })
@@ -2011,43 +2019,6 @@ fn name_is_in_file_root_type(tree: &ParseTree, name: &str) -> bool {
             matches!(&tree.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
         }
         _ => false,
-    })
-}
-
-/// `true` iff `name` is an ENUM type, CLASS, or `const` alias declared INSIDE an inner class (any
-/// class node that is not the file root) — the non-root analog of [`name_is_in_file_root_type`], over
-/// the same complete type-position member set `{Enum, Class, Constant}`. A type with this name
-/// is visible only in its enclosing inner scope, so a type-position `name` in this file may refer to
-/// the inner type rather than a same-named global `class_name`. The root-only guard cannot see it.
-///
-/// The rename layer uses this as a fail-closed REFUSE signal: distinguishing a type-position `name`
-/// that means the inner type from one that means the global class needs per-node scope-aware
-/// resolution (the resolver's job), which gdls does not yet apply in the rename path. Until then,
-/// the presence of any inner-scoped shadow makes the global-class rename unsafe in this file (an
-/// inner `: name` would be wrongly rewritten alongside a legitimate `extends name`), and an inner
-/// type-position cursor would wrongly canonicalize onto the global class — so the rename refuses
-/// rather than emit a wrong edit.
-fn name_is_in_file_inner_scoped_type(tree: &ParseTree, name: &str) -> bool {
-    let root_id = tree.root_id();
-    tree.iter_ids().any(|nid| {
-        if Some(nid) == root_id {
-            return false;
-        }
-        let NodeKind::Class(class) = &tree.get(nid).kind else {
-            return false;
-        };
-        class.members.iter().any(|m| match m {
-            Member::Enum(id) => {
-                matches!(&tree.get(*id).kind, NodeKind::Enum(en) if en.identifier.map(|i| ident_name(tree, i)) == Some(name))
-            }
-            Member::Class(id) => {
-                matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
-            }
-            Member::Constant(id) => {
-                matches!(&tree.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
-            }
-            _ => false,
-        })
     })
 }
 
@@ -2271,9 +2242,18 @@ fn cursor_references_global_class(
     {
         return true;
     }
-    // (c) TYPE position base segment (`extends X` / `: X`) naming a registered global class — type
-    // positions carry no binding, so they are recognized structurally.
-    if cursor_is_type_base_segment(tree, node_id) {
+    // (c) TYPE-ish parser positions naming a registered global class. `extends X` follows
+    // inheritance precedence (Godot checks the global class registry before class-scope members), so
+    // a matching base segment is a global reference. `: X` annotations need the #167 shadow filter:
+    // only a SUITE-LOCAL `X` suppresses the global-class fallback per occurrence (the global registry
+    // precedes class-scope members in type position, so a class-scope `enum`/inner-`class`/`const X`
+    // does NOT shadow — the annotation binds the global).
+    if cursor_is_extends_base_segment(tree, node_id) {
+        return true;
+    }
+    if cursor_is_type_annotation_base_segment(tree, node_id)
+        && !tree.type_name_shadowed_by_enclosing_scope(node_span.start, name)
+    {
         return true;
     }
     // (a) EXPRESSION position: a Class-kind use binding at the cursor span pointing at THIS class.
@@ -4149,60 +4129,13 @@ fn push_use_binding_locations_for(
 /// Class binding (it resolves to the local), so the shadowed token is excluded by construction — the
 /// precision that closes the #163 over-grab.
 ///
-/// TYPE position — `extends Foo` / `: Foo` carry no binding (resolver-level references), so the base
-/// segment (index 0 of [`ClassNode::extends`] / [`TypeNode::type_chain`]) is collected structurally,
-/// name-matched. A SUFFIX segment (`Foo.Inner`, index > 0) is an inner-class path, not a top-level
-/// class reference, and is excluded — the same carve-out [`cursor_is_type_base_segment`] applies at
-/// the cursor.
-/// `true` iff any file the interface index records as referencing `name` (other than `origin_uri`,
-/// the file driving the rename) declares `name` as an inner-class-scoped type
-/// ([`name_is_in_file_inner_scoped_type`]). Such a file may legitimately reference the global class
-/// `name` (`extends name`) WHILE its inner `: name` means the inner type — a distinction a file-level
-/// guard cannot draw, so the rename layer treats this as a fail-closed REFUSE signal for a
-/// global-class rename. Parse-only (no analysis): the structural inner-scope check needs just the
-/// AST, and the candidate parses are content-addressed/cached. The interface-pass `name_referencers`
-/// set bounds the scan to the same candidate fan-out `references` uses for a class name.
-///
-/// `origin_uri` is EXCLUDED here on purpose: the rename caller checks the origin file's own inner
-/// shadow directly against its already-parsed tree (avoiding a redundant parse), so this scans only
-/// the cross-file referencers. Keep the split — re-merging it would re-parse the origin.
-fn any_referencer_has_inner_scoped_type(
-    state: &mut ServerState,
-    name: &str,
-    origin_uri: &Uri,
-) -> bool {
-    let origin_path = crate::uri::uri_to_path(origin_uri);
-    let candidate_fids: Vec<gd_project::FileId> =
-        state.workspace.index.name_referencers(name).collect();
-    for fid in candidate_fids {
-        let Some(path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
-            continue;
-        };
-        if origin_path
-            .as_deref()
-            .is_some_and(|o| normalize_eq(o, &path))
-        {
-            continue;
-        }
-        let Some(cand_uri) = path_to_file_uri(&path) else {
-            continue;
-        };
-        let text = match state.vfs.get(cand_uri.as_str()).map(|d| d.text()) {
-            Some(t) => t,
-            None => match std::fs::read_to_string(path.as_std_path()) {
-                Ok(t) => t,
-                Err(_) => continue,
-            },
-        };
-        let cand_key = CanonicalKey::for_uri(&cand_uri);
-        let parsed = state.workspace.parse(&cand_key, &text);
-        if name_is_in_file_inner_scoped_type(&parsed.tree, name) {
-            return true;
-        }
-    }
-    false
-}
-
+/// Parser-level type-ish positions — `extends Foo` / `: Foo` carry no binding (resolver-level
+/// references), so the base segment (index 0 of [`ClassNode::extends`] / [`TypeNode::type_chain`]) is
+/// collected structurally, name-matched. A SUFFIX segment (`Foo.Inner`, index > 0) is an inner-class
+/// path, not a top-level class reference, and is excluded — the same carve-out applies at the cursor
+/// via [`cursor_is_extends_base_segment`] / [`cursor_is_type_annotation_base_segment`]. `extends`
+/// follows Godot inheritance precedence (global class before class-scope members); type annotations
+/// use the #167 shadow filter.
 fn push_global_class_locations(
     out: &mut Vec<Location>,
     result: &AnalysisResult,
@@ -4229,28 +4162,58 @@ fn push_global_class_locations(
             }
         }
     }
-    // (2) Type-position base segments named `name` (carry no binding). Restricted to index 0 of an
-    // `extends` chain / `TypeNode.type_chain`, so a `Foo.Inner` suffix is never collected.
-    //
-    // A file that locally declares `name` as a root `enum`/inner-class SHADOWS the global class, so
-    // every type position naming `name` in that file refers to the LOCAL type, not this class — skip
-    // them all. (Part 1 above contributes nothing for such a file either: a shadowed `name` reduces
-    // to the local type and records no Class use binding.) Without this guard, renaming a global
-    // `class_name Foo` would rewrite a CONSUMER's own `var y: Foo` whose `Foo` is its in-file enum —
-    // the candidate-side twin of the in-file-type collision.
-    if name_is_in_file_root_type(tree, name) {
-        return;
+    // (2) `extends` base segments named `name` (carry no binding). Godot's inheritance resolver
+    // checks global `class_name`s before same-file class-scope members, so a registered global class
+    // wins even if the extending class declares an enum/inner class/const named `name`. Therefore
+    // these are collected for the global-class rename without the annotation shadow filter.
+    for nid in tree.iter_ids() {
+        let Some(base_id) = (match &tree.get(nid).kind {
+            NodeKind::Class(c) => c.extends.first().copied(),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let base = tree.get(base_id);
+        if let NodeKind::Identifier(i) = &base.kind {
+            if i.name == name {
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(base.span),
+                });
+            }
+        }
     }
+
+    // (3) Type-annotation base segments named `name` (carry no binding). Restricted to index 0 of a
+    // `TypeNode.type_chain`, so a `Foo.Inner` suffix is never collected.
+    //
+    // Each annotation base segment is resolved PER OCCURRENCE
+    // ([`ParseTree::type_name_shadowed_by_enclosing_scope`]): in type-annotation position Godot checks
+    // suite-locals before the global registry but the global registry BEFORE class-scope members
+    // (gdscript_analyzer.cpp:689 < :787 < :845), so a `: Foo` binds the GLOBAL while it exists UNLESS a
+    // SUITE-LOCAL `Foo` (a func-local `const Foo = preload(...)`) shadows it. A `: Foo` enclosed by a
+    // class scope that declares its OWN `enum`/inner-`class`/`const Foo` STILL binds the global and IS
+    // collected — only a suite-local shadow suppresses it. This is occurrence-positive: a base segment
+    // is edited because per-node resolution proves it names the global class.
+    //
+    // (This replaces the former file-level early-return skip — `name_is_in_file_root_type(tree, name)`
+    // → suppress the WHOLE file — which over-suppressed a legitimate `extends Foo` (the global) in a
+    // file that ALSO declared an inner `enum Foo`, forcing the rename to refuse. The per-occurrence
+    // walk separates the two. #167. Part (1) above stays occurrence-positive by construction: a `Foo`
+    // expression (`Foo.A`) inside a scope that declares `enum Foo` reduces to the LOCAL enum member
+    // (expression resolution checks members before the global, the reverse of type position) and
+    // records no Class-use binding pointing at this class file, so it is already excluded there.)
     for nid in tree.iter_ids() {
         let base_id = match &tree.get(nid).kind {
-            NodeKind::Class(c) => c.extends.first().copied(),
             NodeKind::Type(t) => t.type_chain.first().copied(),
             _ => None,
         };
         if let Some(base_id) = base_id {
             let base = tree.get(base_id);
             if let NodeKind::Identifier(i) = &base.kind {
-                if i.name == name {
+                if i.name == name
+                    && !tree.type_name_shadowed_by_enclosing_scope(base.span.start, name)
+                {
                     out.push(Location {
                         uri: uri.clone(),
                         range: mapper.span_to_range(base.span),
@@ -6458,12 +6421,15 @@ fn rename_target_has_project_anchor(
     //       class IS what they refer to (by-identity, faithful). A cursor that resolves to something
     //       ELSE (an in-file member, an enum value, a native member on a typed base) carries a
     //       DIFFERENT-kind binding and is NOT admitted here → it routes to its own anchor below.
-    //   (b) TYPE position — `extends X` / `: X` carry NO binding (resolver-level, no reduced Use), so
-    //       (a) can't see them. Admit when the cursor is the BASE segment (index 0) of the class's
-    //       `extends` chain or a `TypeNode.type_chain` (`extends Foo`, `: Foo`, `: Foo.Inner` on
-    //       `Foo`). A SUFFIX segment (`Outer.Inner` on `Inner`, index > 0) is an inner-class path, NOT
-    //       a top-level `class_name` reference, so it is NOT admitted → a same-named unrelated
-    //       top-level `class_name Inner` can't be borrowed (the type-chain corruption case).
+    //   (b) Parser-level type-ish positions — `extends X` / `: X` carry NO binding (resolver-level,
+    //       no reduced Use), so (a) can't see them. Admit when the cursor is the BASE segment (index
+    //       0) of the class's `extends` chain or a `TypeNode.type_chain` (`extends Foo`, `: Foo`,
+    //       `: Foo.Inner` on `Foo`). A SUFFIX segment (`Outer.Inner` on `Inner`, index > 0) is an
+    //       inner-class path, NOT a top-level `class_name` reference, so it is NOT admitted → a
+    //       same-named unrelated top-level `class_name Inner` can't be borrowed (the type-chain
+    //       corruption case). Inheritance and annotations intentionally split below because Godot
+    //       checks global classes before same-file class-scope members for `extends`, while `: Foo`
+    //       annotations are filtered by the #167 per-occurrence shadow resolver.
     let node_span = parsed.tree.get(node_id).span;
     let class_use_anchored = result.bindings().iter().any(|b| {
         matches!(
@@ -6476,15 +6442,35 @@ fn rename_target_has_project_anchor(
             } if *site == node_span && Some(*f) == global_class_file(state, name)
         )
     });
-    if class_use_anchored || cursor_is_type_base_segment(&parsed.tree, node_id) {
-        // Confirm the type-base segment actually names a PROJECT type — a project `class_name` (a
-        // native base `extends Node` must fall through to the engine refusal), OR an IN-FILE root
-        // enum / inner-class declared in THIS file (`: MyEnum` / `: Inner` — its references set is
-        // collected in-file; the old name-based signal-1 admitted these, the occurrence-positive
-        // replacement must too, or a legit in-file-type rename from a USE site wrongly refuses).
+    if class_use_anchored
+        || cursor_is_extends_base_segment(&parsed.tree, node_id)
+        || cursor_is_type_annotation_base_segment(&parsed.tree, node_id)
+    {
+        // Confirm the type-base segment actually names a PROJECT type the rename can collect:
+        //   - an EXPRESSION-position Class use (`class_use_anchored`) — by identity, always editable;
+        //   - a CLASS `extends name` base segment — Godot's inheritance resolver checks global
+        //     `class_name`s before same-file class-scope members, so a registered global wins even
+        //     when an enclosing class declares an enum/inner class/const of the same name;
+        //   - an IN-FILE ROOT enum / inner-class declared in THIS file (`name_is_in_file_root_type`)
+        //     — its references set is collected in-file (`UnresolvedKind::InFileType`), so a legit
+        //     in-file root-type rename from a USE site is admitted;
+        //   - a TYPE ANNOTATION `class_name name` reference — but ONLY when this occurrence is NOT
+        //     shadowed by a SUITE-LOCAL `name` (`!type_name_shadowed_by_enclosing_scope`). In
+        //     type-annotation position Godot checks suite-locals before the global registry but the
+        //     global registry BEFORE class-scope members (gdscript_analyzer.cpp:689 < :787 < :845), so
+        //     a `: name` enclosed by a class scope that declares its own `enum`/inner-`class`/`const`
+        //     `name` STILL binds the global while the global exists — it is a genuine global reference
+        //     and IS admitted. Only a suite-local (func-local `const name`) shadow precedes the global
+        //     and suppresses the occurrence.
         if class_use_anchored
-            || find_global_class_definition(state, name).is_some()
+            || (find_global_class_definition(state, name).is_some()
+                && cursor_is_extends_base_segment(&parsed.tree, node_id))
             || name_is_in_file_root_type(&parsed.tree, name)
+            || (find_global_class_definition(state, name).is_some()
+                && cursor_is_type_annotation_base_segment(&parsed.tree, node_id)
+                && !parsed
+                    .tree
+                    .type_name_shadowed_by_enclosing_scope(node_span.start, name))
         {
             return true;
         }
@@ -6714,54 +6700,39 @@ pub fn rename(
     let cursor_refers_global_class =
         cursor_references_global_class(state, &uri, &parsed.tree, &key, &text, byte, &old_name);
 
-    // (5a) Fail-closed inner-scope refuse-guard. A type-position reference to `old_name` carries no
-    // binding, so neither the firewall nor the edit collector can tell an inner-class-scoped `: Foo`
-    // (the inner enum/class) from a top-level `: Foo` (a same-named global `class_name`) without
-    // per-node scope-aware type-name resolution the resolver owns. Where an inner-scoped shadow and a
-    // global `class_name` of the same name coexist in the rename's reach, a file-level guard cannot
-    // separate the two — so the rename would emit a WRONG edit. Refuse the whole rename instead (zero
-    // wrong edits; the user renames the residue manually). Over-refusal is the safe direction.
-    if state.workspace.index.registry().contains(&old_name) {
-        // (B) The cursor itself is a type-base segment whose own file declares `old_name` as an
-        // inner-scoped type. The firewall admitted it as a global-class reference, but it may be the
-        // inner type — canonicalizing onto the global `class_name` decl would rewrite an unrelated
-        // class. Refuse.
-        if cursor_is_type_base_segment(&parsed.tree, node_id)
-            && name_is_in_file_inner_scoped_type(&parsed.tree, &old_name)
-        {
-            return Err(RequestRefusal::not_editable(format!(
-                "Cannot safely rename `{old_name}`: an inner-class-scoped type of the same name \
-                 collides with the global class `{old_name}` and cannot be resolved per occurrence"
-            )));
-        }
-        // (A) The cursor positively refers to the global `class_name old_name`, and SOME file in the
-        // rename's reach declares `old_name` as an inner-scoped type. That file's inner `: old_name`
-        // (the inner type) would be wrongly rewritten alongside its legitimate `extends old_name` /
-        // `old_name.new()` (the global class), and a file-level guard cannot separate them. Refuse.
-        // The shadow may live in the ORIGIN file itself (a global-class USE — `old_name.new()` /
-        // `extends old_name` — in a file that also declares an inner `old_name`; checked here with the
-        // already-parsed origin tree, no re-parse) OR in any cross-file referencer. This guard's file
-        // fan-out is exactly the edit collector's: `{origin} ∪ name_referencers(old_name)` — the
-        // origin (always scanned for edits) plus the interface-pass referencer set. Keep that equality
-        // if either the edit-collection candidate set or `any_referencer_has_inner_scoped_type` ever
-        // changes, or a file the collector edits could escape the guard.
-        if cursor_refers_global_class
-            && (name_is_in_file_inner_scoped_type(&parsed.tree, &old_name)
-                || any_referencer_has_inner_scoped_type(state, &old_name, &uri))
-        {
-            return Err(RequestRefusal::not_editable(format!(
-                "Cannot safely rename the global class `{old_name}`: a file in the rename's reach \
-                 declares an inner-class-scoped type of the same name that cannot be distinguished \
-                 from a global reference per occurrence"
-            )));
-        }
-    }
+    // (5a) Class-scope vs global-`class_name` type-name collision is resolved PER OCCURRENCE by the
+    // scope-aware resolver ([`ParseTree::type_name_shadowed_by_enclosing_scope`]), not by a file-level
+    // fail-closed refuse-guard (the #166 coarse guard #167 supersedes). In type-annotation position
+    // Godot checks suite-locals before the global registry but the global registry BEFORE class-scope
+    // members (gdscript_analyzer.cpp:689 < :787 < :845), so:
+    //   - A GLOBAL-class rename collects every type-position `: Foo` whose `Foo` is not shadowed by a
+    //     SUITE-LOCAL — including a class-scope `: Foo` whose root/inner class declares its own
+    //     `enum`/inner-`class`/`const Foo` (that annotation binds the GLOBAL while it exists, so it IS
+    //     a genuine reference and IS edited). The companion expression `Foo.A` binds the local member
+    //     (expression resolution checks members before the global, the reverse order) and records no
+    //     Class-use binding at the global, so it is excluded by construction. Only a suite-local
+    //     (func-local `const Foo`) shadow precedes the global and is suppressed. No whole-rename refusal.
+    //   - A class-scope `: Foo` cursor (root OR inner) is admitted as a global reference by the firewall
+    //     carve-out and canonicalizes onto the global `class_name` decl — the faithful target, since the
+    //     annotation binds the global. A suite-local-shadowed cursor is NOT admitted (it is the local).
 
+    // If the cursor is positively proven to be the global `class_name`, canonicalize straight to
+    // that declaration. The older `definition()` path is name-first for in-file members, so an
+    // `extends Foo` cursor in a file that also declares `enum Foo` could otherwise retarget the enum
+    // even though Godot's inheritance resolver chose the global class.
+    let positive_global_class_decl = cursor_refers_global_class
+        .then(|| find_global_class_definition(state, &old_name))
+        .flatten();
     let global_class_decl = (!cursor_refers_global_class)
         .then(|| find_global_class_definition(state, &old_name))
         .flatten();
     let edit_tdp = if skip_canonicalization {
         tdp.clone()
+    } else if let Some(loc) = positive_global_class_decl {
+        TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: loc.uri },
+            position: loc.range.start,
+        }
     } else {
         match definition(
             state,
