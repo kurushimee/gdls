@@ -454,7 +454,7 @@ fn named_script_container_element_emits_hint() {
         .expect("Array[Hero] must now yield a TYPE hint (label recurses name-substitution)");
     assert_eq!(
         label_of(type_hint),
-        ": Array[Hero] = ",
+        ": Array[Hero]",
         "the label must render the named-script element as `Hero`, not `<Script #N>`"
     );
 
@@ -471,7 +471,7 @@ fn named_script_container_element_emits_hint() {
         edit.new_text
     );
 
-    let edited = apply_edits(t, &[edit.clone()]);
+    let edited = apply_edits(t, std::slice::from_ref(edit));
     assert!(
         edited.contains("var h: Array[Hero] = arr"),
         "the edit must produce `var h: Array[Hero] = arr`; got:\n{edited}"
