@@ -599,3 +599,43 @@ fn type_definition_inner_class_instance_jumps_to_inner_class() {
 
     shutdown(&client, handle);
 }
+
+#[test]
+fn type_definition_doubly_nested_inner_class_instance_descends_full_chain() {
+    // Depth-2 twin of the test above: a doubly-nested inner-class instance (`Outer.Inner.new()`) is
+    // typed `Script` with `inner = ["Outer", "Inner"]`. typeDefinition must descend the FULL chain
+    // and land on the innermost `class Inner:` identifier, not `Outer` and not the file root — pinning
+    // the per-segment descent loop in `inner_class_identifier_span` (depth-1 alone can't catch a loop
+    // that stops one segment early).
+    let src = concat!(
+        "class_name Root\n",              // line 0 — root identifier `Root`
+        "\n",                             // line 1
+        "class Outer:\n",                 // line 2 — outer identifier `Outer`
+        "\tclass Inner:\n",               // line 3 — inner identifier `Inner` at cols 7..12
+        "\t\tvar field := 0\n",           // line 4
+        "\n",                             // line 5
+        "func use_it() -> void:\n",       // line 6
+        "\tvar x := Outer.Inner.new()\n", // line 7 — inferred instance `x` (cols 5..6)
+    );
+    let project = NativeProject::new(&[("nested.gd", src)]);
+    let (client, handle, _) = boot(&project);
+    let uri = project.uri("nested.gd");
+    did_open(&client, &uri, src);
+
+    // typeDefinition on the instance `x` (line 7, col 5) → the innermost `Inner` class header.
+    let loc = scalar(
+        type_definition_at(&client, &uri, Position::new(7, 5))
+            .expect("typeDefinition resolves the doubly-nested inner-class instance type of `x`"),
+    );
+    assert_eq!(loc.uri, uri, "stays in the same file");
+    assert_eq!(
+        loc.range.start,
+        Position::new(3, 7),
+        "typeDefinition must descend to the innermost `Inner` (line 3, col 7), not `Outer` \
+         (line 2) or the file root; got {:?}",
+        loc.range.start
+    );
+    assert_eq!(loc.range.end, Position::new(3, 12), "`Inner` is 5 chars");
+
+    shutdown(&client, handle);
+}
