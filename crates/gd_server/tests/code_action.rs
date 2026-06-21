@@ -1464,6 +1464,42 @@ fn underscore_prefix_not_offered_for_private_class_variable() {
     shutdown(&client, t);
 }
 
+/// UNUSED_PRIVATE_CLASS_VARIABLE gets a DELETE-fix ("Remove unused private variable") that removes the
+/// whole declaration. Round-trip: `var _unused_private = 1` (unused, `_`-prefixed) → the declaration is
+/// deleted; re-analyze CLEAN (the warning is gone, no new diagnostic by identity).
+#[test]
+fn delete_fix_offered_for_private_class_variable() {
+    const SRC: &str = "extends Node\n\nvar _unused_private = 1\n\nfunc f() -> void:\n\tprint(0)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let before = diag_identities(&diags);
+    let diag = diag_with_warning(&diags, "UNUSED_PRIVATE_CLASS_VARIABLE");
+
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Remove unused private variable");
+    let tes = all_text_edits(&edit);
+    assert_eq!(tes.len(), 1, "one deletion; got {tes:?}");
+
+    let patched = apply_text_edits(SRC, tes);
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !has_warning(&after, "UNUSED_PRIVATE_CLASS_VARIABLE"),
+        "UNUSED_PRIVATE_CLASS_VARIABLE must be cleared; got {:?}",
+        after.diagnostics
+    );
+    let induced: Vec<_> = diag_identities(&after)
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert!(
+        induced.is_empty(),
+        "no NEW diagnostic after the delete-fix; induced {induced:?}\npatched:\n{patched}"
+    );
+    shutdown(&client, t);
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Fix 2: add `@onready` for GET_NODE_DEFAULT_WITHOUT_ONREADY
 // ---------------------------------------------------------------------------------------------------
