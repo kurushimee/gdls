@@ -2574,7 +2574,15 @@ pub(crate) fn in_file_script_ref_of_class(
     ctx: &AnalysisContext,
     node: NodeId,
 ) -> Option<crate::data_type::ScriptRef> {
-    let file = ctx.file?;
+    // An orphan analysis (`ctx.file == None`) still has a real in-file inner-class STRUCTURE; the
+    // inner chain is derived from `class_node` purely by walking THIS tree, so it must not be
+    // discarded just because the file has no interned `FileId`. Fall back to `FileId::ORPHAN` — the
+    // exact id `AnalysisContext::finish` already stamps onto the rewritten self-`ScriptRef` — so an
+    // inner-class instance keeps `inner = ["Inner"]` whether or not the file is interned. Without
+    // this, an orphan analysis (e.g. the request raced the index intern, or a stale epoch-0 orphan
+    // analysis was cache-served) collapsed every inner-class instance's chain to `[]`, so
+    // `typeDefinition`/hover/completion mis-resolved the inner instance to the file root.
+    let file = ctx.file.unwrap_or(gd_project::FileId::ORPHAN);
     let root = ctx.tree.root_id()?;
     fn search(ctx: &AnalysisContext, cur: NodeId, target: NodeId, path: &mut Vec<String>) -> bool {
         if cur == target {
@@ -6690,6 +6698,75 @@ mod tests {
             known_attributes_in_file,
             "the known-file analyze must attribute its in-file binding to Some(FileId) — proving \
              the orphan None above is the orphan path, not an absence of recording"
+        );
+    }
+
+    #[test]
+    fn orphan_analysis_keeps_inner_class_instance_chain() {
+        // An orphan analysis (`file = None`) must still derive an inner-class INSTANCE's chain from
+        // the in-file class structure — the chain is a pure DFS over `class_node` and never needed a
+        // `FileId`. Before the `FileId::ORPHAN` fallback in `in_file_script_ref_of_class`, the
+        // orphan path bailed on `let file = ctx.file?`, so `finish()`'s `unwrap_or_default()`
+        // collapsed every inner-class instance's chain to `[]` — the instance's type then resolved
+        // to the file ROOT (the typeDefinition/hover/completion root-lie). This pins the fix at the
+        // deterministic analyzer layer, where the server's index-intern timing race cannot mask it.
+        // A KNOWN-file analysis of the same source must derive the identical chain — the contrast
+        // proves the orphan path now matches, not that the chain is empty in both.
+        let src = "class_name Root\nclass Inner:\n\tvar field := 0\n";
+        let tree = gd_syntax::parse(src).tree;
+        let native = mini_native();
+        let xfile = NoCrossFile;
+        let pol = policy();
+
+        // The `class Inner:` declaration node — the `class_node` an inner-class `DtKind::Class`
+        // value carries, and the input to the chain derivation that `finish()` runs.
+        let inner_class_id = tree
+            .iter_ids()
+            .find(|&id| {
+                match &tree.get(id).kind {
+                NodeKind::Class(c) => c.identifier.is_some_and(|nid| {
+                    matches!(&tree.get(nid).kind, NodeKind::Identifier(i) if i.name == "Inner")
+                }),
+                _ => false,
+            }
+            })
+            .expect("the `class Inner:` declaration node exists");
+
+        // Orphan analysis: `file = None`. The chain is a pure DFS over `class_node`, so it must
+        // derive `["Inner"]` regardless of whether the file has an interned `FileId`. Before the
+        // `FileId::ORPHAN` fallback, `let file = ctx.file?` returned `None` here, and `finish()`'s
+        // `unwrap_or_default()` collapsed the chain to `[]`.
+        let orphan_ctx =
+            crate::context::AnalysisContext::new(&tree, &native, &xfile, None, "inner.gd", &pol);
+        let orphan_ref = in_file_script_ref_of_class(&orphan_ctx, inner_class_id)
+            .expect("orphan analysis must still derive the inner class's ScriptRef");
+        assert_eq!(
+            orphan_ref.inner,
+            vec!["Inner".to_string()],
+            "orphan analysis must keep the inner-class chain `[\"Inner\"]`, not collapse to root `[]`"
+        );
+        assert_eq!(
+            orphan_ref.file,
+            FileId::ORPHAN,
+            "the orphan ref is stamped with the same ORPHAN id `finish()` uses, so file and chain agree"
+        );
+
+        // A KNOWN-file analysis of the same node derives the identical chain — the contrast proves
+        // the orphan path now matches, not that the chain is empty in both.
+        let known_ctx = crate::context::AnalysisContext::new(
+            &tree,
+            &native,
+            &xfile,
+            Some(FileId::new(1)),
+            "inner.gd",
+            &pol,
+        );
+        let known_ref = in_file_script_ref_of_class(&known_ctx, inner_class_id)
+            .expect("known-file analysis derives the inner class's ScriptRef");
+        assert_eq!(
+            orphan_ref.inner, known_ref.inner,
+            "the orphan chain must match the known-file chain — the fix makes the file-id-less path \
+             agree with the interned path"
         );
     }
 
