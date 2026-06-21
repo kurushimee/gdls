@@ -4911,3 +4911,136 @@ fn rename_181_no_collision_member_attr_still_renames() {
         "the normal member rename must still edit the decl + both self.member attributes: {sites:?}"
     );
 }
+
+// =================================================================================================
+// #153: references/rename are inner-class-member blind — they collapse an inner-class instance
+// member onto the same-named ROOT member's occurrence set. Two halves:
+//   (1) corruption-class: references/rename on `x.innerMember` return/edit the ROOT member's sites.
+//   (2) resolution gap: a member inherited via an inner class's own `extends` base resolves ROOT.
+// =================================================================================================
+
+/// Boot a single-file project (interned in the index so the inner-class `ScriptRef.inner` chain is
+/// populated — NOT an orphan analysis) and return the client + the file's uri. Mirrors
+/// `boot_native_member` but writes a real project file under `projectRoot`, the deterministic layer
+/// the #151 orphan-race lesson demands for inner-chain-dependent assertions.
+fn boot_project_file(
+    src: &str,
+) -> (
+    Connection,
+    std::thread::JoinHandle<anyhow::Result<()>>,
+    Uri,
+    TempProject,
+) {
+    let project = common::sample_project();
+    project.write("src/main153.gd", src);
+    let (client, server) = boot();
+    init_open(&project, &client, caps_full(), &["src/main153.gd"], 2);
+    let uri = file_uri(&project.root.join("src/main153.gd"));
+    (client, server, uri, project)
+}
+
+#[test]
+fn references_inner_class_member_excludes_root_member_153() {
+    // #153 half 1 (corruption-class): a ROOT `var field` and an inner-class `var field` are DISTINCT
+    // symbols. `references` clicked on the INNER declaration must return ONLY the inner sites
+    // (its decl + the `x.field` use), NEVER the unrelated ROOT `field` declaration. On main the
+    // binding-backed scan keys on (declaring FILE, name) alone — both members live in the same file,
+    // so the inner click collapses onto the ROOT member's site too (the latent corruption: a rename
+    // via `x.field` would rewrite the unrelated ROOT `field`).
+    //   line 0 `extends Node`
+    //   line 1 `var field := 1`        ROOT member, `field` at col 4
+    //   line 2 `class Inner:`
+    //   line 3 `\tvar field := 2`      INNER member, `field` at col 5
+    //   line 4 `func use_it() -> void:`
+    //   line 5 `\tvar x := Inner.new()`
+    //   line 6 `\tx.field = 3`         INNER use, `field` at col 3
+    let src = "extends Node\nvar field := 1\nclass Inner:\n\tvar field := 2\nfunc use_it() -> void:\n\tvar x := Inner.new()\n\tx.field = 3\n";
+    let (client, server, uri, _project) = boot_project_file(src);
+
+    // Click the INNER declaration `field` (line 3, col 5).
+    let ref_set = references_set(&client, 700, &uri, 3, 5);
+    let lines: Vec<u32> = ref_set.iter().map(|(_, r)| r.start.line).collect();
+
+    // The ROOT `field` declaration is on line 1 — it must NOT appear in the inner member's set.
+    assert!(
+        !lines.contains(&1),
+        "references on the INNER `field` must NOT include the ROOT `field` declaration (line 1); \
+         got {ref_set:?}"
+    );
+    // The inner decl (line 3) and the inner use (line 6) must both be present.
+    assert!(
+        lines.contains(&3) && lines.contains(&6),
+        "references on the INNER `field` must include its decl (line 3) and `x.field` use (line 6); \
+         got {ref_set:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn references_root_member_excludes_inner_class_member_153() {
+    // #153 half 1 mirror: clicking the ROOT `field` must NOT collect the inner-class `field` sites.
+    // Same fixture as above; click the ROOT decl (line 1, col 4).
+    let src = "extends Node\nvar field := 1\nclass Inner:\n\tvar field := 2\nfunc use_it() -> void:\n\tvar x := Inner.new()\n\tx.field = 3\n";
+    let (client, server, uri, _project) = boot_project_file(src);
+
+    let ref_set = references_set(&client, 701, &uri, 1, 4);
+    let lines: Vec<u32> = ref_set.iter().map(|(_, r)| r.start.line).collect();
+
+    // The INNER `field` declaration (line 3) and the inner `x.field` use (line 6) must NOT appear.
+    assert!(
+        !lines.contains(&3) && !lines.contains(&6),
+        "references on the ROOT `field` must NOT include the INNER `field` decl (line 3) or its \
+         `x.field` use (line 6); got {ref_set:?}"
+    );
+    // The ROOT decl (line 1) must be present.
+    assert!(
+        lines.contains(&1),
+        "references on the ROOT `field` must include its own declaration (line 1); got {ref_set:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn definition_inner_class_inherited_member_resolves_inner_base_153() {
+    // #153 half 2 (resolution gap): `iface_at_inner` checks only an inner class's DIRECT members, so
+    // a member INHERITED via the inner class's own `extends` base falls through to the ROOT. With
+    // inner `A.field`, inner `B extends A`, root `field`, and `var x := B.new(); x.field`, the
+    // `x.field` definition must jump to the INNER `A.field` (line 1), not the ROOT `field` (line 5).
+    //   line 0 `class A:`
+    //   line 1 `\tvar field := 1`       inner A.field, `field` at col 5
+    //   line 2 `class B:`
+    //   line 3 `\textends A`
+    //   line 4 `extends Node`
+    //   line 5 `var field := 9`         ROOT field, `field` at col 4
+    //   line 6 `func use_it() -> void:`
+    //   line 7 `\tvar x := B.new()`
+    //   line 8 `\tx.field = 3`          use, `field` at col 3
+    let src = "class A:\n\tvar field := 1\nclass B:\n\textends A\nextends Node\nvar field := 9\nfunc use_it() -> void:\n\tvar x := B.new()\n\tx.field = 3\n";
+    let (client, server, uri, _project) = boot_project_file(src);
+
+    // Click the `x.field` use (line 8, col 3).
+    let def_params = lsp_types::GotoDefinitionParams {
+        text_document_position_params: position_params(&uri, 8, 3),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: lsp_types::PartialResultParams::default(),
+    };
+    client
+        .sender
+        .send(request(702, "textDocument/definition", def_params))
+        .unwrap();
+    let resp = recv_response(&client);
+    let def: Option<GotoDefinitionResponse> =
+        serde_json::from_value(resp.result.expect("definition result")).unwrap();
+    let loc = match def {
+        Some(GotoDefinitionResponse::Scalar(loc)) => loc,
+        other => panic!("definition on `x.field` (B inherits A.field) must resolve, got {other:?}"),
+    };
+    // The inherited `A.field` declaration is on line 1; the ROOT `field` is on line 5 (the bug).
+    assert_eq!(
+        loc.range.start.line, 1,
+        "definition on `x.field` where `B extends A` must jump to the inherited inner `A.field` \
+         (line 1), not the ROOT `field` (line 5); got line {}",
+        loc.range.start.line
+    );
+    shutdown(&client, server);
+}
