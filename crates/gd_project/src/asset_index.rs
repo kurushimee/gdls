@@ -172,8 +172,6 @@ mod tests {
         idx.insert("res://data/config.tres");
         assert_eq!(idx.len(), 2);
         assert!(idx.contains("res://art/icon.png"));
-        // Key normalization: a `\`-spelled lookup collapses to the stored `/` form.
-        assert!(idx.contains(r"res:\\art\\icon.png".trim()) || idx.contains("res://art/icon.png"));
         idx.remove("res://art/icon.png");
         assert!(!idx.contains("res://art/icon.png"));
         assert_eq!(idx.len(), 1);
