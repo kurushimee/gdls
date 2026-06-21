@@ -1429,7 +1429,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
 
     // 3. Class-member + base-chain lookup (analyzer.cpp:4450-4455 → reduce_identifier_from_base).
     if let Some(class_id) = ctx.current_class {
-        if let Some((dt, fold)) = lookup_class_member(ctx, class_id, &name, id) {
+        if let Some((dt, fold, decl_class)) = lookup_class_member(ctx, class_id, &name, id) {
             // Record on resolution success only — unresolved/forward-reference cases would
             // pollute the bindings. The recorded `target_kind` is reserved for a future kind-aware
             // `references` filter (`Binding::matches_use` / `find_use_bindings`); the v1 handler
@@ -1439,8 +1439,13 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             let site = ctx.node(id).span;
             // WP-RD2: `ctx.file` is already `Option`; an orphan records `None` ("don't know")
             // instead of a colliding placeholder id. WP-RD14: via the `Binding::use_` ctor.
+            // #153: key the use on the DECLARING class's inner chain (the scope walk may land the
+            // member on an inheritance-chain base or outer class, not the current class), so a
+            // same-named member of a different class in this file stays distinct.
+            let class_path = class_inner_path(ctx, decl_class);
             ctx.record_binding(Binding::use_(
                 ctx.file,
+                class_path,
                 BindingSymbolKind::Member,
                 name.clone(),
                 site,
@@ -1547,8 +1552,10 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         // Cross-file class reference: drives `textDocument/references` and
         // `textDocument/implementation` (the latter then filters by extends chain).
         let site = ctx.node(id).span;
+        // #153: a `class_name` reference is a file/class-level target, not an inner-class member.
         ctx.record_binding(Binding::use_(
             Some(fid),
+            Vec::new(),
             BindingSymbolKind::Class,
             name.clone(),
             site,
@@ -1641,8 +1648,10 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         // Record a Use binding so `textDocument/references` and `textDocument/definition` on
         // the autoload name work. Class kind mirrors the `class_name` branch at step 5, since
         // an autoload is conceptually a class instance.
+        // #153: an autoload singleton name is a file/class-level target, not an inner-class member.
         ctx.record_binding(Binding::use_(
             Some(fid),
+            Vec::new(),
             BindingSymbolKind::Class,
             name.clone(),
             site,
@@ -1669,8 +1678,10 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     //    references/definition on the name still work.
     if let Some(native) = ctx.xfile.autoload_native_type(&name) {
         let site = ctx.node(id).span;
+        // #153: a scriptless scene autoload is a file/class-level target, not an inner-class member.
         ctx.record_binding(Binding::use_(
             None,
+            Vec::new(),
             BindingSymbolKind::Class,
             name.clone(),
             site,
@@ -1992,12 +2003,16 @@ fn function_param_named(ctx: &AnalysisContext, fn_id: NodeId, name: &str) -> Opt
 /// the reference line, not the declaration line. Godot's parser pre-tags `IdentifierNode` with
 /// the declaration back-pointer; gdls re-derives the dependency edge here, which both feeds the
 /// cycle detection and lazily forces the dependent member's resolution.
+/// On a hit the third tuple element is the NODE of the class that actually DECLARES `name` (the
+/// scope-walk lands it — the class itself, an inheritance-chain base, or an outer class), so a
+/// caller recording a `Binding::Use` can key the use on the DECLARING inner-class chain, not the
+/// accessed class (`B.field` where `B extends A` declares `field` resolves to `A`). #153.
 fn lookup_class_member(
     ctx: &mut AnalysisContext,
     class_id: NodeId,
     name: &str,
     identifier_id: NodeId,
-) -> Option<(DataType, Option<FoldedValue>)> {
+) -> Option<(DataType, Option<FoldedValue>, NodeId)> {
     // analyzer.cpp:4450-4455 — Godot's `reduce_identifier` walks the *full* scope
     // (`get_class_node_current_scope_classes`): the class, its inheritance chain, and its outer
     // chain. gdls previously only walked the inheritance chain (`ctx.bases`), so an identifier
@@ -2023,7 +2038,7 @@ fn lookup_class_member(
             _ => false,
         };
         if class_ident_match {
-            return Some((ctx.get_type(class).clone(), None));
+            return Some((ctx.get_type(class).clone(), None, class));
         }
         let member = match &ctx.node(class).kind {
             NodeKind::Class(c) => c
@@ -2052,6 +2067,8 @@ fn lookup_class_member(
             if target_node.is_some() {
                 crate::resolver::resolve_class_member_by_name(ctx, class, name, identifier_id);
             }
+            // The third element is the DECLARING class node (`class`) so the caller can record the
+            // use against the declaring inner-class chain, not the accessed one. #153.
             return match m {
                 gd_syntax::ast::Member::Variable(vid)
                 | gd_syntax::ast::Member::Signal(vid)
@@ -2075,7 +2092,8 @@ fn lookup_class_member(
                     .identifier
                     .map(|iid| (ctx.get_type(iid).clone(), ctx.folds.get(iid).cloned())),
                 gd_syntax::ast::Member::Group(_) => None,
-            };
+            }
+            .map(|(dt, fold)| (dt, fold, class));
         }
     }
     None
@@ -5452,7 +5470,17 @@ fn record_member_use(
     bind_site: NodeId,
 ) {
     let site = ctx.node(bind_site).span;
-    ctx.record_binding(Binding::use_(Some(link.file), kind, name.to_owned(), site));
+    // #153: carry the DECLARING link's inner-class chain so `references`/`rename` keep same-named
+    // members of different classes in one file distinct (the `CalleeTarget::Script.class_path`
+    // pattern on the member-use surface). For an inherited member the chain loop lands on the
+    // BASE link, so the recorded path points at the class that actually declares the member.
+    ctx.record_binding(Binding::use_(
+        Some(link.file),
+        link.inner.clone(),
+        kind,
+        name.to_owned(),
+        site,
+    ));
 }
 
 /// The basename of a chain link's file, for the `<file.gd>.<EnumName>` fqcn shape Godot's
@@ -5584,8 +5612,11 @@ fn reduce_identifier_from_base(
                 if let Some(decl_file) = decl_file {
                     let qualified = format!("{}.{}", base.enum_type, name);
                     let site = ctx.node(identifier_id).span;
+                    // #153: the QUALIFIED `<Enum>.<value>` name keys the enum-value collector
+                    // (never the bare name / the class path) — the inner chain is moot here.
                     ctx.record_binding(Binding::use_(
                         Some(decl_file),
+                        Vec::new(),
                         BindingSymbolKind::EnumValueLocal,
                         qualified,
                         site,
@@ -5714,7 +5745,7 @@ fn reduce_identifier_from_base(
     // already handles the RESOLVING-sentinel cycle trigger through `resolve_class_member_by_name`.
     if base.kind == DtKind::Class {
         if let Some(class_id) = base.class_node {
-            if let Some((member_dt, fold)) =
+            if let Some((member_dt, fold, decl_class)) =
                 lookup_class_member(ctx, class_id, &name, identifier_id)
             {
                 // Record the resolved in-file attribute read (`self.hp`, an access on a base
@@ -5724,8 +5755,15 @@ fn reduce_identifier_from_base(
                 // orphan records `None` ("don't know"), never a placeholder id. Additive
                 // (WP-N1b): no type or diagnostic changes.
                 let site = ctx.node(identifier_id).span;
+                // #153: in-file attribute read on a base typed as this file's own class
+                // (`self.hp`, `x.field` where `x := Inner.new()`). Key the use on the DECLARING
+                // class's inner chain — the class that actually declares the member, walked through
+                // the base's inheritance/outer scope (`B.field` where `B extends A` resolves to
+                // `A`) — so it stays distinct from a same-named member of another class in the file.
+                let class_path = class_inner_path(ctx, decl_class);
                 ctx.record_binding(Binding::use_(
                     ctx.file,
+                    class_path,
                     BindingSymbolKind::Member,
                     name.clone(),
                     site,

@@ -5044,3 +5044,38 @@ fn definition_inner_class_inherited_member_resolves_inner_base_153() {
     );
     shutdown(&client, server);
 }
+
+#[test]
+fn rename_inner_class_member_does_not_touch_root_member_153() {
+    // #153 half 1, MUTATING consumer (the corruption the issue is filed for): renaming an inner-class
+    // member via the `x.field` instance-access gesture must edit ONLY the inner symbol's sites (its
+    // decl + the `x.field` use), NEVER the unrelated ROOT `field` declaration. On main the edit set
+    // collapses onto the ROOT member's site → the rename rewrites the ROOT `field` and breaks it.
+    // Same fixture as the references half-1 test; click the inner `x.field` USE (line 6, col 3).
+    let src = "extends Node\nvar field := 1\nclass Inner:\n\tvar field := 2\nfunc use_it() -> void:\n\tvar x := Inner.new()\n\tx.field = 3\n";
+    let (client, server, uri, _project) = boot_project_file(src);
+
+    // rename_sites canonicalizes the use-click to the inner declaration and collects the edit set.
+    let sites = rename_sites(&client, 703, &uri, 6, 3, "speed");
+    // The ROOT `field` declaration (line 1) must NEVER be edited (the corruption guard).
+    assert!(
+        !sites.iter().any(|(l, _)| *l == 1),
+        "renaming the inner-class `field` must NOT edit the ROOT `field` declaration (line 1); \
+         got {sites:?}"
+    );
+    // It MUST edit the inner decl (line 3) and the `x.field` use (line 6).
+    assert!(
+        sites.contains(&(3, 5)) && sites.contains(&(6, 3)),
+        "renaming the inner-class `field` must edit its decl (3,5) + the `x.field` use (6,3); \
+         got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+// NOTE on cross-file inner-class instance members (`Lib.Box.new(); b.field` where `Lib` is a
+// path-preloaded const): gdls's analyzer does NOT currently resolve an inner class accessed through a
+// preloaded-const identifier — `Lib.Box.new()` ends `Unresolved`, so `b` types as Variant and no
+// `b.field` binding is recorded. That is a SEPARATE pre-existing analyzer gap (filed #212), distinct
+// from #153's single-file inner-member corruption (which the tests above cover). Once #213 resolves
+// the chain, the same `target_class_path` filter this PR adds makes the cross-file case correct by
+// construction — no further server change needed.
