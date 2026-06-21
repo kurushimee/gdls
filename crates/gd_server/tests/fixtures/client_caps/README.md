@@ -29,8 +29,10 @@ user's only check is a single end-of-Phase-2 trial in real work.
 | `zed.json` | Zed 1.6.3-stable (Windows) | ✅ captured 2026-06-13 (settings-swapped `lsp.<server>.binary` → `wsl.exe` shim; settings restored byte-identical) |
 | `claude-code.json` | — | 🔶 armed: gitignored `.claude/.lsp.json` in this repo routes `.gd` → the capture shim (`~/.local/share/gdls-capture/`); the **next CC session** completes it by touching any `.gd` via the LSP tool, then vendors the JSON, revisits the markdown-by-default decision on `crate::docs::ProseFormat`, and removes the armed config. (Config loads at session start only; not hot-reloadable.) |
 | `vscode.json` | vscode-languageclient 9.0.1 (VS Code + godot-tools 2.6.1) | ✅ hand-authored 2026-06-22 from `vscode-languageclient` v9 source (`release/9.0.x`): `computeClientCapabilities` in `client.ts` + all `fillClientCapabilities` across the feature modules; framed as "VS Code + godot-tools 2.6.1" (the Godot VS Code extension uses vscode-languageclient as its LSP transport) |
-| `eglot.json` | — | ⬜ blocked: no emacs binary and no sudo to install one; revisit if emacs appears |
-| `sublime.json` | — | ⬜ blocked: Sublime Text is not installed on this machine |
+| `eglot.json` | Eglot (GNU Emacs master) | ✅ synthesized 2026-06-22 from `lisp/progmodes/eglot.el` `cl-defgeneric eglot-client-capabilities` (the `:method` default form); runtime-determined fields fixed to the common configured case (yasnippet present → `snippetSupport: true`; markdown-mode → `["markdown","plaintext"]`; `eglot-report-progress` default → `workDoneProgress: true`; local connection → `didChangeWatchedFiles.dynamicRegistration: true`) |
+| `sublime.json` | Sublime Text LSP (sublimelsp/LSP main) | ✅ synthesized 2026-06-22 from `plugin/core/sessions.py` `get_initialize_params`; `didChangeWatchedFiles` included (present when a file-watcher implementation is available) |
 
-Blocked rows are capability gaps of THIS machine, not user tasks — re-attempt whenever the
-tooling appears. The walk meanwhile runs over every vendored profile. Tracked: #98.
+These three were synthesized from each client's authoritative capability source (not machine-captured)
+because the editor binaries are absent on this machine; a `ClientCapabilities` profile is a pure
+fixture, so its fidelity comes from the source, not the local install. The walk runs over every
+vendored profile. Tracked: #98.
