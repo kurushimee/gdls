@@ -549,3 +549,53 @@ fn type_definition_on_variant_or_unresolved_returns_null() {
 
     shutdown(&client, handle);
 }
+
+#[test]
+fn type_definition_inner_class_instance_jumps_to_inner_class() {
+    // #146 family: an inner-class INSTANCE (`var x := Inner.new()`) is typed `Script` with a non-empty
+    // `inner` chain (the same producer #146 fixed for hover/definition). typeDefinition on that
+    // instance must land on the INNER class's identifier (`class Inner:`), not the file ROOT class —
+    // the root-lie that persisted in this read-only consumer. Same-file inferred, so the analyzer
+    // pins the type (cross-file inferred is the separate, unpinned gap above).
+    let src = concat!(
+        "class_name Root\n",        // line 0 — root identifier `Root` at cols 11..15
+        "\n",                       // line 1
+        "class Inner:\n",           // line 2 — inner identifier `Inner` at cols 6..11
+        "\tvar field := 0\n",       // line 3
+        "\n",                       // line 4
+        "func use_it() -> void:\n", // line 5
+        "\tvar x := Inner.new()\n", // line 6 — inferred inner instance `x` (cols 5..6)
+        "\tprint(x)\n",             // line 7 — use of `x` (cols 7..8)
+    );
+    let project = NativeProject::new(&[("inner.gd", src)]);
+    let (client, handle, _) = boot(&project);
+    let uri = project.uri("inner.gd");
+    did_open(&client, &uri, src);
+
+    // typeDefinition on the instance `x` (declaration site, line 6 col 5) → the INNER class header.
+    let loc = scalar(
+        type_definition_at(&client, &uri, Position::new(6, 5))
+            .expect("typeDefinition resolves the inner-class instance type of `x`"),
+    );
+    assert_eq!(loc.uri, uri, "stays in the same file");
+    assert_eq!(
+        loc.range.start,
+        Position::new(2, 6),
+        "typeDefinition must land on the INNER class identifier `Inner` (line 2, col 6), \
+         not the file root class `Root` (line 0); got {:?}",
+        loc.range.start
+    );
+    assert_eq!(loc.range.end, Position::new(2, 11), "`Inner` is 5 chars");
+
+    // And on a USE of `x` (line 7, col 7) — same inner-class type target.
+    let loc_use = scalar(
+        type_definition_at(&client, &uri, Position::new(7, 7))
+            .expect("typeDefinition resolves the inner-class type on a use site too"),
+    );
+    assert_eq!(
+        loc_use, loc,
+        "use-site inner-class type target == declaration-site target"
+    );
+
+    shutdown(&client, handle);
+}
