@@ -2775,3 +2775,40 @@ fn underscore_prefix_refused_when_name_in_nested_lambda() {
     );
     shutdown(&client, t);
 }
+
+/// SOUNDNESS (#119, reverse direction): the renamed binding is an unused PARAM of a NESTED LAMBDA, and
+/// `_name` is a local of the ENCLOSING function. The lambda's enclosing-function span (the lambda) is
+/// CONTAINED IN the enclosing function's span, so the two are NOT disjoint — the fix must NOT be offered.
+/// Locks in the smallest-`Function` selection from the lambda-inward side (the mirror of
+/// `underscore_prefix_refused_when_name_in_nested_lambda`).
+#[test]
+fn underscore_prefix_refused_when_name_in_enclosing_function() {
+    // `_count` is a local of the enclosing `f`; the unused PARAM `count` belongs to a lambda nested in `f`.
+    const SRC: &str =
+        "extends Node\n\nfunc f() -> void:\n\tvar _count = 1\n\tprint(_count)\n\tvar cb = func(count: int) -> void:\n\t\tprint(0)\n\tcb.call(1)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    // The unused PARAM `count` of the lambda is on line 5 (`func(count: int)`).
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| d.code == Some(NumberOrString::String("UNUSED_PARAMETER".to_string())))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the unused lambda PARAM `count` must warn; got {:?}",
+                diags.diagnostics
+            )
+        });
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Prefix unused name").is_none(),
+        "a `_`-prefix whose `_count` lives in the ENCLOSING function must be REFUSED (the lambda span \
+         is nested in the enclosing span, not disjoint); got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
