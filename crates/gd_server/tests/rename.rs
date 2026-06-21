@@ -5074,7 +5074,7 @@ fn rename_inner_class_member_does_not_touch_root_member_153() {
 
 #[test]
 fn rename_inner_class_method_collision_refuses_not_corrupts_153() {
-    // #153 method surface (fusion-found, the corruption the var-member tests above do NOT cover):
+    // #153 method surface (the corruption the var-member tests above do NOT cover):
     // the method/call rename collection keys on (declaring FILE, name) ONLY — `CalleeTarget` drops
     // the inner-class `class_path` — so a same-file ROOT `func hit` and inner `func hit` cannot be
     // discriminated. Renaming via the inner `x.hit()` CALL gesture canonicalizes onto the ROOT decl
