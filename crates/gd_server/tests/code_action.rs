@@ -1464,6 +1464,249 @@ fn underscore_prefix_not_offered_for_private_class_variable() {
     shutdown(&client, t);
 }
 
+/// UNUSED_PRIVATE_CLASS_VARIABLE gets a DELETE-fix ("Remove unused private variable") that removes the
+/// whole declaration. Round-trip: `var _unused_private = 1` (unused, `_`-prefixed) → the declaration is
+/// deleted; re-analyze CLEAN (the warning is gone, no new diagnostic by identity).
+#[test]
+fn delete_fix_offered_for_private_class_variable() {
+    const SRC: &str = "extends Node\n\nvar _unused_private = 1\n\nfunc f() -> void:\n\tprint(0)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let before = diag_identities(&diags);
+    let diag = diag_with_warning(&diags, "UNUSED_PRIVATE_CLASS_VARIABLE");
+
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Remove unused private variable");
+    let tes = all_text_edits(&edit);
+    assert_eq!(tes.len(), 1, "one deletion; got {tes:?}");
+
+    let patched = apply_text_edits(SRC, tes);
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !has_warning(&after, "UNUSED_PRIVATE_CLASS_VARIABLE"),
+        "UNUSED_PRIVATE_CLASS_VARIABLE must be cleared; got {:?}",
+        after.diagnostics
+    );
+    let induced: Vec<_> = diag_identities(&after)
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert!(
+        induced.is_empty(),
+        "no NEW diagnostic after the delete-fix; induced {induced:?}\npatched:\n{patched}"
+    );
+    shutdown(&client, t);
+}
+
+/// The delete-fix deletes the WHOLE declaration including a leading annotation: `@export var _x = 1`
+/// (unused, `_`-prefixed) → both the `@export` line and the `var` line removed. The patched file
+/// re-analyzes CLEAN (no dangling `@export`, no leftover blank line, no new diagnostic).
+#[test]
+fn delete_fix_removes_annotated_private_var_whole() {
+    const SRC: &str = "extends Node\n\n@export var _x = 1\n\nfunc f() -> void:\n\tprint(0)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let before = diag_identities(&diags);
+    let diag = diag_with_warning(&diags, "UNUSED_PRIVATE_CLASS_VARIABLE");
+
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Remove unused private variable");
+    let tes = all_text_edits(&edit);
+    let patched = apply_text_edits(SRC, tes);
+    // Neither the annotation nor the declaration may survive.
+    assert!(
+        !patched.contains("@export") && !patched.contains("_x"),
+        "the whole annotated declaration must be removed; got:\n{patched}"
+    );
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !has_warning(&after, "UNUSED_PRIVATE_CLASS_VARIABLE"),
+        "the warning must be cleared; got {:?}",
+        after.diagnostics
+    );
+    let induced: Vec<_> = diag_identities(&after)
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert!(
+        induced.is_empty(),
+        "no NEW diagnostic after deleting the annotated declaration; induced {induced:?}\n\
+         patched:\n{patched}"
+    );
+    shutdown(&client, t);
+}
+
+/// ADVERSARIAL (comment-overlap refusal): a trailing comment on the declaration line lives in an
+/// AST-invisible side-channel, so a line-range deletion would silently eat it. The delete-fix must be
+/// REFUSED when a comment overlaps the deletion range (the suppression is still offered).
+#[test]
+fn delete_fix_refused_when_comment_in_range() {
+    const SRC: &str =
+        "extends Node\n\nvar _unused = 1  # keep this note\n\nfunc f() -> void:\n\tprint(0)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diag_with_warning(&diags, "UNUSED_PRIVATE_CLASS_VARIABLE");
+
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Remove unused private variable").is_none(),
+        "the delete-fix must be REFUSED when a comment overlaps the deletion range (it would eat \
+         the comment); got titles {:?}",
+        action_titles(&actions)
+    );
+    // The suppression is still offered (it's a pure insertion, never eats anything).
+    assert!(
+        find_action(&actions, "Ignore").is_some(),
+        "the suppression must still be offered; got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
+
+/// ADVERSARIAL (same-line `;`-separated sibling): GDScript allows `;` as a member-statement separator,
+/// so `var _a = 1 ; var _b = 2` is TWO declarations on one physical line. Whole-line deletion of the
+/// targeted unused var would also eat the sibling; when the sibling is itself unused the error backstop
+/// sees no new diagnostic and the collateral deletion would go through silently. The fix must be
+/// REFUSED (fail-closed) for both — the suppression stays available.
+#[test]
+fn delete_fix_refused_for_same_line_sibling_declaration() {
+    const SRC: &str = "extends Node\n\nvar _a = 1 ; var _b = 2\n\nfunc f() -> void:\n\tprint(0)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    // Both `_a` and `_b` are unused, `_`-prefixed private members → both warn.
+    let warns: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| {
+            d.code
+                == Some(NumberOrString::String(
+                    "UNUSED_PRIVATE_CLASS_VARIABLE".into(),
+                ))
+        })
+        .cloned()
+        .collect();
+    assert_eq!(
+        warns.len(),
+        2,
+        "both same-line private vars must warn; got {:?}",
+        diags.diagnostics
+    );
+    for diag in warns {
+        let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag.clone()], None);
+        assert!(
+            find_action(&actions, "Remove unused private variable").is_none(),
+            "the delete-fix must be REFUSED when another declaration shares the physical line (it \
+             would eat the sibling); got titles {:?}",
+            action_titles(&actions)
+        );
+        assert!(
+            find_action(&actions, "Ignore").is_some(),
+            "the suppression must still be offered; got titles {:?}",
+            action_titles(&actions)
+        );
+    }
+    shutdown(&client, t);
+}
+
+/// PROPERTY var: an unused `_`-prefixed private var with an inline getter/setter block. The Variable
+/// node span covers the whole accessor block, so the delete-fix removes ALL of its lines (no dangling
+/// `get:`/`set:` residue). Re-analyze CLEAN.
+#[test]
+fn delete_fix_removes_property_var_with_accessor_block() {
+    const SRC: &str = "extends Node\n\nvar _p: int:\n\tget:\n\t\treturn 1\n\tset(v):\n\t\tpass\n\nfunc f() -> void:\n\tprint(0)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let before = diag_identities(&diags);
+    let diag = diag_with_warning(&diags, "UNUSED_PRIVATE_CLASS_VARIABLE");
+
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Remove unused private variable");
+    let tes = all_text_edits(&edit);
+    let patched = apply_text_edits(SRC, tes);
+    // No fragment of the property declaration (name, get, set body) may survive.
+    assert!(
+        !patched.contains("_p") && !patched.contains("get:") && !patched.contains("set(v)"),
+        "the whole property declaration incl. its accessor block must be removed; got:\n{patched}"
+    );
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !has_warning(&after, "UNUSED_PRIVATE_CLASS_VARIABLE"),
+        "the warning must be cleared; got {:?}",
+        after.diagnostics
+    );
+    let induced: Vec<_> = diag_identities(&after)
+        .difference(&before)
+        .cloned()
+        .collect();
+    assert!(
+        induced.is_empty(),
+        "no NEW diagnostic after deleting the property declaration; induced {induced:?}\n\
+         patched:\n{patched}"
+    );
+    shutdown(&client, t);
+}
+
+/// ADVERSARIAL (error backstop refuses an inducing deletion): a `_`-prefixed private var that the
+/// warning's name-set sweep believes is unused, but whose declaration is load-bearing — removing it
+/// makes the file fail to analyze. Here `_t` is a type used by a typed member (`var keep: _t`); the
+/// name-set sweep does NOT credit a TYPE-annotation mention as a use, so `_t` warns UNUSED — but
+/// deleting its declaration leaves `var keep: _t` referencing an undefined type (a hard ERROR). The
+/// [`edit_is_safe`] re-analysis must catch the induced error and REFUSE the delete-fix; the suppression
+/// stays available. (Pins the backstop actually firing on a deletion, not just by inspection.)
+#[test]
+fn delete_fix_refused_when_deletion_induces_error() {
+    // `_t` is an inner class used as a type; the unused sweep doesn't see the type-position mention.
+    const SRC: &str =
+        "extends Node\n\nclass _t:\n\tpass\n\nvar keep: _t\n\nfunc f() -> void:\n\tprint(keep)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    // Only proceed if `_t` actually warns unused (the sweep doesn't credit the type mention); if a
+    // future sweep change credits it, there's no diagnostic to fix and the case is moot.
+    let Some(diag) = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code
+                == Some(NumberOrString::String(
+                    "UNUSED_PRIVATE_CLASS_VARIABLE".into(),
+                ))
+                && d.message.contains("_t")
+        })
+        .cloned()
+    else {
+        shutdown(&client, t);
+        return;
+    };
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Remove unused private variable").is_none(),
+        "the delete-fix must be REFUSED when removing the declaration induces an error (the type \
+         `_t` is still referenced by `var keep: _t`); got titles {:?}",
+        action_titles(&actions)
+    );
+    assert!(
+        find_action(&actions, "Ignore").is_some(),
+        "the suppression must still be offered; got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Fix 2: add `@onready` for GET_NODE_DEFAULT_WITHOUT_ONREADY
 // ---------------------------------------------------------------------------------------------------

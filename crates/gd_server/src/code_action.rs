@@ -214,13 +214,50 @@ impl DropAnnotationData {
     }
 }
 
+/// Recipe for the delete-declaration fix (UNUSED_PRIVATE_CLASS_VARIABLE): delete the whole unused
+/// private `var` declaration. Carries the URI + the BYTE range to delete — resolved at offer time as
+/// the full lines the declaration occupies (any leading annotations through the trailing newline), so
+/// the removal leaves no blank-indent residue. The byte range is converted to an LSP [`Range`] at
+/// edit-build time. An internal builder input only (the edit is built + gated + carried eagerly at
+/// offer time, never round-tripped). Reuses [`DropAnnotationData`]'s byte-range deletion shape
+/// ([`build_drop_annotation_edit`]).
+#[derive(Debug, Clone)]
+struct DeletePrivateVarData {
+    uri: String,
+    /// Inclusive start byte of the deletion (column 0 of the declaration's first line).
+    delete_start: usize,
+    /// Exclusive end byte of the deletion (the start of the line after the declaration).
+    delete_end: usize,
+}
+
+impl DeletePrivateVarData {
+    fn new(uri: &Uri, span: ByteSpan) -> Self {
+        DeletePrivateVarData {
+            uri: uri.as_str().to_string(),
+            delete_start: span.start,
+            delete_end: span.end,
+        }
+    }
+
+    /// The byte range as a [`DropAnnotationData`] so the generic byte-range deletion builder
+    /// ([`build_drop_annotation_edit`]) applies — both are plain byte-range deletions.
+    fn as_drop(&self) -> DropAnnotationData {
+        DropAnnotationData {
+            uri: self.uri.clone(),
+            delete_start: self.delete_start,
+            delete_end: self.delete_end,
+        }
+    }
+}
+
 /// Append every MUTATING warning quickfix applicable to `diag` to `out`. Dispatches on the warning
 /// `code`; each builder is FAIL-CLOSED (offers nothing when the fix can't be applied safely — the
 /// rename lesson). The fixes:
 ///   * UNUSED_VARIABLE / UNUSED_PARAMETER → `_`-prefix rename ([`push_underscore_prefix_action`]).
-///     UNUSED_PRIVATE_CLASS_VARIABLE is deliberately NOT handled: that warning fires *because* the
-///     var is already `_`-prefixed and unused, so a second `_` (`__x`) still warns — the fix
-///     wouldn't clear its own diagnostic (see issue tracker).
+///   * UNUSED_PRIVATE_CLASS_VARIABLE → delete the declaration ([`push_delete_private_var_action`]).
+///     A `_`-prefix rename is NOT offered for this one: the warning fires *because* the var is
+///     already `_`-prefixed and unused, so a second `_` (`__x`) still warns. The useful intent is to
+///     remove the dead declaration, which clears the warning.
 ///   * GET_NODE_DEFAULT_WITHOUT_ONREADY → `@onready` insertion ([`push_add_onready_action`]).
 ///   * ONREADY_WITH_EXPORT → the two drop-annotation directions ([`push_drop_annotation_actions`]).
 fn push_mutating_actions(
@@ -242,6 +279,9 @@ fn push_mutating_actions(
     match code.as_str() {
         "UNUSED_VARIABLE" | "UNUSED_PARAMETER" => {
             push_underscore_prefix_action(state, uri, diag, out);
+        }
+        "UNUSED_PRIVATE_CLASS_VARIABLE" => {
+            push_delete_private_var_action(state, uri, diag, out);
         }
         "GET_NODE_DEFAULT_WITHOUT_ONREADY" => {
             push_add_onready_action(state, uri, diag, out);
@@ -1066,6 +1106,137 @@ fn build_drop_annotation_edit(
         new_text: String::new(),
     };
     Some(workspace_edit_for(state, uri, text_edit))
+}
+
+// =================================================================================================
+// Fix 4: delete the declaration for UNUSED_PRIVATE_CLASS_VARIABLE (a whole-statement deletion).
+// =================================================================================================
+
+/// Offer the delete-declaration fix for an unused `_`-prefixed private class variable, appending it to
+/// `out` when (and only when) it can be applied SAFELY.
+///
+/// This is a MUTATING DELETION — a new corruption surface distinct from the rename/insert/drop fixes:
+/// a private var can still be referenced in a way the warning's name-set sweep doesn't credit as a use
+/// (the analyzer warns *only* when no identifier mention and no string-literal payload matches the
+/// name), or the deletion could leave a dangling annotation / a property accessor block referencing a
+/// sibling. Two gates guard it:
+///   * the comment-overlap refusal in [`delete_private_var_span`] (a comment inside the deleted lines
+///     is AST-invisible — refuse rather than silently eat user text), and
+///   * the ERROR BACKSTOP ([`edit_is_safe`]): apply the deletion to an in-memory copy and re-analyze;
+///     withhold the fix if the deletion introduces ANY new error (e.g. removing a var that another
+///     member's initializer / accessor still references), so a deletion that breaks the file is never
+///     offered. The warning fires only for a same-file private member, so the edit is single-file.
+///
+/// The refuse decision runs HERE, at offer time, and the gated edit is carried EAGERLY in the action
+/// (not deferred to resolve) — so what the backstop proved safe is exactly what the client applies.
+fn push_delete_private_var_action(
+    state: &mut ServerState,
+    uri: &Uri,
+    diag: &Diagnostic,
+    out: &mut CodeActionResponse,
+) {
+    let Some(span) = delete_private_var_span(state, uri, diag) else {
+        return;
+    };
+    let data = DeletePrivateVarData::new(uri, span);
+    let Some(edit) = build_drop_annotation_edit(state, &data.as_drop()) else {
+        return;
+    };
+    // ERROR BACKSTOP: refuse if removing the declaration would introduce a new error (a member the
+    // name-set sweep missed crediting — e.g. a use the analyzer doesn't track, or a property accessor
+    // referencing it). Catches the open-ended induction the structural gate can't enumerate.
+    if !edit_is_safe(state, uri, &edit) {
+        return;
+    }
+    out.push(CodeActionOrCommand::CodeAction(CodeAction {
+        title: "Remove unused private variable".to_string(),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diag.clone()]),
+        edit: Some(edit),
+        ..Default::default()
+    }));
+}
+
+/// Resolve the BYTE range to delete to remove the unused private `var` declaration covering `diag`'s
+/// anchor: column 0 of the declaration's first line (the first leading annotation, or the `var`
+/// keyword if none) through the start of the line AFTER the declaration's last line. Deleting whole
+/// lines (rather than the bare node span) absorbs the leading indentation and the trailing newline so
+/// no blank-indent residue is left, and for a property var the Variable node span already covers the
+/// full getter/setter block so the accessor lines go with it.
+///
+/// `None` (fail-closed ⇒ no action) when the buffer is gone, no enclosing `Variable` covers the anchor,
+/// or a COMMENT span overlaps the deletion range — comments live in an AST-invisible side-channel
+/// ([`gd_syntax::ParseResult::comments`]), so the line-range delete would silently remove user text.
+fn delete_private_var_span(
+    state: &mut ServerState,
+    uri: &Uri,
+    diag: &Diagnostic,
+) -> Option<ByteSpan> {
+    let doc = state.vfs.get(uri.as_str())?;
+    let text = doc.text();
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+    let byte = mapper.position_to_byte(diag.range.start);
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
+    let tree = &parsed.tree;
+
+    let var_id = enclosing_variable(tree, byte)?;
+    // The declaration's leftmost byte: the first leading annotation's span start if any, else the
+    // `var` keyword (the Variable node span starts at `var`; annotations are separate sibling nodes).
+    let var_span = tree.get(var_id).span;
+    let decl_start = tree
+        .get(var_id)
+        .annotations
+        .iter()
+        .map(|&a| tree.get(a).span.start)
+        .min()
+        .unwrap_or(var_span.start)
+        .min(var_span.start);
+    let decl_end = var_span.end;
+
+    let bytes = text.as_bytes();
+    // Extend LEFT to column 0 of the first line (absorb the leading indentation), and RIGHT past the
+    // trailing newline (absorb the line terminator) so whole lines are removed with no residue.
+    let line_start = bytes[..decl_start]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let line_end = bytes[decl_end..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| decl_end + i + 1)
+        .unwrap_or(bytes.len());
+    let delete = ByteSpan {
+        start: line_start,
+        end: line_end,
+    };
+
+    // SAME-LINE-SIBLING FIREWALL (fail-closed): GDScript allows `;` as a member-statement separator, so
+    // `var _a = 1 ; var _b = 2` is TWO sibling declarations on one physical line. Whole-line deletion of
+    // the targeted one would also eat the sibling — and when that sibling is itself unused, the error
+    // backstop sees no new diagnostic and the collateral deletion goes through silently. So refuse
+    // unless the bytes the line-extension absorbs OUTSIDE the declaration are whitespace only: `[line_
+    // start, decl_start)` (the leading indentation) and `[decl_end, line_end)` minus the single trailing
+    // newline (any code after the statement terminator on the same line). Any non-whitespace there means
+    // another statement shares the line — refuse rather than corrupt.
+    let is_ws = |b: u8| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n';
+    let trailing_end = line_end.saturating_sub(1).max(decl_end); // drop the absorbed terminator newline
+    if bytes[line_start..decl_start].iter().any(|&b| !is_ws(b))
+        || bytes[decl_end..trailing_end].iter().any(|&b| !is_ws(b))
+    {
+        return None;
+    }
+
+    // Refuse if any comment overlaps the deletion range (the [start, end) half-open interval) — a
+    // comment is AST-invisible, so the delete would silently remove it. Refuse rather than corrupt.
+    let eats_comment = parsed
+        .comments
+        .values()
+        .any(|c| c.span.start < delete.end && c.span.end > delete.start);
+    if eats_comment {
+        return None;
+    }
+    Some(delete)
 }
 
 // =================================================================================================
