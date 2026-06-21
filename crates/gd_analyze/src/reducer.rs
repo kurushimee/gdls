@@ -1503,12 +1503,23 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // variables.
     if !ctx.reducing_callee {
         if let Some(sr) = current_class_script_base(ctx) {
-            if let Some((dt, fold)) = lookup_script_chain_member(ctx, &sr, &name, false, id) {
+            if let Some((dt, fold, kind)) = lookup_script_chain_member(ctx, &sr, &name, false, id) {
                 if let Some(fv) = fold {
                     ctx.folds.set(id, fv);
                 }
                 ctx.set_type(id, dt);
-                ctx.mark_lambda_use_self();
+                // Implicit-self access marks `use_self` only for INSTANCE members — variables,
+                // signals, instance functions (analyzer.cpp:4425/4428/4506). An inherited
+                // constant or enum (Godot's CONSTANT/ENUM arms at :4344-4359) has no mark site,
+                // so it must NOT mark even though it resolved through the implicit-self chain.
+                if matches!(
+                    kind,
+                    BindingSymbolKind::Variable
+                        | BindingSymbolKind::Signal
+                        | BindingSymbolKind::Function
+                ) {
+                    ctx.mark_lambda_use_self();
+                }
                 return;
             }
         }
@@ -5237,14 +5248,15 @@ pub(crate) fn script_instance_datatype(
 /// `!base_is_meta`; functions if `!base_is_meta || static`. A name that matches but fails its
 /// condition keeps walking (Godot's switch falls through to the next class). On a hit, records a
 /// [`Binding::Use`] against the DECLARING link's file — what `textDocument/references` and
-/// `definition` project for member-access sites — and returns the type (+ optional fold).
+/// `definition` project for member-access sites — and returns the type (+ optional fold) plus the
+/// resolved member kind (so an implicit-self caller can mark `use_self` for instance members only).
 fn lookup_script_chain_member(
     ctx: &mut AnalysisContext,
     start: &crate::data_type::ScriptRef,
     name: &str,
     base_is_meta: bool,
     bind_site: NodeId,
-) -> Option<(DataType, Option<FoldedValue>)> {
+) -> Option<(DataType, Option<FoldedValue>, BindingSymbolKind)> {
     let chain = crate::script_chain::resolve_script_chain(ctx, start);
     let xf = ctx.xfile;
     for link in chain.links.iter() {
@@ -5271,7 +5283,7 @@ fn lookup_script_chain_member(
                 }
             }
             record_member_use(ctx, link, BindingSymbolKind::Enum, name, bind_site);
-            return Some((dt, None));
+            return Some((dt, None, BindingSymbolKind::Enum));
         }
         let Some(member) = iface.members.iter().find(|m| m.name == name) else {
             continue;
@@ -5288,7 +5300,7 @@ fn lookup_script_chain_member(
                     dt.is_constant = true;
                     record_member_use(ctx, link, BindingSymbolKind::EnumValue, name, bind_site);
                     // Placeholder fold: `is_reduced` gates read only the type.
-                    return Some((dt, Some(FoldedValue::Int(0))));
+                    return Some((dt, Some(FoldedValue::Int(0)), BindingSymbolKind::EnumValue));
                 }
                 // CONSTANT arm (analyzer.cpp:4193-4200): the member's declared type; untyped
                 // consts degrade to soft Variant — permissive, never an enum value.
@@ -5298,7 +5310,7 @@ fn lookup_script_chain_member(
                 // No fold: the value isn't materializable cross-file; every fold consumer is an
                 // `is_reduced` gate or type-only narrowing, so absence only skips
                 // const-companion diagnostics — it never adds one.
-                return Some((dt, None));
+                return Some((dt, None, BindingSymbolKind::Constant));
             }
             MK::Var | MK::Property => {
                 if base_is_meta && !member.flags.is_static {
@@ -5312,7 +5324,7 @@ fn lookup_script_chain_member(
                 dt.is_constant = false;
                 dt.is_read_only = false;
                 record_member_use(ctx, link, BindingSymbolKind::Variable, name, bind_site);
-                return Some((dt, None));
+                return Some((dt, None, BindingSymbolKind::Variable));
             }
             MK::Signal => {
                 if base_is_meta {
@@ -5336,7 +5348,7 @@ fn lookup_script_chain_member(
                     return_type: Box::new(DataType::default()),
                 });
                 record_member_use(ctx, link, BindingSymbolKind::Signal, name, bind_site);
-                return Some((dt, None));
+                return Some((dt, None, BindingSymbolKind::Signal));
             }
             MK::Func => {
                 if base_is_meta && !member.flags.is_static {
@@ -5346,7 +5358,7 @@ fn lookup_script_chain_member(
                 // lives with reduce_call's cross-file CallSig path.
                 let dt = make_callable_type();
                 record_member_use(ctx, link, BindingSymbolKind::Function, name, bind_site);
-                return Some((dt, None));
+                return Some((dt, None, BindingSymbolKind::Function));
             }
             // Named enums are matched through `iface.enums` above; the member-list entry is
             // only the declaration marker.
@@ -5654,7 +5666,7 @@ fn reduce_identifier_from_base(
             // analyzer.cpp:4166-4267 script_classes loop crossing the file boundary) — this is
             // what types `self.hp` when `hp` lives in a cross-file base.
             if let Some(sr) = script_base_of_class(ctx, class_id) {
-                if let Some((dt, fold)) =
+                if let Some((dt, fold, _kind)) =
                     lookup_script_chain_member(ctx, &sr, &name, base.is_meta_type, identifier_id)
                 {
                     if let Some(fv) = fold {
@@ -5727,7 +5739,7 @@ fn reduce_identifier_from_base(
         // typed per Godot's access-mode conditions, with a `Binding::Use` recorded against the
         // declaring file. Misses continue into cycle detection, then the chain's native root.
         if let Some(sr) = base.script_type.clone() {
-            if let Some((dt, fold)) =
+            if let Some((dt, fold, _kind)) =
                 lookup_script_chain_member(ctx, &sr, &name, base.is_meta_type, identifier_id)
             {
                 if let Some(fv) = fold {

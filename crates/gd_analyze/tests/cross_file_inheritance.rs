@@ -486,3 +486,57 @@ func f() -> void:
         "String-returning native method through the chain must type-check the assignment; got {errors:?}"
     );
 }
+
+/// The single lambda in `src`, by `NodeId`, for #141 `use_self` assertions. Panics unless exactly
+/// one lambda is present (parse is deterministic, so this id matches the analyzed tree).
+fn sole_lambda(src: &str) -> gd_syntax::ast::NodeId {
+    let tree = parse(src).tree;
+    let lambdas: Vec<_> = tree
+        .iter_ids()
+        .filter(|&id| matches!(tree.get(id).kind, gd_syntax::ast::NodeKind::Lambda(_)))
+        .collect();
+    assert_eq!(
+        lambdas.len(),
+        1,
+        "expected exactly one lambda; got {}",
+        lambdas.len()
+    );
+    lambdas[0]
+}
+
+/// #141 cross-file arm: a lambda reading an INHERITED instance VARIABLE through a cross-file
+/// Script base marks `use_self` (Godot's VARIABLE arm, analyzer.cpp:4428 — reached for inherited
+/// members via the script_classes walk).
+#[test]
+fn lambda_reading_cross_file_inherited_var_marks_use_self() {
+    let child = "\
+extends BaseThing
+func f():
+\tvar g = func(): return hp
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://child.gd", "")]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    assert!(
+        result.lambda_uses_self(sole_lambda(child)),
+        "a lambda reading an inherited instance var (hp) through a cross-file base must mark use_self (#141)"
+    );
+}
+
+/// #141 cross-file arm — the over-mark guard: a lambda reading an INHERITED CONSTANT through a
+/// cross-file Script base must NOT mark `use_self`. Godot's CONSTANT arm (analyzer.cpp:4344-4352)
+/// has no mark site, so the implicit-self script-chain resolution must gate the mark on member
+/// kind. (Reproduce-first: the unconditional mark on any script-chain hit failed this.)
+#[test]
+fn lambda_reading_cross_file_inherited_const_is_not_marked() {
+    let child = "\
+extends BaseThing
+func f():
+\tvar g = func(): return SPEED
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://child.gd", "")]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    assert!(
+        !result.lambda_uses_self(sole_lambda(child)),
+        "a lambda reading an inherited CONSTANT (SPEED) through a cross-file base must NOT mark use_self (#141)"
+    );
+}
