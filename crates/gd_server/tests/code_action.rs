@@ -2632,3 +2632,107 @@ fn underscore_prefix_no_cross_file_autoload_rebind() {
     );
     shutdown(&client, t);
 }
+
+/// SCOPE-AWARE FIREWALL (#119): the `_`-prefix fix must be OFFERED when `_name` exists ONLY in a
+/// genuinely UNRELATED function scope, where no capture is possible. Here `count` is an unused local
+/// of `f`; `_count` is a distinct local of an unrelated `g`. The whole-file firewall over-refused
+/// (any `_count` identifier anywhere blocked the fix); the scope-aware firewall sees that `_count` is
+/// not visible in `f`'s scope (member / enclosing / global / `f`-local), so the rename `count`→`_count`
+/// is fresh in `f` and capture-free — OFFER it. Verified by apply→reanalyze: the unrelated `g._count`
+/// is untouched, `f`'s local renamed, no new error, the warning clears.
+#[test]
+fn underscore_prefix_offered_when_name_only_in_unrelated_scope() {
+    // `count` unused in `f`; `_count` is a SEPARATE local of the unrelated `g`.
+    const SRC: &str = "extends Node\n\nfunc f() -> void:\n\tvar count = 1\n\nfunc g() -> void:\n\tvar _count = 1\n\tprint(_count)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    // Precondition: error-free input.
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "precondition: input must be error-free; got {:?}",
+        diags.diagnostics
+    );
+    // The unused LOCAL `count` is on line 3 (the `_count` of `g` is used by `print`, doesn't warn).
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == Some(NumberOrString::String("UNUSED_VARIABLE".to_string()))
+                && d.range.start.line == 3
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the unused local `count` (line 3) must warn; got {:?}",
+                diags.diagnostics
+            )
+        });
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Prefix unused name");
+    let patched = apply_text_edits(SRC, all_text_edits(&edit));
+    // Only `f`'s local is renamed; `g`'s unrelated `_count` is untouched.
+    assert!(
+        patched.contains("func f() -> void:\n\tvar _count = 1"),
+        "the unused local `count` in `f` must be renamed to `_count`; patched:\n{patched}"
+    );
+    assert!(
+        patched.contains("func g() -> void:\n\tvar _count = 1\n\tprint(_count)"),
+        "the UNRELATED `g._count` + its use must be left untouched; patched:\n{patched}"
+    );
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !after
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "no errors after the fix (unrelated scope untouched); got {:?}\npatched:\n{patched}",
+        after.diagnostics
+    );
+    assert!(
+        !has_warning(&after, "UNUSED_VARIABLE"),
+        "UNUSED_VARIABLE cleared; got {:?}",
+        after.diagnostics
+    );
+    shutdown(&client, t);
+}
+
+/// SOUNDNESS (#119): the narrowed firewall must STILL refuse a SAME-FUNCTION collision. `count` is an
+/// unused local of `f`; `_count` is ALSO a (used) local of the SAME function `f`. Renaming `count`→
+/// `_count` would collide with the live `_count` in the same scope — a capture. The fix must NOT be
+/// offered (the scope-aware firewall sees `_count` visible in the renamed binding's own function).
+#[test]
+fn underscore_prefix_refused_when_name_in_same_function() {
+    // BOTH `count` (unused) and `_count` (used) are locals of the SAME function `f`.
+    const SRC: &str = "extends Node\n\nfunc f() -> void:\n\tvar count = 1\n\tvar _count = 2\n\tprint(_count)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diags
+        .diagnostics
+        .iter()
+        .find(|d| {
+            d.code == Some(NumberOrString::String("UNUSED_VARIABLE".to_string()))
+                && d.range.start.line == 3
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "the unused local `count` (line 3) must warn; got {:?}",
+                diags.diagnostics
+            )
+        });
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Prefix unused name").is_none(),
+        "a `_`-prefix that COLLIDES with a same-function `_count` must be REFUSED; got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
