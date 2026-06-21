@@ -525,6 +525,42 @@ pub fn definition(
         }
     }
 
+    // (0.6) #153: an attribute on an IN-FILE inner-class instance (`var x := Inner.new(); x.field`)
+    // types its base as `DtKind::Class` (not `Script`), so step (0.5) — which only handles Script
+    // bases — misses it, and step (1)'s root-class name scan would wrongly match a same-named ROOT
+    // member. The analyzer records a `Binding::Use` at this span carrying the DECLARING inner-class
+    // chain (`["A"]` for `B extends A`); when that chain is NON-EMPTY the member lives in an inner
+    // class, so resolve it on the owning class HERE, before the root scan. Empty-chain (root) uses
+    // stay with step (1)/(1.5) — no behavior change for the common case. Mirrors step (0.5)'s
+    // attribute-before-in-file precedent.
+    {
+        let node_span = parsed.tree.get(node_id).span;
+        let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+        let target = analyzed.as_deref().and_then(|a| {
+            a.bindings().iter().find_map(|b| match b {
+                Binding::Use {
+                    site,
+                    target_file: Some(f),
+                    target_class_path,
+                    target_kind,
+                    target_name,
+                } if *site == node_span
+                    && *target_kind != BindingTargetKind::Class
+                    && !target_class_path.is_empty()
+                    && target_name == &name =>
+                {
+                    Some((*f, target_class_path.clone()))
+                }
+                _ => None,
+            })
+        });
+        if let Some((fid, class_path)) = target {
+            if let Some(loc) = member_decl_location(state, fid, &class_path, &name) {
+                return Some(GotoDefinitionResponse::Scalar(loc));
+            }
+        }
+    }
+
     // (1) In-file member.
     let doc = state.vfs.get(uri.as_str())?;
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
@@ -546,22 +582,24 @@ pub fn definition(
                 Binding::Use {
                     site,
                     target_file: Some(f),
+                    target_class_path,
                     target_kind,
                     target_name,
                 } if *site == node_span
                     && *target_kind != BindingTargetKind::Class
                     && target_name == &name =>
                 {
-                    Some(*f)
+                    Some((*f, target_class_path.clone()))
                 }
                 _ => None,
             })
         });
-        if let Some(fid) = target {
-            // A `Binding::Use` carries no inner-class chain (only the declaring file), so resolve in
-            // the file's root interface. (The inner-class member-call case is handled by the
-            // `CalleeTarget` block below, which does carry the chain.)
-            if let Some(loc) = member_decl_location(state, fid, &[], &name) {
+        if let Some((fid, class_path)) = target {
+            // #153: the `Binding::Use` carries the DECLARING inner-class chain — resolve the member
+            // on its owning class (root or inner, including a member inherited via an inner class's
+            // own `extends` base, which the chain loop records against the BASE link). This makes
+            // definition consistent with references and fixes the inherited-inner-member jump.
+            if let Some(loc) = member_decl_location(state, fid, &class_path, &name) {
                 return Some(GotoDefinitionResponse::Scalar(loc));
             }
         }
@@ -1917,6 +1955,59 @@ fn ident_name(tree: &ParseTree, id: NodeId) -> &str {
     }
 }
 
+/// #153: locate the inner-class path of a member DECLARATION click. Walks the class subtree rooted
+/// at `class_id`, descending into nested `class Inner:` blocks while tracking the inner-class chain
+/// in `path` ([`gd_analyze::ScriptRef::inner`]'s vocabulary; empty = the file's root class). When a
+/// non-class/non-enum member named `name` has its declaration identifier exactly at `node_span`,
+/// returns the chain of the class declaring it. `None` when no member-decl click matches — the
+/// caller then falls through to local resolution / the residue floor. Mirrors the analyzer's
+/// `class_inner_path` arena walk on the server's parse tree, so a decl-click and a use-site
+/// (which rides `Binding::Use.target_class_path`) agree on the same chain.
+fn member_decl_click_class_path(
+    tree: &ParseTree,
+    class_id: NodeId,
+    path: &mut Vec<String>,
+    name: &str,
+    node_span: ByteSpan,
+) -> Option<Vec<String>> {
+    let NodeKind::Class(class) = &tree.get(class_id).kind else {
+        return None;
+    };
+    for m in &class.members {
+        match m {
+            // Class/Enum declaration clicks keep the union path (their references live in
+            // annotations/extends the reducer doesn't record) — never classified as a Member.
+            Member::Enum(_) => continue,
+            Member::Class(inner_id) => {
+                let seg = match &tree.get(*inner_id).kind {
+                    NodeKind::Class(ic) => ic
+                        .identifier
+                        .map(|i| ident_name(tree, i).to_owned())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                path.push(seg);
+                if let Some(found) =
+                    member_decl_click_class_path(tree, *inner_id, path, name, node_span)
+                {
+                    return Some(found);
+                }
+                path.pop();
+            }
+            _ => {
+                if let Some(decl) = member_named(tree, m, name) {
+                    if let Some(ident) = declaration_identifier(tree, decl) {
+                        if tree.get(ident).span == node_span {
+                            return Some(path.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Locate the declaration identifier of the value `value_name` in the NAMED enum `enum_name`, both
 /// declared at the root-class scope of `tree`. Returns the value's declaration-identifier `NodeId`
 /// (the precise token an enum-value rename edits) — `None` if no such value exists.
@@ -2878,18 +2969,23 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                     uri: uri.clone(),
                     range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
                 });
-            } else if let NonMethodTarget::Member(tf) = &non_method_target {
+            } else if let NonMethodTarget::Member {
+                file: tf,
+                class_path,
+            } = &non_method_target
+            {
                 // Occurrence-positive member decl: the cursor resolved by identity to a member in
-                // `tf` (its DECLARING file). When `tf` is the current file (a same-file decl click or
-                // use) the in-file lookup is correct. When `tf` is ANOTHER file (a cross-file
-                // attribute use, `x.speed`), the name-only `find_in_file_definition(&parsed.tree, …)`
-                // would return THIS file's same-named decl — a spurious duplicate. Resolve the decl
-                // in `tf` instead, so a same-named local decl is never pulled in. #164.
-                if current_fid.is_some_and(|cf| cf == *tf) {
+                // `tf` (its DECLARING file) and `class_path` (its DECLARING inner-class chain). When
+                // `tf` is the current file AND the member is a ROOT member (`class_path` empty) the
+                // name-only in-file lookup is correct. For an inner-class member (`class_path`
+                // non-empty), or a cross-file attribute use, resolve the decl in the declaring class
+                // via `member_decl_location` (which walks `iface_at_inner`) so a same-named ROOT (or
+                // other-class) member is never pulled in. #153 / #164.
+                if current_fid.is_some_and(|cf| cf == *tf) && class_path.is_empty() {
                     if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
                         decls.push(loc);
                     }
-                } else if let Some(loc) = find_decl_in_declaring_file(state, *tf, &name, enc) {
+                } else if let Some(loc) = member_decl_location(state, *tf, class_path, &name) {
                     decls.push(loc);
                 }
             } else if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
@@ -2937,14 +3033,18 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             }
         } else {
             match &non_method_target {
-                NonMethodTarget::Member(tf) => {
-                    // Binding-backed: every recorded use resolving to (declaring file, name) —
-                    // bare member uses, `self.x` writes/reads, typed attribute accesses. The
+                NonMethodTarget::Member {
+                    file: tf,
+                    class_path,
+                } => {
+                    // Binding-backed: every recorded use resolving to (declaring file, class_path,
+                    // name) — bare member uses, `self.x` writes/reads, typed attribute accesses. The
                     // raw scan is NOT run here; its cross-class bleed is the bug this closes.
                     push_use_binding_locations_for(
                         &mut locations,
                         &result,
                         *tf,
+                        class_path,
                         &name,
                         &uri,
                         &mapper,
@@ -3046,7 +3146,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             // also a RECALL fix: `a.speed` through a body-local typed var never names `speed`
             // in the accessor's interface, so the old `name_referencers` set missed those
             // files entirely.
-            NonMethodTarget::Member(_) => {
+            NonMethodTarget::Member { .. } => {
                 method_scan_candidate_uris(state, &name, current_fid, "references")
             }
             // Locals are never referenced cross-file.
@@ -3152,13 +3252,18 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             }
         } else {
             match &non_method_target {
-                NonMethodTarget::Member(tf) => {
+                NonMethodTarget::Member {
+                    file: tf,
+                    class_path,
+                } => {
                     // Binding-backed only — a candidate's same-named member of a DIFFERENT
-                    // class records a different declaring file and is filtered out here.
+                    // class records a different declaring file (or inner-class path) and is
+                    // filtered out here.
                     push_use_binding_locations_for(
                         &mut locations,
                         &cand_result,
                         *tf,
+                        class_path,
                         &name,
                         &cand_uri,
                         &cand_mapper,
@@ -3493,14 +3598,25 @@ fn collect_in_file_highlight_sites(
             uri: uri.clone(),
             range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
         });
-    } else if let NonMethodTarget::Member(tf) = &non_method_target {
+    } else if let NonMethodTarget::Member {
+        file: tf,
+        class_path,
+    } = &non_method_target
+    {
         // Occurrence-positive member decl: highlight the decl token only when THIS file declares the
         // resolved member (`tf == current_fid`). A cross-file attribute use (`x.speed`, target in
         // another file) has its declaration elsewhere — highlight nothing for it here, never THIS
         // file's same-named decl via the name-only `find_in_file_definition`. documentHighlight is
-        // single-file, so a cross-file decl simply isn't part of this buffer's highlight set. #164.
+        // single-file, so a cross-file decl simply isn't part of this buffer's highlight set. For an
+        // inner-class member (`class_path` non-empty), resolve the decl in the declaring class via
+        // `member_decl_location` so a same-named ROOT member's token is never highlighted. #153 / #164.
         if current_fid.is_some_and(|cf| cf == *tf) {
-            if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, mapper) {
+            let loc = if class_path.is_empty() {
+                find_in_file_definition(&parsed.tree, name, uri, mapper)
+            } else {
+                member_decl_location(state, *tf, class_path, name)
+            };
+            if let Some(loc) = loc {
                 locations.push(loc);
             }
         }
@@ -3539,8 +3655,19 @@ fn collect_in_file_highlight_sites(
             }
         } else {
             match &non_method_target {
-                NonMethodTarget::Member(tf) => {
-                    push_use_binding_locations_for(&mut locations, &result, *tf, name, uri, mapper);
+                NonMethodTarget::Member {
+                    file: tf,
+                    class_path,
+                } => {
+                    push_use_binding_locations_for(
+                        &mut locations,
+                        &result,
+                        *tf,
+                        class_path,
+                        name,
+                        uri,
+                        mapper,
+                    );
                 }
                 NonMethodTarget::Local {
                     decl_ident,
@@ -4016,9 +4143,14 @@ enum UnresolvedKind {
 /// survives exactly where it can't decide.
 enum NonMethodTarget {
     /// The cursor's symbol is a member DECLARED in this file: scan `Binding::Use` records
-    /// filtered by `(declaring file, name)` — two unrelated `var speed`s in different classes
-    /// stop reporting each other's sites.
-    Member(gd_project::FileId),
+    /// filtered by `(declaring file, class_path, name)` — two unrelated `var speed`s in different
+    /// classes (root vs inner, or two inner classes) stop reporting each other's sites. `class_path`
+    /// is the declaring inner-class chain ([`gd_analyze::ScriptRef::inner`]'s vocabulary; empty =
+    /// the file's root class). #153.
+    Member {
+        file: gd_project::FileId,
+        class_path: Vec<String>,
+    },
     /// A local of the enclosing function, identified by its DECLARATION identifier (`decl_ident`)
     /// plus the enclosing function span (`fn_span`). Occurrences are resolved per-identifier against
     /// `decl_ident` ([`ParseTree::local_binding_occurrences`]) so a same-named binding in a nested
@@ -4080,6 +4212,7 @@ fn classify_non_method_target(
             target_file: Some(tf),
             target_name,
             site,
+            ..
         } = b
         {
             if *site == node_span && current_fid == Some(*tf) {
@@ -4116,6 +4249,7 @@ fn classify_non_method_target(
     for b in result.bindings() {
         if let Binding::Use {
             target_file: Some(f),
+            target_class_path,
             target_kind,
             target_name,
             site,
@@ -4144,27 +4278,28 @@ fn classify_non_method_target(
                         | BindingTargetKind::EnumValueLocal
                 )
             {
-                return NonMethodTarget::Member(*f);
+                // #153: carry the declaring inner-class chain so the scan stays distinct from a
+                // same-named member of another class in this file.
+                return NonMethodTarget::Member {
+                    file: *f,
+                    class_path: target_class_path.clone(),
+                };
             }
         }
     }
     if let Some(fid) = current_fid {
-        if let Some(root) = tree.root() {
-            if let NodeKind::Class(class) = &root.kind {
-                for m in &class.members {
-                    // Class/Enum declaration clicks keep the union path (their references
-                    // live in annotations/extends the reducer doesn't record).
-                    if matches!(m, Member::Class(_) | Member::Enum(_)) {
-                        continue;
-                    }
-                    if let Some(decl) = member_named(tree, m, name) {
-                        if let Some(ident) = declaration_identifier(tree, decl) {
-                            if tree.get(ident).span == node_span {
-                                return NonMethodTarget::Member(fid);
-                            }
-                        }
-                    }
-                }
+        if let Some(root_id) = tree.root_id() {
+            // #153: a member DECLARATION click — walk the class tree (root + nested inner classes)
+            // tracking the inner-class path, so an inner-class member decl-click classifies as a
+            // Member of THAT inner class (`class_path`), not as the same-named root member. Root
+            // members → empty path (unchanged).
+            if let Some(class_path) =
+                member_decl_click_class_path(tree, root_id, &mut Vec::new(), name, node_span)
+            {
+                return NonMethodTarget::Member {
+                    file: fid,
+                    class_path,
+                };
             }
         }
     }
@@ -4222,6 +4357,7 @@ fn push_use_binding_locations_for(
     out: &mut Vec<Location>,
     result: &AnalysisResult,
     target_file: gd_project::FileId,
+    class_path: &[String],
     name: &str,
     uri: &Uri,
     mapper: &PositionMapper,
@@ -4229,12 +4365,18 @@ fn push_use_binding_locations_for(
     for binding in result.bindings() {
         if let Binding::Use {
             target_file: Some(tf),
+            target_class_path,
             target_name,
             site,
             ..
         } = binding
         {
-            if *tf == target_file && target_name == name {
+            // #153: match on the declaring inner-class chain too — a same-named member of another
+            // class in this file records a different `target_class_path` and is excluded.
+            if *tf == target_file
+                && target_class_path.as_slice() == class_path
+                && target_name == name
+            {
                 out.push(Location {
                     uri: uri.clone(),
                     range: mapper.span_to_range(*site),
@@ -4277,6 +4419,7 @@ fn push_global_class_locations(
             target_file: Some(tf),
             target_name,
             site,
+            ..
         } = binding
         {
             if *tf == class_file && target_name == name {
@@ -4372,6 +4515,7 @@ fn push_enum_value_binding_locations(
             target_file: Some(tf),
             target_name,
             site,
+            ..
         } = binding
         {
             if *tf == decl_file && target_name == qualified {
@@ -6529,6 +6673,21 @@ fn rename_target_has_project_anchor(
         false
     });
     if call_anchored {
+        // FAIL-CLOSED (#153 method surface): the method/call rename collection
+        // (`push_callee_ident_locations`) keys on (declaring FILE, name) ONLY — `CalleeTarget`
+        // drops the inner-class `class_path` — so when the SAME method name is declared in more than
+        // one class of THIS file (root + an inner class, or two inner classes), it cannot
+        // discriminate which class's `x.m()` call sites belong to the renamed method. #153 made the
+        // non-call `var`/`const` member surface (`Binding::Use.target_class_path`) inner-aware, but
+        // the call surface is still inner-blind: admitting the anchor here would canonicalize the
+        // inner `func` onto the ROOT decl (`find_in_file_definition` walks root members only) and
+        // rewrite the unrelated ROOT method + every same-named call site, leaving the clicked inner
+        // decl untouched (the issue's headline corruption). Until the call collection carries
+        // `class_path` (#213), refuse the ambiguous same-file collision rather than corrupt — zero
+        // edits beats a wrong edit. A name declared in exactly ONE class of the file stays editable.
+        if same_file_method_name_is_class_ambiguous(&parsed.tree, name) {
+            return false;
+        }
         return true;
     }
 
@@ -6608,7 +6767,7 @@ fn rename_target_has_project_anchor(
     // scan), so admitting it cannot reopen the W16 grep-rename hole. #106.
     if matches!(
         classify_non_method_target(&parsed.tree, &result, node_span, byte, name, current_fid),
-        NonMethodTarget::Member(_)
+        NonMethodTarget::Member { .. }
             | NonMethodTarget::Local { .. }
             | NonMethodTarget::EnumValue { .. }
     ) {
@@ -7082,6 +7241,38 @@ fn member_decl_id(member: &Member) -> Option<NodeId> {
         Class(id) | Constant(id) | Function(id) | Signal(id) | Variable(id) | Enum(id) => Some(*id),
         EnumValue(_) | Group(_) => None,
     }
+}
+
+/// `true` iff `name` is declared as a `func` (method) in MORE THAN ONE class of this file — the
+/// root class plus an inner class, or two inner classes. This is the same-file collision the method
+/// rename collection cannot discriminate: `push_callee_ident_locations` keys on (declaring FILE,
+/// name) only (`CalleeTarget` drops the inner `class_path`), so every same-named `x.m()` call across
+/// those classes collapses into one set, and `find_in_file_definition` canonicalizes any of them to
+/// the ROOT decl (it walks root members only). #153 made the non-call `var`/`const` member surface
+/// inner-aware (`Binding::Use.target_class_path`) but left the call surface inner-blind, so a rename
+/// of an ambiguous method would over-capture the root method + under-capture the clicked inner decl.
+/// The fail-closed gate denies the project anchor for such a name → the rename refuses (#213 tracks
+/// threading `class_path` onto the call surface to make these renameable). A name in exactly one
+/// class is unambiguous and stays editable. Only `func` members count — `var`/`const`/`signal`/
+/// `enum`/inner-`class` collisions resolve through the class-path-aware `Binding::Use` surface.
+fn same_file_method_name_is_class_ambiguous(tree: &ParseTree, name: &str) -> bool {
+    let mut classes_declaring = 0usize;
+    for id in tree.iter_ids() {
+        let NodeKind::Class(class) = &tree.get(id).kind else {
+            continue;
+        };
+        let declares_method = class
+            .members
+            .iter()
+            .any(|m| matches!(m, Member::Function(_)) && member_named(tree, m, name).is_some());
+        if declares_method {
+            classes_declaring += 1;
+            if classes_declaring > 1 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `true` iff the current file's ROOT class declares a member named `name` — the member-collision

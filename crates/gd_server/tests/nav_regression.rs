@@ -573,6 +573,7 @@ fn in_file_attribute_read_records_use_binding() {
                 target_kind: BindingTargetKind::Member,
                 target_name,
                 site,
+                ..
             } if target_name == "hp" && *target_file == Some(file) => Some(*site),
             _ => None,
         })

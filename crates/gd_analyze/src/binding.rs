@@ -161,6 +161,12 @@ pub enum Binding {
     Use {
         /// The file declaring the target. `None` for native / unresolved / builtin.
         target_file: Option<FileId>,
+        /// Inner-class chain WITHIN `target_file` where the target is declared
+        /// ([`crate::data_type::ScriptRef::inner`]'s vocabulary; empty = the file's root class).
+        /// Keeps same-named members of different inner classes in one file distinct under
+        /// `references`/`rename` — the [`CalleeTarget::Script::class_path`] pattern, carried onto
+        /// the non-call member-use surface (#153).
+        target_class_path: Vec<String>,
         target_kind: BindingTargetKind,
         target_name: String,
         site: ByteSpan,
@@ -195,12 +201,14 @@ impl Binding {
     /// producer of [`Self::Use`]. Centralizes construction alongside [`Self::call`].
     pub(crate) fn use_(
         target_file: Option<FileId>,
+        target_class_path: Vec<String>,
         target_kind: BindingTargetKind,
         target_name: String,
         site: ByteSpan,
     ) -> Self {
         Binding::Use {
             target_file,
+            target_class_path,
             target_kind,
             target_name,
             site,
@@ -337,18 +345,21 @@ mod tests {
         let result = empty(vec![
             Binding::Use {
                 target_file: Some(FileId::new(1)),
+                target_class_path: Vec::new(),
                 target_kind: BindingTargetKind::Function,
                 target_name: "attack".into(),
                 site: ByteSpan { start: 0, end: 6 },
             },
             Binding::Use {
                 target_file: Some(FileId::new(2)),
+                target_class_path: Vec::new(),
                 target_kind: BindingTargetKind::Variable,
                 target_name: "attack".into(),
                 site: ByteSpan { start: 10, end: 16 },
             },
             Binding::Use {
                 target_file: Some(FileId::new(1)),
+                target_class_path: Vec::new(),
                 target_kind: BindingTargetKind::Function,
                 target_name: "flee".into(),
                 site: ByteSpan { start: 20, end: 24 },
