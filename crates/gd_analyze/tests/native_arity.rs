@@ -171,14 +171,13 @@ func _ready() -> void:
     );
 }
 
-// --- CONSTRUCTOR with a parameterized `_init`: SILENT ----------------------------------------
+// --- CONSTRUCTOR with a parameterized `_init`: CORRECT ARITY SILENT --------------------------
 
 #[test]
-fn constructor_with_arguments_is_silent() {
-    // `X.new(1, 2)` against a `func _init(a, b)` synthesizes the instance type directly without
-    // binding `_init`'s signature, so `sig` stays at its zero-arg default. The arity check must
-    // NOT run on that path — Godot resolves the real `_init` arity, so the call is valid and gdls
-    // must never manufacture `Too many arguments... Expected at most 0`.
+fn constructor_correct_arity_is_silent() {
+    // `Inner.new(1, 2)` against `func _init(_a, _b)` — 2 required params, 2 args. Godot resolves
+    // `_init`'s real arity (get_function_signature with p_is_constructor=true,
+    // gdscript_analyzer.cpp:5829-5869) and validate_call_arg passes, so this must stay silent.
     let src = "\
 extends RefCounted
 
@@ -192,7 +191,98 @@ func make() -> void:
     let msgs = error_messages(src);
     assert!(
         !msgs.iter().any(|m| m.contains("arguments for")),
-        "constructor with a parameterized _init must not arity-error; got {msgs:?}"
+        "constructor with matching _init arity must not arity-error; got {msgs:?}"
+    );
+}
+
+// --- CONSTRUCTOR over-call: TOO MANY fires -----------------------------------------------------
+
+#[test]
+fn constructor_too_many_arguments_fires() {
+    // `Inner.new(1, 2, 3)` against `func _init(_a, _b)` — 2 params, 0 defaults, not vararg.
+    // Godot resolves `_init`'s arity and validate_call_arg (gdscript_analyzer.cpp:5944-5950)
+    // emits "Too many arguments...". The message uses `p_call->function_name`, which is `new`.
+    let src = "\
+extends RefCounted
+
+class Inner:
+\tfunc _init(_a, _b):
+\t\tpass
+
+func make() -> void:
+\tvar _x = Inner.new(1, 2, 3)
+";
+    let msgs = error_messages(src);
+    assert!(
+        msgs.iter().any(|m| m
+            == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."),
+        "constructor over-call must emit Too many arguments; got {msgs:?}"
+    );
+}
+
+// --- CONSTRUCTOR under-call: TOO FEW fires -----------------------------------------------------
+
+#[test]
+fn constructor_too_few_arguments_fires() {
+    // `Inner.new(1)` against `func _init(_a, _b)` — 2 required params, 1 arg. Too few.
+    let src = "\
+extends RefCounted
+
+class Inner:
+\tfunc _init(_a, _b):
+\t\tpass
+
+func make() -> void:
+\tvar _x = Inner.new(1)
+";
+    let msgs = error_messages(src);
+    assert!(
+        msgs.iter().any(|m| m
+            == "Too few arguments for \"new()\" call. Expected at least 2 but received 1."),
+        "constructor under-call must emit Too few arguments; got {msgs:?}"
+    );
+}
+
+// --- CONSTRUCTOR with defaulted `_init` params: required-only is SILENT -----------------------
+
+#[test]
+fn constructor_optional_defaults_required_only_is_silent() {
+    // `func _init(_a, _b = 0)` — 2 params, 1 default ⇒ min 1, max 2. `Inner.new(1)` supplies the
+    // one required arg and must stay silent (the default-arg lower bound).
+    let src = "\
+extends RefCounted
+
+class Inner:
+\tfunc _init(_a, _b = 0):
+\t\tpass
+
+func make() -> void:
+\tvar _x = Inner.new(1)
+";
+    let msgs = error_messages(src);
+    assert!(
+        !msgs.iter().any(|m| m.contains("arguments for")),
+        "constructor supplying only required _init args must be silent; got {msgs:?}"
+    );
+}
+
+// --- NATIVE constructor (no in-file `_init`): SILENT ------------------------------------------
+
+#[test]
+fn native_constructor_with_arguments_is_silent() {
+    // Godot's native constructor path returns empty par_types (gdscript_analyzer.cpp:5897-5903),
+    // so a bare-native `RefCounted.new(1)` is NEVER arity-checked. gdls must match — no in-file
+    // `_init` ⇒ no real signature ⇒ no arity error.
+    let src = "\
+extends Node
+
+func _ready() -> void:
+\tvar _x = RefCounted.new(1, 2, 3)
+";
+    let msgs = error_messages(src);
+    assert!(
+        !msgs.iter().any(|m| m.contains("arguments for")),
+        "native constructor must not arity-error; got {msgs:?}"
     );
 }
 
