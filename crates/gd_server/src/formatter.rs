@@ -191,6 +191,22 @@ impl Default for FormatBridge {
     }
 }
 
+impl FormatBridge {
+    /// Cancel every in-flight format's token. Called when the session enters `shutting_down` (at the
+    /// `shutdown` request, #178): each format thread's [`CANCEL_POLL_INTERVAL`] poll then kills its
+    /// subprocess within ~one poll interval, so a `shutdown`+`exit` round-trip does not leave a
+    /// format child orphaned (reparented to init) by the loop breaking on `exit` before the format's
+    /// done arm fires. The entries are NOT removed here — the supersession map is cleared by each
+    /// format's own done arm via [`apply_format_done`]; tripping the token is idempotent (a one-way
+    /// flag) and harmless if a done arm already removed the entry. Does NOT drain the done channel:
+    /// draining would block shutdown on a slow format — the head-of-line-at-shutdown class #135 fixes.
+    pub(crate) fn cancel_all_in_flight(&self) {
+        for token in self.in_flight.values() {
+            token.cancel();
+        }
+    }
+}
+
 /// Outcome of dispatching a `textDocument/formatting` request: either it was answered SYNCHRONOUSLY
 /// (a defensive no-op — no command configured, or no open buffer — answered with no edits), or it
 /// was handed to an off-worker thread and the response will arrive later via the

@@ -67,4 +67,14 @@ mod tests {
         assert!(clone.is_cancelled());
         assert!(tok.is_cancelled());
     }
+
+    #[test]
+    fn same_token_matches_only_clones() {
+        let tok = CancellationToken::new();
+        let clone = tok.clone();
+        let independent = CancellationToken::new();
+
+        assert!(tok.same_token(&clone));
+        assert!(!tok.same_token(&independent));
+    }
 }

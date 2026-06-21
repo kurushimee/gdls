@@ -531,6 +531,12 @@ fn formatter_cfg_arg(mode: &str, arg: &str) -> serde_json::Value {
     serde_json::json!({ "command": STUB, "args": [mode, arg] })
 }
 
+/// A `formatter` config running the stub in `mode` with two extra args (e.g. `markerafterms <ms>
+/// <path>`).
+fn formatter_cfg_arg2(mode: &str, arg1: &str, arg2: &str) -> serde_json::Value {
+    serde_json::json!({ "command": STUB, "args": [mode, arg1, arg2] })
+}
+
 /// Send a `textDocument/documentSymbol` request — a fast, formatter-independent request used to
 /// prove the worker is free while a slow format runs off-worker (#135).
 fn send_document_symbol(client: &Connection, id: i32, uri: &Uri) {
@@ -696,4 +702,127 @@ fn cancel_kills_inflight_format_promptly_no_late_edit() {
     );
 
     shutdown(&client, thread);
+}
+
+// ---------------------------------------------------------------------------------------------
+// #178 — per-document supersession: a newer format for the same URI cancels the older in-flight one
+// ---------------------------------------------------------------------------------------------
+
+/// #178. Two `textDocument/formatting` requests for the SAME document fired back-to-back: the second
+/// SUPERSEDES the first (the format-on-save + fast-typing case). Supersession trips the older
+/// format's cancellation TOKEN — but NOT its request lifecycle's cancel/stale flags (those are set
+/// only by `$/cancelRequest` / an intervening edit). So `finish_request` finds no interrupt and the
+/// superseded request answers a plain `null` (its run_formatter saw the token tripped → `Ok(None)`),
+/// while the live newer request answers real edits. The supersession map ends with exactly one
+/// in-flight entry (the live one), removed by its own done arm — observable here as: the older id
+/// answers null, the newer id answers edits, and the session stays healthy for a follow-up format
+/// (a leaked/over-deleted map entry would mis-supersede or leak, breaking the next format).
+#[test]
+fn newer_format_supersedes_older_same_uri() {
+    let p = bare_project();
+    let src = "func  f():\n\tvar   x   =   1\n";
+    let (client, thread) = boot();
+    // A slow successful format so both requests are in flight at once: the first is dispatched and
+    // inserts its in-flight entry, then the second is dispatched and supersedes it.
+    init_open(
+        &p,
+        &client,
+        Some(formatter_cfg_arg("delaysqueeze", "1500")),
+        &[("a.gd", src)],
+    );
+    let uri = file_uri(&p.root.join("a.gd"));
+
+    // Fire the older format (id 10), then a newer format for the SAME uri (id 11) right after.
+    send_format(&client, 10, &uri);
+    send_format(&client, 11, &uri);
+
+    // The older (superseded) format answers a plain null — no edits, and NOT an error: supersession
+    // trips only the token, never the lifecycle's cancel/stale flags, so `finish_request` passes the
+    // null through rather than mapping it to RequestCancelled/ContentModified.
+    let (older, _) = recv_response_id(&client, 10, Duration::from_secs(10));
+    assert!(
+        older.error.is_none(),
+        "a superseded format must answer null, not an error; got {:?}",
+        older.error
+    );
+    assert!(
+        edits_of_response(&older).is_none(),
+        "a superseded format must yield no edits (its token was tripped → Ok(None))"
+    );
+
+    // The newer (live) format answers real edits.
+    let (newer, _) = recv_response_id(&client, 11, Duration::from_secs(10));
+    let edits = edits_of_response(&newer).expect("the live format must produce edits");
+    assert_eq!(apply_edits(src, &edits), "func f():\n\tvar x = 1\n");
+
+    // The map ends with exactly one entry, removed by the live format's done arm: prove it by
+    // running another format — a leaked/over-deleted supersession entry would corrupt this one.
+    send_format(&client, 12, &uri);
+    let (third, _) = recv_response_id(&client, 12, Duration::from_secs(10));
+    let edits3 = edits_of_response(&third).expect("a follow-up format must still produce edits");
+    assert_eq!(apply_edits(src, &edits3), "func f():\n\tvar x = 1\n");
+
+    shutdown(&client, thread);
+}
+
+// ---------------------------------------------------------------------------------------------
+// #178 — exit-mid-format: `shutdown` cancels in-flight formats so no subprocess orphans past exit
+// ---------------------------------------------------------------------------------------------
+
+/// #178. With formatting off the serial worker (#135), a `shutdown`+`exit` round-trip arriving while
+/// a format subprocess is in flight would (before the fix) break the event loop on `exit` before the
+/// format's done arm fired: that child reparents to init and runs to completion (a transient orphan).
+/// The fix cancels every in-flight format's token at the `shutdown` request, so each format thread's
+/// 25ms poll-kill reaps its child within ~one poll interval during the round-trip.
+///
+/// Discriminator (behavioral, not marker-absence-alone): the stub's `markerafterms <ms> <path>`
+/// sleeps `<ms>` then writes a MARKER and squeezes. The delay is set LONGER than the shutdown→exit
+/// round-trip, so the child is guaranteed still sleeping when `shutdown` lands. Against the prior
+/// code the (reparented) child runs its full sleep and WRITES THE MARKER after the server exits;
+/// with the fix the `shutdown`-time cancel kills it mid-sleep, so the marker NEVER appears even after
+/// a window well past the delay. (Verified RED against pre-fix `main`: marker appears.)
+#[test]
+fn shutdown_cancels_inflight_format_no_orphan() {
+    let p = bare_project();
+    let src = "func  f():\n\tpass\n";
+    let marker = p.root.join("SHUTDOWN_MARKER");
+    let (client, thread) = boot();
+    init_open(
+        &p,
+        &client,
+        // 1500ms — comfortably longer than the shutdown→exit round-trip below, so the child is still
+        // sleeping when `shutdown` arrives.
+        Some(formatter_cfg_arg2("markerafterms", "1500", marker.as_str())),
+        &[("a.gd", src)],
+    );
+    let uri = file_uri(&p.root.join("a.gd"));
+
+    // Fire the format, give it a beat to actually spawn the subprocess + enter the poll-wait loop,
+    // then tear the session down with shutdown+exit.
+    send_format(&client, 10, &uri);
+    std::thread::sleep(Duration::from_millis(150));
+
+    client
+        .sender
+        .send(request(99, "shutdown", serde_json::Value::Null))
+        .unwrap();
+    // Drain to the shutdown reply (skipping any format response the cancel may have produced first).
+    let _ = recv_response_id(&client, 99, Duration::from_secs(5));
+    client
+        .sender
+        .send(notification("exit", serde_json::Value::Null))
+        .unwrap();
+    thread.join().expect("server panicked").ok();
+
+    // The child must have been killed mid-sleep: poll for a window WELL past the 1500ms delay and
+    // assert the marker never lands. Against the prior code the reparented child wakes and writes it.
+    let marker_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < marker_deadline {
+        assert!(
+            !marker.exists(),
+            "the format subprocess wrote its marker AFTER shutdown — it orphaned past exit instead \
+             of being reaped by the shutdown-time cancel (#178)"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

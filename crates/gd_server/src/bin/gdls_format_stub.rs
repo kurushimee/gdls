@@ -32,6 +32,8 @@
 //! * `markerafter <path>` — sleep a long time (past any cancel window), then create the file at
 //!   `<path>` and squeeze. The marker file appears ONLY if the child ran to completion; a cancel that
 //!   kills the child mid-sleep leaves no marker — that absence is the no-orphan / no-late-write proof.
+//! * `markerafterms <ms> <path>` — same marker proof with a caller-chosen delay. Used by the
+//!   shutdown/exit teardown test so an uncancelled child proves itself quickly.
 //!
 //! Every mode drains stdin first (a real filter does), so the parent's stdin write never blocks on a
 //! full pipe.
@@ -105,6 +107,19 @@ fn main() {
             // late edit was produced). The path is the second arg.
             let marker = arg2.expect("markerafter requires a marker path");
             std::thread::sleep(std::time::Duration::from_secs(30));
+            let _ = std::fs::write(&marker, b"done");
+            let text = String::from_utf8_lossy(&input);
+            let out = squeeze_spaces(&text);
+            write_stdout(out.as_bytes());
+        }
+        "markerafterms" => {
+            let ms: u64 = arg2
+                .as_deref()
+                .unwrap_or("0")
+                .parse()
+                .expect("markerafterms requires a millisecond delay");
+            let marker = args.next().expect("markerafterms requires a marker path");
+            std::thread::sleep(std::time::Duration::from_millis(ms));
             let _ = std::fs::write(&marker, b"done");
             let text = String::from_utf8_lossy(&input);
             let out = squeeze_spaces(&text);
