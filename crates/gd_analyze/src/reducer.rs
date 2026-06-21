@@ -1518,7 +1518,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         // native-method path owns those).
         if let Some(class_id) = ctx.current_class {
             if let Some(root) = crate::resolver::nearest_native_ancestor(ctx, class_id) {
-                if try_native_member(ctx, &root, &name, false, false, id) {
+                if try_native_member(ctx, &root, &name, false, true, id) {
                     return;
                 }
             }
@@ -5676,7 +5676,10 @@ fn reduce_identifier_from_base(
                     &root,
                     &name,
                     is_constructor,
-                    base.is_meta_type,
+                    // Explicit-base path (`obj.member`): Godot marks no lambda self-capture here
+                    // (analyzer.cpp:4040-4378 has no mark_lambda_use_self site), only on the
+                    // implicit-self path.
+                    false,
                     identifier_id,
                 ) {
                     return;
@@ -5798,7 +5801,10 @@ fn reduce_identifier_from_base(
                     &root,
                     &name,
                     is_constructor,
-                    base.is_meta_type,
+                    // Explicit-base path (`obj.member`): Godot marks no lambda self-capture here
+                    // (analyzer.cpp:4040-4378 has no mark_lambda_use_self site), only on the
+                    // implicit-self path.
+                    false,
                     identifier_id,
                 ) {
                     return;
@@ -5845,13 +5851,17 @@ fn try_native_member(
     native_name: &str,
     name: &str,
     is_constructor: bool,
-    is_meta_type: bool,
+    implicit_self: bool,
     identifier_id: NodeId,
 ) -> bool {
     // 1. Property (analyzer.cpp:4317-4326). Walk inherits chain to find the declaring class.
     if let Some(prop) = lookup_native_property(ctx, native_name, name) {
         ctx.set_type(identifier_id, prop);
-        if !is_meta_type {
+        // Godot marks the enclosing lambda `use_self` for an instance member reached through the
+        // implicit `self` (analyzer.cpp:4428 MEMBER_VARIABLE). The explicit-base path
+        // (`obj.position`, analyzer.cpp:4040-4378) has no such site, so only the implicit-self
+        // caller passes `implicit_self`.
+        if implicit_self {
             ctx.mark_lambda_use_self();
         }
         return true;
@@ -5860,7 +5870,7 @@ fn try_native_member(
     //    the full make_callable_type lives with reduce_call.
     if native_method_exists(ctx, native_name, name) {
         ctx.set_type(identifier_id, make_callable_type());
-        if !is_meta_type {
+        if implicit_self {
             ctx.mark_lambda_use_self();
         }
         return true;
@@ -5876,7 +5886,8 @@ fn try_native_member(
         };
         t.is_meta_type = false;
         ctx.set_type(identifier_id, t);
-        if !is_meta_type {
+        // analyzer.cpp:4425 MEMBER_SIGNAL fallthrough marks on the implicit-self path.
+        if implicit_self {
             ctx.mark_lambda_use_self();
         }
         return true;

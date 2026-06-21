@@ -8,6 +8,10 @@
 //! during analysis, so the fact is recorded in a side table queryable via
 //! [`AnalysisResult::lambda_uses_self`].
 //!
+//! All six sites are on the IMPLICIT-self paths. The explicit-base path
+//! (`reduce_identifier_from_base`, analyzer.cpp:4040-4378) has no mark site, so `obj.member` and
+//! meta-type accesses (`Color.RED`) inside a lambda must NOT be marked — guarded below.
+//!
 //! The conformance ratchet is BLIND to this side table (nothing in a `.out` consumes it), so these
 //! direct flag assertions are the only coverage — per the reproduce-first / direct-emission-test
 //! discipline.
@@ -124,6 +128,42 @@ func f():
 }
 
 #[test]
+fn lambda_reading_bare_native_member_is_marked() {
+    // A bare native property of the implicit `self` (Node.name) inside a lambda resolves through
+    // the implicit-self native-member walk (reduce_identifier step 3.5 → try_native_member),
+    // mirroring analyzer.cpp:4428. Must be marked.
+    let src = "\
+extends Node
+
+func f():
+\tvar g = func(): return name
+";
+    assert!(
+        lambda_uses_self(src),
+        "a lambda reading a bare native member of self must be marked use_self (#141)"
+    );
+}
+
+#[test]
+fn lambda_using_self_dot_member_is_marked() {
+    // `self.hp` in a lambda body: the `self` sub-expression hits reduce_self (analyzer.cpp:4778),
+    // so the lambda is marked. This stays marked via the implicit `self`, not the explicit-base
+    // member path.
+    let src = "\
+extends Node
+
+var hp := 10
+
+func f():
+\tvar g = func(): return self.hp
+";
+    assert!(
+        lambda_uses_self(src),
+        "a lambda using `self.member` must be marked use_self via the self sub-expression (#141)"
+    );
+}
+
+#[test]
 fn lambda_using_only_locals_is_not_marked() {
     // Negative control: a lambda touching only its own params/locals captures nothing of `self`
     // and must NOT be marked. Over-marking here would be the inverse fidelity bug.
@@ -136,5 +176,42 @@ func f():
     assert!(
         !lambda_uses_self(src),
         "a lambda using only its own params/locals must NOT be marked use_self (#141)"
+    );
+}
+
+#[test]
+fn lambda_reading_explicit_base_member_is_not_marked() {
+    // Fidelity guard: an EXPLICIT-base instance member access (`obj.position`) inside a lambda
+    // resolves through `reduce_identifier_from_base` (analyzer.cpp:4040-4378), which has NO
+    // mark_lambda_use_self site. Godot does not mark the lambda use_self here, so neither may
+    // gdls. (Reproduce-first for the over-marking fixed in review: the prior `is_meta_type`-gated
+    // marking inside `try_native_member` fired on this instance base.)
+    let src = "\
+extends Node
+
+func f():
+\tvar obj := Node.new()
+\tvar g = func(): return obj.name
+";
+    assert!(
+        !lambda_uses_self(src),
+        "a lambda reading an explicit-base member (`obj.member`) must NOT be marked use_self (#141)"
+    );
+}
+
+#[test]
+fn lambda_reading_meta_type_constant_is_not_marked() {
+    // Fidelity guard: a meta-type member access (`Color.RED` — a class constant on the type,
+    // not an instance member) inside a lambda is not an implicit-self use. Godot's constant arm
+    // (analyzer.cpp:4344-4359) has no mark site; gdls must not mark.
+    let src = "\
+extends Node
+
+func f():
+\tvar g = func(): return Color.RED
+";
+    assert!(
+        !lambda_uses_self(src),
+        "a lambda reading a meta-type constant (`Color.RED`) must NOT be marked use_self (#141)"
     );
 }
