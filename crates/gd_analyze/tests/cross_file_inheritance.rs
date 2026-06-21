@@ -540,3 +540,21 @@ func f():
         "a lambda reading an inherited CONSTANT (SPEED) through a cross-file base must NOT mark use_self (#141)"
     );
 }
+
+/// #141 cross-file arm: a lambda referencing an INHERITED SIGNAL through a cross-file Script base
+/// marks `use_self` (Godot's SIGNAL arm, analyzer.cpp:4425 via the MEMBER_SIGNAL fallthrough).
+/// Pins the `Signal` leg of the implicit-self kind-gate, alongside the `Variable` positive above.
+#[test]
+fn lambda_reading_cross_file_inherited_signal_marks_use_self() {
+    let child = "\
+extends BaseThing
+func f():
+\tvar g = func(): return ping
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://child.gd", "")]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    assert!(
+        result.lambda_uses_self(sole_lambda(child)),
+        "a lambda referencing an inherited signal (ping) through a cross-file base must mark use_self (#141)"
+    );
+}
