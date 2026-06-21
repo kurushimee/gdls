@@ -81,8 +81,9 @@ func _ready() -> void:
 ";
     let msgs = error_messages(src);
     assert!(
-        msgs.iter().any(|m| m
-            == "Too few arguments for \"set()\" call. Expected at least 2 but received 1."),
+        msgs.iter()
+            .any(|m| m
+                == "Too few arguments for \"set()\" call. Expected at least 2 but received 1."),
         "native under-call must emit Too few arguments; got {msgs:?}"
     );
 }
@@ -167,5 +168,51 @@ func _ready() -> void:
     assert!(
         !msgs.iter().any(|m| m.contains("arguments for")),
         "optional-default native called with required args must be silent; got {msgs:?}"
+    );
+}
+
+// --- CONSTRUCTOR with a parameterized `_init`: SILENT ----------------------------------------
+
+#[test]
+fn constructor_with_arguments_is_silent() {
+    // `X.new(1, 2)` against a `func _init(a, b)` synthesizes the instance type directly without
+    // binding `_init`'s signature, so `sig` stays at its zero-arg default. The arity check must
+    // NOT run on that path — Godot resolves the real `_init` arity, so the call is valid and gdls
+    // must never manufacture `Too many arguments... Expected at most 0`.
+    let src = "\
+extends RefCounted
+
+class Inner:
+\tfunc _init(_a, _b):
+\t\tpass
+
+func make() -> void:
+\tvar _x = Inner.new(1, 2)
+";
+    let msgs = error_messages(src);
+    assert!(
+        !msgs.iter().any(|m| m.contains("arguments for")),
+        "constructor with a parameterized _init must not arity-error; got {msgs:?}"
+    );
+}
+
+// --- UNRESOLVED cross-file / dynamic call with args: SILENT ----------------------------------
+
+#[test]
+fn unresolved_variant_call_with_arguments_is_silent() {
+    // A call on a Variant receiver degrades to "Unknown stays dynamic" — `found = true` to suppress
+    // the value-callable error, but `sig` is left at its zero-arg default. Arity-checking that path
+    // would emit a phantom `Too many arguments... Expected at most 0` Godot never produces (it skips
+    // validate_call_arg whenever get_function_signature returns false).
+    let src = "\
+extends Node
+
+func run(thing) -> void:
+\tthing.do_something(1, 2, 3)
+";
+    let msgs = error_messages(src);
+    assert!(
+        !msgs.iter().any(|m| m.contains("arguments for")),
+        "unresolved dynamic call must not arity-error; got {msgs:?}"
     );
 }

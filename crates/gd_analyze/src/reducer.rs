@@ -3763,6 +3763,13 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     let mut return_type: Option<DataType> = None;
     let mut found = false;
     let mut sig = CallSig::default();
+    // True only when a REAL signature was bound into `sig` (an in-file/cross-file/native/builtin
+    // method whose parameter arity is known). `found` alone is too coarse: the constructor arm and
+    // the two "Unknown stays dynamic" Variant-degrade fallbacks set `found = true` to suppress the
+    // value-callable error while leaving `sig` at its zero-arg default — so the arity check
+    // (analyzer.cpp:5944) must gate on this narrower predicate, never on bare `found`, or it would
+    // emit a phantom "Expected at most 0" on a parameterized `_init` or an unresolved cross-file call.
+    let mut sig_resolved = false;
     let mut in_file_function_id: Option<NodeId> = None;
     // The class node DECLARING an in-file-resolved callee (the chain link
     // `lookup_class_function_or_member` found it on) — the owning class recorded on
@@ -3812,6 +3819,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     sig = function_signature(ctx, fn_id);
                     return_type = Some(sig.return_dt.clone());
                     found = true;
+                    sig_resolved = true;
                 }
                 ClassCallLookup::NotAFunction => {
                     // analyzer.cpp:5980-5984 — `Member "X" is not a function.` fires alongside
@@ -3833,6 +3841,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                                 sig = *chain_sig;
                                 return_type = Some(sig.return_dt.clone());
                                 found = true;
+                                sig_resolved = true;
                                 cross_file_callee = Some(link);
                             }
                             ChainCall::Other => {}
@@ -3851,6 +3860,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                                     return_type = Some(s.return_dt.clone());
                                     sig = s;
                                     native_callee = root;
+                                    sig_resolved = true;
                                 } else {
                                     return_type = Some(DataType::variant());
                                 }
@@ -3871,6 +3881,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                             return_type = Some(s.return_dt.clone());
                             sig = s;
                             found = true;
+                            sig_resolved = true;
                             native_callee = Some(root);
                         }
                     }
@@ -3883,6 +3894,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             return_type = Some(s.return_dt.clone());
             sig = s;
             found = true;
+            sig_resolved = true;
             native_callee = Some(base_type.native_type.clone());
         }
     } else if base_type.kind == DtKind::Script {
@@ -3901,6 +3913,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     sig = *chain_sig;
                     return_type = Some(sig.return_dt.clone());
                     found = true;
+                    sig_resolved = true;
                     // WP-N1b: record the DECLARING chain link for call-edge bookkeeping —
                     // consumed at the Binding::Call recording site below (accurate references
                     // filtering).
@@ -3923,6 +3936,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         return_type = Some(s.return_dt.clone());
                         sig = s;
                         native_callee = root;
+                        sig_resolved = true;
                     } else {
                         return_type = Some(DataType::variant());
                     }
@@ -3960,6 +3974,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             return_type = Some(s.return_dt.clone());
             sig = s;
             found = true;
+            sig_resolved = true;
         }
     }
 
@@ -3968,6 +3983,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             return_type = Some(s.return_dt.clone());
             sig = s;
             found = true;
+            sig_resolved = true;
         }
     }
 
@@ -4098,13 +4114,18 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             }
         }
 
-        // analyzer.cpp:6085 → validate_call_arg.
-        // Count checks first (analyzer.cpp:6086-6091). For in-file functions the parameter
-        // count is authoritative (we counted `parameters.len()` + default-initializer count);
-        // for native methods the dump doesn't carry a per-method `default_arguments.size()`,
-        // so the conservative choice is exact arity (min == max), which matches what
-        // `lookup_native_method` populates.
-        if in_file_function_id.is_some() {
+        // analyzer.cpp:6085 → validate_call_arg (analyzer.cpp:5944-5950). The count checks run
+        // for every REAL resolved signature — in-file functions and native/builtin methods alike —
+        // because all now carry an accurate (min_params, max_params) pair (in-file from declared
+        // parameters + default initializers; native/builtin from the dump's per-param default
+        // literals). `sig_resolved` is the gate, not bare `found`: the constructor arm and the two
+        // "Unknown stays dynamic" Variant-degrade fallbacks set `found = true` to suppress the
+        // value-callable error while leaving `sig` at its zero-arg default, and arity-checking
+        // those would manufacture a phantom "Expected at most 0" Godot never emits (it skips
+        // validate_call_arg whenever get_function_signature returns false — analyzer.cpp:3626).
+        // Too-few anchors on the whole call; too-many anchors on the first excess argument
+        // (`p_call->arguments[par_types.size()]`).
+        if sig_resolved {
             if arg_count < sig.min_params {
                 ctx.push_error(
                     format!(
@@ -4119,7 +4140,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         r#"Too many arguments for "{function_name}()" call. Expected at most {} but received {arg_count}."#,
                         sig.max_params
                     ),
-                    id,
+                    call.arguments[sig.max_params],
                 );
             }
         }
@@ -4662,12 +4683,22 @@ fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> 
         .iter()
         .map(|p| type_from_type_ref(ctx, &p.ty))
         .collect();
-    let n = m.params.len();
+    // Per-param default literals give the optional-argument boundary, identical to the native
+    // path: `min_params` is the required count, `max_params` the total — so the arity check at
+    // analyzer.cpp:5944 treats `Array.slice(2, 3)` / `Array.duplicate()` as valid. The dump only
+    // ever attaches defaults to trailing parameters (mirroring `MethodInfo::default_arguments`, a
+    // trailing-only vector), so the required count equals the leading-required prefix length.
+    let max_params = m.params.len();
+    let min_params = m
+        .params
+        .iter()
+        .filter(|p| p.default_value.is_none())
+        .count();
     Some(CallSig {
         return_dt,
         par_types,
-        min_params: n,
-        max_params: n,
+        min_params,
+        max_params,
         is_vararg: m.is_vararg,
         is_static: m.is_static,
         is_coroutine: false,
@@ -4677,12 +4708,12 @@ fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> 
 }
 
 /// Walk a native class's inherits chain looking for a method by name, projecting the dump's
-/// `Method` record into a [`CallSig`]. The dump doesn't carry a per-method default-args count
-/// (Godot's `default_arguments.size()` defaults to 0 at the `MethodInfo` level for native
-/// methods until ClassDB attaches them), so we keep arity exact (`min == max`). Per-param types
-/// route through [`type_from_type_ref`] — `TypeRef::Named` for which the dump has no class /
-/// builtin entry degrades silently to Variant, mirroring the trimmed-dump permissiveness used
-/// across the rest of reduce_call.
+/// `Method` record into a [`CallSig`]. Per-param default literals (`Param::default_value`) give the
+/// optional-argument boundary: `min_params` counts the leading required params, `max_params` is the
+/// total — mirroring how `function_signature_from_info` reads `MethodInfo::default_arguments.size()`
+/// (analyzer.cpp:5923) for the arity check at analyzer.cpp:5944. Per-param types route through
+/// [`type_from_type_ref`] — `TypeRef::Named` for which the dump has no class / builtin entry degrades
+/// silently to Variant, mirroring the trimmed-dump permissiveness used across the rest of reduce_call.
 fn lookup_native_method(ctx: &AnalysisContext, native: &str, name: &str) -> Option<CallSig> {
     let mut cur = Some(native.to_owned());
     while let Some(c) = cur {
@@ -4698,12 +4729,17 @@ fn lookup_native_method(ctx: &AnalysisContext, native: &str, name: &str) -> Opti
                 .iter()
                 .map(|p| type_from_type_ref(ctx, &p.ty))
                 .collect();
-            let n = m.params.len();
+            let max_params = m.params.len();
+            let min_params = m
+                .params
+                .iter()
+                .filter(|p| p.default_value.is_none())
+                .count();
             return Some(CallSig {
                 return_dt,
                 par_types,
-                min_params: n,
-                max_params: n,
+                min_params,
+                max_params,
                 is_vararg: m.is_vararg,
                 is_static: m.is_static,
                 // Native methods never carry a coroutine flag in the dump — only in-file
