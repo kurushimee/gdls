@@ -745,7 +745,10 @@ pub fn type_definition(
 /// [`type_definition`] (phase-4 `typeHierarchy` anchors supertypes through this same path). Three
 /// outcomes, by [`DtKind`]:
 ///   - [`DtKind::Script`] → the external script's `class_name` site (or its file head if it has no
-///     `class_name`), via [`script_decl_location`] keyed on the [`ScriptRef`](gd_analyze::ScriptRef)'s file.
+///     `class_name`), via [`script_decl_location`] keyed on the [`ScriptRef`](gd_analyze::ScriptRef)'s
+///     file. When the ref carries an inner-class chain (`Inner.new()`), the chain is threaded through
+///     so the jump lands on the INNER class's identifier, not the file root (#151, mirroring the
+///     value-node inner resolution #146 fixed for hover/definition).
 ///   - [`DtKind::Native`] → that engine class's stub header, via [`native_class_header_location`].
 ///   - everything else (`Builtin`/`Variant`/`Enum`/`Resolving`/`Unresolved`) → `None`: these name no
 ///     single declaring document to jump to, and guessing would violate "never lie" (W10).
@@ -755,7 +758,10 @@ pub fn type_definition(
 /// being special-cased (matching the upstream invariant noted on `DtKind::Class`).
 fn type_decl_location(state: &mut ServerState, dt: &DataType) -> Option<Location> {
     match dt.kind {
-        DtKind::Script => script_decl_location(state, dt.script_type.as_ref()?.file),
+        DtKind::Script => {
+            let sr = dt.script_type.as_ref()?;
+            script_decl_location(state, sr.file, &sr.inner)
+        }
         DtKind::Native if !dt.native_type.is_empty() => {
             native_class_header_location(state, &dt.native_type)
         }
@@ -769,10 +775,21 @@ fn type_decl_location(state: &mut ServerState, dt: &DataType) -> Option<Location
 /// registry first); kept separate so that name-keyed fast path stays untouched.
 ///
 /// Prefers the open buffer's cached parse (an edited buffer outranks the index), else reads disk.
-/// Anchors at the root class's identifier span; a script with no `class_name` (no root identifier)
-/// falls back to a `(0,0)` whole-file [`Location`] — the existing convention for file targets
-/// (`find_res_path_definition` / `find_autoload_definition`).
-fn script_decl_location(state: &mut ServerState, fid: gd_project::FileId) -> Option<Location> {
+/// With an empty `inner` chain, anchors at the root class's identifier span; a script with no
+/// `class_name` (no root identifier) falls back to a `(0,0)` whole-file [`Location`] — the existing
+/// convention for file targets (`find_res_path_definition` / `find_autoload_definition`).
+///
+/// With a non-empty `inner` chain (`Inner.new()` typed `ScriptRef { inner: ["Inner"] }`), descends
+/// the parse tree's inner-class declarations and anchors the INNER class's identifier — so
+/// typeDefinition on an inner-class instance lands on `class Inner`, not the file root (#151). Inner
+/// classes always carry an identifier (the `class <Name>` token), so the chain either resolves to a
+/// span or — on watcher/buffer drift where the named inner class is gone — degrades to the file head,
+/// never to the wrong (root) identifier.
+fn script_decl_location(
+    state: &mut ServerState,
+    fid: gd_project::FileId,
+    inner: &[String],
+) -> Option<Location> {
     let path = state.workspace.index.path(fid)?.to_path_buf();
     let uri = path_to_file_uri(&path)?;
     let uri_str = uri.as_str().to_owned();
@@ -790,9 +807,15 @@ fn script_decl_location(state: &mut ServerState, fid: gd_project::FileId) -> Opt
         }
     };
     let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
-    let Some(ident_span) = root_class_identifier_span(&parsed.tree) else {
-        // No `class_name` → no identifier to anchor; point at the file head (the file-target
-        // convention) so the jump still lands in the declaring script.
+    let ident_span = if inner.is_empty() {
+        root_class_identifier_span(&parsed.tree)
+    } else {
+        inner_class_identifier_span(&parsed.tree, inner)
+    };
+    let Some(ident_span) = ident_span else {
+        // No identifier to anchor (a root with no `class_name`, or a drifted inner-class chain that
+        // no longer resolves); point at the file head (the file-target convention) so the jump still
+        // lands in the declaring script rather than the wrong identifier.
         return Some(Location {
             uri,
             range: file_start_range(),
@@ -2371,6 +2394,39 @@ fn root_class_identifier_span(tree: &ParseTree) -> Option<gd_syntax::ByteSpan> {
         return None;
     };
     Some(tree.get(root.identifier?).span)
+}
+
+/// The byte span of an inner class's identifier, descending the `chain` of inner-class names from the
+/// root class (`["Inner"]` → the root's `class Inner` member; `["Outer", "Inner"]` → `Outer.Inner`).
+/// Each segment matches a `Member::Class` whose identifier text equals the name; the final segment's
+/// identifier span is returned. `None` if the tree has no root class, any segment is missing (a
+/// drifted chain), or the resolved inner class lacks an identifier. Distinct from `iface_at_inner`,
+/// which walks the analyzer's `Interface` tree — this walks the parse tree for the source span.
+fn inner_class_identifier_span(tree: &ParseTree, chain: &[String]) -> Option<gd_syntax::ByteSpan> {
+    let mut class_id = tree.root_id()?;
+    if !matches!(&tree.get(class_id).kind, NodeKind::Class(_)) {
+        return None;
+    }
+    for seg in chain {
+        let NodeKind::Class(class) = &tree.get(class_id).kind else {
+            return None;
+        };
+        let next = class.members.iter().find_map(|m| match m {
+            Member::Class(id) => match &tree.get(*id).kind {
+                NodeKind::Class(c) => {
+                    let name = c.identifier.map(|i| ident_name(tree, i));
+                    (name == Some(seg.as_str())).then_some(*id)
+                }
+                _ => None,
+            },
+            _ => None,
+        })?;
+        class_id = next;
+    }
+    let NodeKind::Class(inner) = &tree.get(class_id).kind else {
+        return None;
+    };
+    Some(tree.get(inner.identifier?).span)
 }
 
 // =============================================================================================
@@ -4944,7 +5000,7 @@ fn script_hierarchy_item(
         .unwrap_or_else(|| path.file_stem().unwrap_or("script").to_owned());
     // Anchor on the class-name identifier when the script has one; else the file start (the
     // file-target convention shared with `script_decl_location`).
-    let range = match script_decl_location(state, fid) {
+    let range = match script_decl_location(state, fid, &[]) {
         Some(loc) => loc.range,
         None => file_start_range(),
     };
