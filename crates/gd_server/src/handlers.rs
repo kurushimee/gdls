@@ -3215,7 +3215,8 @@ pub fn document_highlight(
 
     // Collect this file's occurrences (no cross-file fan-out), then dedup by range BEFORE
     // classifying so a single occurrence never yields two highlights with conflicting kinds.
-    let mut sites = collect_in_file_highlight_sites(state, &key, &uri, &text, &parsed, byte, &name);
+    let mut sites =
+        collect_in_file_highlight_sites(state, &key, &uri, &text, &parsed, byte, &name, &mapper);
     let range_key = |r: &Range| (r.start.line, r.start.character, r.end.line, r.end.character);
     sites.sort_by_key(|loc| range_key(&loc.range));
     sites.dedup_by(|a, b| a.range == b.range);
@@ -3246,6 +3247,10 @@ pub fn document_highlight(
 /// the declaring identifier is itself an in-file occupant the editor highlights). For a local target
 /// it is omitted here because [`push_local_binding_locations`] already emits the binding's
 /// declaration identifier (appending it again would double the decl; the dedup runs in the caller).
+//
+// The caller-built `mapper` is threaded in (not rebuilt) so a documentHighlight request — which fires
+// on cursor-rest — constructs the rope+mapper exactly once.
+#[allow(clippy::too_many_arguments)] // the request prologue: state + key/uri/text/parsed + cursor byte/name + mapper
 fn collect_in_file_highlight_sites(
     state: &mut ServerState,
     key: &CanonicalKey,
@@ -3254,10 +3259,8 @@ fn collect_in_file_highlight_sites(
     parsed: &gd_syntax::ParseResult,
     byte: usize,
     name: &str,
+    mapper: &PositionMapper,
 ) -> Vec<Location> {
-    let enc = state.encoding;
-    let rope = Rope::from_str(text);
-    let mapper = PositionMapper::new(&rope, enc);
     let node_id = match parsed.tree.innermost_node_at(byte) {
         Some(id) => id,
         None => return Vec::new(),
@@ -3362,6 +3365,30 @@ fn collect_in_file_highlight_sites(
         }
     }
 
+    // Sub-discriminate the `NonMethodTarget::Unresolved` residue exactly as `references` does, so the
+    // in-file highlight set matches its in-file reference subset (the drift guard). Without this the
+    // `Unresolved` arm falls through to the raw `push_identifier_locations` floor, which over-grabs a
+    // same-spelled local/param shadowing a global class (`var Player` under `extends`/`: Player`).
+    //   - `InFileType`: an in-file root `enum`/inner-`class` in TYPE position — checked FIRST so a
+    //     `: FOO` cursor whose name ALSO matches a global `class_name FOO` stays on the in-file type.
+    //   - `GlobalClass`: the cursor positively refers (by identity) to a project `class_name` — a
+    //     decl-click, a `Class` use binding at the span, or a type-base segment — collected via the
+    //     occurrence-positive [`push_global_class_locations`] instead of the raw floor.
+    //   - `RawFloor`: a genuinely unresolvable name — the over-approximate raw-identifier residue.
+    let unresolved_kind = if name_is_in_file_root_type(&parsed.tree, name) {
+        UnresolvedKind::InFileType
+    } else if cursor_references_global_class(state, uri, &parsed.tree, key, text, byte, name) {
+        // `cursor_references_global_class` returns `false` when `global_class_file` is `None` (it
+        // short-circuits on a missing registry entry), so the `Some` arm is the live path; the `None`
+        // arm is a defensive belt-and-suspenders that can't be reached within one request.
+        match global_class_file(state, name) {
+            Some(cf) => UnresolvedKind::GlobalClass(cf),
+            None => UnresolvedKind::RawFloor,
+        }
+    } else {
+        UnresolvedKind::RawFloor
+    };
+
     let mut locations: Vec<Location> = Vec::new();
 
     // Declaration site — always part of the highlight set (no includeDeclaration flag). Locals are
@@ -3389,11 +3416,11 @@ fn collect_in_file_highlight_sites(
         // file's same-named decl via the name-only `find_in_file_definition`. documentHighlight is
         // single-file, so a cross-file decl simply isn't part of this buffer's highlight set. #164.
         if current_fid.is_some_and(|cf| cf == *tf) {
-            if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, &mapper) {
+            if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, mapper) {
                 locations.push(loc);
             }
         }
-    } else if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, &mapper) {
+    } else if let Some(loc) = find_in_file_definition(&parsed.tree, name, uri, mapper) {
         locations.push(loc);
     } else if let Some(loc) = find_global_class_definition(state, name) {
         // Only keep an in-file declaration — a global class declared in ANOTHER file is not an
@@ -3411,7 +3438,7 @@ fn collect_in_file_highlight_sites(
     {
         let result = analyze_with_request_token(state, key, p, &parsed.tree, text);
         if is_method_or_signal {
-            push_binding_locations(&mut locations, &result, name, uri, &mapper);
+            push_binding_locations(&mut locations, &result, name, uri, mapper);
             if let Some(tf) = target_file {
                 push_callee_ident_locations(
                     &mut locations,
@@ -3420,23 +3447,16 @@ fn collect_in_file_highlight_sites(
                     tf,
                     name,
                     uri,
-                    &mapper,
+                    mapper,
                     &mut callee_spans,
                 );
             } else {
-                push_identifier_locations(&mut locations, &parsed.tree, name, uri, &mapper);
+                push_identifier_locations(&mut locations, &parsed.tree, name, uri, mapper);
             }
         } else {
             match &non_method_target {
                 NonMethodTarget::Member(tf) => {
-                    push_use_binding_locations_for(
-                        &mut locations,
-                        &result,
-                        *tf,
-                        name,
-                        uri,
-                        &mapper,
-                    );
+                    push_use_binding_locations_for(&mut locations, &result, *tf, name, uri, mapper);
                 }
                 NonMethodTarget::Local {
                     decl_ident,
@@ -3448,7 +3468,7 @@ fn collect_in_file_highlight_sites(
                         *decl_ident,
                         *fn_span,
                         uri,
-                        &mapper,
+                        mapper,
                     );
                 }
                 NonMethodTarget::EnumValue {
@@ -3462,13 +3482,33 @@ fn collect_in_file_highlight_sites(
                         *decl_file,
                         qualified,
                         uri,
-                        &mapper,
+                        mapper,
                     );
                 }
-                NonMethodTarget::Unresolved => {
-                    push_binding_locations(&mut locations, &result, name, uri, &mapper);
-                    push_identifier_locations(&mut locations, &parsed.tree, name, uri, &mapper);
-                }
+                NonMethodTarget::Unresolved => match unresolved_kind {
+                    UnresolvedKind::GlobalClass(class_file) => {
+                        // Occurrence-positive parity with `references`: Class-use bindings by
+                        // `target_file` identity + type-base segments by position. A same-named
+                        // local/member in THIS file records no Class binding (it resolves to itself),
+                        // so it is excluded — the raw `push_identifier_locations` floor would leak it.
+                        push_global_class_locations(
+                            &mut locations,
+                            &result,
+                            &parsed.tree,
+                            class_file,
+                            name,
+                            uri,
+                            mapper,
+                        );
+                    }
+                    UnresolvedKind::InFileType | UnresolvedKind::RawFloor => {
+                        // Residue floor: the binding scan plus the raw identifier scan, which picks up
+                        // `extends Foo`, type annotations, `class_name`, and other parser-level refs
+                        // the reducer doesn't record. The caller's dedup collapses overlap.
+                        push_binding_locations(&mut locations, &result, name, uri, mapper);
+                        push_identifier_locations(&mut locations, &parsed.tree, name, uri, mapper);
+                    }
+                },
             }
         }
     }
