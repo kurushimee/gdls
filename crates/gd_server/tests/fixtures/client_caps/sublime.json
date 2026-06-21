@@ -105,8 +105,11 @@
       "linkSupport": true
     },
     "diagnostic": {
+      "codeDescriptionSupport": true,
+      "dataSupport": true,
       "dynamicRegistration": true,
       "relatedDocumentSupport": true,
+      "relatedInformation": true,
       "tagSupport": {
         "valueSet": [
           1,
