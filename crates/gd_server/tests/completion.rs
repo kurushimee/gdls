@@ -603,6 +603,67 @@ fn resolve_without_data_is_a_noop() {
     shutdown(&client, server_thread);
 }
 
+/// #152 (#146 follow-up): `completionItem/resolve` for an inner-class INSTANCE member whose name
+/// also exists on the file ROOT must attach the INNER member's `##` doc, not the root one. The
+/// completion list is already correct (the producer feeds the value's inner-class chain, #146);
+/// only the resolved doc was wrong — `resolve_script_member_doc` looked the member up on the root
+/// interface, ignoring the inner chain. Fail-OPEN before the fix (root doc shown).
+#[test]
+fn resolve_inner_class_instance_member_uses_inner_doc_not_root() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"T\"\n",
+    );
+    p.write("extension_api.json", common::MINI_API);
+    // Root `cfg` and inner `Inner.cfg` share a name but carry DISTINCT `##` docs. The instance
+    // `var x := Inner.new()` types `x` as the inner class (#146), so `x.cfg` resolves on `Inner`.
+    let src = concat!(
+        "## ROOT_CONFIG_MARKER\n",  // 0
+        "var cfg: int = 1\n",       // 1  root cfg
+        "\n",                       // 2
+        "class Inner:\n",           // 3
+        "\t## INNER_CONFIG_MARKER\n", // 4
+        "\tvar cfg: int = 2\n",     // 5  inner cfg (the target)
+        "\n",                       // 6
+        "func use_it() -> void:\n", // 7
+        "\tvar x := Inner.new()\n", // 8
+        "\tx.\n",                   // 9  `\tx.` → column 3
+    );
+    let uri = file_uri(&p.root.join("src/inner_resolve.gd"));
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 60, &uri, Position::new(9, 3));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let pre = list
+        .items
+        .iter()
+        .find(|i| i.label == "cfg")
+        .expect("cfg present on the inner instance")
+        .clone();
+
+    client
+        .sender
+        .send(request(61, "completionItem/resolve", &pre))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "resolve errored: {:?}", resp.error);
+    let post: CompletionItem =
+        serde_json::from_value(resp.result.expect("resolve result")).unwrap();
+
+    let doc = format!("{:?}", post.documentation);
+    assert!(
+        doc.contains("INNER_CONFIG_MARKER"),
+        "resolve must attach the INNER member's doc; got {doc}"
+    );
+    assert!(
+        !doc.contains("ROOT_CONFIG_MARKER"),
+        "resolve must NOT attach the root member's doc for an inner-class instance member; got {doc}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 // ===================================================================================================
 // Capability gating — both projections of each gate.
 // ===================================================================================================
