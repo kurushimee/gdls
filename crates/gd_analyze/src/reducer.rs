@@ -1483,6 +1483,9 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
                     ctx.push_error(msg, id);
                 }
             }
+            if non_static_instance_member_kind(ctx, class_id, &name).is_some() {
+                ctx.mark_lambda_use_self();
+            }
             return;
         }
     }
@@ -1500,11 +1503,23 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // variables.
     if !ctx.reducing_callee {
         if let Some(sr) = current_class_script_base(ctx) {
-            if let Some((dt, fold)) = lookup_script_chain_member(ctx, &sr, &name, false, id) {
+            if let Some((dt, fold, kind)) = lookup_script_chain_member(ctx, &sr, &name, false, id) {
                 if let Some(fv) = fold {
                     ctx.folds.set(id, fv);
                 }
                 ctx.set_type(id, dt);
+                // Implicit-self access marks `use_self` only for INSTANCE members — variables,
+                // signals, instance functions (analyzer.cpp:4425/4428/4506). An inherited
+                // constant or enum (Godot's CONSTANT/ENUM arms at :4344-4359) has no mark site,
+                // so it must NOT mark even though it resolved through the implicit-self chain.
+                if matches!(
+                    kind,
+                    BindingSymbolKind::Variable
+                        | BindingSymbolKind::Signal
+                        | BindingSymbolKind::Function
+                ) {
+                    ctx.mark_lambda_use_self();
+                }
                 return;
             }
         }
@@ -1514,7 +1529,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         // native-method path owns those).
         if let Some(class_id) = ctx.current_class {
             if let Some(root) = crate::resolver::nearest_native_ancestor(ctx, class_id) {
-                if try_native_member(ctx, &root, &name, false, id) {
+                if try_native_member(ctx, &root, &name, false, true, id) {
                     return;
                 }
             }
@@ -2677,6 +2692,7 @@ fn reduce_self(ctx: &mut AnalysisContext, id: NodeId) {
     };
     let class_meta = ctx.get_type(cc).clone();
     ctx.set_type(id, type_from_metatype(class_meta));
+    ctx.mark_lambda_use_self();
 }
 
 // ===================================================================================================
@@ -4003,6 +4019,8 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     id,
                 );
             }
+        } else if is_self && !sig.is_static {
+            ctx.mark_lambda_use_self();
         }
 
         // analyzer.cpp:3663 — `Cannot get return value ... void`. Godot gates on
@@ -5230,14 +5248,15 @@ pub(crate) fn script_instance_datatype(
 /// `!base_is_meta`; functions if `!base_is_meta || static`. A name that matches but fails its
 /// condition keeps walking (Godot's switch falls through to the next class). On a hit, records a
 /// [`Binding::Use`] against the DECLARING link's file — what `textDocument/references` and
-/// `definition` project for member-access sites — and returns the type (+ optional fold).
+/// `definition` project for member-access sites — and returns the type (+ optional fold) plus the
+/// resolved member kind (so an implicit-self caller can mark `use_self` for instance members only).
 fn lookup_script_chain_member(
     ctx: &mut AnalysisContext,
     start: &crate::data_type::ScriptRef,
     name: &str,
     base_is_meta: bool,
     bind_site: NodeId,
-) -> Option<(DataType, Option<FoldedValue>)> {
+) -> Option<(DataType, Option<FoldedValue>, BindingSymbolKind)> {
     let chain = crate::script_chain::resolve_script_chain(ctx, start);
     let xf = ctx.xfile;
     for link in chain.links.iter() {
@@ -5264,7 +5283,7 @@ fn lookup_script_chain_member(
                 }
             }
             record_member_use(ctx, link, BindingSymbolKind::Enum, name, bind_site);
-            return Some((dt, None));
+            return Some((dt, None, BindingSymbolKind::Enum));
         }
         let Some(member) = iface.members.iter().find(|m| m.name == name) else {
             continue;
@@ -5281,7 +5300,7 @@ fn lookup_script_chain_member(
                     dt.is_constant = true;
                     record_member_use(ctx, link, BindingSymbolKind::EnumValue, name, bind_site);
                     // Placeholder fold: `is_reduced` gates read only the type.
-                    return Some((dt, Some(FoldedValue::Int(0))));
+                    return Some((dt, Some(FoldedValue::Int(0)), BindingSymbolKind::EnumValue));
                 }
                 // CONSTANT arm (analyzer.cpp:4193-4200): the member's declared type; untyped
                 // consts degrade to soft Variant — permissive, never an enum value.
@@ -5291,7 +5310,7 @@ fn lookup_script_chain_member(
                 // No fold: the value isn't materializable cross-file; every fold consumer is an
                 // `is_reduced` gate or type-only narrowing, so absence only skips
                 // const-companion diagnostics — it never adds one.
-                return Some((dt, None));
+                return Some((dt, None, BindingSymbolKind::Constant));
             }
             MK::Var | MK::Property => {
                 if base_is_meta && !member.flags.is_static {
@@ -5305,7 +5324,7 @@ fn lookup_script_chain_member(
                 dt.is_constant = false;
                 dt.is_read_only = false;
                 record_member_use(ctx, link, BindingSymbolKind::Variable, name, bind_site);
-                return Some((dt, None));
+                return Some((dt, None, BindingSymbolKind::Variable));
             }
             MK::Signal => {
                 if base_is_meta {
@@ -5329,7 +5348,7 @@ fn lookup_script_chain_member(
                     return_type: Box::new(DataType::default()),
                 });
                 record_member_use(ctx, link, BindingSymbolKind::Signal, name, bind_site);
-                return Some((dt, None));
+                return Some((dt, None, BindingSymbolKind::Signal));
             }
             MK::Func => {
                 if base_is_meta && !member.flags.is_static {
@@ -5339,7 +5358,7 @@ fn lookup_script_chain_member(
                 // lives with reduce_call's cross-file CallSig path.
                 let dt = make_callable_type();
                 record_member_use(ctx, link, BindingSymbolKind::Function, name, bind_site);
-                return Some((dt, None));
+                return Some((dt, None, BindingSymbolKind::Function));
             }
             // Named enums are matched through `iface.enums` above; the member-list entry is
             // only the declaration marker.
@@ -5647,7 +5666,7 @@ fn reduce_identifier_from_base(
             // analyzer.cpp:4166-4267 script_classes loop crossing the file boundary) — this is
             // what types `self.hp` when `hp` lives in a cross-file base.
             if let Some(sr) = script_base_of_class(ctx, class_id) {
-                if let Some((dt, fold)) =
+                if let Some((dt, fold, _kind)) =
                     lookup_script_chain_member(ctx, &sr, &name, base.is_meta_type, identifier_id)
                 {
                     if let Some(fv) = fold {
@@ -5664,7 +5683,17 @@ fn reduce_identifier_from_base(
             // corpus pin, await_with_signals_no_warning.gd). A hit types the identifier; a miss
             // falls through to the caller's error/warning semantics, like upstream.
             if let Some(root) = crate::resolver::nearest_native_ancestor(ctx, class_id) {
-                if try_native_member(ctx, &root, &name, is_constructor, identifier_id) {
+                if try_native_member(
+                    ctx,
+                    &root,
+                    &name,
+                    is_constructor,
+                    // Explicit-base path (`obj.member`): Godot marks no lambda self-capture here
+                    // (analyzer.cpp:4040-4378 has no mark_lambda_use_self site), only on the
+                    // implicit-self path.
+                    false,
+                    identifier_id,
+                ) {
                     return;
                 }
             }
@@ -5710,7 +5739,7 @@ fn reduce_identifier_from_base(
         // typed per Godot's access-mode conditions, with a `Binding::Use` recorded against the
         // declaring file. Misses continue into cycle detection, then the chain's native root.
         if let Some(sr) = base.script_type.clone() {
-            if let Some((dt, fold)) =
+            if let Some((dt, fold, _kind)) =
                 lookup_script_chain_member(ctx, &sr, &name, base.is_meta_type, identifier_id)
             {
                 if let Some(fv) = fold {
@@ -5779,7 +5808,17 @@ fn reduce_identifier_from_base(
         // `Cannot find member` ("never lie").
         if let Some(sr) = base.script_type.as_ref() {
             if let Some(root) = crate::script_chain::chain_native_root(ctx, sr) {
-                if try_native_member(ctx, &root, &name, is_constructor, identifier_id) {
+                if try_native_member(
+                    ctx,
+                    &root,
+                    &name,
+                    is_constructor,
+                    // Explicit-base path (`obj.member`): Godot marks no lambda self-capture here
+                    // (analyzer.cpp:4040-4378 has no mark_lambda_use_self site), only on the
+                    // implicit-self path.
+                    false,
+                    identifier_id,
+                ) {
                     return;
                 }
             }
@@ -5799,7 +5838,14 @@ fn reduce_identifier_from_base(
         }
         // A miss leaves the type unset — the caller (reduce_subscript) emits the
         // `Cannot find member` error for genuinely-introspectable native bases.
-        let _ = try_native_member(ctx, &native_name, &name, is_constructor, identifier_id);
+        let _ = try_native_member(
+            ctx,
+            &native_name,
+            &name,
+            is_constructor,
+            base.is_meta_type,
+            identifier_id,
+        );
     }
     // CLASS / SCRIPT branches handled above; bases with no native_type and no class_node degrade
     // to Variant (the silent path Godot's `current_class`-fallback at 4030-4034 would have
@@ -5817,17 +5863,28 @@ fn try_native_member(
     native_name: &str,
     name: &str,
     is_constructor: bool,
+    implicit_self: bool,
     identifier_id: NodeId,
 ) -> bool {
     // 1. Property (analyzer.cpp:4317-4326). Walk inherits chain to find the declaring class.
     if let Some(prop) = lookup_native_property(ctx, native_name, name) {
         ctx.set_type(identifier_id, prop);
+        // Godot marks the enclosing lambda `use_self` for an instance member reached through the
+        // implicit `self` (analyzer.cpp:4428 MEMBER_VARIABLE). The explicit-base path
+        // (`obj.position`, analyzer.cpp:4040-4378) has no such site, so only the implicit-self
+        // caller passes `implicit_self`.
+        if implicit_self {
+            ctx.mark_lambda_use_self();
+        }
         return true;
     }
     // 2. Method (analyzer.cpp:4327-4332). gdls returns the callable type (Variant + sig);
     //    the full make_callable_type lives with reduce_call.
     if native_method_exists(ctx, native_name, name) {
         ctx.set_type(identifier_id, make_callable_type());
+        if implicit_self {
+            ctx.mark_lambda_use_self();
+        }
         return true;
     }
     // 3. Signal (analyzer.cpp:4333-4338).
@@ -5841,6 +5898,10 @@ fn try_native_member(
         };
         t.is_meta_type = false;
         ctx.set_type(identifier_id, t);
+        // analyzer.cpp:4425 MEMBER_SIGNAL fallthrough marks on the implicit-self path.
+        if implicit_self {
+            ctx.mark_lambda_use_self();
+        }
         return true;
     }
     // 4. Enum (analyzer.cpp:4339-4343).
@@ -6234,6 +6295,8 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
+    ctx.mark_lambda_use_self();
+
     // Otherwise the access is a hard `NATIVE Node` (analyzer.cpp:3882-3886): bare `Node`, not the
     // scene-precise node class — faithful to Godot, which never reads the scene for the analyzer's
     // type. Member misses on it raise UNSAFE_*_ACCESS like any typed node base.
@@ -6451,10 +6514,9 @@ fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
 ///   identifiers would resolve to Variant via the tail-guard — the same permissive fallback used
 ///   for un-ported expression kinds elsewhere — so `lambda.call(args)` and parameter mentions
 ///   inside the body still typecheck without false positives.
-/// * **`current_lambda` tracking** (analyzer.cpp:4679-4682) is gated on `mark_lambda_use_self`
-///   and the static-self check that don't apply in gdls's permissive `reduce_get_node` /
-///   `reduce_self` paths, so the field isn't wired on `AnalysisContext` yet — joins WP-E3l with
-///   the rest of the lambda body machinery.
+/// * **`current_lambda` tracking** (analyzer.cpp:4679-4682) is mirrored by
+///   [`AnalysisContext::current_lambda_stack`], so `mark_lambda_use_self` can mark the current
+///   lambda and all parents without mutating gd_syntax's immutable parse tree.
 fn reduce_lambda(ctx: &mut AnalysisContext, id: NodeId) {
     // analyzer.cpp:4668-4673 — Lambda is always a Callable. The make_callable_type placeholder
     // is folded inline here since we don't yet carry method-info for the callable's signature
@@ -6476,7 +6538,9 @@ fn reduce_lambda(ctx: &mut AnalysisContext, id: NodeId) {
     // lambdas).
     if let NodeKind::Lambda(l) = &ctx.node(id).kind {
         if let Some(func_id) = l.function {
+            ctx.push_current_lambda(id);
             crate::resolver::resolve_function_signature(ctx, func_id);
+            ctx.pop_current_lambda();
         }
     }
 
@@ -6493,12 +6557,14 @@ fn reduce_lambda(ctx: &mut AnalysisContext, id: NodeId) {
     // `false` even though the initializer runs under `static_context = true`. Carrying the
     // captured value through the queue lets drain seed `static_context` correctly without
     // mutating the immutable parse tree.
-    ctx.pending_lambda_bodies.push((
-        id,
-        ctx.concrete_function,
-        ctx.static_context,
-        ctx.suite_stack.clone(),
-    ));
+    ctx.pending_lambda_bodies
+        .push(crate::context::PendingLambdaBody {
+            lambda_id: id,
+            captured_concrete: ctx.concrete_function,
+            captured_static: ctx.static_context,
+            captured_suite_stack: ctx.suite_stack.clone(),
+            captured_lambda_stack: ctx.current_lambda_stack.clone(),
+        });
 }
 
 #[cfg(test)]

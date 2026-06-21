@@ -85,6 +85,13 @@ pub struct AnalysisResult {
     /// [`AnalysisContext::finish`]). A frozen output — never mutated post-construction.
     bindings: Vec<Binding>,
 
+    /// Lambda expressions that use `self` implicitly or explicitly while being reduced.
+    ///
+    /// Godot stores this as `GDScriptParser::LambdaNode::use_self`, mutated by
+    /// `GDScriptAnalyzer::mark_lambda_use_self()` (analyzer.cpp:6364). gdls keeps the parse tree
+    /// immutable during analysis, so the analyzer records the same fact in this side table.
+    lambda_uses_self: FxHashSet<NodeId>,
+
     /// `true` when analysis was cut short by the WP-O3 fixpoint governor or a WP-O4 cancellation
     /// token (see [`AnalysisContext::checkpoint`]), so the side tables (`types`, `bindings`,
     /// `member_xrefs`) are **partial**, not authoritative. Callers that cache results keyed by
@@ -102,6 +109,14 @@ impl AnalysisResult {
     #[must_use]
     pub fn bindings(&self) -> &[Binding] {
         &self.bindings
+    }
+
+    /// Whether a lambda expression was marked as using `self` during analysis.
+    ///
+    /// Mirrors Godot's `LambdaNode::use_self` flag without mutating the syntax tree.
+    #[must_use]
+    pub fn lambda_uses_self(&self, lambda: NodeId) -> bool {
+        self.lambda_uses_self.contains(&lambda)
     }
 
     /// This file's per-member cross-file initializer xrefs (see the field docs). Read side of the
@@ -131,9 +146,20 @@ impl AnalysisResult {
             diagnostics,
             member_xrefs,
             bindings,
+            lambda_uses_self: FxHashSet::default(),
             bailed: false,
         }
     }
+}
+
+/// A lambda whose body is queued for resolution after the enclosing body statement.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingLambdaBody {
+    pub lambda_id: NodeId,
+    pub captured_concrete: Option<NodeId>,
+    pub captured_static: bool,
+    pub captured_suite_stack: Vec<NodeId>,
+    pub captured_lambda_stack: Vec<NodeId>,
 }
 
 /// The mutable analysis state for one file. Borrows the inputs (tree, native DB, cross-file query,
@@ -201,7 +227,8 @@ pub struct AnalysisContext<'a> {
     /// so we track it explicitly.
     pub concrete_function: Option<NodeId>,
     /// Lambda nodes whose bodies are queued for resolution after the enclosing class body
-    /// finishes. Each entry is `(lambda_id, captured_concrete_function, captured_static_context)`:
+    /// finishes. Each entry snapshots the enclosing concrete function, static context, lexical
+    /// suite stack, and parent lambda stack:
     /// `concrete_function` lets the body's static-context errors name the outer concrete (e.g.
     /// `static_func()`) instead of the lambda's empty name, and `static_context` lets the body
     /// inherit static-ness from the surrounding scope — Godot's
@@ -209,7 +236,11 @@ pub struct AnalysisContext<'a> {
     /// to `= static_context`, but gdls's parse tree is immutable from the analyzer's side, so
     /// we carry the bit through the queue instead. Mirrors Godot's
     /// `pending_body_resolution_lambdas` queue (analyzer.cpp:4684, drained at :6528).
-    pub pending_lambda_bodies: Vec<(NodeId, Option<NodeId>, bool, Vec<NodeId>)>,
+    pub(crate) pending_lambda_bodies: Vec<PendingLambdaBody>,
+    /// Lambda cursor stack, outermost-to-innermost. Godot carries `current_lambda` plus
+    /// `LambdaNode::parent_lambda`; gdls derives the same chain by pushing around lambda
+    /// signature/body reduction.
+    pub current_lambda_stack: Vec<NodeId>,
     /// Whether the current `reduce_call` is being called as the target of an enclosing `await`.
     /// Mirrors Godot's `p_is_await` parameter (analyzer.cpp:3231 / 3751-3758): when true, a
     /// coroutine call result does NOT fire MISSING_AWAIT; when false at statement root it fires
@@ -262,6 +293,7 @@ pub struct AnalysisContext<'a> {
     ///
     /// **WP-RD1: private staging.** The sole write path is [`Self::record_binding`].
     bindings: Vec<Binding>,
+    lambda_uses_self: FxHashSet<NodeId>,
 
     /// Byte-position regions in which a given warning is suppressed by an
     /// `@warning_ignore_start("CODE_NAME")` / `@warning_ignore_restore("CODE_NAME")` pair (the
@@ -344,6 +376,7 @@ impl<'a> AnalysisContext<'a> {
             reducing_callee: false,
             concrete_function: None,
             pending_lambda_bodies: Vec::new(),
+            current_lambda_stack: Vec::new(),
             awaiting_call: false,
             resolved_interfaces: FxHashSet::default(),
             reduced: FxHashSet::default(),
@@ -356,6 +389,7 @@ impl<'a> AnalysisContext<'a> {
             warning_ignored_lines,
             member_xrefs: FxHashMap::default(),
             bindings: Vec::new(),
+            lambda_uses_self: FxHashSet::default(),
             // M5 WP-O3 / O4: governor + cancellation defaults. The bare `AnalysisContext::new`
             // path leaves these at their permissive values (no cap, no token) so the
             // conformance / fuzz path continues exactly as it did pre-M5;
@@ -370,6 +404,22 @@ impl<'a> AnalysisContext<'a> {
             bailed: false,
             sink: DiagnosticSink::new(),
         }
+    }
+
+    /// `GDScriptAnalyzer::mark_lambda_use_self()` (analyzer.cpp:6364): mark the current lambda
+    /// and all parent lambdas as using `self`.
+    pub(crate) fn mark_lambda_use_self(&mut self) {
+        for &lambda in &self.current_lambda_stack {
+            self.lambda_uses_self.insert(lambda);
+        }
+    }
+
+    pub(crate) fn push_current_lambda(&mut self, lambda: NodeId) {
+        self.current_lambda_stack.push(lambda);
+    }
+
+    pub(crate) fn pop_current_lambda(&mut self) {
+        self.current_lambda_stack.pop();
     }
 
     /// Identifier NodeIds that are the *name slot* of a declaration (Variable / Constant /
@@ -642,6 +692,7 @@ impl<'a> AnalysisContext<'a> {
             diagnostics: self.sink.finish(),
             member_xrefs: self.member_xrefs,
             bindings: self.bindings,
+            lambda_uses_self: self.lambda_uses_self,
             bailed: self.bailed,
         }
     }

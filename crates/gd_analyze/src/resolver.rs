@@ -3347,8 +3347,8 @@ fn drain_pending_lambda_bodies(ctx: &mut AnalysisContext) {
     // queued from a default-arg reduction triggered during a lambda body) remain in
     // `ctx.pending_lambda_bodies` for the next drain call.
     let lambdas = std::mem::take(&mut ctx.pending_lambda_bodies);
-    for (lambda_id, captured_concrete, captured_static, captured_suite_stack) in lambdas {
-        let func_id = match &ctx.node(lambda_id).kind {
+    for pending in lambdas {
+        let func_id = match &ctx.node(pending.lambda_id).kind {
             NodeKind::Lambda(l) => l.function,
             _ => continue,
         };
@@ -3373,13 +3373,18 @@ fn drain_pending_lambda_bodies(ctx: &mut AnalysisContext) {
         let pre_concrete = ctx.concrete_function;
         let pre_static = ctx.static_context;
         let pre_suite_stack = std::mem::take(&mut ctx.suite_stack);
-        ctx.concrete_function = captured_concrete;
-        ctx.static_context = captured_static;
-        ctx.suite_stack = captured_suite_stack;
+        let pre_lambda_stack = std::mem::take(&mut ctx.current_lambda_stack);
+        ctx.concrete_function = pending.captured_concrete;
+        ctx.static_context = pending.captured_static;
+        ctx.suite_stack = pending.captured_suite_stack;
+        ctx.current_lambda_stack = pending.captured_lambda_stack;
+        ctx.push_current_lambda(pending.lambda_id);
         resolve_function_body(ctx, func_id, true);
+        ctx.pop_current_lambda();
         ctx.concrete_function = pre_concrete;
         ctx.static_context = pre_static;
         ctx.suite_stack = pre_suite_stack;
+        ctx.current_lambda_stack = pre_lambda_stack;
     }
     // If new lambdas were queued during this drain pass (e.g. a lambda body that itself
     // declared another lambda whose body was queued mid-resolution), keep draining. The
