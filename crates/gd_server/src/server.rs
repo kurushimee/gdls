@@ -1073,6 +1073,15 @@ fn serve_inner(
                     // below); send nothing now.
                     let resp = if req.method == "shutdown" {
                         shutting_down = true;
+                        // M11 (#178): cancel every in-flight off-worker format so its poll-kill
+                        // (CANCEL_POLL_INTERVAL) reaps the subprocess during the shutdown→exit
+                        // round-trip, before the loop breaks on `exit`. Otherwise a format still
+                        // running at `exit` gets no response and its child reparents to init (a
+                        // bounded, transient orphan). The done channel is NOT drained here — that
+                        // would block shutdown on a slow format (head-of-line-at-shutdown, the
+                        // class #135 fixes); a format that finishes within the round-trip is still
+                        // answered by its done arm, which stays active during `shutting_down`.
+                        state.format_bridge.cancel_all_in_flight();
                         Some(Response::new_ok(req.id, serde_json::Value::Null))
                     } else if shutting_down {
                         // Deregister the lifecycle the router opened for it, then refuse.
