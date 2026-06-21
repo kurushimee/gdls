@@ -114,6 +114,32 @@ fn position_params(uri: &Uri, line: u32, character: u32) -> TextDocumentPosition
     }
 }
 
+/// Apply a set of (range, new_text) edits to `src`, returning the rewritten text. Edits are applied
+/// from the LAST position to the FIRST so earlier ranges stay valid as later text changes length —
+/// the standard non-overlapping LSP-edit application order. Used by the apply→reanalyze identity
+/// checks (rewrite the buffer per a `WorkspaceEdit`, then assert the result is what the analyzer
+/// would re-resolve to the renamed symbol).
+fn apply_edits(src: &str, edits: &[(Range, String)]) -> String {
+    // Convert each (line, character) to a byte offset (UTF-8; the test fixtures are ASCII).
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(src.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let to_byte = |p: Position| -> usize {
+        let line = line_starts[p.line as usize];
+        line + p.character as usize
+    };
+    let mut byte_edits: Vec<(usize, usize, String)> = edits
+        .iter()
+        .map(|(r, t)| (to_byte(r.start), to_byte(r.end), t.clone()))
+        .collect();
+    byte_edits.sort_by_key(|&(start, _, _)| std::cmp::Reverse(start));
+    let mut out = src.to_string();
+    for (start, end, text) in byte_edits {
+        out.replace_range(start..end, &text);
+    }
+    out
+}
+
 fn rename_params(uri: &Uri, line: u32, character: u32, new_name: &str) -> RenameParams {
     RenameParams {
         text_document_position: position_params(uri, line, character),
@@ -4415,6 +4441,114 @@ fn rename_167_func_local_non_const_type_annotation_excluded_precisely() {
             .any(|(u, r)| *u == origin_uri.as_str() && r.start.line == 4),
         "the erroring local-var `var x: Foo` annotation (origin.gd line 4) must be SUPPRESSED; got {:?}",
         view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_167_global_class_with_class_scope_enum_collision_edits_annotation() {
+    // REPRODUCE (#167 corruption cell): a CONSUMER file declares, in CLASS scope (NOT suite-local),
+    // an inner `enum Foo` AND a `var y: Foo` annotation, while a same-named GLOBAL `class_name Foo`
+    // is registered. Verified against the real 4.6.3 binary (and gdls's own `resolve_datatype`,
+    // resolver.rs: the global-class arm precedes the class-scope-member arm): the `: Foo` annotation
+    // binds the GLOBAL class, while the EXPRESSION `Foo.A` binds the inner enum. So under a global
+    // `Foo`→`Bar` rename the annotation `: Foo` MUST be rewritten (it is a genuine global reference)
+    // and the expression `Foo.A` must NOT. Leaving `: Foo` unedited silently RETYPES `y` from the
+    // (departing) global script to the inner enum — clean diff, no error: cardinal-rule corruption.
+    let project = common::sample_project();
+    project.write("src/fooclass.gd", "class_name Foo\nextends Node\nfunc hello() -> void:\n\tpass\n");
+    project.write(
+        "src/consumer.gd",
+        // `var y: Foo` (line 4 col 8) → the GLOBAL class (EDITED). `Foo.A` (line 4 col 14) → the
+        // inner enum (NOT edited). The inner `enum Foo` decl (line 3) is its own symbol (NOT edited).
+        "extends Node\n\nclass Inner:\n\tenum Foo { A }\n\tvar y: Foo = Foo.A\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/fooclass.gd", "src/consumer.gd"],
+        2,
+    );
+    let fooclass_uri = file_uri(&project.root.join("src/fooclass.gd"));
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    // Rename the GLOBAL `class_name Foo` decl (fooclass.gd 0,11) → `Bar`.
+    client
+        .sender
+        .send(request(
+            460,
+            "textDocument/rename",
+            rename_params(&fooclass_uri, 0, 11, "Bar"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the global `class_name Foo` must SUCCEED; got {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+
+    // The global decl is edited.
+    assert!(
+        view.set.iter().any(|(u, r)| *u == fooclass_uri.as_str()
+            && r.start.line == 0
+            && r.start.character == 11),
+        "the `class_name Foo` declaration must be edited; got {:?}",
+        view.set
+    );
+    // THE BUG: the class-scope `: Foo` annotation (consumer.gd line 4, col 8) binds the GLOBAL and
+    // MUST be rewritten to `: Bar`. (Failed on HEAD: it was wrongly suppressed.)
+    assert!(
+        view.set.iter().any(|(u, r)| *u == consumer_uri.as_str()
+            && r.start.line == 4
+            && r.start.character == 8),
+        "the class-scope `: Foo` annotation (consumer.gd 4,8) binds the GLOBAL class and MUST be \
+         edited to `: Bar`; leaving it silently retypes `y` to the inner enum; got {:?}",
+        view.set
+    );
+    // The EXPRESSION `Foo.A` (consumer.gd line 4, col 13/14 region) binds the inner enum and must
+    // NOT be edited.
+    assert!(
+        !view.set.iter().any(|(u, r)| *u == consumer_uri.as_str()
+            && r.start.line == 4
+            && r.start.character > 8),
+        "the expression `Foo.A` (consumer.gd line 4, after the annotation) binds the inner enum and \
+         must NOT be edited; got {:?}",
+        view.set
+    );
+    // The inner `enum Foo` decl token (line 3) must NOT be edited — it is its own symbol.
+    assert!(
+        !view
+            .set
+            .iter()
+            .any(|(u, r)| *u == consumer_uri.as_str() && r.start.line == 3),
+        "the inner `enum Foo` decl (consumer.gd line 3) must NOT be edited; got {:?}",
+        view.set
+    );
+
+    // APPLY → REANALYZE BY IDENTITY: rewrite the consumer buffer per the edit, re-open it, and assert
+    // `definition` on the renamed annotation (`var y: Bar`) resolves to the renamed global script
+    // (fooclass.gd), NOT the inner enum — proving the edit preserved `y`'s type identity.
+    let consumer_edits: Vec<(Range, String)> = view
+        .set
+        .iter()
+        .zip(view.new_texts.iter())
+        .filter(|((u, _), _)| *u == consumer_uri.as_str())
+        .map(|((_, r), t)| (*r, t.clone()))
+        .collect();
+    let original = "extends Node\n\nclass Inner:\n\tenum Foo { A }\n\tvar y: Foo = Foo.A\n";
+    let edited = apply_edits(original, &consumer_edits);
+    assert!(
+        edited.contains("var y: Bar"),
+        "applying the edit must produce `var y: Bar`; got:\n{edited}"
+    );
+    assert!(
+        edited.contains("Foo.A"),
+        "the expression `Foo.A` must survive unedited; got:\n{edited}"
     );
     shutdown(&client, server);
 }

@@ -906,93 +906,50 @@ impl ParseTree {
         out
     }
 
-    /// `true` iff the class node `class_id` declares a member named `name` usable in a TYPE-annotation
-    /// position — a nested `enum`, an inner `class`, or a `const` alias (`const Hero = preload(...)`).
-    /// The COMPLETE type-position member set is `{Enum, Class, Constant}` (a `var`/`func`/`signal`
-    /// cannot annotate a type), so a hit here is unambiguously a TYPE named `name` declared in that
-    /// scope — never an unrelated value/member that happens to share the spelling. The shared building
-    /// block of [`Self::type_name_shadowed_by_enclosing_scope`].
-    fn class_declares_type_named(&self, class_id: NodeId, name: &str) -> bool {
-        let NodeKind::Class(class) = &self.get(class_id).kind else {
-            return false;
-        };
-        class.members.iter().any(|m| match m {
-            Member::Enum(id) => {
-                matches!(&self.get(*id).kind, NodeKind::Enum(en) if en.identifier.map(|i| self.ident_text(i)) == Some(name))
-            }
-            Member::Class(id) => {
-                matches!(&self.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| self.ident_text(i)) == Some(name))
-            }
-            Member::Constant(id) => {
-                matches!(&self.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| self.ident_text(i)) == Some(name))
-            }
-            _ => false,
-        })
-    }
-
-    /// The text of an identifier node, or `""` if `id` is not an [`NodeKind::Identifier`]. A small
-    /// borrow helper for the member-name comparisons above (`Some(self.ident_text(i)) == Some(name)`
-    /// stays a cheap `&str` compare).
-    fn ident_text(&self, id: NodeId) -> &str {
-        match &self.get(id).kind {
-            NodeKind::Identifier(i) => i.name.as_str(),
-            _ => "",
-        }
-    }
-
     /// **Per-occurrence scope-aware type-name resolution.** Given a TYPE-position identifier at `byte`
     /// (textually `name` — the base segment of an `extends`/`: T` chain, e.g. `extends Foo` / `: Foo` /
-    /// `: Foo.Inner` on `Foo`), decide whether `name` resolves to a TYPE declared in a SCOPE lexically
-    /// enclosing `byte` (a suite local, or a member of some enclosing CLASS) rather than to a global
-    /// `class_name` of the same name.
+    /// `: Foo.Inner` on `Foo`), decide whether `name` resolves to a SUITE-LOCAL type declared in a
+    /// block lexically enclosing `byte` rather than to a global `class_name` of the same name.
     ///
-    /// Returns `true` iff some such local declaration is in scope at `byte`. Two scopes are checked —
-    /// and they suppress the occurrence for TWO DISTINCT reasons (both verified against the 4.6.3
-    /// binary), which a maintainer must keep separate or risk reverting one in the corrupting
-    /// direction:
+    /// Returns `true` iff a suite-local `name` is in scope at `byte`. Type resolution checks scopes in
+    /// this order (verified against the 4.6.3 binary AND gdls's own `resolve_datatype`):
     ///
-    ///   1. **Suite-local `NAME` — a TRUE IDENTITY/ERROR SHADOW (faithful).** Godot checks a
-    ///      suite-local before the global class registry (`SuiteNode::has_local` precedes
-    ///      `is_global_class` in `resolve_datatype`), so the idiomatic `const Other = preload(...)`
-    ///      used as `var x: Other` resolves to the CONST, not a same-named global class — even while
-    ///      the global exists. A non-const local is rejected as "cannot be used as a type" at the
-    ///      same precedence point, still without falling through to the global. Its `: NAME` is NEVER
-    ///      a global reference, so editing it under a global-class rename is unconditionally wrong.
-    ///      Suppression here is identity/error resolution.
+    ///   1. **suite-local** (`SuiteNode::has_local`, gdscript_analyzer.cpp:689 / resolver.rs's
+    ///      `lookup_local`) — checked FIRST, BEFORE the global registry;
+    ///   2. **global `class_name`** (`ScriptServer::is_global_class`, :787 / resolver.rs's
+    ///      `global_class_file`) — checked SECOND;
+    ///   3. **current-scope class members** — an `enum`/inner `class`/`const` declared in an enclosing
+    ///      CLASS scope (`get_class_node_current_scope_classes`, :845 / resolver.rs's
+    ///      `datatype_in_scope`) — checked THIRD, LAST.
     ///
-    ///   2. **Same-file class-scope type member (`enum`/inner `class`/`const`) — a deliberate
-    ///      FORWARD-REBIND POLICY (not identity resolution).** Counter-intuitively, while the global
-    ///      `class_name name` still exists Godot resolves a class-scope `: name` to the GLOBAL class
-    ///      (the global registry shadows a same-file class-scope `enum`/inner-`class` in
-    ///      type-annotation position). So this occurrence DOES currently bind to the global. We
-    ///      suppress it anyway because a global rename `name`→`new` REMOVES the global, after which the
-    ///      class-scope `: name` REBINDS to the local type and the file compiles. Leaving it as `name`
-    ///      (suppressing) is the intended refactoring — it silently RETYPES the annotated variable from
-    ///      the (departing) global class to the in-file local type, which is the strictly-better
-    ///      outcome vs. #166's blanket whole-rename refusal; editing it to `new` would instead point it
-    ///      at the renamed global and is the wrong post-rename world for a name that has a local type.
-    ///      This is a POLICY applied to an occurrence that currently resolves to the global — NOT a
-    ///      claim that it already means the local type.
+    /// So ONLY a suite-local (1) precedes the global (2). A class-scope type member (3) loses to the
+    /// global: while the global exists, a class-scope `: name` binds the GLOBAL class, not the
+    /// same-named `enum`/inner-`class`/`const` member. (The EXPRESSION position is the reverse —
+    /// `name.VALUE` resolves the class member first via `reduce_identifier_from_base`, :4467, before
+    /// the global at :4563 — so `Foo.A` binds the inner enum while `: Foo` binds the global. That
+    /// asymmetry is handled by the binding-based collection, not here.)
     ///
-    /// Either way the rule is the same: a type-position `name` whose name is declared in a scope
-    /// enclosing it is NOT collected for the global-class rename. When no enclosing scope declares it,
-    /// the occurrence is a genuine global reference → `false`, and the caller (which has already
-    /// confirmed a global `class_name name` exists) collects it.
+    /// Therefore this returns `true` ONLY for the suite-local case — the one scope that genuinely
+    /// shadows the global:
     ///
-    /// This is the TYPE-position analogue of [`Self::resolve_local_binding_at`]: same scope-walk
-    /// discipline (innermost-first, the first declaring scope decides), reusing its suite-chain walk
-    /// for the suite-local case and adding a CLASS-scope walk (nested by span containment in the
-    /// arena — children are pushed after parents, so the smallest-span `Class` node containing `byte`
-    /// is the innermost enclosing class). The walk is purely lexical/structural (no analyzer pass): a
-    /// type-position class reference carries no `Binding::Use`, so this positional resolution is what a
-    /// mutating consumer must use to tell an enclosing-scope `: Foo` from a top-level global `: Foo`
-    /// per occurrence, instead of refusing the whole rename when both coexist in reach.
+    ///   - a func-local `const Other = preload(...)` used as `var x: Other` resolves to the CONST, not
+    ///     a same-named global class — even while the global exists, and even when declared LATER in
+    ///     the suite (Godot uses `SuiteNode::has_local`, order-insensitive). Editing it under a
+    ///     `class_name Other` rename is corruption.
+    ///   - a non-const suite-local is rejected as "Local ... cannot be used as a type." at the same
+    ///     precedence point, still without falling through to the global — so its `: NAME` is not a
+    ///     global reference either.
     ///
-    /// KNOWN GAP (over-collect, never over-suppress): a `const NAME` INHERITED from a base class
-    /// (`extends`-chain) is in scope in Godot but is invisible to this lexical/span walk, so such a
-    /// `: NAME` would be (wrongly) collected. Narrow (base-class const alias + same-named global +
-    /// a `: NAME` in the derived class); tracked in gdls#188. The suite-local and same-file
-    /// class-scope cases — the ones that arise in the #167 collision matrix — are covered.
+    /// A class-scope `: name` (enclosing-class `enum`/inner-`class`/`const` member) returns `false`:
+    /// it IS a genuine global reference and the caller (which has already confirmed a global
+    /// `class_name name` exists) collects/edits it. Suppressing it would leave a now-dangling `: name`
+    /// after the global is renamed away — the annotated variable silently RETYPES to the class-scope
+    /// member, a clean-diff meaning change.
+    ///
+    /// This is the TYPE-position analogue of [`Self::resolve_local_binding_at`]: the same suite-chain
+    /// walk (innermost-first), purely lexical/structural (no analyzer pass) — a type-position class
+    /// reference carries no `Binding::Use`, so this positional resolution is what a mutating consumer
+    /// uses to tell a suite-local `: Foo` from a global `: Foo` per occurrence.
     pub fn type_name_shadowed_by_enclosing_scope(&self, byte: usize, name: &str) -> bool {
         // (1) Suite-local `NAME` in the enclosing suite chain. Godot's analyzer checks a
         // suite-local before the global class registry (`SuiteNode::has_local` precedes
@@ -1015,27 +972,13 @@ impl ParseTree {
             }
             cur = s.parent_block;
         }
-        // (2) A type member named `name` declared in any CLASS scope enclosing `byte`. Collect every
-        // class scope whose span contains `byte`; the root class contains the whole file, so it is
-        // always included when present. A type member declared in ANY enclosing scope means this
-        // occurrence resolves locally after the global is renamed away (see the doc above), so it is
-        // suppressed. (The boolean decision is "is it declared in any enclosing scope at all", so the
-        // innermost-first ordering only documents the resolution semantics — one declaring scope
-        // anywhere in the chain returns `true`.)
-        let mut enclosing: Vec<(NodeId, u32)> = Vec::new();
-        for id in self.iter_ids() {
-            let node = self.get(id);
-            if !matches!(node.kind, NodeKind::Class(_)) {
-                continue;
-            }
-            if node.span.start <= byte && byte < node.span.end {
-                enclosing.push((id, (node.span.end - node.span.start) as u32));
-            }
-        }
-        enclosing.sort_by_key(|&(_, width)| width);
-        enclosing
-            .iter()
-            .any(|&(class_id, _)| self.class_declares_type_named(class_id, name))
+        // No suite-local shadow. A type member (`enum`/inner `class`/`const`) declared in an enclosing
+        // CLASS scope does NOT shadow here: the global registry is checked BEFORE current-scope class
+        // members (resolver.rs `global_class_file` precedes `datatype_in_scope`, mirroring
+        // gdscript_analyzer.cpp:787 before :845), so while the global exists a class-scope `: name`
+        // binds the GLOBAL, not the class-scope member. The occurrence is therefore a genuine global
+        // reference and is NOT suppressed.
+        false
     }
 }
 
@@ -1160,25 +1103,25 @@ mod tests {
     }
 
     #[test]
-    fn type_name_class_scope_shadow_is_per_occurrence() {
-        // An inner `enum Foo` makes the inner `: Foo` resolve locally (shadowed=true → suppress under a
-        // global-class rename); a TOP-LEVEL `extends Foo` in the same file is NOT enclosed by `Inner`
-        // and resolves to the global (shadowed=false → collect). This is the per-occurrence precision
-        // the file-level guard could not express.
+    fn type_name_class_scope_member_does_not_shadow_global() {
+        // A class-scope `enum Foo` does NOT shadow the global in TYPE-annotation position: the global
+        // registry is checked BEFORE current-scope class members (analyzer.cpp:787 before :845), so
+        // both the inner `: Foo` and a top-level `extends Foo` bind the GLOBAL class (shadowed=false →
+        // collect under a global-class rename). Only a SUITE-LOCAL would shadow.
         let src = "extends Foo\n\nclass Inner:\n\tenum Foo { A }\n\tvar y: Foo = Foo.A\n";
         let tree = crate::parse(src).tree;
         // `extends Foo`: the `Foo` after "extends ".
         let extends_byte = src.find("extends Foo").unwrap() + "extends ".len();
         assert!(
             !tree.type_name_shadowed_by_enclosing_scope(extends_byte, "Foo"),
-            "the top-level `extends Foo` is NOT inside `Inner`, so it is the GLOBAL class (unshadowed)"
+            "the top-level `extends Foo` is the GLOBAL class (unshadowed)"
         );
-        // inner `var y: Foo`.
+        // inner `var y: Foo` — the class-scope `enum Foo` does NOT shadow it; it binds the GLOBAL.
         let inner_anno = type_anno_byte(src, "var y", "Foo");
         assert!(
-            tree.type_name_shadowed_by_enclosing_scope(inner_anno, "Foo"),
-            "the inner `: Foo` is enclosed by `class Inner` (which declares `enum Foo`), so it is the \
-             LOCAL type (shadowed)"
+            !tree.type_name_shadowed_by_enclosing_scope(inner_anno, "Foo"),
+            "the inner `: Foo` binds the GLOBAL class (the class-scope `enum Foo` loses to the global \
+             registry in type position), so it is NOT shadowed"
         );
     }
 
