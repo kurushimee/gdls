@@ -289,7 +289,10 @@ func queue_free():
     // base. (The native dup would carry `MemberOwner::Native("Node")`.)
     assert_eq!(
         qf[0].owner,
-        MemberOwner::Script(project.fid("res://override.gd")),
+        MemberOwner::Script {
+            file: project.fid("res://override.gd"),
+            inner: Vec::new()
+        },
         "the surviving queue_free is the script override, not the native base"
     );
 }

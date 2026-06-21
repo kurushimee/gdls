@@ -62,6 +62,7 @@ fn completion_data_round_trips_compactly_and_carries_no_request_params() {
         CompletionData::Member {
             owner: CompletionDataOwner::ScriptFile {
                 uri: "file:///p/a.gd".to_string(),
+                inner: Vec::new(),
             },
             name: "hp".to_string(),
             detail: None,
@@ -98,6 +99,7 @@ fn member_detail_in_data_is_optional_and_omitted_when_absent() {
     let no_detail = CompletionData::Member {
         owner: CompletionDataOwner::ScriptFile {
             uri: "file:///a.gd".to_string(),
+            inner: Vec::new(),
         },
         name: "x".to_string(),
         detail: None,

@@ -59,9 +59,12 @@ pub enum MemberOwner {
     /// Declared on a native (engine / builtin) class — resolve via
     /// [`NativeDb::lookup_member`] / [`NativeDb::lookup_builtin_member`] on this class name.
     Native(String),
-    /// Declared in a project GDScript file — resolve via that file's [`Interface`]. The
-    /// [`FileId`] is the **declaring** file, not necessarily the requesting buffer.
-    Script(FileId),
+    /// Declared in a project GDScript file — resolve via that file's [`Interface`], descending
+    /// `inner` to the declaring inner class. The [`FileId`] is the **declaring** file, not
+    /// necessarily the requesting buffer; `inner` is its inner-class chain (empty for a top-level
+    /// class), so a member declared on an inner-class instance resolves its doc on the inner
+    /// interface, not the file root (#152).
+    Script { file: FileId, inner: Vec<String> },
     /// No recoverable declarer (an in-file `Class`-node member enumerated without a finished
     /// analysis, an enum *value* flattened off a type) — resolve has no doc source.
     Unknown,
@@ -334,10 +337,14 @@ pub fn script_chain_native_root(
 fn collect_interface_members(
     iface: &Interface,
     owner_file: FileId,
+    owner_inner: &[String],
     seen: &mut FxHashSet<String>,
     out: &mut Vec<MemberItem>,
 ) {
-    let owner = MemberOwner::Script(owner_file);
+    let owner = MemberOwner::Script {
+        file: owner_file,
+        inner: owner_inner.to_vec(),
+    };
     for m in &iface.members {
         if !seen.insert(m.name.clone()) {
             continue;
@@ -419,7 +426,7 @@ fn script_chain_members_seen(
     let mut seen: FxHashSet<String> = FxHashSet::default();
     for link in script_chain_links(xfile, native, start) {
         if let Some(iface) = link_interface(xfile, &link) {
-            collect_interface_members(iface, link.file, &mut seen, &mut out);
+            collect_interface_members(iface, link.file, &link.inner, &mut seen, &mut out);
         }
     }
     (out, seen)
@@ -447,7 +454,7 @@ pub fn script_parent_members(
     // Skip the first link (`start` itself); collect the script links strictly above it.
     for link in script_chain_links(xfile, native, start).into_iter().skip(1) {
         if let Some(iface) = link_interface(xfile, &link) {
-            collect_interface_members(iface, link.file, &mut seen, &mut out);
+            collect_interface_members(iface, link.file, &link.inner, &mut seen, &mut out);
         }
     }
     // The native class the parent chain bottoms out in — the same root `start` reaches (a script
