@@ -15,8 +15,9 @@ use common::{file_uri, notification, request, shutdown, TempProject};
 use lsp_server::Connection;
 use lsp_types::{
     DidOpenTextDocumentParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
-    InitializeParams, InitializeResult, InitializedParams, OneOf, PartialResultParams, Position,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, WorkDoneProgressParams,
+    InitializeParams, InitializeResult, InitializedParams, Location, OneOf, PartialResultParams,
+    Position, ReferenceContext, ReferenceParams, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, WorkDoneProgressParams,
 };
 
 /// Initialize against `project`, returning the parsed `InitializeResult` (so a test can assert on
@@ -74,6 +75,20 @@ fn highlight_params(uri: &lsp_types::Uri, line: u32, character: u32) -> Document
         text_document_position_params: TextDocumentPositionParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             position: Position { line, character },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    }
+}
+
+fn reference_params(uri: &lsp_types::Uri, line: u32, character: u32) -> ReferenceParams {
+    ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position { line, character },
+        },
+        context: ReferenceContext {
+            include_declaration: true,
         },
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: PartialResultParams::default(),
@@ -200,6 +215,79 @@ fn document_highlight_local_var_read_write_decl() {
             "highlight range must span the `count` identifier (5 chars), not the line; got {h:?}"
         );
     }
+
+    shutdown(&client, server_thread);
+}
+
+/// #109 drift guard: `documentHighlight` must remain the request-file subset of `references`.
+/// Click the global class name `Player` in a type annotation. `references` collects only
+/// identity-positive `Player` class references; a same-spelled local variable in this file must not
+/// leak into highlights through the unresolved raw-scan floor.
+#[test]
+fn document_highlight_ranges_match_in_file_references_subset_for_global_class() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    p.write("player.gd", "class_name Player\nextends Node\n");
+    p.write(
+        "use_player.gd",
+        "extends Node\nfunc run(p: Player) -> void:\n\tvar Player := 1\n\tprint(p, Player)\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(&p, &client, &["player.gd", "use_player.gd"]);
+
+    let use_uri = file_uri(&p.root.join("use_player.gd"));
+    client
+        .sender
+        .send(request(
+            90,
+            "textDocument/references",
+            reference_params(&use_uri, 1, 14),
+        ))
+        .unwrap();
+    let refs_resp = common::recv_response(&client);
+    assert!(
+        refs_resp.error.is_none(),
+        "references errored: {:?}",
+        refs_resp.error
+    );
+    let refs: Vec<Location> =
+        serde_json::from_value(refs_resp.result.expect("references result")).unwrap();
+    let mut ref_ranges: Vec<_> = refs
+        .into_iter()
+        .filter(|loc| loc.uri == use_uri)
+        .map(|loc| loc.range)
+        .collect();
+    ref_ranges.sort_by_key(|r| (r.start.line, r.start.character, r.end.line, r.end.character));
+    ref_ranges.dedup();
+
+    client
+        .sender
+        .send(request(
+            91,
+            "textDocument/documentHighlight",
+            highlight_params(&use_uri, 1, 14),
+        ))
+        .unwrap();
+    let hls_resp = common::recv_response(&client);
+    assert!(
+        hls_resp.error.is_none(),
+        "documentHighlight errored: {:?}",
+        hls_resp.error
+    );
+    let hls: Vec<DocumentHighlight> =
+        serde_json::from_value(hls_resp.result.expect("documentHighlight result")).unwrap();
+    let mut highlight_ranges: Vec<_> = hls.into_iter().map(|hl| hl.range).collect();
+    highlight_ranges
+        .sort_by_key(|r| (r.start.line, r.start.character, r.end.line, r.end.character));
+    highlight_ranges.dedup();
+
+    assert_eq!(
+        highlight_ranges, ref_ranges,
+        "documentHighlight ranges must equal references' in-file range subset for the same cursor"
+    );
 
     shutdown(&client, server_thread);
 }
