@@ -28,7 +28,7 @@ user's only check is a single end-of-Phase-2 trial in real work.
 | `neovim.json` | NVIM 0.12.3 | ✅ captured 2026-06-13 (`nvim --headless -l` + `vim.lsp.start`) |
 | `zed.json` | Zed 1.6.3-stable (Windows) | ✅ captured 2026-06-13 (settings-swapped `lsp.<server>.binary` → `wsl.exe` shim; settings restored byte-identical) |
 | `claude-code.json` | — | 🔶 armed: gitignored `.claude/.lsp.json` in this repo routes `.gd` → the capture shim (`~/.local/share/gdls-capture/`); the **next CC session** completes it by touching any `.gd` via the LSP tool, then vendors the JSON, revisits the markdown-by-default decision on `crate::docs::ProseFormat`, and removes the armed config. (Config loads at session start only; not hot-reloadable.) |
-| `vscode.json` | — | ⬜ blocked: VS Code is not installed on this machine, and its capabilities come from a per-extension `vscode-languageclient`, so there is nothing generic to capture without one |
+| `vscode.json` | vscode-languageclient 9.0.1 (VS Code + godot-tools 2.6.1) | ✅ hand-authored 2026-06-22 from `vscode-languageclient` v9 source (`release/9.0.x`): `computeClientCapabilities` in `client.ts` + all `fillClientCapabilities` across the feature modules; framed as "VS Code + godot-tools 2.6.1" (the Godot VS Code extension uses vscode-languageclient as its LSP transport) |
 | `eglot.json` | — | ⬜ blocked: no emacs binary and no sudo to install one; revisit if emacs appears |
 | `sublime.json` | — | ⬜ blocked: Sublime Text is not installed on this machine |
 
