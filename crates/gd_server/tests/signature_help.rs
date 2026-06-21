@@ -87,7 +87,9 @@ fn sig_project() -> TempProject {
         "src/hero.gd",
         "class_name Hero\nextends Node2D\n\n\
          func _init(name: String, level: int = 1) -> void:\n\tpass\n\n\
-         func greet(target: String, loud: bool = false) -> int:\n\treturn 0\n",
+         func greet(target: String, loud: bool = false) -> int:\n\treturn 0\n\n\
+         ## Restore [param amount] hit points to the hero.\n\
+         func heal(amount: int) -> void:\n\tpass\n",
     );
     p
 }
@@ -414,6 +416,27 @@ fn constructor_new_resolves_to_init() {
     shutdown(&client, server_thread);
 }
 
+/// A builtin-type CONSTRUCTOR call `Vector2(<cursor>)` returns NO signature (null) — Godot parity.
+/// Godot's LSP surfaces builtin-constructor overloads only in its completion arghint, never in the
+/// signatureHelp handler (verified against the headless 4.6.3 LSP oracle: `Vector2(`/`Color(` → null
+/// at every arg position). gdls matches that rather than fabricating a `Vector2(...)` placeholder.
+#[test]
+fn builtin_constructor_call_has_no_signature() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f() -> void:\n\tvar v = Vector2(\n";
+    let uri = file_uri(&p.root.join("src/ctor.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor right after `Vector2(` — tab(1) + `var v = Vector2(`(15) = 16.
+    let raw = sig_raw(&client, 10, &uri, Position::new(3, 16));
+    assert!(
+        raw.is_null(),
+        "a builtin constructor must return null (Godot LSP parity), got {raw:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 /// THE cross-file proof: a script method called on a typed cross-file value
 /// (`h.greet(<cursor>)` where `h: Hero`) resolves to `Hero.greet`'s signature with parameter NAMES
 /// and the DEFAULT taken from `hero.gd`'s parse tree — `int greet(target: String, loud: bool =
@@ -432,6 +455,90 @@ fn cross_file_script_method_param_names_from_declaring_tree() {
         only_label(&h),
         "int greet(target: String, loud: bool = false)",
         "cross-file script method: names + default from the DECLARING file's tree"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A script method's `##` doc comment rides on its signature's `documentation` (#97). `Hero.heal`
+/// carries a doc; its signatureHelp popup must surface the prose (rendered to the client's flavor),
+/// while the `(params)` label is unchanged. Discriminates the new doc threading from the old
+/// hardcoded `None`.
+#[test]
+fn cross_file_script_method_carries_doc_comment() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f(h: Hero) -> void:\n\th.heal(1)\n";
+    let uri = file_uri(&p.root.join("src/doc_consumer.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor inside `h.heal(` — tab(1) + `h.heal(`(7) = 8.
+    let h = sig(&client, 10, &uri, Position::new(3, 8));
+    let info = &h.signatures[0];
+    assert_eq!(
+        info.label, "void heal(amount: int)",
+        "the label is unchanged by the doc threading"
+    );
+    let doc = info
+        .documentation
+        .as_ref()
+        .expect("a script method with a `##` doc carries documentation");
+    let text = match doc {
+        lsp_types::Documentation::String(s) => s.clone(),
+        lsp_types::Documentation::MarkupContent(mc) => mc.value.clone(),
+    };
+    assert!(
+        text.contains("Restore") && text.contains("hit points"),
+        "the popup surfaces the `##` prose; got {text:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// An INNER-class method's `##` doc rides on its signature too — the doc comes from the same
+/// inner-walked `MemberDecl` whose `name_span` drives the (inner, not root) signature, so an inner
+/// method that name-collides with a root method shows the inner doc, not the root's.
+#[test]
+fn inner_class_method_carries_its_own_doc() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/inner_doc.gd"));
+    let src = "class_name InnerDocHolder\nextends Node2D\n\n\
+               ## The ROOT poke.\n\
+               func poke(a: int) -> void:\n\tpass\n\n\
+               class Inner:\n\t## The INNER poke.\n\tfunc poke(a: int) -> void:\n\t\tpass\n\n\
+               func use_inner() -> void:\n\tvar x := Inner.new()\n\tx.poke(1)\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\tx.poke(1)` is line 14 (0-based); cursor in arg 0 = tab(1) + "x.poke(".len()(7) = 8.
+    let h = sig(&client, 31, &uri, Position::new(14, 8));
+    let doc = h.signatures[0]
+        .documentation
+        .as_ref()
+        .expect("the inner method carries documentation");
+    let text = match doc {
+        lsp_types::Documentation::String(s) => s.clone(),
+        lsp_types::Documentation::MarkupContent(mc) => mc.value.clone(),
+    };
+    assert!(
+        text.contains("INNER") && !text.contains("ROOT"),
+        "the inner method's own doc is shown, not the root's; got {text:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A script method with NO doc comment carries no `documentation` (the empty-description filter): an
+/// honest absence, never an empty popup. `Hero.greet` has no `##`.
+#[test]
+fn cross_file_script_method_without_doc_has_no_documentation() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f(h: Hero) -> void:\n\th.greet(\"hi\")\n";
+    let uri = file_uri(&p.root.join("src/nodoc_consumer.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    let h = sig(&client, 10, &uri, Position::new(3, 9));
+    assert!(
+        h.signatures[0].documentation.is_none(),
+        "an undocumented script method must carry no documentation popup"
     );
 
     shutdown(&client, server_thread);

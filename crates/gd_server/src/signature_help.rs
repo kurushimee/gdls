@@ -337,12 +337,14 @@ fn resolve_bare_call(
     if let Some(sig) = utility_sig(state, name) {
         return Some(sig);
     }
-    // (b) A builtin type name used as a constructor (`Vector2(`, `Color(`). gdls' data model
-    // carries no per-overload constructor argument lists, so the truthful, non-lying signature is
-    // the constructor shape `Type(...)` rather than a fabricated parameter list.
-    if let Some(sig) = builtin_constructor_sig(state, name) {
-        return Some(sig);
-    }
+    // (b) A builtin type name used as a constructor (`Vector2(`, `Color(`) gets NO signature —
+    // matching Godot's LSP, which returns `null` for builtin constructors (its constructor-overload
+    // arghint lives only in the COMPLETION path, `gdscript_editor.cpp:3411`, never in the
+    // signatureHelp handler; verified against the headless 4.6.3 LSP oracle: `Vector2(` / `Color(`
+    // → null at every arg position). Falling through is correct — a builtin type name is not a
+    // self-method either, so (c) also returns `None`, giving the Godot-parity null. (The per-overload
+    // constructor argument data lives in the dump and belongs on the completion arghint surface,
+    // where Godot's own architecture puts it — deferred to #194.)
     // (c) A method on the implicit-self class (own / inherited project method, else the native
     // root the chain bottoms out in).
     resolve_self_method(state, text, fid, name)
@@ -434,17 +436,6 @@ fn utility_sig(state: &ServerState, name: &str) -> Option<Vec<Sig>> {
     Some(vec![Sig::from_utility(db, name, u)])
 }
 
-/// A builtin type used as a constructor (`Vector2(`, `Color(`). gdls' data model carries no
-/// per-overload constructor argument lists, so the honest signature is the bare `Type(...)`
-/// constructor shape. `None` when `name` isn't a builtin type.
-fn builtin_constructor_sig(state: &ServerState, name: &str) -> Option<Vec<Sig>> {
-    state
-        .workspace
-        .native
-        .builtin_named(name)
-        .map(|_| vec![Sig::constructor(name)])
-}
-
 // ===================================================================================================
 // Script signature sourcing — from the DECLARING file's parse tree (names + types + defaults).
 // ===================================================================================================
@@ -479,6 +470,13 @@ fn script_method_sig(
         .iter()
         .find(|m| m.name == name && m.kind == gd_project::MemberKind::Func)?;
     let name_span = decl.name_span;
+    // The method's `##` doc comment (BBCode), from the OWNING class's interface member — the parse
+    // tree carries no doc, so it rides alongside the signature (#97). Empty description ⇒ no popup.
+    let doc = decl
+        .doc
+        .as_ref()
+        .map(|d| d.description.clone())
+        .filter(|s| !s.is_empty());
 
     let path = state.workspace.index.path(fid)?;
     let decl_text = file_text(state, path);
@@ -493,6 +491,7 @@ fn script_method_sig(
         decl_src,
         name,
         func,
+        doc,
     )])
 }
 
@@ -712,12 +711,15 @@ impl Sig {
     /// `_make_arguments_hint(FunctionNode)`): `ret name(p: T = def, …)` where the return type reads
     /// `void` for an absent / void return, each parameter's type is its written annotation (else
     /// `Variant`), and the default is the **initializer node's source substring**. `src` is the
-    /// declaring file's text the tree was parsed from.
+    /// declaring file's text the tree was parsed from. `doc` is the method's `##` BBCode description
+    /// (from the declaring interface's `MemberDecl`), rendered to the client's prose flavor at
+    /// `finish` time — the parse tree alone carries no doc, so the caller supplies it.
     fn from_function_node(
         tree: &ParseTree,
         src: &str,
         name: &str,
         func: &gd_syntax::ast::FunctionNode,
+        doc: Option<String>,
     ) -> Sig {
         let ret = return_type_label(tree, src, func.return_type);
         let mut b = LabelBuilder::new(format!("{ret} {name}("));
@@ -753,7 +755,7 @@ impl Sig {
                 b.param(&format!("...{pname}: {pty}"));
             }
         }
-        b.finish(function_doc(tree, func))
+        b.finish(doc)
     }
 
     /// A bare constructor signature `Name(...)` — used for engine-class / builtin construction and a
@@ -889,14 +891,6 @@ fn default_count(params: &[gd_types::Param]) -> usize {
 /// A native method's BBCode description, or `None` when empty.
 fn native_method_doc(m: &gd_types::Method) -> Option<String> {
     (!m.description.is_empty()).then(|| m.description.clone())
-}
-
-/// A script function's `##` doc comment from its annotations — none is recorded on the bare
-/// `FunctionNode` here (the doc lives on the interface `MemberDecl`, not the parse node), so this is
-/// `None`. The signature label still carries the full `(params)`; documentation is a nice-to-have
-/// that the resolve-side already surfaces in hover.
-fn function_doc(_tree: &ParseTree, _func: &gd_syntax::ast::FunctionNode) -> Option<String> {
-    None
 }
 
 /// Render a BBCode doc string to the client's negotiated prose flavor as LSP [`Documentation`].
