@@ -4112,8 +4112,9 @@ fn resolve_local_binding(tree: &ParseTree, byte: usize, name: &str) -> Option<(N
 }
 
 /// The span of the smallest `Function` node containing `byte`, or `None` at class scope. The bound
-/// for a local binding's occurrence scan (see [`resolve_local_binding`]).
-fn enclosing_function_span(tree: &ParseTree, byte: usize) -> Option<ByteSpan> {
+/// for a local binding's occurrence scan (see [`resolve_local_binding`]). Shared with the
+/// `_`-prefix scope-aware firewall in `code_action.rs`.
+pub(crate) fn enclosing_function_span(tree: &ParseTree, byte: usize) -> Option<ByteSpan> {
     let mut best: Option<ByteSpan> = None;
     for id in tree.iter_ids() {
         if let NodeKind::Function(_) = &tree.get(id).kind {

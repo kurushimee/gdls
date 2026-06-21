@@ -2708,7 +2708,8 @@ fn underscore_prefix_offered_when_name_only_in_unrelated_scope() {
 #[test]
 fn underscore_prefix_refused_when_name_in_same_function() {
     // BOTH `count` (unused) and `_count` (used) are locals of the SAME function `f`.
-    const SRC: &str = "extends Node\n\nfunc f() -> void:\n\tvar count = 1\n\tvar _count = 2\n\tprint(_count)\n";
+    const SRC: &str =
+        "extends Node\n\nfunc f() -> void:\n\tvar count = 1\n\tvar _count = 2\n\tprint(_count)\n";
     let p = base_project();
     let (server, client) = Connection::memory();
     let t = std::thread::spawn(move || gd_server::serve(server));
