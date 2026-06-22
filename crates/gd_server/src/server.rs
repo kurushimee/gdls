@@ -1938,6 +1938,7 @@ fn reaction_kind(reaction: &Reaction) -> &'static str {
         Reaction::Gdextension { .. } => "gdextension",
         Reaction::DocClassesXml { .. } => "doc_classes_xml",
         Reaction::Scene { .. } => "scene",
+        Reaction::Asset { .. } => "asset",
     }
 }
 
@@ -1949,6 +1950,7 @@ fn event_path(reaction: &Reaction) -> Option<String> {
     match reaction {
         Reaction::GdSource { path, .. } => Some(path.to_string()),
         Reaction::Scene { path, .. } => Some(path.to_string()),
+        Reaction::Asset { path, .. } => Some(path.to_string()),
         _ => None,
     }
 }
@@ -2081,13 +2083,34 @@ fn apply_reaction_inner(
                 }
             }
         }
+        // #127: an arbitrary asset change keeps the AssetIndex live mid-session so `load`/`preload`
+        // path completion offers newly-added textures/audio/`.tres`/… without a restart. Bounded to
+        // the project root like Scene/GdSource. Disk-sourced (assets are never fed from editor
+        // buffers — they're not open documents). It does NOT re-diagnose any script: an asset is just
+        // a `res://` path string in the completion list, and no script's diagnostics depend on which
+        // sibling files exist — so re-publishing would be byte-identical churn (same reasoning as
+        // Scene). Only the index is mutated.
+        Reaction::Asset { path, change } => {
+            if !path_is_within(&path, project_root) {
+                log::warn!("watcher: dropping out-of-root asset event for {path}");
+                return;
+            }
+            match change {
+                FileChange::Created | FileChange::Modified => state.workspace.reindex_asset(&path),
+                FileChange::Deleted => state.workspace.remove_asset(&path),
+                FileChange::Renamed { from, to } => {
+                    state.workspace.remove_asset(&from);
+                    state.workspace.reindex_asset(&to);
+                }
+            }
+        }
         // A dropped `Other` is a no-op here — its `SkipReason` was already recorded on the
         // surrounding `watcher_event` span (WP-RD7).
         Reaction::Other(_) => {}
         // WP-RD11 (3): the project/native-DB reactions (ProjectGodot, ExtensionApiJson,
         // Gdextension, DocClassesXml) are no longer reloaded per-event — `handle_watcher` scans the
         // whole batch and coalesces their reload + `republish_all_open_buffers` into one post-batch
-        // pass. So `apply_reaction` does per-file work only for `GdSource` and `Scene`.
+        // pass. So `apply_reaction` does per-file work only for `GdSource`, `Scene`, and `Asset`.
         _ => {}
     }
 }

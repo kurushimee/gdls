@@ -72,6 +72,16 @@ pub enum Reaction {
     },
     /// A doc-classes XML changed under an addon directory — re-merge into [`gd_types::NativeDb`].
     DocClassesXml { path: Utf8PathBuf },
+    /// #127: an arbitrary project resource (texture, audio, `.tres`, `.scn`, an extension-less file,
+    /// …) was added/removed/modified — re-index its `res://` path in the [`gd_project::AssetIndex`]
+    /// (or drop it on delete). `path` is the canonical destination path, same convention as
+    /// [`Self::GdSource`]. Disk-sourced; does NOT re-diagnose any script (an asset path change cannot
+    /// change a script's diagnostics — same reasoning as [`Self::Scene`]). These are the files Godot's
+    /// `_get_directory_contents` lists with no type filter for `load`/`preload` completion.
+    Asset {
+        path: Utf8PathBuf,
+        change: FileChange,
+    },
     /// Anything else — dropped without action. WP-RD7 split the former catch-all `Other` to carry a
     /// [`SkipReason`] so a structured trace can tell a `.tmp`-file skip from a non-UTF-8-path drop
     /// (the `reaction` span discriminant in `server::reaction_kind` reads it) without the handler
@@ -414,8 +424,9 @@ fn reaction_for_path(path: &Utf8Path, change: FileChange, project_root: &Utf8Pat
     }
     match path.extension() {
         Some("gd") => gd_source_one_sided(path.to_path_buf(), change),
-        // M11 (#76): `.tscn` scene text → the scene index. `.scn` (binary) is deliberately not
-        // handled — gdls parses scene TEXT only (anti-catalog W16) and the watcher doesn't watch it.
+        // M11 (#76): `.tscn` scene text → the scene index. `.scn` (binary) is NOT parsed into the
+        // SceneIndex (gdls parses scene TEXT only, anti-catalog W16); it falls to the asset arm below
+        // (#127), since Godot still lists `.scn` as a loadable `res://` resource.
         Some("tscn") => Reaction::Scene {
             path: path.to_path_buf(),
             change,
@@ -436,20 +447,25 @@ fn reaction_for_path(path: &Utf8Path, change: FileChange, project_root: &Utf8Pat
                     path: path.to_path_buf(),
                 }
             } else {
-                log::debug!(
-                    "watcher: classifier dropping XML path {path} (not under doc_classes/)",
-                );
-                Reaction::Other(SkipReason::NotDocClasses)
+                // #127: an XML outside doc_classes/ is not a doc-merge input, but it IS a project
+                // file Godot lists as a loadable resource → route to the asset index.
+                Reaction::Asset {
+                    path: path.to_path_buf(),
+                    change,
+                }
             }
         }
-        Some(ext) => {
-            log::debug!("watcher: classifier dropping {path} (unhandled extension `.{ext}`)",);
-            Reaction::Other(SkipReason::UnknownExtension)
-        }
-        None => {
-            log::debug!("watcher: classifier dropping {path} (no extension)");
-            Reaction::Other(SkipReason::NoExtension)
-        }
+        // #127: every other file under the project root — textures, audio, `.tres`, `.scn` (binary
+        // scenes Godot's EditorFileSystem still lists, though gdls never text-parses them into the
+        // SceneIndex), an extension-less file like `LICENSE` — is an arbitrary project resource
+        // Godot's `_get_directory_contents` offers for `load`/`preload` completion with no type
+        // filter. Route it to the asset index. (Excluded dirs were already filtered upstream in
+        // `classify_event` / `classify_client_event`, and `extension_api.json`/`project.godot` at the
+        // root returned above, so nothing engine-managed reaches here.)
+        Some(_) | None => Reaction::Asset {
+            path: path.to_path_buf(),
+            change,
+        },
     }
 }
 
@@ -521,12 +537,33 @@ mod tests {
     }
 
     #[test]
-    fn classify_scn_binary_is_not_a_scene_reaction() {
-        // `.scn` (binary) is deliberately NOT handled — gdls parses scene TEXT only (W16). It falls
-        // to the unknown-extension drop, never `Reaction::Scene`.
+    fn classify_scn_binary_is_asset_not_scene() {
+        // `.scn` (binary) is NOT parsed into the text-only SceneIndex (W16), so it is never a
+        // `Reaction::Scene`. But Godot's EditorFileSystem DOES list `.scn` as a loadable resource, so
+        // it IS offered as a `res://` asset path (#127) → `Reaction::Asset`.
         let root = p("/proj");
         let r = classify_client_event(&p("/proj/ui/Panel.scn"), FileChange::Modified, &root);
-        assert!(matches!(r, Reaction::Other(SkipReason::UnknownExtension)));
+        assert!(
+            matches!(r, Reaction::Asset { .. }),
+            "a binary .scn is an asset, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn classify_png_returns_asset() {
+        // An arbitrary asset (texture) is offered for load/preload completion → an asset reaction,
+        // reindexed into the AssetIndex (disk-sourced, never re-diagnoses a script).
+        let root = p("/proj");
+        let r = classify_client_event(&p("/proj/art/icon.png"), FileChange::Modified, &root);
+        assert!(matches!(r, Reaction::Asset { .. }), "got {r:?}");
+    }
+
+    #[test]
+    fn classify_no_extension_file_returns_asset() {
+        // A no-extension project file (e.g. `LICENSE`) is a loadable `res://` resource → an asset.
+        let root = p("/proj");
+        let r = classify_client_event(&p("/proj/LICENSE"), FileChange::Modified, &root);
+        assert!(matches!(r, Reaction::Asset { .. }), "got {r:?}");
     }
 
     #[test]
@@ -545,8 +582,11 @@ mod tests {
     }
 
     #[test]
-    fn classify_extension_api_json_under_addon_is_ignored() {
-        // Only the project root's dump counts.
+    fn classify_extension_api_json_under_addon_is_not_native_dump() {
+        // Only the project root's dump drives the native DB (`Reaction::ExtensionApiJson`). A
+        // same-named file under an addon is just an ordinary `.json` project file — #127 lists it as
+        // a loadable `res://` asset (Godot's `_get_directory_contents` filters nothing), so it is an
+        // asset reaction, never the native-dump reaction.
         let root = p("/proj");
         let ev = mk_event(
             notify::EventKind::Modify(notify::event::ModifyKind::Data(
@@ -556,7 +596,7 @@ mod tests {
         );
         assert!(matches!(
             classify_event(&ev, &root).as_slice(),
-            [Reaction::Other(_)]
+            [Reaction::Asset { .. }]
         ));
     }
 
@@ -627,7 +667,9 @@ mod tests {
     }
 
     #[test]
-    fn classify_unrelated_xml_is_other() {
+    fn classify_unrelated_xml_is_asset() {
+        // #127: a `.xml` outside any doc_classes/ dir is not a doc-merge input, but it IS a project
+        // file Godot lists as a loadable resource → an asset reaction, not a drop.
         let root = p("/proj");
         let ev = mk_event(
             notify::EventKind::Modify(notify::event::ModifyKind::Data(
@@ -637,7 +679,7 @@ mod tests {
         );
         assert!(matches!(
             classify_event(&ev, &root).as_slice(),
-            [Reaction::Other(_)]
+            [Reaction::Asset { .. }]
         ));
     }
 

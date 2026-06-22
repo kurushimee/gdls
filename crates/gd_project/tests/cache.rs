@@ -85,6 +85,7 @@ fn round_trip_warm_equivalent_to_cold() {
     // Build a cold index and snapshot it.
     let cold = Index::build(&root);
     let scenes = gd_project::SceneIndex::build(&root);
+    let assets = gd_project::AssetIndex::build(&root);
     let cold_file_count = cold.file_count();
     assert!(
         cold_file_count >= 2,
@@ -93,7 +94,7 @@ fn round_trip_warm_equivalent_to_cold() {
 
     let key = make_key(&root);
     let files = stat_gd_files(&root);
-    cache::save(&root, &cold, &scenes, &files, key.clone());
+    cache::save(&root, &cold, &scenes, &assets, &files, key.clone());
 
     // The .gdls dir should exist, the cache file should be there.
     let cache_path = root.join(".gdls").join(cache::cache_file_name());
@@ -148,8 +149,9 @@ fn corrupt_file_yields_none_and_quarantines() {
     let key = make_key(&root);
     let cold = Index::build(&root);
     let scenes = gd_project::SceneIndex::build(&root);
+    let assets = gd_project::AssetIndex::build(&root);
     let files = stat_gd_files(&root);
-    cache::save(&root, &cold, &scenes, &files, key.clone());
+    cache::save(&root, &cold, &scenes, &assets, &files, key.clone());
 
     let cache_path = root.join(".gdls").join(cache::cache_file_name());
     assert!(cache_path.exists());
@@ -190,8 +192,9 @@ fn key_mismatch_yields_none_without_quarantine() {
     let save_key = make_key(&root);
     let cold = Index::build(&root);
     let scenes = gd_project::SceneIndex::build(&root);
+    let assets = gd_project::AssetIndex::build(&root);
     let files = stat_gd_files(&root);
-    cache::save(&root, &cold, &scenes, &files, save_key);
+    cache::save(&root, &cold, &scenes, &assets, &files, save_key);
 
     // Load with a different gdls_version → key mismatch.
     let mismatched_key = CacheKey {
@@ -231,6 +234,7 @@ fn file_id_stable_across_round_trip() {
 
     let cold = Index::build(&root);
     let scenes = gd_project::SceneIndex::build(&root);
+    let assets = gd_project::AssetIndex::build(&root);
     let a_path = root.join("a.gd");
     let b_path = root.join("b.gd");
 
@@ -239,7 +243,7 @@ fn file_id_stable_across_round_trip() {
 
     let key = make_key(&root);
     let files = stat_gd_files(&root);
-    cache::save(&root, &cold, &scenes, &files, key.clone());
+    cache::save(&root, &cold, &scenes, &assets, &files, key.clone());
 
     let loaded = cache::load(&root, &key).expect("load");
 
@@ -268,11 +272,12 @@ fn stat_delta_detects_size_change() {
 
     let cold = Index::build(&root);
     let scenes = gd_project::SceneIndex::build(&root);
+    let assets = gd_project::AssetIndex::build(&root);
     let key = make_key(&root);
 
     // Snapshot stats before save.
     let files_before = stat_gd_files(&root);
-    cache::save(&root, &cold, &scenes, &files_before, key.clone());
+    cache::save(&root, &cold, &scenes, &assets, &files_before, key.clone());
 
     let loaded = cache::load(&root, &key).expect("load");
 
@@ -343,11 +348,12 @@ fn concurrent_writers_never_corrupt_the_cache() {
     // Pre-build a cold index and key to reuse across threads.
     let cold = Index::build(&root);
     let scenes = Arc::new(gd_project::SceneIndex::build(&root));
+    let assets = Arc::new(gd_project::AssetIndex::build(&root));
     let key = Arc::new(make_key(&root));
     let files = Arc::new(stat_gd_files(&root));
 
     // Give the writers a head start — save once before the reader starts.
-    cache::save(&root, &cold, &scenes, &files, (*key).clone());
+    cache::save(&root, &cold, &scenes, &assets, &files, (*key).clone());
 
     let barrier = Arc::new(Barrier::new(3));
     let stop = Arc::new(AtomicBool::new(false));
@@ -360,6 +366,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
     let make_writer = |root: Arc<Utf8PathBuf>,
                        cold: Arc<Index>,
                        scenes: Arc<gd_project::SceneIndex>,
+                       assets: Arc<gd_project::AssetIndex>,
                        files: Arc<Vec<FileStat>>,
                        key: Arc<CacheKey>,
                        barrier: Arc<Barrier>,
@@ -368,7 +375,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
             barrier.wait();
             let mut iters = 0usize;
             while !stop.load(Ordering::Relaxed) || iters < 50 {
-                cache::save(&root, &cold, &scenes, &files, (*key).clone());
+                cache::save(&root, &cold, &scenes, &assets, &files, (*key).clone());
                 iters += 1;
                 if iters >= 200 {
                     break;
@@ -383,6 +390,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
         root.clone(),
         cold.clone(),
         scenes.clone(),
+        assets.clone(),
         files.clone(),
         key.clone(),
         barrier.clone(),
@@ -392,6 +400,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
         root.clone(),
         cold.clone(),
         scenes.clone(),
+        assets.clone(),
         files.clone(),
         key.clone(),
         barrier.clone(),

@@ -11,7 +11,7 @@ use std::rc::Rc;
 use camino::{Utf8Path, Utf8PathBuf};
 use gd_analyze::{code_from_name, AnalysisResult, StrictProfile, StrictSettings, WarnPolicy};
 use gd_project::cache::{self, FileStat};
-use gd_project::{Index, ProjectModel, SceneIndex};
+use gd_project::{AssetIndex, Index, ProjectModel, SceneIndex};
 use gd_syntax::{ParseResult, ParseTree};
 use gd_types::{DocXmlError, NativeDb};
 use lru::LruCache;
@@ -134,6 +134,14 @@ pub struct Workspace {
     /// scene-independent; this field is the dormant substrate a phase-3 precise hover/completion
     /// feature reads (through [`crate::xfile::WorkspaceXFileQuery::scene_node_facts`]).
     pub(crate) scenes: SceneIndex,
+    /// #127: the project's arbitrary-asset index — the `res://` paths of every project file that is
+    /// NOT a `.gd` script (covered by [`Self::index`]) and NOT a `.tscn` scene (covered by
+    /// [`Self::scenes`]): textures, audio, `.tres`, fonts, … Built parallel to those two and
+    /// persisted/restored via the same warm-start cache. Consumed only by `load`/`preload` path
+    /// completion, which lists scripts ∪ scenes ∪ assets to match Godot's `_get_directory_contents`
+    /// (every file, no type filter). Paths only — never parsed; freshness rides the shared stat
+    /// table like scenes.
+    pub(crate) assets: AssetIndex,
 }
 
 impl Workspace {
@@ -179,7 +187,7 @@ impl Workspace {
 
         // Attempt warm-start: load the persisted cache and stat-diff it against disk.
         // On any failure (missing file, key mismatch, verify failure) fall through to cold build.
-        let (index, scenes, stat_table) = match cache::load(root, &key) {
+        let (index, scenes, assets, stat_table) = match cache::load(root, &key) {
             Some(loaded) => {
                 log::info!(
                     "cache: warm-start candidate found; stat-diffing {} cached files",
@@ -189,14 +197,17 @@ impl Workspace {
             }
             None => {
                 // Cold build — then sweep all interned files to populate the stat table. The scene
-                // index is cold-built in parallel (its own `.tscn` walk, shared exclusion set).
+                // index is cold-built in parallel (its own `.tscn` walk, shared exclusion set), and
+                // the asset index in another (every other project file, same exclusion set).
                 let idx = Index::build_with_progress(root, &mut |done, total| {
                     sink.progress(done, Some(total), "parsing scripts");
                 });
                 let scene_idx = SceneIndex::build(root);
+                let asset_idx = AssetIndex::build(root);
                 let mut stats = build_stat_table_from_index(&idx);
                 add_scene_stats(&mut stats, &scene_idx, root);
-                (idx, scene_idx, stats)
+                add_asset_stats(&mut stats, &asset_idx, root);
+                (idx, scene_idx, asset_idx, stats)
             }
         };
 
@@ -233,6 +244,7 @@ impl Workspace {
             ),
             stat_table,
             scenes,
+            assets,
         }
     }
 
@@ -320,7 +332,7 @@ impl Workspace {
             .filter(|(path, _)| !open_paths.contains(*path))
             .map(|(_, stat)| stat.clone())
             .collect();
-        cache::save(root, &self.index, &self.scenes, &files, key);
+        cache::save(root, &self.index, &self.scenes, &self.assets, &files, key);
     }
 
     /// Parse `text`, reusing the cached result when the content fingerprint is unchanged. Both
@@ -785,6 +797,15 @@ impl Workspace {
         &self.scenes
     }
 
+    /// #127: the project's arbitrary-asset index (read-only). `load`/`preload` path completion reads
+    /// through here to list non-script/non-scene project files (textures, audio, `.tres`, …)
+    /// alongside scripts and scenes. Exposed so tests can assert the index stays live across watcher
+    /// events.
+    #[must_use]
+    pub fn assets(&self) -> &AssetIndex {
+        &self.assets
+    }
+
     /// M11 (#76): re-index a `.tscn` scene from disk into the [`SceneIndex`] (watcher-driven). The
     /// scene is keyed by its `res://` path; reading/parsing failures are logged and skipped (never
     /// crash). The stat table is refreshed so the next warm-load can skip an unchanged scene. Phase
@@ -812,6 +833,29 @@ impl Workspace {
     pub fn remove_scene(&mut self, path: &Utf8Path) {
         if let Some(res) = self.project.path_to_res(path) {
             self.scenes.remove(&res);
+        }
+        self.stat_table.remove(path);
+    }
+
+    /// #127: record an arbitrary asset (a non-script/non-scene project file) in the [`AssetIndex`]
+    /// from a watcher Created/Modified event. An asset has no content to parse — only its `res://`
+    /// path is indexed — so this is bound-to-root, computes the path, inserts it, and refreshes the
+    /// stat entry so the next warm-load can skip the unchanged file. A path outside the project root
+    /// is skipped (never crash). Does NOT re-diagnose anything (an asset path can't change a script's
+    /// diagnostics).
+    pub fn reindex_asset(&mut self, path: &Utf8Path) {
+        let Some(res) = self.project.path_to_res(path) else {
+            log::debug!("reindex_asset: {path} is not under the project root; skipping");
+            return;
+        };
+        self.assets.insert(res);
+        self.update_stat_from_disk(path);
+    }
+
+    /// #127: drop a deleted asset from the [`AssetIndex`] and its stat entry (watcher Deleted).
+    pub fn remove_asset(&mut self, path: &Utf8Path) {
+        if let Some(res) = self.project.path_to_res(path) {
+            self.assets.remove(&res);
         }
         self.stat_table.remove(path);
     }
@@ -983,6 +1027,10 @@ impl Workspace {
         // both routed through this reconcile — would recover drifted `.gd` but leave `.tscn` stale
         // (the scene index has no other backstop on those paths; cold/warm/per-event all handle it).
         let mut walked_scene_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
+        // #127: assets reconciled on this path too (watcher-overflow / disabled-watcher recovery),
+        // so a drifted asset add/delete is caught alongside scripts and scenes. Separate set since
+        // asset keys aren't `FileId`s (like `walked_scene_paths`).
+        let mut walked_asset_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
 
         let walker = WalkDir::new(root.as_std_path())
             .into_iter()
@@ -1049,7 +1097,27 @@ impl Workspace {
                 }
                 continue;
             }
+            // #127: a non-`.gd`/non-`.tscn` file is an arbitrary asset — reconcile its res:// path
+            // into the asset index (path only, no parse), same stat-diff shape. Done before the
+            // `.gd` gate so only scripts fall through to the interner below.
             if p.extension() != Some("gd") {
+                let path = gd_project::normalize_path(p);
+                walked += 1;
+                walked_asset_paths.insert(path.clone());
+                sink.progress(walked, None, "reconciling assets");
+                let new_stat = entry
+                    .metadata()
+                    .ok()
+                    .map(|m| cache::stat_from_metadata(path.clone(), &m));
+                let stat_changed = match (self.stat_table.get(&path), &new_stat) {
+                    (None, _) => true,
+                    (Some(_), None) => true,
+                    (Some(old), Some(new)) => old.size != new.size || old.mtime_ns != new.mtime_ns,
+                };
+                if stat_changed {
+                    // `reindex_asset` inserts the res path and refreshes the stat entry.
+                    self.reindex_asset(&path);
+                }
                 continue;
             }
             // Normalize the way Index keys do (the shared `gd_project::normalize_path`) so the
@@ -1173,6 +1241,25 @@ impl Workspace {
                     self.stat_table.remove(&gd_project::normalize_path(&abs));
                 }
             }
+            // #127: parallel asset removal pass — an asset in the index but absent from the walk
+            // was deleted while the watcher was off/overflowed. Same res→abs mapping + authoritative
+            // -walk guard (this whole branch). Open buffers don't apply (assets aren't editor docs).
+            let removed_assets: Vec<String> = self
+                .assets
+                .iter()
+                .map(str::to_owned)
+                .filter(|res| {
+                    gd_project::res_to_path(&root, res)
+                        .map(|abs| gd_project::normalize_path(&abs))
+                        .is_none_or(|abs| !walked_asset_paths.contains(&abs))
+                })
+                .collect();
+            for res in &removed_assets {
+                self.assets.remove(res);
+                if let Some(abs) = gd_project::res_to_path(&root, res) {
+                    self.stat_table.remove(&gd_project::normalize_path(&abs));
+                }
+            }
             n
         };
 
@@ -1283,11 +1370,17 @@ fn warm_index_from_cache(
     loaded: gd_project::cache::LoadedCache,
     root: &Utf8Path,
     sink: &mut dyn crate::progress::ProgressSink,
-) -> (Index, SceneIndex, FxHashMap<Utf8PathBuf, FileStat>) {
+) -> (
+    Index,
+    SceneIndex,
+    AssetIndex,
+    FxHashMap<Utf8PathBuf, FileStat>,
+) {
     let gd_project::cache::LoadedCache {
         mut index,
         files,
         mut scenes,
+        mut assets,
     } = loaded;
 
     // Build a lookup table from the cached file stats.
@@ -1308,6 +1401,10 @@ fn warm_index_from_cache(
     let mut walk_errors = 0usize;
     let mut skipped_non_utf8 = 0usize;
     let mut walked_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
+    // #127: assets get the same stat-diff + removal treatment as scenes (they share the stat table),
+    // so an asset added/deleted while gdls was off is reconciled on warm-start. Tracked separately
+    // from `walked_paths` (which the script removal pass keys on) since asset keys aren't `FileId`s.
+    let mut walked_asset_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
     let mut reparsed = 0usize;
     let mut added = 0usize;
     // Stat-changed files that could not be re-read. They sit in `walked_paths` but were neither
@@ -1341,6 +1438,30 @@ fn warm_index_from_cache(
         let is_gd = p.extension() == Some("gd");
         let is_scene = gd_project::is_scene_path(p);
         if !is_gd && !is_scene {
+            // #127: every other (non-excluded) file is an arbitrary asset — index its res:// path
+            // only (no parse). Stat-diff against the shared table so an asset replaced on disk while
+            // gdls was off refreshes its stat entry; insert is idempotent (the path is the key).
+            let path = gd_project::normalize_path(p);
+            walked_asset_paths.insert(path.clone());
+            let new_stat = entry
+                .metadata()
+                .ok()
+                .map(|m| cache::stat_from_metadata(path.clone(), &m));
+            let stat_changed = match (stat_table.get(&path), &new_stat) {
+                (None, _) => true,
+                (Some(_), None) => true,
+                (Some(old), Some(new)) => old.size != new.size || old.mtime_ns != new.mtime_ns,
+            };
+            if stat_changed {
+                if let Some(res) = gd_project::path_to_res(root, &path) {
+                    assets.insert(res);
+                }
+                if let Some(s) = new_stat {
+                    stat_table.insert(path.clone(), s);
+                } else {
+                    stat_table.remove(&path);
+                }
+            }
             continue;
         }
         let path = gd_project::normalize_path(p);
@@ -1438,6 +1559,23 @@ fn warm_index_from_cache(
                 stat_table.remove(&gd_project::normalize_path(&abs));
             }
         }
+        // #127: parallel removal pass for assets — an asset cached but no longer on disk is dropped
+        // from the asset index (and its stat entry pruned), same authoritative-walk guard.
+        let removed_assets: Vec<String> = assets
+            .iter()
+            .map(str::to_owned)
+            .filter(|res| {
+                gd_project::res_to_path(root, res)
+                    .map(|abs| gd_project::normalize_path(&abs))
+                    .is_none_or(|abs| !walked_asset_paths.contains(&abs))
+            })
+            .collect();
+        for res in &removed_assets {
+            assets.remove(res);
+            if let Some(abs) = gd_project::res_to_path(root, res) {
+                stat_table.remove(&gd_project::normalize_path(&abs));
+            }
+        }
         log::info!(
             "warm_index: stat-diff complete: {} unchanged, {} reparsed, {} added, {} removed, \
              {} skipped (unreadable)",
@@ -1460,7 +1598,7 @@ fn warm_index_from_cache(
         );
     }
 
-    (index, scenes, stat_table)
+    (index, scenes, assets, stat_table)
 }
 
 /// Build a stat table by iterating all interned files in the index after a cold build.
@@ -1505,6 +1643,30 @@ fn add_scene_stats(
                 table.insert(key.clone(), cache::stat_from_metadata(key, &meta));
             }
             Err(e) => log::warn!("cold_index: could not stat scene {abs} for cache table: {e}"),
+        }
+    }
+}
+
+/// Add a [`FileStat`] for every indexed asset to `table`, so the warm-start stat-diff reconciles an
+/// asset added/removed while gdls was off (the asset index has no `CacheKey` component of its own —
+/// freshness rides this stat table, exactly like scripts and scenes). Assets are keyed by res://
+/// path; map each back to its absolute path to stat it. An asset whose file vanished between the
+/// index build and this sweep is skipped.
+fn add_asset_stats(
+    table: &mut FxHashMap<Utf8PathBuf, FileStat>,
+    assets: &AssetIndex,
+    root: &Utf8Path,
+) {
+    for res in assets.iter() {
+        let Some(abs) = gd_project::res_to_path(root, res) else {
+            continue;
+        };
+        let key = gd_project::normalize_path(&abs);
+        match std::fs::metadata(abs.as_std_path()) {
+            Ok(meta) => {
+                table.insert(key.clone(), cache::stat_from_metadata(key, &meta));
+            }
+            Err(e) => log::warn!("cold_index: could not stat asset {abs} for cache table: {e}"),
         }
     }
 }

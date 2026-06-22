@@ -2628,6 +2628,53 @@ fn resource_path_lists_indexed_files() {
     shutdown(&client2, st2);
 }
 
+/// `load("res://…")` lists ARBITRARY project assets (textures, `.tres`, audio, …), not only the
+/// indexed `.gd` scripts and `.tscn` scenes — matching Godot's `_get_directory_contents`, which lists
+/// every file with no type filter. A `.png` written before boot must be offered, and its insert is the
+/// FULL res path (whole-content replace ⇒ no scheme dropped, no doubling).
+#[test]
+fn resource_path_lists_arbitrary_assets() {
+    let p = p4_project(); // indexes src/hero.gd
+    p.write("src/icon.png", "PNG-PLACEHOLDER\n"); // an arbitrary, non-script/non-scene asset on disk
+    p.write("data/config.tres", "[gd_resource type=\"Resource\"]\n"); // a root-level asset dir
+    let uri = file_uri(&p.root.join("src/def.gd"));
+
+    // Drill into `res://src/` — the .png must be listed alongside hero.gd.
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar c = load(\"res://src/\")\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+    // `res://src/` occupies columns 15..25, cursor at column 25.
+    let raw = complete_raw(&client, 195, &uri, Position::new(3, 25));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.iter().any(|l| l == "src/icon.png"),
+        "load(\"res://src/\") must list the arbitrary asset icon.png; got {ls:?}"
+    );
+    // Full-content replace: the insert is the full res path.
+    let icon = list
+        .items
+        .iter()
+        .find(|i| i.label == "src/icon.png")
+        .unwrap();
+    assert_eq!(edit_new_text(icon), "res://src/icon.png");
+
+    // Root-level: `load("res://")` must offer the `data/` dir (holding the .tres asset).
+    let src2 = "extends Node2D\n\nfunc f() -> void:\n\tvar c = load(\"res://\")\n";
+    let uri2 = file_uri(&p.root.join("src/def2.gd"));
+    let (client2, st2) = boot(&p, rich_caps(), &uri2, src2);
+    // `res://` occupies columns 15..21, cursor at column 21.
+    let raw2 = complete_raw(&client2, 196, &uri2, Position::new(3, 21));
+    let list2: CompletionList = serde_json::from_value(raw2).expect("a CompletionList");
+    let ls2 = labels(&list2);
+    assert!(
+        ls2.iter().any(|l| l == "data/"),
+        "load(\"res://\") must offer the `data/` subdirectory (holding config.tres); got {ls2:?}"
+    );
+
+    shutdown(&client, server_thread);
+    shutdown(&client2, st2);
+}
+
 /// CORRUPTION GUARD (end-to-end): completing a PARTIAL filename `load("res://src/he|")` and accepting
 /// `src/hero.gd` produces exactly `res://src/hero.gd` once — the edit spans the whole content
 /// (`res://src/he`) and the insert is the full path, so nothing is doubled or dropped.
