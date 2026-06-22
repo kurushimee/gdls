@@ -1224,8 +1224,10 @@ fn attribute_callee_base_type<'a>(
 // SUBSCRIPT / ASSIGN — refinements over the identifier set.
 // ===================================================================================================
 
-/// `d[<cursor>` — the literal string keys of a `const` Dictionary base (quoted, `MEMBER` kind),
-/// ADDED TO the bare-identifier set (Godot `COMPLETION_SUBSCRIPT`, `gdscript_editor.cpp:3613-3624`).
+/// `d[<cursor>` — the literal string keys of a `const` Dictionary base (quoted; Godot's
+/// `CODE_COMPLETION_KIND_MEMBER`, emitted here as the standard-legend LSP `PROPERTY` kind this
+/// codebase uses for members), ADDED TO the bare-identifier set (Godot `COMPLETION_SUBSCRIPT`,
+/// `gdscript_editor.cpp:3613-3624`).
 /// Godot offers the keys when `base.value` is a folded `DICTIONARY` constant: it iterates the dict's
 /// property list, inserting each key `quote(quote_style)` with `CODE_COMPLETION_KIND_MEMBER`, THEN
 /// (additively, when the index is not a literal) calls `_find_identifiers`. gdls mirrors that: it
