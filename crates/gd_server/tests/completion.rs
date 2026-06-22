@@ -1660,6 +1660,27 @@ fn builtin_constructor_overload_arghints() {
         ctors.iter().map(|i| i.label.as_str()).collect::<Vec<_>>()
     );
 
+    // The arghints sort STRICTLY ahead of every identifier candidate: the constructor items occupy
+    // the leading `sort_text` band and the identifier ranks are offset past it, so a lexicographic
+    // client sort keeps the hints on top (no rank collision between the two appended lists).
+    let max_ctor_sort = ctors
+        .iter()
+        .filter_map(|i| i.sort_text.as_deref())
+        .max()
+        .expect("constructor items carry sort_text");
+    let min_ident_sort = list
+        .items
+        .iter()
+        .filter(|i| i.kind != Some(CompletionItemKind::CONSTRUCTOR))
+        .filter_map(|i| i.sort_text.as_deref())
+        .min()
+        .expect("identifier items carry sort_text");
+    assert!(
+        max_ctor_sort < min_ident_sort,
+        "every constructor arghint must sort before every identifier; \
+         max ctor {max_ctor_sort:?} vs min ident {min_ident_sort:?}"
+    );
+
     shutdown(&client, server_thread);
 }
 

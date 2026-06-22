@@ -1143,8 +1143,19 @@ fn call_argument_items(
     // TO the identifier set (Godot computes these in the completion path, `gdscript_editor.cpp:3411`).
     let mut items =
         builtin_constructor_items(state, callee_name, arg_index, render).unwrap_or_default();
-    // Generic call argument → the full in-scope identifier set (reuse the IDENTIFIER renderer).
-    items.extend(identifier_items(state, tree, analyzed, byte, render));
+    // Generic call argument → the full in-scope identifier set (reuse the IDENTIFIER renderer). The
+    // constructor arghints occupy the leading `sort_text` band (ranks `0..ctor_count`); offset the
+    // identifier ranks past it so the client's lexicographic `sort_text` sort keeps the arghints
+    // ahead of the candidates (both lists otherwise start their ranks at 0 → a tie the client breaks
+    // arbitrarily). A no-op when there are no constructor items.
+    let ctor_count = items.len();
+    let mut identifiers = identifier_items(state, tree, analyzed, byte, render);
+    if ctor_count > 0 {
+        for (offset, item) in identifiers.iter_mut().enumerate() {
+            item.sort_text = Some(format!("{:05}", ctor_count + offset));
+        }
+    }
+    items.extend(identifiers);
     items
 }
 
@@ -1225,6 +1236,9 @@ fn constructor_arghint_item(
         detail: Some(arg_detail.to_string()),
         description: Some(label.to_string()),
     });
+    // A display-only arghint inserts nothing; a `.`/`(` commit on it would type the punctuation over
+    // an empty edit (harmless but pointless), so it carries no commit characters.
+    item.commit_characters = None;
     item
 }
 
