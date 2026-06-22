@@ -716,6 +716,15 @@ fn rewrite_tscn_ext_resources(
         };
 
         order.push(uri.clone());
+        // A file is a `.gd` XOR a `.tscn`, so a scene URI can never already hold a `.gd` literal
+        // edit; `insert` (overwrite) is therefore safe. Trip a debug assertion if that cross-surface
+        // invariant is ever violated by a future change, so an overwrite that would silently drop
+        // the other surface's edits surfaces in tests/CI instead of corrupting the WorkspaceEdit.
+        debug_assert!(
+            !by_uri.contains_key(uri.as_str()),
+            "willRenameFiles: a scene URI already held an edit before the .tscn scan — the \
+             .gd/.tscn per-URI exclusivity invariant is broken"
+        );
         by_uri.insert(uri.as_str().to_string(), (version, edits));
         rewritten.insert(scene_res);
     }
