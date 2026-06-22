@@ -642,9 +642,10 @@ func go() -> void:
     let result = analyze_file(&project, "res://use.gd", consumer);
     let errors = error_messages(&result);
     assert!(
-        errors.iter().any(
-            |m| m == "Too few arguments for \"new()\" call. Expected at least 2 but received 1."
-        ),
+        errors
+            .iter()
+            .any(|m| m
+                == "Too few arguments for \"new()\" call. Expected at least 2 but received 1."),
         "cross-file parameterized _init under-call must arity-error; got {errors:?}"
     );
 }
@@ -668,9 +669,10 @@ func go() -> void:
     let result = analyze_file(&project, "res://use.gd", consumer);
     let errors = error_messages(&result);
     assert!(
-        errors.iter().any(
-            |m| m == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."
-        ),
+        errors
+            .iter()
+            .any(|m| m
+                == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."),
         "cross-file parameterized _init over-call must arity-error; got {errors:?}"
     );
 }
@@ -719,9 +721,10 @@ func go() -> void:
     let result = analyze_file(&project, "res://use.gd", consumer);
     let errors = error_messages(&result);
     assert!(
-        errors.iter().any(
-            |m| m == "Too many arguments for \"new()\" call. Expected at most 0 but received 3."
-        ),
+        errors
+            .iter()
+            .any(|m| m
+                == "Too many arguments for \"new()\" call. Expected at most 0 but received 3."),
         "cross-file no-_init over-call must emit Expected at most 0; got {errors:?}"
     );
 }
@@ -792,9 +795,10 @@ func go() -> void:
     let result = analyze_file(&project, "res://use.gd", consumer);
     let errors = error_messages(&result);
     assert!(
-        errors.iter().any(
-            |m| m == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."
-        ),
+        errors
+            .iter()
+            .any(|m| m
+                == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."),
         "class_name-resolved Script _init over-call must arity-error; got {errors:?}"
     );
 }
@@ -817,5 +821,29 @@ func go() -> void:
     assert!(
         !errors.iter().any(|m| m.contains("arguments for")),
         "unresolved cross-file base must not arity-error (fail-closed); got {errors:?}"
+    );
+}
+
+/// FAIL-CLOSED: a base that declares `_init` as a NON-Func member (a `const`/`var`, degenerate)
+/// must leave the constructor count check OFF — gdls never arity-checks against a non-callable.
+#[test]
+fn cross_file_init_non_func_member_stays_silent() {
+    let dep = "\
+class_name Init216NonFunc
+extends RefCounted
+const _init = 1
+";
+    let consumer = "\
+extends RefCounted
+const Dep = preload(\"res://dep.gd\")
+func go() -> void:
+\tvar _x = Dep.new(1, 2, 3)
+";
+    let project = Project::new(&[("res://dep.gd", dep), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        !errors.iter().any(|m| m.contains("arguments for")),
+        "a non-Func _init member must not trigger the constructor arity check; got {errors:?}"
     );
 }
