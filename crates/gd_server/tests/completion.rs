@@ -1648,6 +1648,34 @@ fn subscript_falls_back_to_identifiers() {
     shutdown(&client, server_thread);
 }
 
+/// `d[<cursor>` where `d` is a `const` Dictionary offers the dict's literal string keys (quoted,
+/// MEMBER kind) ADDED TO — not replacing — the identifier set (Godot `COMPLETION_SUBSCRIPT`,
+/// `gdscript_editor.cpp:3613-3624`: dict keys quoted first, then `_find_identifiers`). The keys
+/// `"alpha"`/`"beta"` appear quoted, and the identifier fallback (`print`) is still present.
+#[test]
+fn subscript_const_dict_offers_quoted_keys_plus_identifiers() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/subdict.gd"));
+    // A class-level `const` Dictionary with two string keys, indexed in a func body.
+    let src = "extends Node2D\n\nconst D = {\"alpha\": 1, \"beta\": 2}\n\nfunc f() -> void:\n\tprint(D[)\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tprint(D[` on line 5 → cursor right after `[`. `\t`=0, `print(D[` → `[` at byte 8, col 9.
+    let raw = complete_raw(&client, 138, &uri, Position::new(5, 9));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"\"alpha\"".to_string()) && ls.contains(&"\"beta\"".to_string()),
+        "a const-dict subscript offers the dict's quoted string keys; got {ls:?}"
+    );
+    assert!(
+        ls.contains(&"print".to_string()),
+        "const-dict keys are ADDED TO the identifier fallback (the global `print`); got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 // --- PROPERTY METHOD (get =/set = binds a class method) ---
 
 /// `var x: int:\n\tget = <cursor>` offers the class's own methods (the accessor binds a getter by
