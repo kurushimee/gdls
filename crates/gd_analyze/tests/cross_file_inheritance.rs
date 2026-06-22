@@ -611,3 +611,211 @@ func _ready() -> void:
         "a cross-file fixed-arity method over-supplied must arity-error; got {errors:?}"
     );
 }
+
+// === #216: cross-file Script `_init` constructor arity ==========================================
+//
+// `X.new(...)` where `X` is a cross-file `DtKind::Script` base (a `preload`-constant or a
+// `class_name`-resolved script) must arity-check its `_init` exactly as Godot's
+// `get_function_signature(p_is_constructor=true)` does (gdscript_analyzer.cpp:5829-5903 →
+// validate_call_arg :5944-5950). #208 shipped the in-file Class + native cases and excluded
+// Script; these pin the cross-file Script case. Verified against the real Godot 4.6.3 binary:
+// a no-`_init` script over-called emits `Expected at most 0`; a parameterized `_init`
+// under/over-called emits the real bounds; the function name in the message is `new`.
+
+/// Parameterized cross-file `_init`, under-supplied → "Too few arguments". A `preload`-constant
+/// base typed `DtKind::Script`.
+#[test]
+fn cross_file_init_too_few_arguments_fires() {
+    let dep = "\
+class_name Init216Few
+extends RefCounted
+func _init(a, b):
+\tpass
+";
+    let consumer = "\
+extends RefCounted
+const Dep = preload(\"res://dep.gd\")
+func go() -> void:
+\tvar _x = Dep.new(1)
+";
+    let project = Project::new(&[("res://dep.gd", dep), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        errors.iter().any(
+            |m| m == "Too few arguments for \"new()\" call. Expected at least 2 but received 1."
+        ),
+        "cross-file parameterized _init under-call must arity-error; got {errors:?}"
+    );
+}
+
+/// Parameterized cross-file `_init`, over-supplied → "Too many arguments".
+#[test]
+fn cross_file_init_too_many_arguments_fires() {
+    let dep = "\
+class_name Init216Many
+extends RefCounted
+func _init(a, b):
+\tpass
+";
+    let consumer = "\
+extends RefCounted
+const Dep = preload(\"res://dep.gd\")
+func go() -> void:
+\tvar _x = Dep.new(1, 2, 3)
+";
+    let project = Project::new(&[("res://dep.gd", dep), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        errors.iter().any(
+            |m| m == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."
+        ),
+        "cross-file parameterized _init over-call must arity-error; got {errors:?}"
+    );
+}
+
+/// Parameterized cross-file `_init` called with the right arity → SILENT.
+#[test]
+fn cross_file_init_correct_arity_is_silent() {
+    let dep = "\
+class_name Init216Ok
+extends RefCounted
+func _init(a, b):
+\tpass
+";
+    let consumer = "\
+extends RefCounted
+const Dep = preload(\"res://dep.gd\")
+func go() -> void:
+\tvar _x = Dep.new(1, 2)
+";
+    let project = Project::new(&[("res://dep.gd", dep), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        !errors.iter().any(|m| m.contains("arguments for")),
+        "cross-file correct _init arity must be silent; got {errors:?}"
+    );
+}
+
+/// A cross-file script with NO `_init` over-called → "Expected at most 0" (Godot's empty-par_types
+/// constructor fallback, gdscript_analyzer.cpp:5897-5903). Verified against the real 4.6.3 binary.
+#[test]
+fn cross_file_no_init_over_call_fires_expected_at_most_zero() {
+    let dep = "\
+class_name Init216None
+extends RefCounted
+func hello() -> void:
+\tpass
+";
+    let consumer = "\
+extends RefCounted
+const Dep = preload(\"res://dep.gd\")
+func go() -> void:
+\tvar _x = Dep.new(1, 2, 3)
+";
+    let project = Project::new(&[("res://dep.gd", dep), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        errors.iter().any(
+            |m| m == "Too many arguments for \"new()\" call. Expected at most 0 but received 3."
+        ),
+        "cross-file no-_init over-call must emit Expected at most 0; got {errors:?}"
+    );
+}
+
+/// A cross-file script with NO `_init` constructed with zero args → SILENT (the common valid case).
+#[test]
+fn cross_file_no_init_zero_args_is_silent() {
+    let dep = "\
+class_name Init216NoneOk
+extends RefCounted
+func hello() -> void:
+\tpass
+";
+    let consumer = "\
+extends RefCounted
+const Dep = preload(\"res://dep.gd\")
+func go() -> void:
+\tvar _x = Dep.new()
+";
+    let project = Project::new(&[("res://dep.gd", dep), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        !errors.iter().any(|m| m.contains("arguments for")),
+        "cross-file no-_init zero-arg construction must be silent; got {errors:?}"
+    );
+}
+
+/// A cross-file `_init` with a defaulted param, called with only the required args → SILENT.
+#[test]
+fn cross_file_init_defaulted_params_required_only_is_silent() {
+    let dep = "\
+class_name Init216Default
+extends RefCounted
+func _init(a, b = 2):
+\tpass
+";
+    let consumer = "\
+extends RefCounted
+const Dep = preload(\"res://dep.gd\")
+func go() -> void:
+\tvar _x = Dep.new(1)
+";
+    let project = Project::new(&[("res://dep.gd", dep), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        !errors.iter().any(|m| m.contains("arguments for")),
+        "cross-file defaulted _init called with required args must be silent; got {errors:?}"
+    );
+}
+
+/// A cross-file `class_name`-resolved Script base (not a preload-constant) is arity-checked too.
+#[test]
+fn cross_file_init_via_class_name_fires() {
+    let dep = "\
+class_name Init216Named
+extends RefCounted
+func _init(a, b):
+\tpass
+";
+    let consumer = "\
+extends RefCounted
+func go() -> void:
+\tvar _x = Init216Named.new(1, 2, 3)
+";
+    let project = Project::new(&[("res://dep.gd", dep), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        errors.iter().any(
+            |m| m == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."
+        ),
+        "class_name-resolved Script _init over-call must arity-error; got {errors:?}"
+    );
+}
+
+/// FAIL-CLOSED: an UNRESOLVED base (the dependency file is not in the project index) must stay
+/// SILENT — gdls must never manufacture "Expected at most 0" for a `_init` it cannot prove absent.
+#[test]
+fn cross_file_unresolved_base_stays_silent() {
+    // `Missing216` is referenced but NOT registered in the project, so its interface never
+    // resolves. The base degrades to Variant; the constructor arity check must not fire.
+    let consumer = "\
+extends RefCounted
+const Dep = preload(\"res://missing.gd\")
+func go() -> void:
+\tvar _x = Dep.new(1, 2, 3)
+";
+    let project = Project::new(&[("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        !errors.iter().any(|m| m.contains("arguments for")),
+        "unresolved cross-file base must not arity-error (fail-closed); got {errors:?}"
+    );
+}
