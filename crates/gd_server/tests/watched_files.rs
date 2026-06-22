@@ -170,6 +170,48 @@ fn registration_sent_iff_dynamic_registration_offered() {
     shutdown(&client2, server_thread2);
 }
 
+/// #226: the dynamic-registration glob set must also ask the client to report ARBITRARY ASSET
+/// changes (textures, audio, `.tres`, extension-less files like `LICENSE`). The asset set is
+/// defined by EXCLUSION (everything that is not a `.gd` script / `.tscn` scene / engine-managed
+/// file), so no positive extension allowlist can express it — only a `**/*` catch-all matches the
+/// same file set `AssetIndex::build` indexes. Without it, a client whose only freshness channel is
+/// `didChangeWatchedFiles` (the Helix scenario — no native OS watcher) is never told to report a
+/// newly-created `icon.png`, so the asset index goes stale for `load`/`preload` completion until a
+/// restart. `classify_client_event` re-applies `is_excluded` server-side, so the broad glob does
+/// not pollute the index.
+#[test]
+fn register_watched_files_includes_asset_glob() {
+    let p = sample_project();
+    let (client, _watcher_tx, server_thread) = boot_injected(&p, dynamic_registration_caps());
+
+    let req = loop {
+        if let Message::Request(req) = recv(&client) {
+            break req;
+        }
+    };
+    assert_eq!(req.method, "client/registerCapability");
+    let globs: Vec<&str> = req.params["registrations"][0]["registerOptions"]["watchers"]
+        .as_array()
+        .expect("watchers array")
+        .iter()
+        .map(|w| w["globPattern"].as_str().unwrap())
+        .collect();
+    assert!(
+        globs.contains(&"**/*"),
+        "the dynamic-registration glob set must include a `**/*` catch-all so the client reports \
+         arbitrary-asset create/delete (the exclusion-defined asset set has no extension \
+         allowlist); got {globs:?}"
+    );
+    client
+        .sender
+        .send(Message::Response(Response::new_ok(
+            req.id,
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+    shutdown(&client, server_thread);
+}
+
 /// The #60 acceptance bar: with the native watcher dead (the injected channel never fires —
 /// Helix has no OS watcher), client `didChangeWatchedFiles` notifications alone keep the index
 /// fresh: a created file's `class_name` resolves, an interface edit republishes the open
@@ -266,6 +308,107 @@ fn client_events_alone_keep_the_index_fresh() {
             .unwrap()
             .is_empty(),
         "deleting Fresh via a client event must re-break the probe"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// #226 end-to-end: with the native watcher dead, a CLIENT-delivered asset CREATE makes the new
+/// arbitrary asset live for `load("res://…")` completion, and a DELETE drops it — the asset index
+/// stays fresh through the `didChangeWatchedFiles` funnel alone (the Helix scenario), the same
+/// freshness scripts get in `client_events_alone_keep_the_index_fresh`.
+#[test]
+fn client_events_alone_keep_the_asset_index_fresh() {
+    let p = sample_project();
+    let (client, _watcher_tx, server_thread) = boot_injected(&p, dynamic_registration_caps());
+    // Consume + acknowledge the registration.
+    let reg = loop {
+        if let Message::Request(req) = recv(&client) {
+            break req;
+        }
+    };
+    client
+        .sender
+        .send(Message::Response(Response::new_ok(
+            reg.id,
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+
+    // Open a buffer whose cursor sits inside a `load("res://")` string — completion there lists the
+    // project's `res://` entries (scripts + scenes + arbitrary assets).
+    let probe_uri = file_uri(&p.root.join("probe.gd"));
+    let probe_src = "extends Node\n\nfunc f() -> void:\n\tvar c = load(\"res://\")\n";
+    p.write("probe.gd", probe_src);
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: probe_uri.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 1,
+                    text: probe_src.to_string(),
+                },
+            },
+        ))
+        .unwrap();
+
+    // A `load("res://")` completion lists the next path segment. Helper: the set of insert texts.
+    let complete_res_root = |id: i32| -> String {
+        client
+            .sender
+            .send(request(
+                id,
+                "textDocument/completion",
+                // `\tvar c = load("res://")` — `res://` occupies cols 15..21; cursor at col 21.
+                serde_json::json!({
+                    "textDocument": { "uri": probe_uri.as_str() },
+                    "position": { "line": 3, "character": 21 },
+                }),
+            ))
+            .unwrap();
+        let resp = loop {
+            let r = recv_response(&client);
+            if r.id == RequestId::from(id) {
+                break r;
+            }
+        };
+        assert!(resp.error.is_none(), "completion errored: {:?}", resp.error);
+        serde_json::to_string(&resp.result).unwrap()
+    };
+
+    // Baseline: the fresh `media/` subdir does not exist yet, so it is not offered.
+    assert!(
+        !complete_res_root(20).contains("res://media/"),
+        "media/ must not be offered before its asset exists"
+    );
+
+    // CREATED: write a brand-new arbitrary asset under a previously-absent dir, tell the server via
+    // the client channel only (native watcher is dead).
+    let asset_path = p.root.join("media/icon.png");
+    p.write("media/icon.png", "PNG-PLACEHOLDER");
+    let asset_uri = file_uri(&asset_path);
+    client
+        .sender
+        .send(file_event(&asset_uri, FileChangeType::CREATED))
+        .unwrap();
+    // The new asset's directory is now offered for `res://` completion — the index went live.
+    assert!(
+        complete_res_root(21).contains("res://media/"),
+        "creating an asset via a client event must make its dir live for load() completion"
+    );
+
+    // DELETED: remove on disk, tell the server via the client channel only.
+    p.remove("media/icon.png");
+    client
+        .sender
+        .send(file_event(&asset_uri, FileChangeType::DELETED))
+        .unwrap();
+    assert!(
+        !complete_res_root(22).contains("res://media/"),
+        "deleting the only asset under media/ via a client event must drop it from completion"
     );
 
     shutdown(&client, server_thread);
