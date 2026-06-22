@@ -38,7 +38,7 @@ use lsp_types::{
 use serde::{Deserialize, Serialize};
 
 use gd_analyze::enumerate::{self, MemberItem, MemberItemKind, MemberOwner};
-use gd_analyze::{AnalysisResult, DataType, DtKind};
+use gd_analyze::{AnalysisResult, DataType, DtKind, FoldedValue};
 use gd_syntax::ast::{NodeId, ParseTree};
 use gd_syntax::ByteSpan;
 
@@ -1224,20 +1224,156 @@ fn attribute_callee_base_type<'a>(
 // SUBSCRIPT / ASSIGN — refinements over the identifier set.
 // ===================================================================================================
 
-/// `d[<cursor>` — dictionary keys when the base is a known constant dict (a folded value), else the
-/// bare-identifier set (Godot `COMPLETION_SUBSCRIPT`, `gdscript_editor.cpp:3608`, whose dict-key
-/// arm needs a reduced constant value). The folded-dict-key refinement is deferred to the identifier
-/// fallback here — the key set needs constant-folding the base, which gdls does for `const` dicts
-/// only; until that is threaded, the identifier set is the safe non-lying answer.
+/// `d[<cursor>` — the literal string keys of a `const` Dictionary base (quoted; Godot's
+/// `CODE_COMPLETION_KIND_MEMBER`, emitted here as the standard-legend LSP `PROPERTY` kind this
+/// codebase uses for members), ADDED TO the bare-identifier set (Godot `COMPLETION_SUBSCRIPT`,
+/// `gdscript_editor.cpp:3613-3624`).
+/// Godot offers the keys when `base.value` is a folded `DICTIONARY` constant: it iterates the dict's
+/// property list, inserting each key `quote(quote_style)` with `CODE_COMPLETION_KIND_MEMBER`, THEN
+/// (additively, when the index is not a literal) calls `_find_identifiers`. gdls mirrors that: it
+/// resolves the base identifier to a `const` whose initializer is a Dictionary literal, offers each
+/// key that folded to a `FoldedValue::String` (double-quoted, the W17 canonical quote — no editor
+/// quote-style coupling), then appends the identifier fallback. A base that does not positively
+/// resolve to a `const` dict literal yields the identifier set only (never lie).
 fn subscript_items(
     state: &ServerState,
     tree: &ParseTree,
     analyzed: Option<&AnalysisResult>,
-    _tokens: &[gd_syntax::token::Token],
+    tokens: &[gd_syntax::token::Token],
     byte: usize,
     render: &RenderCtx,
 ) -> Vec<CompletionItem> {
-    identifier_items(state, tree, analyzed, byte, render)
+    let mut items: Vec<CompletionItem> = Vec::new();
+    let mut rank: usize = 0;
+
+    // Dict keys first — only when the base positively resolves to a `const` dict literal whose keys
+    // folded to strings (Godot's `base.value.get_type() == DICTIONARY` guard; `base.value` is set
+    // only for a folded constant). The analysis (and its FoldTable) come from the last good analyze.
+    if let Some(analyzed) = analyzed {
+        if let Some(keys) = const_dict_subscript_keys(tree, analyzed, tokens, byte) {
+            for key in keys {
+                let quoted = format!("\"{key}\"");
+                items.push(keyword_item(
+                    &quoted,
+                    CompletionItemKind::PROPERTY,
+                    CompletionData::Local,
+                    rank,
+                    render,
+                ));
+                rank += 1;
+            }
+        }
+    }
+
+    // Identifier fallback — additive, matching Godot's `_find_identifiers` tail. The identifier
+    // builder ranks from 0, so its `sort_text` would tie the dict keys' ranks; that is harmless for
+    // a client that re-sorts by `sort_text` then label, and the dict keys (quoted) never collide
+    // with bare identifiers. Keys lead because they are pushed first.
+    items.extend(identifier_items(state, tree, analyzed, byte, render));
+    items
+}
+
+/// The literal string keys of the `const` Dictionary that the subscript base in `BASE[<cursor>`
+/// resolves to, or `None` when the base is not a `const` dict literal (caller falls back to the
+/// identifier set). The base is the identifier token immediately before the `[` nearest at-or-before
+/// the cursor; it is resolved to a `const` declaration (a func-local in scope, else a class-level
+/// member), whose initializer must be a Dictionary literal. Only keys that folded to a
+/// `FoldedValue::String` are returned, in source order (Godot iterates the dict's property list).
+fn const_dict_subscript_keys(
+    tree: &ParseTree,
+    analyzed: &AnalysisResult,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+) -> Option<Vec<String>> {
+    let base = subscript_base_identifier(tokens, byte)?;
+    let init = resolve_const_dict_initializer(tree, byte, &base)?;
+    let dict = match &tree.get(init).kind {
+        gd_syntax::ast::NodeKind::Dictionary(d) => d,
+        _ => return None,
+    };
+    // De-duplicate: Godot iterates the folded Dictionary's property list (one entry per key), so a
+    // literal with a repeated key (itself an analyzer error) still offers that key once. We iterate
+    // AST elements, so de-dup here to match Godot's effective set; source order is preserved.
+    let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    let keys: Vec<String> = dict
+        .elements
+        .iter()
+        .filter_map(|kv| kv.key)
+        .filter_map(|key_id| match analyzed.folds.get(key_id) {
+            Some(FoldedValue::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .filter(|s| seen.insert(s.clone()))
+        .collect();
+    if keys.is_empty() {
+        None
+    } else {
+        Some(keys)
+    }
+}
+
+/// The base identifier text in `BASE[<cursor>` — the bare `Identifier` token immediately before the
+/// `[` nearest at-or-before the cursor. `None` when no `[` precedes the cursor, the token before it
+/// is not an identifier (`f()[`, `arr[0][` → `)`/`]`), or that identifier is the tail of an
+/// attribute chain (`a.b[` — `b` is a member access, NOT a resolvable bare `const` name; offering
+/// keys for it would lie about a base that did not resolve to the const). Such bases fall through to
+/// the identifier set.
+fn subscript_base_identifier(tokens: &[gd_syntax::token::Token], byte: usize) -> Option<String> {
+    use gd_syntax::token::TokenKind;
+    let bracket_idx = tokens
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, t)| t.span.end <= byte)
+        .find(|(_, t)| t.kind == TokenKind::BracketOpen)
+        .map(|(i, _)| i)?;
+    let prev_idx = tokens[..bracket_idx]
+        .iter()
+        .rposition(|t| is_meaningful(t.kind))?;
+    if tokens[prev_idx].kind != TokenKind::Identifier {
+        return None;
+    }
+    // Reject an attribute tail (`a.b[`): a `.` immediately before the identifier means it is a member
+    // access, not a bare name resolvable to a `const` declaration.
+    if let Some(before_idx) = tokens[..prev_idx]
+        .iter()
+        .rposition(|t| is_meaningful(t.kind))
+    {
+        if tokens[before_idx].kind == TokenKind::Period {
+            return None;
+        }
+    }
+    Some(tokens[prev_idx].source.to_string())
+}
+
+/// The initializer `NodeId` of the `const` named `name` visible at `byte`: a func-local `const` in
+/// the cursor's scope (shadowing-correct via [`ParseTree::locals_in_scope_at`]), else a class-level
+/// `const` member. `None` when no such `const` exists (a `var`, a same-named non-const member, or an
+/// unknown name). The returned node is the const's initializer expression — the caller checks it is a
+/// Dictionary literal.
+fn resolve_const_dict_initializer(tree: &ParseTree, byte: usize, name: &str) -> Option<NodeId> {
+    use gd_syntax::ast::{LocalKind, Member, NodeKind};
+    // Func-local `const` in scope (innermost-first, already-declared) shadows a class member.
+    for local in tree.locals_in_scope_at(byte) {
+        if local.name == name && local.kind == LocalKind::Constant {
+            if let NodeKind::Constant(c) = &tree.get(local.source).kind {
+                return c.initializer;
+            }
+        }
+    }
+    // Class-level `const` member, by name (verify the resolved member is actually a Constant —
+    // `members_indices` keys by name across every member kind).
+    let root_id = tree.root_id()?;
+    let NodeKind::Class(class) = &tree.get(root_id).kind else {
+        return None;
+    };
+    let idx = *class.members_indices.get(name)?;
+    if let Member::Constant(cid) = class.members.get(idx)? {
+        if let NodeKind::Constant(c) = &tree.get(*cid).kind {
+            return c.initializer;
+        }
+    }
+    None
 }
 
 /// `x = <cursor>` / `x += <cursor>` — enum members when the assignee is enum-typed (Godot

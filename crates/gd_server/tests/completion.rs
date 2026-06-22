@@ -1648,6 +1648,138 @@ fn subscript_falls_back_to_identifiers() {
     shutdown(&client, server_thread);
 }
 
+/// `d[<cursor>` where `d` is a `const` Dictionary offers the dict's literal string keys (quoted,
+/// MEMBER kind) ADDED TO — not replacing — the identifier set (Godot `COMPLETION_SUBSCRIPT`,
+/// `gdscript_editor.cpp:3613-3624`: dict keys quoted first, then `_find_identifiers`). The keys
+/// `"alpha"`/`"beta"` appear quoted, and the identifier fallback (`print`) is still present.
+#[test]
+fn subscript_const_dict_offers_quoted_keys_plus_identifiers() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/subdict.gd"));
+    // A class-level `const` Dictionary with two string keys, indexed in a func body.
+    let src = "extends Node2D\n\nconst D = {\"alpha\": 1, \"beta\": 2}\n\nfunc f() -> void:\n\tprint(D[)\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tprint(D[` on line 5 → cursor right after `[`. `\t`=0, `print(D[` → `[` at byte 8, col 9.
+    let raw = complete_raw(&client, 138, &uri, Position::new(5, 9));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"\"alpha\"".to_string()) && ls.contains(&"\"beta\"".to_string()),
+        "a const-dict subscript offers the dict's quoted string keys; got {ls:?}"
+    );
+    assert!(
+        ls.contains(&"print".to_string()),
+        "const-dict keys are ADDED TO the identifier fallback (the global `print`); got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A **func-local** `const` dict whose subscript is **closed** (`D[]`, an intact parse) resolves
+/// the in-scope local and offers its keys — proving the func-local resolution path itself works (it
+/// is the unclosed-bracket parse collapse, not the resolver, that drops func-local keys mid-edit).
+/// Lua-style keys (`{ a = 1 }`) fold to their key string just like quoted keys.
+#[test]
+fn subscript_func_local_const_dict_closed_offers_keys() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/subloc.gd"));
+    // A func-local `const` Lua-style dict, indexed with a CLOSED subscript (intact parse) so the
+    // func suite does not collapse — the cursor sits between `[` and `]`.
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tconst D = {a = 1, b = 2}\n\tprint(D[])\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tprint(D[])` on line 4 → cursor between `[` and `]`. `[` at byte 8, col 9.
+    let raw = complete_raw(&client, 139, &uri, Position::new(4, 9));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"\"a\"".to_string()) && ls.contains(&"\"b\"".to_string()),
+        "a func-local const Lua-style dict (closed subscript) offers its quoted keys; got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A func-local `const` dict indexed with an **unclosed** subscript (`D[<cursor>`, the real mid-edit
+/// shape) currently falls back to the identifier set: the unclosed `[` collapses the function suite
+/// in the partial parse, so the block-local const's dict is never reduced (its keys do not fold).
+/// The contract holds — never lie: no keys are offered, the identifier fallback is present. The
+/// class-level const path is unaffected (its keys fold in the class pass); see #221.
+#[test]
+fn subscript_func_local_const_dict_unclosed_falls_back() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/sublocu.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tconst D = {a = 1, b = 2}\n\tprint(D[)\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tprint(D[` on line 4 → `[` at byte 8, col 9 (unclosed — the partial-parse collapse case).
+    let raw = complete_raw(&client, 141, &uri, Position::new(4, 9));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        !ls.contains(&"\"a\"".to_string()) && !ls.contains(&"\"b\"".to_string()),
+        "an unclosed func-local const subscript offers NO keys (parse collapse); got {ls:?}"
+    );
+    assert!(
+        ls.contains(&"print".to_string()),
+        "the identifier fallback is still present; got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A `var` Dictionary (NOT `const`) does NOT offer keys — only a folded constant has `base.value`,
+/// so a mutable dict falls back to the identifier set alone (never lie). Mirrors Godot's
+/// `base.value.get_type() == DICTIONARY` guard, which is set only for a reduced constant.
+#[test]
+fn subscript_var_dict_does_not_offer_keys() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/subvar.gd"));
+    // A `var` (mutable) dict — not a folded constant.
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar d = {\"alpha\": 1}\n\tprint(d[)\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tprint(d[` on line 4 → `[` at byte 8, col 9.
+    let raw = complete_raw(&client, 140, &uri, Position::new(4, 9));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        !ls.contains(&"\"alpha\"".to_string()),
+        "a mutable (`var`) dict offers NO keys (only a const folds to `base.value`); got {ls:?}"
+    );
+    assert!(
+        ls.contains(&"print".to_string()),
+        "a `var` dict subscript still falls back to identifiers; got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// An **attribute** base (`a.b[<cursor>`) must NOT offer keys of a same-named `const` dict: `b` is a
+/// member access on `a`, not a bare name resolving to the const, so offering the const's keys would
+/// lie about the base. The const `D`'s keys are NOT offered for `a.D[`; the identifier fallback holds.
+#[test]
+fn subscript_attribute_base_does_not_offer_const_keys() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/subattr.gd"));
+    // A class-level const dict `D`, then an attribute subscript `node.D[` — `D` is read as a member
+    // access here, not the bare const. (`get_node` types as bare Node; `.D` is just a member name.)
+    let src = "extends Node2D\n\nconst D = {\"alpha\": 1}\n\nfunc f() -> void:\n\tvar a := self\n\tprint(a.D[)\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tprint(a.D[` on line 6 → `[` after `a.D`. `\t`=0, `print(a.D[` → `[` at byte 10, col 11.
+    let raw = complete_raw(&client, 142, &uri, Position::new(6, 11));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        !ls.contains(&"\"alpha\"".to_string()),
+        "an attribute base (`a.D[`) offers NO const keys (positive-resolution only); got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 // --- PROPERTY METHOD (get =/set = binds a class method) ---
 
 /// `var x: int:\n\tget = <cursor>` offers the class's own methods (the accessor binds a getter by
