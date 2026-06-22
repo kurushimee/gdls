@@ -64,6 +64,14 @@ const RICH_API: &str = r#"{
     "utility_functions": [
         {"name": "print", "return_type": "void", "is_vararg": true, "arguments": []}
     ],
+    "builtin_classes": [
+        {"name": "Vector2", "constructors": [
+            {"index": 0},
+            {"index": 1, "arguments": [{"name": "from", "type": "Vector2"}]},
+            {"index": 2, "arguments": [{"name": "from", "type": "Vector2i"}]},
+            {"index": 3, "arguments": [{"name": "x", "type": "float"}, {"name": "y", "type": "float"}]}
+        ]}
+    ],
     "classes": [
         {"name": "Object", "methods": [
             {"name": "get_class", "is_const": true, "return_value": {"type": "String"}}
@@ -1596,6 +1604,89 @@ fn call_argument_enum_candidates() {
     assert!(
         ls.contains(&"STATE_IDLE".to_string()) && ls.contains(&"STATE_RUN".to_string()),
         "an enum-typed parameter suggests its enum's constants; got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// --- CALL ARGUMENTS builtin constructor overload arghints (#194) ---
+
+/// `Vector2(<cursor>` offers one item per constructor overload whose arity covers the active arg
+/// index, labelled `Vector2` with a `Type Type(args)` detail (Godot `gdscript_editor.cpp:3411-3427`,
+/// `Variant::get_constructor_list`: `mi.name = mi.return_val.type = type`). At arg index 0 the
+/// no-arg overload is filtered out by Godot's `arg_idx >= arguments.size()` gate, leaving the three
+/// argument-bearing overloads. The constructor items are ADDED to the identifier fallback set.
+#[test]
+fn builtin_constructor_overload_arghints() {
+    let p = rich_project();
+    let uri = file_uri(&p.root.join("src/ctor.gd"));
+    // A bare `Vector2(` in a function body — the CallArguments context with a builtin-type callee.
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar v = Vector2()\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar v = Vector2(` → cursor right after the `(`. `\t`=col0, `var v = Vector2(` → `(` at
+    // byte index 15 (0-based col), cursor after it = column 16.
+    let raw = complete_raw(&client, 140, &uri, Position::new(3, 16));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+
+    // The three argument-bearing overloads appear (the no-arg overload is filtered at arg index 0).
+    let ctors: Vec<&CompletionItem> = list
+        .items
+        .iter()
+        .filter(|i| i.kind == Some(CompletionItemKind::CONSTRUCTOR))
+        .collect();
+    let details: Vec<&str> = ctors.iter().filter_map(|i| i.detail.as_deref()).collect();
+    assert!(
+        details.contains(&"Vector2 Vector2(from: Vector2)"),
+        "the copy ctor overload arghint must appear; got {details:?}"
+    );
+    assert!(
+        details.contains(&"Vector2 Vector2(from: Vector2i)"),
+        "the Vector2i ctor overload arghint must appear; got {details:?}"
+    );
+    assert!(
+        details.contains(&"Vector2 Vector2(x: float, y: float)"),
+        "the (x, y) ctor overload arghint must appear; got {details:?}"
+    );
+    assert_eq!(
+        ctors.len(),
+        3,
+        "exactly the three argument-bearing overloads appear at arg 0 (no-arg filtered); got {details:?}"
+    );
+    // Every constructor item is labelled with the type name (faithful `mi.name = type`).
+    assert!(
+        ctors.iter().all(|i| i.label == "Vector2"),
+        "each constructor item is labelled `Vector2`; got {:?}",
+        ctors.iter().map(|i| i.label.as_str()).collect::<Vec<_>>()
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Godot's per-overload `arg_idx >= arguments.size()` filter: at the SECOND argument
+/// (`Vector2(1.0, <cursor>`) only the 2-arg `(x: float, y: float)` overload survives — the 1-arg
+/// copy/convert overloads no longer cover arg index 1.
+#[test]
+fn builtin_constructor_overload_filtered_by_arg_index() {
+    let p = rich_project();
+    let uri = file_uri(&p.root.join("src/ctor2.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar v = Vector2(1.0, )\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar v = Vector2(1.0, ` → cursor after the comma+space. `var v = Vector2(1.0, ` is 21 chars
+    // after the leading `\t` (col0): cursor at column 21.
+    let raw = complete_raw(&client, 141, &uri, Position::new(3, 21));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let details: Vec<&str> = list
+        .items
+        .iter()
+        .filter(|i| i.kind == Some(CompletionItemKind::CONSTRUCTOR))
+        .filter_map(|i| i.detail.as_deref())
+        .collect();
+    assert_eq!(
+        details,
+        vec!["Vector2 Vector2(x: float, y: float)"],
+        "at arg index 1 only the 2-arg overload survives the arg-index filter; got {details:?}"
     );
 
     shutdown(&client, server_thread);
