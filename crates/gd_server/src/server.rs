@@ -1878,6 +1878,16 @@ fn register_watched_files(state: &mut ServerState) {
                         watcher("**/*.gdextension"),
                         watcher("**/extension_api.json"),
                         watcher("**/doc_classes/*.xml"),
+                        // #226: arbitrary assets are exclusion-defined (everything that is not a
+                        // script/scene/engine-managed file), so no positive extension allowlist can
+                        // express the set — an extension-less `res://LICENSE` is a listable asset
+                        // too. A `**/*` catch-all is the only glob matching `AssetIndex::build`'s own
+                        // definition, so a no-native-watcher client (Helix-class) reports
+                        // arbitrary-asset create/delete and keeps `load`/`preload` completion live.
+                        // `classify_client_event` re-applies the same `is_excluded` server-side
+                        // filter the other broad globs rely on, so the over-delivery converges to
+                        // identical semantics (see the registration doc comment above).
+                        watcher("**/*"),
                     ],
                 },
             }],

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::{file_uri, notification, recv, recv_response, request, sample_project, try_recv};
 use crossbeam_channel::{Receiver, Sender};
-use lsp_server::{Connection, Message, RequestId, Response};
+use lsp_server::{Connection, Message, Response};
 use lsp_types::{
     ClientCapabilities, DidChangeWatchedFilesClientCapabilities, DidChangeWatchedFilesParams,
     DidOpenTextDocumentParams, FileChangeType, FileEvent, InitializeParams, InitializedParams,
@@ -108,7 +108,7 @@ fn workspace_symbol_names(client: &Connection, id: i32, query: &str) -> String {
         .unwrap();
     let resp = loop {
         let r = recv_response(client);
-        if r.id == RequestId::from(id) {
+        if r.id == lsp_server::RequestId::from(id) {
             break r;
         }
     };
@@ -117,7 +117,7 @@ fn workspace_symbol_names(client: &Connection, id: i32, query: &str) -> String {
 }
 
 /// Registration is sent exactly when offered: with `dynamicRegistration: true` the client
-/// receives one `client/registerCapability` for the six watch globs after `initialized`;
+/// receives one `client/registerCapability` for the seven watch globs after `initialized`;
 /// without it, nothing arrives.
 #[test]
 fn registration_sent_iff_dynamic_registration_offered() {
@@ -148,6 +148,7 @@ fn registration_sent_iff_dynamic_registration_offered() {
             "**/*.gdextension",
             "**/extension_api.json",
             "**/doc_classes/*.xml",
+            "**/*",
         ]
     );
     client
@@ -371,7 +372,7 @@ fn client_events_alone_keep_the_asset_index_fresh() {
             .unwrap();
         let resp = loop {
             let r = recv_response(&client);
-            if r.id == RequestId::from(id) {
+            if r.id == lsp_server::RequestId::from(id) {
                 break r;
             }
         };
