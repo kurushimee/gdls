@@ -314,10 +314,13 @@ fn client_events_alone_keep_the_index_fresh() {
     shutdown(&client, server_thread);
 }
 
-/// #226 end-to-end: with the native watcher dead, a CLIENT-delivered asset CREATE makes the new
-/// arbitrary asset live for `load("res://…")` completion, and a DELETE drops it — the asset index
+/// #226 end-to-end funnel (NOT the regression guard — `register_watched_files_includes_asset_glob`
+/// owns that): once an asset event reaches the server, a CLIENT-delivered asset CREATE makes the new
+/// arbitrary asset live for `load("res://…")` completion and a DELETE drops it — the asset index
 /// stays fresh through the `didChangeWatchedFiles` funnel alone (the Helix scenario), the same
-/// freshness scripts get in `client_events_alone_keep_the_index_fresh`.
+/// freshness scripts get in `client_events_alone_keep_the_index_fresh`. The event is injected
+/// directly: client-side glob-matching is the client's job, so this proves the processing path while
+/// the registration test proves the client is told to watch assets in the first place.
 #[test]
 fn client_events_alone_keep_the_asset_index_fresh() {
     let p = sample_project();
