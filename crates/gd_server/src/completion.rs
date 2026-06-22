@@ -159,6 +159,29 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
             TypePos::Type,
             &render,
         ),
+        // Class-body `var x: <cursor>` — available types, then the `get`/`set` accessor keywords
+        // (Godot `COMPLETION_PROPERTY_DECLARATION_OR_TYPE`, `gdscript_editor.cpp:3535`: types listed
+        // first, then `get`, then `set`).
+        CompletionKind::PropertyDeclarationOrType => {
+            let mut items = type_name_items(
+                state,
+                &parsed.tree,
+                analyzed.as_deref(),
+                TypePos::Type,
+                &render,
+            );
+            let base_rank = items.len();
+            for (offset, kw) in ["get", "set"].into_iter().enumerate() {
+                items.push(keyword_item(
+                    kw,
+                    CompletionItemKind::KEYWORD,
+                    CompletionData::Keyword,
+                    base_rank + offset,
+                    &render,
+                ));
+            }
+            items
+        }
         CompletionKind::TypeNameOrVoid => type_name_items(
             state,
             &parsed.tree,

@@ -103,6 +103,14 @@ pub enum CompletionKind {
     /// `Array[`, a cast `x as T`. Identifier names of types are wanted here.
     TypeName,
 
+    /// Inline type-or-accessor position of a **class-body** `var` declaration: `var x: <cursor>`
+    /// (no trailing accessor newline) — Godot's `COMPLETION_PROPERTY_DECLARATION_OR_TYPE`
+    /// (`gdscript_parser.cpp:1241`), which offers the available types **plus** the `get`/`set`
+    /// accessor keywords (`gdscript_editor.cpp:3535`). Distinct from [`CompletionKind::TypeName`]
+    /// (the same slot in a function-local `var`, a `const`, a parameter, a cast `x as T`, or an
+    /// `Array[` element — all type-only, since `parse_property` is unreachable there).
+    PropertyDeclarationOrType,
+
     /// Member access **on a type** in type position: `var x: Foo.` — the nested types, enums, and
     /// constants of `Foo` are wanted, NOT its instance members. Distinct from
     /// [`CompletionKind::Attribute`] (which is instance member access) so the renderer offers the
@@ -1038,15 +1046,123 @@ fn classify_anchored(
     // Type hint after a `:` in a declaration (`var t: Vec`, `var t: `). The AST is the reliable
     // signal — a `Type` node (under a Variable/Constant/Parameter `datatype_specifier`) survives
     // even mid-name. Token-level: anchor is `:` or a word whose enclosing AST node is a `Type`.
+    //
+    // A class-body `var x: <cursor>` is Godot's `COMPLETION_PROPERTY_DECLARATION_OR_TYPE`
+    // (`gdscript_parser.cpp:1241`, reached only under `p_allow_property`): types PLUS `get`/`set`.
+    // Every other type-only slot (function-local `var`, `const`, parameter, cast, `Array[`) keeps
+    // plain `TypeName` — `parse_property` is unreachable there.
     if anchor_kind == Colon && is_declaration_colon(tokens, i) {
-        return Some(CompletionContext::new(CompletionKind::TypeName, prefix));
+        let kind = if is_class_body_var_colon(tokens, i) {
+            CompletionKind::PropertyDeclarationOrType
+        } else {
+            CompletionKind::TypeName
+        };
+        return Some(CompletionContext::new(kind, prefix));
     }
     if is_word_token(anchor_kind) && tokens[i].span.end == byte && ast_is_type_position(tree, byte)
     {
-        return Some(CompletionContext::new(CompletionKind::TypeName, prefix));
+        let kind = match decl_colon_before(tokens, i) {
+            Some(colon) if is_class_body_var_colon(tokens, colon) => {
+                CompletionKind::PropertyDeclarationOrType
+            }
+            _ => CompletionKind::TypeName,
+        };
+        return Some(CompletionContext::new(kind, prefix));
     }
 
     None
+}
+
+/// Index of the declaration type-hint colon (`var x:` / `const x:` / param `p:`) that opens the type
+/// position the word at index `i` sits in, if any — the nearest preceding depth-0 `:` on the same
+/// logical line whose [`is_declaration_colon`] holds. `None` when no such colon precedes `i` on the
+/// line (e.g. a cast `x as T` or an `Array[` element, which have no declaration colon).
+fn decl_colon_before(tokens: &[Token], i: usize) -> Option<usize> {
+    use TokenKind::*;
+    let mut depth: i32 = 0;
+    let mut j = i as isize - 1;
+    while j >= 0 {
+        let k = tokens[j as usize].kind;
+        match k {
+            Newline | Indent | Dedent => break,
+            ParenthesisClose | BracketClose | BraceClose => depth += 1,
+            ParenthesisOpen | BracketOpen | BraceOpen => depth -= 1,
+            Colon if depth == 0 && is_declaration_colon(tokens, j as usize) => {
+                return Some(j as usize);
+            }
+            _ => {}
+        }
+        j -= 1;
+    }
+    None
+}
+
+/// Whether the declaration colon at index `i` belongs to a **class-body** `var` declaration — Godot's
+/// `parse_variable(_, p_allow_property = true)` path, the only one that reaches
+/// `COMPLETION_PROPERTY_DECLARATION_OR_TYPE`. Two conditions, both token-primary (the AST collapses on
+/// mid-edit `var x: <cursor>`, so this never trusts a surviving node):
+/// 1. The colon's logical line declares with `var` (not `const`, and not a bare parameter colon).
+/// 2. The declaration is not nested inside a function body — class-body scope. A `func` opens a suite
+///    at a deeper indent; the colon is function-local while such a suite is still open.
+fn is_class_body_var_colon(tokens: &[Token], i: usize) -> bool {
+    use TokenKind::*;
+    // (1) The colon's line opens with `var` at depth 0 (excludes `const x:` and parameter `p:`).
+    let line_start = tokens[..i]
+        .iter()
+        .rposition(|t| matches!(t.kind, Newline | Indent | Dedent))
+        .map_or(0, |idx| idx + 1);
+    let mut depth: i32 = 0;
+    let mut saw_var = false;
+    for t in &tokens[line_start..i] {
+        match t.kind {
+            ParenthesisOpen | BracketOpen | BraceOpen => depth += 1,
+            ParenthesisClose | BracketClose | BraceClose => depth -= 1,
+            Var if depth == 0 => saw_var = true,
+            Const if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    if !saw_var {
+        return false;
+    }
+
+    // (2) No enclosing `func` suite is open at the colon. Track indentation up to the colon and keep a
+    // stack of the indent depths at which `func` declarations opened; a `func` is still open while the
+    // indentation stays deeper than its own. The colon is class-body iff that stack is empty.
+    let mut indent_depth: i32 = 0;
+    let mut func_indents: Vec<i32> = Vec::new();
+    let mut line_open_kind: Option<TokenKind> = None;
+    let mut bracket_depth: i32 = 0;
+    for t in &tokens[..i] {
+        match t.kind {
+            Indent => {
+                indent_depth += 1;
+                line_open_kind = None;
+            }
+            Dedent => {
+                indent_depth -= 1;
+                while func_indents.last().is_some_and(|&fi| indent_depth <= fi) {
+                    func_indents.pop();
+                }
+                line_open_kind = None;
+            }
+            Newline => line_open_kind = None,
+            ParenthesisOpen | BracketOpen | BraceOpen => bracket_depth += 1,
+            ParenthesisClose | BracketClose | BraceClose => bracket_depth -= 1,
+            Func if bracket_depth == 0 && line_open_kind.is_none() => {
+                func_indents.push(indent_depth);
+                line_open_kind = Some(Func);
+            }
+            // A leading `static` is transparent: it does not claim the line-open slot, so `static func`
+            // and `static var` keep `func`/`var` as the line-opening keyword (Godot's
+            // `parse_class_member` consumes `static` first) — a `static func` body's vars are still
+            // seen as function-local.
+            Static if bracket_depth == 0 && line_open_kind.is_none() => {}
+            _ if bracket_depth == 0 && line_open_kind.is_none() => line_open_kind = Some(t.kind),
+            _ => {}
+        }
+    }
+    func_indents.is_empty()
 }
 
 /// (4) Enclosing call / annotation arguments, else a bare/partial identifier or `None`.

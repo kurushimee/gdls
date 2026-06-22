@@ -2148,6 +2148,71 @@ fn property_accessor_offers_get_and_set_keywords() {
     shutdown(&client, server_thread);
 }
 
+/// A class-body `var x: <cursor>` (inline, no trailing accessor newline) is Godot's
+/// `COMPLETION_PROPERTY_DECLARATION_OR_TYPE` (`gdscript_editor.cpp:3535`): it offers the available
+/// types **and** the `get`/`set` accessor keywords. Discriminates this property-eligible slot from a
+/// plain type position — types alone would under-offer.
+#[test]
+fn class_body_var_inline_type_offers_types_and_get_set() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/pdot.gd"));
+    // `var x: ` at class body, trailing space, cursor right after the `: `.
+    let src = "extends Node\n\nvar x: \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // Line 2 (`var x: `): `var x:` ends col 6, space col 6..7 → cursor at column 7.
+    let raw = complete_raw(&client, 170, &uri, Position::new(2, 7));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"get".to_string()) && ls.contains(&"set".to_string()),
+        "class-body `var x: ` offers the `get`/`set` accessor keywords; got {ls:?}"
+    );
+    assert!(
+        ls.contains(&"Variant".to_string()),
+        "class-body `var x: ` still offers types (e.g. `Variant`); got {ls:?}"
+    );
+    // The `get`/`set` inserts are the bare keyword words (no parens, not a snippet).
+    let get = list
+        .items
+        .iter()
+        .find(|i| i.label == "get")
+        .expect("get item");
+    assert_eq!(
+        get.insert_text_format, None,
+        "the keyword is a plain insert"
+    );
+    assert_eq!(edit_new_text(get), "get", "the insert is the bare keyword");
+
+    shutdown(&client, server_thread);
+}
+
+/// A FUNCTION-LOCAL `var x: <cursor>` is `parse_variable(_, p_allow_property=false)` — it has no
+/// property path, so it offers types ONLY, never `get`/`set`. Guards the scope gate against
+/// over-offering the accessor keywords inside a function body.
+#[test]
+fn func_local_var_inline_type_offers_types_only_no_get_set() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/floc.gd"));
+    let src = "extends Node\n\nfunc f() -> void:\n\tvar x: \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // Line 3 (`\tvar x: `): tab col0, `var x:` ends col 7, space col 7..8 → cursor at column 8.
+    let raw = complete_raw(&client, 170, &uri, Position::new(3, 8));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"Variant".to_string()),
+        "function-local `var x: ` offers types (e.g. `Variant`); got {ls:?}"
+    );
+    assert!(
+        !ls.contains(&"get".to_string()) && !ls.contains(&"set".to_string()),
+        "function-local `var x: ` must NOT offer `get`/`set` (no property path); got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 // --- SUPER METHOD ---
 
 /// `super.<cursor>` offers the **parent** class's methods (`queue_free` from the native `Node`
