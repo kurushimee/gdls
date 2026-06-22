@@ -3844,13 +3844,10 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         found = true;
         // A constructible base whose constructor arity is visible HERE: an in-file Class (its
         // `_init` is reachable on the ClassNode chain) or a resolvable native class (no `_init`,
-        // so Godot's fallback gives empty par_types). A cross-file `DtKind::Script` base is
-        // deliberately EXCLUDED: its `_init` parameter list is not plumbed through here, so
-        // arity-checking it would either miss a real `_init` arity or — worse — false-positive
-        // "Expected at most 0" on a script with a parameterized `_init` (the under-supplied
-        // cross-file case is filed as #216). Only the bases gdls can arity-check correctly today
-        // set the gate; everything else (pure-Variant degrade, cross-file Script) stays silent so
-        // gdls never manufactures an "Expected at most 0" it can't prove.
+        // so Godot's fallback gives empty par_types). A cross-file `DtKind::Script` base is handled
+        // separately below (it resolves `_init` through the script's extends chain). Everything
+        // else (the pure-Variant degrade) stays silent so gdls never manufactures an "Expected at
+        // most 0" it can't prove.
         let constructible = base_type.kind == DtKind::Class
             || (base_type.kind == DtKind::Native
                 && ctx.native.class_named(&base_type.native_type).is_some());
@@ -3872,6 +3869,51 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             }
             sig.arity_known = true;
             sig_resolved = true;
+        }
+
+        // Cross-file `DtKind::Script` base: resolve `_init` through the script's extends chain and
+        // bind its real arity so the count check (analyzer.cpp:5829-5886 → validate_call_arg
+        // :5944-5950) fires. A script that declares NO `_init` hits Godot's constructor fallback
+        // (analyzer.cpp:5897-5903 → `return true` with empty par_types), so an over-supplied call
+        // still errors "Expected at most 0". Only the synthesized instance return type is kept
+        // (Godot returns the base, not `_init`'s return).
+        //
+        // FAIL-CLOSED: the no-`_init` zero-arg gate is set ONLY when the chain resolved cleanly
+        // (every link's interface present, bottoming out in a native root). A chain with an
+        // unresolved link — `chain_native_root` returns `None` — may simply not have walked the
+        // interface declaring `_init`, so gdls leaves `sig_resolved` at its default `false` and
+        // stays silent rather than manufacture an "Expected at most 0" it cannot prove. A
+        // pure-Variant degrade (unresolved base) is not `DtKind::Script` and never reaches here.
+        if base_type.kind == DtKind::Script {
+            if let Some(script_ref) = base_type.script_type.as_ref() {
+                match script_chain_call(ctx, script_ref, "_init") {
+                    ChainCall::Sig(init_sig, _) => {
+                        // Take only the arity fields; keep the synthesized instance return type.
+                        sig.par_types = init_sig.par_types;
+                        sig.min_params = init_sig.min_params;
+                        sig.max_params = init_sig.max_params;
+                        sig.is_vararg = init_sig.is_vararg;
+                        sig.arity_known = true;
+                        sig_resolved = true;
+                    }
+                    ChainCall::Other => {
+                        // `_init` exists as a non-Func member — degenerate; leave the count check
+                        // off rather than risk a wrong bound.
+                    }
+                    ChainCall::Missing => {
+                        // No `_init` anywhere in the chain. Reproduce Godot's empty-par_types
+                        // fallback (min == max == 0, not vararg) ONLY for a fully-resolved chain.
+                        if crate::script_chain::chain_native_root(ctx, script_ref).is_some() {
+                            sig.par_types.clear();
+                            sig.min_params = 0;
+                            sig.max_params = 0;
+                            sig.is_vararg = false;
+                            sig.arity_known = true;
+                            sig_resolved = true;
+                        }
+                    }
+                }
+            }
         }
     } else if base_type.kind == DtKind::Class {
         // In-file class method (`self.method()`, `child.method()`, `Class.method()`).
