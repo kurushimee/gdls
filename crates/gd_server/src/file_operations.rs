@@ -37,9 +37,12 @@
 //!      master" case). A span computed against one text but stamped with another's version is exactly
 //!      the silent-corruption path #66 closed.
 //!
-//! Rewriting a `.tscn`'s own `ext_resource path="…"` entries (the *second* mutating surface) is out
-//! of scope this phase; instead, when a scene-attached `.gd` moves, a `window/showMessage(Warning)`
-//! names the scenes whose `ext_resource` will dangle so the user is never silently misled.
+//! Rewriting a `.tscn`'s own `ext_resource path="…"` entries (the *second* mutating surface) is
+//! ALSO done (#131), under the same fail-closed bar: a scene that attaches a renamed `.gd` (or
+//! instances a renamed `.tscn`) has its `ext_resource path="…"` rewritten, identity-matched and
+//! exact-span and apply→reparse-verified (see `rewrite_tscn_ext_resources`). A scene gdls cannot
+//! safely rewrite is left untouched and a `window/showMessage(Warning)` names it (the never-lie
+//! backstop) — so a scene either gets its reference fixed or the user is told it will dangle.
 //!
 //! ## `did*` are index nudges
 //!
@@ -57,7 +60,7 @@ use lsp_types::{
     OptionalVersionedTextDocumentIdentifier, RenameFilesParams, TextDocumentEdit, TextEdit, Uri,
     WorkspaceEdit,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::position::PositionMapper;
 use crate::server::{show_message, FileOperationsCaps, ServerState};
@@ -152,9 +155,11 @@ impl ResIdentity {
 }
 
 /// One renamed file: the identity of its OLD location (what literals must resolve to, to be
-/// rewritten) and the `res://` text of its NEW location (what they are rewritten to).
+/// rewritten), the OLD `res://` form (the key the `.tscn` `SceneIndex` reverse maps are keyed by —
+/// #131), and the `res://` text of its NEW location (what references are rewritten to).
 struct RenameTarget {
     old_identity: ResIdentity,
+    old_res: String,
     new_res: String,
 }
 
@@ -208,9 +213,9 @@ fn char_breaks_string_literal(c: char) -> bool {
 /// [`WorkspaceEdit`] (one [`TextDocumentEdit`] per affected file), or `None` (LSP `null`) when
 /// nothing needs rewriting.
 ///
-/// Also (side effect, before returning): when a renamed `.gd` is attached to one or more scenes,
-/// emits a `window/showMessage(Warning)` naming them — their `ext_resource path="res://old.gd"` will
-/// dangle (full `.tscn` rewriting is out of scope this phase).
+/// Also rewrites `.tscn` `ext_resource path="…"` entries that reference a renamed file (#131 — the
+/// second mutating surface, see `rewrite_tscn_ext_resources`), and emits a `window/showMessage`
+/// (Warning) naming only the scenes it could NOT safely rewrite (those left dangling).
 ///
 /// The write-set is the fail-closed firewall (see the module docs): only literals that resolve to a
 /// renamed file's identity are touched; the edit targets only the bytes between the quotes; and each
@@ -249,7 +254,7 @@ pub(crate) fn will_rename_files(
             continue;
         };
         if old_abs.extension() == Some("gd") {
-            renamed_gd_old_res.push(old_res);
+            renamed_gd_old_res.push(old_res.clone());
         }
         // FAIL-CLOSED on the WRITE side: the new `res://` text is injected verbatim BETWEEN a
         // literal's quotes, so a target whose `res://` text isn't a plain, in-root, quote-safe path
@@ -268,20 +273,38 @@ pub(crate) fn will_rename_files(
         }
         targets.push(RenameTarget {
             old_identity: ResIdentity::of_path(&state.workspace.index, &old_abs),
+            old_res,
             new_res,
         });
     }
 
-    // Side effect: warn about scenes that will dangle when an attached `.gd` moves (full `.tscn`
-    // ext_resource rewriting is out of scope this phase). Done before the edit so the user sees it
-    // regardless of whether any `.gd` literal needed rewriting.
-    warn_dangling_scene_attachments(state, &renamed_gd_old_res);
-
     if targets.is_empty() {
+        // No safe rewrite target survived: still warn about every scene a renamed `.gd` would leave
+        // dangling (the rename happens client-side regardless), with an empty "already rewritten" set.
+        warn_dangling_scene_attachments(state, &renamed_gd_old_res, &FxHashSet::default());
         return None;
     }
 
-    // (2) Scan every indexed `.gd` ONCE (loops inverted: O(files), not O(renames × files)). For each
+    // First-seen URI order for deterministic output, mirroring `build_workspace_edit`. Each URI's
+    // entry carries the version captured ALONGSIDE the text its spans were computed against, so the
+    // assembled edit can never stamp a span from text A with the version of text B. Shared by the
+    // `.gd` literal scan and the `.tscn` ext_resource scan (a file is each kind, never both).
+    let mut order: Vec<Uri> = Vec::new();
+    let mut by_uri: FxHashMap<String, (Option<i32>, Vec<TextEdit>)> = FxHashMap::default();
+
+    // (2a) The SECOND mutating surface (#131): rewrite `ext_resource path="res://old"` entries inside
+    // `.tscn` scenes that positively reference a renamed file (a script they attach, or a sub-scene
+    // they instance) — driven by the `SceneIndex` reverse maps (NOT a raw `res://` text scan), each
+    // edit anchored to the parser's exact `path_span` and verified by reparse. Returns, per scene
+    // `res://`, whether it was rewritten, so the dangling warning fires ONLY for scenes left untouched.
+    let rewritten_scenes = rewrite_tscn_ext_resources(state, &targets, &mut order, &mut by_uri);
+
+    // Side effect: warn about scenes that will STILL dangle after the rewrite — a `.gd` move whose
+    // scene we could not safely rewrite (refused span / unsafe text). Scenes we DID rewrite are no
+    // longer dangling, so they are excluded. Done before returning so the user always sees it.
+    warn_dangling_scene_attachments(state, &renamed_gd_old_res, &rewritten_scenes);
+
+    // (2b) Scan every indexed `.gd` ONCE (loops inverted: O(files), not O(renames × files)). For each
     // `preload`/`load` `res://` argument literal (positive identification — `collect_load_path_literals`),
     // resolve its identity and look it up in the rename map; a hit yields a `TextEdit` over the
     // path-inside-the-quotes. Edits are grouped per URI into ONE `TextDocumentEdit` (two for one URI
@@ -311,12 +334,6 @@ pub(crate) fn will_rename_files(
     // (`open_buffer_paths`): normalize both sides to a path and compare. This keeps invariant #3
     // (open buffer ⇒ buffer text + its live version) holding regardless of URI spelling.
     let open_overlay = open_buffer_overlay(state);
-
-    // First-seen URI order for deterministic output, mirroring `build_workspace_edit`. Each URI's
-    // entry carries the version captured ALONGSIDE the text its spans were computed against, so the
-    // assembled edit can never stamp a span from text A with the version of text B.
-    let mut order: Vec<Uri> = Vec::new();
-    let mut by_uri: FxHashMap<String, (Option<i32>, Vec<TextEdit>)> = FxHashMap::default();
 
     for (_fid, path) in candidates {
         let Some(uri) = path_to_file_uri(&path) else {
@@ -600,14 +617,228 @@ fn assemble_workspace_edit(
     }
 }
 
+/// The SECOND mutating surface (#131): rewrite `ext_resource path="res://old"` entries inside the
+/// project's `.tscn` scenes that POSITIVELY reference a renamed file, so a scene's script / sub-scene
+/// reference does not dangle after the move. Returns the set of normalized scene `res://` paths that
+/// were successfully rewritten (so the dangling warning fires only for scenes left untouched).
+///
+/// ## Mutating-consumer discipline (the rename-saga bar, carried to scene text)
+///
+/// This is a second client-applied edit surface with the same fail-closed bar as the `.gd` path:
+///
+///   1. **Candidate set by IDENTITY, never a `res://` text scan.** The scenes to consider are driven
+///      by the [`SceneIndex`](gd_project::SceneIndex) reverse maps keyed by each renamed file's OLD
+///      `res://`: `scenes_attaching_script` for a renamed `.gd`, `scenes_instancing` for a renamed
+///      `.tscn`. A scene never referencing a renamed file is never opened. Within a candidate scene,
+///      the `ext_resource` to rewrite is matched by RESOLVED IDENTITY ([`ResIdentity`]) against the
+///      rename targets — exactly as the `.gd` literal scan matches — so a prefix/basename neighbour
+///      (`res://a.gd` vs `res://ab.gd`) can never be hit.
+///   2. **Exact span from the parser, verified by reparse.** The edit targets ONLY the bytes of the
+///      `path="…"` value between its quotes ([`gd_project::scene::ExtResource::path_span`], the
+///      single-source-of-truth the scene parser surfaces). After applying every edit to the scene
+///      text in memory we REPARSE and assert NO ext_resource still resolves to a renamed OLD identity
+///      — a scene whose verify fails is dropped wholesale (no partial edit ships). We deliberately do
+///      NOT assert the new path re-resolves: at willRename time the renamed file is not yet on disk
+///      (the client applies this edit and moves the file afterward), so the new path resolves to
+///      `None` by design; "the old identity is gone" is the correct, sufficient invariant (the new
+///      text was already proven well-formed at offer time by `is_safe_rewrite_target`). This is the
+///      "verify by apply→reparse-by-identity, not string match" rule.
+///   3. **Quote-safe new text + same text/version/mapper as the `.gd` path.** Each target already
+///      passed [`is_safe_rewrite_target`] (in-root, no `..`, no quote/backslash/control char), so the
+///      injected `res://` is safe inside the `.tscn` `path="…"` quotes too. The scene text + version
+///      come from the SAME open-buffer-or-disk source the `.gd` scan uses (a `.tscn` may be open in
+///      the client — it is in the `**/*.tscn` file-operations filter), so a span computed against one
+///      text is never stamped with another's version.
+///
+/// Edits are merged into the shared `order`/`by_uri` accumulator (each file is a `.gd` OR a `.tscn`,
+/// never both, so there is no per-URI collision with the `.gd` scan).
+fn rewrite_tscn_ext_resources(
+    state: &ServerState,
+    targets: &[RenameTarget],
+    order: &mut Vec<Uri>,
+    by_uri: &mut FxHashMap<String, (Option<i32>, Vec<TextEdit>)>,
+) -> FxHashSet<String> {
+    let root = state.workspace.project.root.clone();
+    let mut rewritten: FxHashSet<String> = FxHashSet::default();
+
+    // (1) Candidate scenes BY IDENTITY: for each renamed target, ask the SceneIndex reverse maps which
+    // scenes attach the moved `.gd` (a script) or instance the moved `.tscn` (a sub-scene), keyed by
+    // the target's OLD `res://`. Collect the de-duplicated set of candidate scene `res://` paths under
+    // the index borrow, then read/parse each once below (borrows don't overlap).
+    let candidate_scene_res: Vec<String> = {
+        let scenes = state.workspace.scenes();
+        let mut seen: FxHashSet<String> = FxHashSet::default();
+        let mut out: Vec<String> = Vec::new();
+        for t in targets {
+            // The SceneIndex reverse maps are keyed by the renamed file's OLD `res://`. A `.gd` is a
+            // script some scenes attach; a `.tscn` is a sub-scene some scenes instance. We query BOTH
+            // maps with the same key (a path is one kind, so the other map yields nothing) rather than
+            // branch on extension — cheaper and robust to an odd spelling.
+            let attaching = scenes.scenes_attaching_script(&t.old_res);
+            let instancing = scenes.scenes_instancing(&t.old_res);
+            for scene_res in attaching.chain(instancing) {
+                let key = gd_project::scene::normalize_res(scene_res);
+                if seen.insert(key.clone()) {
+                    out.push(key);
+                }
+            }
+        }
+        out
+    };
+    if candidate_scene_res.is_empty() {
+        return rewritten;
+    }
+
+    let open_overlay = open_buffer_overlay(state);
+
+    for scene_res in candidate_scene_res {
+        // Map the scene's `res://` to its absolute path (in-root, existence not required here — the
+        // open-buffer/disk read below is the existence gate).
+        let Some(abs) = gd_project::res_to_path(&root, &scene_res) else {
+            continue;
+        };
+        let Some(uri) = path_to_file_uri(&abs) else {
+            continue;
+        };
+        // ONE text/version pair, identical discipline to the `.gd` scan: open buffer (buffer text +
+        // live version) when the `.tscn` is open in the client, else disk text + `None`.
+        let (text, version) = match open_overlay.get(&gd_project::normalize_path(&abs)) {
+            Some((text, version)) => (text.clone(), Some(*version)),
+            None => match std::fs::read_to_string(abs.as_std_path()) {
+                Ok(text) => (text, None),
+                Err(_) => continue, // unreadable: can't compute spans safely → skip (never guess)
+            },
+        };
+
+        let edits = match tscn_ext_resource_edits(state, &text, targets) {
+            Some(edits) if !edits.is_empty() => edits,
+            _ => continue, // nothing matched, or the apply→reparse verify failed → ship no edit
+        };
+
+        order.push(uri.clone());
+        by_uri.insert(uri.as_str().to_string(), (version, edits));
+        rewritten.insert(scene_res);
+    }
+
+    rewritten
+}
+
+/// Compute the `.tscn` `ext_resource path="…"` rewrite edits for one scene's `text`, or `None` when
+/// nothing matched OR the apply→reparse-by-identity verify failed (fail-closed: a scene that does not
+/// re-resolve cleanly ships NO edit). Each emitted [`TextEdit`] replaces only the bytes between the
+/// `path="…"` quotes (the parser's [`path_span`](gd_project::scene::ExtResource::path_span)) with a
+/// target's new `res://`, matched by RESOLVED IDENTITY (never the `res://` string).
+fn tscn_ext_resource_edits(
+    state: &ServerState,
+    text: &str,
+    targets: &[RenameTarget],
+) -> Option<Vec<TextEdit>> {
+    let scene = gd_project::scene::parse_scene(text);
+    let rope = ropey::Rope::from_str(text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    let bytes = text.as_bytes();
+
+    // Collect (byte-span, new_res) for every ext_resource whose path resolves to a renamed target.
+    let mut raw_edits: Vec<(usize, usize, String)> = Vec::new();
+    for ext in scene.ext_resources.values() {
+        let Some(path) = ext.path.as_deref() else {
+            continue;
+        };
+        // POSITIVE RESOLUTION by identity, never by string (the prefix trap). An `ext_resource` path
+        // that doesn't resolve, or resolves to some OTHER file, is left untouched.
+        let Some(identity) = ResIdentity::resolve(&state.workspace.index, path) else {
+            continue;
+        };
+        let Some(target) = targets.iter().find(|t| t.old_identity == identity) else {
+            continue;
+        };
+        // EXACT SPAN: the parser surfaces the byte span of the value between the quotes. A `None`
+        // span (not a plain double-quoted string) is refused — never guess the span.
+        let Some((start, end)) = ext.path_span else {
+            continue;
+        };
+        // Defensive: the span must be in range and its raw bytes must still equal the parsed path
+        // (it always does for a fresh parse, but verify before trusting it as an edit target).
+        if end > bytes.len() || start > end || std::str::from_utf8(&bytes[start..end]) != Ok(path) {
+            continue;
+        }
+        raw_edits.push((start, end, target.new_res.clone()));
+    }
+    if raw_edits.is_empty() {
+        return None;
+    }
+
+    // VERIFY by apply→reparse-by-identity (NOT string match): apply every edit to a copy of the text
+    // (descending offset order so earlier spans stay valid), reparse the result, and confirm every
+    // rewritten ext_resource now resolves to its target's NEW identity and the OLD identity is gone.
+    // A scene that fails this is dropped wholesale — no partial / corrupting edit ships.
+    let mut applied = text.to_string();
+    let mut descending = raw_edits.clone();
+    descending.sort_by_key(|e| std::cmp::Reverse(e.0));
+    for (start, end, new_res) in &descending {
+        applied.replace_range(start..end, new_res);
+    }
+    if !tscn_rewrite_verified(state, &applied, targets) {
+        log::warn!(
+            "willRenameFiles: refusing a .tscn ext_resource rewrite — the reparsed scene did not \
+             resolve to the new identity; leaving the scene untouched"
+        );
+        return None;
+    }
+
+    // Passed verification: turn each raw byte span into an LSP TextEdit over the inner-quote bytes.
+    let edits = raw_edits
+        .into_iter()
+        .map(|(start, end, new_res)| TextEdit {
+            range: mapper.span_to_range(gd_syntax::ByteSpan::new(start, end)),
+            new_text: new_res,
+        })
+        .collect();
+    Some(edits)
+}
+
+/// Verify a post-rewrite `.tscn` text: NO `ext_resource` path may still resolve to a renamed target's
+/// OLD identity. Identity-based — never a `res://` string compare — so a prefix neighbour can't
+/// masquerade as a survivor. We do NOT assert the NEW path re-resolves: the renamed file is not yet on
+/// disk at willRename time, so the new path resolves to `None` by design — "the old identity is gone"
+/// is the correct, sufficient invariant (the new text's well-formedness was proven at offer time by
+/// `is_safe_rewrite_target`). A future change MUST NOT add a NEW-resolves assertion here — it would
+/// fail every legitimate rewrite (the file the new path names does not exist until the client moves it).
+fn tscn_rewrite_verified(state: &ServerState, text: &str, targets: &[RenameTarget]) -> bool {
+    let scene = gd_project::scene::parse_scene(text);
+    let index = &state.workspace.index;
+    // No ext_resource may still resolve to a renamed OLD identity.
+    for ext in scene.ext_resources.values() {
+        if let Some(path) = ext.path.as_deref() {
+            if let Some(identity) = ResIdentity::resolve(index, path) {
+                if targets.iter().any(|t| t.old_identity == identity) {
+                    return false; // an old reference survived → the rewrite was incomplete
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Emit a `window/showMessage(Warning)` naming the scenes whose `ext_resource path="res://old.gd"`
-/// will dangle when a script they attach is moved. Full `.tscn` `ext_resource` rewriting is the
-/// second mutating surface and out of scope this phase; surfacing the warning keeps the user from
-/// being silently misled. No-op when no renamed `.gd` is attached to any scene.
-fn warn_dangling_scene_attachments(state: &ServerState, renamed_gd_old_res: &[String]) {
+/// is left DANGLING when a script they attach is moved — i.e. the scenes gdls did NOT rewrite. A
+/// scene present in `rewritten_scenes` is no longer dangling (its `ext_resource` is in the returned
+/// WorkspaceEdit), so it is excluded; only scenes we refused to rewrite (unsafe span/text) warn. The
+/// warning is the never-lie backstop for the residual fail-closed cases. No-op when every attaching
+/// scene was rewritten (or none exists).
+fn warn_dangling_scene_attachments(
+    state: &ServerState,
+    renamed_gd_old_res: &[String],
+    rewritten_scenes: &FxHashSet<String>,
+) {
     let mut affected: Vec<String> = Vec::new();
     for old_res in renamed_gd_old_res {
         for scene_res in state.workspace.scenes().scenes_attaching_script(old_res) {
+            // Exclude scenes we successfully rewrote (no longer dangling). Compare on the normalized
+            // res spelling the rewrite recorded, so a `\`/`/` or `res://./` variant can't slip past.
+            if rewritten_scenes.contains(&gd_project::scene::normalize_res(scene_res)) {
+                continue;
+            }
             if !affected.iter().any(|s| s == scene_res) {
                 affected.push(scene_res.to_string());
             }
@@ -623,7 +854,7 @@ fn warn_dangling_scene_attachments(state: &ServerState, renamed_gd_old_res: &[St
         MessageType::WARNING,
         &format!(
             "gdls: moving a script attached to {} will leave the scene's `ext_resource` path \
-             dangling — gdls does not yet rewrite scene files; update the scene(s) manually: {scenes}",
+             dangling — gdls could not safely rewrite the scene file(s); update them manually: {scenes}",
             if affected.len() == 1 { "a scene" } else { "scenes" },
         ),
     );

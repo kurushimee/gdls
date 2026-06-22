@@ -627,13 +627,16 @@ fn batch_rename_gd_and_tscn_together() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 4. Scene-attached .gd move → window/showMessage(Warning)
+// 4. Scene-attached .gd move → .tscn rewritten, NO dangling warning (#131)
 // ---------------------------------------------------------------------------------------------
 
-/// Moving a `.gd` that a scene attaches as its `ext_resource` Script → a `window/showMessage`
-/// (Warning) naming the affected scene(s) (full `.tscn` rewriting is out of scope this phase).
+/// Moving a `.gd` that a scene attaches as its `ext_resource` Script to a SAFE new path now rewrites
+/// the scene's `ext_resource` (the second mutating surface, #131) instead of warning — so NO dangling
+/// `window/showMessage(Warning)` for that scene fires (it is no longer dangling). The rewrite content
+/// itself is asserted by `scene_attached_script_move_rewrites_tscn_ext_resource`; this pins the
+/// warning-suppression half: a successfully-rewritten scene must not also be reported as dangling.
 #[test]
-fn scene_attached_script_move_warns() {
+fn scene_attached_script_safe_move_rewrites_without_dangling_warning() {
     let p = bare_project();
     p.write("player.gd", "extends Node\n");
     p.write(
@@ -659,28 +662,35 @@ fn scene_attached_script_move_warns() {
         .send(request(10, "workspace/willRenameFiles", params))
         .unwrap();
 
-    // A window/showMessage(Warning) naming player.tscn must arrive (before or alongside the response).
-    let mut warned = false;
+    // No dangling `window/showMessage(Warning)` for player.tscn may arrive (it was rewritten), and
+    // the response must carry a .tscn edit.
+    let mut dangling_warned = false;
+    let mut got_tscn_edit = false;
+    let tscn_uri = file_uri(&p.root.join("player.tscn")).as_str().to_string();
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         match try_recv(&client, Duration::from_millis(200)) {
             Some(Message::Notification(n)) if n.method == "window/showMessage" => {
-                assert_eq!(n.params["type"], 2, "MessageType::WARNING is 2");
                 let msg = n.params["message"].as_str().unwrap_or("");
-                assert!(
-                    msg.contains("res://player.tscn"),
-                    "warning must name the dangling scene; got {msg:?}"
-                );
-                warned = true;
+                if msg.contains("res://player.tscn") && msg.contains("dangling") {
+                    dangling_warned = true;
+                }
+            }
+            Some(Message::Response(r)) if r.id == lsp_server::RequestId::from(10) => {
+                let view = flatten_edit(r.result.unwrap_or(serde_json::Value::Null));
+                got_tscn_edit = view.edits.iter().any(|(u, _, _)| u == &tscn_uri);
                 break;
             }
-            Some(_) => continue,
-            None => continue,
+            _ => continue,
         }
     }
     assert!(
-        warned,
-        "moving a scene-attached script must warn about the dangling scene"
+        got_tscn_edit,
+        "a safe scene-attached .gd move must rewrite the scene's ext_resource"
+    );
+    assert!(
+        !dangling_warned,
+        "a successfully-rewritten scene must NOT also be reported as dangling"
     );
 
     shutdown(&client, thread);
