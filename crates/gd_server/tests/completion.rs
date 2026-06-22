@@ -1624,9 +1624,9 @@ fn builtin_constructor_overload_arghints() {
     let src = "extends Node2D\n\nfunc f() -> void:\n\tvar v = Vector2()\n";
     let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
 
-    // `\tvar v = Vector2(` → cursor right after the `(`. `\t`=col0, `var v = Vector2(` → `(` at
-    // byte index 15 (0-based col), cursor after it = column 16.
-    let raw = complete_raw(&client, 140, &uri, Position::new(3, 16));
+    // `\tvar v = Vector2(` → cursor right after the `(`. `\t`=col0, `Vector2` cols 9-15, `(`=col16,
+    // so the cursor sits just past the `(` at column 17.
+    let raw = complete_raw(&client, 140, &uri, Position::new(3, 17));
     let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
 
     // The three argument-bearing overloads appear (the no-arg overload is filtered at arg index 0).

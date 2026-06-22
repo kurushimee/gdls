@@ -1139,8 +1139,93 @@ fn call_argument_items(
                 .collect();
         }
     }
+    // A bare builtin-type callee (`Vector2(`, `Color(`) gets per-overload constructor arghints, ADDED
+    // TO the identifier set (Godot computes these in the completion path, `gdscript_editor.cpp:3411`).
+    let mut items =
+        builtin_constructor_items(state, callee_name, arg_index, render).unwrap_or_default();
     // Generic call argument → the full in-scope identifier set (reuse the IDENTIFIER renderer).
-    identifier_items(state, tree, analyzed, byte, render)
+    items.extend(identifier_items(state, tree, analyzed, byte, render));
+    items
+}
+
+/// Per-overload constructor arghints for a bare builtin-type callee (`Vector2(`, `Color(`). Mirrors
+/// Godot's "Complete constructor." branch (`gdscript_editor.cpp:3411-3427`): iterate
+/// `Variant::get_constructor_list`, skip every overload the active argument index overruns
+/// (`arg_idx >= arguments.size()`), and render each survivor via the `_make_arguments_hint`
+/// `Type Type(args)` shape — `get_constructor_list` sets `mi.name = mi.return_val.type = type`, so
+/// both the name and return read as the type. `None` when the callee isn't a builtin type name (the
+/// caller then offers the identifier set alone). These are display-only arghints: the item inserts
+/// nothing (an empty edit over the prefix span), so committing one is inert.
+fn builtin_constructor_items(
+    state: &ServerState,
+    callee_name: Option<&str>,
+    arg_index: usize,
+    render: &RenderCtx,
+) -> Option<Vec<CompletionItem>> {
+    let name = callee_name?;
+    let db = &state.workspace.native;
+    let builtin = db.builtin_named(name)?;
+    let items: Vec<CompletionItem> = builtin
+        .constructors
+        .iter()
+        // Godot's `if (p_argidx >= E.arguments.size()) continue;` — an overload whose arity the
+        // cursor's argument index overruns can't be the one being typed (the no-arg overload is
+        // dropped at arg index 0 here).
+        .filter(|ctor| arg_index < ctor.params.len())
+        .enumerate()
+        .map(|(rank, ctor)| {
+            let args = ctor
+                .params
+                .iter()
+                .map(|p| format!("{}: {}", db.name_of(p.name), db.display_type(&p.ty, None)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // `Type Type(args)`: the faithful `_make_arguments_hint` label for a constructor
+            // MethodInfo whose name and return type are both the builtin type.
+            let detail = format!("{name} {name}({args})");
+            constructor_arghint_item(name, &detail, &format!("({args})"), rank, render)
+        })
+        .collect();
+    (!items.is_empty()).then_some(items)
+}
+
+/// One display-only constructor-overload arghint item: labelled with the builtin type name, the
+/// `Type Type(args)` shape in `detail` (renders on every client) plus a structured
+/// `labelDetails.detail` (`(args)`) for clients that advertise `labelDetailsSupport`. The insert is
+/// EMPTY — an arghint is informational (Godot surfaces it as a call-hint popup, not a selectable
+/// completion), so committing one types nothing rather than re-inserting the type name mid-call.
+fn constructor_arghint_item(
+    label: &str,
+    detail: &str,
+    arg_detail: &str,
+    rank: usize,
+    render: &RenderCtx,
+) -> CompletionItem {
+    let mut item = build_item_with(
+        ItemText {
+            label,
+            filter: label,
+        },
+        CompletionItemKind::CONSTRUCTOR,
+        // Empty insert: an arghint commits to nothing (the edit replaces the empty prefix span with
+        // the empty string). `data` is `Keyword` so `completionItem/resolve` leaves it untouched.
+        ItemInsert {
+            plain: String::new(),
+            snippet: None,
+        },
+        CompletionData::Keyword,
+        rank,
+        render,
+    );
+    // The `Type Type(args)` detail (universal) + structured labelDetails (the client advertised
+    // `labelDetailsSupport`); set post-build since `build_item_with` fixes `detail: None` for the
+    // lazy-resolve path the doc-bearing contexts use. Mirrors `NodeCandidates::into_items`.
+    item.detail = Some(detail.to_string());
+    item.label_details = Some(lsp_types::CompletionItemLabelDetails {
+        detail: Some(arg_detail.to_string()),
+        description: Some(label.to_string()),
+    });
+    item
 }
 
 /// The enum/bitfield constant names for the active call argument, or `None` when the parameter is

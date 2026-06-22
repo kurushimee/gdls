@@ -184,8 +184,8 @@ pub struct Singleton {
 }
 
 /// A builtin / Variant type (`Vector2`, `Array`, …). Shape differs from `ClassDef`: bare
-/// `return_type` strings, direct `members`, `operators`, `constructors` (the latter two are not
-/// consumed in M2 and are left unmodeled — serde ignores them).
+/// `return_type` strings, direct `members`, `operators`, `constructors`. `operators` stays
+/// unmodeled (serde ignores it); `constructors` feeds the completion arghint surface (#194).
 #[derive(Clone, Debug, Deserialize)]
 pub struct BuiltinClass {
     pub name: String,
@@ -201,6 +201,17 @@ pub struct BuiltinClass {
     pub enums: Vec<EnumDef>,
     #[serde(default)]
     pub methods: Vec<BuiltinMethod>,
+    #[serde(default)]
+    pub constructors: Vec<BuiltinConstructor>,
+}
+
+/// One constructor overload of a builtin type, as the dump emits it: an optional `arguments` list
+/// (the no-arg default constructor omits `arguments`). Mirrors the per-overload `MethodInfo`
+/// Godot's `Variant::get_constructor_list` builds (`core/variant/variant_construct.cpp`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct BuiltinConstructor {
+    #[serde(default)]
+    pub arguments: Vec<ArgumentDef>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

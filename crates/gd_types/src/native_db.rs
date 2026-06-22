@@ -142,6 +142,17 @@ pub struct BuiltinType {
     pub methods: Vec<Method>,
     pub enums: Vec<NativeEnum>,
     pub constants: Vec<NamedConst>,
+    /// The constructor overloads, in dump order (`Vector2()`, `Vector2(Vector2)`,
+    /// `Vector2(Vector2i)`, `Vector2(float, float)`). Mirrors `Variant::get_constructor_list`;
+    /// consumed by the completion arghint surface (#194), not by the analyzer.
+    pub constructors: Vec<Constructor>,
+}
+
+/// One constructor overload of a [`BuiltinType`] — just its parameter list (the type's own name is
+/// the constructor name and return type, per `Variant::get_constructor_list`).
+#[derive(Clone, Debug)]
+pub struct Constructor {
+    pub params: Vec<Param>,
 }
 
 /// A `@GlobalScope` utility function (`abs`, `print`, …).
@@ -1153,6 +1164,13 @@ fn ingest_builtin(b: api::BuiltinClass, it: &mut Interner) -> BuiltinType {
                     .then(|| parse_color_literal(&k.value))
                     .flatten(),
                 ty: non_empty(&k.ty, it),
+            })
+            .collect(),
+        constructors: b
+            .constructors
+            .into_iter()
+            .map(|c| Constructor {
+                params: ingest_args(c.arguments, it),
             })
             .collect(),
     }
