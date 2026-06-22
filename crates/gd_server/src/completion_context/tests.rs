@@ -251,6 +251,35 @@ fn type_name_var_hint_empty() {
 }
 
 #[test]
+fn class_body_var_inline_type_offers_get_set() {
+    // Class-body `var x: <cursor>` (no trailing newline) is Godot's
+    // COMPLETION_PROPERTY_DECLARATION_OR_TYPE (`gdscript_parser.cpp:1241`): types PLUS the `get`/`set`
+    // accessor keywords. Both the trailing-colon and the mid-type-name forms classify there.
+    for m in ["var x: |", "var x: Vec|"] {
+        let ctx = at(m);
+        assert_eq!(
+            ctx.kind,
+            CompletionKind::PropertyDeclarationOrType,
+            "`{m}` (class-body inline type) must be PropertyDeclarationOrType"
+        );
+    }
+}
+
+#[test]
+fn func_local_var_inline_type_is_plain_type_name() {
+    // A FUNCTION-LOCAL `var x: <cursor>` is `parse_variable(_, p_allow_property=false)`
+    // (`gdscript_parser.cpp:2032`): no property path, so types ONLY — plain TypeName, never get/set.
+    for m in ["func f():\n\tvar x: |", "func f():\n\tvar x: Vec|"] {
+        let ctx = at(m);
+        assert_eq!(
+            ctx.kind,
+            CompletionKind::TypeName,
+            "`{m}` (function-local inline type) must stay plain TypeName"
+        );
+    }
+}
+
+#[test]
 fn type_name_or_void_return() {
     // `func f() -> ` → return-type completion.
     let m = "func f() -> |";

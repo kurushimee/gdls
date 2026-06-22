@@ -103,6 +103,14 @@ pub enum CompletionKind {
     /// `Array[`, a cast `x as T`. Identifier names of types are wanted here.
     TypeName,
 
+    /// Inline type-or-accessor position of a **class-body** `var` declaration: `var x: <cursor>`
+    /// (no trailing accessor newline) — Godot's `COMPLETION_PROPERTY_DECLARATION_OR_TYPE`
+    /// (`gdscript_parser.cpp:1241`), which offers the available types **plus** the `get`/`set`
+    /// accessor keywords (`gdscript_editor.cpp:3535`). Distinct from [`CompletionKind::TypeName`]
+    /// (the same slot in a function-local `var`, a `const`, a parameter, a cast `x as T`, or an
+    /// `Array[` element — all type-only, since `parse_property` is unreachable there).
+    PropertyDeclarationOrType,
+
     /// Member access **on a type** in type position: `var x: Foo.` — the nested types, enums, and
     /// constants of `Foo` are wanted, NOT its instance members. Distinct from
     /// [`CompletionKind::Attribute`] (which is instance member access) so the renderer offers the
