@@ -803,6 +803,47 @@ func go() -> void:
     );
 }
 
+/// A leaf script that declares NO `_init` but extends a cross-file base that DOES: the chain walk
+/// must resolve the inherited `_init` arity and fire on a mis-arity `Leaf.new(...)`. This is the
+/// transitive case `script_chain_call` exists for (a flat single-interface lookup of the leaf would
+/// miss it). Godot walks the same ClassNode base chain (gdscript_analyzer.cpp:5837-5851); verified
+/// against the real 4.6.3 binary (leaf with inherited-only `_init`, under-called → "Too few...").
+#[test]
+fn cross_file_inherited_init_from_base_fires() {
+    let base = "\
+class_name Init216Base
+extends RefCounted
+func _init(a, b):
+\tpass
+";
+    let leaf = "\
+class_name Init216Leaf
+extends Init216Base
+func leaf_only() -> void:
+\tpass
+";
+    let consumer = "\
+extends RefCounted
+const Leaf = preload(\"res://leaf.gd\")
+func go() -> void:
+\tvar _x = Leaf.new(1)
+";
+    let project = Project::new(&[
+        ("res://base.gd", base),
+        ("res://leaf.gd", leaf),
+        ("res://use.gd", ""),
+    ]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    let errors = error_messages(&result);
+    assert!(
+        errors
+            .iter()
+            .any(|m| m
+                == "Too few arguments for \"new()\" call. Expected at least 2 but received 1."),
+        "inherited cross-file _init under-call must arity-error through the chain; got {errors:?}"
+    );
+}
+
 /// FAIL-CLOSED: an UNRESOLVED base (the dependency file is not in the project index) must stay
 /// SILENT — gdls must never manufacture "Expected at most 0" for a `_init` it cannot prove absent.
 #[test]
