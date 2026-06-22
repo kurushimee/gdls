@@ -595,7 +595,7 @@ fn no_text_edit_for_script_class_name_colliding_with_builtin() {
         .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 3)
     {
         assert!(
-            type_hint.text_edits.as_ref().map_or(true, |e| e.is_empty()),
+            type_hint.text_edits.as_ref().is_none_or(|e| e.is_empty()),
             "a script `class_name` that collides with the builtin `Array` must carry NO textEdit \
              (`: Array = ` would re-parse as the builtin); got {:?}",
             type_hint.text_edits
@@ -630,7 +630,7 @@ fn no_text_edit_for_script_class_name_colliding_with_native() {
         .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 3)
     {
         assert!(
-            type_hint.text_edits.as_ref().map_or(true, |e| e.is_empty()),
+            type_hint.text_edits.as_ref().is_none_or(|e| e.is_empty()),
             "a script `class_name` that collides with the native `Node` must carry NO textEdit; \
              got {:?}",
             type_hint.text_edits
