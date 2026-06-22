@@ -563,6 +563,83 @@ fn text_edit_for_unicode_named_script_inferred_type() {
     shutdown(&client, server_thread);
 }
 
+/// A script whose `class_name` collides with a builtin type name (`Array`) must NOT get a
+/// type-annotation `textEdit` — `: Array = ` would re-parse as the builtin `Array`, not the script,
+/// silently mis-annotating the variable. Godot's analyzer rejects such a `class_name` ("hides a
+/// built-in type", `gdscript_analyzer.cpp`), so this is a malformed-project-only path; under gdls's
+/// "never crash, never lie" tolerance the index still surfaces the name (the registry does not
+/// arbitrate), so the annotation gate must refuse it. The informational LABEL may still show; only
+/// the corrupting auto-insert edit is withheld.
+#[test]
+fn no_text_edit_for_script_class_name_colliding_with_builtin() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    // A sibling script declaring `class_name Array` (collides with the builtin `Array`). Godot would
+    // reject this, but gdls's index surfaces it anyway. The var is typed via `preload(…).new()` (NOT
+    // the bare `Array.new()`, which the analyzer resolves to the builtin) so the inferred type is the
+    // SCRIPT — exercising the `DtKind::Script` annotation arm with a colliding `class_name`.
+    let arr = "class_name Array\nextends RefCounted\n\nfunc greet() -> void:\n\tpass\n";
+    let t = "extends Node\n\nfunc run() -> void:\n\tvar h := preload(\"res://arr.gd\").new()\n\th.greet()\n";
+    init_and_open_caps(
+        &p,
+        &client,
+        &[("arr.gd", arr), ("t.gd", t)],
+        inlay_caps(false, false),
+    );
+    let uri = file_uri(&p.root.join("t.gd"));
+    let hints = request_hints(&client, 10, &uri, whole_doc());
+
+    if let Some(type_hint) = hints
+        .iter()
+        .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 3)
+    {
+        assert!(
+            type_hint.text_edits.as_ref().is_none_or(|e| e.is_empty()),
+            "a script `class_name` that collides with the builtin `Array` must carry NO textEdit \
+             (`: Array = ` would re-parse as the builtin); got {:?}",
+            type_hint.text_edits
+        );
+    }
+
+    shutdown(&client, server_thread);
+}
+
+/// A script whose `class_name` collides with a native engine class name (`Node`) must NOT get a
+/// type-annotation `textEdit` — `: Node = ` would re-parse as the native `Node`, not the script.
+/// Same malformed-project-only rationale as the builtin-collision case (Godot rejects it: "hides a
+/// native class", `gdscript_analyzer.cpp`).
+#[test]
+fn no_text_edit_for_script_class_name_colliding_with_native() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let node = "class_name Node\nextends RefCounted\n\nfunc greet() -> void:\n\tpass\n";
+    let t = "extends Node\n\nfunc run() -> void:\n\tvar h := preload(\"res://node.gd\").new()\n\th.greet()\n";
+    init_and_open_caps(
+        &p,
+        &client,
+        &[("node.gd", node), ("t.gd", t)],
+        inlay_caps(false, false),
+    );
+    let uri = file_uri(&p.root.join("t.gd"));
+    let hints = request_hints(&client, 10, &uri, whole_doc());
+
+    if let Some(type_hint) = hints
+        .iter()
+        .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 3)
+    {
+        assert!(
+            type_hint.text_edits.as_ref().is_none_or(|e| e.is_empty()),
+            "a script `class_name` that collides with the native `Node` must carry NO textEdit; \
+             got {:?}",
+            type_hint.text_edits
+        );
+    }
+
+    shutdown(&client, server_thread);
+}
+
 /// Regression (review M1): an inner-class method that shares a name with a root-class method must
 /// get the INNER method's parameter names, not the root's — the analyzer's `class_path` disambiguates
 /// the callee, and the resolver must honor it (a wrong name is a "never lie" violation).
