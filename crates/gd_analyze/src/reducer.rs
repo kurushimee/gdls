@@ -3814,9 +3814,25 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     let mut native_callee: Option<String> = None;
 
     if is_constructor {
-        // `X.new()` returns an instance of X (analyzer.cpp's flow ends up there via
-        // `get_function_signature` finding `_init`). Synthesize directly to skip the
-        // signature walk.
+        // `X.new()` returns an instance of X. The return type is synthesized directly (Godot's
+        // `get_function_signature` with `p_is_constructor=true` sets `r_return_type = p_base_type`
+        // at analyzer.cpp:5869 rather than `_init`'s declared return), so we don't take the
+        // method's return type. But the SAME `get_function_signature` call also resolves the
+        // constructor's parameter list and runs `validate_call_arg` (analyzer.cpp:3653 → 5944)
+        // against it, so a mis-arity `X.new(...)` errors:
+        //   * An in-file Class / cross-file Script base with an `_init` member resolves its real
+        //     parameter list + default-arg count (analyzer.cpp:5829-5872: `function_name = _init`,
+        //     walk the class chain).
+        //   * A base with NO `_init` (a native class, or an in-file/script class that declares
+        //     none) hits the constructor fallback at analyzer.cpp:5897-5903, which `return true`
+        //     with an EMPTY par_types and zero default-arg count — so `validate_call_arg` still
+        //     fires "Too many arguments... Expected at most 0" on any over-supplied argument
+        //     (too-few can never fire: min == 0). A non-instantiable / singleton / abstract base
+        //     never reaches here — those early-return above (matching Godot's `return false`
+        //     branches at analyzer.cpp:5810-5827), so the arity check is correctly skipped.
+        // Only a base that could not be resolved to a constructible type (the pure-Variant
+        // degrade) leaves `sig_resolved = false` — gdls never manufactures an "Expected at most 0"
+        // for a base it could not resolve.
         let mut instance = base_type.clone();
         instance.is_meta_type = false;
         instance.is_constant = false;
@@ -3826,6 +3842,37 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         }
         return_type = Some(instance);
         found = true;
+        // A constructible base whose constructor arity is visible HERE: an in-file Class (its
+        // `_init` is reachable on the ClassNode chain) or a resolvable native class (no `_init`,
+        // so Godot's fallback gives empty par_types). A cross-file `DtKind::Script` base is
+        // deliberately EXCLUDED: its `_init` parameter list is not plumbed through here, so
+        // arity-checking it would either miss a real `_init` arity or — worse — false-positive
+        // "Expected at most 0" on a script with a parameterized `_init` (the under-supplied
+        // cross-file case is filed as #216). Only the bases gdls can arity-check correctly today
+        // set the gate; everything else (pure-Variant degrade, cross-file Script) stays silent so
+        // gdls never manufactures an "Expected at most 0" it can't prove.
+        let constructible = base_type.kind == DtKind::Class
+            || (base_type.kind == DtKind::Native
+                && ctx.native.class_named(&base_type.native_type).is_some());
+        if constructible {
+            // Resolve an in-file `_init` for its real arity; absent one, the zero-arg fallback
+            // (min == max == 0, not vararg) reproduces analyzer.cpp:5897-5903's empty par_types.
+            if let Some(class_id) = base_type.class_node {
+                if let ClassCallLookup::Function(init_id, _) =
+                    lookup_class_function_or_member(ctx, class_id, "_init")
+                {
+                    let init_sig = function_signature(ctx, init_id);
+                    // Keep the synthesized instance return type (Godot returns the base, not
+                    // `_init`'s return); take only the arity fields so the count check fires.
+                    sig.par_types = init_sig.par_types;
+                    sig.min_params = init_sig.min_params;
+                    sig.max_params = init_sig.max_params;
+                    sig.is_vararg = init_sig.is_vararg;
+                }
+            }
+            sig.arity_known = true;
+            sig_resolved = true;
+        }
     } else if base_type.kind == DtKind::Class {
         // In-file class method (`self.method()`, `child.method()`, `Class.method()`).
         if let Some(class_id) = base_type.class_node {

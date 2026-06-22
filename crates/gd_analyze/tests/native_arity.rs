@@ -171,14 +171,13 @@ func _ready() -> void:
     );
 }
 
-// --- CONSTRUCTOR with a parameterized `_init`: SILENT ----------------------------------------
+// --- CONSTRUCTOR with a parameterized `_init`: CORRECT ARITY SILENT --------------------------
 
 #[test]
-fn constructor_with_arguments_is_silent() {
-    // `X.new(1, 2)` against a `func _init(a, b)` synthesizes the instance type directly without
-    // binding `_init`'s signature, so `sig` stays at its zero-arg default. The arity check must
-    // NOT run on that path — Godot resolves the real `_init` arity, so the call is valid and gdls
-    // must never manufacture `Too many arguments... Expected at most 0`.
+fn constructor_correct_arity_is_silent() {
+    // `Inner.new(1, 2)` against `func _init(_a, _b)` — 2 required params, 2 args. Godot resolves
+    // `_init`'s real arity (get_function_signature with p_is_constructor=true,
+    // gdscript_analyzer.cpp:5829-5869) and validate_call_arg passes, so this must stay silent.
     let src = "\
 extends RefCounted
 
@@ -192,7 +191,147 @@ func make() -> void:
     let msgs = error_messages(src);
     assert!(
         !msgs.iter().any(|m| m.contains("arguments for")),
-        "constructor with a parameterized _init must not arity-error; got {msgs:?}"
+        "constructor with matching _init arity must not arity-error; got {msgs:?}"
+    );
+}
+
+// --- CONSTRUCTOR over-call: TOO MANY fires -----------------------------------------------------
+
+#[test]
+fn constructor_too_many_arguments_fires() {
+    // `Inner.new(1, 2, 3)` against `func _init(_a, _b)` — 2 params, 0 defaults, not vararg.
+    // Godot resolves `_init`'s arity and validate_call_arg (gdscript_analyzer.cpp:5944-5950)
+    // emits "Too many arguments...". The message uses `p_call->function_name`, which is `new`.
+    let src = "\
+extends RefCounted
+
+class Inner:
+\tfunc _init(_a, _b):
+\t\tpass
+
+func make() -> void:
+\tvar _x = Inner.new(1, 2, 3)
+";
+    let msgs = error_messages(src);
+    assert!(
+        msgs.iter()
+            .any(|m| m
+                == "Too many arguments for \"new()\" call. Expected at most 2 but received 3."),
+        "constructor over-call must emit Too many arguments; got {msgs:?}"
+    );
+}
+
+// --- CONSTRUCTOR under-call: TOO FEW fires -----------------------------------------------------
+
+#[test]
+fn constructor_too_few_arguments_fires() {
+    // `Inner.new(1)` against `func _init(_a, _b)` — 2 required params, 1 arg. Too few.
+    let src = "\
+extends RefCounted
+
+class Inner:
+\tfunc _init(_a, _b):
+\t\tpass
+
+func make() -> void:
+\tvar _x = Inner.new(1)
+";
+    let msgs = error_messages(src);
+    assert!(
+        msgs.iter()
+            .any(|m| m
+                == "Too few arguments for \"new()\" call. Expected at least 2 but received 1."),
+        "constructor under-call must emit Too few arguments; got {msgs:?}"
+    );
+}
+
+// --- CONSTRUCTOR with defaulted `_init` params: required-only is SILENT -----------------------
+
+#[test]
+fn constructor_optional_defaults_required_only_is_silent() {
+    // `func _init(_a, _b = 0)` — 2 params, 1 default ⇒ min 1, max 2. `Inner.new(1)` supplies the
+    // one required arg and must stay silent (the default-arg lower bound).
+    let src = "\
+extends RefCounted
+
+class Inner:
+\tfunc _init(_a, _b = 0):
+\t\tpass
+
+func make() -> void:
+\tvar _x = Inner.new(1)
+";
+    let msgs = error_messages(src);
+    assert!(
+        !msgs.iter().any(|m| m.contains("arguments for")),
+        "constructor supplying only required _init args must be silent; got {msgs:?}"
+    );
+}
+
+// --- NATIVE constructor over-call: TOO MANY (Expected at most 0) -----------------------------
+
+#[test]
+fn native_constructor_over_call_fires_expected_at_most_zero() {
+    // Godot's constructor fallback for a base with no `_init` (analyzer.cpp:5897-5903) `return
+    // true` with EMPTY par_types, so `validate_call_arg` (analyzer.cpp:5948-5950) fires
+    // "Too many arguments... Expected at most 0" on `RefCounted.new(1, 2, 3)` — the message uses
+    // `p_call->function_name`, which is `new`. gdls must match: a resolvable native base is
+    // constructible, so the zero-arg arity bound applies.
+    let src = "\
+extends Node
+
+func _ready() -> void:
+\tvar _x = RefCounted.new(1, 2, 3)
+";
+    let msgs = error_messages(src);
+    assert!(
+        msgs.iter().any(|m| m
+            == "Too many arguments for \"new()\" call. Expected at most 0 but received 3."),
+        "native constructor over-call must emit Too many arguments (Expected at most 0); got {msgs:?}"
+    );
+}
+
+// --- NATIVE constructor zero-arg: SILENT -----------------------------------------------------
+
+#[test]
+fn native_constructor_zero_args_is_silent() {
+    // `RefCounted.new()` supplies 0 args against the zero-arg native fallback — correct arity,
+    // no error (too-few can never fire since min == 0).
+    let src = "\
+extends Node
+
+func _ready() -> void:
+\tvar _x = RefCounted.new()
+";
+    let msgs = error_messages(src);
+    assert!(
+        !msgs.iter().any(|m| m.contains("arguments for")),
+        "native constructor with no args must be silent; got {msgs:?}"
+    );
+}
+
+// --- IN-FILE class with NO `_init`, over-call: TOO MANY (Expected at most 0) -----------------
+
+#[test]
+fn in_file_class_no_init_over_call_fires_expected_at_most_zero() {
+    // An in-file class that declares no `_init` hits the same constructor fallback
+    // (analyzer.cpp:5897-5903 → empty par_types), so `Inner.new(1)` over-supplies a zero-arg
+    // constructor and must emit "Too many arguments... Expected at most 0".
+    let src = "\
+extends RefCounted
+
+class Inner:
+\tvar x := 1
+
+func make() -> void:
+\tvar _x = Inner.new(1)
+";
+    let msgs = error_messages(src);
+    assert!(
+        msgs.iter()
+            .any(|m| m
+                == "Too many arguments for \"new()\" call. Expected at most 0 but received 1."),
+        "in-file class without _init must arity-error on over-call; got {msgs:?}"
     );
 }
 
