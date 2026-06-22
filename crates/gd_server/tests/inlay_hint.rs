@@ -525,6 +525,44 @@ fn text_edit_for_named_script_inferred_type() {
     shutdown(&client, server_thread);
 }
 
+/// A `var := …` that infers a script type whose `class_name` uses NON-ASCII (Unicode XID) identifier
+/// characters DOES get a `textEdit` inserting the bare class name — the lexer accepts Unicode
+/// identifiers (`unicode_ident::is_xid_start`/`is_xid_continue`), so the annotation gate must too. A
+/// withheld edit here would be a silent under-emission for a perfectly source-valid type.
+#[test]
+fn text_edit_for_unicode_named_script_inferred_type() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let hero = "class_name Héro\nextends RefCounted\n\nfunc greet() -> void:\n\tpass\n";
+    let t = "extends Node\n\nfunc run() -> void:\n\tvar h := Héro.new()\n\th.greet()\n";
+    init_and_open_caps(
+        &p,
+        &client,
+        &[("hero.gd", hero), ("t.gd", t)],
+        inlay_caps(false, false),
+    );
+    let uri = file_uri(&p.root.join("t.gd"));
+    let hints = request_hints(&client, 10, &uri, whole_doc());
+
+    let type_hint = hints
+        .iter()
+        .find(|h| h.kind == Some(InlayHintKind::TYPE) && h.position.line == 3)
+        .expect("the inferred Unicode-named-script var must get a TYPE hint");
+    let edit = type_hint
+        .text_edits
+        .as_ref()
+        .and_then(|e| e.first())
+        .expect("a Unicode class_name'd script type must carry a textEdit");
+    assert_eq!(
+        edit.new_text, ": Héro = ",
+        "the edit must insert the bare Unicode class_name; got {:?}",
+        edit.new_text
+    );
+
+    shutdown(&client, server_thread);
+}
+
 /// Regression (review M1): an inner-class method that shares a name with a root-class method must
 /// get the INNER method's parameter names, not the root's — the analyzer's `class_path` disambiguates
 /// the callee, and the resolver must honor it (a wrong name is a "never lie" violation).
