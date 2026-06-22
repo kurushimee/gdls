@@ -40,7 +40,7 @@ pub const MAX_INSTANCE_DEPTH: usize = 64;
 /// strings that are frequently numeric (`"2"`) but may be alphanumeric (`"13_4dhva"`). `path` is the
 /// `res://…` target (preferred); `uid` is the `uid://…` it was written with (used to resolve `path`
 /// only when `path` is absent, via the project UID map).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 pub struct ExtResource {
     /// `type="…"` — e.g. `"Script"`, `"PackedScene"`, `"Texture2D"`. May be empty if omitted.
     pub ty: String,
@@ -48,6 +48,25 @@ pub struct ExtResource {
     pub path: Option<String>,
     /// `uid="uid://…"`, if present.
     pub uid: Option<String>,
+    /// Byte offsets `(start, end)` into the parsed `.tscn` TEXT of the `path="…"` value BETWEEN its
+    /// surrounding double-quotes (so `text[start..end] == path` verbatim), or `None` when the span
+    /// could not be isolated as a plain single-line double-quoted string. This is the exact-span
+    /// anchor `willRenameFiles` rewrites; it is the live-text-only spelling and is NOT serialized
+    /// (a warm-loaded scene re-derives it on demand by reparsing), so the cache format is unchanged.
+    #[serde(skip)]
+    pub path_span: Option<(usize, usize)>,
+}
+
+// `path_span` is a LIVE-TEXT byte coordinate, not part of an ext_resource's identity (two scenes
+// with the same `type`/`path`/`uid` are equal regardless of where in the file the path sits). It is
+// also `#[serde(skip)]`, so a warm-loaded scene deserializes it as `None` while a freshly-parsed one
+// holds `Some(span)` — deriving `PartialEq` would make a cache round-trip unequal to a fresh parse
+// (the documented warm-load equality class). Excluding it here keeps `ExtResource` equality identity-
+// based and the round-trip stable.
+impl PartialEq for ExtResource {
+    fn eq(&self, other: &Self) -> bool {
+        self.ty == other.ty && self.path == other.path && self.uid == other.uid
+    }
 }
 
 /// The resolved nature of a node's type.
@@ -333,14 +352,19 @@ pub fn parse_scene(text: &str) -> Scene {
     // `type=`-less instanced node and a `script=` line are both available).
     let mut cur_node: Option<usize> = None;
 
-    for logical in logical_lines(text) {
+    for (line_offset, logical) in logical_lines(text) {
         let line = logical.trim();
         if line.is_empty() || line.starts_with(';') {
             continue;
         }
         if let Some(inner) = section_header(line) {
             cur_node = None; // leaving any node body
-            handle_section(&mut scene, inner, &mut cur_node);
+                             // Absolute byte offset of `inner` (the text between the `[` `]`) within the original
+                             // `text`: the logical line's own offset plus the distance from the logical line's start
+                             // to where `inner` begins (the leading whitespace `trim` removed, then the `[`). Lets the
+                             // `ext_resource` arm anchor its `path="…"` value span back to absolute `text` coordinates.
+            let inner_offset = line_offset + (inner.as_ptr() as usize - logical.as_ptr() as usize);
+            handle_section(&mut scene, inner, inner_offset, &mut cur_node);
             continue;
         }
         // A body `key = value` line. Only `[node]` bodies carry relations we keep.
@@ -355,8 +379,15 @@ pub fn parse_scene(text: &str) -> Scene {
     scene
 }
 
-/// Dispatch a `[section ...]` header (the text between the brackets) into the scene.
-fn handle_section(scene: &mut Scene, inner: &str, cur_node: &mut Option<usize>) {
+/// Dispatch a `[section ...]` header (the text between the brackets) into the scene. `inner_offset`
+/// is the absolute byte offset of `inner` within the original `.tscn` text, used only to anchor the
+/// `ext_resource` `path="…"` value span.
+fn handle_section(
+    scene: &mut Scene,
+    inner: &str,
+    inner_offset: usize,
+    cur_node: &mut Option<usize>,
+) {
     let (kind, attrs_text) = split_section_kind(inner);
     match kind {
         "gd_scene" => {
@@ -369,12 +400,22 @@ fn handle_section(scene: &mut Scene, inner: &str, cur_node: &mut Option<usize>) 
             let attrs = parse_attrs(attrs_text);
             // An ext_resource with no id is unreferenceable; skip it rather than invent a key.
             if let Some(id) = attrs.get("id") {
+                let path = attrs.get("path").cloned();
+                // Anchor the `path="…"` value's byte span (between the quotes) back to absolute
+                // `text` coordinates, fail-closed (None unless it is a plain double-quoted string
+                // whose inner equals the parsed value). `inner` is a verbatim substring of `text`
+                // at `inner_offset`, so a span found within `inner` shifts by `inner_offset`.
+                let path_span = path
+                    .as_deref()
+                    .and_then(|p| ext_path_value_span(inner, p))
+                    .map(|(s, e)| (s + inner_offset, e + inner_offset));
                 scene.ext_resources.insert(
                     id.clone(),
                     ExtResource {
                         ty: attrs.get("type").cloned().unwrap_or_default(),
-                        path: attrs.get("path").cloned(),
+                        path,
                         uid: attrs.get("uid").cloned(),
+                        path_span,
                     },
                 );
             }
@@ -499,6 +540,97 @@ fn parse_ext_resource_id(value: &str) -> Option<String> {
         .strip_suffix(')')?
         .trim();
     Some(unquote(inner).to_owned())
+}
+
+/// The byte span (relative to `inner`) of the `path="<value>"` attribute VALUE — the bytes *between*
+/// the double-quotes — for an `[ext_resource …]` header whose inner text is `inner`, or `None`
+/// (fail-closed) when the `path` attribute is absent, isn't a plain double-quoted string, or its
+/// quoted content doesn't equal `expected_value` verbatim.
+///
+/// This is the single-source-of-truth span the `willRenameFiles` `.tscn` rewrite (#131) edits. It is
+/// computed by the SAME tolerant attribute walk [`parse_attrs`] uses — quote/bracket/escape aware —
+/// so the located `path` key is the real attribute, never a substring of some other value (e.g. a
+/// `uid="…path…"`). The span covers ONLY the inner bytes (quotes excluded), and only when the raw
+/// inner slice equals `expected_value` (no escapes / continuation), so a caller can replace exactly
+/// those bytes without touching the quotes. Mirrors `file_operations::inner_string_span`'s discipline.
+fn ext_path_value_span(inner: &str, expected_value: &str) -> Option<(usize, usize)> {
+    // Walk `inner` as (byte_offset, char) so every slice point is a valid boundary (multibyte-safe,
+    // matching `parse_attrs`). For each `key=value` pair, when the key is `path`, capture the value's
+    // byte range; require it to be a plain `"…"` double-quoted string whose content == expected.
+    let chars: Vec<(usize, char)> = inner.char_indices().collect();
+    let len = inner.len();
+    let byte_at = |k: usize| chars.get(k).map_or(len, |&(b, _)| b);
+    let m = chars.len();
+    let mut k = 0usize;
+    while k < m {
+        while k < m && chars[k].1.is_whitespace() {
+            k += 1;
+        }
+        if k >= m {
+            break;
+        }
+        // Read a key: up to `=` or whitespace.
+        let key_start = byte_at(k);
+        while k < m {
+            let c = chars[k].1;
+            if c == '=' || c.is_whitespace() {
+                break;
+            }
+            k += 1;
+        }
+        let key = inner[key_start..byte_at(k)].trim();
+        while k < m && chars[k].1.is_whitespace() {
+            k += 1;
+        }
+        if k >= m || chars[k].1 != '=' {
+            continue; // a bare token with no `=` — skip, mirroring parse_attrs
+        }
+        k += 1; // consume '='
+        while k < m && chars[k].1.is_whitespace() {
+            k += 1;
+        }
+        // Read the value with the same quote/bracket/escape awareness as parse_attrs, but remember
+        // the value's start so we can return a span (parse_attrs only keeps the unquoted string).
+        let val_start = byte_at(k);
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        while k < m {
+            let c = chars[k].1;
+            if in_str {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
+                k += 1;
+                continue;
+            }
+            match c {
+                '"' => in_str = true,
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                _ if c.is_whitespace() && depth == 0 => break,
+                _ => {}
+            }
+            k += 1;
+        }
+        let val_end = byte_at(k);
+        if key != "path" {
+            continue;
+        }
+        // The value must be a plain double-quoted string `"…"` whose inner equals expected verbatim.
+        let raw = &inner[val_start..val_end];
+        let stripped = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"'))?;
+        if stripped != expected_value {
+            return None; // escapes / unexpected spelling — refuse (caller falls back to no rewrite)
+        }
+        // Inner span excludes the two quote bytes (`"` is one byte each).
+        return Some((val_start + 1, val_end - 1));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -654,32 +786,56 @@ fn unquote(s: &str) -> &str {
 /// across physical lines stays one logical line — and, crucially, a `[` at the start of such a
 /// continuation line is NOT mistaken for a section header. Mirrors `project_godot::logical_lines`:
 /// section headers, comments, and blanks at depth 0 are atomic.
-fn logical_lines(text: &str) -> Vec<String> {
+///
+/// Each logical line is returned with the absolute byte offset of its FIRST physical line's start
+/// within `text`, so a span found inside a (single-physical-line) section header can be anchored
+/// back to absolute `text` coordinates — the `ext_resource` `path="…"` value span needs this. A
+/// section header is always atomic (a single physical line, pushed verbatim), so its returned string
+/// is byte-identical to `text[offset..offset + line.len()]`.
+fn logical_lines(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut buf = String::new();
+    let mut buf_offset = 0usize; // byte offset of `buf`'s first physical line within `text`
     let mut depth = 0i32;
     let mut in_str = false;
 
+    // `str::lines` strips the terminator and hides byte offsets, so walk the byte offset manually.
+    let mut offset = 0usize;
     for line in text.lines() {
+        let line_offset = offset;
+        // Advance past this physical line plus its terminator. `lines` accepts both `\n` and
+        // `\r\n`; recover the terminator width from the gap to the next line (or end of text).
+        offset += line.len();
+        if offset < text.len() {
+            // The next byte is `\n` (LF) or `\r\n` (CRLF) — `lines` consumed exactly one of them.
+            offset += if text.as_bytes().get(offset) == Some(&b'\r') {
+                2
+            } else {
+                1
+            };
+        }
+
         if buf.is_empty() && depth == 0 && !in_str {
             let head = line.trim_start();
             if head.is_empty() || head.starts_with(';') || head.starts_with('[') {
-                out.push(line.to_owned());
+                out.push((line_offset, line.to_owned()));
                 continue;
             }
         }
-        if !buf.is_empty() {
+        if buf.is_empty() {
+            buf_offset = line_offset;
+        } else {
             buf.push('\n');
         }
         buf.push_str(line);
         scan_depth(line, &mut depth, &mut in_str);
         if depth <= 0 && !in_str {
             depth = 0;
-            out.push(std::mem::take(&mut buf));
+            out.push((buf_offset, std::mem::take(&mut buf)));
         }
     }
     if !buf.is_empty() {
-        out.push(buf);
+        out.push((buf_offset, buf));
     }
     out
 }
@@ -1069,5 +1225,39 @@ script = ExtResource("1")
         assert!(!is_scene_path(Utf8Path::new("a/b.scn")));
         assert!(!is_scene_path(Utf8Path::new("a/b.gd")));
         assert!(!is_scene_path(Utf8Path::new("a/b.tres")));
+    }
+
+    #[test]
+    fn ext_resource_path_span_anchors_value_between_quotes() {
+        // The span the #131 .tscn rewrite edits: byte offsets into the TEXT of the `path="…"` value,
+        // quotes excluded, so `text[start..end]` is the path verbatim — for the script and the
+        // instanced-PackedScene ext_resources alike.
+        let text = "[gd_scene format=3]\n\
+            [ext_resource type=\"Script\" path=\"res://player.gd\" id=\"1\"]\n\
+            [ext_resource type=\"PackedScene\" uid=\"uid://x\" path=\"res://child.tscn\" id=\"2\"]\n\
+            [node name=\"Player\" type=\"Node\"]\n";
+        let s = parse_scene(text);
+
+        let script = s.ext_resources.get("1").expect("ext_resource 1");
+        let (a, b) = script.path_span.expect("script path span");
+        assert_eq!(&text[a..b], "res://player.gd");
+        assert_eq!(script.path.as_deref(), Some("res://player.gd"));
+
+        // The PackedScene's `path` span is found even though a `uid="…"` precedes it (the attribute
+        // walk locates the real `path` key, never a substring of another value).
+        let packed = s.ext_resources.get("2").expect("ext_resource 2");
+        let (c, d) = packed.path_span.expect("packed path span");
+        assert_eq!(&text[c..d], "res://child.tscn");
+    }
+
+    #[test]
+    fn ext_resource_path_span_none_when_uid_only() {
+        // A uid-only ext_resource (no `path=`) has no span to rewrite — fail-closed None.
+        let text = "[gd_scene format=3]\n\
+            [ext_resource type=\"Script\" uid=\"uid://abc\" id=\"1\"]\n";
+        let s = parse_scene(text);
+        let r = s.ext_resources.get("1").expect("ext_resource 1");
+        assert_eq!(r.path, None);
+        assert_eq!(r.path_span, None);
     }
 }

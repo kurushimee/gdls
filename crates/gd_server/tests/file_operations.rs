@@ -627,13 +627,16 @@ fn batch_rename_gd_and_tscn_together() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// 4. Scene-attached .gd move → window/showMessage(Warning)
+// 4. Scene-attached .gd move → .tscn rewritten, NO dangling warning (#131)
 // ---------------------------------------------------------------------------------------------
 
-/// Moving a `.gd` that a scene attaches as its `ext_resource` Script → a `window/showMessage`
-/// (Warning) naming the affected scene(s) (full `.tscn` rewriting is out of scope this phase).
+/// Moving a `.gd` that a scene attaches as its `ext_resource` Script to a SAFE new path now rewrites
+/// the scene's `ext_resource` (the second mutating surface, #131) instead of warning — so NO dangling
+/// `window/showMessage(Warning)` for that scene fires (it is no longer dangling). The rewrite content
+/// itself is asserted by `scene_attached_script_move_rewrites_tscn_ext_resource`; this pins the
+/// warning-suppression half: a successfully-rewritten scene must not also be reported as dangling.
 #[test]
-fn scene_attached_script_move_warns() {
+fn scene_attached_script_safe_move_rewrites_without_dangling_warning() {
     let p = bare_project();
     p.write("player.gd", "extends Node\n");
     p.write(
@@ -659,28 +662,35 @@ fn scene_attached_script_move_warns() {
         .send(request(10, "workspace/willRenameFiles", params))
         .unwrap();
 
-    // A window/showMessage(Warning) naming player.tscn must arrive (before or alongside the response).
-    let mut warned = false;
+    // No dangling `window/showMessage(Warning)` for player.tscn may arrive (it was rewritten), and
+    // the response must carry a .tscn edit.
+    let mut dangling_warned = false;
+    let mut got_tscn_edit = false;
+    let tscn_uri = file_uri(&p.root.join("player.tscn")).as_str().to_string();
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         match try_recv(&client, Duration::from_millis(200)) {
             Some(Message::Notification(n)) if n.method == "window/showMessage" => {
-                assert_eq!(n.params["type"], 2, "MessageType::WARNING is 2");
                 let msg = n.params["message"].as_str().unwrap_or("");
-                assert!(
-                    msg.contains("res://player.tscn"),
-                    "warning must name the dangling scene; got {msg:?}"
-                );
-                warned = true;
+                if msg.contains("res://player.tscn") && msg.contains("dangling") {
+                    dangling_warned = true;
+                }
+            }
+            Some(Message::Response(r)) if r.id == lsp_server::RequestId::from(10) => {
+                let view = flatten_edit(r.result.unwrap_or(serde_json::Value::Null));
+                got_tscn_edit = view.edits.iter().any(|(u, _, _)| u == &tscn_uri);
                 break;
             }
-            Some(_) => continue,
-            None => continue,
+            _ => continue,
         }
     }
     assert!(
-        warned,
-        "moving a scene-attached script must warn about the dangling scene"
+        got_tscn_edit,
+        "a safe scene-attached .gd move must rewrite the scene's ext_resource"
+    );
+    assert!(
+        !dangling_warned,
+        "a successfully-rewritten scene must NOT also be reported as dangling"
     );
 
     shutdown(&client, thread);
@@ -1199,6 +1209,160 @@ fn resource_loader_load_rewritten_but_unrelated_method_not() {
         after.contains("loader.load(\"res://a.gd\")"),
         "an unrelated obj.load argument must be byte-identical: {after}"
     );
+
+    shutdown(&client, thread);
+}
+
+// ---------------------------------------------------------------------------------------------
+// 8. .tscn ext_resource rewrite (#131): the SECOND mutating surface
+// ---------------------------------------------------------------------------------------------
+
+/// Read a `.tscn` file relative to the project root.
+fn read_tscn(p: &TempProject, rel: &str) -> String {
+    std::fs::read_to_string(p.root.join(rel).as_std_path()).expect("read .tscn")
+}
+
+/// Moving a scene-attached `.gd` rewrites the scene's `ext_resource path="res://old.gd"` entry to
+/// the new path — the SECOND mutating surface (#131). The emitted edit, applied to the `.tscn` text,
+/// re-resolves the ext_resource to the new identity; the warning for THAT scene no longer fires
+/// (it is no longer dangling).
+#[test]
+fn scene_attached_script_move_rewrites_tscn_ext_resource() {
+    let p = bare_project();
+    p.write("player.gd", "extends Node\n");
+    let tscn_src = "[gd_scene format=3]\n[ext_resource type=\"Script\" path=\"res://player.gd\" id=\"1\"]\n[node name=\"Player\" type=\"Node\"]\nscript = ExtResource(\"1\")\n";
+    p.write("player.tscn", tscn_src);
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &[]);
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    let result = will_rename(&client, 10, &p, "player.gd", "nodes/player.gd");
+    let view = flatten_edit(result);
+
+    let tscn_uri = file_uri(&p.root.join("player.tscn")).as_str().to_string();
+    let tscn_edit = view
+        .edits
+        .iter()
+        .find(|(u, _, _)| u == &tscn_uri)
+        .unwrap_or_else(|| panic!("expected a TextEdit over player.tscn; got {:?}", view.edits));
+    assert_eq!(
+        tscn_edit.2, "res://nodes/player.gd",
+        "the ext_resource path is rewritten to the new res:// path"
+    );
+
+    // Apply the edit and reparse — the ext_resource must now resolve to the NEW path.
+    let after = apply_edit_to(tscn_src, &tscn_edit.1, &tscn_edit.2);
+    let scene = gd_project::scene::parse_scene(&after);
+    let attached: Vec<&str> = scene.attached_scripts().collect();
+    assert_eq!(
+        attached,
+        vec!["res://nodes/player.gd"],
+        "after the edit, the scene attaches the NEW path: {after}"
+    );
+    assert!(
+        !after.contains("res://player.gd"),
+        "the old path must be gone: {after}"
+    );
+
+    shutdown(&client, thread);
+}
+
+/// Moving a `.tscn` that is INSTANCED as a sub-scene by another `.tscn` rewrites the parent's
+/// `ext_resource path="res://old.tscn"` (PackedScene) entry to the new path. (#131 — instanced-scene
+/// ext_resource.)
+#[test]
+fn instanced_subscene_move_rewrites_parent_tscn_ext_resource() {
+    let p = bare_project();
+    let child_src = "[gd_scene format=3]\n[node name=\"ChildRoot\" type=\"Node\"]\n";
+    p.write("child.tscn", child_src);
+    let parent_src = "[gd_scene format=3]\n[ext_resource type=\"PackedScene\" path=\"res://child.tscn\" id=\"1\"]\n[node name=\"Root\" type=\"Node\"]\n[node name=\"Sub\" parent=\".\" instance=ExtResource(\"1\")]\n";
+    p.write("parent.tscn", parent_src);
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &[]);
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    let result = will_rename(&client, 10, &p, "child.tscn", "scenes/child.tscn");
+    let view = flatten_edit(result);
+
+    let parent_uri = file_uri(&p.root.join("parent.tscn")).as_str().to_string();
+    let parent_edit = view
+        .edits
+        .iter()
+        .find(|(u, _, _)| u == &parent_uri)
+        .unwrap_or_else(|| panic!("expected a TextEdit over parent.tscn; got {:?}", view.edits));
+    assert_eq!(parent_edit.2, "res://scenes/child.tscn");
+
+    let after = apply_edit_to(parent_src, &parent_edit.1, &parent_edit.2);
+    let scene = gd_project::scene::parse_scene(&after);
+    let instanced: Vec<&str> = scene.instanced_scenes().collect();
+    assert_eq!(
+        instanced,
+        vec!["res://scenes/child.tscn"],
+        "after the edit, the parent instances the NEW sub-scene path: {after}"
+    );
+
+    shutdown(&client, thread);
+}
+
+/// Fail-closed: renaming a scene-attached `.gd` to a name whose `res://` text would BREAK the
+/// `ext_resource` path (a quote) REFUSES the `.tscn` rewrite — the scene stays untouched AND the
+/// dangling warning still fires (the scene is genuinely left dangling, so the user must be told).
+#[test]
+fn fail_closed_unsafe_tscn_rewrite_keeps_warning() {
+    let p = bare_project();
+    p.write("player.gd", "extends Node\n");
+    let tscn_src = "[gd_scene format=3]\n[ext_resource type=\"Script\" path=\"res://player.gd\" id=\"1\"]\n[node name=\"Player\" type=\"Node\"]\nscript = ExtResource(\"1\")\n";
+    p.write("player.tscn", tscn_src);
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &[]);
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    // Rename player.gd → a name with a double quote: the new res path can't be injected into the
+    // ext_resource `path="…"` without breaking it. Refuse → no .tscn edit, but warn.
+    let params = RenameFilesParams {
+        files: vec![FileRename {
+            old_uri: file_uri(&p.root.join("player.gd")).as_str().to_string(),
+            new_uri: file_uri(&p.root.join("we\"rd.gd")).as_str().to_string(),
+        }],
+    };
+    client
+        .sender
+        .send(request(10, "workspace/willRenameFiles", params))
+        .unwrap();
+
+    // The dangling warning must still fire (the scene is genuinely left dangling).
+    let mut warned = false;
+    let mut got_edit = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match try_recv(&client, Duration::from_millis(200)) {
+            Some(Message::Notification(n)) if n.method == "window/showMessage" => {
+                let msg = n.params["message"].as_str().unwrap_or("");
+                if msg.contains("res://player.tscn") {
+                    warned = true;
+                }
+            }
+            Some(Message::Response(r)) if r.id == lsp_server::RequestId::from(10) => {
+                got_edit = !r.result.unwrap_or(serde_json::Value::Null).is_null();
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert!(
+        !got_edit,
+        "an unsafe new path must refuse the .tscn rewrite (no edit)"
+    );
+    assert!(
+        warned,
+        "a refused (still-dangling) scene must keep its dangling warning"
+    );
+    // The scene on disk must still reference the OLD path (we never touched it).
+    let tscn_now = read_tscn(&p, "player.tscn");
+    assert!(tscn_now.contains("res://player.gd"));
 
     shutdown(&client, thread);
 }
