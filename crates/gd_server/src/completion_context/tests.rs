@@ -280,6 +280,39 @@ fn func_local_var_inline_type_is_plain_type_name() {
 }
 
 #[test]
+fn static_func_local_var_inline_type_is_plain_type_name() {
+    // A `static func` body is still `parse_variable(_, p_allow_property=false)` — the leading
+    // `static` keyword does not change the function-local scope, so its inner `var x: <cursor>`
+    // stays plain TypeName (never get/set). The nested-block form must hold too.
+    for m in [
+        "static func f():\n\tvar x: |",
+        "static func f():\n\tvar x: Vec|",
+        "static func f():\n\tif true:\n\t\tvar x: |",
+    ] {
+        let ctx = at(m);
+        assert_eq!(
+            ctx.kind,
+            CompletionKind::TypeName,
+            "`{m}` (static-function-local inline type) must stay plain TypeName"
+        );
+    }
+}
+
+#[test]
+fn static_class_body_var_inline_type_offers_get_set() {
+    // A class-body `static var x: <cursor>` is still a class member (`p_allow_property=true`), so it
+    // reaches COMPLETION_PROPERTY_DECLARATION_OR_TYPE — types PLUS get/set.
+    for m in ["static var x: |", "static var x: Vec|"] {
+        let ctx = at(m);
+        assert_eq!(
+            ctx.kind,
+            CompletionKind::PropertyDeclarationOrType,
+            "`{m}` (static class-body inline type) must be PropertyDeclarationOrType"
+        );
+    }
+}
+
+#[test]
 fn type_name_or_void_return() {
     // `func f() -> ` → return-type completion.
     let m = "func f() -> |";

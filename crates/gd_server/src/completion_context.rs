@@ -1149,10 +1149,14 @@ fn is_class_body_var_colon(tokens: &[Token], i: usize) -> bool {
             Newline => line_open_kind = None,
             ParenthesisOpen | BracketOpen | BraceOpen => bracket_depth += 1,
             ParenthesisClose | BracketClose | BraceClose => bracket_depth -= 1,
-            Func if bracket_depth == 0 && line_open_kind.is_none() => {
+            Func if bracket_depth == 0 && line_open_kind.is_none_or(|k| k == Static) => {
                 func_indents.push(indent_depth);
                 line_open_kind = Some(Func);
             }
+            // A leading `static` is transparent: `static func` and `static var` keep the `func`/`var`
+            // as the line-opening keyword (Godot's `parse_class_member` consumes `static` first), so a
+            // `static func` body's vars are still seen as function-local.
+            Static if bracket_depth == 0 && line_open_kind.is_none() => {}
             _ if bracket_depth == 0 && line_open_kind.is_none() => line_open_kind = Some(t.kind),
             _ => {}
         }
