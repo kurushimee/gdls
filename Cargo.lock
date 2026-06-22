@@ -215,6 +215,7 @@ dependencies = [
  "tracing",
  "tracing-log",
  "tracing-subscriber",
+ "unicode-ident",
  "walkdir",
  "which",
 ]

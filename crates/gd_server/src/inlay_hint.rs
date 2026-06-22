@@ -402,18 +402,27 @@ fn annotation_type(state: &ServerState, dt: &DataType) -> Option<String> {
 }
 
 /// Whether `s` is a valid GDScript type EXPRESSION: a dotted chain of identifiers
-/// (`float`/`Node2D`/`Outer.Inner`) or a container form (`Array[int]`, `Dictionary[String, int]`,
-/// nested). The final guard on [`annotation_type`]'s output — a defensive re-check so a future
-/// per-kind derivation that produced a non-source string can't slip a corrupting edit through.
+/// (`float`/`Node2D`/`Outer.Inner`/`Héro`) or a container form (`Array[int]`,
+/// `Dictionary[String, int]`, nested). The final guard on [`annotation_type`]'s output — a defensive
+/// re-check so a future per-kind derivation that produced a non-source string can't slip a corrupting
+/// edit through.
+///
+/// Each dotted segment must be a valid GDScript identifier under the SAME Unicode XID rule the
+/// tokenizer applies (`gd_syntax::lexer`'s `is_identifier_start`/`is_identifier_continue`): the first
+/// char is `_` or `XID_Start`, the rest are `XID_Continue` (which already admits `_`). A Unicode
+/// `class_name` (e.g. `Héro`) is therefore accepted, matching what the lexer would tokenize — an
+/// ASCII-only rule here would withhold the auto-insert edit for a type the source can legally name.
 fn is_source_valid_type(s: &str) -> bool {
     fn is_type_ident(s: &str) -> bool {
-        // A dotted chain of GDScript identifiers: each segment starts with a letter/`_` and is
-        // alphanumeric/`_` thereafter, no empty segment.
+        // A dotted chain of GDScript identifiers: each non-empty segment starts with `_` or an
+        // `XID_Start` char and continues with `XID_Continue` chars — identical to the tokenizer's
+        // `is_identifier_start`/`is_identifier_continue` so a Unicode identifier the lexer accepts is
+        // accepted here too.
         !s.is_empty()
             && s.split('.').all(|seg| {
                 let mut chars = seg.chars();
-                matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
-                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                matches!(chars.next(), Some(c) if c == '_' || unicode_ident::is_xid_start(c))
+                    && chars.all(unicode_ident::is_xid_continue)
             })
     }
     // A container form `Outer[Inner, …]`: the head is a type ident, the bracketed body is a
@@ -642,6 +651,11 @@ mod tests {
         assert!(is_source_valid_type("Array[int]"));
         assert!(is_source_valid_type("Dictionary[String, int]"));
         assert!(is_source_valid_type("Array[Array[int]]"));
+        // A Unicode `class_name` (and a dotted chain through one) is source-valid under the lexer's
+        // XID rule — the tokenizer would accept these identifiers, so the auto-insert edit must too.
+        assert!(is_source_valid_type("Héro"));
+        assert!(is_source_valid_type("Héro.E"));
+        assert!(is_source_valid_type("Array[Héro]"));
     }
 
     #[test]
@@ -651,6 +665,9 @@ mod tests {
         assert!(!is_source_valid_type("<Class>"));
         // A leading-digit segment is rejected.
         assert!(!is_source_valid_type("2d_thing"));
+        // A leading combining mark is rejected: it is `XID_Continue` but not `XID_Start`, so the
+        // lexer would not start an identifier with it — the accept gate is drawn on the lexer's side.
+        assert!(!is_source_valid_type("\u{0301}x"));
         // Empty / bracket-malformed strings are rejected.
         assert!(!is_source_valid_type(""));
         assert!(!is_source_valid_type("Array["));

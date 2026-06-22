@@ -7,6 +7,6 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-unicode-ident = "1.0.24"
+unicode-ident.workspace = true
 unicode-security.workspace = true
 serde.workspace = true
