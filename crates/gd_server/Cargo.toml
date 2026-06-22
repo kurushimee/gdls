@@ -62,6 +62,10 @@ lru.workspace = true
 # re-arming after a delete+recreate lands a different directory at the same path.
 dunce.workspace = true
 same-file.workspace = true
+# The inlayHint type-annotation validator (`inlay_hint::is_source_valid_type`) accepts Unicode
+# identifiers using the SAME XID rule as the `gd_syntax` lexer, so an auto-insert edit is offered for
+# a Unicode-`class_name` script type rather than withheld.
+unicode-ident.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

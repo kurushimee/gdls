@@ -72,6 +72,11 @@ lru = "0.18.0"
 # confusable-character tables at compile time and zero runtime allocation beyond the skeleton
 # string itself (cached keyword skeleton-set is built once via `OnceLock`).
 unicode-security = "0.1.2"
+# `unicode-ident` — the identifier-character predicate (`is_xid_start`/`is_xid_continue`, faithful to
+# Godot's `xid_start`/`xid_continue` tables in `gdscript_tokenizer.cpp`). Hoisted here so the
+# `gd_syntax` lexer and the `gd_server` inlayHint type-annotation validator share ONE version of the
+# XID rule — a divergence would let the validator reject a Unicode identifier the lexer accepts.
+unicode-ident = "1.0.24"
 # M5 Phase F. `dunce` (WP-RD9) — Windows junction- and UNC-aware path canonicalization: unlike
 # `std::fs::canonicalize`, it resolves NTFS junctions while preserving plain drive paths (never
 # emitting a `\\?\` verbatim prefix that downstream `camino`/`Utf8Path` comparisons would split
