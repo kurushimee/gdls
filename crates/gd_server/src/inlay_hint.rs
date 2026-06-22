@@ -357,6 +357,7 @@ fn hintable_type_label(state: &ServerState, tree: &ParseTree, dt: &DataType) -> 
 /// Every returned string is finally re-checked by [`is_source_valid_type`] (belt-and-suspenders).
 fn annotation_type(state: &ServerState, dt: &DataType) -> Option<String> {
     use gd_analyze::data_type::variant_type_name;
+    use gd_analyze::resolver::builtin_type_from_name;
     use gd_analyze::VariantType;
 
     let candidate: String = match dt.kind {
@@ -389,12 +390,26 @@ fn annotation_type(state: &ServerState, dt: &DataType) -> Option<String> {
             if !sr.inner.is_empty() {
                 return None;
             }
-            state
+            let name = state
                 .workspace
                 .index
                 .interface(sr.file)?
                 .class_name
-                .clone()?
+                .clone()?;
+            // Withhold the auto-insert edit when the `class_name` collides with a builtin Variant
+            // type (`Array`, `int`, …) or a native engine class (`Node`, …). Godot's analyzer rejects
+            // such a `class_name` outright (`gdscript_analyzer.cpp`: "hides a built-in type" / "hides
+            // a native class"), so under faithful indexing this name never reaches a usable script
+            // type. But the shallow index stores the name as-written and only the M3 analyzer reports
+            // the collision as a diagnostic — it is NOT stripped from the interface — so a colliding
+            // name CAN surface here. Inserting `: Array = ` would then re-parse as the builtin/native
+            // type, not the intended script, silently mis-annotating the file. Fail-closed.
+            if builtin_type_from_name(&name).is_some()
+                || state.workspace.native.class_named(&name).is_some()
+            {
+                return None;
+            }
+            name
         }
         _ => return None,
     };

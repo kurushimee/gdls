@@ -576,9 +576,11 @@ fn no_text_edit_for_script_class_name_colliding_with_builtin() {
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
     // A sibling script declaring `class_name Array` (collides with the builtin `Array`). Godot would
-    // reject this, but gdls's index surfaces it anyway.
+    // reject this, but gdls's index surfaces it anyway. The var is typed via `preload(…).new()` (NOT
+    // the bare `Array.new()`, which the analyzer resolves to the builtin) so the inferred type is the
+    // SCRIPT — exercising the `DtKind::Script` annotation arm with a colliding `class_name`.
     let arr = "class_name Array\nextends RefCounted\n\nfunc greet() -> void:\n\tpass\n";
-    let t = "extends Node\n\nfunc run() -> void:\n\tvar h := Array.new()\n\th.greet()\n";
+    let t = "extends Node\n\nfunc run() -> void:\n\tvar h := preload(\"res://arr.gd\").new()\n\th.greet()\n";
     init_and_open_caps(
         &p,
         &client,
@@ -613,7 +615,7 @@ fn no_text_edit_for_script_class_name_colliding_with_native() {
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
     let node = "class_name Node\nextends RefCounted\n\nfunc greet() -> void:\n\tpass\n";
-    let t = "extends Node\n\nfunc run() -> void:\n\tvar h := Node.new()\n\th.greet()\n";
+    let t = "extends Node\n\nfunc run() -> void:\n\tvar h := preload(\"res://node.gd\").new()\n\th.greet()\n";
     init_and_open_caps(
         &p,
         &client,
