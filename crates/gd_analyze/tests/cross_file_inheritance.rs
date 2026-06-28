@@ -888,3 +888,77 @@ func go() -> void:
         "a non-Func _init member must not trigger the constructor arity check; got {errors:?}"
     );
 }
+
+// === #212: inner class accessed via a preloaded-const identifier =================================
+//
+// `Lib.Box.new()` where `const Lib = preload("res://lib.gd")` and `lib.gd` declares an inner
+// `class Box` must resolve: `Lib.Box` is the inner class `Box` of the preloaded script (a Script
+// meta type with `inner = ["Box"]`), `Lib.Box.new()` yields a `Box` instance, and `b.field`
+// resolves to `Box.field`. Pre-fix the reducer's `lookup_script_chain_member` had no inner-class
+// arm, so `Lib.Box` returned `Unresolved` and `b` degraded to Variant — `references`/`rename`/
+// hover/completion on `b.field` saw nothing. Godot's analyzer resolves the inner class through the
+// preloaded constant's class chain (gdscript_analyzer.cpp constant/subscript member walk).
+
+/// `Lib.Box.new()` types `b` as the inner `Box` instance, and `b.field` records a `Binding::Use`
+/// against `lib.gd` with the inner class path `["Box"]`.
+#[test]
+fn inner_class_via_preload_const_resolves() {
+    let lib = "\
+extends Node
+var field := 1
+class Box:
+\tvar field := 2
+";
+    let consumer = "\
+extends Node
+const Lib = preload(\"res://lib.gd\")
+func run() -> void:
+\tvar b := Lib.Box.new()
+\tb.field = 5
+";
+    let project = Project::new(&[("res://lib.gd", lib), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+
+    // `b.field` must type as int (the inner `Box.field`, not Variant).
+    let tree = parse(consumer).tree;
+    let mut field_typed_int = false;
+    for id in tree.iter_ids() {
+        if let gd_syntax::ast::NodeKind::Identifier(ident) = &tree.get(id).kind {
+            if ident.name == "field" {
+                let dt = result.types.get(id);
+                if dt.is_set() && format!("{dt}") == "int" {
+                    field_typed_int = true;
+                }
+            }
+        }
+    }
+    assert!(
+        field_typed_int,
+        "b.field must type as int (the inner Box.field) via Lib.Box.new()"
+    );
+
+    // A `Binding::Use` for `field` must target lib.gd with the inner class path ["Box"].
+    let lib_fid = project.fid("res://lib.gd");
+    let field_uses: Vec<&Binding> = result
+        .bindings()
+        .iter()
+        .filter(|b| {
+            matches!(
+                b,
+                Binding::Use {
+                    target_file: Some(f),
+                    target_name,
+                    ..
+                } if *f == lib_fid && target_name == "field"
+            )
+        })
+        .collect();
+    assert!(
+        field_uses.iter().any(|b| matches!(
+            b,
+            Binding::Use { target_class_path, .. } if target_class_path == &["Box".to_owned()]
+        )),
+        "b.field must record a Use against lib.gd inner class [\"Box\"]; got {field_uses:?}"
+    );
+}
