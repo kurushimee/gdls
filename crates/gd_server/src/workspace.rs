@@ -471,6 +471,11 @@ impl Workspace {
             .filter(|entry| entry.hash == hash && entry.epoch == current_epoch)
             .map(|entry| Rc::clone(&entry.value));
         let cached_used = cached.is_some();
+        // #210: set when a bailed re-analyze recovered the cached COMPLETE entry for identical bytes
+        // (a same-`hash`, stale-`epoch` entry). That entry is intentionally NOT re-stamped to the
+        // current epoch (the bail must self-heal on the next call), so the WP-RD8 epoch-exact
+        // postcondition below does not apply to it.
+        let mut served_bail_recovery = false;
         let result = match cached {
             Some(hit) => hit,
             None => {
@@ -527,6 +532,32 @@ impl Workspace {
                         file = %path,
                         "analysis bailed (fixpoint governor / cancellation); not caching the partial result"
                     );
+                    // #210: never serve the partial when a COMPLETE result for IDENTICAL bytes is
+                    // already cached. The epoch-exact lookup above missed (a dependency interface
+                    // change bumped this file's epoch in the gap), forcing this re-analyze — which
+                    // then bailed. The cache only ever stores complete results (a bail is never
+                    // cached, this very branch), so any same-`hash` entry is complete. Identical
+                    // bytes ⇒ identical tree ⇒ exact same-file byte-derived resolution
+                    // (`smallest_typed_containing` etc.); only a cross-file dependency interface
+                    // could be stale — strictly better than the partial's missing types / a null
+                    // lie. A bounded, documented relaxation of the WP-RD8 epoch-exact key, and
+                    // self-healing: the bail is still not cached, so the next call re-attempts.
+                    if let Some(complete) = self
+                        .analysis_cache
+                        .get(key)
+                        .filter(|e| e.hash == hash)
+                        .map(|e| Rc::clone(&e.value))
+                    {
+                        tracing::warn!(
+                            name = "analyze_bailed_served_cached_complete",
+                            file = %path,
+                            "serving the cached COMPLETE analysis for identical content (epoch relaxed) instead of the bailed partial"
+                        );
+                        served_bail_recovery = true;
+                        complete
+                    } else {
+                        result
+                    }
                 } else {
                     self.analysis_cache.put(
                         key.clone(),
@@ -536,8 +567,8 @@ impl Workspace {
                             value: Rc::clone(&result),
                         },
                     );
+                    result
                 }
-                result
             }
         };
         // WP-RD8 postcondition (the self-validating-key analog of the retired `!is_dirty`
@@ -547,12 +578,14 @@ impl Workspace {
         // cross-file diagnostic (never lie).
         debug_assert!(
             result.bailed
+                || served_bail_recovery
                 || self
                     .analysis_cache
                     .peek(key)
                     .is_some_and(|e| e.epoch == current_epoch),
             "invariant: a completed analyze() must leave {path}'s cached entry stamped with the \
-             current epoch (a bailed result is intentionally not cached)"
+             current epoch (a bailed result is intentionally not cached; a #210 bail-recovery serves \
+             a deliberately stale-epoch complete entry without re-stamping it)"
         );
         _span.record("cache_hit", cached_used);
         _span.record("elapsed_us", _start.elapsed().as_micros() as u64);
@@ -1788,4 +1821,63 @@ fn load_native(
         log::info!("merged {merged} GDExtension class(es) from doc XML");
     }
     db
+}
+
+#[cfg(test)]
+mod bail_recovery_tests {
+    //! #210: a bailed (fixpoint-governor / cancellation) re-analyze must NOT serve its partial when
+    //! a COMPLETE result for the identical bytes is already cached — it serves the complete one
+    //! (hash-match, epoch relaxed), never lying with truncated side tables.
+    use super::*;
+
+    #[test]
+    fn bailed_reanalyze_serves_cached_complete_for_identical_bytes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(dir.path().join("project.godot"), "config_version=5\n")
+            .expect("write project.godot");
+        let src = "extends Node\nfunc go() -> void:\n\tvar a := 1\n\tvar b := a + 1\n\tprint(b)\n";
+        let gd_path = root.join("main.gd");
+        std::fs::write(gd_path.as_std_path(), src).expect("write main.gd");
+
+        let options = InitializationOptions::parse(Some(&serde_json::json!({
+            "projectRoot": root.as_str(),
+            "autoDumpExtensionApi": false,
+        })));
+        let mut ws = Workspace::load(&root, &options);
+        let key = CanonicalKey::for_path(&gd_path).expect("canonical key for main.gd");
+
+        let tree = ws.parse(&key, src).tree.clone();
+
+        // 1. A complete analyze caches the full result at the file's current epoch.
+        let complete = ws.analyze(&key, &gd_path, &tree, src);
+        assert!(
+            !complete.bailed,
+            "the seeding analyze must complete, not bail"
+        );
+
+        // 2. Bump this file's epoch — the dependency-interface-change analog the bug needs: a
+        //    watcher epoch bump in the gap before a request makes the request's epoch-exact lookup
+        //    miss. `reindex` re-applies the same interface, which unconditionally bumps the epoch.
+        ws.reindex(&gd_path, &tree);
+
+        // 3. Re-analyze IDENTICAL bytes with a tiny iter_limit so the fixpoint governor bails on the
+        //    first checkpoint. The epoch-exact cache lookup misses (epoch bumped), forcing the
+        //    re-analyze; it bails; #210 then recovers the cached complete entry for the same hash.
+        let opts = gd_analyze::AnalyzeOptions {
+            iter_limit: Some(1),
+            ..Default::default()
+        };
+        let served = ws.analyze_with_options(&key, &gd_path, &tree, src, opts);
+
+        assert!(
+            !served.bailed,
+            "a bailed re-analyze must serve the cached COMPLETE result for identical bytes (#210), \
+             not the partial"
+        );
+        assert!(
+            Rc::ptr_eq(&served, &complete),
+            "the served result must be the SAME complete Rc that the seeding analyze cached"
+        );
+    }
 }
