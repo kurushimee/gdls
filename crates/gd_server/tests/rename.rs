@@ -1900,6 +1900,87 @@ fn rename_enum_value_distinguishes_two_enums_with_same_value_name() {
 }
 
 #[test]
+fn rename_180_inner_enum_value_via_decl_renames_precisely() {
+    // #180: an enum value declared in an INNER class (`class Inner:` … `enum Direction { NORTH }`)
+    // must resolve from its DECLARATION click — the reducer now carries the declaring enum's
+    // inner-class path on the `EnumValueLocal` binding, and the server resolvers descend into inner
+    // classes. (Pre-#180 this refused: the decl resolvers walked only `root.members`.)
+    //   line 2 `\tenum Direction { NORTH, SOUTH }` → inner decl `NORTH` at col 18
+    //   line 3 `\tvar d := Direction.NORTH`        → inner use  `NORTH` at col 20
+    let src =
+        "extends Node\nclass Inner:\n\tenum Direction { NORTH, SOUTH }\n\tvar d := Direction.NORTH\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the inner value DECLARATION (line 2, col 18). Rename → `UP`.
+    let sites = rename_sites(&client, 230, &main_uri, 2, 18, "UP");
+    assert_eq!(
+        sites,
+        vec![(2, 18), (3, 20)],
+        "renaming an inner-class enum value from its declaration must edit the inner decl + the \
+         `Direction.NORTH` use inside Inner, never the sibling `SOUTH`; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_180_inner_enum_value_via_use_renames_precisely() {
+    // Same inner-class fixture, clicked on the `Direction.NORTH` USE inside Inner. Click-site
+    // independent: the binding anchors by identity to the inner enum's declaration.
+    let src =
+        "extends Node\nclass Inner:\n\tenum Direction { NORTH, SOUTH }\n\tvar d := Direction.NORTH\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+    // Click the inner USE `NORTH` (line 3, col 20). Rename → `UP`.
+    let sites = rename_sites(&client, 231, &main_uri, 3, 20, "UP");
+    assert_eq!(
+        sites,
+        vec![(2, 18), (3, 20)],
+        "renaming an inner-class enum value from a use site must edit the same set as the \
+         declaration click (inner decl + inner use); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_180_root_and_inner_same_named_enum_value_stay_distinct() {
+    // #180 CORRUPTION GUARD: a root `enum Direction { NORTH }` and an inner
+    // `class Inner:` … `enum Direction { NORTH }` of ONE file share the qualified identity
+    // `Direction.NORTH` but live in DIFFERENT classes. The declaring inner-class path on each
+    // `EnumValueLocal` binding keeps them distinct — renaming the ROOT value must edit ONLY the root
+    // decl + root use, leaving the inner decl + inner use untouched (and vice-versa). Without the
+    // path key, both record `(file, "Direction.NORTH", [])` and one rename would corrupt the other.
+    //   line 1 `enum Direction { NORTH }`       → ROOT  decl `NORTH` at col 17
+    //   line 2 `var rd := Direction.NORTH`      → ROOT  use  `NORTH` at col 20
+    //   line 4 `\tenum Direction { NORTH }`     → INNER decl `NORTH` at col 18
+    //   line 5 `\tvar id := Direction.NORTH`    → INNER use  `NORTH` at col 21
+    let src = "extends Node\nenum Direction { NORTH }\nvar rd := Direction.NORTH\nclass Inner:\n\tenum Direction { NORTH }\n\tvar id := Direction.NORTH\n";
+    let (client, server, main_uri, _project) = boot_native_member(src);
+
+    // Rename the ROOT value from its decl (line 1, col 17) → `UP`. ONLY root positions edited.
+    let sites = rename_sites(&client, 232, &main_uri, 1, 17, "UP");
+    assert_eq!(
+        sites,
+        vec![(1, 17), (2, 20)],
+        "renaming the ROOT `Direction.NORTH` must edit ONLY the root decl + root use; got {sites:?}"
+    );
+    assert!(
+        !sites.contains(&(4, 18)) && !sites.contains(&(5, 21)),
+        "the INNER decl (4,18) and inner use (5,21) must be UNTOUCHED by the root rename; got {sites:?}"
+    );
+
+    // Mirror: rename the INNER value from its decl (line 4, col 18) → `DOWN`. ONLY inner positions.
+    let inner_sites = rename_sites(&client, 233, &main_uri, 4, 18, "DOWN");
+    assert_eq!(
+        inner_sites,
+        vec![(4, 18), (5, 21)],
+        "renaming the INNER `Direction.NORTH` must edit ONLY the inner decl + inner use; got {inner_sites:?}"
+    );
+    assert!(
+        !inner_sites.contains(&(1, 17)) && !inner_sites.contains(&(2, 20)),
+        "the ROOT decl (1,17) and root use (2,20) must be UNTOUCHED by the inner rename; got {inner_sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
 fn rename_refuses_cross_file_enum_value() {
     // A cross-file enum value (`Lib.Dir.NORTH`, where `enum Dir { NORTH }` is declared in lib.gd)
     // currently REFUSES: the analyzer records no positive in-file anchor for it (the cross-file enum
