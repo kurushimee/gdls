@@ -2122,12 +2122,12 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 /// floor.
 ///
 /// The declaration arm deliberately matches a `Function`/`Signal` identifier at *any* class
-/// depth — inner-class methods (`class Foo:` … `func helper():`) included. The references
-/// method path still filters call sites at FILE granularity, so a root-class and an inner-class
-/// method sharing one name in one file may mix their call-site sets — the bounded residue of
-/// the over-approximating stance. (`CalleeTarget::Script` now records the owning `class_path`;
-/// threading it through the method path's target resolution — which would need the cursor
-/// side's owning class too — is the remaining refinement.)
+/// depth — inner-class methods (`class Foo:` … `func helper():`) included. The references/rename
+/// method path discriminates call sites by the callee's owning `class_path`
+/// (`CalleeTarget::Script.class_path`, threaded through target resolution alongside the declaring
+/// file — #213), so a root-class and an inner-class method sharing one name in one file keep
+/// distinct call-site sets; the cursor's owning class is derived from the clicked call's
+/// `CalleeTarget` (call-site click) or `member_decl_click_class_path` (decl-site click).
 ///
 /// Used to decide whether `textDocument/references` takes the method path (call-site
 /// projection + project-wide text scan) or the non-method classification. Purely structural
