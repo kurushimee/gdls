@@ -563,12 +563,38 @@ pub(crate) fn bare_node_path_committed_dir(
     byte: usize,
 ) -> Option<(NodePathSigil, String)> {
     use TokenKind::*;
-    let anchor = anchor_index(tokens, byte)?;
+
+    // Two cursor framings reach here:
+    //   * `$A/B/Sp|` — the cursor is past the path tokens; `anchor_index` (last `span.end <= byte`)
+    //     names the partial-word/`/`/sigil token to start the back-walk from.
+    //   * `$"A/B|"` — the cursor sits STRICTLY inside a quoted-segment `Literal` (`span.end > byte`),
+    //     so `anchor_index` would name the `$`/`%` sigil BEFORE it, the walk would collect nothing,
+    //     and the committed dir would be `""` (ROOT children) — disagreeing with the edit span, which
+    //     splits the in-string content on `/`. Seed the walk with the in-string content-before-cursor
+    //     (which may carry the literal's internal `/`) and start the back-walk at the token BEFORE the
+    //     literal, so the `rfind('/')` split below yields the committed dir exactly as the edit span
+    //     does. The STRING form (`get_node("A/B|")`) self-rejects: the token before the literal is `(`
+    //     (not a path token) → the walk returns `None` → `string_node_path_committed_dir` handles it.
+    let in_literal = tokens
+        .iter()
+        .enumerate()
+        .find(|(_, t)| t.kind == Literal && t.span.start < byte && byte < t.span.end);
+    let mut segs_rev: Vec<&str> = Vec::new();
+    let start = match in_literal {
+        Some((lit_idx, lit_tok)) => {
+            let content_start = lit_tok.span.start + 1; // after the opening quote
+            let seed = lit_tok
+                .source
+                .get(content_start - lit_tok.span.start..byte - lit_tok.span.start)?;
+            segs_rev.push(seed);
+            lit_idx as isize - 1
+        }
+        None => anchor_index(tokens, byte)? as isize,
+    };
 
     // Collect the path segment tokens (names + separators) walking left to the `$`/`%` root, the
     // same set `classify_deferred` accepts. Stop the moment a non-path token appears.
-    let mut segs_rev: Vec<&str> = Vec::new();
-    let mut j = anchor as isize;
+    let mut j = start;
     let sigil;
     loop {
         if j < 0 {
