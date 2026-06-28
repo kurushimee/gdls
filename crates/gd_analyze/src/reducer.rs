@@ -5466,6 +5466,41 @@ fn lookup_script_chain_member(
             record_member_use(ctx, link, BindingSymbolKind::Enum, name, bind_site);
             return Some((dt, None, BindingSymbolKind::Enum));
         }
+        // #212: an INNER CLASS of this link (`Lib.Box`, where `Lib` is a preload-const / script
+        // meta and `Box` is `class Box:` inside the dependency). Godot's `script_classes` walk
+        // reaches inner classes through `ClassNode::members` (analyzer.cpp:4150-4187 CLASS arm);
+        // gdls's interface exposes them on `iface.inner`. Yields a Script META type whose
+        // `ScriptRef.inner` descends one segment past this link, so `.new()` (reducer.rs:3836,
+        // `instance = base_type.clone(); is_meta_type = false`) produces a precise `Box` instance
+        // and `b.field` then resolves through the inner chain. The match is meta-AND-instance
+        // reachable (an inner class is a constant member of its outer, like a named enum — no
+        // access-mode gate). Records a `Class`-kind use against the OWNING link so
+        // references/rename key the `.Box` site on the declaring class (#153's class_path filter
+        // then makes the cross-file case correct by construction).
+        if iface
+            .inner
+            .iter()
+            .any(|i| i.class_name.as_deref() == Some(name))
+        {
+            let mut inner = link.inner.clone();
+            inner.push(name.to_owned());
+            let sref = crate::data_type::ScriptRef {
+                file: link.file,
+                inner,
+            };
+            let dt = DataType {
+                type_source: TypeSource::AnnotatedExplicit,
+                kind: DtKind::Script,
+                builtin_type: VariantType::Object,
+                is_meta_type: true,
+                is_constant: true,
+                native_type: crate::script_chain::chain_native_root(ctx, &sref).unwrap_or_default(),
+                script_type: Some(sref),
+                ..Default::default()
+            };
+            record_member_use(ctx, link, BindingSymbolKind::Class, name, bind_site);
+            return Some((dt, None, BindingSymbolKind::Class));
+        }
         let Some(member) = iface.members.iter().find(|m| m.name == name) else {
             continue;
         };
