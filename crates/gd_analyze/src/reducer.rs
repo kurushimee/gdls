@@ -5741,14 +5741,30 @@ fn reduce_identifier_from_base(
                 } else {
                     base.script_type.as_ref().map(|s| s.file)
                 };
+                // #180: the declaring enum's INNER-CLASS path — `base.class_node` is the class
+                // DECLARING the enum (set by `make_class_enum_type`), so an in-file enum keys on the
+                // chain to that class; a cross-file enum keys on its `script_type.inner`. Carried as
+                // `target_class_path` so a root `enum A { X }` and an inner `Inner.enum A { X }` of
+                // ONE file stay DISTINCT (without it, both record the same `(file, "A.X", [])` ⇒
+                // renaming one would wrongly edit the other). Read before `type_from_metatype` consumes
+                // `base`, alongside `decl_file`.
+                let decl_class_path: Vec<String> = match base.class_node {
+                    Some(cn) => class_inner_path(ctx, cn),
+                    None => base
+                        .script_type
+                        .as_ref()
+                        .map(|s| s.inner.clone())
+                        .unwrap_or_default(),
+                };
                 if let Some(decl_file) = decl_file {
                     let qualified = format!("{}.{}", base.enum_type, name);
                     let site = ctx.node(identifier_id).span;
-                    // #153: the QUALIFIED `<Enum>.<value>` name keys the enum-value collector
-                    // (never the bare name / the class path) — the inner chain is moot here.
+                    // The QUALIFIED `<Enum>.<value>` name + the declaring inner-class path
+                    // (`target_class_path`) jointly key the enum-value collector — never the bare
+                    // name. The path keeps same-named root-vs-inner enums of one file apart (#180).
                     ctx.record_binding(Binding::use_(
                         Some(decl_file),
-                        Vec::new(),
+                        decl_class_path,
                         BindingSymbolKind::EnumValueLocal,
                         qualified,
                         site,

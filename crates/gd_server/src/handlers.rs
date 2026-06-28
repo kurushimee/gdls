@@ -637,21 +637,24 @@ pub fn definition(
     {
         let node_span = parsed.tree.get(node_id).span;
         let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
-        let qualified = analyzed.as_deref().and_then(|a| {
+        // #180: capture the binding's declaring inner-class path alongside the qualified name so an
+        // inner-class enum value jumps to its OWN decl, not a same-named root one.
+        let binding = analyzed.as_deref().and_then(|a| {
             a.bindings().iter().find_map(|b| match b {
                 Binding::Use {
                     target_kind: BindingTargetKind::EnumValueLocal,
+                    target_class_path,
                     target_name,
                     site,
                     ..
-                } if *site == node_span => Some(target_name.clone()),
+                } if *site == node_span => Some((target_name.clone(), target_class_path.clone())),
                 _ => None,
             })
         });
-        if let Some(qualified) = qualified {
+        if let Some((qualified, class_path)) = binding {
             if let Some((enum_name, value_name)) = qualified.split_once('.') {
                 if let Some(decl_ident) =
-                    find_enum_value_decl_ident(&parsed.tree, enum_name, value_name)
+                    find_enum_value_decl_ident(&parsed.tree, enum_name, value_name, &class_path)
                 {
                     let doc = state.vfs.get(uri.as_str())?;
                     let mapper = PositionMapper::new(&doc.rope, state.encoding);
@@ -2032,24 +2035,50 @@ fn member_decl_click_class_path(
     None
 }
 
-/// Locate the declaration identifier of the value `value_name` in the NAMED enum `enum_name`, both
-/// declared at the root-class scope of `tree`. Returns the value's declaration-identifier `NodeId`
-/// (the precise token an enum-value rename edits) — `None` if no such value exists.
+/// Descend `tree` from the root class along `class_path` (the inner-class chain — each segment names
+/// an inner class by its `class_name` identifier), returning the [`NodeId`] of the class at the end
+/// of the path. An empty path returns the root class. `None` if any segment is missing — the same
+/// occurrence-positive vocabulary as [`gd_analyze::ScriptRef::inner`] (#180).
+fn class_at_inner_path(tree: &ParseTree, class_path: &[String]) -> Option<NodeId> {
+    let mut current = tree.root_id()?;
+    for seg in class_path {
+        let NodeKind::Class(class) = &tree.get(current).kind else {
+            return None;
+        };
+        let next = class.members.iter().find_map(|m| {
+            let gd_syntax::ast::Member::Class(inner_id) = m else {
+                return None;
+            };
+            let NodeKind::Class(inner) = &tree.get(*inner_id).kind else {
+                return None;
+            };
+            (inner.identifier.map(|i| ident_name(tree, i)) == Some(seg)).then_some(*inner_id)
+        })?;
+        current = next;
+    }
+    Some(current)
+}
+
+/// Locate the declaration identifier of the value `value_name` in the NAMED enum `enum_name`,
+/// declared in the class at `class_path` (empty = the root class; a non-empty chain = an inner class,
+/// #180). Returns the value's declaration-identifier `NodeId` (the precise token an enum-value rename
+/// edits) — `None` if no such value exists at that class.
 ///
 /// Anonymous enums (`enum { ... }`, `EnumNode.identifier == None`) are skipped: their values hoist
 /// to class constants and resolve through the member path, not this enum-value path. The
-/// (enum-name, value-name) pair is the composite identity that keeps `enum A { X }` and
-/// `enum B { X }` distinct (#106).
+/// (enum-name, value-name, class_path) triple is the composite identity that keeps `enum A { X }` and
+/// `enum B { X }` — and a root `A.X` and an inner `Inner.A.X` of one file — distinct (#106 / #180).
 fn find_enum_value_decl_ident(
     tree: &ParseTree,
     enum_name: &str,
     value_name: &str,
+    class_path: &[String],
 ) -> Option<NodeId> {
-    let root_id = tree.root_id()?;
-    let NodeKind::Class(root) = &tree.get(root_id).kind else {
+    let class_id = class_at_inner_path(tree, class_path)?;
+    let NodeKind::Class(class) = &tree.get(class_id).kind else {
         return None;
     };
-    for m in &root.members {
+    for m in &class.members {
         let gd_syntax::ast::Member::Enum(enum_id) = m else {
             continue;
         };
@@ -2071,33 +2100,64 @@ fn find_enum_value_decl_ident(
     None
 }
 
-/// If `ident_id` is the declaration identifier of a value in a NAMED enum at the root-class scope,
-/// return `(value_decl_ident, "<EnumName>.<value>")` — the composite-identity anchor a
-/// declaration-site click on an enum value resolves to (#106). `None` otherwise (the click is not on
-/// an enum value declaration). Anonymous-enum values are skipped (they hoist to member constants).
-fn enum_value_decl_at(tree: &ParseTree, ident_id: NodeId) -> Option<(NodeId, String)> {
-    let root_id = tree.root_id()?;
-    let NodeKind::Class(root) = &tree.get(root_id).kind else {
-        return None;
-    };
-    for m in &root.members {
-        let gd_syntax::ast::Member::Enum(enum_id) = m else {
-            continue;
+/// If `ident_id` is the declaration identifier of a value in a NAMED enum at ANY class scope (root or
+/// inner), return `(value_decl_ident, "<EnumName>.<value>", class_path)` — the composite-identity
+/// anchor a declaration-site click on an enum value resolves to, plus the declaring class's
+/// inner-class chain (empty = root, #180). `None` otherwise (the click is not on an enum value
+/// declaration). Anonymous-enum values are skipped (they hoist to member constants).
+fn enum_value_decl_at(tree: &ParseTree, ident_id: NodeId) -> Option<(NodeId, String, Vec<String>)> {
+    fn walk(
+        tree: &ParseTree,
+        class_id: NodeId,
+        ident_id: NodeId,
+        path: &mut Vec<String>,
+    ) -> Option<(NodeId, String, Vec<String>)> {
+        let NodeKind::Class(class) = &tree.get(class_id).kind else {
+            return None;
         };
-        let NodeKind::Enum(en) = &tree.get(*enum_id).kind else {
-            continue;
-        };
-        let Some(enum_name) = en.identifier.map(|i| ident_name(tree, i).to_owned()) else {
-            continue; // anonymous enum
-        };
-        for v in &en.values {
-            if v.identifier == Some(ident_id) {
-                let value_name = ident_name(tree, ident_id);
-                return Some((ident_id, format!("{enum_name}.{value_name}")));
+        for m in &class.members {
+            match m {
+                gd_syntax::ast::Member::Enum(enum_id) => {
+                    let NodeKind::Enum(en) = &tree.get(*enum_id).kind else {
+                        continue;
+                    };
+                    let Some(enum_name) = en.identifier.map(|i| ident_name(tree, i).to_owned())
+                    else {
+                        continue; // anonymous enum
+                    };
+                    for v in &en.values {
+                        if v.identifier == Some(ident_id) {
+                            let value_name = ident_name(tree, ident_id);
+                            return Some((
+                                ident_id,
+                                format!("{enum_name}.{value_name}"),
+                                path.clone(),
+                            ));
+                        }
+                    }
+                }
+                gd_syntax::ast::Member::Class(inner_id) => {
+                    let NodeKind::Class(inner) = &tree.get(*inner_id).kind else {
+                        continue;
+                    };
+                    let name = inner
+                        .identifier
+                        .map(|i| ident_name(tree, i).to_owned())
+                        .unwrap_or_default();
+                    path.push(name);
+                    if let Some(found) = walk(tree, *inner_id, ident_id, path) {
+                        return Some(found);
+                    }
+                    path.pop();
+                }
+                _ => {}
             }
         }
+        None
     }
-    None
+    let root_id = tree.root_id()?;
+    let mut path = Vec::new();
+    walk(tree, root_id, ident_id, &mut path)
 }
 
 /// The identifier name of the node at `id`, or `None` if it isn't an [`NodeKind::Identifier`]. The
@@ -3140,17 +3200,19 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 NonMethodTarget::EnumValue {
                     qualified,
                     decl_file,
+                    class_path,
                     ..
                 } => {
                     // Enum-qualified binding scan: only `EnumValueLocal` uses of THIS value
-                    // (keyed on `(decl_file, <EnumName>.<value>)`), never the bare-name scan —
-                    // keeps an unrelated `const NORTH` / a second enum's same-named value / a
-                    // different class's same-named value out of the set. The declaration token is
-                    // added separately via `declaration_locations`.
+                    // (keyed on `(decl_file, class_path, <EnumName>.<value>)`), never the bare-name
+                    // scan — keeps an unrelated `const NORTH` / a second enum's same-named value / a
+                    // different class's (root-vs-inner #180) same-named value out of the set. The
+                    // declaration token is added separately via `declaration_locations`.
                     push_enum_value_binding_locations(
                         &mut locations,
                         &result,
                         *decl_file,
+                        class_path,
                         qualified,
                         &uri,
                         &mapper,
@@ -3372,12 +3434,14 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 NonMethodTarget::EnumValue {
                     qualified,
                     decl_file,
+                    class_path,
                     ..
                 } => {
                     push_enum_value_binding_locations(
                         &mut locations,
                         &cand_result,
                         *decl_file,
+                        class_path,
                         qualified,
                         &cand_uri,
                         &cand_mapper,
@@ -3834,12 +3898,14 @@ fn collect_in_file_highlight_sites(
                 NonMethodTarget::EnumValue {
                     qualified,
                     decl_file,
+                    class_path,
                     ..
                 } => {
                     push_enum_value_binding_locations(
                         &mut locations,
                         &result,
                         *decl_file,
+                        class_path,
                         qualified,
                         uri,
                         mapper,
@@ -4325,6 +4391,11 @@ enum NonMethodTarget {
         decl_ident: NodeId,
         qualified: String,
         decl_file: gd_project::FileId,
+        /// The declaring enum's inner-class chain (empty = root class). A root `enum A { X }` and an
+        /// inner `Inner.enum A { X }` of one file share `(decl_file, "A.X")` but differ HERE, so the
+        /// binding scan keyed on `(decl_file, class_path, qualified)` keeps them distinct — the #180
+        /// corruption guard.
+        class_path: Vec<String>,
     },
     /// Couldn't resolve — the documented "over-approximate, never under-report" residue floor
     /// (raw identifier scan). Class/Enum/EnumValue targets classify here DELIBERATELY:
@@ -4359,20 +4430,24 @@ fn classify_non_method_target(
         if let Binding::Use {
             target_kind: BindingTargetKind::EnumValueLocal,
             target_file: Some(tf),
+            target_class_path,
             target_name,
             site,
-            ..
         } = b
         {
             if *site == node_span && current_fid == Some(*tf) {
                 if let Some((enum_name, value_name)) = target_name.split_once('.') {
+                    // #180: resolve the value's decl in the enum's DECLARING class (the binding's
+                    // `target_class_path`), not just the root — an inner-class enum value resolves
+                    // here, and the path is carried so the binding scan stays root-vs-inner distinct.
                     if let Some(decl_ident) =
-                        find_enum_value_decl_ident(tree, enum_name, value_name)
+                        find_enum_value_decl_ident(tree, enum_name, value_name, target_class_path)
                     {
                         return NonMethodTarget::EnumValue {
                             decl_ident,
                             qualified: target_name.clone(),
                             decl_file: *tf,
+                            class_path: target_class_path.clone(),
                         };
                     }
                 }
@@ -4384,12 +4459,13 @@ fn classify_non_method_target(
     // without a known FileId the cross-file fan-out has no identity to key on, so fall through. #106.
     if let Some(fid) = current_fid {
         if let Some(ident_id) = tree.innermost_node_at(node_span.start) {
-            if let Some((decl_ident, qualified)) = enum_value_decl_at(tree, ident_id) {
+            if let Some((decl_ident, qualified, class_path)) = enum_value_decl_at(tree, ident_id) {
                 if tree.get(decl_ident).span == node_span {
                     return NonMethodTarget::EnumValue {
                         decl_ident,
                         qualified,
                         decl_file: fid,
+                        class_path,
                     };
                 }
             }
@@ -4654,6 +4730,7 @@ fn push_enum_value_binding_locations(
     out: &mut Vec<Location>,
     result: &AnalysisResult,
     decl_file: gd_project::FileId,
+    class_path: &[String],
     qualified: &str,
     uri: &Uri,
     mapper: &PositionMapper,
@@ -4662,12 +4739,18 @@ fn push_enum_value_binding_locations(
         if let Binding::Use {
             target_kind: BindingTargetKind::EnumValueLocal,
             target_file: Some(tf),
+            target_class_path,
             target_name,
             site,
-            ..
         } = binding
         {
-            if *tf == decl_file && target_name == qualified {
+            // #180: the declaring inner-class chain joins the `(decl_file, qualified)` key — a
+            // same-named value of a same-named enum in ANOTHER class of this file records a different
+            // `target_class_path` and is excluded (the root-vs-inner corruption guard).
+            if *tf == decl_file
+                && target_class_path.as_slice() == class_path
+                && target_name == qualified
+            {
                 out.push(Location {
                     uri: uri.clone(),
                     range: mapper.span_to_range(*site),
