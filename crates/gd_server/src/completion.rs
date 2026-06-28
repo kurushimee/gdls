@@ -1408,7 +1408,13 @@ fn const_dict_subscript_keys(
     byte: usize,
 ) -> Option<Vec<String>> {
     let base = subscript_base_identifier(tokens, byte)?;
-    let init = resolve_const_dict_initializer(tree, byte, &base)?;
+    // Resolve the const's dict initializer: the scope-aware path first (precise — a func-local in the
+    // cursor's suite shadows a class member), then the collapse fallback (#221). When the cursor's `[`
+    // is unclosed mid-edit, the pull lexer suppresses the newline, the enclosing function suite never
+    // closes, and `locals_in_scope_at` finds nothing — but the `const NAME = {…}` declaration node
+    // still exists in the arena, so an arena scan recovers it.
+    let init = resolve_const_dict_initializer(tree, byte, &base)
+        .or_else(|| arena_scan_const_dict_initializer(tree, &base))?;
     let dict = match &tree.get(init).kind {
         gd_syntax::ast::NodeKind::Dictionary(d) => d,
         _ => return None,
@@ -1421,10 +1427,7 @@ fn const_dict_subscript_keys(
         .elements
         .iter()
         .filter_map(|kv| kv.key)
-        .filter_map(|key_id| match analyzed.folds.get(key_id) {
-            Some(FoldedValue::String(s)) => Some(s.clone()),
-            _ => None,
-        })
+        .filter_map(|key_id| dict_key_string(tree, analyzed, dict.style, key_id))
         .filter(|s| seen.insert(s.clone()))
         .collect();
     if keys.is_empty() {
@@ -1432,6 +1435,76 @@ fn const_dict_subscript_keys(
     } else {
         Some(keys)
     }
+}
+
+/// The string value of a const-dict key node, for subscript-key completion. The analyzer's
+/// [`FoldedValue::String`] is consulted FIRST (the precise, intact-parse path — a key that folds to a
+/// string through const-reference / concatenation is offered exactly as before). When the fold is
+/// absent — the #221 unclosed-bracket collapse leaves the func body unreduced, so key nodes never
+/// fold — the string is derived from the AST key node, faithful to how Godot folds the two
+/// syntactic string-key shapes:
+///   - a LUA-style key (`{a = 1}`, `DictStyle::LuaTable` or the single-element ambiguous `None`) is a
+///     bare `Identifier` whose name IS the string key;
+///   - a PYTHON-style key (`{"a": 1}`) is a string `Literal`.
+///
+/// Any other key shape (a Python-style non-string literal `{1: x}`, an expression) is NOT a statically
+/// known string key and yields `None` — the same exclusion the `FoldedValue::String` filter applied,
+/// so the collapse fallback never offers a key Godot's fold would not (never lie).
+fn dict_key_string(
+    tree: &ParseTree,
+    analyzed: &AnalysisResult,
+    style: Option<gd_syntax::ast::DictStyle>,
+    key_id: NodeId,
+) -> Option<String> {
+    use gd_syntax::ast::{DictStyle, NodeKind};
+    // Fold-first: preserve the intact-parse path byte-for-byte.
+    if let Some(FoldedValue::String(s)) = analyzed.folds.get(key_id) {
+        return Some(s.clone());
+    }
+    // AST fallback (collapse): derive the key string syntactically, style-aware.
+    match (&tree.get(key_id).kind, style) {
+        // Lua-style (and the single-element ambiguous `None`, parsed Lua-style) identifier key.
+        (NodeKind::Identifier(i), Some(DictStyle::LuaTable) | None) => Some(i.name.clone()),
+        // Python-style quoted string-literal key.
+        (NodeKind::Literal(l), Some(DictStyle::PythonDict)) => match &l.value {
+            gd_syntax::Literal::String(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Collapse fallback for [`resolve_const_dict_initializer`] (#221): the cursor's `[` is unclosed, so
+/// the enclosing function suite never closed and the func-local `const` is invisible to
+/// `locals_in_scope_at` — but its declaration node survives in the arena. Scan for a `const` named
+/// `name` whose initializer is a Dictionary literal. To stay never-lie under a (pathological)
+/// same-name collision, return the initializer ONLY when exactly one such const-dict declaration
+/// exists; two same-named const dicts with different keys are genuinely ambiguous under the degraded
+/// parse, so we offer no keys (the caller falls back to the identifier set).
+fn arena_scan_const_dict_initializer(tree: &ParseTree, name: &str) -> Option<NodeId> {
+    use gd_syntax::ast::NodeKind;
+    let mut found: Option<NodeId> = None;
+    for id in tree.iter_ids() {
+        let NodeKind::Constant(c) = &tree.get(id).kind else {
+            continue;
+        };
+        let Some(ident) = c.identifier else { continue };
+        let NodeKind::Identifier(i) = &tree.get(ident).kind else {
+            continue;
+        };
+        if i.name != name {
+            continue;
+        }
+        let Some(init) = c.initializer else { continue };
+        if !matches!(tree.get(init).kind, NodeKind::Dictionary(_)) {
+            continue;
+        }
+        if found.is_some() {
+            return None; // ambiguous same-name const dicts under the collapse → never lie
+        }
+        found = Some(init);
+    }
+    found
 }
 
 /// The base identifier text in `BASE[<cursor>` — the bare `Identifier` token immediately before the
