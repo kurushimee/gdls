@@ -585,6 +585,42 @@ pub fn definition(
         }
     }
 
+    // (0.7) #195: a TYPE-POSITION base segment (`: Foo` annotation / `extends Foo`) that names a
+    // registered global `class_name Foo` resolves to the GLOBAL class — BEFORE the in-file member
+    // scan (1). Godot's `resolve_datatype` checks `is_global_class` (gdscript_analyzer.cpp:787)
+    // before current-/inherited-scope class members (:866), so while the global exists a class-level
+    // `: Foo` binds the GLOBAL even when this class declares its own `const/enum/class Foo`. The old
+    // ordering let step (1) match that class-scope `const Foo` first, so `definition` jumped LOCAL
+    // while the analyzer (and rename, which canonicalizes through here) bound GLOBAL — the divergence
+    // a future mutating consumer would mis-resolve on. The carve-out mirrors the rename firewall:
+    //   - `extends Foo` base: admitted unconditionally (inheritance is global-before-class-scope and
+    //     cannot be suite-local-shadowed);
+    //   - `: Foo` annotation base: admitted unless a SUITE-LOCAL `Foo` shadows it (the one binding
+    //     kind Godot checks before the global at :688) — a func-local `const Foo` keeps LOCAL.
+    // Expression position (`Foo.A`, `Foo.new()`) is members-first and already routes through the
+    // `Binding::Use { Class }` recording / step (1), so it is untouched.
+    {
+        let node_span = parsed.tree.get(node_id).span;
+        let is_extends_base = cursor_is_extends_base_segment(&parsed.tree, node_id);
+        let is_annotation_base = cursor_is_type_annotation_base_segment(&parsed.tree, node_id);
+        // No `name_is_in_file_root_type` guard: while a global `class_name Foo` EXISTS, Godot binds
+        // `: Foo` / `extends Foo` to the GLOBAL even when this file declares its own root
+        // `const/enum/class Foo` (787 before 866) — that collision IS the #195 case. Only a
+        // suite-local shadow (annotation position) keeps it LOCAL. When no global exists,
+        // `find_global_class_definition` returns None and this step is inert, so an in-file-only
+        // root type still resolves via step (1).
+        let admit = is_extends_base
+            || (is_annotation_base
+                && !parsed
+                    .tree
+                    .type_name_shadowed_by_enclosing_scope(node_span.start, &name));
+        if admit {
+            if let Some(loc) = find_global_class_definition(state, &name) {
+                return Some(GotoDefinitionResponse::Scalar(loc));
+            }
+        }
+    }
+
     // (1) In-file member.
     let doc = state.vfs.get(uri.as_str())?;
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
