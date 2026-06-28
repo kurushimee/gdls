@@ -1813,13 +1813,14 @@ fn subscript_func_local_const_dict_closed_offers_keys() {
     shutdown(&client, server_thread);
 }
 
-/// A func-local `const` dict indexed with an **unclosed** subscript (`D[<cursor>`, the real mid-edit
-/// shape) currently falls back to the identifier set: the unclosed `[` collapses the function suite
-/// in the partial parse, so the block-local const's dict is never reduced (its keys do not fold).
-/// The contract holds — never lie: no keys are offered, the identifier fallback is present. The
-/// class-level const path is unaffected (its keys fold in the class pass); see #221.
+/// #221: a func-local `const` dict indexed with an **unclosed** subscript (`D[<cursor>`, the real
+/// mid-edit shape) NOW offers its keys. The unclosed `[` collapses the function suite in the partial
+/// parse so the block-local const's dict never reduces (its keys do not fold), but the `const D = {…}`
+/// declaration node survives in the arena: the completion path recovers it (arena scan) and derives
+/// the Lua-style keys syntactically from the AST when the fold is absent. Keys are ADDED TO the
+/// identifier fallback, exactly as the closed-subscript and class-level paths already did.
 #[test]
-fn subscript_func_local_const_dict_unclosed_falls_back() {
+fn subscript_func_local_const_dict_unclosed_offers_keys() {
     let p = p4_project();
     let uri = file_uri(&p.root.join("src/sublocu.gd"));
     let src = "extends Node2D\n\nfunc f() -> void:\n\tconst D = {a = 1, b = 2}\n\tprint(D[)\n";
@@ -1830,12 +1831,37 @@ fn subscript_func_local_const_dict_unclosed_falls_back() {
     let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
     let ls = labels(&list);
     assert!(
-        !ls.contains(&"\"a\"".to_string()) && !ls.contains(&"\"b\"".to_string()),
-        "an unclosed func-local const subscript offers NO keys (parse collapse); got {ls:?}"
+        ls.contains(&"\"a\"".to_string()) && ls.contains(&"\"b\"".to_string()),
+        "an unclosed func-local const subscript now offers its Lua-style keys (arena-scan + AST \
+         derivation under the collapse); got {ls:?}"
     );
     assert!(
         ls.contains(&"print".to_string()),
         "the identifier fallback is still present; got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// #221 sibling: the PYTHON-style quoted-key variant under the same unclosed-bracket collapse. A
+/// func-local `const` dict with string-literal keys (`{"a": 1}`) recovers its keys via the AST
+/// string-literal fallback (the fold is absent under the collapse), not just the Lua identifier path.
+#[test]
+fn subscript_func_local_const_python_dict_unclosed_offers_keys() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/sublocupy.gd"));
+    let src =
+        "extends Node2D\n\nfunc f() -> void:\n\tconst D = {\"a\": 1, \"b\": 2}\n\tprint(D[)\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tprint(D[` on line 4 → `[` at byte 8, col 9 (unclosed collapse).
+    let raw = complete_raw(&client, 142, &uri, Position::new(4, 9));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"\"a\"".to_string()) && ls.contains(&"\"b\"".to_string()),
+        "an unclosed func-local const PYTHON-style dict offers its quoted keys via the AST \
+         string-literal fallback; got {ls:?}"
     );
 
     shutdown(&client, server_thread);
