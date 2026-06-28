@@ -4223,6 +4223,87 @@ fn rename_163_root_const_alias_annotation_edited_under_global_rename() {
 }
 
 #[test]
+fn rename_188_inherited_const_alias_does_not_shadow_global_in_type_position() {
+    // #188 VERIFY-AND-CLOSE: an INHERITED base-class `const Foo` does NOT shadow a global
+    // `class_name Foo` in TYPE-ANNOTATION position. Godot's `resolve_datatype` checks
+    // `is_global_class` (gdscript_analyzer.cpp:787) BEFORE the inherited-scope-class else-branch
+    // (:866, which walks `get_class_node_current_scope_classes` — base classes included). So while a
+    // global `class_name Foo` exists, a derived class's `: Foo` binds the GLOBAL, never the inherited
+    // `const Foo`. Renaming the global therefore CORRECTLY edits the derived `: Foo` (a genuine
+    // global reference), and the base-class `const Foo` (a different symbol, in another file) is
+    // untouched. The issue's "over-collect" framing was inverted: this edit is faithful, and
+    // SUPPRESSING it (the proposed fix) would UNDER-collect a real global reference. This is the
+    // inherited-const sibling of `rename_163_root_const_alias_annotation_edited_under_global_rename`.
+    let project = common::sample_project();
+    project.write("src/foo.gd", "class_name Foo\nextends Node\n");
+    project.write("src/other.gd", "class_name OtherThing\nextends Node\n");
+    project.write(
+        "src/base.gd",
+        "class_name Base\nextends Node\n\nconst Foo = preload(\"res://src/other.gd\")\n",
+    );
+    project.write("src/derived.gd", "extends Base\n\nvar x: Foo = null\n");
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &[
+            "src/foo.gd",
+            "src/other.gd",
+            "src/base.gd",
+            "src/derived.gd",
+        ],
+        2,
+    );
+    let foo_uri = file_uri(&project.root.join("src/foo.gd"));
+    let base_uri = file_uri(&project.root.join("src/base.gd"));
+    let derived_uri = file_uri(&project.root.join("src/derived.gd"));
+
+    // Rename the global `class_name Foo` decl (foo.gd line 0; `class_name ` cols 0-10, `Foo`@11).
+    client
+        .sender
+        .send(request(
+            11,
+            "textDocument/rename",
+            rename_params(&foo_uri, 0, 11, "Renamed"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "global `class_name Foo` rename must succeed: {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.unwrap()).unwrap());
+
+    // The global decl IS edited.
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == foo_uri.as_str() && r.start.line == 0 && r.start.character == 11),
+        "the global `class_name Foo` decl (foo.gd 0,11) must be edited; got {:?}",
+        view.set
+    );
+    // The derived `var x: Foo` annotation IS edited — it binds the GLOBAL (faithful, not over-collect).
+    assert!(
+        view.set
+            .iter()
+            .any(|(u, r)| *u == derived_uri.as_str() && r.start.line == 2 && r.start.character == 7),
+        "the derived `var x: Foo` annotation (derived.gd 2,7) binds the GLOBAL and must be edited; \
+         got {:?}",
+        view.set
+    );
+    // The inherited base-class `const Foo` is a DIFFERENT symbol and must NOT be edited.
+    assert!(
+        !view.set.iter().any(|(u, _)| *u == base_uri.as_str()),
+        "the inherited base-class `const Foo` (base.gd) must NOT be edited (different symbol); got {:?}",
+        view.set
+    );
+    shutdown(&client, server);
+}
+
+#[test]
 fn rename_167_inner_const_alias_annotation_edited_under_global_rename() {
     // #167 const-alias cell (inner scope). Same idiomatic `const Hero = preload(...)` alias + its
     // `var x: Hero` use, but INSIDE a `class Inner:` scope. In TYPE-ANNOTATION position binding
