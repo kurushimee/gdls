@@ -500,6 +500,88 @@ fn definition_jumps_across_files_via_class_name() {
 }
 
 #[test]
+fn definition_on_type_position_const_alias_collision_jumps_to_global_195() {
+    // #195: a TYPE-POSITION base segment (`: Foo` annotation / `extends Foo`) that names a global
+    // `class_name Foo` resolves to the GLOBAL class — even when the SAME file declares a class-scope
+    // `const Foo = preload(...)`. Godot's `resolve_datatype` checks `is_global_class`
+    // (gdscript_analyzer.cpp:787) before current-/inherited-scope class members (:866), so the global
+    // binds in type position. The old `definition` matched the class-scope `const Foo` first (step 1),
+    // diverging from the analyzer (and from `rename`, which canonicalizes through `definition`).
+    let fixture_dir = std::env::temp_dir().join("gdls_def_const_alias_195");
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+    std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    // foo.gd declares the global `class_name Foo` (the type the annotations bind to).
+    std::fs::write(fixture_dir.join("foo.gd"), "class_name Foo\nextends Node\n")
+        .expect("write foo.gd");
+    // other.gd is the const-alias target (a class_name-less script).
+    std::fs::write(fixture_dir.join("other.gd"), "extends Node\n").expect("write other.gd");
+    // consumer extends the global Foo AND declares a class-scope `const Foo` alias + a `: Foo` use.
+    //   line 0 `extends Foo`                              `Foo`@8
+    //   line 1 `const Foo = preload("res://other.gd")`    the class-scope alias (NOT the type target)
+    //   line 2 `var x: Foo = null`                        `Foo`@7
+    let consumer = "extends Foo\nconst Foo = preload(\"res://other.gd\")\nvar x: Foo = null\n";
+    std::fs::write(fixture_dir.join("consumer.gd"), consumer).expect("write consumer.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+        "autoDumpExtensionApi": false,
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+    let foo_uri: Uri = format!(
+        "file:///{}",
+        fixture_dir
+            .join("foo.gd")
+            .to_string_lossy()
+            .replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    let consumer_uri: Uri = format!(
+        "file:///{}",
+        fixture_dir
+            .join("consumer.gd")
+            .to_string_lossy()
+            .replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &consumer_uri, consumer);
+
+    // (a) `: Foo` annotation base (line 2, col 7) → the GLOBAL class decl in foo.gd, NOT the
+    // class-scope `const Foo` on line 1.
+    let ann = definition_at(&client, &consumer_uri, Position::new(2, 7))
+        .expect("`: Foo` annotation resolves");
+    let GotoDefinitionResponse::Scalar(ann_loc) = ann else {
+        panic!("expected scalar Location for `: Foo`");
+    };
+    assert!(
+        ann_loc.uri.as_str().ends_with("/foo.gd"),
+        "`: Foo` must jump to the global class in foo.gd, not the local const; got {}",
+        ann_loc.uri.as_str()
+    );
+    assert_eq!(ann_loc.range.start, Position::new(0, 11));
+
+    // (b) `extends Foo` base (line 0, col 8) → the same GLOBAL class decl (inheritance is
+    // global-before-class-scope too).
+    let ext =
+        definition_at(&client, &consumer_uri, Position::new(0, 8)).expect("`extends Foo` resolves");
+    let GotoDefinitionResponse::Scalar(ext_loc) = ext else {
+        panic!("expected scalar Location for `extends Foo`");
+    };
+    assert!(
+        ext_loc.uri.as_str().ends_with("/foo.gd"),
+        "`extends Foo` must jump to the global class in foo.gd; got {}",
+        ext_loc.uri.as_str()
+    );
+    assert_eq!(ext_loc.range.start, Position::new(0, 11));
+
+    let _ = foo_uri;
+    shutdown(&client, handle);
+    let _ = std::fs::remove_dir_all(&fixture_dir);
+}
+
+#[test]
 fn definition_on_cross_file_member_covers_the_name_token() {
     // Cross-file member jumps must anchor the NAME token — the same shape the in-file arm
     // returns — not the whole declaration node that `MemberDecl::span` covers: editors select

@@ -4122,15 +4122,17 @@ fn rename_163_root_const_alias_annotation_edited_under_global_rename() {
     // `class_name` > class-scope member: a root-scope `const Hero` is a CLASS-scope member, NOT a
     // suite-local, so it does NOT precede the global. While the global `class_name Hero` exists, this
     // root `: Hero` annotation binds the GLOBAL class — so renaming the global `Hero` rewrites it.
-    // (The read-side `definition` below still resolves `: Hero` to the local const; that is a separate
-    // read-time behavior, left unchanged.) The rename edits the global decl + genuine `extends Hero`
-    // consumers + this class-scope `: Hero`. #163.
+    // The read-side `definition` on `: Hero` now AGREES (resolves to the GLOBAL class), matching the
+    // analyzer's global-first type-position ordering — #195 closed the prior LOCAL-vs-GLOBAL
+    // divergence. The rename edits the global decl + genuine `extends Hero` consumers + this
+    // class-scope `: Hero`. #163, #195.
     let project = common::sample_project();
     project.write("src/hero.gd", "class_name Hero\nextends Node\n");
     project.write("src/other.gd", "class_name OtherThing\nextends Node\n");
     project.write(
         "src/c1.gd",
-        // `const Hero` shadows the global; `var x: Hero` resolves to the local const, not the class.
+        // `const Hero` is a class-scope member; in TYPE position the global `class_name Hero` precedes
+        // it, so `var x: Hero` binds the GLOBAL class (not the local const).
         "extends Node\n\nconst Hero = preload(\"res://src/other.gd\")\n\nvar x: Hero = null\n",
     );
     let (client, server) = boot();
@@ -4145,9 +4147,10 @@ fn rename_163_root_const_alias_annotation_edited_under_global_rename() {
     let enemy_uri = file_uri(&project.root.join("src/enemy.gd"));
     let c1_uri = file_uri(&project.root.join("src/c1.gd"));
 
-    // Identity oracle: definition on `var x: Hero` (c1.gd line 4, `var x: `=cols0-6, `Hero`@7) must
-    // resolve to the LOCAL `const Hero` (c1.gd line 2), proving the annotation is NOT the global class
-    // — so editing it under the global-class rename would be wrong.
+    // Identity oracle (#195): definition on `var x: Hero` (c1.gd line 4, `var x: `=cols0-6, `Hero`@7)
+    // must resolve to the GLOBAL class decl (hero.gd line 0) — matching the analyzer's type-position
+    // ordering (global `class_name` before class-scope members) — so editing it under the global-class
+    // rename is the CORRECT, consistent behavior, not a divergence.
     client
         .sender
         .send(request(
@@ -4164,13 +4167,14 @@ fn rename_163_root_const_alias_annotation_edited_under_global_rename() {
     };
     assert_eq!(
         def_loc.uri.as_str(),
-        c1_uri.as_str(),
-        "`: Hero` must resolve to the LOCAL const in c1.gd, not the global class in hero.gd; got {:?}",
+        hero_uri.as_str(),
+        "`: Hero` must resolve to the GLOBAL class in hero.gd (global-first type ordering), not the \
+         local const in c1.gd; got {:?}",
         def_loc.uri
     );
     assert_eq!(
-        def_loc.range.start.line, 2,
-        "`: Hero` must resolve to the `const Hero` declaration on c1.gd line 2; got {:?}",
+        def_loc.range.start.line, 0,
+        "`: Hero` must resolve to the `class_name Hero` declaration on hero.gd line 0; got {:?}",
         def_loc.range
     );
 
