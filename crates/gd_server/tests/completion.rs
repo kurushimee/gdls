@@ -2875,6 +2875,75 @@ fn dollar_deep_path_lists_child_node_children() {
     shutdown(&client, server_thread);
 }
 
+/// A bare quoted-segment path `$"UI/<cursor>"` (cursor strictly inside the literal) lists the QUOTED
+/// committed dir's children — UI's child `Bar` — NOT the root children. Regression for #143: the
+/// list must agree with the edit span (which replaces only the in-string last segment), so accepting
+/// a candidate yields `$"UI/Bar"`, never a root node wrongly placed under `UI/`.
+#[test]
+fn dollar_quoted_segment_path_lists_quoted_dir_children() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("player.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar a = $\"UI/\"\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar a = $"UI/"` → `\t`=0, `var a = `=1..8, `$`=9, `"`=10, `U`=11, `I`=12, `/`=13, closing
+    // `"`=14; cursor strictly inside the literal right after `/` (between col 13 and the closing
+    // quote at col 14) → column 14.
+    let raw = complete_raw(&client, 204, &uri, Position::new(3, 14));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"Bar".to_string()),
+        "`$\"UI/\"` must list UI's child Bar; got {ls:?}"
+    );
+    assert!(
+        !ls.contains(&"Health".to_string())
+            && !ls.contains(&"Sprite".to_string())
+            && !ls.contains(&"UI".to_string()),
+        "`$\"UI/\"` must NOT list the root children Health/Sprite/UI (that is the #143 corruption); \
+         got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The accept edit for a bare quoted-segment path `$"UI/Ba<cursor>"` replaces ONLY the in-string last
+/// segment `Ba`, so accepting `Bar` yields `$"UI/Bar"` — never `$"UI/UI/Bar"` (committed-dir doubled)
+/// nor a clobbered `UI/` prefix. The companion to the list-correctness test above (#143).
+#[test]
+fn dollar_quoted_segment_path_edit_replaces_only_last_segment() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("player.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar a = $\"UI/Ba\"\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    // `\tvar a = $"UI/Ba"` → `$`=9, `"`=10, `U`=11, `I`=12, `/`=13, `B`=14, `a`=15, closing `"`=16;
+    // cursor glued to the end of `Ba`, strictly inside the literal → column 16.
+    let raw = complete_raw(&client, 205, &uri, Position::new(3, 16));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let bar = list
+        .items
+        .iter()
+        .find(|it| it.label == "Bar")
+        .expect("Bar must be offered under the committed dir UI");
+    // `rich_caps()` opts into insertReplaceSupport, so the node-path item is an `InsertReplaceEdit`
+    // whose insert == replace == the prefix span.
+    let (range, new_text) = match bar.text_edit.as_ref().expect("Bar must carry a textEdit") {
+        CompletionTextEdit::Edit(e) => (e.range, e.new_text.clone()),
+        CompletionTextEdit::InsertAndReplace(e) => {
+            assert_eq!(e.insert, e.replace, "node-path insert == replace");
+            (e.replace, e.new_text.clone())
+        }
+    };
+    // The edit must replace exactly the `Ba` span (cols 14..16 on line 3) — the in-string last
+    // segment — leaving the `UI/` committed prefix intact.
+    assert_eq!(range.start, Position::new(3, 14), "edit start = `Ba` start");
+    assert_eq!(range.end, Position::new(3, 16), "edit end = cursor");
+    assert_eq!(new_text, "Bar", "edit inserts the bare child name");
+
+    shutdown(&client, server_thread);
+}
+
 /// `%<cursor>` lists the scene's owner-unique node names with their types.
 #[test]
 fn percent_unique_node_path_lists_unique_names() {
