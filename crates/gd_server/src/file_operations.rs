@@ -235,6 +235,9 @@ pub(crate) fn will_rename_files(
     // literal's resolved identity can be compared for equality.
     let mut targets: Vec<RenameTarget> = Vec::new();
     let mut renamed_gd_old_res: Vec<String> = Vec::new();
+    // #229: the `.tscn` analog of `renamed_gd_old_res` — old `res://` of every renamed SCENE, so a
+    // scene that INSTANCES it as a sub-scene and is left unrewritten still gets a dangling warning.
+    let mut renamed_tscn_old_res: Vec<String> = Vec::new();
     for f in &params.files {
         let (Some(old_abs), Some(new_abs)) =
             (uri_str_to_path(&f.old_uri), uri_str_to_path(&f.new_uri))
@@ -255,6 +258,10 @@ pub(crate) fn will_rename_files(
         };
         if old_abs.extension() == Some("gd") {
             renamed_gd_old_res.push(old_res.clone());
+        } else if old_abs.extension() == Some("tscn") {
+            // #229: collected BEFORE the safety gate (like the `.gd` case), so a refused-rewrite
+            // scene move still warns about the parent scenes that instance it.
+            renamed_tscn_old_res.push(old_res.clone());
         }
         // FAIL-CLOSED on the WRITE side: the new `res://` text is injected verbatim BETWEEN a
         // literal's quotes, so a target whose `res://` text isn't a plain, in-root, quote-safe path
@@ -279,9 +286,15 @@ pub(crate) fn will_rename_files(
     }
 
     if targets.is_empty() {
-        // No safe rewrite target survived: still warn about every scene a renamed `.gd` would leave
-        // dangling (the rename happens client-side regardless), with an empty "already rewritten" set.
-        warn_dangling_scene_attachments(state, &renamed_gd_old_res, &FxHashSet::default());
+        // No safe rewrite target survived: still warn about every scene a renamed `.gd` (script
+        // attachment) or `.tscn` (sub-scene instance) would leave dangling (the rename happens
+        // client-side regardless), with an empty "already rewritten" set.
+        warn_dangling_scene_references(
+            state,
+            &renamed_gd_old_res,
+            &renamed_tscn_old_res,
+            &FxHashSet::default(),
+        );
         return None;
     }
 
@@ -300,9 +313,15 @@ pub(crate) fn will_rename_files(
     let rewritten_scenes = rewrite_tscn_ext_resources(state, &targets, &mut order, &mut by_uri);
 
     // Side effect: warn about scenes that will STILL dangle after the rewrite — a `.gd` move whose
-    // scene we could not safely rewrite (refused span / unsafe text). Scenes we DID rewrite are no
-    // longer dangling, so they are excluded. Done before returning so the user always sees it.
-    warn_dangling_scene_attachments(state, &renamed_gd_old_res, &rewritten_scenes);
+    // attaching scene, or a `.tscn` move whose instancing parent scene (#229), we could not safely
+    // rewrite (refused span / unsafe text). Scenes we DID rewrite are no longer dangling, so they
+    // are excluded. Done before returning so the user always sees it.
+    warn_dangling_scene_references(
+        state,
+        &renamed_gd_old_res,
+        &renamed_tscn_old_res,
+        &rewritten_scenes,
+    );
 
     // (2b) Scan every indexed `.gd` ONCE (loops inverted: O(files), not O(renames × files)). For each
     // `preload`/`load` `res://` argument literal (positive identification — `collect_load_path_literals`),
@@ -829,44 +848,83 @@ fn tscn_rewrite_verified(state: &ServerState, text: &str, targets: &[RenameTarge
     true
 }
 
-/// Emit a `window/showMessage(Warning)` naming the scenes whose `ext_resource path="res://old.gd"`
-/// is left DANGLING when a script they attach is moved — i.e. the scenes gdls did NOT rewrite. A
-/// scene present in `rewritten_scenes` is no longer dangling (its `ext_resource` is in the returned
-/// WorkspaceEdit), so it is excluded; only scenes we refused to rewrite (unsafe span/text) warn. The
-/// warning is the never-lie backstop for the residual fail-closed cases. No-op when every attaching
-/// scene was rewritten (or none exists).
-fn warn_dangling_scene_attachments(
+/// Emit `window/showMessage(Warning)`s naming the scenes whose `ext_resource path="res://old"` is
+/// left DANGLING by a refused move — the never-lie backstop for the residual fail-closed cases. Two
+/// dangle kinds, each with its own message (a sub-scene→sub-scene dangle cannot be described by the
+/// script-attachment text):
+///   - SCRIPT ATTACHMENT — a renamed `.gd` (`renamed_gd_old_res`) attached by scenes via
+///     `scenes_attaching_script`;
+///   - SUB-SCENE INSTANCE (#229) — a renamed `.tscn` (`renamed_tscn_old_res`) instanced by parent
+///     scenes via `scenes_instancing`.
+///
+/// A scene present in `rewritten_scenes` is no longer dangling (its `ext_resource` is in the returned
+/// WorkspaceEdit), so it is excluded from both groups; only scenes we refused to rewrite (unsafe
+/// span/text/verify) warn. No-op when every referencing scene was rewritten (or none exists).
+fn warn_dangling_scene_references(
     state: &ServerState,
     renamed_gd_old_res: &[String],
+    renamed_tscn_old_res: &[String],
     rewritten_scenes: &FxHashSet<String>,
 ) {
-    let mut affected: Vec<String> = Vec::new();
-    for old_res in renamed_gd_old_res {
-        for scene_res in state.workspace.scenes().scenes_attaching_script(old_res) {
-            // Exclude scenes we successfully rewrote (no longer dangling). Compare on the normalized
-            // res spelling the rewrite recorded, so a `\`/`/` or `res://./` variant can't slip past.
-            if rewritten_scenes.contains(&gd_project::scene::normalize_res(scene_res)) {
-                continue;
-            }
-            if !affected.iter().any(|s| s == scene_res) {
-                affected.push(scene_res.to_string());
+    // Collect the unrewritten referencing scenes for one dangle kind. Excludes scenes we rewrote,
+    // compared on the normalized res spelling the rewrite recorded (so a `\`/`/` or `res://./`
+    // variant can't slip past). `referencing` yields the scenes pointing at each renamed old-res.
+    let collect = |old_set: &[String], referencing: &dyn Fn(&str) -> Vec<String>| -> Vec<String> {
+        let mut affected: Vec<String> = Vec::new();
+        for old_res in old_set {
+            for scene_res in referencing(old_res) {
+                if rewritten_scenes.contains(&gd_project::scene::normalize_res(&scene_res)) {
+                    continue;
+                }
+                if !affected.iter().any(|s| s == &scene_res) {
+                    affected.push(scene_res);
+                }
             }
         }
+        affected.sort(); // deterministic message
+        affected
+    };
+
+    let scenes = state.workspace.scenes();
+    let attach = collect(renamed_gd_old_res, &|old| {
+        scenes
+            .scenes_attaching_script(old)
+            .map(str::to_owned)
+            .collect()
+    });
+    if !attach.is_empty() {
+        let list = attach.join(", ");
+        show_message(
+            state,
+            MessageType::WARNING,
+            &format!(
+                "gdls: moving a script attached to {} will leave the scene's `ext_resource` path \
+                 dangling — gdls could not safely rewrite the scene file(s); update them manually: {list}",
+                if attach.len() == 1 { "a scene" } else { "scenes" },
+            ),
+        );
     }
-    if affected.is_empty() {
-        return;
+
+    let instance = collect(renamed_tscn_old_res, &|old| {
+        scenes.scenes_instancing(old).map(str::to_owned).collect()
+    });
+    if !instance.is_empty() {
+        let list = instance.join(", ");
+        show_message(
+            state,
+            MessageType::WARNING,
+            &format!(
+                "gdls: moving a sub-scene instanced by {} will leave the parent scene's \
+                 `ext_resource` path dangling — gdls could not safely rewrite the scene file(s); \
+                 update them manually: {list}",
+                if instance.len() == 1 {
+                    "another scene"
+                } else {
+                    "other scenes"
+                },
+            ),
+        );
     }
-    affected.sort(); // deterministic message
-    let scenes = affected.join(", ");
-    show_message(
-        state,
-        MessageType::WARNING,
-        &format!(
-            "gdls: moving a script attached to {} will leave the scene's `ext_resource` path \
-             dangling — gdls could not safely rewrite the scene file(s); update them manually: {scenes}",
-            if affected.len() == 1 { "a scene" } else { "scenes" },
-        ),
-    );
 }
 
 /// `workspace/didRenameFiles`: route a client-observed batch of renames into the index-reconcile

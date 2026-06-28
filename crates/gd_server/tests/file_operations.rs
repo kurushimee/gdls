@@ -1306,6 +1306,70 @@ fn instanced_subscene_move_rewrites_parent_tscn_ext_resource() {
     shutdown(&client, thread);
 }
 
+/// #229 never-lie backstop: when a renamed `.tscn` is INSTANCED as a sub-scene by another scene and
+/// gdls REFUSES to rewrite that reference (here: the new path contains a quote, so the `ext_resource`
+/// path text can't be injected), the parent scene is left dangling — so a sub-scene-appropriate
+/// `window/showMessage(Warning)` must fire (mirroring the script-attachment dangle path). Pre-#229
+/// the refused sub-scene move emitted neither a rewrite nor a warning.
+#[test]
+fn fail_closed_unsafe_subscene_rewrite_warns_dangling() {
+    let p = bare_project();
+    let child_src = "[gd_scene format=3]\n[node name=\"ChildRoot\" type=\"Node\"]\n";
+    p.write("child.tscn", child_src);
+    let parent_src = "[gd_scene format=3]\n[ext_resource type=\"PackedScene\" path=\"res://child.tscn\" id=\"1\"]\n[node name=\"Root\" type=\"Node\"]\n[node name=\"Sub\" parent=\".\" instance=ExtResource(\"1\")]\n";
+    p.write("parent.tscn", parent_src);
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &[]);
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    // Rename child.tscn → a name with a double quote: the new res path can't be injected into the
+    // parent's `ext_resource path="…"` without breaking it. Refuse the .tscn rewrite, but warn.
+    let params = RenameFilesParams {
+        files: vec![FileRename {
+            old_uri: file_uri(&p.root.join("child.tscn")).as_str().to_string(),
+            new_uri: file_uri(&p.root.join("ch\"ild.tscn")).as_str().to_string(),
+        }],
+    };
+    client
+        .sender
+        .send(request(10, "workspace/willRenameFiles", params))
+        .unwrap();
+
+    let mut warned = false;
+    let mut got_edit = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match try_recv(&client, Duration::from_millis(200)) {
+            Some(Message::Notification(n)) if n.method == "window/showMessage" => {
+                let msg = n.params["message"].as_str().unwrap_or("");
+                // The sub-scene-appropriate message naming the dangling parent scene.
+                if msg.contains("sub-scene") && msg.contains("res://parent.tscn") {
+                    warned = true;
+                }
+            }
+            Some(Message::Response(r)) if r.id == lsp_server::RequestId::from(10) => {
+                got_edit = !r.result.unwrap_or(serde_json::Value::Null).is_null();
+                break;
+            }
+            _ => continue,
+        }
+    }
+    assert!(
+        !got_edit,
+        "an unsafe new path must refuse the sub-scene .tscn rewrite (no edit)"
+    );
+    assert!(
+        warned,
+        "a refused instanced sub-scene move must emit a sub-scene dangling warning naming the parent"
+    );
+    // The parent on disk must still reference the OLD sub-scene path (we never touched it).
+    let parent_now = read_tscn(&p, "parent.tscn");
+    assert!(parent_now.contains("res://child.tscn"));
+
+    shutdown(&client, thread);
+}
+
 /// Fail-closed: renaming a scene-attached `.gd` to a name whose `res://` text would BREAK the
 /// `ext_resource` path (a quote) REFUSES the `.tscn` rewrite — the scene stays untouched AND the
 /// dangling warning still fires (the scene is genuinely left dangling, so the user must be told).
