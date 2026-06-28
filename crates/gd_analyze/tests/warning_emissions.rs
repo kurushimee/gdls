@@ -1446,3 +1446,56 @@ fn dollar_typed_arg_pass_fires_unsafe_call_argument() {
         "passing bare-`Node` `$Child` to a `Control` parameter must fire UNSAFE_CALL_ARGUMENT, got {got:?}"
     );
 }
+
+#[test]
+fn coroutine_init_propagates_is_coroutine_to_constructor_missing_await() {
+    // #217: an inner class whose `_init` is a coroutine (its body contains `await`, so the parser
+    // sets `FunctionNode::is_coroutine`) makes `Inner.new()` a coroutine CALL. Godot stamps
+    // `r_return_type.is_coroutine = found_function->is_coroutine` on the constructor's synthesized
+    // instance return type (gdscript_analyzer.cpp:5870), so a bare `Inner.new()` at statement root
+    // fires MISSING_AWAIT (analyzer.cpp:3751-3758). Pre-fix the constructor arm copied only `_init`'s
+    // arity fields, leaving `is_coroutine = false`, so the warning never fired.
+    let src = "extends Node\n\
+               class Inner:\n\
+               \tfunc _init() -> void:\n\
+               \t\tawait get_tree()\n\
+               func go() -> void:\n\
+               \tInner.new()\n";
+    // MISSING_AWAIT is ignore-by-default (gdscript_warning.h; warnings.rs DEFAULT_LEVELS), so it
+    // must be enabled to observe emission — the coroutine propagation itself is independent of the
+    // warning level (the off-root error test below exercises the same flag without policy gating).
+    let got = codes(src, &policy_enabling(&["MISSING_AWAIT"]));
+    assert!(
+        got.contains(&WarningCode::MissingAwait),
+        "a coroutine `_init` must make a root `Inner.new()` fire MISSING_AWAIT; got {got:?}"
+    );
+}
+
+#[test]
+fn coroutine_init_constructor_off_root_fires_coroutine_call_error() {
+    // #217 mirror (off-root): the same coroutine `Inner.new()` in expression position (not a bare
+    // statement) escalates to the error `Function "new()" is a coroutine, so it must be called with
+    // "await".` (analyzer.cpp:3751-3758, the non-root branch). Proves `is_coroutine` reaches the
+    // call-result type the coroutine-call check reads, not merely the warning path.
+    let src = "extends Node\n\
+               class Inner:\n\
+               \tfunc _init() -> void:\n\
+               \t\tawait get_tree()\n\
+               func go() -> void:\n\
+               \tvar x = Inner.new()\n\
+               \tprint_debug(x)\n";
+    let tree = gd_syntax::parse(src).tree;
+    let native = mini_native();
+    let result = gd_analyze::analyze(&tree, None, "t.gd", &native, &NoCrossFile, &godot_policy());
+    assert!(
+        result.diagnostics.iter().any(|d| d
+            .message()
+            .contains(r#"is a coroutine, so it must be called with "await"."#)),
+        "an off-root coroutine `Inner.new()` must fire the coroutine-call error; got {:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.message())
+            .collect::<Vec<_>>()
+    );
+}

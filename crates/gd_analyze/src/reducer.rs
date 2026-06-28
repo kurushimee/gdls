@@ -3865,6 +3865,11 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     sig.min_params = init_sig.min_params;
                     sig.max_params = init_sig.max_params;
                     sig.is_vararg = init_sig.is_vararg;
+                    // analyzer.cpp:5870 — a coroutine `_init` makes `X.new()` a coroutine call;
+                    // Godot stamps `r_return_type.is_coroutine = found_function->is_coroutine`.
+                    // The common tail (~4345) propagates `sig.is_coroutine` onto the call-result
+                    // type the MISSING_AWAIT / coroutine-call check reads (#217).
+                    sig.is_coroutine = init_sig.is_coroutine;
                 }
             }
             sig.arity_known = true;
@@ -3893,6 +3898,9 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         sig.min_params = init_sig.min_params;
                         sig.max_params = init_sig.max_params;
                         sig.is_vararg = init_sig.is_vararg;
+                        // A coroutine `_init` reached through the script chain makes `X.new()` a
+                        // coroutine call too (analyzer.cpp:5870 stamp; propagated at ~4345). #217.
+                        sig.is_coroutine = init_sig.is_coroutine;
                         sig.arity_known = true;
                         sig_resolved = true;
                     }
