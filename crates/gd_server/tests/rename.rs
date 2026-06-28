@@ -5072,57 +5072,164 @@ fn rename_inner_class_member_does_not_touch_root_member_153() {
     shutdown(&client, server);
 }
 
-#[test]
-fn rename_inner_class_method_collision_refuses_not_corrupts_153() {
-    // #153 method surface (the corruption the var-member tests above do NOT cover):
-    // the method/call rename collection keys on (declaring FILE, name) ONLY — `CalleeTarget` drops
-    // the inner-class `class_path` — so a same-file ROOT `func hit` and inner `func hit` cannot be
-    // discriminated. Renaming via the inner `x.hit()` CALL gesture canonicalizes onto the ROOT decl
-    // (`find_in_file_definition` walks root members only) and would rewrite the ROOT method + every
-    // same-named call site while leaving the clicked inner decl untouched (over-capture AND
-    // under-capture). Until the call surface carries `class_path` (#213), the fail-closed gate must
-    // REFUSE this ambiguous rename (zero edits) rather than corrupt.
-    //   line 0 `extends Node`
-    //   line 1 `func hit() -> void:`     ROOT method
-    //   line 2 `\tpass`
-    //   line 3 `class Inner:`
-    //   line 4 `\tfunc hit() -> void:`   INNER method (same name)
-    //   line 5 `\t\tpass`
-    //   line 6 `func use_it() -> void:`
-    //   line 7 `\tvar x := Inner.new()`
-    //   line 8 `\tx.hit()`               INNER call, `hit` at col 3
-    let src = "extends Node\nfunc hit() -> void:\n\tpass\nclass Inner:\n\tfunc hit() -> void:\n\t\tpass\nfunc use_it() -> void:\n\tvar x := Inner.new()\n\tx.hit()\n";
-    let (client, server, uri, _project) = boot_project_file(src);
+// The shared fixture for the #213 inner-vs-root method discrimination tests:
+//   line 0 `extends Node`
+//   line 1 `func hit() -> void:`     ROOT method, `hit` at col 5
+//   line 2 `\tpass`
+//   line 3 `class Inner:`
+//   line 4 `\tfunc hit() -> void:`   INNER method (same name), `hit` at col 6
+//   line 5 `\t\tpass`
+//   line 6 `func use_it() -> void:`
+//   line 7 `\tvar x := Inner.new()`
+//   line 8 `\tx.hit()`               INNER call, `hit` at col 3
+const INNER_VS_ROOT_METHOD_SRC: &str = "extends Node\nfunc hit() -> void:\n\tpass\nclass Inner:\n\tfunc hit() -> void:\n\t\tpass\nfunc use_it() -> void:\n\tvar x := Inner.new()\n\tx.hit()\n";
 
-    // Rename via the inner `x.hit()` call gesture (line 8, col 3) → `smash`. Must REFUSE (the
-    // collision is undiscriminable on the call surface), not silently rewrite the ROOT method.
-    client
-        .sender
-        .send(request(
-            704,
-            "textDocument/rename",
-            rename_params(&uri, 8, 3, "smash"),
-        ))
-        .unwrap();
-    let resp = recv_response(&client);
-    assert!(
-        resp.error.is_some(),
-        "an undiscriminable same-file root-vs-inner method rename must REFUSE with a typed error, \
-         not corrupt; got result {:?}",
-        resp.result
-    );
-    assert!(
-        resp.result.is_none(),
-        "a refused ambiguous-method rename must carry ZERO edits, got {:?}",
-        resp.result
+#[test]
+fn rename_inner_class_method_via_call_targets_inner_only_213() {
+    // #213 (the corruption the var-member #153 tests do NOT cover): the method/call rename surface
+    // now threads the callee's inner-class `class_path` (`CalleeTarget::Script.class_path`) through
+    // both collection AND decl canonicalization, so a same-file ROOT `func hit` and inner `func hit`
+    // are discriminated by identity. Renaming via the inner `x.hit()` CALL gesture (line 8, col 3) →
+    // `smash` must SUCCEED and edit EXACTLY the inner decl (line 4) + the inner call (line 8), NEVER
+    // the unrelated ROOT `func hit` (line 1). On main this REFUSED (the fail-closed ambiguity gate);
+    // the inner-blind collection it guarded would have rewritten the ROOT method instead.
+    let (client, server, uri, _project) = boot_project_file(INNER_VS_ROOT_METHOD_SRC);
+
+    // Rename via the inner `x.hit()` call gesture (line 8, col 3) → `smash`.
+    let sites = rename_sites(&client, 704, &uri, 8, 3, "smash");
+
+    // EXACTLY the inner decl (line 4, col 6) + the inner call (line 8, col 3). The ROOT decl (line 1)
+    // must NOT be edited (the headline corruption guard).
+    assert_eq!(
+        sites,
+        vec![(4, 6), (8, 3)],
+        "renaming the inner method via its call must edit ONLY the inner decl (4,6) + inner call \
+         (8,3), never the ROOT `func hit` (line 1); got {sites:?}"
     );
     shutdown(&client, server);
 }
 
-// NOTE on cross-file inner-class instance members (`Lib.Box.new(); b.field` where `Lib` is a
-// path-preloaded const): gdls's analyzer does NOT currently resolve an inner class accessed through a
-// preloaded-const identifier — `Lib.Box.new()` ends `Unresolved`, so `b` types as Variant and no
-// `b.field` binding is recorded. That is a SEPARATE pre-existing analyzer gap (filed #212), distinct
-// from #153's single-file inner-member corruption (which the tests above cover). Once #213 resolves
-// the chain, the same `target_class_path` filter this PR adds makes the cross-file case correct by
-// construction — no further server change needed.
+#[test]
+fn rename_root_method_via_decl_targets_root_only_213() {
+    // #213 mirror: clicking the ROOT `func hit` decl (line 1, col 5) → `smash` edits ONLY the root
+    // decl — there are no root call sites in this fixture (`x.hit()` is the INNER method). It must
+    // NEVER edit the inner `func hit` (line 4) or the inner call (line 8).
+    let (client, server, uri, _project) = boot_project_file(INNER_VS_ROOT_METHOD_SRC);
+
+    let sites = rename_sites(&client, 705, &uri, 1, 5, "smash");
+    assert_eq!(
+        sites,
+        vec![(1, 5)],
+        "renaming the ROOT method via its decl must edit ONLY the root decl (1,5), never the inner \
+         decl (line 4) or inner call (line 8); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_inner_method_via_decl_targets_inner_only_213() {
+    // #213: clicking the INNER `func hit` decl (line 4, col 6) → `smash` edits its own decl + the
+    // inner call (line 8), never the ROOT `func hit` (line 1). Decl-click parity with the call-click
+    // test above — the decl-site path derives `target_class_path` from `member_decl_click_class_path`.
+    let (client, server, uri, _project) = boot_project_file(INNER_VS_ROOT_METHOD_SRC);
+
+    let sites = rename_sites(&client, 706, &uri, 4, 6, "smash");
+    assert_eq!(
+        sites,
+        vec![(4, 6), (8, 3)],
+        "renaming the inner method via its decl must edit ONLY the inner decl (4,6) + inner call \
+         (8,3), never the ROOT `func hit` (line 1); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+// #212 + #213 compose, cross-file: now that the analyzer resolves an inner class reached through a
+// path-preloaded const (#212 — `Lib.Box.new()` types `b` as the inner `Box`, so `b.m()` records a
+// `CalleeTarget::Script { file: lib, class_path: ["Box"] }`), the #213 `target_class_path` filter
+// makes a cross-file inner-class method rename discriminate the inner method from a same-named ROOT
+// decoy in the SAME declaring file. The single-file tests above cannot exercise that composition;
+// this multi-file test is the integration proof.
+#[test]
+fn cross_file_inner_class_method_rename_discriminates_root_decoy_213() {
+    let project = common::sample_project();
+    // lib.gd declares a ROOT `func m` decoy AND an inner `Box.func m` (the rename target):
+    //   line 0 `extends Node`
+    //   line 1 `func m() -> void:`     ROOT decoy `m` at col 5
+    //   line 2 `\tpass`
+    //   line 3 `class Box:`
+    //   line 4 `\tfunc m() -> void:`   INNER `m` at col 6 (target)
+    //   line 5 `\t\tpass`
+    project.write(
+        "src/lib.gd",
+        "extends Node\nfunc m() -> void:\n\tpass\nclass Box:\n\tfunc m() -> void:\n\t\tpass\n",
+    );
+    // consumer.gd reaches the inner method through the preloaded const:
+    //   line 0 `extends Node`
+    //   line 1 `const Lib = preload("res://src/lib.gd")`
+    //   line 2 `func run() -> void:`
+    //   line 3 `\tvar b := Lib.Box.new()`
+    //   line 4 `\tb.m()`               INNER call `m` at col 3
+    project.write(
+        "src/consumer.gd",
+        "extends Node\nconst Lib = preload(\"res://src/lib.gd\")\nfunc run() -> void:\n\tvar b := Lib.Box.new()\n\tb.m()\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/lib.gd", "src/consumer.gd"],
+        2,
+    );
+    let lib_uri = file_uri(&project.root.join("src/lib.gd"));
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    // references on the `b.m()` call (consumer line 4, col 3) must be EXACTLY the inner `Box.m` decl
+    // (lib line 4) + the call (consumer line 4), across both files — never lib.gd's root `func m`
+    // (line 1, the cross-file discrimination proof).
+    let ref_set = references_set(&client, 12, &consumer_uri, 4, 3);
+    let ref_starts: Vec<(String, u32, u32)> = ref_set
+        .iter()
+        .map(|(u, r)| (u.clone(), r.start.line, r.start.character))
+        .collect();
+    assert_eq!(
+        ref_starts,
+        // `references_set` sorts by (uri, range); `consumer.gd` < `lib.gd` lexically.
+        vec![
+            (consumer_uri.as_str().to_string(), 4, 3),
+            (lib_uri.as_str().to_string(), 4, 6),
+        ],
+        "references on the cross-file inner `b.m()` call must be the inner Box.m decl (lib 4,6) + \
+         the call (consumer 4,3), never the root `func m` (lib line 1); got {ref_starts:?}"
+    );
+
+    // Rename via the same call gesture → `strike`. The edited set must EQUAL references (the
+    // rename ⊆ references discipline) — inner decl + call, root decoy untouched, across both files.
+    client
+        .sender
+        .send(request(
+            13,
+            "textDocument/rename",
+            rename_params(&consumer_uri, 4, 3, "strike"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "cross-file inner-class method rename must succeed: {:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let view = flatten_edit(&edit);
+    assert_eq!(
+        view.set, ref_set,
+        "cross-file inner-class method edited set must equal the references set (inner decl + call, \
+         root decoy untouched)"
+    );
+    assert!(
+        view.new_texts.iter().all(|t| t == "strike"),
+        "every edit writes the new name, got {:?}",
+        view.new_texts
+    );
+    shutdown(&client, server);
+}

@@ -491,6 +491,30 @@ pub fn definition(
 
     let name = cursor_identifier(&parsed.tree, node_id)?;
 
+    // (0.4) #213: a DECLARATION-site click on an inner-class member's identifier (`func hit` inside
+    // `class Inner`) carries no `Binding::Use`/`Binding::Call` (a decl is not a use), so steps
+    // (0.5)/(0.6)/(1.5)/(1.6) — all use-site projections — miss it, and step (1)'s root-only scan
+    // would return a same-named ROOT member's decl instead. Resolve the click's OWN inner-class chain
+    // (`member_decl_click_class_path`) and, when non-empty (an inner-class member), jump to that
+    // precise decl via the class-path-aware `member_decl_location`. Empty (root) decl-clicks fall to
+    // step (1), unchanged. Keeps `definition` consistent with the references/rename decl-click path.
+    {
+        let node_span = parsed.tree.get(node_id).span;
+        let inner = parsed.tree.root_id().and_then(|rid| {
+            member_decl_click_class_path(&parsed.tree, rid, &mut Vec::new(), &name, node_span)
+        });
+        if let Some(inner) = inner.filter(|c| !c.is_empty()) {
+            let fid = crate::uri::uri_to_path(&uri)
+                .as_deref()
+                .and_then(|p| state.workspace.index.file_id(p));
+            if let Some(fid) = fid {
+                if let Some(loc) = member_decl_location(state, fid, &inner, &name) {
+                    return Some(GotoDefinitionResponse::Scalar(loc));
+                }
+            }
+        }
+    }
+
     // (0.5) #146: a subscript attribute (`base.member`) on a project-Script base resolves on the
     // OWNING class — descending the base value's inner-class chain — and MUST run before the bare
     // in-file lookup (1), which would otherwise match a same-named ROOT member for an inner-class
@@ -2798,6 +2822,10 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // and reused by both the call-site probe below and push_callee_ident_locations in the
     // current-file scan — eliminates a duplicate O(nodes) tree walk per references request.
     let mut callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+    // #213: alongside `target_file`, carry the callee's inner-class `class_path` so the call-site
+    // collection (`push_callee_ident_locations`) and the decl canonicalization discriminate a
+    // same-file ROOT method from an inner-class method of the same name. Empty = the root class.
+    let mut target_class_path: Vec<String> = Vec::new();
     let target_file: Option<gd_project::FileId> = if is_method_or_signal {
         // Analyze the current file to determine target_file.
         let target_file_from_binding = if let Some(p) = current_path
@@ -2806,10 +2834,10 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         {
             let cur_result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
             // Look for a Binding::Call whose callee identifier span (in the parse tree)
-            // contains the cursor byte. If found (call-site click), target_file = the callee's
-            // Script-declaring file. The shared callee-span map (`callee_spans`, hoisted above)
-            // is built lazily on the first matching binding and reused by
-            // push_callee_ident_locations below.
+            // contains the cursor byte. If found (call-site click), capture BOTH the callee's
+            // Script-declaring file AND its inner-class `class_path` (#213). The shared callee-span
+            // map (`callee_spans`, hoisted above) is built lazily on the first matching binding and
+            // reused by push_callee_ident_locations below.
             cur_result.bindings().iter().find_map(|b| {
                 if let Binding::Call {
                     callee,
@@ -2823,7 +2851,11 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                             callee_spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
                         if let Some(ident_span) = spans.get(call_site).copied() {
                             if ident_span.start <= byte && byte < ident_span.end {
-                                return Some(callee.script_file());
+                                let cp = match callee {
+                                    CalleeTarget::Script { class_path, .. } => class_path.clone(),
+                                    _ => Vec::new(),
+                                };
+                                return Some((callee.script_file(), cp));
                             }
                         }
                     }
@@ -2836,15 +2868,38 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         // Distinguish the two None origins that the old `.flatten().or(current_fid)` conflated —
         // collapsing them dropped every cross-file reference for native subscript calls
         // (e.g. `node.queue_free()`, whose Binding::Call classifies a non-Script callee):
-        //   Some(Some(f)) — call-site click on a resolved callee: the declaring file is `f`.
-        //   Some(None)    — call-site click on a NATIVE/unresolved callee: keep target_file None so
-        //                   the scan falls back to push_identifier_locations (raw text scan) rather
-        //                   than filtering on a Script file no Binding::Call carries.
-        //   None          — no Binding::Call at the cursor (declaration-site click): the current
-        //                   file declares the method, so target_file = current_fid.
+        //   Some((Some(f), cp)) — call-site click on a resolved callee: declaring file `f`, chain `cp`.
+        //   Some((None, _))     — call-site click on a NATIVE/unresolved callee: keep target_file None so
+        //                         the scan falls back to push_identifier_locations (raw text scan) rather
+        //                         than filtering on a Script file no Binding::Call carries.
+        //   None                — no Binding::Call at the cursor (declaration-site click): the current
+        //                         file declares the method, so target_file = current_fid and the chain
+        //                         is the clicked decl's own inner-class path.
         match target_file_from_binding {
-            Some(cf) => cf,
-            None => current_fid,
+            Some((cf, cp)) => {
+                target_class_path = cp;
+                cf
+            }
+            None => {
+                // Declaration-site click: derive the clicked method's inner-class chain from the
+                // decl identifier at `node_span` so an inner `func m` decl canonicalizes to itself,
+                // not the root `m`. Empty for a root-class method (or when no decl-click matches).
+                let node_span = parsed.tree.get(node_id).span;
+                target_class_path = parsed
+                    .tree
+                    .root_id()
+                    .and_then(|rid| {
+                        member_decl_click_class_path(
+                            &parsed.tree,
+                            rid,
+                            &mut Vec::new(),
+                            &name,
+                            node_span,
+                        )
+                    })
+                    .unwrap_or_default();
+                current_fid
+            }
         }
     } else {
         None
@@ -2927,22 +2982,25 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         let mut decls = Vec::new();
         let decl_found = if is_method_or_signal {
             if let Some(tf) = target_file {
-                if current_fid.is_some_and(|cf| cf == tf) {
-                    // Declaration-site click: the current file IS the declaring file.
-                    if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-                        decls.push(loc);
-                        true
-                    } else {
-                        false
-                    }
+                // #213: an inner-class method (`target_class_path` non-empty) must canonicalize to
+                // its OWN decl via the class-path-aware `member_decl_location` (walks `iface_at_inner`),
+                // never the root-only `find_in_file_definition`/`find_decl_in_declaring_file`, which
+                // would pull in a same-named ROOT method's decl.
+                let loc = if !target_class_path.is_empty() {
+                    member_decl_location(state, tf, &target_class_path, &name)
+                } else if current_fid.is_some_and(|cf| cf == tf) {
+                    // Declaration-site / same-file call-site click on a ROOT method: the current file
+                    // IS the declaring file.
+                    find_in_file_definition(&parsed.tree, &name, &uri, &mapper)
                 } else {
-                    // Cross-file call-site click: read the declaring file and locate the identifier.
-                    if let Some(loc) = find_decl_in_declaring_file(state, tf, &name, enc) {
-                        decls.push(loc);
-                        true
-                    } else {
-                        false
-                    }
+                    // Cross-file call-site click on a ROOT method: read the declaring file's tree.
+                    find_decl_in_declaring_file(state, tf, &name, enc)
+                };
+                if let Some(loc) = loc {
+                    decls.push(loc);
+                    true
+                } else {
+                    false
                 }
             } else {
                 false
@@ -3012,23 +3070,39 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     {
         let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
         if is_method_or_signal {
-            push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
             // For method/signal targets: use callee-filtered call projection instead of raw
             // identifier scan to avoid false positives from identically-named declarations.
             // Only project when target_file is Some — if None (native/unresolved), fall back
             // to identifier scan so we never under-report for unresolvable targets.
             if let Some(tf) = target_file {
+                // #213: the `Binding::Use` member-use sites (recorded by `record_member_use` at the
+                // callee identifier) must also be class-path-filtered — the name-only
+                // `push_binding_locations` would re-admit a same-named other-class method's uses that
+                // the call-site filter excludes. Use the class-path-aware collector for the Some branch.
+                push_use_binding_locations_for(
+                    &mut locations,
+                    &result,
+                    tf,
+                    &target_class_path,
+                    &name,
+                    &uri,
+                    &mapper,
+                );
                 push_callee_ident_locations(
                     &mut locations,
                     &result,
                     &parsed.tree,
                     tf,
+                    &target_class_path,
                     &name,
                     &uri,
                     &mapper,
                     &mut callee_spans,
                 );
             } else {
+                // Native/unresolved callee: name-only binding scan + raw identifier scan (no Script
+                // file to filter on).
+                push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
                 push_identifier_locations(&mut locations, &parsed.tree, &name, &uri, &mapper);
             }
         } else {
@@ -3224,24 +3298,43 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         let rope = Rope::from_str(&text);
         let cand_mapper = PositionMapper::new(&rope, enc);
         if is_method_or_signal {
-            push_binding_locations(&mut locations, &cand_result, &name, &cand_uri, &cand_mapper);
             // For method/signal targets: use callee-filtered call projection (accurate) rather
             // than raw identifier scan (which would pick up unrelated same-named declarations
             // like `func helper():` in other.gd). When target_file is None (native/unresolved),
             // fall back to identifier scan to avoid under-reporting.
             if let Some(tf) = target_file {
+                // #213: class-path-filter the candidate's member-use sites too (see the current-file
+                // block) — a candidate's same-named other-class method use is excluded by identity.
+                push_use_binding_locations_for(
+                    &mut locations,
+                    &cand_result,
+                    tf,
+                    &target_class_path,
+                    &name,
+                    &cand_uri,
+                    &cand_mapper,
+                );
                 let mut cand_callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
                 push_callee_ident_locations(
                     &mut locations,
                     &cand_result,
                     &parsed.tree,
                     tf,
+                    &target_class_path,
                     &name,
                     &cand_uri,
                     &cand_mapper,
                     &mut cand_callee_spans,
                 );
             } else {
+                // Native/unresolved callee: name-only binding scan + raw identifier scan.
+                push_binding_locations(
+                    &mut locations,
+                    &cand_result,
+                    &name,
+                    &cand_uri,
+                    &cand_mapper,
+                );
                 push_identifier_locations(
                     &mut locations,
                     &parsed.tree,
@@ -3496,6 +3589,9 @@ fn collect_in_file_highlight_sites(
     // call sites of THIS method, not identically-named methods. `None` (native/unresolved) falls
     // back to the raw identifier scan, never under-reporting.
     let mut callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+    // #213: carry the callee's inner-class `class_path` alongside `target_file` — mirrors `references`
+    // so a same-file ROOT method and inner-class method of the same name highlight distinctly.
+    let mut target_class_path: Vec<String> = Vec::new();
     let target_file: Option<gd_project::FileId> = if is_method_or_signal {
         let target_file_from_binding = if let Some(p) = current_path
             .as_ref()
@@ -3515,7 +3611,11 @@ fn collect_in_file_highlight_sites(
                             callee_spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
                         if let Some(ident_span) = spans.get(call_site).copied() {
                             if ident_span.start <= byte && byte < ident_span.end {
-                                return Some(callee.script_file());
+                                let cp = match callee {
+                                    CalleeTarget::Script { class_path, .. } => class_path.clone(),
+                                    _ => Vec::new(),
+                                };
+                                return Some((callee.script_file(), cp));
                             }
                         }
                     }
@@ -3526,8 +3626,28 @@ fn collect_in_file_highlight_sites(
             None
         };
         match target_file_from_binding {
-            Some(cf) => cf,
-            None => current_fid,
+            Some((cf, cp)) => {
+                target_class_path = cp;
+                cf
+            }
+            None => {
+                // Declaration-site click: the clicked method's own inner-class chain (`node_span` is
+                // already bound above). Empty for a root-class method or a non-decl-click.
+                target_class_path = parsed
+                    .tree
+                    .root_id()
+                    .and_then(|rid| {
+                        member_decl_click_class_path(
+                            &parsed.tree,
+                            rid,
+                            &mut Vec::new(),
+                            name,
+                            node_span,
+                        )
+                    })
+                    .unwrap_or_default();
+                current_fid
+            }
         }
     } else {
         None
@@ -3584,7 +3704,23 @@ fn collect_in_file_highlight_sites(
     // handled by the within-scope identifier scan below (which already emits the decl token), so
     // they're excluded here to avoid a duplicate the caller would then have to dedup; an enum VALUE's
     // decl is added explicitly (its use scan does not emit it).
-    if is_autoload {
+    if is_method_or_signal {
+        // #213: canonicalize the method/signal decl to THIS file's declaring class. An inner-class
+        // method (`target_class_path` non-empty) resolves via the class-path-aware
+        // `member_decl_location` so a same-named ROOT method's token is never highlighted; a root
+        // method uses the root-only `find_in_file_definition`. Only the current file's decl is an
+        // in-file occurrence — a cross-file call-site click's decl lives elsewhere and is omitted.
+        if target_file.is_some_and(|tf| current_fid.is_some_and(|cf| cf == tf)) {
+            let loc = if !target_class_path.is_empty() {
+                member_decl_location(state, current_fid.unwrap(), &target_class_path, name)
+            } else {
+                find_in_file_definition(&parsed.tree, name, uri, mapper)
+            };
+            if let Some(loc) = loc {
+                locations.push(loc);
+            }
+        }
+    } else if is_autoload {
         if let Some(loc) = find_autoload_definition(state, name) {
             locations.push(loc);
         }
@@ -3638,19 +3774,32 @@ fn collect_in_file_highlight_sites(
     {
         let result = analyze_with_request_token(state, key, p, &parsed.tree, text);
         if is_method_or_signal {
-            push_binding_locations(&mut locations, &result, name, uri, mapper);
             if let Some(tf) = target_file {
+                // #213: class-path-filter the member-use sites (parity with `references`) so a
+                // same-named other-class method's uses are excluded by identity.
+                push_use_binding_locations_for(
+                    &mut locations,
+                    &result,
+                    tf,
+                    &target_class_path,
+                    name,
+                    uri,
+                    mapper,
+                );
                 push_callee_ident_locations(
                     &mut locations,
                     &result,
                     &parsed.tree,
                     tf,
+                    &target_class_path,
                     name,
                     uri,
                     mapper,
                     &mut callee_spans,
                 );
             } else {
+                // Native/unresolved callee: name-only binding scan + raw identifier scan.
+                push_binding_locations(&mut locations, &result, name, uri, mapper);
                 push_identifier_locations(&mut locations, &parsed.tree, name, uri, mapper);
             }
         } else {
@@ -4701,6 +4850,7 @@ fn push_callee_ident_locations(
     result: &AnalysisResult,
     tree: &ParseTree,
     target_file: gd_project::FileId,
+    target_class_path: &[String],
     name: &str,
     uri: &Uri,
     mapper: &PositionMapper,
@@ -4709,14 +4859,21 @@ fn push_callee_ident_locations(
     callee_spans: &mut Option<FxHashMap<ByteSpan, ByteSpan>>,
 ) {
     for binding in result.bindings() {
+        // #213: discriminate on the callee's inner-class `class_path`, not just `(file, name)`. A
+        // same-file ROOT `func m` and inner `func m` record distinct `CalleeTarget::Script.class_path`
+        // chains, so a call to the inner method is collected ONLY when the chain matches — the
+        // root method's call sites stay out of the inner method's set (and vice versa).
         if let Binding::Call {
-            callee,
+            callee: CalleeTarget::Script { file, class_path },
             callee_name,
             call_site,
             ..
         } = binding
         {
-            if callee.script_file() == Some(target_file) && callee_name == name {
+            if *file == target_file
+                && class_path.as_slice() == target_class_path
+                && callee_name == name
+            {
                 let spans = callee_spans.get_or_insert_with(|| callee_ident_spans(tree));
                 if let Some(span) = spans.get(call_site).copied() {
                     out.push(Location {
@@ -6673,21 +6830,11 @@ fn rename_target_has_project_anchor(
         false
     });
     if call_anchored {
-        // FAIL-CLOSED (#153 method surface): the method/call rename collection
-        // (`push_callee_ident_locations`) keys on (declaring FILE, name) ONLY — `CalleeTarget`
-        // drops the inner-class `class_path` — so when the SAME method name is declared in more than
-        // one class of THIS file (root + an inner class, or two inner classes), it cannot
-        // discriminate which class's `x.m()` call sites belong to the renamed method. #153 made the
-        // non-call `var`/`const` member surface (`Binding::Use.target_class_path`) inner-aware, but
-        // the call surface is still inner-blind: admitting the anchor here would canonicalize the
-        // inner `func` onto the ROOT decl (`find_in_file_definition` walks root members only) and
-        // rewrite the unrelated ROOT method + every same-named call site, leaving the clicked inner
-        // decl untouched (the issue's headline corruption). Until the call collection carries
-        // `class_path` (#213), refuse the ambiguous same-file collision rather than corrupt — zero
-        // edits beats a wrong edit. A name declared in exactly ONE class of the file stays editable.
-        if same_file_method_name_is_class_ambiguous(&parsed.tree, name) {
-            return false;
-        }
+        // #213: the method/call rename surface now threads the callee's inner-class `class_path`
+        // (`CalleeTarget::Script.class_path`) through collection AND decl canonicalization, so a
+        // same-file ROOT `func m` and inner `func m` are discriminated by identity — the call sites
+        // and decl of the clicked method only. The old fail-closed ambiguity refuse is therefore
+        // retired: a call-anchored cursor is always a positive project anchor.
         return true;
     }
 
@@ -7241,38 +7388,6 @@ fn member_decl_id(member: &Member) -> Option<NodeId> {
         Class(id) | Constant(id) | Function(id) | Signal(id) | Variable(id) | Enum(id) => Some(*id),
         EnumValue(_) | Group(_) => None,
     }
-}
-
-/// `true` iff `name` is declared as a `func` (method) in MORE THAN ONE class of this file — the
-/// root class plus an inner class, or two inner classes. This is the same-file collision the method
-/// rename collection cannot discriminate: `push_callee_ident_locations` keys on (declaring FILE,
-/// name) only (`CalleeTarget` drops the inner `class_path`), so every same-named `x.m()` call across
-/// those classes collapses into one set, and `find_in_file_definition` canonicalizes any of them to
-/// the ROOT decl (it walks root members only). #153 made the non-call `var`/`const` member surface
-/// inner-aware (`Binding::Use.target_class_path`) but left the call surface inner-blind, so a rename
-/// of an ambiguous method would over-capture the root method + under-capture the clicked inner decl.
-/// The fail-closed gate denies the project anchor for such a name → the rename refuses (#213 tracks
-/// threading `class_path` onto the call surface to make these renameable). A name in exactly one
-/// class is unambiguous and stays editable. Only `func` members count — `var`/`const`/`signal`/
-/// `enum`/inner-`class` collisions resolve through the class-path-aware `Binding::Use` surface.
-fn same_file_method_name_is_class_ambiguous(tree: &ParseTree, name: &str) -> bool {
-    let mut classes_declaring = 0usize;
-    for id in tree.iter_ids() {
-        let NodeKind::Class(class) = &tree.get(id).kind else {
-            continue;
-        };
-        let declares_method = class
-            .members
-            .iter()
-            .any(|m| matches!(m, Member::Function(_)) && member_named(tree, m, name).is_some());
-        if declares_method {
-            classes_declaring += 1;
-            if classes_declaring > 1 {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// `true` iff the current file's ROOT class declares a member named `name` — the member-collision
