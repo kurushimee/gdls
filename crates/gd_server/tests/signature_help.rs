@@ -67,6 +67,29 @@ const SIG_API: &str = r#"{
         ]},
         {"name": "CanvasItem", "inherits": "Node"},
         {"name": "Node2D", "inherits": "CanvasItem"}
+    ],
+    "builtin_classes": [
+        {"name": "Vector2", "constructors": [
+            {},
+            {"arguments": [{"name": "from", "type": "Vector2"}]},
+            {"arguments": [{"name": "from", "type": "Vector2i"}]},
+            {"arguments": [{"name": "x", "type": "float"}, {"name": "y", "type": "float"}]}
+        ]},
+        {"name": "Color", "constructors": [
+            {},
+            {"arguments": [{"name": "from", "type": "Color"}]},
+            {"arguments": [
+                {"name": "r", "type": "float"},
+                {"name": "g", "type": "float"},
+                {"name": "b", "type": "float"}
+            ]},
+            {"arguments": [
+                {"name": "r", "type": "float"},
+                {"name": "g", "type": "float"},
+                {"name": "b", "type": "float"},
+                {"name": "a", "type": "float"}
+            ]}
+        ]}
     ]
 }"#;
 
@@ -416,23 +439,110 @@ fn constructor_new_resolves_to_init() {
     shutdown(&client, server_thread);
 }
 
-/// A builtin-type CONSTRUCTOR call `Vector2(<cursor>)` returns NO signature (null) — Godot parity.
-/// Godot's LSP surfaces builtin-constructor overloads only in its completion arghint, never in the
-/// signatureHelp handler (verified against the headless 4.6.3 LSP oracle: `Vector2(`/`Color(` → null
-/// at every arg position). gdls matches that rather than fabricating a `Vector2(...)` placeholder.
+/// #257: a builtin-type CONSTRUCTOR call `Vector2(<cursor>)` answers with one signature per
+/// overload, in dump order, labelled `Type Type(args)` — the `_make_arguments_hint` shape
+/// `Variant::get_constructor_list` implies (it sets `mi.name = mi.return_val.type = type`).
+///
+/// This deliberately DIVERGES from Godot's own language server, which returns null here and puts
+/// its constructor arghints on the completion surface instead (that surface, #194, is untouched).
+/// Per #30 a generic client renders parameter hints from `signatureHelp` and nowhere else, and
+/// these are among the most-typed calls in GDScript.
+///
+/// At argument index 0 the no-arg overload is already gone — Godot's own filter
+/// (`gdscript_editor.cpp:3417`, `if (p_argidx >= E.arguments.size()) continue;`) drops any
+/// overload the cursor's argument index overruns.
 #[test]
-fn builtin_constructor_call_has_no_signature() {
+fn builtin_constructor_offers_one_signature_per_overload() {
     let p = sig_project();
     let src = "extends Node\n\nfunc f() -> void:\n\tvar v = Vector2(\n";
     let uri = file_uri(&p.root.join("src/ctor.gd"));
     let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
 
-    // Cursor right after `Vector2(` — tab(1) + `var v = Vector2(`(15) = 16.
-    let raw = sig_raw(&client, 10, &uri, Position::new(3, 16));
-    assert!(
-        raw.is_null(),
-        "a builtin constructor must return null (Godot LSP parity), got {raw:?}"
+    // Cursor right after `Vector2(` — tab(1) + `var v = Vector2(`(16) = column 17.
+    let h = sig(&client, 10, &uri, Position::new(3, 17));
+    let labels: Vec<&str> = h.signatures.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "Vector2 Vector2(from: Vector2)",
+            "Vector2 Vector2(from: Vector2i)",
+            "Vector2 Vector2(x: float, y: float)",
+        ],
+        "one signature per surviving overload, in dump order; the no-arg overload is filtered out \
+         at argument index 0"
     );
+    assert_eq!(h.active_signature, Some(0));
+    assert_eq!(h.active_parameter, Some(0));
+
+    shutdown(&client, server_thread);
+}
+
+/// The overload filter tracks the cursor: past the first comma only overloads with a second
+/// parameter survive, and `activeParameter` follows.
+#[test]
+fn builtin_constructor_overloads_narrow_as_arguments_are_typed() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f() -> void:\n\tvar c = Color(0.5, 0.5, \n";
+    let uri = file_uri(&p.root.join("src/ctor2.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor after the SECOND comma — argument index 2, so only the 3- and 4-arg overloads
+    // survive. tab(1) + `var c = Color(0.5, 0.5, `(24) = column 25.
+    let h = sig(&client, 10, &uri, Position::new(3, 25));
+    let labels: Vec<&str> = h.signatures.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec![
+            "Color Color(r: float, g: float, b: float)",
+            "Color Color(r: float, g: float, b: float, a: float)",
+        ],
+        "the 0-arg and copy overloads can no longer be what is being typed"
+    );
+    assert_eq!(h.active_parameter, Some(2), "highlighting the third slot");
+
+    shutdown(&client, server_thread);
+}
+
+/// Typing past EVERY overload's arity is an error state mid-edit. Godot's completion filter shows
+/// nothing there; signature help keeps the popup alive instead, offering every overload widest
+/// first so `activeSignature` points at the closest match — a hint that degrades rather than
+/// vanishing under the user's cursor.
+#[test]
+fn builtin_constructor_past_every_arity_still_offers_the_widest() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f() -> void:\n\tvar v = Vector2(1, 2, 3, \n";
+    let uri = file_uri(&p.root.join("src/ctor3.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor after the third comma — argument index 3, past every Vector2 overload.
+    // tab(1) + `var v = Vector2(1, 2, 3, `(25) = column 26.
+    let h = sig(&client, 10, &uri, Position::new(3, 26));
+    assert_eq!(
+        h.signatures.first().map(|s| s.label.as_str()),
+        Some("Vector2 Vector2(x: float, y: float)"),
+        "widest overload first so activeSignature=0 is the closest match"
+    );
+    assert_eq!(
+        h.signatures.len(),
+        4,
+        "every overload is offered as a floor"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A bare name that is NOT a builtin type still falls through to the self-method arm — the
+/// constructor arm must not swallow ordinary calls.
+#[test]
+fn a_non_builtin_bare_name_still_resolves_as_a_self_method() {
+    let p = sig_project();
+    let src =
+        "extends Node\n\nfunc helper(a: int) -> void:\n\tpass\n\nfunc f() -> void:\n\thelper(\n";
+    let uri = file_uri(&p.root.join("src/ctor4.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    let h = sig(&client, 10, &uri, Position::new(6, 8));
+    assert_eq!(only_label(&h), "void helper(a: int)");
 
     shutdown(&client, server_thread);
 }

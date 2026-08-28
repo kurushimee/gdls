@@ -90,6 +90,7 @@ pub fn signature_help(
         &text,
         &tokens,
         open_idx,
+        arg_index,
         fid,
     )?;
     if sigs.is_empty() {
@@ -194,6 +195,7 @@ fn resolve_signatures(
     text: &str,
     tokens: &[Token],
     open_idx: usize,
+    arg_index: usize,
     fid: Option<gd_project::FileId>,
 ) -> Option<Vec<Sig>> {
     let callee_idx = prev_meaningful(tokens, open_idx)?;
@@ -231,7 +233,7 @@ fn resolve_signatures(
             state, tree, analyzed, text, tokens, dot_idx, open_idx, &name,
         );
     }
-    resolve_bare_call(state, text, fid, &name)
+    resolve_bare_call(state, text, fid, &name, arg_index)
 }
 
 /// The identifier text of the simple-name token immediately before the dot at `dot_idx` (the base
@@ -488,22 +490,66 @@ fn resolve_bare_call(
     text: &str,
     fid: Option<gd_project::FileId>,
     name: &str,
+    arg_index: usize,
 ) -> Option<Vec<Sig>> {
     // (a) `@GlobalScope` / GDScript utility (`print`, `abs`, `randi`, …).
     if let Some(sig) = utility_sig(state, name) {
         return Some(sig);
     }
-    // (b) A builtin type name used as a constructor (`Vector2(`, `Color(`) gets NO signature —
-    // matching Godot's LSP, which returns `null` for builtin constructors (its constructor-overload
-    // arghint lives only in the COMPLETION path, `gdscript_editor.cpp:3411`, never in the
-    // signatureHelp handler; verified against the headless 4.6.3 LSP oracle: `Vector2(` / `Color(`
-    // → null at every arg position). Falling through is correct — a builtin type name is not a
-    // self-method either, so (c) also returns `None`, giving the Godot-parity null. (The per-overload
-    // constructor argument data lives in the dump and belongs on the completion arghint surface,
-    // where Godot's own architecture puts it — deferred to #194.)
+    // (b) A builtin type name used as a constructor (`Vector2(`, `Color(`, `Callable(`).
+    if let Some(sigs) = builtin_constructor_sigs(state, name, arg_index) {
+        return Some(sigs);
+    }
     // (c) A method on the implicit-self class (own / inherited project method, else the native
     // root the chain bottoms out in).
     resolve_self_method(state, text, fid, name)
+}
+
+/// Per-overload signatures for a bare builtin-type callee (`Vector2(`, `Color(`, `Callable(`) —
+/// #257. `None` when `name` isn't a builtin type, so the caller falls through to the self-method
+/// arm.
+///
+/// **A deliberate deviation from Godot, not an oversight.** Godot's own language server returns
+/// `null` here (verified against the headless 4.6.3 oracle at every argument position): its
+/// constructor-overload arghints live in the COMPLETION path (`gdscript_editor.cpp:3411-3427`),
+/// because that is where the Godot editor's call-hint popup is fed from. #194 ported that surface
+/// faithfully and it stays exactly as it was. But a generic client renders parameter hints from
+/// `signatureHelp` and nowhere else, and `Vector2(` / `Color(` are among the most-typed calls in
+/// the language — so under #30 ("generic LSP first; Godot-specific data additive, never instead")
+/// the same dump data is served here too. Purely additive: no analyzer behaviour moves, and the
+/// completion arghints are untouched.
+///
+/// Overload selection mirrors Godot's completion filter: skip every overload whose arity the
+/// active argument index overruns (`arg_idx >= arguments.size()`, `gdscript_editor.cpp:3417`),
+/// which drops the no-arg overload as soon as anything is typed. Where Godot then shows nothing,
+/// this keeps the popup alive: if the filter empties the set — the user typed past every
+/// overload's arity, an error state mid-edit — every overload is offered with the widest first, so
+/// the hint degrades to "here is the closest thing" instead of vanishing.
+fn builtin_constructor_sigs(state: &ServerState, name: &str, arg_index: usize) -> Option<Vec<Sig>> {
+    let db = &state.workspace.native;
+    let builtin = db.builtin_named(name)?;
+    if builtin.constructors.is_empty() {
+        return None;
+    }
+    let surviving: Vec<&gd_types::Constructor> = builtin
+        .constructors
+        .iter()
+        .filter(|ctor| arg_index < ctor.params.len())
+        .collect();
+    let sigs: Vec<Sig> = if surviving.is_empty() {
+        let mut all: Vec<&gd_types::Constructor> = builtin.constructors.iter().collect();
+        // Widest first so `activeSignature` = 0 points at the closest match to what was typed.
+        all.sort_by_key(|ctor| std::cmp::Reverse(ctor.params.len()));
+        all.into_iter()
+            .map(|ctor| Sig::from_builtin_constructor(db, name, ctor))
+            .collect()
+    } else {
+        surviving
+            .into_iter()
+            .map(|ctor| Sig::from_builtin_constructor(db, name, ctor))
+            .collect()
+    };
+    Some(sigs)
 }
 
 /// `Type.new(` — the constructor of a native class or a project `class_name`, resolved from the
@@ -859,6 +905,26 @@ impl Sig {
         }
         if u.is_vararg {
             b.vararg();
+        }
+        b.finish(None)
+    }
+
+    /// Build a signature from one builtin-type constructor overload (#257). `Variant::get_constructor_list`
+    /// sets `mi.name = mi.return_val.type = type`, so the faithful `_make_arguments_hint` label
+    /// reads `Type Type(args)` — the same shape #194 renders on the completion arghint surface, so
+    /// the two never disagree about an overload. Constructors carry no per-overload description in
+    /// the dump, so `doc` is `None` (as with `from_utility`), and none is a vararg.
+    fn from_builtin_constructor(
+        db: &gd_types::NativeDb,
+        type_name: &str,
+        ctor: &gd_types::Constructor,
+    ) -> Sig {
+        let mut b = LabelBuilder::new(format!("{type_name} {type_name}("));
+        for (i, p) in ctor.params.iter().enumerate() {
+            b.sep(i);
+            let pname = db.name_of(p.name);
+            let pty = db.display_type(&p.ty, None);
+            b.param(&format!("{pname}: {pty}"));
         }
         b.finish(None)
     }
