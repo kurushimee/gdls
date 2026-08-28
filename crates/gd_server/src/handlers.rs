@@ -1203,7 +1203,7 @@ fn render_hover(
     // #258: the same, for a PROJECT `class_name` — the file whose head-class `##` doc the hover
     // should render (the declaration site `class_name DocWidget` and every use site
     // `DocWidget.new()` both land on the registry arm below, which used to emit a bare name).
-    let mut script_class_lookup: Option<gd_project::FileId> = None;
+    let mut script_class_lookup: Option<(gd_project::FileId, Vec<String>)> = None;
 
     // Highest precedence — the cursor is directly on a *type name*. The analyzer pins the resolved
     // type on the enclosing class / `extends` node (often the script's own `<Script #N>` meta), not
@@ -1223,7 +1223,11 @@ fn render_hover(
                     class,
                 ))
             } else if let Some(entry) = state.workspace.index.registry().get(&ident.name) {
-                script_class_lookup = state.workspace.index.file_id(&entry.path);
+                script_class_lookup = state
+                    .workspace
+                    .index
+                    .file_id(&entry.path)
+                    .map(|f| (f, Vec::new()));
                 Some(ident.name.clone())
             } else {
                 None
@@ -1247,6 +1251,16 @@ fn render_hover(
             md.push_str("```");
             if dt.kind == DtKind::Native && !dt.native_type.is_empty() {
                 native_lookup = Some(dt.native_type.clone());
+            }
+            // #277: a script class named in a TYPE position (`func f(i: VfDoc.Inner)`) has no
+            // registry entry for its inner segment, so the leaf-label arm above never fires and the
+            // hover was a bare `VfDoc.Inner`. The analyzer pinned a Script type here — follow its
+            // `(file, inner)` to the declaring `Interface` and render that class's `##` doc, the
+            // same body the expression-position hover (`VfDoc.Inner.new()`) already shows.
+            if dt.kind == DtKind::Script && script_class_lookup.is_none() {
+                if let Some(sr) = &dt.script_type {
+                    script_class_lookup = Some((sr.file, sr.inner.clone()));
+                }
             }
         }
     }
@@ -1283,12 +1297,9 @@ fn render_hover(
     // #258: a project class's own `##` doc — brief, long form, `@tutorial` links, and the
     // `@deprecated` / `@experimental` banner. Read from the declaring file's `Interface`, so a
     // cross-file use site renders the same body as the declaration site.
-    if let Some(fid) = script_class_lookup {
-        if let Some(doc) = state
-            .workspace
-            .index
-            .interface(fid)
-            .and_then(|i| i.doc.as_deref())
+    if let Some((fid, inner)) = script_class_lookup {
+        if let Some(doc) =
+            iface_at_inner(&state.workspace.index, fid, &inner).and_then(|i| i.doc.as_deref())
         {
             crate::docs::append_class_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
         }

@@ -503,3 +503,36 @@ fn the_new_prose_survives_the_plaintext_downgrade() {
 
     common::shutdown(&client, server_thread);
 }
+
+/// #277: an inner class named in a TYPE position (`func f(i: Outer.Inner)`) has no `class_name`
+/// registry entry for its `Inner` segment, so the leaf-label hover arm never fired and the body was
+/// a bare `DocWidget.Inner`. The analyzer pinned a Script type there — following it to the
+/// declaring interface renders the same doc the expression position (`DocWidget.Inner.new()`)
+/// already showed.
+#[test]
+fn an_inner_class_in_a_type_position_carries_its_doc() {
+    let p = common::sample_project();
+    p.write("src/docw.gd", DOCUMENTED_SRC);
+    let use_src = "extends Node\n\nfunc take(i: DocWidget.Inner) -> void:\n\tprint(i)\n";
+    p.write("src/typepos.gd", use_src);
+    let (client, server_thread) = boot(&p, hover_caps(vec![MarkupKind::Markdown]));
+    let decl = file_uri(&p.root.join("src/docw.gd"));
+    let usage = file_uri(&p.root.join("src/typepos.gd"));
+    did_open(&client, &decl, DOCUMENTED_SRC);
+    did_open(&client, &usage, use_src);
+
+    let (_, value) = hover_at(&client, 30, &usage, 2, 25); // `Inner` in `i: DocWidget.Inner`
+    assert!(
+        value.contains("A nested helper."),
+        "the inner class's doc in a type annotation: {value}"
+    );
+
+    // The outer segment of the same annotation still renders the head class's doc.
+    let (_, value) = hover_at(&client, 31, &usage, 2, 15); // `DocWidget`
+    assert!(
+        value.contains("A documented widget."),
+        "the outer segment keeps the head-class doc: {value}"
+    );
+
+    common::shutdown(&client, server_thread);
+}

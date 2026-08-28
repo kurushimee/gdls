@@ -328,7 +328,10 @@ pub(crate) struct SignatureHelpCaps {
 }
 
 impl ClientCaps {
-    fn negotiate(caps: &lsp_types::ClientCapabilities) -> Self {
+    /// `raw` is the client's `capabilities` object exactly as it arrived. Everything reads through
+    /// the typed `caps` except [`Self::diagnostic_refresh_support`], whose standard key lsp-types
+    /// 0.97 misspells — see there.
+    fn negotiate(caps: &lsp_types::ClientCapabilities, raw: &serde_json::Value) -> Self {
         let td = caps.text_document.as_ref();
         ClientCaps {
             hierarchical_document_symbols: td
@@ -401,14 +404,24 @@ impl ClientCaps {
                 .and_then(|w| w.workspace_edit.as_ref())
                 .and_then(|w| w.document_changes)
                 .unwrap_or(false),
-            // #255: same optional-path convention. `workspace.diagnostics` is the 3.17 pull
-            // block; `refreshSupport` there is the client saying it can re-pull on demand.
-            diagnostic_refresh_support: caps
-                .workspace
-                .as_ref()
-                .and_then(|w| w.diagnostic.as_ref())
-                .and_then(|d| d.refresh_support)
-                .unwrap_or(false),
+            // #255/#277: `workspace.diagnostics.refreshSupport` — PLURAL, per LSP 3.17. lsp-types
+            // 0.97 names the field `workspace.diagnostic` (singular), which under its
+            // `rename_all = "camelCase"` deserializes the wrong wire key, so the typed path is
+            // blind to what VS Code, Neovim, Zed and Sublime actually send (all four of the
+            // captured client profiles use the plural). Read the spec key off the raw object and
+            // keep the typed field as a fallback for any client that follows lsp-types instead.
+            diagnostic_refresh_support: raw
+                .get("workspace")
+                .and_then(|w| w.get("diagnostics"))
+                .and_then(|d| d.get("refreshSupport"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_else(|| {
+                    caps.workspace
+                        .as_ref()
+                        .and_then(|w| w.diagnostic.as_ref())
+                        .and_then(|d| d.refresh_support)
+                        .unwrap_or(false)
+                }),
             semantic_tokens: SemanticTokensCaps::negotiate(caps),
             inlay_hint: InlayHintCaps::negotiate(caps),
             code_action: CodeActionCaps::negotiate(caps),
@@ -824,10 +837,13 @@ fn serve_inner(
 ) -> Result<SessionEnd> {
     // --- Lifecycle: split handshake so we can read the client's offered encodings first. ---
     let (init_id, init_value) = connection.initialize_start()?;
+    // Keep the RAW capabilities object alongside the typed one: lsp-types 0.97 misspells one
+    // standard key, and that key gates a real feature — see `ClientCaps::negotiate`.
+    let raw_caps = init_value.get("capabilities").cloned().unwrap_or_default();
     let init: InitializeParams = serde_json::from_value(init_value)?;
 
     let encoding = PositionEncoding::negotiate(&init.capabilities);
-    let caps = ClientCaps::negotiate(&init.capabilities);
+    let caps = ClientCaps::negotiate(&init.capabilities, &raw_caps);
     let options = InitializationOptions::parse(init.initialization_options.as_ref());
     let root = resolve_root(&options, &init);
 

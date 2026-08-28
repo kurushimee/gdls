@@ -364,23 +364,20 @@ fn body_only_dependency_edit_refreshes_the_dependent_on_both_channels() {
 
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
-    let init = InitializeParams {
-        capabilities: ClientCapabilities {
-            workspace: Some(lsp_types::WorkspaceClientCapabilities {
-                diagnostic: Some(lsp_types::DiagnosticWorkspaceClientCapabilities {
-                    refresh_support: Some(true),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-        initialization_options: Some(serde_json::json!({
+    // #277: hand-built JSON, not a serialized `InitializeParams`. LSP 3.17 spells this key
+    // `workspace.diagnostics.refreshSupport` (PLURAL) and every captured real client sends it that
+    // way; lsp-types 0.97 names the field `workspace.diagnostic`, so a typed round-trip here would
+    // exercise a wire key no editor sends and pass while the real one stayed blind.
+    let init = serde_json::json!({
+        "processId": serde_json::Value::Null,
+        "rootUri": serde_json::Value::Null,
+        "capabilities": { "workspace": { "diagnostics": { "refreshSupport": true } } },
+        "initializationOptions": {
             "projectRoot": p.root.as_str(),
             "autoDumpExtensionApi": false,
             "extensionApiPath": p.root.join("extension_api.json").as_str(),
-        })),
-        ..Default::default()
-    };
+        },
+    });
     client.sender.send(request(1, "initialize", init)).unwrap();
     assert!(recv_response(&client).error.is_none());
     client
