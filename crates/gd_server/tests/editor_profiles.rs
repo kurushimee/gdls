@@ -812,7 +812,12 @@ fn check_m10_projection(
     // Decode the flat 5-int stream `[deltaLine, deltaStart, length, tokenType, modifiers]` and collect
     // the set of token-type wire indices present. gdls emits the SERVER index for `method`, the same
     // for every profile that advertises it (proving emission is server-legend-indexed, not remapped).
-    let token_types: Vec<u64> = data.chunks_exact(5).filter_map(|c| c[3].as_u64()).collect();
+    let token_types: Vec<u64> = data
+        .as_chunks::<5>()
+        .0
+        .iter()
+        .filter_map(|c| c[3].as_u64())
+        .collect();
     if profile_advertises_method {
         assert!(
             token_types.contains(&server_method_index),
