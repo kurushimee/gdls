@@ -1184,7 +1184,12 @@ fn build_drop_annotation_edit(
 ///   * the ERROR BACKSTOP ([`edit_is_safe`]): apply the deletion to an in-memory copy and re-analyze;
 ///     withhold the fix if the deletion introduces ANY new error (e.g. removing a var that another
 ///     member's initializer / accessor still references), so a deletion that breaks the file is never
-///     offered. The warning fires only for a same-file private member, so the edit is single-file.
+///     offered. The warning fires only for a same-file private member, so the edit is single-file, and
+///   * the CROSS-FILE READ GATE ([`private_member_mentioned_cross_file`], #204): both gates above are
+///     single-file, but a private member can be read from another file through this script's type
+///     (`var a: A` then `a._x`) — a body-only read the eager `Interface` index cannot see. Deleting it
+///     does not error (a missing member on a script-class base degrades to `Variant`, faithfully) but
+///     silently de-types that consumer, so any cross-file mention that could be such a read refuses.
 ///
 /// The refuse decision runs HERE, at offer time, and the gated edit is carried EAGERLY in the action
 /// (not deferred to resolve) — so what the backstop proved safe is exactly what the client applies.
@@ -1207,6 +1212,18 @@ fn push_delete_private_var_action(
     if !edit_is_safe(state, uri, &edit) {
         return;
     }
+    // CROSS-FILE READ GATE (#204): the warning and the error backstop above are both SINGLE-FILE, so
+    // a private member read from ANOTHER file through this script's type (`var a: A` then `a._x`,
+    // both in function BODIES) is reported unused here, and deleting it silently de-types that
+    // consumer. Refuse when any other indexed file MENTIONS the name in a shape that could be such a
+    // read. Runs LAST — it is the only project-wide gate, so every cheaper in-file refusal short-
+    // circuits it and a parked cursor pays the scan only for a fix that is otherwise offerable.
+    let Some(name) = private_var_name(state, uri, diag) else {
+        return;
+    };
+    if private_member_mentioned_cross_file(state, uri, &name) {
+        return;
+    }
     out.push(CodeActionOrCommand::CodeAction(CodeAction {
         title: "Remove unused private variable".to_string(),
         kind: Some(CodeActionKind::QUICKFIX),
@@ -1214,6 +1231,102 @@ fn push_delete_private_var_action(
         edit: Some(edit),
         ..Default::default()
     }));
+}
+
+/// The declared NAME of the private `var` covering `diag`'s anchor — the identifier the #204
+/// cross-file gate searches other files for. `None` when the buffer is gone, no enclosing
+/// `Variable` covers the anchor, or the declaration has no identifier (a partial parse).
+fn private_var_name(state: &mut ServerState, uri: &Uri, diag: &Diagnostic) -> Option<String> {
+    let doc = state.vfs.get(uri.as_str())?;
+    let text = doc.text();
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+    let byte = mapper.position_to_byte(diag.range.start);
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
+    let var_id = enclosing_variable(&parsed.tree, byte)?;
+    let NodeKind::Variable(v) = &parsed.tree.get(var_id).kind else {
+        return None;
+    };
+    let ident = v.identifier?;
+    match &parsed.tree.get(ident).kind {
+        NodeKind::Identifier(i) => Some(i.name.clone()),
+        _ => None,
+    }
+}
+
+/// `true` iff any OTHER indexed project file mentions `name` in a shape that could READ this
+/// file's private member — the #204 gate. Fail-CLOSED: a mention refuses the delete-fix.
+///
+/// Why a text scan and not resolution: gdls is eager-interfaces / lazy-bodies, and a file's
+/// `Interface` records only interface-surface references (the `extends` head, member types, param
+/// types). A body-only `var a: A` + `a._x` is invisible to `name_referencers` AND to the dep graph
+/// (both fed from that same interface set), so no index query can see the consumer — verified
+/// empirically on the #204 repro (`name_referencers` came back empty while the fix was still
+/// offered). Confirming a hit by IDENTITY would need per-hit lazy analysis, what
+/// `textDocument/references` pays (its p99 is the slowest handler in the set) — far too much for an
+/// interactive lightbulb.
+///
+/// As a REFUSAL signal the prefilter alone is sound, because it is one-sided: a false hit only
+/// withholds a quickfix, it never applies a wrong edit. So the scan is text-only — no analysis, no
+/// per-hit resolution — and deliberately narrow enough not to withhold the fix on every project:
+/// only an ATTRIBUTE mention (`.name`, the only shape a cross-file read of a private member can
+/// take — a bare `name` in another file resolves in THAT file's own scope) or a QUOTED mention
+/// (`"name"` / `'name'`, the dynamic `get`/`set`/`call` payload Godot's own unused-warning sweep
+/// credits in-file) counts.
+///
+/// Remaining fail-OPEN holes are non-corrupting by construction (deleting a member that IS read
+/// cross-file does not error — a missing member on a script-class base degrades to `Variant`,
+/// faithfully: `gdscript_analyzer.cpp` `reduce_subscript`): a whitespace-separated `a . _x`, and a
+/// payload assembled at runtime (`obj.get("_" + suffix)`). Both are documented limitations.
+fn private_member_mentioned_cross_file(state: &mut ServerState, uri: &Uri, name: &str) -> bool {
+    let current_fid = crate::uri::uri_to_path(uri)
+        .as_deref()
+        .and_then(|p| state.workspace.index.file_id(p));
+    // Collect paths first (index borrow), then read text (VFS / disk borrow) so the borrows do not
+    // overlap — the same two-phase shape the references scan uses.
+    let paths: Vec<camino::Utf8PathBuf> = state
+        .workspace
+        .index
+        .iter_interfaces()
+        .filter(|(fid, _)| current_fid != Some(*fid))
+        .filter_map(|(fid, _)| state.workspace.index.path(fid).map(|p| p.to_path_buf()))
+        .collect();
+    for p in paths {
+        let text = crate::uri::path_to_file_uri(&p)
+            .and_then(|u| state.vfs.get(u.as_str()).map(|d| d.text()))
+            .or_else(|| std::fs::read_to_string(p.as_std_path()).ok());
+        // An unreadable candidate cannot be proven safe — refuse (fail-closed), same stance as the
+        // error backstop's unreadable-buffer arm.
+        let Some(text) = text else {
+            return true;
+        };
+        if text_mentions_member(&text, name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `true` iff `text` contains `name` as an ATTRIBUTE (`.name`) or a QUOTED payload (`"name"` /
+/// `'name'`), with a non-identifier byte after it so `_x` does not match inside `_xyz`. The
+/// text-only half of the #204 gate — see [`private_member_mentioned_cross_file`].
+fn text_mentions_member(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let end_ok = |i: usize| {
+        bytes
+            .get(i)
+            .is_none_or(|&b| !(b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80))
+    };
+    text.match_indices(name).any(|(pos, _)| {
+        let after = pos + name.len();
+        if !end_ok(after) {
+            return false;
+        }
+        match pos.checked_sub(1).map(|i| bytes[i]) {
+            Some(b'.') => true,
+            Some(q @ (b'"' | b'\'')) => bytes.get(after) == Some(&q),
+            _ => false,
+        }
+    })
 }
 
 /// Resolve the BYTE range to delete to remove the unused private `var` declaration covering `diag`'s
