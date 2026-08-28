@@ -2958,6 +2958,91 @@ fn rename_anon_enum_value_does_not_rewrite_unrelated_class_name() {
 }
 
 #[test]
+fn rename_161_anon_enum_decl_click_definition_leaks_the_class_but_rename_never_edits_it() {
+    // #161 (gate 2 of #159), the end-to-end companion to the `canonicalization_target` unit tests.
+    //
+    // The DECLARATION token of an anonymous-enum value is the one cursor shape that reaches
+    // `definition()`'s name-only step-2 class fallback: it is not a `Member::Enum`/`Constant`/… so
+    // the in-file member scan (step 1) skips it, and a declaration carries no `Binding::Use`, so the
+    // binding-projection steps (1.5/1.55/1.6) skip it too. `definition` therefore answers with the
+    // UNRELATED `class_name FOO` in another file — the leak the rename canonicalization backstop
+    // exists to reject.
+    //
+    // What this pins is the OUTCOME the backstop guarantees: whatever `definition` says, the rename
+    // never edits that class. Today the fail-closed firewall refuses this cursor outright (an
+    // anon-enum value's declaration token has no project anchor), which is why the backstop's reject
+    // arm is not reachable end-to-end and is unit-tested directly in `handlers::tests`. If a future
+    // change gives this cursor an anchor, the rename must still leave `class_name FOO` alone — this
+    // test then exercises the backstop for real rather than the refusal.
+    //   consumer.gd line 1 `enum { FOO }`  → anon-enum value DECL `FOO` at col 7 (the cursor)
+    //   foo.gd     line 0 `class_name FOO` → UNRELATED class decl at col 11 (must NEVER be edited)
+    let project = common::sample_project();
+    project.write(
+        "src/consumer.gd",
+        "extends Node\nenum { FOO }\nfunc go() -> int:\n\treturn FOO\n",
+    );
+    project.write("src/foo.gd", "class_name FOO\nextends Node\n");
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/consumer.gd", "src/foo.gd"],
+        2,
+    );
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+    let foo_uri = file_uri(&project.root.join("src/foo.gd"));
+
+    // `definition` on the anon-enum DECL token leaks the unrelated class (the step-2 name-only
+    // fallback). Asserted so this test fails loudly if the leak is ever closed — at which point the
+    // backstop's premise, and this test's framing, need revisiting.
+    let def_params = lsp_types::GotoDefinitionParams {
+        text_document_position_params: position_params(&consumer_uri, 1, 7),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: lsp_types::PartialResultParams::default(),
+    };
+    client
+        .sender
+        .send(request(310, "textDocument/definition", def_params))
+        .unwrap();
+    let def_resp = recv_response(&client);
+    let def: Option<GotoDefinitionResponse> =
+        serde_json::from_value(def_resp.result.expect("definition result")).unwrap();
+    assert!(
+        matches!(&def, Some(GotoDefinitionResponse::Scalar(loc)) if loc.uri == foo_uri),
+        "definition on the anon-enum decl token is expected to leak the unrelated `class_name FOO` \
+         (the name-only step-2 fallback the rename backstop guards); got {def:?}"
+    );
+
+    // The rename at the SAME cursor must not edit foo.gd — today by refusing outright.
+    client
+        .sender
+        .send(request(
+            311,
+            "textDocument/rename",
+            rename_params(&consumer_uri, 1, 7, "BAR"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    match resp.result {
+        None => assert!(
+            resp.error.is_some(),
+            "a rename that produces no edit must carry a typed refusal, never a silent null"
+        ),
+        Some(v) => {
+            let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v).unwrap());
+            assert!(
+                view.set.iter().all(|(u, _)| *u != foo_uri.as_str()),
+                "the rename must NEVER edit the unrelated `class_name FOO` in foo.gd \
+                 (wrong-symbol corruption); got {:?}",
+                view.set
+            );
+        }
+    }
+    shutdown(&client, server);
+}
+
+#[test]
 fn rename_class_name_from_expression_use_with_colliding_member_renames_the_class() {
     // The POSITIVE twin (case-2 of #159, reframed): when a bare identifier is SHADOWED by a project
     // `class_name`, it resolves to the CLASS faithfully (Godot `gdscript_analyzer.cpp:4563`
