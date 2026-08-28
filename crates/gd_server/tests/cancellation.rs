@@ -184,9 +184,10 @@ fn cancel_after_response_is_an_idempotent_noop() {
             .unwrap(),
         ))
         .unwrap();
-    let Message::Response(_first) = recv(&client) else {
-        panic!("expected a documentSymbol response");
-    };
+    // `recv_response` skips server-initiated notifications: this session has no
+    // `extensionApiPath`, so it also gets the one-time `window/showMessage` naming the embedded
+    // stock fallback (#259).
+    let _first = recv_response(&client);
 
     // Now cancel id 2 — the response has already been sent and `pending_requests` cleared, so
     // the cancel-arm warn-logs and drops with no double-response.

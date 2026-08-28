@@ -155,10 +155,17 @@ fn m0_lifecycle_diagnostics_and_symbols() {
         ))
         .unwrap();
 
-    let Message::Notification(note) = recv(&client) else {
-        panic!("expected a publishDiagnostics notification");
+    // Skip anything the server sends unprompted before the push — this session has no
+    // `extensionApiPath`, so it also gets the one-time `window/showMessage` naming the embedded
+    // stock fallback (#259). A conforming client tolerates server notifications in any order.
+    let note = loop {
+        let Message::Notification(note) = recv(&client) else {
+            panic!("expected a publishDiagnostics notification");
+        };
+        if note.method == "textDocument/publishDiagnostics" {
+            break note;
+        }
     };
-    assert_eq!(note.method, "textDocument/publishDiagnostics");
     let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
     assert!(
         diags.diagnostics.is_empty(),

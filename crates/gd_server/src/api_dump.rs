@@ -261,11 +261,16 @@ pub(crate) fn spawn_background_dump(
     }
 }
 
-/// The bundled stock-Godot class surface, gunzipped + ingested on demand. Regenerate the asset
-/// from a stock binary of the pinned reference version:
-/// `godot --headless --dump-extension-api` (no docs — types only, hover descriptions stay
-/// empty under the fallback), then minify + `gzip -9` to
-/// `assets/extension_api_4.6.3_stock.min.json.gz`.
+/// The bundled stock-Godot class surface, gunzipped + ingested on demand.
+///
+/// It carries the DOCUMENTATION fields (#259): this is the first-run path for a user who installs
+/// gdls with no Godot on `PATH`, and a docs-free asset gave them correct signatures with no prose
+/// anywhere in the engine surface — silently, with nothing saying why.
+///
+/// Regenerate with `scripts/regen-stock-api.py`, from a STOCK binary of the pinned reference
+/// version (`godot --headless --dump-extension-api-with-docs`, run outside any project so no
+/// GDExtension gets baked in). That script keeps exactly the fields `gd_types::api` reads and
+/// drops the GDExtension ABI sections gdls never touches, which pays for much of the prose.
 ///
 /// `None` only if the embedded bytes fail to decompress/parse — corrupt vendored asset, caught
 /// by `embedded_stock_db_loads` in CI — so callers degrade rather than unwrap.
@@ -692,8 +697,11 @@ mod tests {
 
     /// CI guard on the vendored asset: the embedded stock dump must decompress, parse, carry
     /// `Generic` provenance, contain the everyday classes whose absence caused the v1.0.1
-    /// first-run false-positive storm (issue #24), and ingest the full Variant utility set so the
-    /// canonical registry and the dump can never silently drift apart.
+    /// first-run false-positive storm (issue #24), ingest the full Variant utility set so the
+    /// canonical registry and the dump can never silently drift apart, and CARRY DOCUMENTATION
+    /// (#259) — a dump regenerated with `--dump-extension-api` instead of
+    /// `--dump-extension-api-with-docs` parses perfectly and silently empties every hover on the
+    /// first-run path, which is exactly the failure this pins.
     #[test]
     fn embedded_stock_db_loads() {
         let db = embedded_stock_db().expect("embedded stock dump must ingest");
@@ -704,6 +712,24 @@ mod tests {
                 "embedded stock dump is missing {class}"
             );
         }
+        // #259: prose at every level hover reads it from — the class itself, one of its methods,
+        // and one of its properties.
+        let node = db.class_named("Node").expect("Node is present");
+        assert!(
+            !node.brief_description.is_empty() && !node.description.is_empty(),
+            "the embedded dump must carry class documentation — regenerate it with \
+             `--dump-extension-api-with-docs` via scripts/regen-stock-api.py"
+        );
+        assert!(
+            node.methods
+                .iter()
+                .any(|m| db.name_of(m.name) == "add_child" && !m.description.is_empty()),
+            "the embedded dump must carry per-method documentation"
+        );
+        assert!(
+            node.properties.iter().any(|p| !p.description.is_empty()),
+            "the embedded dump must carry per-property documentation"
+        );
         // Every canonical Variant utility must survive the ingest path
         // (extension_api `utility_functions` → `NativeDb::utility`)...
         for name in gd_types::VARIANT_UTILITY_FUNCTIONS {
