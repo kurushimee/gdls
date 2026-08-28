@@ -38,8 +38,8 @@ pub use interface::{
 pub use model::{AutoloadTyping, LoadOutcome, ProjectModel};
 pub use paths::{path_to_res, res_to_path};
 pub use project_godot::{
-    classify, parse as parse_project_godot, Autoload, ProjectGodot, ResTarget, WarnLevel,
-    WarningConfig,
+    autoload_key_span, classify, parse as parse_project_godot, Autoload, ProjectGodot, ResTarget,
+    WarnLevel, WarningConfig,
 };
 pub use registry::{BaseRef, ClassEntry, ClassNameRegistry};
 pub use scene::{

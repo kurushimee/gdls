@@ -173,6 +173,74 @@ pub fn parse_with_confidence(text: &str) -> (ProjectGodot, f32) {
     (pg, confidence)
 }
 
+/// The byte range of the autoload NAME inside its `[autoload]` key line — the one place a
+/// singleton's name is DECLARED (`Global="*res://global.gd"`), and therefore the edit an autoload
+/// rename must make alongside the `.gd` occurrences (#157). Returns the range of the name TEXT only,
+/// so the `*` singleton marker, the quoting and the target path are all preserved by a replacement.
+///
+/// Fail-closed, because the caller is a mutating consumer: `None` unless EXACTLY ONE key in the
+/// `[autoload]` section names `name`. A key is recognized only in its unambiguous shape — a
+/// physical line in the `[autoload]` section whose text before the first `=` is `name` (bare, or
+/// double-quoted), and whose name is a plain identifier. A continuation line of a multi-line value
+/// therefore cannot be mistaken for a key, and a duplicated entry refuses rather than editing one of
+/// two.
+#[must_use]
+pub fn autoload_key_span(text: &str, name: &str) -> Option<std::ops::Range<usize>> {
+    if name.is_empty() || !is_config_identifier(name) {
+        return None;
+    }
+    let mut section = String::new();
+    let mut found: Option<std::ops::Range<usize>> = None;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let t = line.trim();
+        if t.is_empty() || t.starts_with(';') {
+            continue;
+        }
+        if let Some(sec) = t.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            section = sec.trim().to_owned();
+            continue;
+        }
+        if section != "autoload" {
+            continue;
+        }
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        let trimmed = key.trim();
+        // The key's own extent inside the line, then the name's extent inside the key (which strips
+        // a surrounding pair of quotes). Byte arithmetic on `line` — every offset is a real boundary
+        // because `trim`/`strip_prefix` only cut at ASCII delimiters.
+        let key_start = start + (trimmed.as_ptr() as usize - line.as_ptr() as usize);
+        let (name_text, name_start) =
+            match trimmed.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+                Some(inner) => (inner, key_start + 1),
+                None => (trimmed, key_start),
+            };
+        if name_text != name || !is_config_identifier(name_text) {
+            continue;
+        }
+        if found.is_some() {
+            return None; // duplicated entry — refuse rather than edit one of two
+        }
+        found = Some(name_start..name_start + name_text.len());
+    }
+    found
+}
+
+/// True for a plain `[A-Za-z_][A-Za-z0-9_]*` name — what an autoload singleton key is allowed to be
+/// (Godot registers it as a global identifier). Keeps [`autoload_key_span`] from matching a key that
+/// only LOOKS like the name after trimming.
+fn is_config_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn unquote(s: &str) -> String {
     let s = s.trim();
     s.strip_prefix('"')
@@ -352,5 +420,43 @@ gdscript/warnings/exclude_addons=true
              got {}",
             parse_with_confidence(garbage).1
         );
+    }
+
+    /// #157: the autoload key span is what a singleton rename rewrites, so it must cover the NAME
+    /// only — the `*` singleton marker, the quoting and the path all survive a replacement.
+    #[test]
+    fn autoload_key_span_covers_only_the_name() {
+        let text = "config_version=5\n\n[application]\n\nconfig/name=\"T\"\n\n\
+                    [autoload]\n\nGlobal=\"*res://global.gd\"\nOther=\"res://other.gd\"\n";
+        let span = autoload_key_span(text, "Global").expect("Global is declared");
+        assert_eq!(&text[span.clone()], "Global");
+        // Replacing exactly that range keeps the rest of the entry byte-for-byte.
+        let mut renamed = text.to_owned();
+        renamed.replace_range(span, "Settings");
+        assert!(renamed.contains("Settings=\"*res://global.gd\""));
+        assert!(renamed.contains("Other=\"res://other.gd\""));
+    }
+
+    /// A quoted key resolves to the name INSIDE the quotes (so the quotes survive), and a key
+    /// outside the `[autoload]` section is never matched — `config/name` is not an autoload.
+    #[test]
+    fn autoload_key_span_handles_quoting_and_section_scope() {
+        let text =
+            "[application]\n\nconfig/name=\"Global\"\n\n[autoload]\n\n\"Global\"=\"*res://g.gd\"\n";
+        let span = autoload_key_span(text, "Global").expect("Global is declared");
+        assert_eq!(&text[span.clone()], "Global");
+        assert_eq!(&text[span.start - 1..span.start], "\"");
+        assert!(autoload_key_span(text, "name").is_none());
+        assert!(autoload_key_span(text, "Missing").is_none());
+    }
+
+    /// Fail-closed for a mutating consumer: a duplicated entry refuses rather than editing one of
+    /// two, and a non-identifier name is never matched.
+    #[test]
+    fn autoload_key_span_refuses_ambiguity() {
+        let dup = "[autoload]\n\nGlobal=\"*res://a.gd\"\nGlobal=\"*res://b.gd\"\n";
+        assert!(autoload_key_span(dup, "Global").is_none());
+        assert!(autoload_key_span("[autoload]\n\nGlobal=\"*res://a.gd\"\n", "").is_none());
+        assert!(autoload_key_span("[autoload]\n\n1Bad=\"*res://a.gd\"\n", "1Bad").is_none());
     }
 }
