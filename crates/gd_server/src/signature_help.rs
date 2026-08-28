@@ -15,7 +15,10 @@
 //! - **Callee resolution** dispatches like `_find_call_arguments`: a `base.method(` subscript callee
 //!   resolves the base's type from the analysis (native / builtin / project-script method); a
 //!   `ClassName.new(` resolves the class's `_init`; a bare `name(` is a `@GlobalScope` utility, a
-//!   builtin constructor, or a method on the implicit-self class.
+//!   builtin constructor, or a method on the implicit-self class. One gdls addition on top of
+//!   `_find_call_arguments`: a `Callable`-typed base whose name is pinned to a lambda literal shows
+//!   THAT lambda's parameters for `.call(` / `.call_deferred(` — see [`lambda_call_sig`] for the
+//!   fail-closed rule and for why `.bind(` is left alone (#193).
 //!
 //! # Where parameter NAMES + DEFAULTS come from (the load-bearing constraint)
 //!
@@ -272,6 +275,14 @@ fn resolve_attribute_call(
         }
         DtKind::Builtin => {
             let bt = gd_analyze::data_type::variant_type_name(base_dt.builtin_type);
+            // A lambda-valued name's `.call(` shows the LAMBDA's parameters (#193); the native
+            // `Callable.call(...)` vararg signature it otherwise falls back to says nothing about
+            // what the call actually takes.
+            if bt == "Callable" {
+                if let Some(sig) = lambda_call_sig(tree, text, tokens, dot_idx, method) {
+                    return Some(sig);
+                }
+            }
             builtin_method_sig(state, bt, method)
         }
         DtKind::Script => {
@@ -322,6 +333,151 @@ fn call_target_at_open_paren(
         })
         .max_by_key(|(start, _)| *start)
         .map(|(_, callee)| callee.clone())
+}
+
+// ===================================================================================================
+// Lambda callees (#193).
+// ===================================================================================================
+
+/// `f.call(` / `f.call_deferred(` where `f` names a lambda — the signature of the LAMBDA the call
+/// forwards its arguments to, rendered as `ret call(p: T = def, …)` like any other callee.
+///
+/// The originating lambda is pinned **syntactically**, in the requesting file only. Godot's analyzer
+/// types every lambda as a bare `Callable` carrying no method info (`gdscript_analyzer.cpp:4683`,
+/// `reduce_lambda`) and gdls' port is faithful to that, so the base value's [`DataType`] cannot hold
+/// the lambda's identity — the same division of labour as Godot's own editor layer, which guesses an
+/// expression's shape in `gdscript_editor.cpp` rather than in the analyzer.
+///
+/// Fail-closed ("never lie"): the base must be a plain name whose binding at the call site is a `var`
+/// initialized with a lambda literal, and which no assignment ever rebinds — see [`lambda_bound_to`]
+/// for how the binding is pinned. Every refusal falls back to the honest native `Callable`
+/// signature: a parameter list belonging to some OTHER lambda is exactly the lie to avoid.
+///
+/// `bind` is deliberately NOT handled: `Callable.bind` appends its arguments to the END of the
+/// lambda's parameter list, so which parameter the cursor sits in depends on how many arguments the
+/// user will eventually bind — unknowable mid-typing, and a wrong `activeParameter` is a lie. Same
+/// for `callv`/`bindv`, whose single argument is an `Array`, not the lambda's parameter list.
+fn lambda_call_sig(
+    tree: &ParseTree,
+    text: &str,
+    tokens: &[Token],
+    dot_idx: usize,
+    method: &str,
+) -> Option<Vec<Sig>> {
+    if !matches!(method, "call" | "call_deferred") {
+        return None;
+    }
+    let base_idx = prev_meaningful(tokens, dot_idx)?;
+    let base = base_token_name_before(tokens, dot_idx)?;
+    let func = lambda_bound_to(tree, &base, tokens[base_idx].span.start)?;
+    Some(vec![Sig::from_lambda(tree, text, method, func)])
+}
+
+/// The lambda `name` holds at `base_byte`, under the fail-closed rule documented on
+/// [`lambda_call_sig`]. A LOCAL name resolves through the tree's scope-correct binding resolver
+/// (`ParseTree::resolve_local_binding_at`, the primitive the rename firewall trusts), so two
+/// functions each declaring their own `var f := func …` each get their own lambda; a name with no
+/// local binding in scope falls back to a class-level `var`, which must be the file's only member of
+/// that name. Either way a name the code REBINDS by assignment is refused: gdls does not track which
+/// assignment reaches the cursor, so the declared lambda may not be the one being called.
+fn lambda_bound_to<'a>(
+    tree: &'a ParseTree,
+    name: &str,
+    base_byte: usize,
+) -> Option<&'a gd_syntax::ast::FunctionNode> {
+    let decl_ident = match tree.resolve_local_binding_at(base_byte, name) {
+        Some(decl) => {
+            // Binding-correct: only THIS binding's own occurrences count as rebinds; a same-named
+            // local in a sibling block is a different symbol and is excluded by re-resolution.
+            let scope = crate::handlers::enclosing_function_span(tree, tree.get(decl).span.start)?;
+            let occurrences = tree.local_binding_occurrences(decl, scope);
+            if occurrences
+                .iter()
+                .any(|&span| is_assignment_target(tree, span))
+            {
+                return None;
+            }
+            decl
+        }
+        None => class_level_var_ident(tree, name)?,
+    };
+    let var = variable_declaring(tree, decl_ident)?;
+    let NodeKind::Lambda(l) = &tree.get(var.initializer?).kind else {
+        return None;
+    };
+    match &tree.get(l.function?).kind {
+        NodeKind::Function(f) => Some(f),
+        _ => None,
+    }
+}
+
+/// The declaration identifier of a class-level `var name` — the file's ONLY member of that name,
+/// declared outside every function (a `var` inside a function is a local, which the caller resolved
+/// first). `None` when the name isn't a unique class-level `var`, or when any assignment in the file
+/// rebinds it (`name = …` / `self.name = …` / `other.name = …`, all conservatively refused: a member
+/// has no scope narrower than the file to bound the scan).
+fn class_level_var_ident(tree: &ParseTree, name: &str) -> Option<gd_syntax::ast::NodeId> {
+    let mut found = None;
+    for id in tree.iter_ids() {
+        match &tree.get(id).kind {
+            NodeKind::Variable(v) => {
+                let Some(ident) = v.identifier else { continue };
+                if ident_text(tree, ident) != name {
+                    continue;
+                }
+                if crate::handlers::enclosing_function_span(tree, tree.get(id).span.start).is_some()
+                {
+                    return None; // a same-named local elsewhere — ambiguous, refuse
+                }
+                if found.is_some() {
+                    return None; // declared twice at class level (in an inner class, say)
+                }
+                found = Some(ident);
+            }
+            NodeKind::Assignment(a) if assignee_name(tree, a.assignee).as_deref() == Some(name) => {
+                return None
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// The `VariableNode` whose declaration identifier is `ident` — the `var` a resolved binding was
+/// declared by. `None` for a binding introduced by anything else (a parameter, a `for` variable, a
+/// `match` pattern), none of which can hold a lambda literal.
+fn variable_declaring(
+    tree: &ParseTree,
+    ident: gd_syntax::ast::NodeId,
+) -> Option<&gd_syntax::ast::VariableNode> {
+    tree.iter_ids().find_map(|id| match &tree.get(id).kind {
+        NodeKind::Variable(v) if v.identifier == Some(ident) => Some(v),
+        _ => None,
+    })
+}
+
+/// True when the identifier at `span` is the ASSIGNEE of an assignment (`name = …`) — the site that
+/// rebinds a name to a value its declaration never saw.
+fn is_assignment_target(tree: &ParseTree, span: gd_syntax::ByteSpan) -> bool {
+    tree.iter_ids().any(|id| match &tree.get(id).kind {
+        NodeKind::Assignment(a) => a.assignee.is_some_and(|aid| tree.get(aid).span == span),
+        _ => false,
+    })
+}
+
+/// The bare name an assignment's assignee writes to: the identifier for a plain write, the attribute
+/// for a `self.name` / `obj.name` write, `None` for an index write or a missing assignee.
+fn assignee_name(tree: &ParseTree, assignee: Option<gd_syntax::ast::NodeId>) -> Option<String> {
+    match &tree.get(assignee?).kind {
+        NodeKind::Identifier(i) => Some(i.name.clone()),
+        NodeKind::Subscript(sub) => match sub.access {
+            Some(gd_syntax::ast::SubscriptAccess::Attribute(Some(attr))) => {
+                Some(ident_text(tree, attr))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A bare `name(` — a `@GlobalScope` utility, a builtin constructor (`Vector2(`), or a method on the
@@ -722,6 +878,37 @@ impl Sig {
         doc: Option<String>,
     ) -> Sig {
         let ret = return_type_label(tree, src, func.return_type);
+        Sig::from_function_node_returning(tree, src, &ret, name, func, doc)
+    }
+
+    /// Build a lambda's signature under the callee name the call site used (`call` /
+    /// `call_deferred`, see [`lambda_call_sig`]). An UNANNOTATED lambda return renders as `Variant`,
+    /// not `_make_arguments_hint`'s `void` default: `Callable.call` yields whatever the lambda
+    /// returns, so claiming `void` would be a lie about the call's value. A lambda carries no `##`
+    /// doc, so there is no documentation to attach.
+    fn from_lambda(
+        tree: &ParseTree,
+        src: &str,
+        method: &str,
+        func: &gd_syntax::ast::FunctionNode,
+    ) -> Sig {
+        let ret = match func.return_type {
+            Some(_) => return_type_label(tree, src, func.return_type),
+            None => "Variant".to_string(),
+        };
+        Sig::from_function_node_returning(tree, src, &ret, method, func, None)
+    }
+
+    /// The shared body of [`Sig::from_function_node`] / [`Sig::from_lambda`]: the `ret name(…)`
+    /// label over `func`'s parameters, with the return label supplied by the caller.
+    fn from_function_node_returning(
+        tree: &ParseTree,
+        src: &str,
+        ret: &str,
+        name: &str,
+        func: &gd_syntax::ast::FunctionNode,
+        doc: Option<String>,
+    ) -> Sig {
         let mut b = LabelBuilder::new(format!("{ret} {name}("));
         for (i, &pid) in func.parameters.iter().enumerate() {
             b.sep(i);
