@@ -262,6 +262,10 @@ binary. No release cut.
   `gdls/progress/"gdls-out-0"` — lsp-server renders a string `RequestId`'s `Display` through `Debug`
   on purpose, and interpolating the outgoing id inherited that into a wire value. Tokens are opaque
   so nothing broke, but the quotes read back verbatim in client protocol logs.
+- **`textDocumentSync` advertised as options, not a bare kind** (#260): the number form said
+  nothing about `openClose` or `save`, and every per-file surface here is keyed on an open buffer.
+  Now `{ openClose: true, change: Incremental, save: { includeText: false } }` — `didSave` is
+  routed and mutates nothing, so the text is never resent, and neither `willSave` hook is claimed.
 
 ## [1.0.7] — 2026-06-13
 
