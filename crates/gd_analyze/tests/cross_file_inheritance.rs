@@ -962,3 +962,181 @@ func run() -> void:
         "b.field must record a Use against lib.gd inner class [\"Box\"]; got {field_uses:?}"
     );
 }
+
+// ============================================================================
+// #256 — member misses on a SCRIPT base
+// ============================================================================
+
+/// Policy with the named ignore-by-default codes turned on.
+fn policy_enabling(names: &[&str]) -> WarnPolicy {
+    let strict = StrictSettings {
+        enable_warnings: names.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    };
+    WarnPolicy::build(&gd_project::WarningConfig::default(), &strict)
+}
+
+fn analyze_file_with(
+    project: &Project,
+    consumer_path: &str,
+    src: &str,
+    policy: &WarnPolicy,
+) -> AnalysisResult {
+    let tree = parse(src).tree;
+    let native = native_db();
+    analyze(
+        &tree,
+        Some(project.fid(consumer_path)),
+        consumer_path,
+        &native,
+        project,
+        policy,
+    )
+}
+
+fn warning_messages(result: &AnalysisResult) -> Vec<String> {
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() != Severity::Error)
+        .map(|d| d.message().to_owned())
+        .collect()
+}
+
+/// #256, finishing #123's stated acceptance: a method miss on a `class_name` INSTANCE warns like
+/// the same miss on a native base does. It stays a warning, never an error — the interface view of
+/// another file is a shallow extract, so a gap in it must never become `Function not found`.
+///
+/// The base name is the script's `class_name`, not the `<Script #1>` placeholder `Display` renders
+/// (Godot's `DataType::to_string()` for SCRIPT, gdscript_parser.cpp:5321-5329).
+#[test]
+fn script_base_method_miss_warns_unsafe_method_access() {
+    let consumer = "\
+extends Node
+func go() -> void:
+\tvar d := BaseThing.new()
+\td.bogus()
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://c.gd", "")]);
+    let policy = policy_enabling(&["UNSAFE_METHOD_ACCESS"]);
+    let result = analyze_file_with(&project, "res://c.gd", consumer, &policy);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+    assert_eq!(
+        warning_messages(&result),
+        vec![r#"The method "bogus()" is not present on the inferred type "BaseThing" (but may be present on a subtype)."#.to_string()]
+    );
+}
+
+/// The property half of the same arm.
+#[test]
+fn script_base_property_miss_warns_unsafe_property_access() {
+    let consumer = "\
+extends Node
+func go() -> void:
+\tvar d := BaseThing.new()
+\tprint(d.bogus_prop)
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://c.gd", "")]);
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS"]);
+    let result = analyze_file_with(&project, "res://c.gd", consumer, &policy);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+    assert_eq!(
+        warning_messages(&result),
+        vec![r#"The property "bogus_prop" is not present on the inferred type "BaseThing" (but may be present on a subtype)."#.to_string()]
+    );
+}
+
+/// FP guard — the risk class. Every member the chain really carries stays silent: the class's own
+/// `var`/`const`/`signal`/`func`, and the members it inherits from its NATIVE root.
+#[test]
+fn real_script_chain_members_stay_silent() {
+    let consumer = "\
+extends Node
+func go() -> void:
+\tvar d := BaseThing.new()
+\tprint(d.hp)
+\tprint(d.SPEED)
+\td.boost(1)
+\td.ping.emit(1)
+\td.queue_free()
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://c.gd", "")]);
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS", "UNSAFE_METHOD_ACCESS"]);
+    let result = analyze_file_with(&project, "res://c.gd", consumer, &policy);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+    assert_eq!(warning_messages(&result), Vec::<String>::new());
+}
+
+/// FP guard: a member declared on a script the base itself extends resolves through the chain.
+#[test]
+fn inherited_script_chain_members_stay_silent() {
+    let mid = "class_name MidThing\nextends BaseThing\nvar extra := 1\n";
+    let consumer = "\
+extends Node
+func go() -> void:
+\tvar d := MidThing.new()
+\tprint(d.extra)
+\tprint(d.hp)
+\td.boost(1)
+";
+    let project = Project::new(&[
+        ("res://base.gd", BASE_GD),
+        ("res://mid.gd", mid),
+        ("res://c.gd", ""),
+    ]);
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS", "UNSAFE_METHOD_ACCESS"]);
+    let result = analyze_file_with(&project, "res://c.gd", consumer, &policy);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+    assert_eq!(warning_messages(&result), Vec::<String>::new());
+}
+
+/// FP guard: a chain whose root gdls cannot reach was never fully walked, so a miss in it proves
+/// nothing — silent regardless of policy.
+#[test]
+fn unwalkable_script_chain_stays_silent() {
+    let orphan = "class_name Orphan\nextends SomethingNobodyDeclares\n";
+    let consumer = "\
+extends Node
+func go() -> void:
+\tvar d := Orphan.new()
+\td.bogus()
+\tprint(d.bogus_prop)
+";
+    let project = Project::new(&[("res://orphan.gd", orphan), ("res://c.gd", "")]);
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS", "UNSAFE_METHOD_ACCESS"]);
+    let result = analyze_file_with(&project, "res://c.gd", consumer, &policy);
+    assert_eq!(warning_messages(&result), Vec::<String>::new());
+}
+
+/// Godot's policy contract: both codes are ignore-by-default, so the DEFAULT policy says nothing
+/// about either miss.
+#[test]
+fn script_base_misses_are_silent_under_the_default_policy() {
+    let consumer = "\
+extends Node
+func go() -> void:
+\tvar d := BaseThing.new()
+\td.bogus()
+\tprint(d.bogus_prop)
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://c.gd", "")]);
+    let result = analyze_file(&project, "res://c.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+    assert_eq!(warning_messages(&result), Vec::<String>::new());
+}
+
+/// A method miss emits the METHOD warning only — the callee's attribute reduction must not also
+/// fire the PROPERTY one for the same name.
+#[test]
+fn script_base_method_miss_does_not_double_report_as_a_property() {
+    let consumer = "\
+extends Node
+func go() -> void:
+\tvar d := BaseThing.new()
+\td.bogus()
+";
+    let project = Project::new(&[("res://base.gd", BASE_GD), ("res://c.gd", "")]);
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS", "UNSAFE_METHOD_ACCESS"]);
+    let result = analyze_file_with(&project, "res://c.gd", consumer, &policy);
+    assert_eq!(warning_messages(&result).len(), 1, "exactly one warning");
+}

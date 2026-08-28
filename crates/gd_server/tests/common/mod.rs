@@ -59,9 +59,31 @@ impl Default for TempProject {
     }
 }
 
-/// A minimal `extension_api.json`: `Object ← Node ← CanvasItem ← Node2D`.
+/// A minimal `extension_api.json`: `Object ← Node ← CanvasItem ← Node2D`, plus the handful of
+/// Variant utility functions the fixtures call.
+///
+/// A dump loaded from a path stamps [`gd_types::ApiProvenance::Exact`], which since #256 is the
+/// claim that a bare `name()` gdls cannot resolve genuinely does not exist. So a minimal dump has
+/// to carry the utilities its fixtures use, or every `print(...)` in them reads as a typo. Real
+/// `--dump-extension-api` output lists all 114; these are the ones the suite reaches for.
 pub const MINI_API: &str = r#"{
     "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+    "utility_functions": [
+        {"name": "print", "return_type": "void", "category": "general", "is_vararg": true, "hash": 1, "arguments": []},
+        {"name": "prints", "return_type": "void", "category": "general", "is_vararg": true, "hash": 2, "arguments": []},
+        {"name": "printerr", "return_type": "void", "category": "general", "is_vararg": true, "hash": 3, "arguments": []},
+        {"name": "push_error", "return_type": "void", "category": "general", "is_vararg": true, "hash": 4, "arguments": []},
+        {"name": "push_warning", "return_type": "void", "category": "general", "is_vararg": true, "hash": 5, "arguments": []},
+        {"name": "str", "return_type": "String", "category": "general", "is_vararg": true, "hash": 6, "arguments": []},
+        {"name": "typeof", "return_type": "int", "category": "general", "is_vararg": false, "hash": 7,
+         "arguments": [{"name": "variable", "type": "Variant"}]},
+        {"name": "is_instance_valid", "return_type": "bool", "category": "general", "is_vararg": false, "hash": 8,
+         "arguments": [{"name": "instance", "type": "Variant"}]},
+        {"name": "abs", "return_type": "Variant", "category": "math", "is_vararg": false, "hash": 9,
+         "arguments": [{"name": "x", "type": "Variant"}]},
+        {"name": "min", "return_type": "Variant", "category": "math", "is_vararg": true, "hash": 10, "arguments": []},
+        {"name": "max", "return_type": "Variant", "category": "math", "is_vararg": true, "hash": 11, "arguments": []}
+    ],
     "classes": [
         {"name": "Object"},
         {"name": "Node", "inherits": "Object"},

@@ -194,10 +194,14 @@ fn trimmed_fixture_ingests_variant_utilities() {
             "{name} must be in the canonical Variant-utility registry"
         );
     }
+    // #256 made a bare `name()` gdls cannot resolve an ERROR under `Exact` provenance, so the
+    // fixture now carries the dump's FULL utility list rather than a hand-picked nine — a trimmed
+    // list would have made every `typeof(…)` / `prints(…)` in the conformance corpus read as a
+    // typo. The count is the real 4.6.3 `utility_functions` length.
     assert_eq!(
         db.utility_count(),
-        9,
-        "trimmed fixture carries exactly its 9 utilities"
+        114,
+        "trimmed fixture carries the complete 4.6.3 utility surface"
     );
 }
 
