@@ -1540,6 +1540,91 @@ fn delete_fix_removes_annotated_private_var_whole() {
     shutdown(&client, t);
 }
 
+/// ADVERSARIAL (#204, cross-file read): the warning and the error backstop are both SINGLE-FILE, so a
+/// private member read from ANOTHER file through this script's `class_name` — `var a: A` then `a._x`,
+/// both in function BODIES, invisible to the interface index and the dep graph — is reported unused
+/// here. Deleting it does not error (a missing member on a script-class base degrades to `Variant`,
+/// faithfully) but silently de-types the consumer, so the delete-fix must be REFUSED.
+#[test]
+fn delete_fix_refused_when_a_private_member_is_read_cross_file() {
+    const SRC: &str = "class_name A\nextends Node\n\nvar _x = 1\n\nfunc f() -> void:\n\tprint(0)\n";
+    const CONSUMER: &str =
+        "extends Node\n\nfunc g() -> void:\n\tvar a: A = A.new()\n\tprint(a._x)\n";
+    let p = base_project();
+    p.write("consumer.gd", CONSUMER);
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diag_with_warning(&diags, "UNUSED_PRIVATE_CLASS_VARIABLE");
+
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Remove unused private variable").is_none(),
+        "the delete-fix must be REFUSED while another file reads `a._x` (deleting it silently \
+         de-types that consumer); got titles {:?}",
+        action_titles(&actions)
+    );
+    // The suppression is still offered — it changes nothing outside this file.
+    assert!(
+        find_action(&actions, "Ignore").is_some(),
+        "the suppression must still be offered; got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
+
+/// The #204 gate is fail-CLOSED and text-only, so it also refuses on a DYNAMIC read payload
+/// (`a.get("_x")`) — the shape Godot's own unused-warning sweep credits in-file — and on an
+/// attribute mention it cannot prove belongs to this script. Deliberate over-refusal: a false hit
+/// only withholds a quickfix, it never applies a wrong edit.
+#[test]
+fn delete_fix_refused_for_a_quoted_cross_file_payload() {
+    const SRC: &str = "class_name A\nextends Node\n\nvar _x = 1\n\nfunc f() -> void:\n\tprint(0)\n";
+    const CONSUMER: &str = "extends Node\n\nfunc g(a: A) -> void:\n\tprint(a.get(\"_x\"))\n";
+    let p = base_project();
+    p.write("consumer.gd", CONSUMER);
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diag_with_warning(&diags, "UNUSED_PRIVATE_CLASS_VARIABLE");
+
+    let actions = request_code_action(&client, 10, &uri, diag.range, vec![diag], None);
+    assert!(
+        find_action(&actions, "Remove unused private variable").is_none(),
+        "the delete-fix must be REFUSED while another file names `\"_x\"` as a dynamic payload; \
+         got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
+
+/// The gate must not swallow the fix wholesale: another file that merely mentions a LONGER name
+/// sharing the prefix (`a._x_ray`) or the bare word (`_x` as its own local) is not a read of THIS
+/// member, so the delete-fix is still offered and still deletes the declaration.
+#[test]
+fn delete_fix_still_offered_when_other_files_only_look_similar() {
+    const SRC: &str = "class_name A\nextends Node\n\nvar _x = 1\n\nfunc f() -> void:\n\tprint(0)\n";
+    const NEIGHBOR: &str =
+        "extends Node\n\nfunc g(a: A) -> void:\n\tprint(a._x_ray)\n\nfunc h() -> void:\n\tvar _x = 2\n\tprint(_x)\n";
+    let p = base_project();
+    p.write("neighbor.gd", NEIGHBOR);
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diag_with_warning(&diags, "UNUSED_PRIVATE_CLASS_VARIABLE");
+
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Remove unused private variable");
+    let patched = apply_text_edits(SRC, all_text_edits(&edit));
+    assert!(
+        !patched.contains("var _x"),
+        "the declaration must still be deleted when no other file READS it; got:\n{patched}"
+    );
+    shutdown(&client, t);
+}
+
 /// ADVERSARIAL (comment-overlap refusal): a trailing comment on the declaration line lives in an
 /// AST-invisible side-channel, so a line-range deletion would silently eat it. The delete-fix must be
 /// REFUSED when a comment overlaps the deletion range (the suppression is still offered).
