@@ -93,7 +93,33 @@ fn m0_lifecycle_diagnostics_and_symbols() {
         "server should negotiate UTF-8 when the client offers it"
     );
     // Exactly the v1 surface must be advertised.
-    assert!(caps.text_document_sync.is_some());
+    // #260: the OPTIONS form, not the bare Kind number — a client must be told that `didOpen`
+    // and `didClose` are wanted (every per-file surface here is keyed on an open buffer) rather
+    // than left to assume it, and that `didSave` does not need the text resent.
+    match caps.text_document_sync.as_ref().expect("sync advertised") {
+        lsp_types::TextDocumentSyncCapability::Options(o) => {
+            assert_eq!(o.open_close, Some(true), "openClose must be explicit");
+            assert_eq!(
+                o.change,
+                Some(lsp_types::TextDocumentSyncKind::INCREMENTAL),
+                "incremental sync is the contract the didChange handler implements"
+            );
+            assert_eq!(
+                o.save,
+                Some(lsp_types::TextDocumentSyncSaveOptions::SaveOptions(
+                    lsp_types::SaveOptions {
+                        include_text: Some(false)
+                    }
+                )),
+                "didSave is routed but mutates nothing, so the text must not be resent"
+            );
+            assert!(
+                o.will_save.is_none() && o.will_save_wait_until.is_none(),
+                "neither willSave hook is implemented; W15 forbids advertising them"
+            );
+        }
+        other => panic!("textDocumentSync must be the options form, got {other:?}"),
+    }
     assert!(caps.document_symbol_provider.is_some());
     assert!(caps.workspace_symbol_provider.is_some());
     assert!(caps.definition_provider.is_some());

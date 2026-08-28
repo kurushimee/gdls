@@ -2294,8 +2294,27 @@ fn capabilities(
 ) -> ServerCapabilities {
     ServerCapabilities {
         position_encoding: Some(encoding.to_kind()),
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(
-            TextDocumentSyncKind::INCREMENTAL,
+        // #260: the OPTIONS form, not the bare `TextDocumentSyncKind` number. Both are legal
+        // (`textDocumentSync?: TextDocumentSyncOptions | TextDocumentSyncKind`) and every
+        // mainstream client normalises the number to `{ openClose: true, change: N }` — but the
+        // number states nothing, and every per-file surface here is keyed on an OPEN buffer, so
+        // `openClose` is a hard requirement rather than something to leave a minimal client to
+        // assume. `save.include_text = false` is the truthful value: `didSave` is routed and
+        // deliberately mutates nothing (the buffer is already authoritative, `router.rs`), so
+        // re-sending the text would be pure waste. `will_save` / `will_save_wait_until` stay
+        // unset — not implemented, and W15 forbids advertising a surface with nothing behind it.
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            lsp_types::TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                will_save: None,
+                will_save_wait_until: None,
+                save: Some(lsp_types::TextDocumentSyncSaveOptions::SaveOptions(
+                    lsp_types::SaveOptions {
+                        include_text: Some(false),
+                    },
+                )),
+            },
         )),
         document_symbol_provider: Some(OneOf::Left(true)),
         // M7 (#58): the two genuinely long requests advertise workDoneProgress so clients send a
