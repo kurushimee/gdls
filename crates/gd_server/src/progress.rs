@@ -61,7 +61,12 @@ impl ProgressReporter {
             return Self::disabled();
         }
         let id = shared.next_outgoing_id();
-        let token = ProgressToken::String(format!("gdls/progress/{id}"));
+        // #265: `{id}` would go through lsp-server's Display, which Debug-quotes the string
+        // variant — the token is a wire value, so it takes the id's own text.
+        let token = ProgressToken::String(format!(
+            "gdls/progress/{}",
+            crate::router::SessionShared::request_id_text(&id)
+        ));
         let poisoned = shared.register_outgoing_create(id.clone());
         let create = lsp_server::Request {
             id,

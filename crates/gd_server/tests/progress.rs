@@ -128,6 +128,21 @@ fn cold_start_progress_is_one_cleanly_paired_token() {
         "exactly one begin"
     );
 
+    // #265: the token is a wire value, not a log line. lsp-server's `Display` for a string
+    // `RequestId` renders through `Debug` on purpose, so interpolating the outgoing id with
+    // `{id}` used to embed literal quotes: `gdls/progress/"gdls-out-0"`.
+    let ProgressToken::String(text) = &token else {
+        panic!("the cold-start token is server-minted and always a string; got {token:?}");
+    };
+    assert!(
+        !text.contains('"') && !text.contains('\\'),
+        "the progress token must carry the outgoing id's own text, with no Debug quoting: {text:?}"
+    );
+    assert!(
+        text.starts_with("gdls/progress/gdls-out-"),
+        "the token keeps its readable shape: {text:?}"
+    );
+
     shutdown(&client, server_thread);
 }
 

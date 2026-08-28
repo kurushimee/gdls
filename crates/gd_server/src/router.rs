@@ -165,6 +165,21 @@ impl SessionShared {
         RequestId::from(format!("gdls-out-{n}"))
     }
 
+    /// The id's own text, without lsp-server's `Display` quoting.
+    ///
+    /// `RequestId`'s `Display` renders the string variant through `Debug` on purpose, so a log
+    /// line can tell `92` from `"92"`. That is right for a log and wrong for anything that goes
+    /// on the wire: #265 shipped a progress token reading `gdls/progress/"gdls-out-0"`, quotes
+    /// included. Anywhere an id is EMBEDDED in a protocol value, use this instead of `{id}`.
+    pub(crate) fn request_id_text(id: &RequestId) -> String {
+        match serde_json::to_value(id) {
+            Ok(serde_json::Value::String(s)) => s,
+            // A numeric id has no quoting problem — `Value::to_string` renders it bare.
+            Ok(other) => other.to_string(),
+            Err(_) => id.to_string(),
+        }
+    }
+
     /// Register an outstanding `window/workDoneProgress/create` and hand back the poison flag
     /// the router sets when the client answers it with an error.
     pub(crate) fn register_outgoing_create(&self, id: RequestId) -> Arc<AtomicBool> {
