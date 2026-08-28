@@ -16,12 +16,17 @@
 /// Which prose flavor the client negotiated (`ClientCaps::hover_format`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum ProseFormat {
-    /// GitHub-Flavored Markdown. Also the default when the client advertises no
-    /// `hover.contentFormat` — a deliberate pragmatic choice (Claude Code, the primary v1
-    /// consumer, renders markdown); revisited against the captured editor profiles in the M7
-    /// exit harness.
-    #[default]
+    /// GitHub-Flavored Markdown. Sent only when the client ASKED for it.
     Markdown,
+    /// The floor (#261). A client that advertised no `contentFormat` / `documentationFormat` has
+    /// told the server nothing about what it can render, and `MarkupKind::PlainText` is the one
+    /// thing every client understands — sending markdown on that assumption surfaces raw
+    /// ``` fences and `**` in a popup that cannot render them. Every captured editor profile
+    /// (vscode, neovim, helix, zed, eglot, sublime) declares markdown explicitly, so this default
+    /// is reached only by a genuinely minimal client. Completion and signatureHelp already took
+    /// this floor via an explicit `unwrap_or`; making it the derived default puts hover on the
+    /// same footing and keeps the three from drifting apart again.
+    #[default]
     PlainText,
 }
 
