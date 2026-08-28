@@ -801,10 +801,14 @@ mod tests {
         // wait budget) don't hardcode `DEBOUNCE_QUIET_TIME`.
         let dir = tempfile::tempdir().expect("temp dir");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
-        let quiet = Duration::from_millis(200);
+        // A quiet window an order of magnitude longer than the burst it must swallow. The burst is
+        // ~60 ms of work on an idle machine; a GitHub runner has been seen stretching it past a
+        // second, so 1.5 s is what keeps the property MEASURABLE there instead of degenerating into
+        // "every write got its own window, nothing to coalesce".
+        let quiet = Duration::from_millis(1500);
         let watcher = FileWatcher::with_quiet_time(&root, quiet).expect("FileWatcher starts");
 
-        // Hammer one file far faster than the quiet-time: 12 writes over ~60 ms ≪ 200 ms window.
+        // Hammer one file far faster than the quiet-time: 12 writes over ~60 ms ≪ 1.5 s window.
         let target = dir.path().join("hammered.gd");
         const WRITES: usize = 12;
         let burst_start = Instant::now();
@@ -812,13 +816,8 @@ mod tests {
             std::fs::write(&target, format!("var x = {i}\n")).unwrap();
             std::thread::sleep(Duration::from_millis(5));
         }
-        // How long the burst ACTUALLY took. On an idle machine it is ~60 ms — comfortably inside one
-        // quiet window — but a loaded CI runner can stretch each 5 ms sleep by an order of magnitude,
-        // and a burst that spans several windows legitimately debounces into one batch PER WINDOW.
-        // Bounding by the measured span (rather than by the assumption that the burst fits in one
-        // window) keeps the contract exact on a healthy machine without failing a healthy debouncer
-        // on a stalled one.
-        let windows_spanned = (burst_start.elapsed().as_millis() / quiet.as_millis()) as usize + 1;
+        // How long the burst ACTUALLY took — the precondition for the coalescing assertion below.
+        let burst_span = burst_start.elapsed();
 
         // Drain debounced batches until the stream goes quiet (no batch for a full 300 ms after the
         // burst settles). Count only the events the watcher actually ACTS on — `classify_event`'s
@@ -830,10 +829,13 @@ mod tests {
         // classifier (`SkipReason::AccessOnly`) and are irrelevant to the reindex budget, yet on a
         // loaded CI runner ~2 Access events × 12 writes pushed the raw count to 24 — past `WRITES` —
         // and failed a perfectly-healthy debouncer. Classifying first measures the real contract.
+        // A batch can't arrive later than one quiet window after the last write, so a receive that
+        // waits longer than that and hears nothing means the stream has settled.
+        let settle = quiet + Duration::from_millis(500);
         let mut index_events_for_target = 0usize;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + settle * 4;
         while Instant::now() < deadline {
-            match watcher.events().recv_timeout(Duration::from_millis(300)) {
+            match watcher.events().recv_timeout(settle) {
                 Ok(Ok(batch)) => {
                     for ev in &batch {
                         for reaction in classify_event(ev, &root) {
@@ -854,12 +856,23 @@ mod tests {
             index_events_for_target >= 1,
             "the watcher must surface at least one index-affecting event for the hammered file"
         );
-        let allowed = (WRITES / 2).max(windows_spanned);
+        // The upper bound is only meaningful if the burst actually fit inside ONE quiet window. If
+        // the machine stalled hard enough to stretch it past that, each write got a window of its
+        // own and there was nothing to coalesce — not a debouncer failure, and not measurable. Say
+        // so and stop, rather than failing a healthy debouncer (the old flake).
+        if burst_span >= quiet {
+            eprintln!(
+                "coalescing bound skipped: the {WRITES}-write burst took {burst_span:?}, which is \
+                 not shorter than the {quiet:?} quiet window — nothing to coalesce"
+            );
+            return;
+        }
+        let allowed = WRITES / 2;
         assert!(
             index_events_for_target <= allowed,
             "the quiet-time must COALESCE the {WRITES}-write burst into far fewer index-affecting \
-             events; got {index_events_for_target}, allowed {allowed} ({windows_spanned} quiet \
-             window(s) spanned; no coalescing would yield ~{WRITES})"
+             events; got {index_events_for_target}, allowed {allowed} (the burst took \
+             {burst_span:?}, inside one {quiet:?} window; no coalescing would yield ~{WRITES})"
         );
     }
 }
