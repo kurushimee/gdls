@@ -163,26 +163,150 @@ pub(crate) fn bbcode_to(format: ProseFormat, input: &str) -> String {
 /// Append a converted doc paragraph below a signature block, rust-analyzer style: a `---` rule
 /// between fence and prose in markdown, a blank line in plaintext. Empty prose appends nothing.
 pub(crate) fn append_doc(out: &mut String, format: ProseFormat, bbcode: &str) {
-    let prose = bbcode_to(format, bbcode);
-    if prose.is_empty() {
+    append_block(out, format, &bbcode_to(format, bbcode));
+}
+
+/// The paragraph-appending half of [`append_doc`], for text that is already in the target flavor
+/// (a deprecation banner, a tutorial list) rather than raw BBCode. Empty text appends nothing;
+/// paragraphs after the first are separated by a blank line, so GFM renders them as the distinct
+/// paragraphs they are instead of running a brief into its long form.
+pub(crate) fn append_block(out: &mut String, format: ProseFormat, text: &str) {
+    if text.is_empty() {
         return;
     }
-    if format == ProseFormat::Markdown {
-        if !out.contains("\n---\n") {
-            out.push_str("\n\n---\n");
-        }
-        out.push('\n');
-        out.push_str(&prose);
+    if out.is_empty() {
+        // No signature block to separate from — this IS the body (completion documentation).
+        out.push_str(text);
+        return;
+    }
+    // The `---` rule separates a SIGNATURE FENCE from its prose (rust-analyzer's hover shape). A
+    // body with no fence — completion `documentation`, which is prose only — takes a blank line.
+    if format == ProseFormat::Markdown && out.contains("```") && !out.contains("\n---\n") {
+        // The rule already ends the line; one more newline opens the prose block.
+        out.push_str("\n\n---\n\n");
     } else {
         out.push_str("\n\n");
-        out.push_str(&prose);
+    }
+    out.push_str(text);
+}
+
+/// M11+ (#258): the doc body for one script member — its `##` prose, preceded by a
+/// deprecation / experimental banner when the doc comment carries `@deprecated` / `@experimental`.
+///
+/// The banner leads rather than trails: a reader who stops at the first line of a long hover still
+/// learns the member is on its way out. `bbcode_to` runs over the marker MESSAGE too, since
+/// `@deprecated: Use [method resize] instead.` is BBCode like the rest of the prose.
+pub(crate) fn append_member_doc(
+    out: &mut String,
+    format: ProseFormat,
+    doc: &gd_syntax::doc_comments::MemberDoc,
+) {
+    append_markers(
+        out,
+        format,
+        doc.is_deprecated,
+        &doc.deprecated_message,
+        doc.is_experimental,
+        &doc.experimental_message,
+    );
+    append_doc(out, format, &doc.description);
+}
+
+/// M11+ (#258): the doc body for one script class — the same banner, then the brief, then the long
+/// form when it differs (Godot splits a `##` block at its first blank line, so a one-paragraph doc
+/// has `brief == description` and must not render twice), then the `@tutorial` links.
+pub(crate) fn append_class_doc(
+    out: &mut String,
+    format: ProseFormat,
+    doc: &gd_syntax::doc_comments::ClassDoc,
+) {
+    append_markers(
+        out,
+        format,
+        doc.is_deprecated,
+        &doc.deprecated_message,
+        doc.is_experimental,
+        &doc.experimental_message,
+    );
+    append_doc(out, format, &doc.brief);
+    if doc.description != doc.brief {
+        append_doc(out, format, &doc.description);
+    }
+    append_tutorials(out, format, &doc.tutorials);
+}
+
+/// The `@tutorial` list: a markdown link list, or `title (url)` lines in plaintext — the same
+/// titled-link shape [`bbcode_to`] already gives `[url=…]…[/url]` in each flavor. An untitled
+/// `@tutorial: url` renders as the bare URL.
+fn append_tutorials(out: &mut String, format: ProseFormat, tutorials: &[(String, String)]) {
+    if tutorials.is_empty() {
+        return;
+    }
+    let md = format == ProseFormat::Markdown;
+    let mut block = if md {
+        String::from("**Tutorials**\n")
+    } else {
+        String::from("Tutorials\n")
+    };
+    for (title, url) in tutorials {
+        block.push_str("\n- ");
+        match (title.trim(), md) {
+            ("", true) => block.push_str(&format!("<{url}>")),
+            ("", false) => block.push_str(url),
+            (t, true) => block.push_str(&format!("[{t}]({url})")),
+            (t, false) => block.push_str(&format!("{t} ({url})")),
+        }
+    }
+    append_block(out, format, &block);
+}
+
+/// The deprecation / experimental banner lines, in declaration order (a member can carry both).
+fn append_markers(
+    out: &mut String,
+    format: ProseFormat,
+    deprecated: bool,
+    deprecated_message: &str,
+    experimental: bool,
+    experimental_message: &str,
+) {
+    if deprecated {
+        append_block(
+            out,
+            format,
+            &marker(format, "Deprecated", deprecated_message),
+        );
+    }
+    if experimental {
+        append_block(
+            out,
+            format,
+            &marker(format, "Experimental", experimental_message),
+        );
+    }
+}
+
+/// One banner line: `**Deprecated:** <message>` in markdown, `Deprecated: <message>` in plaintext,
+/// and `Deprecated.` when the doc comment gave no message.
+fn marker(format: ProseFormat, label: &str, message: &str) -> String {
+    let body = bbcode_to(format, message);
+    let md = format == ProseFormat::Markdown;
+    if body.is_empty() {
+        if md {
+            format!("**{label}.**")
+        } else {
+            format!("{label}.")
+        }
+    } else if md {
+        format!("**{label}:** {body}")
+    } else {
+        format!("{label}: {body}")
     }
 }
 
 /// Downgrade an assembled markdown hover body for a plaintext-only client: code fences and
-/// `---` rules drop, inline code/bold/italic markers strip, text survives. Deliberately a
-/// simplifier, not a markdown parser — hover bodies are assembled in-house and use a known
-/// subset.
+/// `---` rules drop, inline code/bold/italic markers strip, links flatten to `title (url)`, text
+/// survives. Deliberately a simplifier, not a markdown parser — hover bodies are assembled
+/// in-house and use a known subset.
 pub(crate) fn markdown_to_plaintext(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
     for line in md.lines() {
@@ -193,12 +317,70 @@ pub(crate) fn markdown_to_plaintext(md: &str) -> String {
         if trimmed == "---" {
             continue;
         }
-        let mut cleaned = line.replace("**", "");
+        let mut cleaned = flatten_links(line);
+        cleaned = cleaned.replace("**", "");
         cleaned = cleaned.replace('`', "");
         out.push_str(&cleaned);
         out.push('\n');
     }
     out.trim().to_string()
+}
+
+/// `[title](url)` → `title (url)` and `<url>` → `url`, matching the shapes [`bbcode_to`] emits for
+/// `[url]` tags in plaintext (#258 — the `@tutorial` list reaches a plaintext client through this
+/// downgrade, since hover bodies are always assembled as markdown).
+fn flatten_links(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(lb) = rest.find('[') {
+        // `[title](url)` only — an unmatched `[` or a `]` not followed by `(` stays verbatim.
+        let after = &rest[lb + 1..];
+        let Some(rb) = after.find(']') else {
+            break;
+        };
+        if !after[rb + 1..].starts_with('(') {
+            out.push_str(&rest[..lb + 1 + rb + 1]);
+            rest = &after[rb + 1..];
+            continue;
+        }
+        let paren = &after[rb + 2..];
+        let Some(close) = paren.find(')') else {
+            break;
+        };
+        out.push_str(&rest[..lb]);
+        out.push_str(&after[..rb]);
+        out.push_str(" (");
+        out.push_str(&paren[..close]);
+        out.push(')');
+        rest = &paren[close + 1..];
+    }
+    out.push_str(rest);
+    // A bare autolink carries no title to keep.
+    strip_autolinks(&out)
+}
+
+/// `<https://…>` → `https://…`; any other angle-bracketed run stays verbatim.
+fn strip_autolinks(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(lt) = rest.find('<') {
+        let after = &rest[lt + 1..];
+        let Some(gt) = after.find('>') else {
+            break;
+        };
+        let inner = &after[..gt];
+        out.push_str(&rest[..lt]);
+        if inner.contains("://") {
+            out.push_str(inner);
+        } else {
+            out.push('<');
+            out.push_str(inner);
+            out.push('>');
+        }
+        rest = &after[gt + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 enum Tag<'a> {
@@ -399,7 +581,97 @@ mod tests {
         );
         // A second paragraph joins below without a second rule.
         append_doc(&mut out, ProseFormat::Markdown, "More.");
-        assert!(out.ends_with("Does the **thing**.\nMore."));
+        assert!(out.ends_with("Does the **thing**.\n\nMore."));
+    }
+
+    #[test]
+    fn member_doc_leads_with_the_deprecation_banner() {
+        let doc = gd_syntax::doc_comments::MemberDoc {
+            description: "Grows the widget.".into(),
+            is_deprecated: true,
+            deprecated_message: "Use [method resize] instead.".into(),
+            ..Default::default()
+        };
+        let mut out = "```gdscript\nfunc grow()\n```".to_string();
+        append_member_doc(&mut out, ProseFormat::Markdown, &doc);
+        assert_eq!(
+            out,
+            "```gdscript\nfunc grow()\n```\n\n---\n\n**Deprecated:** Use `resize()` instead.\n\nGrows the widget."
+        );
+
+        let mut plain = String::new();
+        append_member_doc(&mut plain, ProseFormat::PlainText, &doc);
+        assert_eq!(
+            plain,
+            "Deprecated: Use resize() instead.\n\nGrows the widget."
+        );
+    }
+
+    #[test]
+    fn a_marker_without_a_message_still_renders() {
+        let doc = gd_syntax::doc_comments::MemberDoc {
+            description: "Prose.".into(),
+            is_experimental: true,
+            ..Default::default()
+        };
+        let mut out = String::new();
+        append_member_doc(&mut out, ProseFormat::Markdown, &doc);
+        assert!(out.contains("**Experimental.**"), "{out}");
+    }
+
+    #[test]
+    fn class_doc_renders_brief_long_form_and_tutorials_once() {
+        let doc = gd_syntax::doc_comments::ClassDoc {
+            brief: "A widget.".into(),
+            description: "The [b]long[/b] form.".into(),
+            tutorials: vec![
+                ("Widgets".into(), "https://example.com/w".into()),
+                (String::new(), "https://example.com/bare".into()),
+            ],
+            ..Default::default()
+        };
+        let mut out = "```gdscript\nDocWidget\n```".to_string();
+        append_class_doc(&mut out, ProseFormat::Markdown, &doc);
+        assert_eq!(
+            out,
+            "```gdscript\nDocWidget\n```\n\n---\n\nA widget.\n\nThe **long** form.\n\n**Tutorials**\n\n- [Widgets](https://example.com/w)\n- <https://example.com/bare>"
+        );
+
+        // A one-paragraph `##` block has `brief == description`; it must not render twice.
+        let single = gd_syntax::doc_comments::ClassDoc {
+            brief: "Only this.".into(),
+            description: "Only this.".into(),
+            ..Default::default()
+        };
+        let mut once = String::new();
+        append_class_doc(&mut once, ProseFormat::Markdown, &single);
+        assert_eq!(once.matches("Only this.").count(), 1, "{once}");
+    }
+
+    #[test]
+    fn the_plaintext_downgrade_flattens_the_tutorial_links() {
+        let doc = gd_syntax::doc_comments::ClassDoc {
+            brief: "A widget.".into(),
+            description: "A widget.".into(),
+            tutorials: vec![("Widgets".into(), "https://example.com/w".into())],
+            is_deprecated: true,
+            deprecated_message: "Gone in 2.0.".into(),
+            ..Default::default()
+        };
+        // Hover bodies are always assembled as markdown, then downgraded at the wire boundary.
+        let mut md = "```gdscript\nDocWidget\n```".to_string();
+        append_class_doc(&mut md, ProseFormat::Markdown, &doc);
+        assert_eq!(
+            markdown_to_plaintext(&md),
+            "DocWidget\n\n\nDeprecated: Gone in 2.0.\n\nA widget.\n\nTutorials\n\n- Widgets (https://example.com/w)"
+        );
+    }
+
+    #[test]
+    fn flatten_links_leaves_non_links_alone() {
+        assert_eq!(markdown_to_plaintext("array[0] = 1"), "array[0] = 1");
+        assert_eq!(markdown_to_plaintext("a <T> b"), "a <T> b");
+        assert_eq!(markdown_to_plaintext("[unclosed"), "[unclosed");
     }
 
     #[test]

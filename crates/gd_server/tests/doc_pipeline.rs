@@ -291,3 +291,215 @@ fn documented_class_members_survive_a_doc_only_edit() {
 
     common::shutdown(&client, server_thread);
 }
+
+// ===================================================================================================
+// #258 — the doc surfaces M7 left unwired: the file's own class, enums and enum values, non-`func`
+// members at a cross-file USE site, and the `@deprecated` / `@experimental` markers.
+// ===================================================================================================
+
+/// Every declaration kind that can carry a `##` block, plus a `@deprecated` member and a
+/// `@tutorial` link on the class.
+const DOCUMENTED_SRC: &str = "\
+## A documented widget.
+##
+## The [b]long[/b] form.
+##
+## @tutorial(Widgets): https://example.com/widgets
+class_name DocWidget
+extends Node
+
+## The widget's width.
+var width: int = 3
+
+## The upper bound.
+const LIMIT := 9
+
+## What a widget can be.
+enum Kind {
+\t## The first one.
+\tONE,
+\tTWO,
+}
+
+## Fired on change.
+signal changed(v: int)
+
+## Grows the widget.
+##
+## @deprecated: Use resize() instead.
+func grow(amount: int) -> void:
+\twidth += amount
+
+## A nested helper.
+class Inner:
+\t## The inner field.
+\tvar q := 1
+";
+
+const DOCUMENTED_USE_SRC: &str = "\
+extends Node
+
+func use_it(w: DocWidget) -> void:
+\tw.grow(1)
+\tprint(w.width, DocWidget.LIMIT, DocWidget.Kind.ONE)
+\tw.changed.connect(func(v): pass)
+\tvar i := DocWidget.Inner.new()
+\tprint(i.q)
+";
+
+/// Lay the pair down and open both, returning their URIs.
+fn documented_project() -> (
+    common::TempProject,
+    Connection,
+    std::thread::JoinHandle<anyhow::Result<()>>,
+    Uri,
+    Uri,
+) {
+    let p = common::sample_project();
+    p.write("src/docw.gd", DOCUMENTED_SRC);
+    p.write("src/docuse.gd", DOCUMENTED_USE_SRC);
+    let (client, server_thread) = boot(&p, hover_caps(vec![MarkupKind::Markdown]));
+    let decl = file_uri(&p.root.join("src/docw.gd"));
+    let usage = file_uri(&p.root.join("src/docuse.gd"));
+    did_open(&client, &decl, DOCUMENTED_SRC);
+    did_open(&client, &usage, DOCUMENTED_USE_SRC);
+    (p, client, server_thread, decl, usage)
+}
+
+/// Hovering the file's OWN `class_name` used to render a bare name. It now carries the head class's
+/// `##` block — brief, long form, and the `@tutorial` links — and so does every cross-file use of
+/// that class name, which reads the same `Interface`.
+#[test]
+fn the_files_own_class_name_hovers_with_its_doc() {
+    let (_p, client, server_thread, decl, usage) = documented_project();
+
+    let (_, value) = hover_at(&client, 10, &decl, 5, 12); // `DocWidget` in `class_name DocWidget`
+    assert!(
+        value.contains("A documented widget."),
+        "brief on the declaration: {value}"
+    );
+    assert!(
+        value.contains("The **long** form."),
+        "long form, converted: {value}"
+    );
+    assert!(
+        value.contains("[Widgets](https://example.com/widgets)"),
+        "@tutorial link: {value}"
+    );
+
+    let (_, value) = hover_at(&client, 11, &usage, 6, 11); // `DocWidget` in `DocWidget.Inner.new()`
+    assert!(
+        value.contains("A documented widget."),
+        "the same body at a cross-file use site: {value}"
+    );
+
+    common::shutdown(&client, server_thread);
+}
+
+/// A named enum and its values each carry their own `##` block. Neither reached hover before #258:
+/// the declaration scan skipped `Member::Enum` outright, and a value's doc is keyed by
+/// `(enum node, index)` rather than by declaration node.
+#[test]
+fn enums_and_enum_values_hover_with_their_docs() {
+    let (_p, client, server_thread, decl, usage) = documented_project();
+
+    let (_, value) = hover_at(&client, 12, &decl, 15, 6); // `Kind` in `enum Kind {`
+    assert!(value.contains("enum Kind"), "declaration line: {value}");
+    assert!(value.contains("What a widget can be."), "enum doc: {value}");
+
+    let (_, value) = hover_at(&client, 13, &decl, 17, 2); // `ONE`
+    assert!(value.contains("Kind.ONE"), "qualified value: {value}");
+    assert!(value.contains("The first one."), "value doc: {value}");
+
+    let (_, value) = hover_at(&client, 14, &usage, 4, 44); // `Kind` in `DocWidget.Kind.ONE`
+    assert!(
+        value.contains("What a widget can be."),
+        "cross-file enum doc: {value}"
+    );
+
+    let (_, value) = hover_at(&client, 15, &usage, 4, 49); // `ONE` in `DocWidget.Kind.ONE`
+    assert!(
+        value.contains("The first one."),
+        "cross-file enum-value doc: {value}"
+    );
+
+    common::shutdown(&client, server_thread);
+}
+
+/// M7 wired the doc through the CALL hover only, so a `var` / `const` / `signal` / inner `class`
+/// referenced from another file rendered a bare signature. All four now carry the declaring file's
+/// prose, like the method already did.
+#[test]
+fn non_func_members_carry_their_doc_at_a_cross_file_use_site() {
+    let (_p, client, server_thread, _decl, usage) = documented_project();
+
+    let (_, value) = hover_at(&client, 16, &usage, 4, 10); // `width` in `w.width`
+    assert!(value.contains("The widget's width."), "var: {value}");
+
+    let (_, value) = hover_at(&client, 17, &usage, 4, 27); // `LIMIT` in `DocWidget.LIMIT`
+    assert!(value.contains("The upper bound."), "const: {value}");
+
+    let (_, value) = hover_at(&client, 18, &usage, 5, 4); // `changed` in `w.changed.connect(…)`
+    assert!(value.contains("Fired on change."), "signal: {value}");
+
+    let (_, value) = hover_at(&client, 19, &usage, 6, 21); // `Inner` in `DocWidget.Inner.new()`
+    assert!(value.contains("class Inner"), "inner class line: {value}");
+    assert!(value.contains("A nested helper."), "inner class: {value}");
+
+    let (_, value) = hover_at(&client, 20, &usage, 7, 9); // `q` in `i.q`
+    assert!(value.contains("The inner field."), "inner field: {value}");
+
+    common::shutdown(&client, server_thread);
+}
+
+/// `@deprecated: msg` renders as a banner ABOVE the prose, at the declaration and at every use.
+#[test]
+fn a_deprecated_member_renders_its_marker_in_hover() {
+    let (_p, client, server_thread, decl, usage) = documented_project();
+
+    let (_, value) = hover_at(&client, 21, &decl, 27, 6); // `grow` in `func grow(...)`
+    assert!(
+        value.contains("**Deprecated:** Use resize() instead."),
+        "banner on the declaration: {value}"
+    );
+    let banner = value.find("**Deprecated:**").expect("banner");
+    let prose = value.find("Grows the widget.").expect("prose");
+    assert!(banner < prose, "the banner leads the prose: {value}");
+
+    let (_, value) = hover_at(&client, 22, &usage, 3, 4); // `grow` in `w.grow(1)`
+    assert!(
+        value.contains("**Deprecated:** Use resize() instead."),
+        "banner at the use site: {value}"
+    );
+
+    common::shutdown(&client, server_thread);
+}
+
+/// The plaintext downgrade covers the new prose too: no `**` on the banner, and the `@tutorial`
+/// link flattens to `title (url)` — the same shape `[url=…]` already takes in plaintext.
+#[test]
+fn the_new_prose_survives_the_plaintext_downgrade() {
+    let p = common::sample_project();
+    p.write("src/docw.gd", DOCUMENTED_SRC);
+    let (client, server_thread) = boot(&p, hover_caps(vec![MarkupKind::PlainText]));
+    let decl = file_uri(&p.root.join("src/docw.gd"));
+    did_open(&client, &decl, DOCUMENTED_SRC);
+
+    let (kind, value) = hover_at(&client, 23, &decl, 5, 12); // `class_name DocWidget`
+    assert_eq!(kind, "plaintext");
+    assert!(
+        value.contains("Widgets (https://example.com/widgets)"),
+        "flattened tutorial link: {value}"
+    );
+    assert!(!value.contains("]("), "no markdown link syntax: {value}");
+    assert!(!value.contains("**"), "no bold markers: {value}");
+
+    let (kind, value) = hover_at(&client, 24, &decl, 27, 6); // `func grow(...)`
+    assert_eq!(kind, "plaintext");
+    assert!(
+        value.contains("Deprecated: Use resize() instead."),
+        "plain banner: {value}"
+    );
+
+    common::shutdown(&client, server_thread);
+}

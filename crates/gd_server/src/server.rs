@@ -298,6 +298,12 @@ pub(crate) struct CompletionCaps {
     /// outside the negotiated set is dropped to `None` (the item still completes, just without an
     /// icon) rather than sent as an unknown number.
     pub(crate) kind_value_set: Option<Vec<lsp_types::CompletionItemKind>>,
+    /// `completionItem.tagSupport.valueSet` contains `Deprecated` (#258). When true, a member
+    /// whose `##` doc carries `@deprecated` ships `tags: [1]`; when false — the absent-capability
+    /// default — the same member ships the pre-3.15 `deprecated: true` boolean instead, so a
+    /// minimal client still strikes it through. Never both: `tags` supersedes the deprecated
+    /// boolean in LSP 3.15+, and sending both to a tag-aware client is redundant.
+    pub(crate) tag_support_deprecated: bool,
 }
 
 /// The `textDocument.signatureHelp` client capabilities gdls projects each signature against
@@ -567,6 +573,10 @@ impl CompletionCaps {
             kind_value_set: completion
                 .and_then(|c| c.completion_item_kind.as_ref())
                 .and_then(|k| k.value_set.clone()),
+            tag_support_deprecated: item.and_then(|i| i.tag_support.as_ref()).is_some_and(|t| {
+                t.value_set
+                    .contains(&lsp_types::CompletionItemTag::DEPRECATED)
+            }),
         }
     }
 }

@@ -224,7 +224,7 @@ zero stale-version edits.
   `@rpc`…) → `decorator`, `const` → `variable`+`readonly`, parameters → `parameter`, members →
   `property`, locals → `variable`, keywords/operators/literals only where the grammar layer is
   known-absent (`augmentsSyntaxTokens` respected). Modifiers: `declaration`, `definition`,
-  `readonly`, `static`, `defaultLibrary`, `deprecated`.
+  `readonly`, `static`, `defaultLibrary`, `deprecated` (the last from `## @deprecated`, see §7.2).
 - **inlayHint** (+resolve, refresh): inferred types on `:=` declarations, parameter names at call
   sites; both individually toggleable via configuration; off-by-default param-name hints for
   single-argument calls.
@@ -303,6 +303,20 @@ exists — e.g. into materialized stubs). Output kind selected per the client's
 `contentFormat`/`documentationFormat` order; plaintext fallback strips markup. Raw BBCode never
 appears on the wire (§3 W8). Hover shape follows the rust-analyzer convention: fenced
 ` ```gdscript ` signature block, `---`, prose.
+
+Every declaration that can carry a `##` block reaches every prose surface (#258), not just the
+`func` M7 wired first: the file's own head class (brief, long form, `@tutorial` links) on its
+`class_name` and on every cross-file use of that name; named enums and their values; and `var` /
+`const` / `signal` / inner `class` at a cross-file USE site, not only at the declaration.
+
+`@deprecated` / `@experimental` render as a banner ABOVE the prose (a reader who stops at the first
+line still learns the symbol is on its way out), and `@deprecated` additionally drives two non-prose
+signals: `CompletionItem.tags: [Deprecated]` — downgraded to the pre-3.15 `deprecated: true` boolean
+for a client that never advertised `completionItem.tagSupport`, never both — and the standard
+`deprecated` semantic-token modifier on the declaration and on every resolved use (member reads,
+call sites, class names), each read from the DECLARING file's `Interface`. Native symbols never
+carry either signal: `extension_api.json` (4.6.3, with or without docs) has no deprecation field, so
+there is nothing to claim one from.
 
 ### 7.3 Performance and scale
 

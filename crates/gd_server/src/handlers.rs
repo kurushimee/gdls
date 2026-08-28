@@ -1200,6 +1200,10 @@ fn render_hover(
     // declaration-fallback below still uses `leaf` so an `extends Node` keyword span resolves to
     // the `Node` class even when the analyzer pinned the type on the surrounding ClassNode.
     let mut native_lookup: Option<String> = None;
+    // #258: the same, for a PROJECT `class_name` — the file whose head-class `##` doc the hover
+    // should render (the declaration site `class_name DocWidget` and every use site
+    // `DocWidget.new()` both land on the registry arm below, which used to emit a bare name).
+    let mut script_class_lookup: Option<gd_project::FileId> = None;
 
     // Highest precedence — the cursor is directly on a *type name*. The analyzer pins the resolved
     // type on the enclosing class / `extends` node (often the script's own `<Script #N>` meta), not
@@ -1218,7 +1222,8 @@ fn render_hover(
                     &state.workspace.native,
                     class,
                 ))
-            } else if state.workspace.index.registry().get(&ident.name).is_some() {
+            } else if let Some(entry) = state.workspace.index.registry().get(&ident.name) {
+                script_class_lookup = state.workspace.index.file_id(&entry.path);
                 Some(ident.name.clone())
             } else {
                 None
@@ -1272,6 +1277,20 @@ fn render_hover(
     if let Some(name) = native_lookup {
         if let Some(class) = state.workspace.native.class_named(&name) {
             append_class_docs(&mut md, class);
+        }
+    }
+
+    // #258: a project class's own `##` doc — brief, long form, `@tutorial` links, and the
+    // `@deprecated` / `@experimental` banner. Read from the declaring file's `Interface`, so a
+    // cross-file use site renders the same body as the declaration site.
+    if let Some(fid) = script_class_lookup {
+        if let Some(doc) = state
+            .workspace
+            .index
+            .interface(fid)
+            .and_then(|i| i.doc.as_deref())
+        {
+            crate::docs::append_class_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
         }
     }
 
@@ -1364,13 +1383,10 @@ fn hover_member_signature(
             let mut md = String::from("```gdscript\n");
             md.push_str(&sig);
             md.push_str("\n```");
-            // M7 (#62): the declaring file's `##` doc for this member, BBCode → GFM.
+            // M7 (#62): the declaring file's `##` doc for this member, BBCode → GFM — with the
+            // `@deprecated` / `@experimental` banner since #258.
             if let Some(doc) = &decl.doc {
-                crate::docs::append_doc(
-                    &mut md,
-                    crate::docs::ProseFormat::Markdown,
-                    &doc.description,
-                );
+                crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
             }
             Some(md)
         }
@@ -1581,6 +1597,14 @@ fn hover_attribute_member_signature(
         }
         _ => None,
     });
+    // #258: `Owner.Kind.ONE` — a named enum's VALUE. The reducer records it as an
+    // `EnumValueLocal` use whose `target_name` is the QUALIFIED `"Kind.ONE"` (see
+    // `BindingTargetKind::EnumValueLocal`), so it is invisible to the bare-name member walk below;
+    // its doc lives on the declaring interface's `enums`, not its `members`.
+    if let Some(md) = hover_enum_value_use(state, analyzed, attr_span, name) {
+        return Some(md);
+    }
+
     let base_dt = analyzed.types.get(base_id);
     let direct_iface = if base_dt.kind == DtKind::Script {
         base_dt
@@ -1590,13 +1614,60 @@ fn hover_attribute_member_signature(
     } else {
         None
     };
+    // #258: an INNER CLASS reached as `Owner.Inner`. Inner classes live on `Interface::inner`,
+    // never in `members` (there is no `MemberKind::Class`), so the member walk below can't see one
+    // — its `##` doc reached hover only at its own declaration site.
+    if let Some(inner) = [binding_iface, direct_iface]
+        .into_iter()
+        .flatten()
+        .find_map(|i| {
+            i.inner
+                .iter()
+                .find(|c| c.class_name.as_deref() == Some(name))
+        })
+    {
+        let mut md = format!("```gdscript\nclass {name}\n```");
+        if let Some(doc) = inner.doc.as_deref() {
+            crate::docs::append_class_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
+        }
+        return Some(md);
+    }
+
+    // #258: a named enum reached as `Owner.Kind`. `format_member_signature` has no `Enum` shape
+    // (the analyzer's `<file>.Kind` meta label used to be the whole hover), so render the
+    // declaration line and the enum's own `##` doc here.
+    if let Some(iface) = [binding_iface, direct_iface]
+        .into_iter()
+        .flatten()
+        .find(|i| i.enums.iter().any(|e| e.name.as_str() == name))
+    {
+        let mut md = format!("```gdscript\nenum {name}\n```");
+        if let Some(doc) = iface
+            .members
+            .iter()
+            .find(|m| m.name.as_str() == name && m.kind == gd_project::MemberKind::Enum)
+            .and_then(|m| m.doc.as_deref())
+        {
+            crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
+        }
+        return Some(md);
+    }
+
     if let Some(decl) = [binding_iface, direct_iface]
         .into_iter()
         .flatten()
         .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))
     {
         let sig = format_member_signature(name, decl)?;
-        return Some(format!("```gdscript\n{sig}\n```"));
+        let mut md = format!("```gdscript\n{sig}\n```");
+        // #258: this path serves every NON-call member reference — `obj.width`, `Singleton.LIMIT`,
+        // `obj.sig`, an uncalled `obj.method`. It rendered the bare signature, so a `var`/`const`/
+        // `signal`'s `##` doc reached hover only at its declaration site while a `func`'s reached
+        // both (`hover_member_signature` already appended it).
+        if let Some(doc) = &decl.doc {
+            crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
+        }
+        return Some(md);
     }
 
     // v1.0.4 (#35): no project declaration — a Native (or Builtin) base reads the NativeDb:
@@ -1630,6 +1701,45 @@ fn hover_attribute_member_signature(
         }
         _ => None,
     }
+}
+
+/// #258: the use-site enum-value hover — `EnumName.VALUE` plus the value's `##` doc, resolved from
+/// the `EnumValueLocal` binding recorded at `site`. That binding's `target_name` is the QUALIFIED
+/// `"<Enum>.<value>"`, so the enum half also picks the right `EnumDecl` when one file declares two
+/// enums with a same-named value.
+fn hover_enum_value_use(
+    state: &ServerState,
+    analyzed: &AnalysisResult,
+    site: gd_syntax::span::ByteSpan,
+    name: &str,
+) -> Option<String> {
+    let (file, qualified) = analyzed.bindings().iter().find_map(|b| match b {
+        Binding::Use {
+            site: s,
+            target_file: Some(f),
+            target_kind: gd_analyze::BindingTargetKind::EnumValueLocal,
+            target_name,
+            ..
+        } if *s == site => Some((*f, target_name.clone())),
+        _ => None,
+    })?;
+    let (enum_name, value_name) = qualified.split_once('.')?;
+    if value_name != name {
+        return None;
+    }
+    let iface = state.workspace.index.interface(file)?;
+    let value = iface
+        .enums
+        .iter()
+        .find(|e| e.name.as_str() == enum_name)?
+        .values
+        .iter()
+        .find(|v| v.name.as_str() == value_name)?;
+    let mut md = format!("```gdscript\n{enum_name}.{value_name}\n```");
+    if let Some(doc) = value.doc.as_deref() {
+        crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
+    }
+    Some(md)
 }
 
 /// Render a [`gd_project::MemberDecl`]'s declaration shape — the one formatter behind both the
@@ -1674,6 +1784,34 @@ fn format_member_signature(name: &str, decl: &gd_project::MemberDecl) -> Option<
     Some(sig)
 }
 
+/// #258: the enum-value half of [`hover_declaration_signature`]. Renders `EnumName.VALUE` plus the
+/// value's own `##` doc when the cursor sits on a value identifier inside a NAMED `enum X { … }`.
+/// Unnamed enums are skipped: Godot attaches no per-value doc there (`doc_comments`'s
+/// `attach_enum_value_docs` is named-enums-only), and their values already hover as hoisted consts.
+fn hover_enum_value_declaration(tree: &ParseTree, leaf_id: NodeId, name: &str) -> Option<String> {
+    for enum_id in tree.iter_ids() {
+        let NodeKind::Enum(e) = &tree.get(enum_id).kind else {
+            continue;
+        };
+        // An UNNAMED enum has no identifier — skip it rather than ending the scan.
+        let Some(enum_name) = e.identifier.map(|i| ident_name(tree, i).to_owned()) else {
+            continue;
+        };
+        if enum_name.is_empty() {
+            continue;
+        }
+        let Some(idx) = e.values.iter().position(|v| v.identifier == Some(leaf_id)) else {
+            continue;
+        };
+        let mut md = format!("```gdscript\n{enum_name}.{name}\n```");
+        if let Some(doc) = tree.docs.enum_value_docs.get(&(enum_id, idx)) {
+            crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
+        }
+        return Some(md);
+    }
+    None
+}
+
 /// Declaration-site hover (issue #26): when the cursor is on the NAME identifier of a class-level
 /// declaration (`func`/`var`/`const`/`signal`/inner `class`), render that member's signature —
 /// previously the typed-ancestor fallback walked up to the enclosing class node and surfaced its
@@ -1696,6 +1834,12 @@ fn hover_declaration_signature(
     let name = ident_name(tree, leaf_id).to_owned();
     if name.is_empty() {
         return None;
+    }
+
+    // #258: the cursor is on a named enum's VALUE identifier. Its doc lives in `enum_value_docs`
+    // keyed by `(enum node, index)`, not `member_docs`, so it can't ride the member scan below.
+    if let Some(md) = hover_enum_value_declaration(tree, leaf_id, &name) {
+        return Some(md);
     }
 
     // The declaration whose name slot is exactly this identifier node, plus its OWNING class:
@@ -1727,7 +1871,14 @@ fn hover_declaration_signature(
                     NodeKind::Variable(v) => (*id, v.identifier == Some(leaf_id)),
                     _ => continue,
                 },
-                Member::Enum(_) | Member::EnumValue(_) | Member::Group(_) => continue,
+                // #258: a NAMED enum's own declaration. Unnamed-enum values (`Member::EnumValue`)
+                // and `@export_group` markers carry no doc — Godot never routes either through
+                // `parse_class_member` — so they still fall through.
+                Member::Enum(id) => match &tree.get(*id).kind {
+                    NodeKind::Enum(e) => (*id, e.identifier == Some(leaf_id)),
+                    _ => continue,
+                },
+                Member::EnumValue(_) | Member::Group(_) => continue,
             };
             if named_by_leaf {
                 decl = Some((mid, member, class_id));
@@ -1753,16 +1904,21 @@ fn hover_declaration_signature(
             }
         }
         let mut md = format!("```gdscript\n{sig}\n```");
-        // M7 (#62): the inner class's `##` doc (brief, then long form when distinct).
+        // M7 (#62): the inner class's `##` doc — brief, long form when distinct, tutorials, and
+        // the deprecation banner (#258), through the one class-doc renderer.
         if let Some(doc) = tree.docs.class_docs.get(&decl_id) {
-            crate::docs::append_doc(&mut md, crate::docs::ProseFormat::Markdown, &doc.brief);
-            if doc.description != doc.brief {
-                crate::docs::append_doc(
-                    &mut md,
-                    crate::docs::ProseFormat::Markdown,
-                    &doc.description,
-                );
-            }
+            crate::docs::append_class_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
+        }
+        return Some(md);
+    }
+
+    // #258: a named `enum X:` declaration renders from the AST like the inner-class arm — the
+    // interface walk below can't serve it (`format_member_signature` has no `Enum` shape, and the
+    // analyzer's `<Owner>.<Enum>` meta label carried no prose).
+    if let Member::Enum(_) = member {
+        let mut md = format!("```gdscript\nenum {name}\n```");
+        if let Some(doc) = tree.docs.member_docs.get(&decl_id) {
+            crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
         }
         return Some(md);
     }
@@ -1812,13 +1968,9 @@ fn hover_declaration_signature(
         }
     }
     let mut md = format!("```gdscript\n{sig}\n```");
-    // M7 (#62): the member's own `##` doc prose, BBCode → GFM.
+    // M7 (#62): the member's own `##` doc prose, BBCode → GFM, plus the #258 banner.
     if let Some(doc) = member_doc {
-        crate::docs::append_doc(
-            &mut md,
-            crate::docs::ProseFormat::Markdown,
-            &doc.description,
-        );
+        crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, &doc);
     }
     Some(md)
 }
@@ -7994,6 +8146,7 @@ pub fn semantic_tokens_full(
         &parsed.tree,
         Some(&analysis),
         &state.workspace.native,
+        Some(&state.workspace.index),
     );
     let data = crate::semantic_tokens::encode(&raw, &mapper, &state.caps.semantic_tokens.legend);
 
@@ -8034,6 +8187,7 @@ pub fn semantic_tokens_full_delta(
         &parsed.tree,
         Some(&analysis),
         &state.workspace.native,
+        Some(&state.workspace.index),
     );
     let data = crate::semantic_tokens::encode(&raw, &mapper, &state.caps.semantic_tokens.legend);
 
@@ -8093,6 +8247,7 @@ pub fn semantic_tokens_range(
         &parsed.tree,
         analysis.as_deref(),
         &state.workspace.native,
+        Some(&state.workspace.index),
     );
 
     // Filter to tokens intersecting the requested range, on the byte spans (before encoding, so the

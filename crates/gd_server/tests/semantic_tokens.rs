@@ -904,3 +904,115 @@ fn augments_syntax_tokens_true_and_false_are_identical() {
         "the fixture should still produce identifier tokens"
     );
 }
+
+// ===================================================================================================
+// #258 — the `deprecated` modifier, which the legend advertised but nothing ever emitted.
+// ===================================================================================================
+
+/// A library whose class, method, property and enum value are all `## @deprecated`, alongside
+/// undeprecated siblings that must stay unmarked.
+const DEP_LIB: &str = "\
+## A widget.
+##
+## @deprecated: Gone in 2.0.
+class_name DepWidget
+extends Node
+
+## @deprecated: Use resize().
+func grow() -> void:
+\tpass
+
+func keep() -> void:
+\tpass
+
+## @deprecated: Old.
+var width := 1
+
+var height := 2
+
+enum Kind {
+\t## @deprecated: Old value.
+\tONE,
+\tTWO,
+}
+";
+
+const DEP_USE: &str = "\
+extends Node
+
+func f(w: DepWidget) -> void:
+\tw.grow()
+\tw.keep()
+\tprint(w.width, w.height)
+\tvar other := DepWidget.new()
+\tprint(other)
+";
+
+fn has_deprecated(d: &Decoded) -> bool {
+    d.mods.iter().any(|m| m == "deprecated")
+}
+
+/// Every DECLARATION whose `##` block carries `@deprecated` gets the modifier — class, method,
+/// property, and enum member — and every undeprecated sibling keeps its modifier set unchanged.
+#[test]
+fn deprecated_declarations_carry_the_modifier() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let init = init_and_open_caps(
+        &p,
+        &client,
+        &[("src/deplib.gd", DEP_LIB)],
+        full_legend_caps(None),
+    );
+    let legend = server_legend(&init);
+    let uri = file_uri(&p.root.join("src/deplib.gd"));
+    let decoded = decode(&request_full(&client, 2, &uri), &legend);
+
+    assert!(has_deprecated(at(&decoded, 3, 11)), "class_name DepWidget");
+    assert!(has_deprecated(at(&decoded, 7, 5)), "func grow");
+    assert!(has_deprecated(at(&decoded, 14, 4)), "var width");
+    assert!(has_deprecated(at(&decoded, 20, 1)), "enum value ONE");
+
+    assert!(!has_deprecated(at(&decoded, 10, 5)), "func keep is clean");
+    assert!(!has_deprecated(at(&decoded, 16, 4)), "var height is clean");
+    assert!(
+        !has_deprecated(at(&decoded, 21, 1)),
+        "enum value TWO is clean"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A cross-file USE of a deprecated symbol carries it too — the call site, the property read, and
+/// the class name — read from the DECLARING file's interface, never from a name match.
+#[test]
+fn deprecated_cross_file_uses_carry_the_modifier() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let init = init_and_open_caps(
+        &p,
+        &client,
+        &[("src/deplib.gd", DEP_LIB), ("src/depuse.gd", DEP_USE)],
+        full_legend_caps(None),
+    );
+    let legend = server_legend(&init);
+    let uri = file_uri(&p.root.join("src/depuse.gd"));
+    let decoded = decode(&request_full(&client, 2, &uri), &legend);
+
+    assert!(has_deprecated(at(&decoded, 3, 3)), "w.grow() call site");
+    assert!(has_deprecated(at(&decoded, 5, 9)), "w.width read");
+    assert!(
+        has_deprecated(at(&decoded, 6, 14)),
+        "the DepWidget class name"
+    );
+
+    assert!(!has_deprecated(at(&decoded, 4, 3)), "w.keep() is clean");
+    assert!(
+        !has_deprecated(at(&decoded, 5, 18)),
+        "w.height read is clean"
+    );
+
+    shutdown(&client, server_thread);
+}

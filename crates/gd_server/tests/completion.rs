@@ -3105,3 +3105,129 @@ fn member_completion_on_inner_class_instance_lists_inner_members() {
 
     shutdown(&client, server_thread);
 }
+
+// ===================================================================================================
+// #258 — the deprecation signal on completion items.
+// ===================================================================================================
+
+/// The same capability bundle as [`rich_caps`], plus (or minus) `completionItem.tagSupport` for
+/// `Deprecated`. LSP 3.15 gates `CompletionItem.tags` on exactly this; a client without it still
+/// understands the older `deprecated` boolean.
+fn caps_with_tag_support(tags: bool) -> ClientCapabilities {
+    let mut c = rich_caps();
+    let item = c
+        .text_document
+        .as_mut()
+        .and_then(|t| t.completion.as_mut())
+        .and_then(|c| c.completion_item.as_mut())
+        .expect("completion item caps");
+    item.tag_support = tags.then(|| lsp_types::TagSupport::<lsp_types::CompletionItemTag> {
+        value_set: vec![lsp_types::CompletionItemTag::DEPRECATED],
+    });
+    c
+}
+
+const DEPRECATED_LIB: &str = "\
+class_name DepLib
+extends Node
+
+## Grows it.
+##
+## @deprecated: Use resize() instead.
+func grow() -> void:
+\tpass
+
+## Still fine.
+func keep() -> void:
+\tpass
+";
+
+/// A member whose `##` block carries `@deprecated` ships `tags: [Deprecated]` to a tag-aware
+/// client, and its `documentation` leads with the banner. Undeprecated siblings carry neither
+/// signal — the marker is only ever added on positive evidence.
+#[test]
+fn a_deprecated_member_item_carries_the_deprecated_tag() {
+    let p = sample_project();
+    p.write("src/deplib.gd", DEPRECATED_LIB);
+    let src = "extends Node\n\nfunc f(d: DepLib) -> void:\n\td.\n";
+    let uri = file_uri(&p.root.join("src/use.gd"));
+    p.write("src/use.gd", src);
+    let (client, server_thread) = boot(&p, caps_with_tag_support(true), &uri, src);
+
+    let raw = complete_raw(&client, 2, &uri, Position::new(3, 3));
+    let list: CompletionList = serde_json::from_value(raw).expect("CompletionList");
+    let grow = list
+        .items
+        .iter()
+        .find(|i| i.label == "grow")
+        .expect("`grow` offered");
+    assert_eq!(
+        grow.tags.as_deref(),
+        Some(&[lsp_types::CompletionItemTag::DEPRECATED][..]),
+        "tags: [Deprecated] for a tag-aware client"
+    );
+    #[allow(deprecated)]
+    {
+        assert!(
+            grow.deprecated.is_none(),
+            "never both signals: tags supersedes the boolean"
+        );
+    }
+
+    let keep = list
+        .items
+        .iter()
+        .find(|i| i.label == "keep")
+        .expect("`keep` offered");
+    assert!(keep.tags.is_none(), "an undeprecated sibling is unmarked");
+
+    // The banner rides the resolved documentation too.
+    client
+        .sender
+        .send(request(3, "completionItem/resolve", grow.clone()))
+        .unwrap();
+    let resolved: CompletionItem =
+        serde_json::from_value(recv_response(&client).result.expect("resolve result"))
+            .expect("CompletionItem");
+    let doc = match resolved.documentation.expect("documentation") {
+        lsp_types::Documentation::MarkupContent(m) => m.value,
+        lsp_types::Documentation::String(s) => s,
+    };
+    assert!(
+        doc.starts_with("**Deprecated:** Use resize() instead."),
+        "banner leads the documentation: {doc}"
+    );
+    assert!(
+        !doc.contains("---"),
+        "no stray rule: documentation is prose, not a signature block: {doc}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A client that never advertised `tagSupport` gets the pre-3.15 `deprecated: true` boolean
+/// instead, so it can still strike the item through.
+#[test]
+fn a_client_without_tag_support_gets_the_deprecated_boolean() {
+    let p = sample_project();
+    p.write("src/deplib.gd", DEPRECATED_LIB);
+    let src = "extends Node\n\nfunc f(d: DepLib) -> void:\n\td.\n";
+    let uri = file_uri(&p.root.join("src/use.gd"));
+    p.write("src/use.gd", src);
+    let (client, server_thread) = boot(&p, caps_with_tag_support(false), &uri, src);
+
+    let raw = complete_raw(&client, 2, &uri, Position::new(3, 3));
+    let list: CompletionList = serde_json::from_value(raw).expect("CompletionList");
+    let grow = list
+        .items
+        .iter()
+        .find(|i| i.label == "grow")
+        .expect("`grow` offered");
+    assert!(grow.tags.is_none(), "no tags without tagSupport");
+    #[allow(deprecated)]
+    {
+        assert_eq!(grow.deprecated, Some(true), "the pre-3.15 signal instead");
+    }
+
+    shutdown(&client, server_thread);
+}
