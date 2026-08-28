@@ -248,6 +248,17 @@ No release cut. Closes out every remaining tracker item — the issue tracker is
   burst actually fits inside one quiet window (#249, #252) — a stalled CI runner has nothing to
   coalesce, which was the long-standing flake.
 
+Generic-client conformance wave (#255–#265), merged 2026-08-29. Findings from an end-to-end
+verification of the release binary driven over stdio by a synthetic LSP client across four client
+capability profiles, with disputed analyzer behaviour cross-checked against the Godot 4.6.3-stable
+binary. No release cut.
+
+### Fixed
+- **`exit` without `shutdown` now exits 1** (#262): LSP 3.17 §exit reserves status 0 for the case
+  where the shutdown handshake completed, so a supervising client can tell a clean stop from an
+  abrupt one. gdls returned 0 either way. A transport close (stdin EOF, no `exit` at all) stays 0 —
+  the client leaving is not a protocol violation.
+
 ## [1.0.7] — 2026-06-13
 
 Follow-ups to the v1.0.6 utility-as-Callable hotfix, surfaced by its review (#92). Cut from
