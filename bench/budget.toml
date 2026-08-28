@@ -77,34 +77,36 @@ p50_ms = 11.1
 p99_ms = 17.2
 
 [completion]
-# textDocument/completion (M8 #64). ESTIMATED, NOT measured on the 2338-file calibration project
-# above -- this branch's only available fixture is the 3-file ~/dev/godot-test-project, whose
-# member-enumeration has no cross-file fan-out and would NOT be comparable to the rows above (same
-# machine + same large project is the whole point of this file). The operator's calibration walk
-# (the bench replay driver + scripts/summarize-spans.py on the large project) MUST recalibrate this.
+# textDocument/completion (M8 #64). MEASURED on the large calibration project (#99) — 298 samples.
 #
-# Basis for the estimate: completion is analysis-priced -- it runs `analyze_if_gd` to resolve the
-# base expression's type "exactly like hover" (server.rs dispatch; it is in the Hard-pressure shed
-# list), then enumerates + renders the resolved type's full member set. So it sits in the
-# warm_analyze / hover family on the analyze leg, plus member-enumeration + item-build on top of
-# hover's single-binding lookup. p50 tracks warm_analyze's cache-hit case; p99 adds the
-# enumeration/render cost over a large or import-heavy receiver to warm_analyze's full-pass p99.
-p50_ms = 0.3   # estimate: ~warm_analyze p50 (0.1) + member enumeration/render
-p99_ms = 6.0   # estimate: ~warm_analyze p99 (4.2) + enumeration over a wide member set
+# Capture (2026-08-28): the same 2414-`.gd` project as the rows above, walked with
+# `scripts/lsp-poke.py` on a release build with `GDLS_LOG_FORMAT=json`, then summarized by
+# `scripts/summarize-spans.py`. 101 files opened (spread evenly across the tree so cross-file
+# fan-out is real), then three member-access completions per file at existing `receiver.member`
+# sites — the analysis-priced path: `analyze_if_gd` resolves the base expression's type "exactly
+# like hover", then the resolved type's full member set is enumerated and rendered.
+#
+# NOT the same session as the rows above: this walk ran under WSL2 on the same CPU class, over a
+# script/scene-only copy of the tree (2414 `.gd` + 14017 `.tscn`, asset payloads excluded), so its
+# cold_index / reconcile / RSS legs are NOT comparable to the asset-heavy capture those rows come
+# from and were deliberately left alone. The two request rows below are per-request latencies on a
+# warmed index, which that difference does not touch.
+#
+# The old estimate (p50 0.3 / p99 6.0, anchored to warm_analyze) was close on the median and
+# conservative on the tail: p50 0.4, p95 1.6, p99 4.0, max 5.3.
+p50_ms = 0.4
+p99_ms = 4.0
 
 [signature_help]
-# textDocument/signatureHelp (M8 #65). ESTIMATED and UNMEASURABLE on this branch:
-# `feat/m8-completion-signaturehelp` carries completion only; the signatureHelp handler, its
-# `signatureHelpProvider` capability, and `signature_help.rs` live on the stacked
-# `feat/m8-signaturehelp` branch. There is nothing to drive or time here. This row MUST be
-# recalibrated by the operator's bench walk once that branch's hardening pass runs.
+# textDocument/signatureHelp (M8 #65). MEASURED on the same walk (#99) — 283 samples: three
+# call-argument positions per opened file, cursor just inside the `(`.
 #
-# Basis for the estimate: signatureHelp is also analysis-priced (it resolves the call receiver's
-# type to pick the active signature/parameter), so it is in the same warm_analyze/hover family as
-# completion but renders a single signature rather than the whole member set -- expected to be at or
-# below completion's cost. Placeholder mirrors completion pending real measurement.
-p50_ms = 0.3   # estimate: analysis-priced, ~completion (single-signature render)
-p99_ms = 6.0   # estimate: ~completion p99; recalibrate on the signatureHelp branch
+# Confirms the M8 reasoning that signatureHelp sits at or below completion: it resolves the call
+# receiver the same way but renders ONE signature instead of the whole member set — p50 0.1,
+# p95 0.8, p99 1.4, max 1.5, roughly a third of completion's tail. The old placeholder mirrored
+# completion's estimate (0.3 / 6.0).
+p50_ms = 0.1
+p99_ms = 1.4
 
 [memory]
 # Peak resident-set observed during the calibration walk via the WP-O2 RssSampler. baseline is
