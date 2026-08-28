@@ -410,6 +410,149 @@ fn multi_file_rewrite_only_resolving_literals() {
     shutdown(&client, thread);
 }
 
+/// #132 (const indirection): `const P := "res://a.gd"` consumed by `load(P)` in the same file is a
+/// load reference one hop away — the const's own literal is rewritten. The proof is positive: the
+/// name is declared exactly once in the file AND a load consumes it. A `res://` const that NO load
+/// consumes stays untouched (the module's "a value is never rewritten" rule).
+#[test]
+fn const_indirection_rewritten_only_when_a_load_consumes_it() {
+    let p = bare_project();
+    p.write("a.gd", "extends Node\n");
+    // b.gd: the const IS consumed by `load` → rewritten. The unconsumed const of the same path is
+    // in another file so the two cases can't share a literal.
+    let b_src =
+        "extends Node\nconst P := \"res://a.gd\"\nfunc f():\n\tvar x = load(P)\n\tprint(x)\n";
+    p.write("b.gd", b_src);
+    // c.gd: a `res://a.gd` const used only as a VALUE (compared, printed) → never rewritten.
+    let c_src =
+        "extends Node\nconst Q := \"res://a.gd\"\nfunc f(s: String) -> bool:\n\treturn s == Q\n";
+    p.write("c.gd", c_src);
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &["a.gd", "b.gd", "c.gd"]);
+    let view = flatten_edit(will_rename(&client, 10, &p, "a.gd", "renamed/a2.gd"));
+
+    let b_uri = file_uri(&p.root.join("b.gd")).as_str().to_string();
+    let c_uri = file_uri(&p.root.join("c.gd")).as_str().to_string();
+    assert!(
+        view.edits.iter().all(|(u, _, _)| u != &c_uri),
+        "a `res://` const no load consumes is a VALUE and must never be rewritten; got {:?}",
+        view.edits
+    );
+    let b_edit = view
+        .edits
+        .iter()
+        .find(|(u, _, _)| u == &b_uri)
+        .unwrap_or_else(|| {
+            panic!(
+                "the load-consumed const must be rewritten; got {:?}",
+                view.edits
+            )
+        });
+    let b_after = apply_edit_to(b_src, &b_edit.1, &b_edit.2);
+    assert!(
+        b_after.contains("const P := \"res://renamed/a2.gd\""),
+        "the const literal follows the move: {b_after}"
+    );
+    shutdown(&client, thread);
+}
+
+/// #132 (const indirection, fail-closed): a const whose name is declared MORE THAN ONCE in the file
+/// (a same-named local/parameter shadows it somewhere) cannot be trusted to mean the same thing at
+/// the load site, so it is NOT rewritten — a missed rewrite, never a wrong one.
+#[test]
+fn const_indirection_refused_when_the_name_is_declared_twice() {
+    let p = bare_project();
+    p.write("a.gd", "extends Node\n");
+    let b_src = "extends Node\nconst P := \"res://a.gd\"\nfunc f():\n\tvar P := \"res://other.gd\"\n\tvar x = load(P)\n\tprint(x)\n";
+    p.write("b.gd", b_src);
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &["a.gd", "b.gd"]);
+    let result = will_rename(&client, 10, &p, "a.gd", "renamed/a2.gd");
+    assert!(
+        result.is_null(),
+        "a shadowed const name must not be rewritten (fail-closed) — nothing else references \
+         a.gd, so the whole edit is null; got {result:?}"
+    );
+    shutdown(&client, thread);
+}
+
+/// #132 (`load` shadow): a file that declares its own `func load` is not calling the `@GlobalScope`
+/// utility, so its bare `load("res://…")` argument must NOT be rewritten — that literal belongs to a
+/// user method whose meaning gdls cannot know. `preload` (a dedicated AST node, unshadowable) in the
+/// same file is still rewritten.
+#[test]
+fn bare_load_skipped_in_a_file_that_declares_its_own_load() {
+    let p = bare_project();
+    p.write("a.gd", "extends Node\n");
+    let b_src = "extends Node\nconst A = preload(\"res://a.gd\")\nfunc load(path: String) -> String:\n\treturn path\nfunc f():\n\tprint(load(\"res://a.gd\"))\n";
+    p.write("b.gd", b_src);
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &["a.gd", "b.gd"]);
+    let view = flatten_edit(will_rename(&client, 10, &p, "a.gd", "renamed/a2.gd"));
+
+    assert_eq!(
+        view.edits.len(),
+        1,
+        "only the `preload` literal may be rewritten while `load` is shadowed; got {:?}",
+        view.edits
+    );
+    let after = apply_edit_to(b_src, &view.edits[0].1, &view.edits[0].2);
+    assert!(
+        after.contains("preload(\"res://renamed/a2.gd\")"),
+        "the preload literal follows the move: {after}"
+    );
+    assert!(
+        after.contains("print(load(\"res://a.gd\"))"),
+        "the shadowed `load` call's argument must be byte-identical: {after}"
+    );
+    shutdown(&client, thread);
+}
+
+/// #132 (other `ResourceLoader` forms): `ResourceLoader["load"](…)` (the same call by string index)
+/// and `ResourceLoader.load_threaded_request(…)` take their path in the same first-argument position
+/// and are rewritten. `other_obj.load(…)` still is not — the base name is matched precisely.
+#[test]
+fn resource_loader_index_and_threaded_forms_are_rewritten() {
+    let p = bare_project();
+    p.write("a.gd", "extends Node\n");
+    let b_src = "extends Node\nvar other_obj\nfunc f():\n\tResourceLoader[\"load\"](\"res://a.gd\")\n\tResourceLoader.load_threaded_request(\"res://a.gd\")\n\tother_obj.load(\"res://a.gd\")\n";
+    p.write("b.gd", b_src);
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &["a.gd", "b.gd"]);
+    let view = flatten_edit(will_rename(&client, 10, &p, "a.gd", "renamed/a2.gd"));
+
+    assert_eq!(
+        view.edits.len(),
+        2,
+        "the index form and the threaded request are rewritten, the foreign `.load` is not; got {:?}",
+        view.edits
+    );
+    // Apply from the LAST range backwards so earlier ranges stay valid.
+    let mut edits = view.edits.clone();
+    edits.sort_by(|a, b| cmp_range(&b.1, &a.1));
+    let mut after = b_src.to_string();
+    for (_, range, new_text) in &edits {
+        after = apply_edit_to(&after, range, new_text);
+    }
+    assert!(
+        after.contains("ResourceLoader[\"load\"](\"res://renamed/a2.gd\")"),
+        "the string-index form follows the move: {after}"
+    );
+    assert!(
+        after.contains("load_threaded_request(\"res://renamed/a2.gd\")"),
+        "the threaded request follows the move: {after}"
+    );
+    assert!(
+        after.contains("other_obj.load(\"res://a.gd\")"),
+        "a foreign object's `.load` must be byte-identical: {after}"
+    );
+    shutdown(&client, thread);
+}
+
 /// A referencing file that is NOT open is rewritten from its DISK text, and its `TextDocumentEdit`
 /// carries version `None` (the "content on disk is master" case) — the span and the `None` version
 /// describe the same disk bytes. Also covers a SELF-reference: `a.gd` preloading itself is rewritten

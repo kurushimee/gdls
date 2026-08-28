@@ -6,13 +6,21 @@
 //! moves the files on disk. Its job: when a `.gd`/`.tscn` is renamed/moved, rewrite every `.gd`
 //! `preload`/`load` `res://`-path string ARGUMENT that pointed at the *old* path so it points at the
 //! *new* one — otherwise the move silently breaks those load references. The write-set is scoped to
-//! `preload(…)` / `load(…)` / `ResourceLoader.load(…)` argument literals POSITIVELY (the spec's
-//! `preload`/`load` scope — docs/09 §141,§252) — NOT every `res://` literal that resolves: a
-//! `res://` string used as a *value* (`if p == "res://moved.gd"`, `const PATH := "res://moved.gd"`,
-//! a dict key/value) is left untouched, because rewriting a non-load literal would CHANGE program
-//! behavior (flip a guard, alter a display value) — a corrupting edit, not a benign over-edit. This
-//! is the one place willRename's WRITE-set is *narrower* than `documentLink`'s READ-set (which still
-//! links any `res://` literal): a mutating surface narrows, a read surface stays broad.
+//! `preload(…)` / `load(…)` / `ResourceLoader.load(…)` / `ResourceLoader.load_threaded_request(…)`
+//! argument literals POSITIVELY (the spec's `preload`/`load` scope — docs/09 §141,§252) — NOT every
+//! `res://` literal that resolves: a `res://` string used as a *value* (`if p == "res://moved.gd"`,
+//! a `const PATH := "res://moved.gd"` nothing loads, a dict key/value) is left untouched, because
+//! rewriting a non-load literal would CHANGE program behavior (flip a guard, alter a display value)
+//! — a corrupting edit, not a benign over-edit. This is the one place willRename's WRITE-set is
+//! *narrower* than `documentLink`'s READ-set (which still links any `res://` literal): a mutating
+//! surface narrows, a read surface stays broad.
+//!
+//! #132 widened that positive set — never the rule — by three forms that are still identified from
+//! the load site: `ResourceLoader["load"](…)` (the same call spelled as a string index), the
+//! threaded request, and ONE hop of const indirection (`const P := "res://x"` … `load(P)`, where the
+//! const's name is declared exactly once in the file, so nothing can shadow or reassign it). It also
+//! narrowed one: a file DECLARING anything named `load` shadows the `@GlobalScope` utility, so its
+//! bare `load(…)` arguments are skipped wholesale rather than resolved.
 //!
 //! Because the client applies the edit verbatim, the bar is the rename-saga bar (the
 //! `rename`/#66 lesson, carried to every mutating consumer): **"broken code / wrong target?" →
@@ -472,24 +480,38 @@ fn rewrite_literals_in(
 
 /// Walk the parse tree and collect the `(NodeId, "res://…")` of every STRING literal that is
 /// positively a `preload`/`load` PATH ARGUMENT — the only literals willRename is allowed to rewrite.
-/// Returns the literal node's id (for its span) and its decoded `res://` value. Three positive forms,
+/// Returns the literal node's id (for its span) and its decoded `res://` value. The positive forms,
 /// each identified by the AST node that *introduces* the load (never by walking up from a literal):
 ///
 ///   * `preload(<path>)` — the dedicated [`NodeKind::Preload`]; `path` points straight at the arg.
 ///   * `load(<path>)` — a [`NodeKind::Call`] whose callee is a bare `Identifier{name:"load"}` and is
 ///     not a `super` call. The `@GlobalScope` utility (reducer.rs `global_utility`), a free function,
 ///     never a method — so the callee being an `Identifier` (not a `Subscript`) is what distinguishes
-///     it from an arbitrary `obj.load("res://x")` user method (which we must NOT rewrite).
-///   * `ResourceLoader.load(<path>)` — a [`NodeKind::Call`] whose callee is a `Subscript` of the form
-///     `ResourceLoader.load` (base `Identifier{name:"ResourceLoader"}`, attribute `load`). Matched on
-///     the base name precisely, so `other_obj.load("res://x")` is excluded. (A `ResourceLoader`
-///     shadowed by a local of that name is pathological and a missed rewrite — the safe direction.)
+///     it from an arbitrary `obj.load("res://x")` user method (which we must NOT rewrite). #132: a
+///     file that DECLARES anything named `load` (a `func load`, a member/local `load` Callable) is
+///     shadowing the utility, so its bare `load(…)` calls are skipped wholesale — resolving which
+///     occurrence binds the shadow is read-tuned name resolution a mutating consumer must not trust
+///     (the #66 lesson), and skipping is the safe direction (a missed rewrite, never a wrong one).
+///   * `ResourceLoader.load(<path>)` / `ResourceLoader.load_threaded_request(<path>)` — a
+///     [`NodeKind::Call`] whose callee is a `Subscript` on base `Identifier{name:"ResourceLoader"}`,
+///     reached either as an ATTRIBUTE (`ResourceLoader.load`) or as a STRING INDEX
+///     (`ResourceLoader["load"]`, #132 — the same call by another spelling). Matched on the base name
+///     precisely, so `other_obj.load("res://x")` is excluded. (A `ResourceLoader` shadowed by a local
+///     of that name is pathological and a missed rewrite — the safe direction.) The threaded form
+///     takes its path in the same first-argument position.
+///
+/// #132: a CONST INDIRECTION (`const P := "res://x.gd"` … `load(P)`) is rewritten at the CONST's own
+/// literal, but only under positive proof: the const's initializer is a `res://` string literal, its
+/// name is declared EXACTLY ONCE in the file (nothing can shadow or reassign it), and that name
+/// appears as the path argument of one of the load forms above IN THE SAME FILE. That last condition
+/// is what keeps the module's "a `res://` *value* is never rewritten" rule intact — the literal is
+/// rewritten because a load positively consumes it, not because it looks like a path.
 ///
 /// Parentheses are transparent in the AST (`parse_grouping` returns the inner expression), so
 /// `preload(("res://x"))` still points `path`/`arguments[0]` straight at the literal. Only the FIRST
 /// argument of a `load` call is the path (`load(path, type_hint, …)`); a `load()` with no argument
 /// yields nothing. A non-`res://` string in any of these positions is skipped (the caller only
-/// rewrites `res://` paths anyway).
+/// rewrites `res://` paths anyway). Each literal is reported ONCE even when several loads consume it.
 fn collect_load_path_literals(
     tree: &gd_syntax::ast::ParseTree,
 ) -> Vec<(gd_syntax::ast::NodeId, String)> {
@@ -508,38 +530,94 @@ fn collect_load_path_literals(
             path.starts_with("res://").then(|| (id, path.clone()))
         };
 
-    // Whether `callee` is a bare `load` (an `Identifier{name:"load"}`) or `ResourceLoader.load`
-    // (a `Subscript` `ResourceLoader.load`). Anything else (another method's `.load`, a complex
-    // callee) is NOT a load reference.
+    // #132: every name this file DECLARES, with how many times. Two consumers, both fail-closed:
+    // a declared `load` shadows the global utility (skip bare `load` callees), and a const is only
+    // trusted as a path indirection when its name is declared exactly once (nothing shadows it).
+    let decl_counts = declaration_name_counts(tree);
+    let load_is_shadowed = decl_counts.contains_key("load");
+
+    // #132: `const NAME := "res://…"` → the literal, for names declared exactly once in the file.
+    // A candidate only; it is emitted only if a load below positively consumes the NAME.
+    let mut const_paths: FxHashMap<&str, (gd_syntax::ast::NodeId, String)> = FxHashMap::default();
+    for node_id in tree.iter_ids() {
+        let NodeKind::Constant(c) = &tree.get(node_id).kind else {
+            continue;
+        };
+        let (Some(ident), Some(init)) = (c.identifier, c.initializer) else {
+            continue;
+        };
+        let NodeKind::Identifier(IdentifierNode { name }) = &tree.get(ident).kind else {
+            continue;
+        };
+        if decl_counts.get(name.as_str()).copied() != Some(1) {
+            continue;
+        }
+        if let Some(lit) = res_literal(Some(init)) {
+            const_paths.insert(name.as_str(), lit);
+        }
+    }
+
+    // Whether `callee` is a bare `load` (an `Identifier{name:"load"}`, unless this file shadows the
+    // utility) or a `ResourceLoader` load entry point — `ResourceLoader.load` /
+    // `ResourceLoader.load_threaded_request`, reached by attribute or by string index
+    // (`ResourceLoader["load"]`). Anything else (another object's `.load`, a complex callee) is NOT
+    // a load reference.
     let is_load_callee = |callee: Option<gd_syntax::ast::NodeId>| -> bool {
         let Some(callee) = callee else {
             return false;
         };
+        // The `ResourceLoader` member a subscript names, whether spelled as an attribute
+        // (`ResourceLoader.load`) or as a string index (`ResourceLoader["load"]`).
+        let subscript_member = |sub: &SubscriptNode| -> Option<String> {
+            let base = sub.base?;
+            let base_is_resource_loader = matches!(
+                &tree.get(base).kind,
+                NodeKind::Identifier(IdentifierNode { name }) if name == "ResourceLoader"
+            );
+            if !base_is_resource_loader {
+                return None;
+            }
+            match sub.access.as_ref()? {
+                SubscriptAccess::Attribute(Some(attr)) => match &tree.get(*attr).kind {
+                    NodeKind::Identifier(IdentifierNode { name }) => Some(name.clone()),
+                    _ => None,
+                },
+                SubscriptAccess::Index(Some(index)) => match &tree.get(*index).kind {
+                    NodeKind::Literal(LiteralNode {
+                        value: Literal::String(name),
+                    }) => Some(name.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
         match &tree.get(callee).kind {
-            NodeKind::Identifier(IdentifierNode { name }) => name == "load",
-            NodeKind::Subscript(SubscriptNode {
-                base: Some(base),
-                access: Some(SubscriptAccess::Attribute(Some(attr))),
-            }) => {
-                let base_is_resource_loader = matches!(
-                    &tree.get(*base).kind,
-                    NodeKind::Identifier(IdentifierNode { name }) if name == "ResourceLoader"
-                );
-                let attr_is_load = matches!(
-                    &tree.get(*attr).kind,
-                    NodeKind::Identifier(IdentifierNode { name }) if name == "load"
-                );
-                base_is_resource_loader && attr_is_load
+            NodeKind::Identifier(IdentifierNode { name }) => name == "load" && !load_is_shadowed,
+            NodeKind::Subscript(sub) => {
+                subscript_member(sub).is_some_and(|m| m == "load" || m == "load_threaded_request")
             }
             _ => false,
         }
     };
 
-    let mut out = Vec::new();
+    // The path argument of a load: the literal itself, or — #132 — the `res://` literal of a
+    // single-declaration const the argument names.
+    let path_literal =
+        |arg: Option<gd_syntax::ast::NodeId>| -> Option<(gd_syntax::ast::NodeId, String)> {
+            if let Some(lit) = res_literal(arg) {
+                return Some(lit);
+            }
+            let NodeKind::Identifier(IdentifierNode { name }) = &tree.get(arg?).kind else {
+                return None;
+            };
+            const_paths.get(name.as_str()).cloned()
+        };
+
+    let mut out: Vec<(gd_syntax::ast::NodeId, String)> = Vec::new();
     for node_id in tree.iter_ids() {
         match &tree.get(node_id).kind {
             NodeKind::Preload(PreloadNode { path }) => {
-                out.extend(res_literal(*path));
+                out.extend(path_literal(*path));
             }
             NodeKind::Call(CallNode {
                 callee,
@@ -548,12 +626,48 @@ fn collect_load_path_literals(
                 ..
             }) if !is_super && is_load_callee(*callee) => {
                 // The path is the FIRST argument; a `load()` with none contributes nothing.
-                out.extend(res_literal(arguments.first().copied()));
+                out.extend(path_literal(arguments.first().copied()));
             }
             _ => {}
         }
     }
+    // One const literal can back several loads — report each literal once, so the caller never
+    // stacks two identical edits on the same span.
+    out.sort_by_key(|(id, _)| *id);
+    out.dedup_by_key(|(id, _)| *id);
     out
+}
+
+/// How many times each declared NAME appears as a declaration in this file — every `var`, `const`,
+/// `func`, `signal`, `enum`, inner `class` and parameter, at any nesting depth. The #132 shadow
+/// ledger: a name declared at all can shadow a global utility, and a name declared more than once
+/// cannot be trusted to mean one thing at every use site. Structural (no analysis, no scoping), so
+/// it over-counts rather than under-counts — the safe direction for a mutating consumer.
+fn declaration_name_counts(tree: &gd_syntax::ast::ParseTree) -> FxHashMap<String, usize> {
+    use gd_syntax::ast::IdentifierNode;
+
+    let mut counts: FxHashMap<String, usize> = FxHashMap::default();
+    let mut bump = |ident: Option<gd_syntax::ast::NodeId>| {
+        let Some(id) = ident else {
+            return;
+        };
+        if let NodeKind::Identifier(IdentifierNode { name }) = &tree.get(id).kind {
+            *counts.entry(name.clone()).or_insert(0) += 1;
+        }
+    };
+    for node_id in tree.iter_ids() {
+        match &tree.get(node_id).kind {
+            NodeKind::Variable(v) => bump(v.identifier),
+            NodeKind::Constant(c) => bump(c.identifier),
+            NodeKind::Function(f) => bump(f.identifier),
+            NodeKind::Signal(sg) => bump(sg.identifier),
+            NodeKind::Parameter(pa) => bump(pa.identifier),
+            NodeKind::Enum(e) => bump(e.identifier),
+            NodeKind::Class(c) => bump(c.identifier),
+            _ => {}
+        }
+    }
+    counts
 }
 
 /// Isolate the byte span of the path BETWEEN a string literal's quotes, or `None` (refuse) when the
