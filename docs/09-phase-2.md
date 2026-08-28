@@ -275,6 +275,24 @@ didChangeWatchedFiles.dynamicRegistration, applyEdit, workspaceEdit.documentChan
 the spec forbids double registration, and this is the one capability Helix only honors
 dynamically).
 
+**Watch breadth is a trade, and it is decided per session (#264).** The registered globs always
+include the script, scene and engine-managed files (`**/*.gd`, `**/*.tscn`, `**/project.godot`,
+`**/*.gdextension`, `**/extension_api.json`, `**/doc_classes/*.xml`) — few files, and a duplicate
+delivery costs one content-fingerprint comparison. A seventh glob, the `**/*` catch-all, is
+conditional. It exists because arbitrary project assets are defined by EXCLUSION (everything that
+is not a script, scene or engine-managed file — `res://LICENSE` is a listable asset), so no
+positive extension allowlist can express the set `AssetIndex::build` indexes, and without it a
+client whose only freshness channel is `didChangeWatchedFiles` never learns about a new
+`icon.png`, leaving `load`/`preload` completion stale until a restart (#226).
+
+But it asks the client to watch the whole workspace — `.git/`, `.import/`, `build/`, exported
+binaries — which on a large project means a great many inotify handles and a steady stream of
+notifications the server discards; some clients cap or warn on watcher breadth. So gdls registers
+it only when it buys something: when its own filesystem watcher failed to arm. When that watcher
+is live it already reports asset create/delete, and the catch-all is pure client-side cost.
+`classify_client_event` re-applies the same server-side `is_excluded` filter on both paths, so the
+two converge to identical semantics — what differs is only who pays for the delivery.
+
 ### 7.2 Documentation pipeline
 
 One converter, used by every prose-emitting feature (hover, completion docs, signatureHelp docs):
