@@ -272,6 +272,11 @@ binary. No release cut.
   `PlainText`, which also puts hover on the floor completion and signatureHelp already took, and
   an empty format list takes it too. Every captured editor profile asks for markdown explicitly,
   so nothing real is downgraded.
+- **`func` reports `SymbolKind.Method`** (#263): a `.gd` file is a class, so every `func` in it —
+  top-level, inner-class, or `static` — is a member of one, and GDScript has no free functions for
+  `Function` to mean. `documentSymbol` (both shapes), `workspace/symbol` and call-hierarchy items
+  all say `Method` now, matching the `CompletionItemKind::Method` completion already returned for
+  the same symbols; the kind picks the glyph an outline draws, and the two surfaces disagreed.
 
 ## [1.0.7] — 2026-06-13
 
