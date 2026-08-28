@@ -793,6 +793,44 @@ pub fn run_with_recorder(recorder: Option<BenchRecorder>) -> Result<()> {
     Ok(())
 }
 
+/// Deserialize the `initialize` params, recovering field by field rather than failing the
+/// handshake.
+///
+/// A whole-struct `from_value` is all-or-nothing, and `InitializeParams` is large: one field a
+/// client sends in a shape lsp-types 0.97 does not model — a `rootUri` it cannot parse, a
+/// capability value of the wrong JSON type — used to abort `serve_inner` before it could answer,
+/// so the client saw the server vanish with no response and no error (#280). That contradicts both
+/// "never crash, never lie" and the generic-LSP contract: a server must not require params in
+/// exactly the shape one Rust crate models.
+///
+/// Only four fields are read downstream, so recovery is cheap and lossless: `capabilities` (also
+/// read raw, per #277), `initializationOptions`, `workspaceFolders` and the deprecated `rootUri`.
+/// Each is parsed independently and defaults on failure, which lets `resolve_root` fall through
+/// its existing `projectRoot` → workspace-folder → cwd ladder.
+fn parse_initialize_params(raw: &serde_json::Value) -> InitializeParams {
+    match serde_json::from_value::<InitializeParams>(raw.clone()) {
+        Ok(init) => init,
+        Err(err) => {
+            log::warn!(
+                "initialize params did not deserialize ({err}); recovering the fields gdls \
+                 actually reads and continuing — the handshake still completes"
+            );
+            let field = |name: &str| raw.get(name).cloned().unwrap_or(serde_json::Value::Null);
+            let mut init = InitializeParams::default();
+            if let Ok(caps) = serde_json::from_value(field("capabilities")) {
+                init.capabilities = caps;
+            }
+            init.initialization_options = raw.get("initializationOptions").cloned();
+            init.workspace_folders = serde_json::from_value(field("workspaceFolders")).ok();
+            #[allow(deprecated)]
+            {
+                init.root_uri = serde_json::from_value(field("rootUri")).ok();
+            }
+            init
+        }
+    }
+}
+
 /// Run the server over an arbitrary [`Connection`] (stdio in production, in-memory in tests).
 /// Equivalent to [`serve_with_recorder`] with the recorder sourced from the gating env var.
 pub fn serve(connection: Connection) -> Result<()> {
@@ -840,7 +878,7 @@ fn serve_inner(
     // Keep the RAW capabilities object alongside the typed one: lsp-types 0.97 misspells one
     // standard key, and that key gates a real feature — see `ClientCaps::negotiate`.
     let raw_caps = init_value.get("capabilities").cloned().unwrap_or_default();
-    let init: InitializeParams = serde_json::from_value(init_value)?;
+    let init = parse_initialize_params(&init_value);
 
     let encoding = PositionEncoding::negotiate(&init.capabilities);
     let caps = ClientCaps::negotiate(&init.capabilities, &raw_caps);

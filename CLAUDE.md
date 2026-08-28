@@ -29,6 +29,11 @@ cargo test --workspace
   (the alias in `.cargo/config.toml`), not bare `cargo clippy`.
 - **Run it:** `cargo run --bin gdls` (debug) or `target/release/gdls` (release). It speaks JSON-RPC over
   stdio, so a bare invocation just waits for an LSP client.
+- **The local loop is the LINUX half of the gate.** CI also runs the same four steps on
+  `windows-latest`, which stayed red for twelve merges once (#279) because nothing in the merge loop
+  surfaces it. After merging, check `gh run list --branch main --limit 5`. Anything under test that
+  needs a file URI goes through `common::file_uri` (over `gd_server::uri::path_to_file_uri`), never a
+  hand-built `format!("file://…")` — a Windows temp root is a drive path and does not survive that.
 
 ## Rust workflow notes
 

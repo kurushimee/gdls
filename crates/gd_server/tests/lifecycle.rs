@@ -222,3 +222,69 @@ fn m0_lifecycle_diagnostics_and_symbols() {
     let served = server_thread.join().expect("server thread panicked");
     served.expect("serve() returned an error");
 }
+
+/// #280 — a client whose `initialize` params do not fit lsp-types' model still gets a handshake.
+///
+/// `InitializeParams` is a large typed struct and `from_value` is all-or-nothing, so a single
+/// field in an unmodelled shape used to abort the session before the server could answer: no
+/// result, no error, just a closed pipe. Here `rootUri` is a raw Windows drive path — exactly what
+/// broke #279 — and `clientInfo` is the wrong JSON type. The server must still reply, still
+/// advertise its capabilities, and still shut down cleanly, falling back to the cwd for its root.
+#[test]
+fn a_malformed_initialize_param_still_completes_the_handshake() {
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+
+    client
+        .sender
+        .send(request(
+            1,
+            "initialize",
+            serde_json::json!({
+                "processId": 1,
+                "rootUri": "file://C:\\Windows\\Temp\\proj",
+                "clientInfo": "definitely-not-an-object",
+                "capabilities": {
+                    "general": { "positionEncodings": ["utf-8"] }
+                }
+            }),
+        ))
+        .unwrap();
+
+    let resp = recv_response(&client);
+    assert_eq!(resp.id, RequestId::from(1));
+    assert!(
+        resp.error.is_none(),
+        "a param gdls never reads must not fail the handshake: {:?}",
+        resp.error
+    );
+    let result: InitializeResult =
+        serde_json::from_value(resp.result.expect("initialize result")).unwrap();
+    assert!(
+        result.capabilities.hover_provider.is_some(),
+        "the recovered handshake must advertise the real capability set"
+    );
+    assert_eq!(
+        result.capabilities.position_encoding,
+        Some(PositionEncodingKind::UTF8),
+        "capabilities parsed fine on their own, so the negotiated encoding must survive recovery"
+    );
+
+    client
+        .sender
+        .send(notification("initialized", serde_json::json!({})))
+        .unwrap();
+    client
+        .sender
+        .send(request(2, "shutdown", serde_json::Value::Null))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert_eq!(resp.id, RequestId::from(2));
+    client
+        .sender
+        .send(notification("exit", serde_json::Value::Null))
+        .unwrap();
+
+    let served = server_thread.join().expect("server thread panicked");
+    served.expect("serve() returned an error");
+}
