@@ -324,6 +324,16 @@ binary. No release cut.
   written down in `docs/09` §7.1.
 
 ### Added
+- **The bundled engine API now carries documentation** (#259): the `extension_api.json` embedded in
+  the binary as the last-resort fallback was dumped without docs, so a user who installs gdls with
+  no Godot on `PATH` — the headless case this project exists for — got correct signatures and an
+  empty hover on every engine class, silently. It is now built with
+  `--dump-extension-api-with-docs` and stripped to only the fields gdls reads (the GDExtension ABI
+  sections and binding hashes go), which costs 690 KB of gzipped asset — 396 KB → 1.09 MB, an 8%
+  release-binary increase — and buys the whole engine's prose on first run.
+  `scripts/regen-stock-api.py` regenerates it, and a CI test fails if a regeneration drops the
+  docs. That session also sends one `window/showMessage` at startup naming the stock surface and
+  how to replace it, since the prose being present does not make it the user's own engine build.
 - **signatureHelp for builtin type constructors** (#257): `Vector2(`, `Color(`, `Callable(` and
   friends answer with one signature per overload, labelled `Type Type(args)` — the shape
   `Variant::get_constructor_list` implies — filtered by Godot's own arg-index rule so an overload

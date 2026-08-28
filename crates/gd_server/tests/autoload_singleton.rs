@@ -107,8 +107,23 @@ fn did_open(client: &Connection, project: &TempProject, rel: &str) {
             },
         ))
         .unwrap();
-    // Drain the publishDiagnostics push.
-    let _ = recv(client);
+    let _ = recv_publish(client);
+}
+
+/// Receive until the `publishDiagnostics` push arrives, skipping anything else the server sends
+/// unprompted — a session booted without an `extensionApiPath` also gets the one-time
+/// `window/showMessage` naming the embedded stock fallback (#259), and a conforming client
+/// tolerates server notifications in any order.
+fn recv_publish(client: &Connection) -> PublishDiagnosticsParams {
+    loop {
+        let msg = recv(client);
+        let Message::Notification(notif) = msg else {
+            panic!("expected a publishDiagnostics notification, got {msg:?}");
+        };
+        if notif.method == "textDocument/publishDiagnostics" {
+            return serde_json::from_value(notif.params).expect("valid PublishDiagnosticsParams");
+        }
+    }
 }
 
 /// Open a file and assert the resulting `publishDiagnostics` carries zero diagnostics.
@@ -131,18 +146,7 @@ fn did_open_assert_clean(client: &Connection, project: &TempProject, rel: &str) 
             },
         ))
         .unwrap();
-    // Parse the publishDiagnostics push and assert empty.
-    let msg = recv(client);
-    let Message::Notification(notif) = msg else {
-        panic!("expected publishDiagnostics notification after didOpen, got {msg:?}");
-    };
-    assert_eq!(
-        notif.method, "textDocument/publishDiagnostics",
-        "expected publishDiagnostics, got {}",
-        notif.method
-    );
-    let params: PublishDiagnosticsParams =
-        serde_json::from_value(notif.params).expect("valid PublishDiagnosticsParams");
+    let params = recv_publish(client);
     assert!(
         params.diagnostics.is_empty(),
         "autoload typing must produce zero diagnostics for {rel}; got: {:?}",
@@ -718,13 +722,7 @@ fn did_open_collect_diags(
             },
         ))
         .unwrap();
-    let msg = recv(client);
-    let Message::Notification(notif) = msg else {
-        panic!("expected publishDiagnostics, got {msg:?}");
-    };
-    let params: PublishDiagnosticsParams =
-        serde_json::from_value(notif.params).expect("valid PublishDiagnosticsParams");
-    params.diagnostics
+    recv_publish(client).diagnostics
 }
 
 /// Set up a project whose autoload is a SCENE (`Global="*res://global.tscn"`) whose root node

@@ -120,12 +120,19 @@ fn did_open(client: &Connection, uri: &Uri, text: &str) {
         .unwrap();
 }
 
+/// Receive until the `publishDiagnostics` push arrives, skipping anything the server sends
+/// unprompted — a session booted without an `extensionApiPath` also gets the one-time
+/// `window/showMessage` naming the embedded stock fallback (#259), and a conforming client
+/// tolerates server notifications in any order.
 fn recv_publish_diagnostics(client: &Connection) -> PublishDiagnosticsParams {
-    let Message::Notification(note) = recv(client) else {
-        panic!("expected a publishDiagnostics notification");
-    };
-    assert_eq!(note.method, "textDocument/publishDiagnostics");
-    serde_json::from_value(note.params).unwrap()
+    loop {
+        let Message::Notification(note) = recv(client) else {
+            panic!("expected a publishDiagnostics notification");
+        };
+        if note.method == "textDocument/publishDiagnostics" {
+            return serde_json::from_value(note.params).unwrap();
+        }
+    }
 }
 
 fn shutdown(client: &Connection, handle: std::thread::JoinHandle<()>) {

@@ -980,6 +980,24 @@ fn serve_inner(
     // live native watcher, freshness is already degraded and the client is the only channel left.
     register_watched_files(&mut state, watcher.is_some());
 
+    // #259: say once, on the wire, which native surface this session actually got. The embedded
+    // fallback is a complete STOCK 4.6.3 surface (documentation included), but it is not the
+    // user's engine: a different Godot version, and every GDExtension class, is simply absent —
+    // which is why it carries `Generic` provenance and why the analyzer will not turn its misses
+    // into errors. A stderr line is invisible to most clients; "never lie" covers a degraded
+    // surface the user cannot see. One notification per session, at startup, never repeated.
+    if state.workspace.native.provenance() == gd_types::ApiProvenance::Generic {
+        show_message(
+            &state,
+            lsp_types::MessageType::INFO,
+            "gdls is using its built-in stock Godot 4.6.3 API surface — no project dump was \
+             found. Engine classes and their documentation are available, but classes from your \
+             own Godot build or from GDExtensions are not. To use your engine's real API, set \
+             `godotBinaryPath` (or the GDLS_GODOT environment variable), or point \
+             `extensionApiPath` at an extension_api.json.",
+        );
+    }
+
     // At startup no buffers are open yet, so this set is empty; building it via the same helper the
     // watcher uses keeps the "open buffer wins" rule uniform and correct even if a future change
     // opens a buffer before this point. The dirty set this reconcile produces is drained lazily —

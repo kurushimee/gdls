@@ -19,7 +19,7 @@ use lsp_types::{
     TextDocumentItem, Uri,
 };
 
-use common::{notification, recv, request, try_recv};
+use common::{notification, recv, recv_response, request, try_recv};
 
 /// Drive a small session (initialize + didOpen + documentSymbol + shutdown/exit) with a recorder
 /// attached, then load the artifact and replay it — asserting on the schema shape, the trace
@@ -89,9 +89,10 @@ fn record_then_replay_round_trips() {
             },
         ))
         .expect("send documentSymbol");
-    let Message::Response(sym_resp) = recv(&client) else {
-        panic!("expected documentSymbol response");
-    };
+    // `recv_response` rather than a bare `recv`: this session has no `extensionApiPath`, so it
+    // also gets the one-time `window/showMessage` naming the embedded stock fallback (#259), and
+    // the drain above may have taken the publish instead.
+    let sym_resp = recv_response(&client);
     assert_eq!(sym_resp.id, RequestId::from(2));
 
     // Clean shutdown so the server thread joins and the recorder flushes.
