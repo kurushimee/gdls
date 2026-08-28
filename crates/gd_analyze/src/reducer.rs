@@ -6577,11 +6577,12 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
 // sibling/subtype downcasts (`var c: Control = $Node2DChild` — exit 0) that a precise `Node2D` type
 // would reject. A `DataType` is used symmetrically in compatibility checks, so a scene-PRECISE type
 // fed here would turn those Godot-tolerated downcasts into false positives. Precise scene-derived
-// node types are therefore a navigation-only goal (precise HOVER/COMPLETION), kept OUT of the
-// diagnostic path. The `scene_node_facts` seam — the `CrossFileQuery::scene_node_facts` trait
+// node types are therefore a navigation-only goal (precise HOVER/DEFINITION/COMPLETION), kept OUT of
+// the diagnostic path. The `scene_node_facts` seam — the `CrossFileQuery::scene_node_facts` trait
 // default-None in `cross_file.rs`, the `WorkspaceXFileQuery` override, and the gd_project
-// `SceneIndex::resolve_relative_from`/`resolve_unique_in` resolution — is the dormant substrate for
-// that future feature; it is NOT consulted by the diagnostic path here. See docs/02 §11.
+// `SceneIndex::resolve_relative_from`/`resolve_unique_in` resolution — is what those navigation
+// surfaces read (`gd_server::scene_nav`); it is NOT consulted by the diagnostic path here. See
+// docs/02 §11.
 
 // ===================================================================================================
 // reduce_await — analyzer.cpp:3053

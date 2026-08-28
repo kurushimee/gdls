@@ -131,8 +131,8 @@ pub struct Workspace {
     /// `res://` path. Built parallel to [`Self::index`] (scenes aren't `FileId`s; see
     /// [`gd_project::SceneIndex`]). Persisted/restored via the same warm-start cache. The diagnostic
     /// path does NOT read it — a valid `$`/`%` types as bare `NATIVE Node` (faithful to Godot),
-    /// scene-independent; this field is the dormant substrate a phase-3 precise hover/completion
-    /// feature reads (through [`crate::xfile::WorkspaceXFileQuery::scene_node_facts`]).
+    /// scene-independent; this field is the substrate the precise NAVIGATION surfaces read (hover /
+    /// definition / typeDefinition / completion, through [`Self::scene_node_facts`]).
     pub(crate) scenes: SceneIndex,
     /// #127: the project's arbitrary-asset index — the `res://` paths of every project file that is
     /// NOT a `.gd` script (covered by [`Self::index`]) and NOT a `.tscn` scene (covered by
@@ -671,6 +671,37 @@ impl Workspace {
             &self.policy,
             gd_analyze::AnalyzeOptions::default(),
         )
+    }
+
+    /// M11 follow-up (#125) — the scene-precise fact for a `$`/`%`/`get_node("…")` access made by
+    /// the script at `path`, for NAVIGATION only (hover / definition / typeDefinition; see
+    /// [`crate::scene_nav`]).
+    ///
+    /// This reads the same seam the analyzer deliberately leaves dormant: `reduce_get_node` types a
+    /// valid `$`/`%` as bare `NATIVE Node` (faithful to Godot), because a scene-precise type in the
+    /// DIAGNOSTIC path would reject the sibling downcasts Godot tolerates (`docs/02` §11). The
+    /// precise fact is safe on the read-only surfaces, which run no compatibility check.
+    ///
+    /// CONSERVATIVE: `None` unless every scene attaching this script resolves the access to the same
+    /// target (the [`WorkspaceXFileQuery::scene_node_facts`] contract).
+    #[must_use]
+    pub fn scene_node_facts(
+        &self,
+        path: &Utf8Path,
+        query: &gd_analyze::NodePathQuery,
+    ) -> Option<gd_analyze::SceneNodeFacts> {
+        use gd_analyze::CrossFileQuery as _;
+        let file = self.index.file_id(path)?;
+        let autoloads = self.build_autoload_maps(&self.project, &self.scenes);
+        let xfile = WorkspaceXFileQuery::new(
+            &self.index,
+            &self.native,
+            &self.analysis_cache,
+            autoloads,
+            &self.scenes,
+            &self.project.root,
+        );
+        xfile.scene_node_facts(file, query)
     }
 
     /// Drop a URI's cached parse and analysis (on `didClose`).

@@ -16,8 +16,8 @@
 //!
 //! **Scope.** The diagnostic path does NOT consume this — a valid `$`/`%` types as bare `NATIVE
 //! Node` (`gd_analyze`, faithful to Godot), independent of the scene. This index + its node-path
-//! resolution are the dormant substrate for a phase-3 precise hover/completion feature; this module
-//! builds the index + a query API on it.
+//! resolution are the substrate the precise NAVIGATION surfaces read (hover / definition /
+//! completion, via `gd_server`); this module builds the index + a query API on it.
 
 use camino::{Utf8Path, Utf8PathBuf};
 use rustc_hash::{FxHashMap, FxHashSet};

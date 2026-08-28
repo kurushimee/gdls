@@ -16,12 +16,13 @@ use gd_types::NativeDb;
 
 use crate::binding::MemberXref;
 
-/// A statically-known `$`/`%` node-path access a future navigation feature asks the scene index to
-/// resolve (phase-3 substrate — see [`CrossFileQuery::scene_node_facts`]; NOT the diagnostic path).
+/// A statically-known `$`/`%` node-path access the NAVIGATION surfaces ask the scene index to
+/// resolve (see [`CrossFileQuery::scene_node_facts`]; NOT the diagnostic path).
 ///
-/// Deliberately the SUBSET of `$`/`%` shapes scene resolution handles soundly; every other shape
-/// (absolute `$/root/...`, embedded/multi-segment `%`, `get_node("literal")`) yields no query and
-/// stays unresolved (the navigation feature degrades gracefully on those).
+/// Deliberately the SUBSET of `$`/`%` shapes scene resolution handles soundly. A `get_node("A/B")` /
+/// `get_node("%Name")` call spells the same access and maps to the same query; every other shape
+/// (an absolute `$/root/...` path, an embedded/multi-segment `%`) yields no query and stays
+/// unresolved, which the navigation surfaces degrade on gracefully (`gd_server::scene_nav`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodePathQuery {
     /// A root-relative `$A/B`-style path (no leading `/`, no `%`), resolved RELATIVE to the node the
@@ -33,8 +34,8 @@ pub enum NodePathQuery {
 }
 
 /// What the scene index knows about a `$`/`%` access target — a *fact*, never a `DataType` (the trait
-/// stays free of the analyzer's type lattice; a consumer builds a `DataType` from this). Phase-3
-/// navigation substrate (NOT the diagnostic path — [`CrossFileQuery::scene_node_facts`]).
+/// stays free of the analyzer's type lattice; a consumer builds a `DataType` from this). Navigation
+/// substrate (NOT the diagnostic path — [`CrossFileQuery::scene_node_facts`]).
 ///
 /// Resolution is CONSERVATIVE end-to-end: a `Some` means every attaching scene agreed on this exact
 /// fact; any ambiguity (no scene, absent node, instanced sub-scene unresolved, two scenes
@@ -199,9 +200,9 @@ pub trait CrossFileQuery {
     /// concrete type fact of the target node, reading the `.tscn` scene(s) `script_file` is attached
     /// to.
     ///
-    /// **Phase-3 navigation substrate — NOT the diagnostic path.** This is the dormant seam for a
-    /// future precise-HOVER / precise-COMPLETION feature (resolving `$Foo` to its scene-precise node
-    /// class for navigation). It is **deliberately NOT consulted by `reduce_get_node`**: a valid
+    /// **Navigation substrate — NOT the diagnostic path.** This is the seam the precise-HOVER /
+    /// -DEFINITION / -COMPLETION features read (resolving `$Foo` to its scene-precise node class for
+    /// navigation; `gd_server::scene_nav`). It is **deliberately NOT consulted by `reduce_get_node`**: a valid
     /// `$`/`%` types as bare `NATIVE Node` (faithful to Godot — see `docs/02` §11), because a
     /// scene-PRECISE `DataType` fed into the symmetric compatibility checks would turn the
     /// sibling/subtype downcasts Godot tolerates (`var c: Control = $Node2DChild`) into false

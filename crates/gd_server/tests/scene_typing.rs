@@ -4,14 +4,14 @@
 //! frontend produces (`gdscript_analyzer.cpp:3882-3886`). Godot never reads the `.tscn` for the
 //! analyzer's *type*, so a `$`/`%` access is the bare `Node` base, NOT the scene-precise node class,
 //! and Godot TOLERATES sibling/subtype downcasts off it that a precise type would reject. Precise
-//! scene-derived node types are a navigation-only goal (precise HOVER/COMPLETION) kept OUT of the
-//! diagnostic path; the scene-resolution seam (`scene_node_facts`) is left dormant for that future
-//! feature (`docs/02` §11).
+//! scene-derived node types are a navigation-only goal (precise HOVER/DEFINITION/COMPLETION) kept
+//! OUT of the diagnostic path; the scene-resolution seam (`scene_node_facts`) serves those
+//! navigation surfaces alone — `tests/scene_nav.rs` is their guard (`docs/02` §11).
 //!
 //! This guard is **direction-independent**: assigning/casting a scene-attached `$Health` (a `Node2D`
 //! node) to an incompatible Node-derived sibling (`Control`) must produce NO error — a `Node` →
 //! `Control` downcast Godot tolerates. It FAILS LOUDLY if anyone re-wires precise scene typing into
-//! the diagnostic path through the dormant seam (which would make these Godot-tolerated downcasts
+//! the diagnostic path through that navigation seam (which would make these Godot-tolerated downcasts
 //! into `Invalid cast` / `Cannot assign` false positives). Keeping the real scene setup is what
 //! gives the guard teeth against re-introduction.
 

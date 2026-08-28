@@ -202,7 +202,7 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
         self.autoloads.names.contains(name)
     }
 
-    /// Phase-3 navigation substrate (dormant; NOT consulted by the diagnostic path — `reduce_get_node`
+    /// Navigation substrate (NOT consulted by the diagnostic path — `reduce_get_node`
     /// types `$`/`%` as bare `Node`, see [`gd_analyze::CrossFileQuery::scene_node_facts`]). Resolves a
     /// `$`/`%` access by `script_file` against the scene(s) it is attached to. CONSERVATIVE: returns
     /// `Some` only when EVERY attaching scene resolves the access to the identical fact; any miss /
