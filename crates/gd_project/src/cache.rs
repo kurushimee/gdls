@@ -72,7 +72,14 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// project with NO arbitrary-asset completions until each asset's first on-disk touch — the same
 /// "warm-load serves stale/empty derived state" hazard the v6 note guards against. So v7 files are
 /// ignored and rebuilt. One cold re-index per project on upgrade, self-healing.
-pub const CACHE_FORMAT_VERSION: u32 = 8;
+/// v9 (#255): `Interface` gained `body_refs` — the identifiers a file references anywhere,
+/// function bodies included, which `Index::recompute_edges` resolves through the `class_name`
+/// registry into dependency edges. A v8 cache predates the field, so warm-loading it would rebuild
+/// the dep graph WITHOUT the body-level edges and reproduce exactly the staleness this closes: an
+/// open file whose only use of a class sits in a function body would never refresh when that class
+/// changed. Not `#[serde(default)]` for that reason — v8 files are ignored and rebuilt. One cold
+/// re-index per project on upgrade, self-healing.
+pub const CACHE_FORMAT_VERSION: u32 = 9;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool

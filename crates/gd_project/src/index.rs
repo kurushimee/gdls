@@ -662,17 +662,23 @@ impl Index {
     /// Recompute one file's forward edges from its interface against the current registry, and refresh
     /// its name-reference bookkeeping.
     fn recompute_edges(&mut self, fid: FileId) {
-        let (names, path_extends, preloads) = match self.interfaces.get(&fid) {
+        let (names, path_extends, preloads, body_refs) = match self.interfaces.get(&fid) {
             Some(iface) => (
                 referenced_names(iface),
                 path_extends_of(iface),
                 iface.preload_deps.clone(),
+                iface.body_refs.clone(),
             ),
-            None => (FxHashSet::default(), None, Vec::new()),
+            None => (FxHashSet::default(), None, Vec::new(), Vec::new()),
         };
 
         let mut deps = FxHashSet::default();
-        for name in &names {
+        // #255: body-level references join the interface-level ones for the *edge* pass only.
+        // `Interface::body_refs` is every identifier the file mentions, so the registry lookup is
+        // what makes this precise: only names that are a project `class_name` survive, and a local
+        // that happens to share a class's name costs one redundant edge, never a wrong result.
+        // They are NOT added to `set_name_refs` below — see `Interface::body_refs`.
+        for name in names.iter().chain(body_refs.iter()) {
             if let Some(entry) = self.registry.get(name) {
                 if let Some(&target) = self.ids.get(&entry.path) {
                     deps.insert(target);
@@ -1594,6 +1600,64 @@ mod tests {
         assert!(
             idx.verify().is_ok(),
             "path-ref bookkeeping keeps the index cross-table consistent"
+        );
+    }
+
+    #[test]
+    fn body_only_class_use_is_a_dep_edge_so_a_dependency_edit_invalidates_it() {
+        // #255: `user.gd` names `Dep` only inside a function body — never in its `extends`, a
+        // member annotation, a parameter type, or a `preload`. That use is a real dependency
+        // (its call sites type-check against `Dep`'s members), but `referenced_names` only sees
+        // the *interface*, so the file had no reverse edge and an edit to `dep.gd` left it stale:
+        // an open `user.gd` kept publishing diagnostics computed against the OLD `dep.gd`.
+        let mut idx = cold_index(&[
+            (
+                "dep.gd",
+                "class_name Dep\nextends Node\nfunc label() -> String:\n\treturn \"\"\n",
+            ),
+            (
+                "user.gd",
+                "extends Node\nfunc go():\n\tvar d := Dep.new()\n\tprint(d.label())\n",
+            ),
+        ]);
+        idx.clear_dirty();
+        let user_epoch0 = epoch(&idx, "user.gd");
+
+        // `label()`'s return type flips String → int: an interface change on the dependency.
+        let dep1 = interface::extract(
+            &gd_syntax::parse("class_name Dep\nextends Node\nfunc label() -> int:\n\treturn 0\n")
+                .tree,
+        );
+        idx.on_file_changed(&abs("dep.gd"), dep1);
+
+        assert!(
+            epoch(&idx, "user.gd") > user_epoch0,
+            "a body-only user of `Dep` must re-analyze when `Dep`'s interface changes"
+        );
+        assert!(
+            idx.verify().is_ok(),
+            "the widened edge keeps the index consistent"
+        );
+    }
+
+    #[test]
+    fn body_only_attribute_segments_do_not_become_dep_edges() {
+        // The widened collection must stay a *reference* scan: `d.Dep` reads a MEMBER named
+        // `Dep`, not the global class, so it must not manufacture an edge. Same for a Lua-style
+        // dictionary key. Over-edging is only a cost, but these two positions are the ones the
+        // rename firewall already treats as non-references (#181), so they stay excluded here.
+        let idx = cold_index(&[
+            ("dep.gd", "class_name Dep\nextends Node\n"),
+            (
+                "user.gd",
+                "extends Node\nfunc go(d):\n\tprint(d.Dep)\n\tvar t := { Dep = 1 }\n\tprint(t)\n",
+            ),
+        ]);
+        let dep = idx.file_id(&abs("dep.gd")).unwrap();
+        let user = idx.file_id(&abs("user.gd")).unwrap();
+        assert!(
+            !idx.deps.reverse_closure(dep).contains(&user),
+            "attribute idents and Lua dict keys are not class references"
         );
     }
 

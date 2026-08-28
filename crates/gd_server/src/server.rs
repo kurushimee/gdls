@@ -157,6 +157,14 @@ pub(crate) struct ClientCaps {
     /// `textDocument.publishDiagnostics`. Grouped in a sub-struct like [`InlayHintCaps`] so the
     /// handlers read `state.caps.code_action.<gate>`.
     pub(crate) code_action: CodeActionCaps,
+    /// `workspace.diagnostics.refreshSupport` (#255) — gates the server→client
+    /// `workspace/diagnostic/refresh` request. gdls advertises `diagnosticProvider` with
+    /// `interFileDependencies: true`, which promises that editing one file can change ANOTHER
+    /// file's diagnostics; refresh is the protocol's only way to tell a pull client its cached
+    /// results for those other files are stale. Absent ⇒ never sent (the client can't consume it)
+    /// and the pull client re-requests on its own cadence — typically only for the document it is
+    /// editing, which is exactly the staleness this closes for clients that DO advertise it.
+    pub(crate) diagnostic_refresh_support: bool,
     /// The M11 (#79) workspace file-operation gates, captured under
     /// `workspace.fileOperations`. Grouped in a sub-struct like [`CodeActionCaps`] so the handler
     /// reads `state.caps.file_operations.<gate>` and the advertised capability mirrors them.
@@ -387,6 +395,14 @@ impl ClientCaps {
                 .and_then(|w| w.workspace_edit.as_ref())
                 .and_then(|w| w.document_changes)
                 .unwrap_or(false),
+            // #255: same optional-path convention. `workspace.diagnostics` is the 3.17 pull
+            // block; `refreshSupport` there is the client saying it can re-pull on demand.
+            diagnostic_refresh_support: caps
+                .workspace
+                .as_ref()
+                .and_then(|w| w.diagnostic.as_ref())
+                .and_then(|d| d.refresh_support)
+                .unwrap_or(false),
             semantic_tokens: SemanticTokensCaps::negotiate(caps),
             inlay_hint: InlayHintCaps::negotiate(caps),
             code_action: CodeActionCaps::negotiate(caps),
@@ -600,6 +616,11 @@ pub(crate) enum OutboundKind {
     /// client re-requests hints for its visible documents). Sent when the inlay-hint config toggles
     /// (`workspace/didChangeConfiguration`) so already-shown hints reflect the new policy live.
     InlayHintRefresh,
+    /// #255: a `workspace/diagnostic/refresh` request — the response is acknowledgment-only (the
+    /// client re-pulls `textDocument/diagnostic` for its open documents). Sent when a reindex
+    /// invalidated a file OTHER than the one the client just edited, which is precisely when a
+    /// pull client's cache goes stale without it noticing.
+    WorkspaceDiagnosticRefresh,
     /// M10 (#75): a `workspace/applyEdit` request — gdls's FIRST server→client request that expects a
     /// meaningful RESPONSE ([`lsp_types::ApplyWorkspaceEditResponse`] `{ applied }`). Sent by the
     /// `gdls.applyWarningIgnore` command (the `codeActionLiteralSupport` fallback path) FIRE-AND-FORGET
@@ -1510,6 +1531,13 @@ fn handle_outbound_response(state: &mut ServerState, resp: Response) {
             ),
             None => log::debug!("client acknowledged the inlayHint refresh"),
         },
+        OutboundKind::WorkspaceDiagnosticRefresh => match &resp.error {
+            Some(err) => log::debug!(
+                "client declined workspace/diagnostic/refresh ({}); its pull results for                  dependents stay stale until it re-pulls on its own cadence",
+                err.message
+            ),
+            None => log::debug!("client acknowledged the workspace diagnostic refresh"),
+        },
         // M10 (#75): the `workspace/applyEdit` reply for a `gdls.applyWarningIgnore` command. Correlate
         // it (the W3 requirement: a server→client request MUST be correlated, never bounced) — accept
         // and reject both end here, neither crashes the session. An error reply (the client refused
@@ -1588,6 +1616,34 @@ fn send_inlay_hint_refresh(state: &mut ServerState) {
     };
     if state.sender.send(Message::Request(req)).is_err() {
         log::warn!("workspace/inlayHint/refresh send failed (client disconnected?)");
+    }
+}
+
+/// #255: ask the client to re-pull `textDocument/diagnostic` for its open documents — sent when a
+/// reindex invalidated files BEYOND the one the client just edited (a dependency's interface
+/// changed, a `class_name` appeared, a project-wide policy or native-DB reload). The push path
+/// republishes open buffers directly; a pull client has no equivalent signal, and gdls advertises
+/// `diagnosticProvider.interFileDependencies: true` — this is the request that promise implies.
+///
+/// Gated on the client's `workspace.diagnostics.refreshSupport`; a no-op (never sent) otherwise.
+/// Fire-and-forget: the response is acknowledgment-only (correlated to
+/// [`OutboundKind::WorkspaceDiagnosticRefresh`]). Callers send it at most ONCE per reindex batch —
+/// a project-wide change fans one refresh out, never one per dependent.
+fn send_workspace_diagnostic_refresh(state: &mut ServerState) {
+    if !state.caps.diagnostic_refresh_support {
+        return;
+    }
+    let id = state.shared.next_outgoing_id();
+    state
+        .outbound
+        .insert(id.clone(), OutboundKind::WorkspaceDiagnosticRefresh);
+    let req = Request {
+        id,
+        method: "workspace/diagnostic/refresh".to_string(),
+        params: serde_json::Value::Null,
+    };
+    if state.sender.send(Message::Request(req)).is_err() {
+        log::warn!("workspace/diagnostic/refresh send failed (client disconnected?)");
     }
 }
 
@@ -2268,6 +2324,18 @@ fn republish_dirty_open_buffers_except(state: &mut ServerState, skip: Option<&Ur
     for uri in stale_uris {
         publish_diagnostics(state, uri, None);
     }
+    // #255, the pull half: the loop above only reaches OPEN buffers, and only the push channel. A
+    // pull client's cached `textDocument/diagnostic` results for every invalidated file — open or
+    // not — are now stale, and nothing else tells it so. Send ONE refresh per drained batch, and
+    // only when the batch reached past the file the caller already handled: a plain body-only edit
+    // dirties just that file, which the client is re-pulling anyway, so it must not trigger a
+    // project-wide re-pull on every keystroke.
+    let skip_path = skip
+        .and_then(uri_to_path)
+        .map(|p| gd_project::normalize_path(&p));
+    if dirty_set.iter().any(|p| Some(p) != skip_path.as_ref()) {
+        send_workspace_diagnostic_refresh(state);
+    }
 }
 
 /// Republish diagnostics for every open buffer — used after a project-wide policy change
@@ -2278,6 +2346,8 @@ fn republish_all_open_buffers(state: &mut ServerState) {
     for uri in open_buffer_uris(state) {
         publish_diagnostics(state, uri, None);
     }
+    // #255: the project-wide analogue — one refresh for the whole reload, never one per file.
+    send_workspace_diagnostic_refresh(state);
 }
 
 /// Advertise exactly the v1 capability set Claude Code consumes (`docs/05-lsp-cc-integration.md`).
