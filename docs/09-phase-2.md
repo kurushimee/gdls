@@ -135,7 +135,7 @@ relevant 3.18) appears exactly once.
 | textDocument/inlayHint (+ resolve, refresh) | **M10** | Inferred `:=` types, parameter names; config-toggleable |
 | textDocument/documentColor + colorPresentation | **M10** | `Color(...)`, `Color.CONSTANT`, `Color("#hex")` literals |
 | textDocument/codeAction (+ resolve, `source.fixAll`) | **M10** | Quickfixes for the warning set; standard kind strings; honors `context.only`; `workspace/applyEdit` + `executeCommand` plumbing |
-| `.tscn` scene index → `$`/`%` typing | ✅ M11 | Valid `$`/`%` types as bare `NATIVE Node` — diagnostics converge with Godot (`docs/02 §11`) (#76). Precise scene-derived node facts (the scene index + resolution seam) are kept dormant for navigation/completion in phase 3 — NOT the diagnostic path (they'd turn Godot-tolerated downcasts into false positives) |
+| `.tscn` scene index → `$`/`%` typing | ✅ M11 | Valid `$`/`%` types as bare `NATIVE Node` — diagnostics converge with Godot (`docs/02 §11`) (#76). Precise scene-derived node facts (the scene index + resolution seam) drive NAVIGATION only — hover/definition/typeDefinition (#125) and completion — never the diagnostic path (they'd turn Godot-tolerated downcasts into false positives) |
 | Scene-aware completion (node paths in `$`/`%`/`get_node`) | ✅ M11 | Extends M8 completion with the M11 scene index; no scene ⇒ empty, multi-scene ⇒ annotated union (#77) |
 | Autoload scene typing (`uid://` → scene → root script) | ✅ M11 | The `gd_project` deferral (`model.rs` uid→scene lookup); scriptless root ⇒ bare `Node` floor (#78) |
 | fileOperations: willRenameFiles (+ did\*) | ✅ M11 | Moving a `.gd`/`.tscn` returns `WorkspaceEdit` fixing `preload`/`load` paths (positively-identified args only); `did*` nudges the index (#79) |
@@ -248,7 +248,8 @@ zero custom token names on the wire; fix-all on save works in VS Code via standa
 scene-derived node types are deferred to a phase-3 navigation feature (precise hover/completion),
 explicitly OUT of the diagnostic path because a precise type fed into the symmetric compatibility
 checks would turn Godot-tolerated sibling downcasts into false positives; the resolution substrate
-(scene index + `scene_node_facts` seam) is built and kept dormant for that. Scene-aware node-path
+(scene index + `scene_node_facts` seam) is what those navigation surfaces read (#125 landed the
+precise hover/definition/typeDefinition half in `gd_server::scene_nav`). Scene-aware node-path
 completion; autoload `uid://` scene → root-script typing; `willRenameFiles` → `preload`/`load` path
 edits (+`did*` index nudges); the external-formatter bridge. **Exit:** `$`/`%` diagnostics converge
 with Godot on the acceptance projects (sweep gate per `scripts/m6-acceptance/scan_diags.py`,

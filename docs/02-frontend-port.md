@@ -199,8 +199,16 @@ assign a value of type Node2D…"; `$Health as Control` → "Invalid cast…" �
 larger effort. Precise scene-derived node types are therefore a **navigation-only goal** (precise
 hover/completion, phase 3), explicitly kept OUT of the diagnostic path.
 
-**Dormant substrate kept for that phase-3 navigation feature** (built + unit-tested, NOT consulted by
-`reduce_get_node` or any diagnostic):
+**The navigation half now ships** (#125): `hover` / `definition` / `typeDefinition` answer a `$Path` /
+`%Name` / `get_node("literal")` access with the scene-precise node type — the engine class of the node the
+access reaches, or the `class_name` of the script attached to it — built in `gd_server::scene_nav` and handed
+straight to the renderers. That decoupling is the point: the precise type is a display/jump vehicle that never
+enters an `AnalysisResult`, so the compatibility checks keep seeing bare `Node` and the tolerated downcasts
+stay silent. Everything the scene index cannot resolve unanimously (an absolute `$/root/…` path, a script no
+scene attaches, an absent node, two attaching scenes disagreeing) falls back to the bare-`Node` answer rather
+than guessing.
+
+**The substrate both halves read** (NOT consulted by `reduce_get_node` or any diagnostic):
 
 - `gd_analyze::CrossFileQuery::scene_node_facts` — a project-FACT seam (returns a `SceneNodeFacts`: a native
   class name or an attached-script `FileId`, never a `DataType`). **Default impl returns `None`**; overridden

@@ -368,6 +368,22 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         });
     }
 
+    // #125: the cursor is inside a `$Path` / `%Name` / `get_node("…")` access — render the
+    // SCENE-PRECISE node type (`Node2D`, or the class of the script attached to that node) instead
+    // of the analyzer's bare `Node`. Navigation-only by construction: the type comes from
+    // `scene_nav`, never from the `AnalysisResult` (a precise type in the diagnostic path would
+    // false-positive on the sibling downcasts Godot tolerates — see `crate::scene_nav`). Falls
+    // through to the bare `Node` hover whenever the scenes don't agree.
+    if let Some((access_id, dt)) =
+        crate::scene_nav::scene_node_type_at(state, &uri, &parsed.tree, byte)
+    {
+        let label = human_type_label(state, &parsed.tree, &dt);
+        return Some(Hover {
+            contents: hover_contents(state, format!("```gdscript\n{label}\n```")),
+            range: Some(mapper.span_to_range(parsed.tree.get(access_id).span)),
+        });
+    }
+
     // v1.0.2 (issue #26): the cursor is on the NAME of a class-level declaration — render its
     // signature (the analyzer pins no type on the name identifier, so the typed-ancestor
     // fallback below would walk up to the class node and surface its `<Script #N>` meta).
@@ -487,6 +503,16 @@ pub fn definition(
     // (C1) String literal inside preload/load: cursor on `"res://foo.gd"` → jump to foo.gd.
     if let Some(loc) = find_res_path_definition(state, &parsed.tree, node_id) {
         return Some(GotoDefinitionResponse::Scalar(loc));
+    }
+
+    // (C2) #125: the cursor is inside a `$Path` / `%Name` / `get_node("…")` access — jump to the
+    // declaration of the SCENE-PRECISE node's type: the attached script's `class_name` site, or the
+    // engine class's stub header. Navigation-only (see `crate::scene_nav`); a `$` access carries no
+    // identifier, so without this arm the `cursor_identifier` below ends the walk with `null`.
+    if let Some((_, dt)) = crate::scene_nav::scene_node_type_at(state, &uri, &parsed.tree, byte) {
+        if let Some(loc) = type_decl_location(state, &dt) {
+            return Some(GotoDefinitionResponse::Scalar(loc));
+        }
     }
 
     let name = cursor_identifier(&parsed.tree, node_id)?;
@@ -830,6 +856,15 @@ pub fn type_definition(
     let doc = state.vfs.get(uri.as_str())?;
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
     let byte = mapper.position_to_byte(tdp.position);
+
+    // #125: a `$Path` / `%Name` / `get_node("…")` access answers with the SCENE-PRECISE node type,
+    // whose declaration is a more useful jump than bare `Node`'s stub. Navigation-only — see
+    // `crate::scene_nav`.
+    if let Some((_, dt)) = crate::scene_nav::scene_node_type_at(state, &uri, &parsed.tree, byte) {
+        if let Some(loc) = type_decl_location(state, &dt) {
+            return Some(GotoTypeDefinitionResponse::Scalar(loc));
+        }
+    }
 
     // Clone the DataType so the `analyzed` borrow is released before `type_decl_location` reborrows
     // `state` (the script arm parses the target file; the native arm reads the stub cache). The

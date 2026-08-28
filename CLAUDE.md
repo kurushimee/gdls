@@ -107,9 +107,10 @@ parser, so it is not a standalone pre-pass.
   scene-derived precise type — the precise per-node type the editor shows comes from a separate
   scene-instantiation path. So `reduce_get_node` types valid `$`/`%` as bare `Node` (M11 retired the
   old permissive-`Variant` deviation): a member miss fires `UNSAFE_PROPERTY_ACCESS`, sibling
-  downcasts/casts stay silent — matching Godot. Precise scene-derived node types are **navigation-only**
-  (phase-3 hover/completion via the dormant `scene_node_facts` seam), deliberately kept OUT of the
-  diagnostic path (feeding them in would false-positive on Godot-tolerated downcasts). See `docs/02` §11.
+  downcasts/casts stay silent — matching Godot. Precise scene-derived node types are **navigation-only**:
+  `gd_server::scene_nav` reads the `scene_node_facts` seam for hover/definition/typeDefinition (#125) and
+  completion, and that type never enters an `AnalysisResult` — feeding it into the diagnostic path would
+  false-positive on Godot-tolerated downcasts. See `docs/02` §11.
 
 - **Intentional deferrals, not dead code.** Phase 2 features are deliberately stubbed/deferred — check the
   milestone status below before assuming something is missing.
