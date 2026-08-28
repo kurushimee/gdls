@@ -313,6 +313,16 @@ binary. No release cut.
   ignore-by-default, exactly as in Godot. Script bases in these messages read as their `class_name`
   now, not the internal `<Script #3>` placeholder.
 
+- **The watch registration no longer asks clients to watch everything** (#264): the glob set
+  included a `**/*` catch-all so that a client with no server-side watcher would still report new
+  assets and keep `load`/`preload` completion live (#226). It was sent unconditionally, which on a
+  large project means the client watches `.git/`, `.import/`, `build/` and every exported binary —
+  a great many inotify handles and a stream of notifications gdls discards. It is now registered
+  only when gdls's own filesystem watcher failed to arm; when that watcher is live it already
+  reports asset changes. The other six globs are unchanged, and both paths run the same
+  server-side exclusion filter, so the semantics are identical either way. The trade-off is
+  written down in `docs/09` §7.1.
+
 ### Added
 - **signatureHelp for builtin type constructors** (#257): `Vector2(`, `Color(`, `Callable(` and
   friends answer with one signature per overload, labelled `Type Type(args)` — the shape

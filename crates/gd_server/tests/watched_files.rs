@@ -69,6 +69,65 @@ fn boot_injected(
     (client, watcher_tx, server_thread)
 }
 
+/// Boot with gdls's REAL filesystem watcher — the ordinary session shape. `FileWatcher::new`
+/// succeeds on a temp directory, so this is the "native watcher armed" path #264 branches on.
+fn boot_real(
+    p: &common::TempProject,
+    capabilities: ClientCapabilities,
+) -> (Connection, std::thread::JoinHandle<anyhow::Result<()>>) {
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let init = InitializeParams {
+        capabilities,
+        initialization_options: Some(serde_json::json!({
+            "projectRoot": p.root.as_str(),
+            "autoDumpExtensionApi": false,
+            "extensionApiPath": p.root.join("extension_api.json").as_str(),
+        })),
+        ..Default::default()
+    };
+    client.sender.send(request(1, "initialize", init)).unwrap();
+    loop {
+        if let Message::Response(resp) = recv(&client) {
+            assert!(resp.error.is_none());
+            break;
+        }
+    }
+    client
+        .sender
+        .send(notification("initialized", InitializedParams {}))
+        .unwrap();
+    (client, server_thread)
+}
+
+/// Pull the registered glob list off the one `client/registerCapability` the server sends, and
+/// answer it so the outbound entry is consumed.
+fn registered_globs(client: &Connection) -> Vec<String> {
+    let req = loop {
+        if let Message::Request(req) = recv(client) {
+            break req;
+        }
+    };
+    assert_eq!(req.method, "client/registerCapability");
+    let registration = &req.params["registrations"][0];
+    assert_eq!(registration["id"], "gdls-watched-files");
+    assert_eq!(registration["method"], "workspace/didChangeWatchedFiles");
+    let globs: Vec<String> = registration["registerOptions"]["watchers"]
+        .as_array()
+        .expect("watchers array")
+        .iter()
+        .map(|w| w["globPattern"].as_str().unwrap().to_owned())
+        .collect();
+    client
+        .sender
+        .send(Message::Response(Response::new_ok(
+            req.id,
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+    globs
+}
+
 fn shutdown(client: &Connection, thread: std::thread::JoinHandle<anyhow::Result<()>>) {
     client
         .sender
@@ -117,30 +176,16 @@ fn workspace_symbol_names(client: &Connection, id: i32, query: &str) -> String {
 }
 
 /// Registration is sent exactly when offered: with `dynamicRegistration: true` the client
-/// receives one `client/registerCapability` for the seven watch globs after `initialized`;
-/// without it, nothing arrives.
+/// receives one `client/registerCapability` for the watch globs after `initialized`; without it,
+/// nothing arrives. This boot has no native watcher, so the `**/*` asset catch-all is included
+/// (#264's fallback path).
 #[test]
 fn registration_sent_iff_dynamic_registration_offered() {
     let p = sample_project();
     let (client, _watcher_tx, server_thread) = boot_injected(&p, dynamic_registration_caps());
 
-    let req = loop {
-        if let Message::Request(req) = recv(&client) {
-            break req;
-        }
-    };
-    assert_eq!(req.method, "client/registerCapability");
-    let registration = &req.params["registrations"][0];
-    assert_eq!(registration["id"], "gdls-watched-files");
-    assert_eq!(registration["method"], "workspace/didChangeWatchedFiles");
-    let globs: Vec<&str> = registration["registerOptions"]["watchers"]
-        .as_array()
-        .expect("watchers array")
-        .iter()
-        .map(|w| w["globPattern"].as_str().unwrap())
-        .collect();
     assert_eq!(
-        globs,
+        registered_globs(&client),
         vec![
             "**/*.gd",
             "**/*.tscn",
@@ -151,13 +196,6 @@ fn registration_sent_iff_dynamic_registration_offered() {
             "**/*",
         ]
     );
-    client
-        .sender
-        .send(Message::Response(Response::new_ok(
-            req.id,
-            serde_json::Value::Null,
-        )))
-        .unwrap();
     shutdown(&client, server_thread);
 
     // Without the capability: no registration request within a generous window.
@@ -171,45 +209,51 @@ fn registration_sent_iff_dynamic_registration_offered() {
     shutdown(&client2, server_thread2);
 }
 
-/// #226: the dynamic-registration glob set must also ask the client to report ARBITRARY ASSET
-/// changes (textures, audio, `.tres`, extension-less files like `LICENSE`). The asset set is
-/// defined by EXCLUSION (everything that is not a `.gd` script / `.tscn` scene / engine-managed
-/// file), so no positive extension allowlist can express it — only a `**/*` catch-all matches the
-/// same file set `AssetIndex::build` indexes. Without it, a client whose only freshness channel is
-/// `didChangeWatchedFiles` (the Helix scenario — no native OS watcher) is never told to report a
+/// #226 on the fallback path: with NO native watcher, the glob set must ask the client to report
+/// ARBITRARY ASSET changes (textures, audio, `.tres`, extension-less files like `LICENSE`). The
+/// asset set is defined by EXCLUSION (everything that is not a `.gd` script / `.tscn` scene /
+/// engine-managed file), so no positive extension allowlist can express it — only a `**/*`
+/// catch-all matches the same file set `AssetIndex::build` indexes. Without it, a client whose
+/// only freshness channel is `didChangeWatchedFiles` (the Helix scenario) is never told about a
 /// newly-created `icon.png`, so the asset index goes stale for `load`/`preload` completion until a
 /// restart. `classify_client_event` re-applies `is_excluded` server-side, so the broad glob does
 /// not pollute the index.
 #[test]
-fn register_watched_files_includes_asset_glob() {
+fn register_watched_files_includes_asset_glob_without_a_native_watcher() {
     let p = sample_project();
     let (client, _watcher_tx, server_thread) = boot_injected(&p, dynamic_registration_caps());
 
-    let req = loop {
-        if let Message::Request(req) = recv(&client) {
-            break req;
-        }
-    };
-    assert_eq!(req.method, "client/registerCapability");
-    let globs: Vec<&str> = req.params["registrations"][0]["registerOptions"]["watchers"]
-        .as_array()
-        .expect("watchers array")
-        .iter()
-        .map(|w| w["globPattern"].as_str().unwrap())
-        .collect();
+    let globs = registered_globs(&client);
     assert!(
-        globs.contains(&"**/*"),
-        "the dynamic-registration glob set must include a `**/*` catch-all so the client reports \
-         arbitrary-asset create/delete (the exclusion-defined asset set has no extension \
-         allowlist); got {globs:?}"
+        globs.iter().any(|g| g == "**/*"),
+        "with no native watcher the glob set must include the `**/*` catch-all so the client \
+         reports arbitrary-asset create/delete; got {globs:?}"
     );
-    client
-        .sender
-        .send(Message::Response(Response::new_ok(
-            req.id,
-            serde_json::Value::Null,
-        )))
-        .unwrap();
+    shutdown(&client, server_thread);
+}
+
+/// #264: the other side of the same trade. When gdls armed its OWN filesystem watcher, that
+/// watcher already reports asset create/delete — so asking the client to watch the entire
+/// workspace buys nothing and costs it a great many inotify handles over `.git/`, `.import/`,
+/// `build/` and every exported binary. The catch-all is dropped; the specific globs stay, since
+/// the engine-managed files are few and a duplicate delivery costs one fingerprint comparison.
+#[test]
+fn register_watched_files_omits_the_catch_all_when_the_native_watcher_is_armed() {
+    let p = sample_project();
+    let (client, server_thread) = boot_real(&p, dynamic_registration_caps());
+
+    assert_eq!(
+        registered_globs(&client),
+        vec![
+            "**/*.gd",
+            "**/*.tscn",
+            "**/project.godot",
+            "**/*.gdextension",
+            "**/extension_api.json",
+            "**/doc_classes/*.xml",
+        ],
+        "a session with its own watcher must not ask the client to watch the whole workspace"
+    );
     shutdown(&client, server_thread);
 }
 

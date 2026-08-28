@@ -975,7 +975,10 @@ fn serve_inner(
     // `initialized` notification itself was already consumed by `initialize_finish` during the
     // handshake — there is no later hook). No-op without
     // `workspace.didChangeWatchedFiles.dynamicRegistration`.
-    register_watched_files(&mut state);
+    // #264: the `**/*` catch-all is a FALLBACK, not a default — pass whether gdls armed its own
+    // OS watcher. Same predicate as `reconcile_mode` just below, for the same reason: without a
+    // live native watcher, freshness is already degraded and the client is the only channel left.
+    register_watched_files(&mut state, watcher.is_some());
 
     // At startup no buffers are open yet, so this set is empty; building it via the same helper the
     // watcher uses keeps the "open buffer wins" rule uniform and correct even if a future change
@@ -1941,15 +1944,55 @@ pub(crate) fn handle_client_file_events(
 /// `workspace.didChangeWatchedFiles.dynamicRegistration`. Deliberately broad `**/` globs: the
 /// classification funnel re-applies the same root/exclusion rules the native watcher uses, so
 /// over-delivery converges to identical semantics. (`**/*.tscn` joins the list in M11.)
-fn register_watched_files(state: &mut ServerState) {
+///
+/// `native_watcher_armed` decides whether the `**/*` asset catch-all is included — see the
+/// comment at its entry. Everything else is registered either way: the engine-managed files are
+/// few, and a duplicate delivery costs one content-fingerprint comparison.
+fn register_watched_files(state: &mut ServerState, native_watcher_armed: bool) {
     if !state.caps.dynamic_watched_files {
         return;
     }
     let watcher = |glob: &str| serde_json::json!({ "globPattern": glob });
+    // #226 / #264: the arbitrary-asset catch-all. Arbitrary assets are defined by EXCLUSION
+    // (everything that is not a script / scene / engine-managed file), so no positive extension
+    // allowlist can express the set — an extension-less `res://LICENSE` is a listable asset too,
+    // and `**/*` is the only glob matching `AssetIndex::build`'s own definition. It exists for the
+    // client whose ONLY freshness channel is `didChangeWatchedFiles` (the Helix scenario): without
+    // it, a newly-created `icon.png` never reaches the asset index and `load`/`preload` completion
+    // goes stale until a restart.
+    //
+    // But it asks the client to watch the entire workspace — `.git/`, `.import/`, `build/`,
+    // exported binaries, every asset — which on a large project is a great many inotify handles
+    // and a steady stream of notifications gdls then discards, and some clients cap or warn on
+    // watcher breadth. So it is registered only when it BUYS something: when gdls armed its own
+    // OS watcher, that watcher already reports asset create/delete, and the catch-all is pure
+    // client-side cost for a channel the server does not need. `classify_client_event` re-applies
+    // the same `is_excluded` server-side filter either way, so the two paths converge to identical
+    // semantics — the difference is only who pays for the delivery.
+    let asset_catch_all = (!native_watcher_armed).then(|| watcher("**/*"));
+    if native_watcher_armed {
+        log::debug!(
+            "watch registration: native watcher is armed, omitting the `**/*` asset catch-all              (asset freshness rides the native watcher)"
+        );
+    }
     let id = state.shared.next_outgoing_id();
     state
         .outbound
         .insert(id.clone(), OutboundKind::RegisterWatchedFiles);
+    let watchers: Vec<serde_json::Value> = [
+        watcher("**/*.gd"),
+        // M11 (#76): `.tscn` scene files feed the scene index (node/script/instance relations).
+        // `.scn` (binary) is intentionally NOT watched — gdls parses scene TEXT only (anti-catalog
+        // W16), and a binary `.scn` has no text form.
+        watcher("**/*.tscn"),
+        watcher("**/project.godot"),
+        watcher("**/*.gdextension"),
+        watcher("**/extension_api.json"),
+        watcher("**/doc_classes/*.xml"),
+    ]
+    .into_iter()
+    .chain(asset_catch_all)
+    .collect();
     let req = Request {
         id,
         method: "client/registerCapability".to_string(),
@@ -1957,29 +2000,7 @@ fn register_watched_files(state: &mut ServerState) {
             "registrations": [{
                 "id": "gdls-watched-files",
                 "method": "workspace/didChangeWatchedFiles",
-                "registerOptions": {
-                    "watchers": [
-                        watcher("**/*.gd"),
-                        // M11 (#76): `.tscn` scene files feed the scene index (node/script/instance
-                        // relations). `.scn` (binary) is intentionally NOT watched — gdls parses
-                        // scene TEXT only (anti-catalog W16), and a binary `.scn` has no text form.
-                        watcher("**/*.tscn"),
-                        watcher("**/project.godot"),
-                        watcher("**/*.gdextension"),
-                        watcher("**/extension_api.json"),
-                        watcher("**/doc_classes/*.xml"),
-                        // #226: arbitrary assets are exclusion-defined (everything that is not a
-                        // script/scene/engine-managed file), so no positive extension allowlist can
-                        // express the set — an extension-less `res://LICENSE` is a listable asset
-                        // too. A `**/*` catch-all is the only glob matching `AssetIndex::build`'s own
-                        // definition, so a no-native-watcher client (Helix-class) reports
-                        // arbitrary-asset create/delete and keeps `load`/`preload` completion live.
-                        // `classify_client_event` re-applies the same `is_excluded` server-side
-                        // filter the other broad globs rely on, so the over-delivery converges to
-                        // identical semantics (see the registration doc comment above).
-                        watcher("**/*"),
-                    ],
-                },
+                "registerOptions": { "watchers": watchers },
             }],
         }),
     };
