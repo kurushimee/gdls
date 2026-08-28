@@ -7284,28 +7284,15 @@ pub fn rename(
             position: loc.range.start,
         }
     } else {
-        match definition(
+        let resolved = definition(
             state,
             GotoDefinitionParams {
                 text_document_position_params: tdp.clone(),
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: lsp_types::PartialResultParams::default(),
             },
-        ) {
-            // Reject a canonicalization that landed on the project `class_name old_name` declaration
-            // when the cursor does not positively refer to that class (the name-only step-2 leak) —
-            // fall back to the cursor, whose own resolved reference set is complete and correct.
-            Some(GotoDefinitionResponse::Scalar(loc))
-                if global_class_decl.as_ref() == Some(&loc) =>
-            {
-                tdp.clone()
-            }
-            Some(GotoDefinitionResponse::Scalar(loc)) => TextDocumentPositionParams {
-                text_document: lsp_types::TextDocumentIdentifier { uri: loc.uri },
-                position: loc.range.start,
-            },
-            _ => tdp.clone(),
-        }
+        );
+        canonicalization_target(&tdp, resolved, global_class_decl.as_ref())
     };
 
     // (6) Reuse `references` (declaration + every reference) for the edit set — index/binding-backed
@@ -7322,6 +7309,49 @@ pub fn rename(
     let locations = references(state, ref_params).unwrap_or_default();
 
     Ok(Some(build_workspace_edit(state, locations, &new_name)))
+}
+
+/// Rename step (5)'s canonicalization decision: turn `definition()`'s answer for the cursor into
+/// the position the edit set is collected FROM, with the #159 gate-2 backstop applied.
+///
+/// `rejected_class_decl` is the project `class_name old_name` declaration when — and only when —
+/// the cursor does NOT positively refer to that class (`cursor_references_global_class` said no);
+/// it is `None` for a cursor that does refer to it (that cursor never reaches here — it
+/// canonicalizes straight to the decl) and when no such class exists.
+///
+/// Three arms:
+///   - `definition()` landed on `rejected_class_decl` → **reject**: keep the CURSOR. This is the
+///     fail-closed backstop. `definition()`'s step (2) is a name-only
+///     `find_global_class_definition(name)` fallback, so a cursor whose name merely collides with a
+///     project `class_name` can be handed that class's declaration; canonicalizing onto it would
+///     collect (and rewrite) the unrelated class project-wide — the #159 corruption. The cursor's
+///     own reference set is complete for such a symbol, so falling back loses nothing.
+///   - any other scalar → canonicalize onto that declaration (the click-site-independent anchor).
+///   - `None` / a non-scalar response → keep the cursor (nothing better to anchor on).
+///
+/// Kept as a standalone function so the reject arm is unit-testable (#161): end-to-end it is
+/// currently UNREACHABLE from legal source — every cursor the rename firewall
+/// ([`rename_target_has_project_anchor`]) admits also resolves through one of `definition()`'s
+/// earlier, occurrence-positive steps (0.4-1.6) before the name-only step (2), and the one cursor
+/// shape that DOES reach step (2) with a colliding class (an anonymous-enum value's declaration
+/// token) has no project anchor and is refused outright. The backstop exists precisely so that
+/// ordering is not load-bearing: it must survive a change to `definition()`'s steps (#158) or a
+/// binding-recording gap. The unit tests below are what a refactor that drops it fails.
+fn canonicalization_target(
+    cursor: &TextDocumentPositionParams,
+    resolved: Option<GotoDefinitionResponse>,
+    rejected_class_decl: Option<&Location>,
+) -> TextDocumentPositionParams {
+    match resolved {
+        Some(GotoDefinitionResponse::Scalar(loc)) if rejected_class_decl == Some(&loc) => {
+            cursor.clone()
+        }
+        Some(GotoDefinitionResponse::Scalar(loc)) => TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: loc.uri },
+            position: loc.range.start,
+        },
+        _ => cursor.clone(),
+    }
 }
 
 /// An empty [`WorkspaceEdit`] in whichever shape the client negotiated (a no-op rename). Keeps the
@@ -7733,4 +7763,103 @@ pub fn semantic_tokens_range(
 fn next_semantic_tokens_id(state: &mut ServerState) -> String {
     state.semantic_tokens_result_seq += 1;
     format!("st-{}", state.semantic_tokens_result_seq)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uri(s: &str) -> Uri {
+        s.parse().expect("test uri")
+    }
+
+    fn loc(u: &str, line: u32, character: u32) -> Location {
+        Location {
+            uri: uri(u),
+            range: Range {
+                start: Position { line, character },
+                end: Position {
+                    line,
+                    character: character + 3,
+                },
+            },
+        }
+    }
+
+    fn cursor_at(u: &str, line: u32, character: u32) -> TextDocumentPositionParams {
+        TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: uri(u) },
+            position: Position { line, character },
+        }
+    }
+
+    /// #161 (from #159 gate 2): the REJECT arm. `definition()` handed back the project
+    /// `class_name` declaration for a cursor that does not positively refer to that class — the
+    /// name-only step-2 leak — so canonicalization must be refused and the CURSOR kept. Deleting
+    /// the reject arm makes this fail: the rename would then collect (and rewrite) the unrelated
+    /// class project-wide.
+    #[test]
+    fn canonicalization_rejects_the_unrelated_class_decl_and_keeps_the_cursor() {
+        let cursor = cursor_at("file:///proj/consumer.gd", 3, 8);
+        let class_decl = loc("file:///proj/foo.gd", 0, 11);
+        let out = canonicalization_target(
+            &cursor,
+            Some(GotoDefinitionResponse::Scalar(class_decl.clone())),
+            Some(&class_decl),
+        );
+        assert_eq!(
+            out.text_document.uri.as_str(),
+            "file:///proj/consumer.gd",
+            "a rejected canonicalization must stay on the cursor's own file"
+        );
+        assert_eq!(out.position, cursor.position);
+    }
+
+    /// The same `definition()` answer canonicalizes NORMALLY when that class decl is not the
+    /// rejected one (the cursor positively refers to the class). Pins that the backstop rejects by
+    /// IDENTITY of the resolved location, never blanket-refusing class declarations.
+    #[test]
+    fn canonicalization_accepts_a_class_decl_that_is_not_rejected() {
+        let cursor = cursor_at("file:///proj/consumer.gd", 3, 8);
+        let class_decl = loc("file:///proj/foo.gd", 0, 11);
+        let out = canonicalization_target(
+            &cursor,
+            Some(GotoDefinitionResponse::Scalar(class_decl.clone())),
+            None,
+        );
+        assert_eq!(out.text_document.uri.as_str(), "file:///proj/foo.gd");
+        assert_eq!(out.position, class_decl.range.start);
+    }
+
+    /// A declaration that is NOT the rejected class decl canonicalizes normally even while a
+    /// rejected class decl exists — the common case (an in-file member's own declaration).
+    #[test]
+    fn canonicalization_accepts_an_unrelated_declaration_while_a_class_decl_is_rejected() {
+        let cursor = cursor_at("file:///proj/consumer.gd", 3, 8);
+        let member_decl = loc("file:///proj/consumer.gd", 1, 7);
+        let class_decl = loc("file:///proj/foo.gd", 0, 11);
+        let out = canonicalization_target(
+            &cursor,
+            Some(GotoDefinitionResponse::Scalar(member_decl.clone())),
+            Some(&class_decl),
+        );
+        assert_eq!(out.text_document.uri.as_str(), "file:///proj/consumer.gd");
+        assert_eq!(out.position, member_decl.range.start);
+    }
+
+    /// No definition (or a non-scalar response) keeps the cursor — there is nothing better to
+    /// anchor the edit set on, and the cursor's own set is what `references` already resolves.
+    #[test]
+    fn canonicalization_without_a_scalar_definition_keeps_the_cursor() {
+        let cursor = cursor_at("file:///proj/consumer.gd", 3, 8);
+        let class_decl = loc("file:///proj/foo.gd", 0, 11);
+        for resolved in [
+            None,
+            Some(GotoDefinitionResponse::Array(vec![class_decl.clone()])),
+        ] {
+            let out = canonicalization_target(&cursor, resolved, Some(&class_decl));
+            assert_eq!(out.text_document.uri.as_str(), "file:///proj/consumer.gd");
+            assert_eq!(out.position, cursor.position);
+        }
+    }
 }
