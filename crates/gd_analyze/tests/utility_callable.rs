@@ -66,9 +66,10 @@ fn ident_info(src: &str, name: &str) -> (DataType, bool) {
 
 /// The issue's minimal repro: `print.call_deferred(message)` is a builtin-method call on the
 /// constant Callable `print` reduces to — godot accepts it with zero diagnostics. The type
-/// assertion keeps the test discriminating: the trimmed fixture DB lacks `call_deferred`, so
-/// an unknown method on ANY base would also be silently permissive — zero errors alone would
-/// hold even if `print` mis-resolved.
+/// assertion keeps the test discriminating: zero errors alone would hold even if `print`
+/// mis-resolved to some base whose members gdls cannot introspect. Since #256 the fixture
+/// carries `Callable`'s full method table, so `call_deferred` resolving is a real hit and a
+/// mis-resolution would show up as `Function "call_deferred()" not found in base Callable.`
 #[test]
 fn print_call_deferred_is_clean() {
     let src =

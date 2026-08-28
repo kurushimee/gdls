@@ -9,10 +9,17 @@ use gd_analyze::NoCrossFile;
 use gd_project::WarningConfig;
 use gd_types::NativeDb;
 
+/// `from_json` stamps [`gd_types::ApiProvenance::Exact`], which since #256 is the claim that a
+/// bare `name()` gdls cannot resolve genuinely does not exist. So a minimal dump has to carry the
+/// utility functions its fixtures call, or every `print(...)` in them reads as a typo.
 fn mini_native() -> NativeDb {
     NativeDb::from_json(
         r#"{
             "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+            "utility_functions": [
+                {"name": "print", "return_type": "void", "category": "general",
+                 "is_vararg": true, "hash": 1, "arguments": []}
+            ],
             "classes": [
                 {"name": "Object"},
                 {"name": "Node", "inherits": "Object"}

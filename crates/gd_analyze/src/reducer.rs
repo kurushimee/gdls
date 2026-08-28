@@ -4061,6 +4061,25 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         native_callee = root;
                         sig_resolved = true;
                     } else {
+                        // #256: the ERROR stays off (an interface gap must never become
+                        // "Function not found"), but the WARNING belongs here — this is
+                        // analyzer.cpp:3740-3742's arm, whose gate is any non-`self`,
+                        // non-hard-BUILTIN base, and a `class_name` instance is exactly that.
+                        // #123 landed it NATIVE-only because a Script miss degrades before the
+                        // not-found branch; this is the same claim made at the site that
+                        // actually knows. Sound only when the chain was fully walkable
+                        // (`native_root` resolved) under an `Exact` dump — otherwise the miss
+                        // may be a gap in gdls's view, not in the user's code.
+                        if root.is_some()
+                            && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+                        {
+                            let base_str = class_identifier_name_or_default(ctx, &base_type);
+                            ctx.push_warning(
+                                crate::warnings::WarningCode::UnsafeMethodAccess,
+                                &[function_name.clone(), base_str],
+                                id,
+                            );
+                        }
                         return_type = Some(DataType::variant());
                     }
                     found = true;
@@ -4414,33 +4433,67 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             }
         }
 
-        // Emit Godot-faithful errors only when the lookup definitively failed against an
-        // introspectable base. For `is_self=true` (identifier callee from within a method) with
-        // no super, Godot uses `ClassDB::get_method_info` + `GDScriptUtilityFunctions` over
-        // the full engine surface — gdls only sees the (possibly trimmed) NativeDb, so a missing
-        // utility (`typeof`, `Color()`, …) would false-positive every such call. Permissive
-        // silence on `is_self && !is_super` keeps trimmed-dump runs honest while still letting
-        // the super-call + subscript-base errors fire.
+        // analyzer.cpp:3748-3760 — the hard "Function not found in base" error. Godot's gate is
+        // `!found && (is_self || (base is hard BUILTIN))`, its base name is
+        // `is_self && !is_super ? "self" : base_type.to_string()`, and its anchor is the CALL for
+        // a super-call and the CALLEE otherwise.
+        //
+        // Every arm below is a negative claim — "this name exists nowhere" — whose lookup bottoms
+        // out in the native surface, so all of them are gated on `ApiProvenance::Exact` (v1.0.2,
+        // issue #24): under a `Generic`/`Absent` DB a custom engine build may define exactly the
+        // member the stock dump lacks.
+        // #256: the hard-BUILTIN half of Godot's `is_self || (hard && BUILTIN)` gate
+        // (`Vector2(1, 2).bogus()`). The builtin method tables come straight out of the dump's
+        // `builtin_classes[].methods` — the same tables `signatureHelp` resolves `arr.append(` and
+        // `Vector2.lerp(` from — so under `Exact` a miss is provable, provided the dump actually
+        // carries an entry for this builtin (a trimmed one may not, and then absence proves
+        // nothing). `Dictionary` is excluded for the same reason as the member arm above: its keys
+        // are its members, so Godot answers any name with a Variant.
+        let builtin_base_is_introspectable = base_type.is_hard_type()
+            && base_type.kind == DtKind::Builtin
+            && !base_type.is_meta_type
+            && !matches!(
+                base_type.builtin_type,
+                VariantType::Dictionary | VariantType::Nil
+            )
+            && ctx
+                .native
+                .builtin_named(data_type::variant_type_name(base_type.builtin_type))
+                .is_some();
         if !name_is_value
-            && call.is_super
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+            && ((is_self && (call.is_super || self_base_is_introspectable(ctx, &base_type)))
+                || builtin_base_is_introspectable)
         {
-            // v1.0.2 (issue #24): the super-miss template below is a negative claim whose lookup
-            // bottoms out in the native chain — under a `Generic`/`Absent` DB a custom engine build
-            // may define the member the stock surface lacks, so it only fires with `Exact` provenance.
+            // The native super-VIRTUAL case (`super._init()`, `super._notification()`, …) is
+            // resolved by the seeded native methods and handled at its resolution site (the
+            // `call.is_super && sig.is_virtual` arm in the `if found` block,
+            // analyzer.cpp:3630-3636), so it never reaches here — a super-call arriving here is a
+            // real method miss.
             //
-            // analyzer.cpp:3758 — super-call fall-through "Function not found in base". The native
-            // super-VIRTUAL case (`super._init()`, `super._notification()`, …) is resolved by the
-            // seeded native methods and handled at its resolution site (the `call.is_super &&
-            // sig.is_virtual` arm in the `if found` block, analyzer.cpp:3630-3636), so it never
-            // reaches here. This arm covers only a super-call to a name the native chain genuinely
-            // lacks (a real method miss).
+            // #256: the non-super `is_self` half (`miss()`, `self.miss()`) used to be silenced
+            // outright, on the grounds that a trimmed dump missing a utility (`typeof`, `Color()`)
+            // would false-positive every bare call. Two things make that silence unnecessary now:
+            // the utility lookup runs and EARLY-RETURNS well before this branch (the Variant-
+            // utility table plus `gd_utility_return_type`), so a utility call never arrives here at
+            // all; and `Exact` provenance is exactly the claim that the dump IS the engine surface.
+            // What remains is the resolution question — a self-call only reaches `!found` when the
+            // in-file walk missed AND the chain bottomed out at a native root that also missed, so
+            // [`self_base_is_introspectable`] re-checks that the chain was actually walkable before
+            // gdls asserts a name is absent from it.
+            let base_name = if is_self && !call.is_super {
+                "self".to_string()
+            } else {
+                base_type.to_string()
+            };
+            let anchor = if call.is_super {
+                id
+            } else {
+                call.callee.unwrap_or(id)
+            };
             ctx.push_error(
-                format!(
-                    r#"Function "{function_name}()" not found in base {}."#,
-                    base_type
-                ),
-                id,
+                format!(r#"Function "{function_name}()" not found in base {base_name}."#),
+                anchor,
             );
         } else if !name_is_value
             && !call.is_super
@@ -4623,6 +4676,29 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
 /// per-call-site helpers like this one read the identifier on demand so error messages render
 /// `MyClass` instead of `<Class>`.
 pub(crate) fn class_identifier_name_or_default(ctx: &AnalysisContext, dt: &DataType) -> String {
+    // A cross-file SCRIPT base gets the same treatment for the same reason: `Display` renders it
+    // as the internal placeholder `<Script #3>`, while Godot's `DataType::to_string()` for SCRIPT
+    // (gdscript_parser.cpp:5321-5329) returns the script's name, falling back to its path. Read
+    // the `class_name` off the depended interface — for an inner class, its own declared name —
+    // and fall back to the file path exactly as upstream does.
+    if dt.kind == DtKind::Script {
+        if let Some(sr) = dt.script_type.as_ref() {
+            if let Some(inner) = sr.inner.last() {
+                return inner.clone();
+            }
+            if let Some(name) = ctx
+                .xfile
+                .interface(sr.file)
+                .and_then(|i| i.class_name.as_deref())
+            {
+                return name.to_owned();
+            }
+            if let Some(path) = ctx.xfile.file_path(sr.file) {
+                return path.to_owned();
+            }
+        }
+        return dt.to_string();
+    }
     if dt.kind != DtKind::Class {
         return dt.to_string();
     }
@@ -4757,6 +4833,24 @@ fn lookup_class_function_or_member(
 }
 
 /// Hard-coded GDScript utility function return-type table, mirroring
+/// #256: whether a `self` base was resolved well enough for gdls to claim a name is absent from it.
+///
+/// A non-super self-call reaches the not-found branch only after the in-file class walk missed and
+/// the chain-continuation missed too — but "the chain-continuation missed" has two very different
+/// causes. Either the chain WAS walkable and the name genuinely is not on it (a real typo), or the
+/// chain could not be followed at all (`extends SomeUnresolvableName`, an orphan buffer, a base
+/// whose type never resolved), in which case absence proves nothing. Only the first may error.
+///
+/// A cross-file `Script` base never reaches here — its miss degrades to a silent `Variant` with
+/// `found = true` ("Unknown stays dynamic"), because a shallow interface view can be incomplete.
+/// So the check reduces to: the base is an in-file class whose ancestry reaches a native root.
+fn self_base_is_introspectable(ctx: &AnalysisContext, base_type: &DataType) -> bool {
+    base_type.kind == DtKind::Class
+        && base_type
+            .class_node
+            .is_some_and(|cid| crate::resolver::nearest_native_ancestor(ctx, cid).is_some())
+}
+
 /// `modules/gdscript/gdscript_utility_functions.cpp:570-592`. These functions are NOT in the
 /// Variant utility set (extension_api.json) — they're GDScript-only. Returns `None` for
 /// unknown names so the caller falls through to the method-call dispatch.
@@ -5132,6 +5226,36 @@ fn reduce_subscript_attribute(
             if let Some(folded) = ctx.folds.get(attr_id).cloned() {
                 ctx.folds.set(sub_id, folded);
             }
+            // #256: a SCRIPT base never reaches the `else` arm below — its member miss reduces to
+            // a permissive Variant (an interface gap must never become `Cannot find member`), so
+            // `is_set()` is true either way and UNSAFE_PROPERTY_ACCESS was structurally
+            // unreachable for `class_name` instances while firing correctly for native ones.
+            // Finishing #123's stated acceptance: ask the chain read-only whether the name is
+            // actually there. Same soundness bar as everywhere else — an `Exact` dump and a chain
+            // that was fully walkable (`native_root` resolved); anything less and the miss might
+            // be gdls's view, not the user's code. The ERROR path stays untouched.
+            if base_type.kind == DtKind::Script
+                && (!base_type.is_meta_type || !base_type.is_constant)
+                && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+            {
+                if let Some(sr) = base_type.script_type.clone() {
+                    let attr_name = match &ctx.node(attr_id).kind {
+                        NodeKind::Identifier(i) => i.name.clone(),
+                        _ => String::new(),
+                    };
+                    if crate::script_chain::chain_native_root(ctx, &sr).is_some()
+                        && !attr_name.is_empty()
+                        && !script_chain_has_member(ctx, &sr, &attr_name)
+                    {
+                        let base_str = class_identifier_name_or_default(ctx, &base_type);
+                        ctx.push_warning(
+                            crate::warnings::WarningCode::UnsafePropertyAccess,
+                            &[attr_name, base_str],
+                            sub_id,
+                        );
+                    }
+                }
+            }
         } else if !base_type.is_meta_type || !base_type.is_constant {
             // analyzer.cpp:4878-4886 — the UNSAFE_PROPERTY_ACCESS arm. A property miss on a
             // non-meta or non-constant base ⇒ the lookup is dynamic, not an error; the access
@@ -5439,6 +5563,42 @@ pub(crate) fn script_instance_datatype(
 /// [`Binding::Use`] against the DECLARING link's file — what `textDocument/references` and
 /// `definition` project for member-access sites — and returns the type (+ optional fold) plus the
 /// resolved member kind (so an implicit-self caller can mark `use_self` for instance members only).
+/// #256: does `start`'s extends chain (or the native class it bottoms out in) carry a member
+/// named `name`? A READ-ONLY companion to [`lookup_script_chain_member`] — it records no
+/// `Binding::Use`, sets no type and pushes no diagnostic, so it is safe to ask as a second opinion
+/// after the reduction already happened.
+///
+/// It exists because a Script-base member miss reduces to a permissive `Variant` (an interface gap
+/// must never become `Cannot find member`), which is indistinguishable from a genuine untyped
+/// `var x` member. The caller needs that distinction to decide whether the access was actually
+/// unsafe.
+fn script_chain_has_member(
+    ctx: &AnalysisContext,
+    start: &crate::data_type::ScriptRef,
+    name: &str,
+) -> bool {
+    let chain = crate::script_chain::resolve_script_chain(ctx, start);
+    for link in chain.links.iter() {
+        let Some(iface) = crate::script_chain::link_interface(ctx.xfile, link) else {
+            continue;
+        };
+        if iface.members.iter().any(|m| m.name == name)
+            || iface.enums.iter().any(|e| e.name == name)
+            || iface.unnamed_enum_values.iter().any(|v| v == name)
+            || iface
+                .inner
+                .iter()
+                .any(|c| c.class_name.as_deref() == Some(name))
+        {
+            return true;
+        }
+    }
+    chain
+        .native_root
+        .as_deref()
+        .is_some_and(|root| ctx.native.lookup_member(root, name).is_some())
+}
+
 fn lookup_script_chain_member(
     ctx: &mut AnalysisContext,
     start: &crate::data_type::ScriptRef,
@@ -5862,8 +6022,7 @@ fn reduce_identifier_from_base(
             return;
         }
         // Non-meta builtin base (instance): members (`pos.x` → int, analyzer.cpp:4118-4124 via
-        // Variant introspection) and methods (constant Callable). Unknown names stay a silent
-        // Variant — the trimmed-DB / dynamic-member rule.
+        // Variant introspection) and methods (constant Callable).
         let builtin_name = data_type::variant_type_name(base.builtin_type);
         if let Some(bt) = ctx.native.builtin_named(builtin_name) {
             if let Some(member) = bt
@@ -5883,7 +6042,33 @@ fn reduce_identifier_from_base(
                 ctx.set_type(identifier_id, make_callable_type());
                 return;
             }
+            // analyzer.cpp:4144-4158 — miss on a HARD builtin instance base.
+            //
+            // #256: this used to degrade to a silent Variant on the trimmed-DB rule, which also
+            // silenced `Vector2(1, 2).bogus` — one of the two lines Godot reports for a typo'd
+            // builtin method call. `ApiProvenance::Exact` is the claim that the dump IS the engine
+            // surface, and reaching here means the base's builtin entry was present and neither its
+            // members nor its methods carry the name, so absence is provable.
+            //
+            // Godot's own switch keeps two shapes out: `Dictionary` returns a bare Variant for ANY
+            // name (analyzer.cpp:4124-4128 — a dictionary's keys are its members), and `Nil` has
+            // its own `Cannot get property "%s" on a null object.` message, which is not this arm's
+            // to emit.
+            if base.is_hard_type()
+                && !matches!(
+                    base.builtin_type,
+                    VariantType::Dictionary | VariantType::Nil
+                )
+                && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+            {
+                ctx.push_error(
+                    format!(r#"Cannot find member "{name}" in base "{base}"."#),
+                    identifier_id,
+                );
+            }
         }
+        // A builtin the (possibly trimmed) dump doesn't carry proves nothing about the name —
+        // silent Variant, same as before.
         ctx.set_type(identifier_id, DataType::variant());
         return;
     }

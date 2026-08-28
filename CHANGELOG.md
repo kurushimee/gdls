@@ -297,6 +297,22 @@ binary. No release cut.
   all say `Method` now, matching the `CompletionItemKind::Method` completion already returned for
   the same symbols; the kind picks the glyph an outline draws, and the two surfaces disagreed.
 
+- **A call to a function that does not exist reports it** (#256): `miss()`, `self.miss()` and a
+  method miss on a hard builtin base (`Vector2(1, 2).bogus()`) were all completely silent — the
+  most common GDScript typo produced no squiggle. Each was hushed on the theory that a trimmed
+  native dump would make absence unprovable, but the utility lookup early-returns long before that
+  branch is reached, and `ApiProvenance::Exact` is precisely the claim that the dump IS the engine
+  surface — the same gate every neighbouring arm already used. Now they emit Godot's own text at
+  Godot's own ranges, verified line-for-line against the 4.6.3-stable binary, and still stay silent
+  wherever the claim would be unsound: a non-`Exact` dump, an `extends` that does not resolve, a
+  soft-typed base, or a `Dictionary` (whose keys are its members, as upstream has it).
+- **A member miss on a `class_name` instance warns** (#256): `UNSAFE_METHOD_ACCESS` /
+  `UNSAFE_PROPERTY_ACCESS` fired on native bases and said nothing on script ones, because a script
+  miss degrades to a permissive `Variant` before the arm that reports it. Both now fire for script
+  bases too, when the chain was fully walkable, finishing #123's stated acceptance. Both codes stay
+  ignore-by-default, exactly as in Godot. Script bases in these messages read as their `class_name`
+  now, not the internal `<Script #3>` placeholder.
+
 ### Added
 - **signatureHelp for builtin type constructors** (#257): `Vector2(`, `Color(`, `Callable(` and
   friends answer with one signature per overload, labelled `Type Type(args)` — the shape
