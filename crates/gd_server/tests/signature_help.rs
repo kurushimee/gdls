@@ -801,3 +801,175 @@ fn root_class_method_signature_unaffected_by_inner_walk() {
 
     shutdown(&client, server_thread);
 }
+
+// ===================================================================================================
+// #193 — lambda `.call` signatures.
+// ===================================================================================================
+
+/// #193: `f.call(<cursor>)` where `f` holds a lambda shows the LAMBDA's parameters — names, types
+/// and defaults from the lambda literal — with the cursor's argument index mapped onto them. Without
+/// this the only answer is the native `Callable.call(...)` vararg shape, which says nothing about
+/// what the call takes.
+#[test]
+fn lambda_call_shows_the_lambdas_parameters() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/lambda_call.gd"));
+    let src = "extends Node\n\n\
+               func run() -> void:\n\
+               \tvar f := func(a: int, b: String = \"hi\") -> void:\n\t\tpass\n\
+               \tf.call(1, \"x\")\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\tf.call(1, "x")` is line 5 (0-based); arg 0 = tab(1) + "f.call(".len()(7) = 8.
+    let h = sig(&client, 40, &uri, Position::new(5, 8));
+    assert_eq!(
+        only_label(&h),
+        "void call(a: int, b: String = \"hi\")",
+        "the lambda's own parameter list, under the `call` callee name"
+    );
+    assert_eq!(h.signatures[0].active_parameter, Some(0));
+
+    // Advance past the comma into arg 1: column 11 is just after `1, `.
+    let h2 = sig(&client, 41, &uri, Position::new(5, 11));
+    assert_eq!(h2.signatures[0].active_parameter, Some(1));
+
+    shutdown(&client, server_thread);
+}
+
+/// An UNANNOTATED lambda return renders as `Variant`, not `void`: `Callable.call` yields whatever
+/// the lambda returns, so `void` would misreport the call's value. `call_deferred` resolves the same
+/// way (it forwards the same argument list).
+#[test]
+fn lambda_call_deferred_renders_unannotated_return_as_variant() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/lambda_deferred.gd"));
+    let src = "extends Node\n\n\
+               func run() -> void:\n\
+               \tvar doubler := func(x):\n\t\treturn x * 2\n\
+               \tdoubler.call_deferred(2)\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\tdoubler.call_deferred(2)` is line 5; arg 0 = tab(1) + "doubler.call_deferred(".len()(22).
+    let h = sig(&client, 42, &uri, Position::new(5, 23));
+    assert_eq!(only_label(&h), "Variant call_deferred(x: Variant)");
+
+    shutdown(&client, server_thread);
+}
+
+/// A CLASS-LEVEL `var` holding a lambda resolves from inside any method (the visibility rule only
+/// constrains a `var` declared inside a function).
+#[test]
+fn class_level_lambda_var_resolves_from_a_method() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/lambda_member.gd"));
+    let src = "extends Node\n\n\
+               var handler := func(damage: int) -> bool:\n\treturn damage > 0\n\n\
+               func run() -> void:\n\thandler.call(3)\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\thandler.call(3)` is line 6; arg 0 = tab(1) + "handler.call(".len()(13) = 14.
+    let h = sig(&client, 43, &uri, Position::new(6, 14));
+    assert_eq!(only_label(&h), "bool call(damage: int)");
+
+    shutdown(&client, server_thread);
+}
+
+/// Fail-closed: a name REBOUND by a later assignment can hold a different callable than the lambda
+/// it was declared with, and gdls does not track which assignment reaches the cursor — so no lambda
+/// signature is offered. (This project's dump carries no `Callable` builtin, so the honest fallback
+/// is `null` rather than a wrong parameter list.)
+#[test]
+fn reassigned_lambda_var_offers_no_lambda_signature() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/lambda_reassigned.gd"));
+    let src = "extends Node\n\n\
+               func run() -> void:\n\
+               \tvar f := func(a: int) -> void:\n\t\tpass\n\
+               \tf = func(other: String, extra: int) -> void:\n\t\tpass\n\
+               \tf.call(1)\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\tf.call(1)` is line 7; arg 0 = tab(1) + "f.call(".len()(7) = 8.
+    let raw = sig_raw(&client, 44, &uri, Position::new(7, 8));
+    assert!(
+        raw.is_null(),
+        "a rebound lambda name must not claim a lambda signature; got {raw}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Two functions each declaring their own `var f := func …` each get THEIR OWN lambda: the base is
+/// resolved through the tree's scope-correct binding resolver (the primitive the rename firewall
+/// trusts), not a file-wide name match — so a same-named lambda in a sibling scope can never supply
+/// the parameter list.
+#[test]
+fn same_named_lambda_vars_in_two_functions_resolve_per_scope() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/lambda_scoped.gd"));
+    let src = "extends Node\n\n\
+               func one() -> void:\n\
+               \tvar f := func(a: int) -> void:\n\t\tpass\n\
+               \tf.call(1)\n\n\
+               func two() -> void:\n\
+               \tvar f := func(other: String) -> void:\n\t\tpass\n\
+               \tf.call(\"x\")\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\tf.call(1)` is line 5; arg 0 = tab(1) + "f.call(".len()(7) = 8.
+    let h1 = sig(&client, 45, &uri, Position::new(5, 8));
+    assert_eq!(only_label(&h1), "void call(a: int)");
+
+    // `\tf.call("x")` is line 10 — the OTHER function's `f`.
+    let h2 = sig(&client, 46, &uri, Position::new(10, 8));
+    assert_eq!(only_label(&h2), "void call(other: String)");
+
+    shutdown(&client, server_thread);
+}
+
+/// `bind` keeps the native `Callable.bind` shape: it appends its arguments to the END of the
+/// lambda's parameter list, so which parameter the cursor sits in depends on how many arguments the
+/// user will eventually bind — unknowable mid-typing, and a wrong `activeParameter` is a lie.
+#[test]
+fn lambda_bind_is_not_mapped_onto_the_lambdas_parameters() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/lambda_bind.gd"));
+    let src = "extends Node\n\n\
+               func run() -> void:\n\
+               \tvar f := func(a: int, b: int) -> void:\n\t\tpass\n\
+               \tf.bind(2)\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\tf.bind(2)` is line 5; arg 0 = tab(1) + "f.bind(".len()(7) = 8.
+    let raw = sig_raw(&client, 46, &uri, Position::new(5, 8));
+    assert!(
+        raw.is_null(),
+        "bind must not borrow the lambda's parameter list; got {raw}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Fail-closed for a class-level holder too: a member `var` that any method rebinds (`self.handler =
+/// …`) may hold a different callable at the call site than the lambda it was declared with, so no
+/// lambda signature is offered.
+#[test]
+fn reassigned_class_level_lambda_var_refuses() {
+    let p = sig_project();
+    let uri = file_uri(&p.root.join("src/lambda_member_reassigned.gd"));
+    let src = "extends Node\n\n\
+               var handler := func(damage: int) -> bool:\n\treturn damage > 0\n\n\
+               func swap() -> void:\n\
+               \tself.handler = func(other: String) -> bool:\n\t\treturn true\n\n\
+               func run() -> void:\n\thandler.call(3)\n";
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // `\thandler.call(3)` is line 10; arg 0 = tab(1) + "handler.call(".len()(13) = 14.
+    let raw = sig_raw(&client, 47, &uri, Position::new(10, 14));
+    assert!(
+        raw.is_null(),
+        "a rebound member must not claim a lambda signature; got {raw}"
+    );
+
+    shutdown(&client, server_thread);
+}
