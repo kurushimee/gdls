@@ -260,6 +260,12 @@ binary. No release cut.
   anything. Every test then saw status 1, and the one expecting 1 passed for the wrong reason —
   red Windows CI for twelve commits. They go through the production URI helper now, and read the
   `initialize` response back so a handshake-time death is a named failure on any platform.
+- **A malformed `initialize` param no longer kills the handshake** (#280): `InitializeParams` is a
+  large typed struct and `from_value` is all-or-nothing, so one field in a shape lsp-types 0.97
+  does not model — an unparseable `rootUri`, a capability value of the wrong JSON type — aborted
+  the session before the server could answer, and the client saw it vanish with no result and no
+  error. Only four fields are ever read downstream, so a failed parse now recovers them one at a
+  time and continues, logging what it could not read.
 - **`exit` without `shutdown` now exits 1** (#262): LSP 3.17 §exit reserves status 0 for the case
   where the shutdown handshake completed, so a supervising client can tell a clean stop from an
   abrupt one. gdls returned 0 either way. A transport close (stdin EOF, no `exit` at all) stays 0 —
