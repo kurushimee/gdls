@@ -707,6 +707,21 @@ pub(crate) struct SemanticTokensCacheEntry {
     pub(crate) tokens: Vec<lsp_types::SemanticToken>,
 }
 
+/// How a session ended — the input to the process exit code LSP 3.17 §exit specifies: "The
+/// server should exit with `success` code 0 if the shutdown request has been received before;
+/// otherwise with `error` code 1." Only the stdio binary path acts on this; an in-memory
+/// `serve` in tests just gets it back as a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionEnd {
+    /// `exit` arrived after a `shutdown` request — a clean handshake.
+    CleanExit,
+    /// `exit` arrived with no prior `shutdown` — the spec's error case.
+    ExitWithoutShutdown,
+    /// The transport closed (stdin EOF, router hang-up) without an `exit` notification. Not a
+    /// protocol violation — the client is simply gone — so this exits 0 like a clean shutdown.
+    TransportClosed,
+}
+
 /// Build and run the server on stdio. This is the binary entry point's worker.
 pub fn run() -> Result<()> {
     run_with_recorder(BenchRecorder::from_env())
@@ -719,9 +734,15 @@ pub fn run_with_recorder(recorder: Option<BenchRecorder>) -> Result<()> {
     crate::logging::init();
     log::info!("gdls {} starting on stdio", env!("CARGO_PKG_VERSION"));
     let (connection, io_threads) = Connection::stdio();
-    serve_with_recorder(connection, recorder)?;
+    let end = serve_inner(connection, recorder, WatcherSource::Real)?;
     io_threads.join()?;
     log::info!("gdls stopped");
+    // LSP 3.17 §exit: `exit` without a prior `shutdown` is an error the client can detect only
+    // through the process status. Exit AFTER the join + log above so stderr is flushed first.
+    if end == SessionEnd::ExitWithoutShutdown {
+        log::warn!("exit received without a prior shutdown request; exiting with status 1");
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -745,7 +766,8 @@ enum WatcherSource {
 /// own recorder built from the CLI arg) and by `tests/bench_record.rs` (avoids global env
 /// mutation in test code).
 pub fn serve_with_recorder(connection: Connection, recorder: Option<BenchRecorder>) -> Result<()> {
-    serve_inner(connection, recorder, WatcherSource::Real)
+    serve_inner(connection, recorder, WatcherSource::Real)?;
+    Ok(())
 }
 
 /// WP-RD3 test seam: run the full server lifecycle but with the filesystem watcher's event
@@ -757,14 +779,15 @@ pub fn serve_with_injected_watcher(
     connection: Connection,
     watcher_rx: Receiver<DebounceEventResult>,
 ) -> Result<()> {
-    serve_inner(connection, None, WatcherSource::Injected(watcher_rx))
+    serve_inner(connection, None, WatcherSource::Injected(watcher_rx))?;
+    Ok(())
 }
 
 fn serve_inner(
     connection: Connection,
     recorder: Option<BenchRecorder>,
     watcher_source: WatcherSource,
-) -> Result<()> {
+) -> Result<SessionEnd> {
     // --- Lifecycle: split handshake so we can read the client's offered encodings first. ---
     let (init_id, init_value) = connection.initialize_start()?;
     let init: InitializeParams = serde_json::from_value(init_value)?;
@@ -1000,6 +1023,9 @@ fn serve_inner(
     // M7 (#57): set by the `shutdown` request; requests received after it answer InvalidRequest
     // (-32600) per LSP 3.17 until the `exit` notification breaks the loop.
     let mut shutting_down = false;
+    // #262: which of LSP 3.17 §exit's two cases the session ends in. Set at each `break` below and
+    // returned so the stdio entry point can pick the process status.
+    let mut session_end = SessionEnd::TransportClosed;
 
     loop {
         let watcher_arm = watcher_rx.as_ref().unwrap_or(&dummy);
@@ -1111,6 +1137,11 @@ fn serve_inner(
                         rec.record_notification(&note);
                     }
                     if note.method == "exit" {
+                        session_end = if shutting_down {
+                            SessionEnd::CleanExit
+                        } else {
+                            SessionEnd::ExitWithoutShutdown
+                        };
                         break;
                     }
                     dispatch_notification(&mut state, note);
@@ -1275,7 +1306,7 @@ fn serve_inner(
     if router.join().is_err() {
         log::warn!("router thread panicked during shutdown; session was already ending");
     }
-    Ok(())
+    Ok(session_end)
 }
 
 // ---------------------------------------------------------------------------
