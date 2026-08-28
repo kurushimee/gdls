@@ -7007,11 +7007,12 @@ fn rename_name_is_engine_symbol(state: &ServerState, name: &str) -> bool {
 /// genuinely-unresolvable residue (unknown identifiers, `extends UnknownThing`) returns `false` →
 /// the caller refuses.
 ///
-/// KNOWN LIMITATION (deliberate, fail-closed): an autoload singleton NAME lacks a project anchor here
-/// (its only declaration is the `project.godot` `[autoload]` key, not a `.gd` symbol), so it REFUSES
-/// rather than raw-scan-and-edit — the refuse-rather-than-corrupt stance (a name-scan rename is
-/// exactly the W16 grep-rename). A proper autoload rename (config-file rewrite) is tracked in #157.
-/// Enum TYPE names, enum members, and in-file enum VALUES rename normally.
+/// An autoload singleton NAME anchors through [`autoload_cursor_target`] (#157): its declaration is
+/// the `project.godot` `[autoload]` key rather than a `.gd` symbol, so `rename` handles it on a
+/// dedicated path that rewrites the key alongside the by-identity `.gd` edits. A SCRIPTLESS-scene
+/// autoload still refuses (no script to anchor an edit set against), as does a name that is also a
+/// project `class_name` (the occurrences are the class's). Enum TYPE names, enum members, and
+/// in-file enum VALUES rename normally.
 fn rename_target_has_project_anchor(
     state: &mut ServerState,
     uri: &Uri,
@@ -7072,6 +7073,15 @@ fn rename_target_has_project_anchor(
     };
     let current_fid = state.workspace.index.file_id(p);
     let result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+
+    // An autoload singleton NAME (#157) — a project-declared GLOBAL whose declaration is the
+    // `project.godot` `[autoload]` key rather than a `.gd` symbol. `rename` owns it on a dedicated
+    // path (config-key rewrite + by-identity `.gd` edits); admitting it here is what lets
+    // `prepare_rename` offer the box. The gate itself excludes the two shapes that must stay refused
+    // (a scriptless-scene autoload, and a name that is also a project `class_name`).
+    if autoload_cursor_target(state, &result, &parsed.tree, node_id, name).is_some() {
+        return true;
+    }
 
     // A call whose callee resolves to a PROJECT Script file (bare `m()` or dotted `x.m()`) — mirror
     // the `references` target_file resolution: `callee.script_file()` is `Some` ONLY for a project
@@ -7330,6 +7340,15 @@ pub fn rename(
     // collision checks against the symbol's own declaration (which would always "collide").
     if new_name == old_name {
         return Ok(Some(empty_workspace_edit(state)));
+    }
+
+    // (3a) #157 — an autoload singleton NAME. Its declaration is the `project.godot` `[autoload]`
+    // key, not a `.gd` symbol, so the generic pipeline below would rewrite the script occurrences
+    // and leave the config registering the OLD name — every renamed `Global.foo()` undeclared, out
+    // of a rename that reported success. The dedicated path does both halves or refuses outright.
+    if let Some(outcome) = autoload_rename(state, &uri, &parsed.tree, node_id, &old_name, &new_name)
+    {
+        return outcome.map(Some);
     }
 
     // (3b) New-name GLOBAL collision (independent of the old-name fail-closed gate): when the
@@ -7597,6 +7616,180 @@ fn build_workspace_edit(
             ..Default::default()
         }
     }
+}
+
+// ===================================================================================================
+// Autoload singleton NAME rename (#157).
+// ===================================================================================================
+
+/// The autoload script's [`FileId`](gd_project::FileId) when THIS cursor is a script-backed autoload
+/// singleton NAME — the shared gate for the rename anchor and the rename edit set (#157). `None` for
+/// every other cursor, so callers fall through to their normal paths.
+///
+/// Occurrence-positive, never name-only: the analyzer must have recorded a `Binding::Use` AT the
+/// cursor span pointing at the autoload's script (`reduce_identifier` step 9). A local, parameter or
+/// member named `Global` shadows the singleton and records no such binding, so it is excluded by
+/// construction — the same "never lie" gate `definition` and `references` use.
+///
+/// Two shapes are refused here rather than downstream, because a rename must not touch either:
+///
+/// * a **scriptless scene autoload** — its `Use` binding carries no `target_file` (the analyzer's
+///   step-9a native-`Node` floor), so there is no script to anchor a by-identity `.gd` edit set
+///   against, and the only alternative is the raw name scan the rename firewall exists to forbid;
+/// * a name that is **also a project `class_name`** — Godot resolves the global class BEFORE the
+///   autoload (`gdscript_analyzer.cpp:4563` precedes `:4570`), so the occurrences belong to the
+///   class, and the binding cannot tell the two apart (both name the same file).
+fn autoload_cursor_target(
+    state: &ServerState,
+    result: &AnalysisResult,
+    tree: &ParseTree,
+    node_id: NodeId,
+    name: &str,
+) -> Option<gd_project::FileId> {
+    if state.workspace.index.registry().contains(name) {
+        return None;
+    }
+    let fid = state
+        .workspace
+        .project
+        .autoload_script_path_in_scenes(name, &state.workspace.scenes)
+        .and_then(|p| state.workspace.index.resolve_res_path(&p))?;
+    let span = tree.get(node_id).span;
+    result
+        .bindings()
+        .iter()
+        .any(|b| {
+            matches!(b,
+                Binding::Use { site, target_file: Some(f), target_name, .. }
+                    if *site == span && *f == fid && target_name == name
+            )
+        })
+        .then_some(fid)
+}
+
+/// The whole rename of an autoload singleton NAME (#157) — `Some` when the cursor is one (the result
+/// is then the edit or the refusal), `None` when it is not (the caller continues on the generic
+/// path).
+///
+/// An autoload is the one project symbol whose **declaration is not GDScript**: `Global` exists
+/// because `project.godot` says `Global="*res://global.gd"`, and the script itself never spells the
+/// name. So the generic rename pipeline — collect a `.gd` reference set, rewrite it — would leave
+/// the config registering the OLD name and turn every renamed `Global.foo()` into an undeclared
+/// identifier: broken code out of a green rename. This path therefore does both halves or neither.
+///
+/// The `.gd` edit set is collected **by identity** ([`push_use_binding_locations_for`] on the
+/// autoload script's `FileId`), never by the project-wide raw name scan `references` uses for an
+/// autoload READ: that scan also captures an unrelated `obj.Global` attribute or a `var Global`
+/// local in some other file, and admitting it as a WRITE set is exactly the grep-rename the firewall
+/// forbids (anti-catalog W16).
+///
+/// New-name validation covers the namespaces an autoload actually lives in — it becomes a GLOBAL
+/// identifier, so it must not collide with an engine symbol, a project `class_name`, or another
+/// autoload. The same-scope [`rename_collision`] check the generic path runs does not see any of
+/// those.
+fn autoload_rename(
+    state: &mut ServerState,
+    uri: &Uri,
+    tree: &ParseTree,
+    node_id: NodeId,
+    old_name: &str,
+    new_name: &str,
+) -> Option<Result<WorkspaceEdit, RequestRefusal>> {
+    let text = state.vfs.get(uri.as_str())?.text();
+    let path = crate::uri::uri_to_path(uri)?;
+    if path.extension() != Some("gd") {
+        return None;
+    }
+    let key = CanonicalKey::for_uri(uri);
+    let result = analyze_with_request_token(state, &key, &path, tree, &text);
+    let fid = autoload_cursor_target(state, &result, tree, node_id, old_name)?;
+
+    // From here the cursor IS an autoload singleton name: every exit is the edit or a refusal.
+    if rename_name_is_engine_symbol(state, new_name) {
+        return Some(Err(RequestRefusal::invalid_name(format!(
+            "Cannot rename to `{new_name}`: it is a native engine symbol"
+        ))));
+    }
+    if state.workspace.index.registry().contains(new_name) {
+        return Some(Err(RequestRefusal::invalid_name(format!(
+            "Cannot rename to `{new_name}`: a project class named `{new_name}` already exists"
+        ))));
+    }
+    if state
+        .workspace
+        .project
+        .autoloads
+        .iter()
+        .any(|a| a.name == new_name)
+    {
+        return Some(Err(RequestRefusal::invalid_name(format!(
+            "Cannot rename to `{new_name}`: an autoload named `{new_name}` already exists"
+        ))));
+    }
+
+    // The `project.godot` half. Located first: if the key can't be pinned, the rename is refused
+    // WHOLE — editing the `.gd` occurrences alone is what would break the project.
+    let config_edit = match autoload_config_key_location(state, old_name) {
+        Some(loc) => loc,
+        None => {
+            return Some(Err(RequestRefusal::not_editable(format!(
+                "Cannot rename the autoload `{old_name}`: its `[autoload]` entry in `project.godot` \
+                 could not be located, and renaming only the script references would leave the \
+                 project registering the old name"
+            ))));
+        }
+    };
+
+    let mut locations = vec![config_edit];
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    push_use_binding_locations_for(&mut locations, &result, fid, &[], old_name, uri, &mapper);
+
+    // Every other project file that textually mentions the name is a candidate; what is COLLECTED
+    // inside one stays binding-backed, so the wide candidate set cannot widen the edit set.
+    let current_fid = state.workspace.index.file_id(&path);
+    for (cand_path, cand_uri) in method_scan_candidate_uris(state, old_name, current_fid, "rename")
+    {
+        let Some((cand_text, _parsed, cand_result)) =
+            load_candidate_analysis(state, &cand_path, &cand_uri, "rename")
+        else {
+            continue;
+        };
+        let cand_rope = Rope::from_str(&cand_text);
+        let cand_mapper = PositionMapper::new(&cand_rope, state.encoding);
+        push_use_binding_locations_for(
+            &mut locations,
+            &cand_result,
+            fid,
+            &[],
+            old_name,
+            &cand_uri,
+            &cand_mapper,
+        );
+    }
+
+    Some(Ok(build_workspace_edit(state, locations, new_name)))
+}
+
+/// The [`Location`] of the autoload NAME inside `project.godot`'s `[autoload]` key — the declaration
+/// half of an autoload rename. Reads the open buffer when the config is open in the editor (so the
+/// edit lands on what the user sees), else the file on disk. `None` when the config can't be read or
+/// the key can't be pinned unambiguously ([`gd_project::autoload_key_span`] is fail-closed), which
+/// the caller turns into a whole-rename refusal.
+fn autoload_config_key_location(state: &ServerState, name: &str) -> Option<Location> {
+    let path = state.workspace.project.root.join("project.godot");
+    let uri = path_to_file_uri(&path)?;
+    let text = match state.vfs.get(uri.as_str()) {
+        Some(doc) => doc.text(),
+        None => std::fs::read_to_string(path.as_std_path()).ok()?,
+    };
+    let span = gd_project::autoload_key_span(&text, name)?;
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    Some(Location {
+        uri,
+        range: mapper.span_to_range(ByteSpan::new(span.start, span.end)),
+    })
 }
 
 /// Refuse a rename whose `new_name` would collide with an existing declaration in the SAME scope as

@@ -5710,3 +5710,276 @@ fn cross_file_inner_class_method_rename_discriminates_root_decoy_213() {
     );
     shutdown(&client, server);
 }
+
+// =================================================================================================
+// #157 — autoload singleton NAME rename (config-file rewrite + by-identity edit set).
+// =================================================================================================
+
+/// A project with a script-backed autoload `Global` (declared ONLY by the `project.godot`
+/// `[autoload]` key), one consumer that uses it in a function body, and — deliberately — an
+/// unrelated `Global` ATTRIBUTE and a local `var Global` in a third file, which the old
+/// project-wide raw name scan would have swept into a rename's write set.
+fn autoload_project() -> TempProject {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"T\"\n\n\
+         [autoload]\n\nGlobal=\"*res://src/global.gd\"\nOther=\"*res://src/other.gd\"\n",
+    );
+    p.write("extension_api.json", common::MINI_API);
+    p.write(
+        "src/global.gd",
+        "extends Node\n\nvar score: int = 0\n\nfunc add(n: int) -> void:\n\tscore += n\n",
+    );
+    p.write("src/other.gd", "extends Node\n");
+    p.write(
+        "src/consumer.gd",
+        "extends Node\n\nfunc f() -> void:\n\tGlobal.add(1)\n\tprint(Global.score)\n",
+    );
+    // Same TEXT, different symbols: an attribute on an unrelated object and a function-local. Both
+    // are `Global` occurrences a name scan would rewrite; neither refers to the singleton.
+    p.write(
+        "src/decoy.gd",
+        "extends Node\n\nvar holder := self\n\nfunc f() -> void:\n\tvar Global := 1\n\tprint(Global)\n",
+    );
+    p
+}
+
+/// The whole point of #157: renaming the singleton rewrites BOTH halves — every by-identity `.gd`
+/// use AND the `project.godot` `[autoload]` key that declares it. Applying the edit leaves the
+/// config registering the NEW name (with the `*` singleton marker, quoting and path untouched), so
+/// the renamed calls still resolve.
+#[test]
+fn autoload_rename_rewrites_the_config_key_and_the_uses() {
+    let project = autoload_project();
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/consumer.gd", "src/decoy.gd"],
+        2,
+    );
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+    let config_uri = file_uri(&project.root.join("project.godot"));
+    let decoy_uri = file_uri(&project.root.join("src/decoy.gd"));
+
+    // `\tGlobal.add(1)` is line 3; `Global` starts at column 1.
+    client
+        .sender
+        .send(request(
+            60,
+            "textDocument/rename",
+            rename_params(&consumer_uri, 3, 1, "Settings"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "rename errored: {:?}", resp.error);
+    let edit: WorkspaceEdit =
+        serde_json::from_value(resp.result.expect("rename result")).expect("WorkspaceEdit");
+    let view = flatten_edit(&edit);
+
+    assert!(
+        view.new_texts.iter().all(|t| t == "Settings"),
+        "every edit inserts the new name"
+    );
+    let uris: Vec<&str> = view.set.iter().map(|(u, _)| u.as_str()).collect();
+    assert!(
+        uris.contains(&config_uri.as_str()),
+        "the `project.godot` [autoload] key MUST be rewritten; edited: {uris:?}"
+    );
+    assert!(
+        uris.contains(&consumer_uri.as_str()),
+        "the consumer's uses must be rewritten; edited: {uris:?}"
+    );
+    assert!(
+        !uris.contains(&decoy_uri.as_str()),
+        "an unrelated local/attribute named `Global` must NOT be edited (W16); edited: {uris:?}"
+    );
+
+    // Apply the config edit and check the entry is intact apart from the name.
+    let config_text = std::fs::read_to_string(project.root.join("project.godot").as_std_path())
+        .expect("project.godot readable");
+    let config_edits: Vec<(Range, String)> = view
+        .set
+        .iter()
+        .zip(view.new_texts.iter())
+        .filter(|((u, _), _)| u == config_uri.as_str())
+        .map(|((_, r), t)| (*r, t.clone()))
+        .collect();
+    assert_eq!(config_edits.len(), 1, "exactly one config key is rewritten");
+    let renamed_config = apply_edits(&config_text, &config_edits);
+    assert!(
+        renamed_config.contains("Settings=\"*res://src/global.gd\""),
+        "the `*` marker, quoting and path must survive: {renamed_config:?}"
+    );
+    assert!(
+        renamed_config.contains("Other=\"*res://src/other.gd\""),
+        "the sibling autoload must be untouched: {renamed_config:?}"
+    );
+
+    // And the consumer reads with the new name everywhere the old one appeared.
+    let consumer_text = std::fs::read_to_string(project.root.join("src/consumer.gd").as_std_path())
+        .expect("consumer readable");
+    let consumer_edits: Vec<(Range, String)> = view
+        .set
+        .iter()
+        .zip(view.new_texts.iter())
+        .filter(|((u, _), _)| u == consumer_uri.as_str())
+        .map(|((_, r), t)| (*r, t.clone()))
+        .collect();
+    let renamed_consumer = apply_edits(&consumer_text, &consumer_edits);
+    assert!(
+        renamed_consumer.contains("Settings.add(1)") && renamed_consumer.contains("Settings.score"),
+        "every use is rewritten: {renamed_consumer:?}"
+    );
+    assert!(
+        !renamed_consumer.contains("Global"),
+        "no occurrence of the old name may survive: {renamed_consumer:?}"
+    );
+
+    shutdown(&client, server);
+}
+
+/// `prepareRename` offers the box on an autoload name — the firewall used to refuse it outright
+/// (its declaration is not a `.gd` symbol), which is what #157 changed.
+#[test]
+fn prepare_rename_offers_the_box_on_an_autoload_name() {
+    let project = autoload_project();
+    let (client, server) = boot();
+    init_open(&project, &client, caps_full(), &["src/consumer.gd"], 2);
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    client
+        .sender
+        .send(request(
+            61,
+            "textDocument/prepareRename",
+            position_params(&consumer_uri, 3, 1),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "prepareRename on an autoload must not refuse: {:?}",
+        resp.error
+    );
+    let prepared: PrepareRenameResponse =
+        serde_json::from_value(resp.result.expect("prepareRename result")).expect("prepare shape");
+    match prepared {
+        PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
+            assert_eq!(placeholder, "Global");
+        }
+        PrepareRenameResponse::Range(_) | PrepareRenameResponse::DefaultBehavior { .. } => {}
+    }
+
+    shutdown(&client, server);
+}
+
+/// An autoload becomes a GLOBAL identifier, so the new name is validated against the namespaces it
+/// would join: engine symbols, project `class_name`s, and the other autoloads. Each refuses with
+/// zero edits — the same-scope member/local check the generic path runs sees none of these.
+#[test]
+fn autoload_rename_refuses_a_colliding_new_name() {
+    let project = autoload_project();
+    project.write(
+        "src/hero.gd",
+        "class_name Hero\nextends Node\n\nfunc f() -> void:\n\tpass\n",
+    );
+    let (client, server) = boot();
+    init_open(&project, &client, caps_full(), &["src/consumer.gd"], 2);
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    // A native engine class, a project `class_name`, and a sibling autoload. The message names the
+    // clash, which is what distinguishes these from the blanket "not an editable project symbol"
+    // refusal the firewall used to give every autoload cursor.
+    let refusal_message = |id: i32, new_name: &str| -> String {
+        client
+            .sender
+            .send(request(
+                id,
+                "textDocument/rename",
+                rename_params(&consumer_uri, 3, 1, new_name),
+            ))
+            .unwrap();
+        let resp = recv_response(&client);
+        assert!(
+            resp.result.is_none(),
+            "a refused rename must carry ZERO edits, got {:?}",
+            resp.result
+        );
+        resp.error.expect("a typed refusal").message
+    };
+    assert!(refusal_message(62, "Node").contains("native engine symbol"));
+    assert!(refusal_message(63, "Hero").contains("a project class named `Hero` already exists"));
+    assert!(refusal_message(64, "Other").contains("an autoload named `Other` already exists"));
+
+    shutdown(&client, server);
+}
+
+/// A SCRIPTLESS scene autoload has no script to anchor a by-identity edit set against, so it stays
+/// refused — the refuse-rather-than-corrupt stance, unchanged by #157.
+#[test]
+fn scriptless_scene_autoload_rename_still_refuses() {
+    let project = TempProject::new();
+    project.write(
+        "project.godot",
+        "config_version=5\n\n[autoload]\n\nHud=\"*res://hud.tscn\"\n",
+    );
+    project.write("extension_api.json", common::MINI_API);
+    // A scene whose root carries no script: the autoload types as bare `Node`, with no FileId.
+    project.write(
+        "hud.tscn",
+        "[gd_scene format=3]\n[node name=\"Hud\" type=\"Node\"]\n",
+    );
+    project.write(
+        "src/consumer.gd",
+        "extends Node\n\nfunc f() -> void:\n\tprint(Hud)\n",
+    );
+    let (client, server) = boot();
+    init_open(&project, &client, caps_full(), &["src/consumer.gd"], 2);
+    let consumer_uri = file_uri(&project.root.join("src/consumer.gd"));
+
+    // `\tprint(Hud)` is line 3; `Hud` starts at column 7.
+    assert_rename_refused(&client, 65, &consumer_uri, 3, 7, "Overlay");
+
+    shutdown(&client, server);
+}
+
+/// A local shadowing the singleton is renamed as the LOCAL it is — no config edit, no cross-file
+/// fan-out. The "never lie" gate is occurrence-positive, so the shadowed token never anchors the
+/// autoload path.
+#[test]
+fn a_local_shadowing_an_autoload_renames_as_a_local() {
+    let project = autoload_project();
+    let (client, server) = boot();
+    init_open(&project, &client, caps_full(), &["src/decoy.gd"], 2);
+    let decoy_uri = file_uri(&project.root.join("src/decoy.gd"));
+    let config_uri = file_uri(&project.root.join("project.godot"));
+
+    // `\tvar Global := 1` is line 5; the local's name starts at column 5.
+    client
+        .sender
+        .send(request(
+            66,
+            "textDocument/rename",
+            rename_params(&decoy_uri, 5, 5, "tally"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "rename errored: {:?}", resp.error);
+    let edit: WorkspaceEdit =
+        serde_json::from_value(resp.result.expect("rename result")).expect("WorkspaceEdit");
+    let view = flatten_edit(&edit);
+    let uris: Vec<&str> = view.set.iter().map(|(u, _)| u.as_str()).collect();
+    assert!(
+        uris.iter().all(|u| *u == decoy_uri.as_str()),
+        "a local rename stays in its own file; edited: {uris:?}"
+    );
+    assert!(
+        !uris.contains(&config_uri.as_str()),
+        "a local rename must NEVER touch project.godot"
+    );
+
+    shutdown(&client, server);
+}
