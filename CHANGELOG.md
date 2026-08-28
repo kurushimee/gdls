@@ -192,9 +192,61 @@ glyph), #125 (precise `$`/`%` navigation typing — the dormant substrate's cons
 mid-string completion span), #127 (`res://` asset completion), #129 (scriptless autoload as a type
 annotation), #131 (`.tscn` `ext_resource` rewrite on rename), #132 (`willRenameFiles` write-set
 misses), #135/#136 (formatter head-of-line / cancel). The M9 (#106/#107/#109) and M10
-(#111/#113/#114/#115/#118/#119) carryovers remain tracked.
+(#111/#113/#114/#115/#118/#119) carryovers remain tracked. (All of these were closed afterwards —
+see the post-Phase-2 hardening entry below.)
 
 **Phase 2 is now COMPLETE (M7–M11 shipped); a release will be cut from `main` as a separate step.**
+
+Post-Phase-2 hardening (#99, #125, #132, #157, #161, #189, #193, #204, #246), merged 2026-08-28.
+No release cut. Closes out every remaining tracker item — the issue tracker is empty.
+
+### Added
+- **Precise `$`/`%` navigation typing** (#125): `hover`, `definition` and `typeDefinition` on a
+  `$Path` / `%Name` / `get_node("literal")` access answer with the scene-precise node type — the
+  engine class of the node the access reaches, or the `class_name` of the script attached to it —
+  instead of bare `Node` (and, for `definition`, instead of nothing at all). Built in
+  `gd_server::scene_nav` from the scene-index fact and handed straight to the renderers, so it never
+  enters an `AnalysisResult`: the diagnostic path keeps seeing bare `Node`, and the sibling downcasts
+  Godot tolerates stay silent. Conservative — an absolute path, a scene-less script, or two attaching
+  scenes disagreeing all fall back to bare `Node`.
+- **Autoload singleton NAME rename** (#157): an autoload is the one project symbol whose declaration
+  is not GDScript, so renaming it now rewrites the `project.godot` `[autoload]` key alongside the
+  `.gd` uses — or refuses whole. The `.gd` edit set is collected BY IDENTITY (the autoload script's
+  `FileId`), never by the raw name scan the read path uses, so an unrelated same-named local or
+  attribute is excluded by construction; the config span covers the NAME only, leaving the `*`
+  singleton marker, quoting and path intact. The new name is validated against the namespaces an
+  autoload joins (engine symbols, project `class_name`s, other autoloads). A scriptless-scene
+  autoload and a name that is also a `class_name` stay refused.
+- **Lambda `.call` / `.call_deferred` signatures** (#193): signatureHelp on a lambda-valued name
+  shows the LAMBDA's parameter list instead of the native `Callable.call(...)` vararg shape. The
+  lambda is pinned in the server glue (Godot's analyzer types every lambda as a bare `Callable` with
+  no method info, and the port is faithful to that), through the scope-correct binding resolver, and
+  refuses on any rebind. `.bind` deliberately keeps the native signature — it binds a TRAILING slice
+  whose length is unknowable mid-typing.
+
+### Fixed
+- **Half-applied class rename** (#246): a `class_name` consumer that used the class only in function
+  BODIES was never scanned (the interface index records the `extends` head and member/param types
+  only), so the class was renamed while that consumer kept calling the old name. The candidate set is
+  now the project-wide textual prefilter; collection inside a candidate stays occurrence-positive.
+- **Inner-class-scoped type rename** (#189): a type declared inside an inner class and colliding with
+  a global `class_name` refused for lack of a precise target, and the global's own rename over-grabbed
+  an unrelated in-file `extends`. Both now resolve positionally against the enclosing class.
+- **`codeAction` delete-fix cross-file gate** (#204): the `UNUSED_PRIVATE_CLASS_VARIABLE` delete fix
+  could not see body-only cross-file reads (invisible to the interface index) and offered a deletion
+  that broke them. A one-sided textual refusal signal now suppresses the fix whenever any other file
+  mentions the member.
+- **`willRenameFiles` write-set misses** (#132): index-form and threaded `ResourceLoader` calls and
+  `preload` through a const indirection were missed, while a bare `load` shadowed by a local was
+  wrongly rewritten.
+
+### Changed
+- **completion / signatureHelp perf budget rows** (#99) replaced their estimates with measurements
+  from a 2414-file project, with provenance recorded in `bench/budget.toml`.
+- Test-only: the rename canonicalization class-decl backstop is pinned white-box (#161, unreachable
+  from legal source by design), and the watcher coalescing bound is now measured only when the write
+  burst actually fits inside one quiet window (#249, #252) — a stalled CI runner has nothing to
+  coalesce, which was the long-standing flake.
 
 ## [1.0.7] — 2026-06-13
 
