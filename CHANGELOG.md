@@ -258,6 +258,10 @@ binary. No release cut.
   where the shutdown handshake completed, so a supervising client can tell a clean stop from an
   abrupt one. gdls returned 0 either way. A transport close (stdin EOF, no `exit` at all) stays 0 —
   the client leaving is not a protocol violation.
+- **Progress token no longer carries Debug quotes** (#265): `window/workDoneProgress/create` shipped
+  `gdls/progress/"gdls-out-0"` — lsp-server renders a string `RequestId`'s `Display` through `Debug`
+  on purpose, and interpolating the outgoing id inherited that into a wire value. Tokens are opaque
+  so nothing broke, but the quotes read back verbatim in client protocol logs.
 
 ## [1.0.7] — 2026-06-13
 
