@@ -13,10 +13,10 @@
 
 mod common;
 
-use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, ChildStdout, Command, Stdio};
 
-use common::sample_project;
+use common::{file_uri, sample_project};
 
 fn gdls_bin() -> &'static str {
     env!("CARGO_BIN_EXE_gdls")
@@ -28,12 +28,14 @@ fn frame(body: &serde_json::Value) -> Vec<u8> {
     format!("Content-Length: {}\r\n\r\n{text}", text.len()).into_bytes()
 }
 
-/// Spawn `gdls` on stdio and complete `initialize` / `initialized` against `root`.
+/// Spawn `gdls` on stdio and complete `initialize` / `initialized` against `root`, returning the
+/// child with its stdout already positioned past the `initialize` response.
 ///
-/// The `initialize` RESPONSE is not read back — these tests only care about the process status,
-/// and leaving stdout unread is exactly what a client that dies mid-session does. stdout is piped
-/// (not inherited) so the harness's own output stays clean; the pipe buffer is far larger than the
-/// handshake, so the server never blocks writing into it.
+/// That response IS read back, and it is the whole point of reading it: without it a server that
+/// died during the handshake is indistinguishable from a live one, because a dead process and a
+/// clean `exit` both end in a closed pipe. Reading it turns "the handshake never happened" into a
+/// named failure on every platform instead of a status code that only looks wrong on one of them.
+/// stdout is piped (not inherited) so the harness's own output stays clean.
 fn spawn_initialized(root: &camino::Utf8Path) -> Child {
     let mut child = Command::new(gdls_bin())
         .stdin(Stdio::piped())
@@ -46,7 +48,10 @@ fn spawn_initialized(root: &camino::Utf8Path) -> Child {
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
             "processId": std::process::id(),
-            "rootUri": format!("file://{root}"),
+            // Built through the production URI helper, not `format!("file://{root}")`: a Windows
+            // temp root is a drive path, and pasting it after the scheme yields `file://C:\\Users\\...`
+            // — an unparseable URI that used to take the whole handshake down (#279).
+            "rootUri": file_uri(root).as_str(),
             "capabilities": {},
         }
     });
@@ -57,7 +62,53 @@ fn spawn_initialized(root: &camino::Utf8Path) -> Child {
         })))
         .expect("write initialized");
     stdin.flush().expect("flush");
+    expect_initialize_response(&mut child);
     child
+}
+
+/// Read frames off the child's stdout until the `initialize` response arrives, so every test below
+/// starts from a server that is demonstrably up. Panics with the server's own words if the pipe
+/// closes first — that is what a handshake-time death looks like from the client side.
+fn expect_initialize_response(child: &mut Child) {
+    let stdout = child.stdout.as_mut().expect("stdout piped");
+    let mut reader = BufReader::new(stdout);
+    for _ in 0..8 {
+        let Some(body) = read_frame(&mut reader) else {
+            panic!(
+                "gdls closed stdout before answering `initialize` — the handshake died (see #279)"
+            );
+        };
+        let msg: serde_json::Value = serde_json::from_slice(&body).expect("server sent valid JSON");
+        if msg.get("id").and_then(serde_json::Value::as_i64) == Some(1) {
+            assert!(
+                msg.get("result").is_some(),
+                "`initialize` must answer with a result, got {msg}"
+            );
+            return;
+        }
+    }
+    panic!("no `initialize` response within the first 8 frames from the server");
+}
+
+/// Read one `Content-Length`-framed message body, or `None` at end of stream.
+fn read_frame(reader: &mut BufReader<&mut ChildStdout>) -> Option<Vec<u8>> {
+    let mut len = None;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).ok()? == 0 {
+            return None;
+        }
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(v) = trimmed.strip_prefix("Content-Length: ") {
+            len = v.parse::<usize>().ok();
+        }
+    }
+    let mut body = vec![0u8; len?];
+    reader.read_exact(&mut body).ok()?;
+    Some(body)
 }
 
 fn send(child: &mut Child, msg: serde_json::Value) {

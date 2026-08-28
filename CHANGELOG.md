@@ -254,6 +254,12 @@ capability profiles, with disputed analyzer behaviour cross-checked against the 
 binary. No release cut.
 
 ### Fixed
+- **The `exit` status tests now build a Windows-safe root URI** (#279): they pasted a temp path
+  straight after the `file://` scheme, which is fine on a POSIX root and unparseable on a Windows
+  drive path, so `initialize` failed to deserialize and the server exited 1 before indexing
+  anything. Every test then saw status 1, and the one expecting 1 passed for the wrong reason —
+  red Windows CI for twelve commits. They go through the production URI helper now, and read the
+  `initialize` response back so a handshake-time death is a named failure on any platform.
 - **`exit` without `shutdown` now exits 1** (#262): LSP 3.17 §exit reserves status 0 for the case
   where the shutdown handshake completed, so a supervising client can tell a clean stop from an
   abrupt one. gdls returned 0 either way. A transport close (stdin EOF, no `exit` at all) stays 0 —
