@@ -756,7 +756,7 @@ fn resource_path_partial_scheme_does_not_drop_res() {
         );
         assert_eq!(
             splice(marked, "res://src/foo.gd"),
-            format!("func f():\n\tload(\"res://src/foo.gd\")"),
+            "func f():\n\tload(\"res://src/foo.gd\")".to_string(),
             "accepting the full path must yield the canonical literal for {marked:?}"
         );
     }

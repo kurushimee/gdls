@@ -509,7 +509,9 @@ fn apply_wire_delta(base: &SemanticTokens, delta: &SemanticTokensDelta) -> Vec<S
         }
         flat.splice(start..end, ins);
     }
-    flat.chunks_exact(5)
+    flat.as_chunks::<5>()
+        .0
+        .iter()
         .map(|c| SemanticToken {
             delta_line: c[0],
             delta_start: c[1],

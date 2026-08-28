@@ -1051,10 +1051,7 @@ fn class_member(ctx: &AnalysisContext, class_id: NodeId, name: &str) -> Option<M
 /// Resolve a bare name to an in-scope in-file class's meta type (the class-name arm of
 /// `resolve_datatype`'s scope search). Wired in WP-D and consumed since.
 fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> {
-    let scope = match ctx.current_class {
-        Some(c) => scope_classes(ctx, c),
-        None => return None,
-    };
+    let scope = scope_classes(ctx, ctx.current_class?);
     for look in scope.iter().copied() {
         if class_identifier_name(ctx, look).as_deref() == Some(name) {
             return Some(ctx.get_type(look).clone());

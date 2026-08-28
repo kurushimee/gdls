@@ -1116,7 +1116,9 @@ pub(crate) fn apply_delta(
         flat.splice(start..end, ins);
     }
     // Re-chunk to tokens.
-    flat.chunks_exact(5)
+    flat.as_chunks::<5>()
+        .0
+        .iter()
         .map(|c| SemanticToken {
             delta_line: c[0],
             delta_start: c[1],
