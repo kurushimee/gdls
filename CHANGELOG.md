@@ -343,6 +343,25 @@ binary. No release cut.
   these are among the most-typed calls in GDScript. Where Godot's filter would show nothing —
   typing past every overload's arity — the popup stays up with the widest overload first rather
   than vanishing mid-edit.
+- **`##` docs now reach every surface they were written for** (#258): M7 wired the doc pipeline
+  through the paths it needed at the time, which left most declaration kinds with prose nobody
+  ever saw. Hovering a file's own `class_name` — or any cross-file use of that name — rendered a
+  bare identifier instead of the head class's brief, long form and `@tutorial` links. Named enums
+  and their values rendered a type label and no doc at all, on either side. And a documented
+  `var` / `const` / `signal` / inner `class` showed its prose at the declaration but not where it
+  was actually read from another file: the doc rode the CALL hover, so only `func` had both.
+  All of them now render the same body wherever the symbol appears, read from the declaring file's
+  interface.
+- **`@deprecated` and `@experimental` are visible** (#258): both were parsed and then dropped.
+  They now lead the hover body as a banner — above the prose, so a reader who stops at the first
+  line still learns the symbol is on its way out — and `@deprecated` additionally sets
+  `CompletionItem.tags: [Deprecated]`, downgraded to the pre-3.15 `deprecated: true` boolean for a
+  client that never advertised `completionItem.tagSupport` (never both), and the standard
+  `deprecated` semantic-token modifier on the declaration and on every resolved use — a member
+  read, a call site, a class name — each resolved through the declaring file's interface rather
+  than by name. The modifier was in the advertised legend since M10 with nothing behind it.
+  Engine symbols never carry either signal: `extension_api.json` has no deprecation field in
+  4.6.3, with or without docs, so there is nothing to claim one from.
 
 ## [1.0.7] — 2026-06-13
 

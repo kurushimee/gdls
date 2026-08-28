@@ -291,6 +291,60 @@ impl RenderCtx<'_> {
         let path = self.index.path(file)?;
         crate::uri::path_to_file_uri(path).map(|u| u.as_str().to_string())
     }
+
+    /// #258: whether the declaring script marked this member `## @deprecated`. Read from the
+    /// DECLARING file's interface — the same precise owner key `completionItem/resolve` uses, never
+    /// a name-only search. Native members are always `false`: `extension_api.json` (4.6.3, with or
+    /// without docs) carries no deprecation field at all, so gdls has no source to claim one from.
+    fn member_is_deprecated(&self, owner: &MemberOwner, name: &str) -> bool {
+        let MemberOwner::Script { file, inner } = owner else {
+            return false;
+        };
+        let Some(mut iface) = self.index.interface(*file) else {
+            return false;
+        };
+        for seg in inner {
+            match iface
+                .inner
+                .iter()
+                .find(|c| c.class_name.as_deref() == Some(seg.as_str()))
+            {
+                Some(i) => iface = i,
+                None => return false,
+            }
+        }
+        iface
+            .members
+            .iter()
+            .find(|m| m.name == name)
+            .and_then(|m| m.doc.as_deref())
+            .is_some_and(|d| d.is_deprecated)
+    }
+}
+
+/// #258: stamp the LSP deprecation signal on an item whose declaring `##` doc says `@deprecated`.
+/// A client that advertised `completionItem.tagSupport` with `Deprecated` gets `tags: [Deprecated]`
+/// (LSP 3.15+); one that did not gets the older `deprecated: true` boolean, which is what a minimal
+/// client still understands. Never both — `tags` supersedes the boolean.
+fn mark_deprecated(
+    mut item: CompletionItem,
+    owner: &MemberOwner,
+    name: &str,
+    render: &RenderCtx,
+) -> CompletionItem {
+    if !render.member_is_deprecated(owner, name) {
+        return item;
+    }
+    if render.caps.tag_support_deprecated {
+        item.tags = Some(vec![lsp_types::CompletionItemTag::DEPRECATED]);
+    } else {
+        #[allow(deprecated)]
+        // The pre-3.15 signal, sent only to clients that never advertised tags.
+        {
+            item.deprecated = Some(true);
+        }
+    }
+    item
 }
 
 // ===================================================================================================
@@ -449,7 +503,8 @@ fn member_item(m: &MemberItem, rank: usize, render: &RenderCtx) -> CompletionIte
         detail: m.detail.clone(),
     };
     let callable = matches!(m.kind, MemberItemKind::Method);
-    build_item(&m.name, kind, callable, data, rank, render)
+    let item = build_item(&m.name, kind, callable, data, rank, render);
+    mark_deprecated(item, &m.owner, &m.name, render)
 }
 
 /// Translate an enumeration [`MemberOwner`] into the serializable resolve key
@@ -528,6 +583,7 @@ fn identifier_items(
     if let Some(analyzed) = analyzed {
         for m in self_chain_members(state, tree, analyzed) {
             let callable = matches!(m.kind, MemberItemKind::Method);
+            let before = items.len();
             push(
                 &m.name,
                 member_kind(m.kind),
@@ -541,6 +597,11 @@ fn identifier_items(
                 &mut seen,
                 &mut rank,
             );
+            // #258: the closure de-duplicates, so stamp only the item it actually appended.
+            if items.len() > before {
+                let last = items.len() - 1;
+                items[last] = mark_deprecated(items[last].clone(), &m.owner, &m.name, render);
+            }
         }
     }
 
@@ -921,15 +982,23 @@ fn type_name_items(
             MemberItemKind::Enum => CompletionItemKind::ENUM,
             _ => CompletionItemKind::CLASS,
         };
-        push(
-            &m.name,
-            kind,
-            CompletionData::Member {
-                owner: data_owner(&m.owner, render),
-                name: m.name.clone(),
-                detail: m.detail.clone(),
-            },
-        );
+        // Inlined rather than routed through `push`: #258 stamps the deprecation marker on the
+        // item it just built, and the shared closure holds `items` borrowed for its own lifetime.
+        if seen.insert(m.name.clone()) {
+            let item = keyword_item(
+                &m.name,
+                kind,
+                CompletionData::Member {
+                    owner: data_owner(&m.owner, render),
+                    name: m.name.clone(),
+                    detail: m.detail.clone(),
+                },
+                rank,
+                render,
+            );
+            items.push(mark_deprecated(item, &m.owner, &m.name, render));
+            rank += 1;
+        }
     }
 
     items
@@ -1731,7 +1800,7 @@ fn property_method_items(
         .enumerate()
         .map(|(rank, m)| {
             // The accessor binds a bare method name (no call parens) — never a snippet.
-            keyword_item(
+            let item = keyword_item(
                 &m.name,
                 CompletionItemKind::METHOD,
                 CompletionData::Member {
@@ -1741,7 +1810,8 @@ fn property_method_items(
                 },
                 rank,
                 render,
-            )
+            );
+            mark_deprecated(item, &m.owner, &m.name, render)
         })
         .collect()
 }
@@ -2935,10 +3005,14 @@ fn resolve_script_member_doc(
     }
     let decl = iface.members.iter().find(|m| m.name == name)?;
     let doc = decl.doc.as_ref()?;
-    if doc.description.is_empty() {
+    // #258: the banner is part of the documentation body, so a member whose `##` block carries
+    // only `@deprecated: …` still resolves to something instead of `None`.
+    let mut body = String::new();
+    crate::docs::append_member_doc(&mut body, format, doc);
+    if body.is_empty() {
         return None;
     }
-    Some(prose_doc(format, &doc.description))
+    Some(prose_doc_raw(format, &body))
 }
 
 /// Documentation + detail for a global symbol (utility / constant). Utilities render their

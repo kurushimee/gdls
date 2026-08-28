@@ -19,8 +19,8 @@
 //!     parameters → `parameter`; class vars (members) → `property`; locals → `variable`.
 //!   * Modifiers: `declaration` (+ `definition`, identical in GDScript) on every declaration site;
 //!     `readonly` on `const`; `static` on `static func`/`static var`; `defaultLibrary` on native
-//!     classes; `deprecated` is in the legend for completeness (not emitted in v1 — the analyzer has
-//!     no per-symbol deprecation source for GDScript).
+//!     classes; `deprecated` on a declaration (and every resolved use) whose GDScript `##` doc
+//!     block carries `@deprecated` (#258 — natives never, the dump has no such field).
 //!
 //! ## Analysis-priced vs parse-priced (the `range` contract)
 //!
@@ -47,7 +47,7 @@ use lsp_types::{
     SemanticTokensLegend,
 };
 
-use gd_analyze::{AnalysisResult, Binding, BindingTargetKind, DtKind};
+use gd_analyze::{AnalysisResult, Binding, BindingTargetKind, CalleeTarget, DtKind};
 use gd_syntax::ast::{
     DictStyle, EnumValue, LocalKind, Member, NodeId, NodeKind, ParseTree, PatternKind,
     SubscriptAccess,
@@ -123,7 +123,9 @@ const MOD_DEFINITION: u32 = 1 << 1;
 const MOD_READONLY: u32 = 1 << 2;
 const MOD_STATIC: u32 = 1 << 3;
 const MOD_DEFAULT_LIBRARY: u32 = 1 << 4;
-#[allow(dead_code)] // In the legend for completeness; GDScript has no per-symbol deprecation source.
+/// #258: set on the declaration and the resolved uses of a member / class whose `##` doc block
+/// carries `@deprecated`. Native symbols never get it — `extension_api.json` (4.6.3) carries no
+/// deprecation field, so gdls has no source to claim one from.
 const MOD_DEPRECATED: u32 = 1 << 5;
 
 /// A declaration site carries `declaration` + `definition` (GDScript has no separate declare/define).
@@ -154,6 +156,7 @@ pub(crate) fn classify_document(
     tree: &ParseTree,
     analysis: Option<&AnalysisResult>,
     db: &gd_types::NativeDb,
+    index: Option<&gd_project::Index>,
 ) -> Vec<RawToken> {
     let mut out: Vec<RawToken> = Vec::new();
 
@@ -173,6 +176,32 @@ pub(crate) fn classify_document(
             })
             .collect(),
         None => FxHashMap::default(),
+    };
+
+    // (1b) #258: resolved SCRIPT call sites, for the deprecation modifier on a callee identifier. A
+    // resolved method call records a `Binding::Call` (whose span is the whole call expression) and
+    // NO `Binding::Use` at the callee ident, so `use_deprecated` can't see it — `callee_deprecated`
+    // picks the innermost containing call site with a matching callee name instead.
+    let script_calls: Vec<(ByteSpan, gd_project::FileId, &[String], &str)> = match analysis {
+        Some(a) => a
+            .bindings()
+            .iter()
+            .filter_map(|b| match b {
+                Binding::Call {
+                    callee: CalleeTarget::Script { file, class_path },
+                    callee_name,
+                    call_site,
+                    ..
+                } => Some((
+                    *call_site,
+                    *file,
+                    class_path.as_slice(),
+                    callee_name.as_str(),
+                )),
+                _ => None,
+            })
+            .collect(),
+        None => Vec::new(),
     };
 
     // (2) Declaration-identifier spans: the identifier child of every declaration node, so the AST
@@ -238,7 +267,7 @@ pub(crate) fn classify_document(
                         tree,
                         idn,
                         TokType::Class,
-                        MOD_DECL,
+                        MOD_DECL | decl_deprecated(tree, id),
                     );
                 }
                 // `extends A.B` / `extends "res://..."` — the extends idents are type positions.
@@ -248,7 +277,9 @@ pub(crate) fn classify_document(
             }
             NodeKind::Function(f) => {
                 if let Some(idn) = f.identifier {
-                    let mods = MOD_DECL | if f.is_static { MOD_STATIC } else { 0 };
+                    let mods = MOD_DECL
+                        | if f.is_static { MOD_STATIC } else { 0 }
+                        | decl_deprecated(tree, id);
                     // A class-member `func` is a `method` (every named GDScript func is a member of
                     // its class — the script IS the root class); only a lambda-body func (reached via
                     // `LambdaNode.function`, not a `Member::Function`) stays `function`. This makes
@@ -292,7 +323,9 @@ pub(crate) fn classify_document(
                     } else {
                         TokType::Variable
                     };
-                    let mods = MOD_DECL | if v.is_static { MOD_STATIC } else { 0 };
+                    let mods = MOD_DECL
+                        | if v.is_static { MOD_STATIC } else { 0 }
+                        | decl_deprecated(tree, id);
                     emit_decl(&mut out, &mut decl_spans, tree, idn, ty, mods);
                 }
                 if let Some(ts) = v.datatype_specifier {
@@ -307,7 +340,7 @@ pub(crate) fn classify_document(
                         tree,
                         idn,
                         TokType::Variable,
-                        MOD_DECL | MOD_READONLY,
+                        MOD_DECL | MOD_READONLY | decl_deprecated(tree, id),
                     );
                 }
                 if let Some(ts) = c.datatype_specifier {
@@ -322,7 +355,7 @@ pub(crate) fn classify_document(
                         tree,
                         idn,
                         TokType::Event,
-                        MOD_DECL,
+                        MOD_DECL | decl_deprecated(tree, id),
                     );
                 }
             }
@@ -334,11 +367,16 @@ pub(crate) fn classify_document(
                         tree,
                         idn,
                         TokType::Enum,
-                        MOD_DECL,
+                        MOD_DECL | decl_deprecated(tree, id),
                     );
                 }
-                for v in &e.values {
-                    emit_enum_value(&mut out, &mut decl_spans, tree, v);
+                for (i, v) in e.values.iter().enumerate() {
+                    let dep = tree
+                        .docs
+                        .enum_value_docs
+                        .get(&(id, i))
+                        .is_some_and(|d| d.is_deprecated);
+                    emit_enum_value(&mut out, &mut decl_spans, tree, v, dep);
                 }
             }
             NodeKind::Cast(c) => {
@@ -480,7 +518,7 @@ pub(crate) fn classify_document(
         // to the local path (a local callable still colors `variable`); the utility/method/constructor
         // coloring is omitted, exactly as cross-file member/enum-value uses already are (never guessed).
         if analysis.is_some() && call_callee_spans.contains(&key) {
-            if let Some(Binding::Use { target_kind, .. }) = use_index.get(&key).copied() {
+            if let Some(b @ Binding::Use { target_kind, .. }) = use_index.get(&key).copied() {
                 // The callee resolved to an in-file member (a script IS its root class, so a bare
                 // sibling call is a method call). Re-map a callable target kind to `method` — EXCEPT
                 // the one case #111 mislabels: a property holding a Callable invoked directly (`var cb:
@@ -498,7 +536,7 @@ pub(crate) fn classify_document(
                     BindingTargetKind::Function | BindingTargetKind::Member
                 ) && !callee_is_in_file_callable_property(tree, span.start, &ident.name)
                 {
-                    push_span(&mut out, span, TokType::Method, 0);
+                    push_span(&mut out, span, TokType::Method, use_deprecated(index, b));
                     continue;
                 }
                 // else: a same-class Callable property (`Member::Variable`) or a non-callable
@@ -551,21 +589,24 @@ pub(crate) fn classify_document(
                     )
             );
             if !is_callable_property {
-                push_span(&mut out, span, TokType::Method, 0);
+                let mods = callee_deprecated(index, &script_calls, span, &ident.name);
+                push_span(&mut out, span, TokType::Method, mods);
                 continue;
             }
             // else: a Callable property invoked through `obj.cb()` — left to the generic member-use
             // path below, which colors it `property`.
         }
         // A resolved member/enum/method/cross-file use — from the analyzer binding.
-        if let Some(Binding::Use {
-            target_kind,
-            target_file,
-            ..
-        }) = use_index.get(&key).copied()
+        if let Some(
+            b @ Binding::Use {
+                target_kind,
+                target_file,
+                ..
+            },
+        ) = use_index.get(&key).copied()
         {
             if let Some((ty, modifiers)) = use_token(*target_kind, target_file.is_none()) {
-                push_span(&mut out, span, ty, modifiers);
+                push_span(&mut out, span, ty, modifiers | use_deprecated(index, b));
             }
             continue;
         }
@@ -676,6 +717,159 @@ fn callee_is_in_file_callable_property(tree: &ParseTree, byte: usize, name: &str
     }
 }
 
+/// #258: [`MOD_DEPRECATED`] when the declaration node `id` carries a `## @deprecated` block, else 0.
+/// Covers class + member declarations in one lookup — the two doc tables are keyed by disjoint node
+/// kinds, so at most one can hit.
+fn decl_deprecated(tree: &ParseTree, id: NodeId) -> u32 {
+    let hit = tree
+        .docs
+        .member_docs
+        .get(&id)
+        .is_some_and(|d| d.is_deprecated)
+        || tree
+            .docs
+            .class_docs
+            .get(&id)
+            .is_some_and(|d| d.is_deprecated);
+    if hit {
+        MOD_DEPRECATED
+    } else {
+        0
+    }
+}
+
+/// #258: [`MOD_DEPRECATED`] for a resolved USE, read from the DECLARING file's `Interface` (the same
+/// precise `target_file` + `target_class_path` key hover and completion resolve through — never a
+/// name-only search). `None` index, a native target (`target_file: None`), or an unindexed file all
+/// yield 0: the modifier is only ever added on positive evidence.
+fn use_deprecated(index: Option<&gd_project::Index>, binding: &Binding) -> u32 {
+    let Binding::Use {
+        target_file: Some(file),
+        target_class_path,
+        target_kind,
+        target_name,
+        ..
+    } = binding
+    else {
+        return 0;
+    };
+    let Some(index) = index else {
+        return 0;
+    };
+    let Some(mut iface) = index.interface(*file) else {
+        return 0;
+    };
+    for seg in target_class_path {
+        match iface
+            .inner
+            .iter()
+            .find(|c| c.class_name.as_deref() == Some(seg.as_str()))
+        {
+            Some(i) => iface = i,
+            None => return 0,
+        }
+    }
+    // A CLASS use names a class, not a member: the head interface itself (`class_name X`) or one of
+    // its inner classes — both carry a `ClassDoc`, never a `MemberDecl`.
+    if matches!(target_kind, BindingTargetKind::Class) {
+        let doc = iface
+            .inner
+            .iter()
+            .find(|c| c.class_name.as_deref() == Some(target_name.as_str()))
+            .map_or_else(
+                || {
+                    (iface.class_name.as_deref() == Some(target_name.as_str()))
+                        .then_some(iface)
+                        .and_then(|i| i.doc.as_deref())
+                },
+                |c| c.doc.as_deref(),
+            );
+        return if doc.is_some_and(|d| d.is_deprecated) {
+            MOD_DEPRECATED
+        } else {
+            0
+        };
+    }
+    // An `EnumValueLocal` use carries the QUALIFIED `"<Enum>.<value>"` name, and its doc lives on
+    // the interface's `enums`, not its `members` (see `BindingTargetKind::EnumValueLocal`).
+    let hit = if matches!(target_kind, BindingTargetKind::EnumValueLocal) {
+        target_name
+            .split_once('.')
+            .and_then(|(e, v)| {
+                iface
+                    .enums
+                    .iter()
+                    .find(|d| d.name.as_str() == e)?
+                    .values
+                    .iter()
+                    .find(|d| d.name.as_str() == v)
+            })
+            .and_then(|v| v.doc.as_deref())
+            .is_some_and(|d| d.is_deprecated)
+    } else {
+        iface
+            .members
+            .iter()
+            .find(|m| &m.name == target_name)
+            .and_then(|m| m.doc.as_deref())
+            .is_some_and(|d| d.is_deprecated)
+    };
+    if hit {
+        MOD_DEPRECATED
+    } else {
+        0
+    }
+}
+
+/// #258: [`MOD_DEPRECATED`] for a CALLEE identifier at `span`. A resolved method call records a
+/// `Binding::Call` over the whole call expression rather than a `Use` at the callee ident, so the
+/// owning call is the innermost recorded `call_site` that contains `span` and dispatches to a callee
+/// of this name. Ties never matter: two calls with the same callee name can't share an innermost
+/// span. 0 whenever nothing resolves — the modifier is only ever added on positive evidence.
+fn callee_deprecated(
+    index: Option<&gd_project::Index>,
+    script_calls: &[(ByteSpan, gd_project::FileId, &[String], &str)],
+    span: ByteSpan,
+    name: &str,
+) -> u32 {
+    let Some(index) = index else {
+        return 0;
+    };
+    let Some((_, file, class_path, _)) = script_calls
+        .iter()
+        .filter(|(site, _, _, callee)| {
+            *callee == name && site.start <= span.start && span.end <= site.end
+        })
+        .min_by_key(|(site, _, _, _)| site.end - site.start)
+    else {
+        return 0;
+    };
+    let Some(mut iface) = index.interface(*file) else {
+        return 0;
+    };
+    for seg in *class_path {
+        match iface
+            .inner
+            .iter()
+            .find(|c| c.class_name.as_deref() == Some(seg.as_str()))
+        {
+            Some(i) => iface = i,
+            None => return 0,
+        }
+    }
+    let hit = iface
+        .members
+        .iter()
+        .find(|m| m.name == name)
+        .and_then(|m| m.doc.as_deref())
+        .is_some_and(|d| d.is_deprecated);
+    if hit {
+        MOD_DEPRECATED
+    } else {
+        0
+    }
+}
+
 /// The `(TokType, modifiers)` for a resolved [`Binding::Use`], or `None` for kinds with no standard
 /// mapping (none currently — every variant maps). `native` adds `defaultLibrary` to type kinds.
 fn use_token(kind: BindingTargetKind, native: bool) -> Option<(TokType, u32)> {
@@ -760,11 +954,13 @@ fn emit_enum_value(
     decl_spans: &mut FxHashMap<(usize, usize), ()>,
     tree: &ParseTree,
     v: &EnumValue,
+    deprecated: bool,
 ) {
     if let Some(idn) = v.identifier {
         let span = tree.get(idn).span;
         decl_spans.insert((span.start, span.end), ());
-        push_span(out, span, TokType::EnumMember, MOD_DECL | MOD_READONLY);
+        let mods = MOD_DECL | MOD_READONLY | if deprecated { MOD_DEPRECATED } else { 0 };
+        push_span(out, span, TokType::EnumMember, mods);
     }
 }
 
@@ -1384,7 +1580,7 @@ mod tests {
         let src = "extends Node\nclass_name Foo\n\n@export var hp: int = 0\n\nfunc run(n: int) -> void:\n\tvar x = n\n\tprint(x)\n";
         let parsed = gd_syntax::parse(src);
         let db = gd_types::NativeDb::empty();
-        let raw = classify_document(&parsed.tree, None, &db);
+        let raw = classify_document(&parsed.tree, None, &db, None);
         assert!(
             !raw.is_empty(),
             "structural classification must still emit tokens with no analysis"
@@ -1427,7 +1623,7 @@ mod tests {
         let src = "func f():\n\tvar name = 1\n\treturn { name = name }\n";
         let parsed = gd_syntax::parse(src);
         let db = gd_types::NativeDb::empty();
-        let raw = classify_document(&parsed.tree, None, &db);
+        let raw = classify_document(&parsed.tree, None, &db, None);
 
         // The Lua key `name` (the one right after `{ `) must have NO token.
         let key_byte = src.find("{ name").unwrap() + "{ ".len();
@@ -1462,7 +1658,7 @@ mod tests {
         let src = "const MAX_VAL = 100\n@export_range(0, MAX_VAL) var hp: int = 0\n";
         let parsed = gd_syntax::parse(src);
         let db = gd_types::NativeDb::empty();
-        let raw = classify_document(&parsed.tree, None, &db);
+        let raw = classify_document(&parsed.tree, None, &db, None);
 
         let at_byte = src.find("@export_range").unwrap();
         let deco = raw
@@ -1496,7 +1692,7 @@ mod tests {
         let src = "@export_range(\n\t0, 100) var hp: int = 0\n";
         let parsed = gd_syntax::parse(src);
         let db = gd_types::NativeDb::empty();
-        let raw = classify_document(&parsed.tree, None, &db);
+        let raw = classify_document(&parsed.tree, None, &db, None);
         let rope = Rope::from_str(src);
         let mapper = PositionMapper::new(&rope, PositionEncoding::Utf16);
         let encoded = encode(&raw, &mapper, &ClientLegend::full());
@@ -1613,7 +1809,7 @@ mod tests {
         let db = trimmed_db();
         let src = "extends Node\nfunc foo() -> void:\n\tpass\nfunc test() -> void:\n\tfoo()\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         // The callee `foo` in `\tfoo()` (the LAST `foo` occurrence — the call site).
         let callee_byte = src.rfind("foo").unwrap();
@@ -1645,7 +1841,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func test() -> void:\n\tprint(\"hi\")\n\tlen([1])\n\trange(3)\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         for name in ["print", "len", "range"] {
             let byte = src.find(&format!("{name}(")).unwrap();
@@ -1673,7 +1869,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func test() -> void:\n\tfor item in [1, 2]:\n\t\tprint(item)\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         // The decl-site `item` (in `for item in`).
         let decl_byte = src.find("for item").unwrap() + "for ".len();
@@ -1704,7 +1900,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func test() -> void:\n\tmatch 5:\n\t\tvar y:\n\t\t\tprint(y)\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         let decl_byte = src.find("var y").unwrap() + "var ".len();
         let decl = tok_at(&raw, decl_byte)
@@ -1736,7 +1932,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func print() -> void:\n\tpass\nfunc test() -> void:\n\tprint()\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         let callee_byte = src.rfind("print").unwrap();
         let callee =
@@ -1760,7 +1956,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func foo() -> void:\n\tpass\nfunc test() -> void:\n\tfoo()\n\tprint(\"hi\")\n\tlen([1])\n\tfor item in [1, 2]:\n\t\tpass\n\tmatch 5:\n\t\tvar y:\n\t\t\tpass\n";
         let parsed = gd_syntax::parse(src);
-        let raw = classify_document(&parsed.tree, None, &db);
+        let raw = classify_document(&parsed.tree, None, &db, None);
 
         // Bare callees (method + utilities alike) are OMITTED under no analysis.
         for (label, needle, off) in [
@@ -1797,7 +1993,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func foo() -> void:\n\tpass\nfunc test() -> void:\n\tfoo()\n\tprint(\"hi\")\n\tfor item in [1]:\n\t\tprint(item)\n\tmatch 5:\n\t\tvar y:\n\t\t\tprint(y)\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
         assert!(!raw.is_empty());
         for t in &raw {
             // `TokType as usize` must index a real legend slot — a custom type would be out of range
@@ -1825,7 +2021,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func test() -> void:\n\tvar v = Vector2(1, 2)\n\tvar c = Color(1, 1, 1)\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         for name in ["Vector2", "Color"] {
             let byte = src.find(&format!("{name}(")).unwrap();
@@ -1860,7 +2056,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func test() -> void:\n\tvar c = Color8(255, 0, 0)\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         let byte = src.find("Color8(").unwrap();
         let tok = tok_at(&raw, byte).expect("the `Color8` utility callee must be colored");
@@ -1879,7 +2075,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func Vector2() -> void:\n\tpass\nfunc test() -> void:\n\tVector2()\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         let callee_byte = src.rfind("Vector2").unwrap();
         let callee =
@@ -1902,7 +2098,7 @@ mod tests {
         let db = trimmed_db();
         let src = "extends Node\nvar cb: Callable = func(): pass\nfunc foo() -> void:\n\tpass\nfunc test() -> void:\n\tcb()\n\tfoo()\n\tvar read = cb\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         // The `cb()` callee colors `property` (what `cb` IS), NOT `method`.
         let cb_call_byte = src.find("\tcb()").unwrap() + 1;
@@ -1940,7 +2136,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func foo() -> void:\n\tpass\nclass Inner:\n\tvar foo: Callable = func(): pass\n\tfunc run() -> void:\n\t\tfoo()\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         // The inner `foo()` call resolves to the inner `var foo` (a property), not the root `func foo`.
         let inner_call_byte = src.rfind("foo()").unwrap();
@@ -1968,7 +2164,7 @@ mod tests {
         let src_a =
             "extends Base\nclass Base:\n\tfunc foo() -> void:\n\t\tpass\nfunc run() -> void:\n\tfoo()\n";
         let (p_a, a_a) = analyze_for(src_a, &db);
-        let raw_a = classify_document(&p_a.tree, Some(&a_a), &db);
+        let raw_a = classify_document(&p_a.tree, Some(&a_a), &db, None);
         let call_a = src_a.rfind("foo()").unwrap();
         let tok_a = tok_at(&raw_a, call_a)
             .expect("the inherited-method callee (root extends in-file base) must be colored");
@@ -1981,7 +2177,7 @@ mod tests {
         // Shape B: an inner `Derived extends Base`; bare call to the inherited method.
         let src_b = "class Base:\n\tfunc foo() -> void:\n\t\tpass\nclass Derived extends Base:\n\tfunc run() -> void:\n\t\tfoo()\n";
         let (p_b, a_b) = analyze_for(src_b, &db);
-        let raw_b = classify_document(&p_b.tree, Some(&a_b), &db);
+        let raw_b = classify_document(&p_b.tree, Some(&a_b), &db, None);
         let call_b = src_b.rfind("foo()").unwrap();
         let tok_b = tok_at(&raw_b, call_b)
             .expect("the inherited-method callee (inner Derived extends Base) must be colored");
@@ -2002,7 +2198,7 @@ mod tests {
         let src =
             "extends Node\nfunc helper() -> void:\n\tpass\nfunc test() -> void:\n\tself.helper()\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         let attr_byte = src.find("self.helper()").unwrap() + "self.".len();
         let attr = tok_at(&raw, attr_byte)
@@ -2032,7 +2228,7 @@ mod tests {
         let db = trimmed_db();
         let src = "class_name Target\nextends Node\nvar cb: Callable\nfunc real() -> void:\n\tpass\nfunc use() -> void:\n\tvar obj: Target = Target.new()\n\tobj.cb()\n\tobj.real()\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         // `obj.cb()` — the Callable-property callee colors `property` (what `cb` IS).
         let cb_byte = src.find("obj.cb()").unwrap() + "obj.".len();
@@ -2065,7 +2261,7 @@ mod tests {
         let db = trimmed_db();
         let src = "extends Node\nfunc test() -> void:\n\tsuper.test()\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         // The `test` attribute in `super.test()` must NOT be the `method` the dotted-callee path emits.
         // (The generic member-use arm may color it `property` — pre-existing, untouched by this fix.)
@@ -2089,7 +2285,7 @@ mod tests {
         let db = trimmed_db();
         let src = "func helper() -> void:\n\tpass\nfunc test() -> void:\n\tvar v = Vector2(1, 2)\n\tself.helper()\n";
         let parsed = gd_syntax::parse(src);
-        let raw = classify_document(&parsed.tree, None, &db);
+        let raw = classify_document(&parsed.tree, None, &db, None);
 
         let vec_byte = src.find("Vector2(").unwrap();
         assert!(
@@ -2113,7 +2309,7 @@ mod tests {
         let db = trimmed_db();
         let src = "extends Node\nvar cb: Callable = func(): pass\nfunc helper() -> void:\n\tpass\nfunc test() -> void:\n\tvar v = Vector2(1, 2)\n\tvar c = Color(1, 1, 1)\n\tcb()\n\thelper()\n\tself.helper()\n";
         let (parsed, analysis) = analyze_for(src, &db);
-        let raw = classify_document(&parsed.tree, Some(&analysis), &db);
+        let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
         assert!(!raw.is_empty());
         for t in &raw {
             assert!(
