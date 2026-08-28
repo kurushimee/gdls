@@ -151,6 +151,90 @@ fn references_finds_cross_file_method_calls() {
     shutdown(&client, server_thread);
 }
 
+/// #246: a consumer that names a `class_name` ONLY inside function bodies is invisible to the
+/// interface-level `name_referencers` set, so it used to be skipped entirely. `references` on the
+/// class must still return its body-only occurrences — and must NOT return an unrelated same-named
+/// local in a third file (widening the candidate set may never widen what is collected inside one).
+#[test]
+fn references_on_class_name_finds_body_only_consumer() {
+    let p = TempProject::new();
+    p.write("project.godot", "config_version=5\n");
+    p.write("extension_api.json", common::MINI_API);
+    p.write("hero.gd", "class_name Hero\nextends Node\n");
+    // Interface-level consumer: `extends Hero` is in the interface, so the old fast path saw it.
+    p.write("enemy.gd", "extends Hero\n\nfunc flee():\n\tpass\n");
+    // Body-only consumer: nothing at interface level mentions Hero.
+    p.write(
+        "bodyonly.gd",
+        "extends Node\n\nfunc f() -> void:\n\tvar h: Hero = Hero.new()\n\tprint(h)\n",
+    );
+    // A same-named LOCAL that is not the class — must never be collected.
+    p.write(
+        "shadow.gd",
+        "extends Node\n\nfunc g() -> void:\n\tvar Hero := 1\n\tprint(Hero)\n",
+    );
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(
+        &p,
+        &client,
+        &["hero.gd", "enemy.gd", "bodyonly.gd", "shadow.gd"],
+    );
+
+    let hero_uri = file_uri(&p.root.join("hero.gd"));
+    let params = ReferenceParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: hero_uri.clone(),
+            },
+            // Click on `Hero` in `class_name Hero` (line 0, col 11).
+            position: Position {
+                line: 0,
+                character: 11,
+            },
+        },
+        context: ReferenceContext {
+            include_declaration: false,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(10, "textDocument/references", params))
+        .unwrap();
+    let resp = common::recv_response(&client);
+    assert!(resp.error.is_none(), "references errored: {:?}", resp.error);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.expect("references result")).unwrap();
+
+    let enemy_uri = file_uri(&p.root.join("enemy.gd"));
+    let body_uri = file_uri(&p.root.join("bodyonly.gd"));
+    let shadow_uri = file_uri(&p.root.join("shadow.gd"));
+    assert!(
+        locs.iter().any(|l| l.uri == enemy_uri),
+        "the `extends Hero` consumer must be included; got {locs:?}"
+    );
+    let body_cols: Vec<u32> = locs
+        .iter()
+        .filter(|l| l.uri == body_uri)
+        .map(|l| l.range.start.character)
+        .collect();
+    assert_eq!(
+        body_cols,
+        vec![8, 15],
+        "both body-only occurrences (`var h: Hero` col 8, `Hero.new()` col 15) must be included; \
+         got {locs:?}"
+    );
+    assert!(
+        locs.iter().all(|l| l.uri != shadow_uri),
+        "an unrelated same-named LOCAL must never be collected; got {locs:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
 /// M6-E false-positive gate: `textDocument/references` for `Lib::helper` must NOT include
 /// occurrences of an unrelated same-named method in `other.gd` (`class_name Other` with its own
 /// `func helper()`). The callee_file-filtered mechanism must distinguish between the two.

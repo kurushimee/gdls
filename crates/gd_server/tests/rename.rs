@@ -2958,6 +2958,85 @@ fn rename_anon_enum_value_does_not_rewrite_unrelated_class_name() {
 }
 
 #[test]
+fn rename_246_class_rename_edits_a_body_only_consumer() {
+    // #246: a consumer that names the class ONLY inside function bodies is invisible to the
+    // interface-level `name_referencers` set the class candidate scan used to ride, so renaming the
+    // class silently skipped it — a HALF-APPLIED rename that leaves that file calling a name which no
+    // longer exists. Every occurrence must be edited, and an unrelated same-named LOCAL in a third
+    // file must still be left alone (a wider candidate set may not widen what is collected inside a
+    // candidate).
+    //   hero.gd     line 0 `class_name Hero`          → the decl (col 11)
+    //   enemy.gd    line 0 `extends Hero`             → interface-level use (col 8)
+    //   bodyonly.gd line 3 `\tvar h: Hero = Hero.new()` → body-only uses (cols 8 and 15)
+    //   shadow.gd   line 3 `\tvar Hero := 1`          → an unrelated local, never edited
+    let project = common::sample_project();
+    project.write(
+        "src/bodyonly.gd",
+        "extends Node\n\nfunc f() -> void:\n\tvar h: Hero = Hero.new()\n\tprint(h)\n",
+    );
+    project.write(
+        "src/shadow.gd",
+        "extends Node\n\nfunc g() -> void:\n\tvar Hero := 1\n\tprint(Hero)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &[
+            "src/hero.gd",
+            "src/enemy.gd",
+            "src/bodyonly.gd",
+            "src/shadow.gd",
+        ],
+        2,
+    );
+    let hero_uri = file_uri(&project.root.join("src/hero.gd"));
+    let body_uri = file_uri(&project.root.join("src/bodyonly.gd"));
+    let shadow_uri = file_uri(&project.root.join("src/shadow.gd"));
+
+    client
+        .sender
+        .send(request(
+            320,
+            "textDocument/rename",
+            rename_params(&hero_uri, 0, 11, "Champion"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the class must succeed: {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.expect("edit")).unwrap());
+    let body_cols: Vec<u32> = view
+        .set
+        .iter()
+        .filter(|(u, _)| *u == body_uri.as_str())
+        .map(|(_, r)| r.start.character)
+        .collect();
+    assert_eq!(
+        body_cols,
+        vec![8, 15],
+        "both body-only occurrences must be edited (the #246 half-applied rename); got {:?}",
+        view.set
+    );
+    assert!(
+        view.set.iter().all(|(u, _)| *u != shadow_uri.as_str()),
+        "an unrelated same-named local must never be edited; got {:?}",
+        view.set
+    );
+    assert!(
+        view.new_texts.iter().all(|t| t == "Champion"),
+        "every edit writes the new name; got {:?}",
+        view.new_texts
+    );
+    shutdown(&client, server);
+}
+
+#[test]
 fn rename_161_anon_enum_decl_click_definition_leaks_the_class_but_rename_never_edits_it() {
     // #161 (gate 2 of #159), the end-to-end companion to the `canonicalization_target` unit tests.
     //
@@ -3101,10 +3180,10 @@ fn rename_class_name_from_expression_use_with_colliding_member_renames_the_class
         "every edit writes the new name; got {:?}",
         view.new_texts
     );
-    // NB: the `Global.new()` expression use site is NOT collected here — a pre-existing
-    // references-completeness gap for class uses in expression position, orthogonal to #159's
-    // wrong-symbol-corruption fix (tracked separately). This test pins only that the class is the
-    // correct, by-identity target.
+    // The `Global.new()` expression use site is collected too (it was missed until the class
+    // candidate set widened past the interface-level `name_referencers` fast-path — a body-only
+    // consumer is invisible there). This test pins only that the class is the correct, by-identity
+    // target.
     shutdown(&client, server);
 }
 

@@ -3343,11 +3343,28 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             {
                 Vec::new()
             }
+            // A project `class_name` reaches into consumers' function BODIES (`var h: Hero = Hero.new()`,
+            // `o as Hero`, `Hero.CONST`), and the shallow interface pass records only the `extends` head
+            // plus member/param TYPES — so `name_referencers` never lists a body-only consumer and every
+            // occurrence in it was silently missed. Under `rename` (the mutating consumer) that is a
+            // half-applied rename: the class is renamed while the body-only consumer keeps calling the
+            // old name. Same recall fix, same mechanism, as the `Member` arm above: the project-wide
+            // textual prefilter picks candidates, and the per-candidate collection stays
+            // occurrence-POSITIVE ([`push_global_class_locations`] — `Class` use bindings by
+            // `target_file` identity + type-base segments by position), so widening the candidate set
+            // cannot widen what is collected inside one. The `RawFloor` residue below keeps the narrow
+            // interface fast-path: its collector IS the raw name scan, so a wider candidate set would
+            // widen an over-grab.
+            NonMethodTarget::Unresolved
+                if matches!(unresolved_kind, UnresolvedKind::GlobalClass(_)) =>
+            {
+                method_scan_candidate_uris(state, &name, current_fid, "references")
+            }
             NonMethodTarget::Unresolved => {
-                // Fast-path for class/type names (incl. the occurrence-positive `GlobalClass` bucket):
-                // only files whose interface mentions `name` can reference it; `name_referencers`
-                // already has that set. (Autoloads are excluded — they take the project-wide textual
-                // scan above since they never appear in interface sets.)
+                // Fast-path for the unresolvable residue: only files whose interface mentions `name`
+                // can reference it at interface level; `name_referencers` already has that set.
+                // (Autoloads are excluded — they take the project-wide textual scan above since they
+                // never appear in interface sets.)
                 let mut candidate_fids: FxHashSet<gd_project::FileId> = FxHashSet::default();
                 for fid in state.workspace.index.name_referencers(&name) {
                     candidate_fids.insert(fid);
