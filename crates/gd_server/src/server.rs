@@ -101,9 +101,9 @@ pub(crate) struct ClientCaps {
     /// dynamically, and the spec forbids registering the same capability statically too.
     pub(crate) dynamic_watched_files: bool,
     /// `textDocument.hover.contentFormat` (M7 #62): the first kind in the client's preference
-    /// order that gdls supports. Absent ⇒ Markdown — see
-    /// [`crate::docs::ProseFormat`] for why that pragmatic default stands until the M7 exit
-    /// harness captures the real editor profiles.
+    /// order that gdls supports. Absent ⇒ PlainText (#261) — the captured editor profiles all
+    /// declare markdown explicitly, so the default is reached only by a client that has told the
+    /// server nothing; see [`crate::docs::ProseFormat`].
     pub(crate) hover_format: crate::docs::ProseFormat,
     /// The M8 (#64) completion gates, captured under `textDocument.completion`. Grouped in a
     /// sub-struct so the completion handler reads `state.caps.completion.<gate>` and the rest of
@@ -268,7 +268,8 @@ pub(crate) struct CompletionCaps {
     /// contexts).
     pub(crate) commit_characters_support: bool,
     /// `completionItem.documentationFormat` — the first kind gdls supports, reusing the
-    /// [`crate::docs::ProseFormat`] negotiation `hover.contentFormat` uses. Absent ⇒ Markdown.
+    /// [`crate::docs::ProseFormat`] negotiation `hover.contentFormat` uses. Absent ⇒ PlainText
+    /// (the conservative floor, see [`crate::docs::ProseFormat`]).
     /// Consumed by `completionItem/resolve` when it renders the lazy documentation.
     pub(crate) documentation_format: crate::docs::ProseFormat,
     /// `completionItem.resolveSupport.properties` — the property names the client will pull lazily
@@ -298,9 +299,9 @@ pub(crate) struct CompletionCaps {
 pub(crate) struct SignatureHelpCaps {
     /// `signatureInformation.documentationFormat` — the first kind gdls supports, reusing the
     /// [`crate::docs::ProseFormat`] negotiation `hover.contentFormat` uses. Absent ⇒ PlainText (the
-    /// same conservative downgrade [`CompletionCaps::documentation_format`] takes: a client that
-    /// didn't enumerate formats can always render plaintext, and attaching un-asked-for markdown
-    /// could surface raw `**`).
+    /// same conservative downgrade [`CompletionCaps::documentation_format`] and `hover_format`
+    /// take: a client that didn't enumerate formats can always render plaintext, and attaching
+    /// un-asked-for markdown could surface raw `**`).
     pub(crate) documentation_format: crate::docs::ProseFormat,
     /// `signatureInformation.parameterInformation.labelOffsetSupport` — when true, each
     /// [`lsp_types::ParameterInformation`] carries `[start, end)` offsets into the signature label;
@@ -498,8 +499,10 @@ impl SemanticTokensCaps {
 /// The first [`crate::docs::ProseFormat`] gdls supports in a client's preference-ordered
 /// `MarkupKind` list (Markdown preferred, PlainText accepted, anything else skipped). Shared by
 /// `hover.contentFormat` (M7 #62) and `completionItem.documentationFormat` (M8 #64) so both honor
-/// the same negotiation; an empty / all-unknown list falls back to the caller's `unwrap_or_default`
-/// (Markdown).
+/// the same negotiation; an empty / all-unknown list falls back to
+/// [`crate::docs::ProseFormat::PlainText`] — the same floor an absent capability takes (#261),
+/// since a client that enumerated only kinds gdls doesn't know has still said nothing about
+/// markdown.
 fn prose_format_from(formats: &[lsp_types::MarkupKind]) -> crate::docs::ProseFormat {
     formats
         .iter()

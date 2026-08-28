@@ -204,18 +204,39 @@ fn plaintext_preferring_client_gets_stripped_hover() {
     common::shutdown(&client, server_thread);
 }
 
-/// With no `hover.contentFormat` advertised, the pragmatic default stays markdown (documented
-/// on `ProseFormat`; revisited against captured editor profiles in the M7 exit harness).
+/// #261: a client that advertised no `hover.contentFormat` has told the server nothing about
+/// what it can render, so plaintext is the floor — sending markdown on that assumption puts raw
+/// ``` fences and `**` into a popup that may not render them. Every captured editor profile asks
+/// for markdown explicitly, so nothing real is downgraded by this.
 #[test]
-fn absent_content_format_defaults_to_markdown() {
+fn absent_content_format_defaults_to_plaintext() {
     let p = sample_project();
     p.write("src/hero.gd", HERO_SRC);
     let (client, server_thread) = boot(&p, ClientCapabilities::default());
     let hero_uri = file_uri(&p.root.join("src/hero.gd"));
     did_open(&client, &hero_uri, HERO_SRC);
 
-    let (kind, _) = hover_at(&client, 2, &hero_uri, 6, 6);
-    assert_eq!(kind, "markdown");
+    let (kind, value) = hover_at(&client, 2, &hero_uri, 6, 6);
+    assert_eq!(kind, "plaintext");
+    assert!(!value.contains("```"), "no fences: {value}");
+    assert!(!value.contains("**"), "no bold markers: {value}");
+
+    common::shutdown(&client, server_thread);
+}
+
+/// An EMPTY `contentFormat` list says just as little as an absent one, so it takes the same
+/// floor rather than falling through to markdown.
+#[test]
+fn empty_content_format_also_takes_plaintext() {
+    let p = sample_project();
+    p.write("src/hero.gd", HERO_SRC);
+    let (client, server_thread) = boot(&p, hover_caps(vec![]));
+    let hero_uri = file_uri(&p.root.join("src/hero.gd"));
+    did_open(&client, &hero_uri, HERO_SRC);
+
+    let (kind, value) = hover_at(&client, 2, &hero_uri, 6, 6);
+    assert_eq!(kind, "plaintext");
+    assert!(!value.contains("```"), "no fences: {value}");
 
     common::shutdown(&client, server_thread);
 }

@@ -69,6 +69,16 @@ fn boot_with_options(
                 position_encodings: Some(vec![PositionEncodingKind::UTF8]),
                 ..Default::default()
             }),
+            // These tests assert hover CONTENT, so they ask for markdown the way every real
+            // editor profile does. Without the request the server answers plaintext (#261) —
+            // the correct floor for a client that declared nothing, but not what is under test.
+            text_document: Some(lsp_types::TextDocumentClientCapabilities {
+                hover: Some(lsp_types::HoverClientCapabilities {
+                    content_format: Some(vec![MarkupKind::Markdown]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         },
         initialization_options: init_options,

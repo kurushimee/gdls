@@ -266,6 +266,12 @@ binary. No release cut.
   nothing about `openClose` or `save`, and every per-file surface here is keyed on an open buffer.
   Now `{ openClose: true, change: Incremental, save: { includeText: false } }` — `didSave` is
   routed and mutates nothing, so the text is never resent, and neither `willSave` hook is claimed.
+- **Hover prose defaults to plaintext, not markdown** (#261): a client that advertised no
+  `hover.contentFormat` had said nothing about what it can render, and got markdown anyway —
+  fences and `**` into a popup that may not render them. `ProseFormat`'s default is now
+  `PlainText`, which also puts hover on the floor completion and signatureHelp already took, and
+  an empty format list takes it too. Every captured editor profile asks for markdown explicitly,
+  so nothing real is downgraded.
 
 ## [1.0.7] — 2026-06-13
 
