@@ -2284,6 +2284,61 @@ fn name_is_in_file_root_type(tree: &ParseTree, name: &str) -> bool {
     })
 }
 
+/// `true` iff a class ENCLOSING `byte` — the innermost one outward, the file root included —
+/// declares `name` as an ENUM, an INNER CLASS, or a `const` alias. The scope-aware sibling of
+/// [`name_is_in_file_root_type`], and the #189 fix: an inner class's own `enum Bar` is just as much
+/// an in-file type as a root one, but the root-only predicate could not see it, so an inner-scoped
+/// type cursor fell through to the `RawFloor` residue — whose raw identifier scan fans out
+/// CROSS-FILE over `name_referencers(name)` and rewrote a same-named global class's consumers in
+/// unrelated files (a W16 grep-rename, proven on `main`).
+///
+/// Same member-kind restriction as the root predicate — `{Enum, Class, Constant}`, the complete set
+/// usable in a type-annotation position — so an unrelated `var`/`func`/`signal` of the same name
+/// cannot admit a cursor. Scope walk is positional (a class node whose span contains `byte`), which
+/// is what makes it an ENCLOSING-scope test rather than a file-wide name test: a type declared in a
+/// SIBLING inner class does not admit a cursor outside it.
+fn name_is_in_file_type(tree: &ParseTree, byte: usize, name: &str) -> bool {
+    let declares = |members: &[Member]| {
+        members.iter().any(|m| match m {
+            Member::Enum(id) => {
+                matches!(&tree.get(*id).kind, NodeKind::Enum(en) if en.identifier.map(|i| ident_name(tree, i)) == Some(name))
+            }
+            Member::Class(id) => {
+                matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+            }
+            Member::Constant(id) => {
+                matches!(&tree.get(*id).kind, NodeKind::Constant(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+            }
+            _ => false,
+        })
+    };
+    tree.iter_ids().any(|nid| {
+        let node = tree.get(nid);
+        match &node.kind {
+            NodeKind::Class(c) => {
+                node.span.start <= byte && byte < node.span.end && declares(&c.members)
+            }
+            _ => false,
+        }
+    }) || name_is_in_file_root_type(tree, name)
+}
+
+/// `true` iff `node_id` is the DECLARATION identifier of a member of ANY class in this file — the
+/// root class or any inner class, at any nesting depth. [`node_is_root_member`] sees the root
+/// class's members only, so an inner class's `enum Bar` declaration token had no project anchor and
+/// the rename REFUSED it outright (#189). Positional, like its root-only sibling: it admits the
+/// declaration token itself, never a same-named use elsewhere.
+fn node_is_class_member_decl(tree: &ParseTree, node_id: NodeId) -> bool {
+    tree.iter_ids().any(|nid| match &tree.get(nid).kind {
+        NodeKind::Class(c) => c.members.iter().any(|m| {
+            member_decl_id(m)
+                .and_then(|decl| declaration_identifier(tree, decl))
+                .is_some_and(|iid| iid == node_id)
+        }),
+        _ => false,
+    })
+}
+
 fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
     // Single pass: short-circuit on a func/signal declaration; otherwise remember the subscript
     // that owns this attribute identifier and collect every `Call` callee node, then decide.
@@ -3050,7 +3105,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     //     identity + type-base segments by position) instead of the raw floor, so an unrelated
     //     same-named local/param/member in a consumer is never rewritten. #163.
     //   - `RawFloor`: a genuinely unresolvable name — the documented over-approximate residue.
-    let unresolved_kind = if name_is_in_file_root_type(&parsed.tree, &name) {
+    let unresolved_kind = if name_is_in_file_type(&parsed.tree, byte, &name) {
         UnresolvedKind::InFileType
     } else if cursor_refers_global_class {
         // `cursor_refers_global_class` already returned `false` when `global_class_file` is `None`
@@ -3275,6 +3330,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                         // refs the reducer doesn't record. The dedup pass collapses overlap. An
                         // in-file type keeps the in-file raw scan (its own `: FOO`/`FOO.A` uses are
                         // genuine); only its CROSS-FILE fan-out is suppressed below.
+                        let floor_start = locations.len();
                         push_binding_locations(&mut locations, &result, &name, &uri, &mapper);
                         push_identifier_locations(
                             &mut locations,
@@ -3283,6 +3339,30 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                             &uri,
                             &mapper,
                         );
+                        // #189: when a same-named GLOBAL `class_name` also exists, this file's
+                        // type-base segments (`extends Foo`, an unshadowed `: Foo`) bind THAT class,
+                        // not the in-file type — Godot resolves the global registry before
+                        // class-scope members in both positions. The raw name scan cannot tell them
+                        // apart, so subtract them by identity: renaming the in-file `enum Foo` must
+                        // never rewrite this file's `extends Foo` into a name nothing declares.
+                        if matches!(unresolved_kind, UnresolvedKind::InFileType)
+                            && global_class_file(state, &name).is_some()
+                        {
+                            let mut global_owned = Vec::new();
+                            push_type_base_segment_locations(
+                                &mut global_owned,
+                                &parsed.tree,
+                                &name,
+                                &uri,
+                                &mapper,
+                            );
+                            let tail: Vec<Location> = locations
+                                .split_off(floor_start)
+                                .into_iter()
+                                .filter(|l| !global_owned.contains(l))
+                                .collect();
+                            locations.extend(tail);
+                        }
                     }
                 },
             }
@@ -3801,7 +3881,7 @@ fn collect_in_file_highlight_sites(
     //     decl-click, a `Class` use binding at the span, or a type-base segment — collected via the
     //     occurrence-positive [`push_global_class_locations`] instead of the raw floor.
     //   - `RawFloor`: a genuinely unresolvable name — the over-approximate raw-identifier residue.
-    let unresolved_kind = if name_is_in_file_root_type(&parsed.tree, name) {
+    let unresolved_kind = if name_is_in_file_type(&parsed.tree, byte, name) {
         UnresolvedKind::InFileType
     } else if cursor_references_global_class(state, uri, &parsed.tree, key, text, byte, name) {
         // `cursor_references_global_class` returns `false` when `global_class_file` is `None` (it
@@ -4708,10 +4788,35 @@ fn push_global_class_locations(
             }
         }
     }
-    // (2) `extends` base segments named `name` (carry no binding). Godot's inheritance resolver
-    // checks global `class_name`s before same-file class-scope members, so a registered global class
-    // wins even if the extending class declares an enum/inner class/const named `name`. Therefore
-    // these are collected for the global-class rename without the annotation shadow filter.
+    push_type_base_segment_locations(out, tree, name, uri, mapper);
+}
+
+/// Append a [`Location`] for every parser-level TYPE-BASE segment named `name` — the occurrences a
+/// same-named global `class_name` OWNS in this file, which carry no `Binding::Use` of their own:
+///
+///   * `extends name` base segments. Godot's inheritance resolver checks global `class_name`s before
+///     same-file class-scope members, so a registered global class wins even if the extending class
+///     declares an enum/inner class/const named `name` — collected without the shadow filter.
+///   * `: name` annotation base segments (index 0 of a `TypeNode.type_chain`, so a `Foo.Inner` suffix
+///     is never collected), each resolved PER OCCURRENCE via
+///     [`ParseTree::type_name_shadowed_by_enclosing_scope`]: in type-annotation position Godot checks
+///     suite-locals before the global registry but the global registry BEFORE class-scope members
+///     (gdscript_analyzer.cpp:689 < :787 < :845), so a `: Foo` binds the GLOBAL while it exists UNLESS
+///     a SUITE-LOCAL `Foo` (a func-local `const Foo = preload(...)`) shadows it. A `: Foo` enclosed by
+///     a class scope that declares its OWN `enum`/inner-`class`/`const Foo` STILL binds the global and
+///     IS collected.
+///
+/// Two consumers, and they are exact complements: [`push_global_class_locations`] ADDS this set (it
+/// is renaming the global class), and the in-file-type residue scan SUBTRACTS it (#189 — those
+/// occurrences bind the global, not the same-named in-file type, so a raw name scan that keeps them
+/// would rewrite this file's `extends <global>` into a name nothing declares).
+fn push_type_base_segment_locations(
+    out: &mut Vec<Location>,
+    tree: &ParseTree,
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
     for nid in tree.iter_ids() {
         let Some(base_id) = (match &tree.get(nid).kind {
             NodeKind::Class(c) => c.extends.first().copied(),
@@ -4730,25 +4835,10 @@ fn push_global_class_locations(
         }
     }
 
-    // (3) Type-annotation base segments named `name` (carry no binding). Restricted to index 0 of a
-    // `TypeNode.type_chain`, so a `Foo.Inner` suffix is never collected.
-    //
-    // Each annotation base segment is resolved PER OCCURRENCE
-    // ([`ParseTree::type_name_shadowed_by_enclosing_scope`]): in type-annotation position Godot checks
-    // suite-locals before the global registry but the global registry BEFORE class-scope members
-    // (gdscript_analyzer.cpp:689 < :787 < :845), so a `: Foo` binds the GLOBAL while it exists UNLESS a
-    // SUITE-LOCAL `Foo` (a func-local `const Foo = preload(...)`) shadows it. A `: Foo` enclosed by a
-    // class scope that declares its OWN `enum`/inner-`class`/`const Foo` STILL binds the global and IS
-    // collected — only a suite-local shadow suppresses it. This is occurrence-positive: a base segment
-    // is edited because per-node resolution proves it names the global class.
-    //
-    // (This replaces the former file-level early-return skip — `name_is_in_file_root_type(tree, name)`
-    // → suppress the WHOLE file — which over-suppressed a legitimate `extends Foo` (the global) in a
-    // file that ALSO declared an inner `enum Foo`, forcing the rename to refuse. The per-occurrence
-    // walk separates the two. #167. Part (1) above stays occurrence-positive by construction: a `Foo`
-    // expression (`Foo.A`) inside a scope that declares `enum Foo` reduces to the LOCAL enum member
-    // (expression resolution checks members before the global, the reverse of type position) and
-    // records no Class-use binding pointing at this class file, so it is already excluded there.)
+    // Annotation base segments. (The per-occurrence shadow walk replaced a file-level early-return
+    // skip — `name_is_in_file_root_type(tree, name)` → suppress the WHOLE file — which
+    // over-suppressed a legitimate `extends Foo` (the global) in a file that ALSO declared an inner
+    // `enum Foo`, forcing the rename to refuse. #167.)
     for nid in tree.iter_ids() {
         let base_id = match &tree.get(nid).kind {
             NodeKind::Type(t) => t.type_chain.first().copied(),
@@ -6915,6 +7005,14 @@ fn rename_target_has_project_anchor(
     if node_is_root_member(&parsed.tree, node_id) {
         return true;
     }
+    // #189: the same click one class deeper. `node_is_root_member` sees the ROOT class's members
+    // only, so an INNER class's `enum Bar` / `class Widget` / `const Alias` declaration token had no
+    // anchor and refused — an inner-scoped type could not be renamed at all, even with nothing
+    // colliding. Positional like its root-only sibling (the declaration token itself, never a
+    // same-named use), so it cannot borrow an unrelated symbol's anchor.
+    if node_is_class_member_decl(&parsed.tree, node_id) {
+        return true;
+    }
     // Enclosing-function local, parameter, `for` iterator, or `match` bind (resolved respecting
     // nested scopes) — all editable project symbols.
     if resolve_local_binding(&parsed.tree, byte, name).is_some() {
@@ -7032,7 +7130,7 @@ fn rename_target_has_project_anchor(
         if class_use_anchored
             || (find_global_class_definition(state, name).is_some()
                 && cursor_is_extends_base_segment(&parsed.tree, node_id))
-            || name_is_in_file_root_type(&parsed.tree, name)
+            || name_is_in_file_type(&parsed.tree, byte, name)
             || (find_global_class_definition(state, name).is_some()
                 && cursor_is_type_annotation_base_segment(&parsed.tree, node_id)
                 && !parsed
