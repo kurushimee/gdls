@@ -362,6 +362,17 @@ binary. No release cut.
   than by name. The modifier was in the advertised legend since M10 with nothing behind it.
   Engine symbols never carry either signal: `extension_api.json` has no deprecation field in
   4.6.3, with or without docs, so there is nothing to claim one from.
+- **`workspace/diagnostic/refresh` now reaches real clients** (#277): the refresh #255 added was
+  gated on `workspace.diagnostic.refreshSupport`, which is what lsp-types 0.97 deserializes — but
+  LSP 3.17 spells the key `workspace.diagnostics`, plural, and that is what VS Code, Neovim, Zed
+  and Sublime all send. No editor had ever received it, so the pull half of the staleness fix was
+  inert while the push half worked. The key is now read off the raw capabilities object, with the
+  typed field kept as a fallback, and the test builds the capability as JSON so a typed round-trip
+  can no longer hide the same class of bug.
+- **An inner class hovers with its doc in a type position too** (#277): `func f(i: Outer.Inner)`
+  showed a bare `Outer.Inner` while `Outer.Inner.new()` showed the doc, because the `Inner` segment
+  has no `class_name` registry entry to route through. The analyzer already pins a script type
+  there; following it reaches the same declaring interface.
 
 ## [1.0.7] — 2026-06-13
 
