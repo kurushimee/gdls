@@ -4305,13 +4305,152 @@ fn rename_167_global_class_use_in_self_shadowing_origin_file_edits_precisely() {
 }
 
 #[test]
-fn rename_167_inner_enum_decl_click_with_colliding_global_refuses() {
-    // (the 4th matrix position — inner-type DECL click): cursor on the inner `enum Foo` DECL token
-    // itself, with a same-named global `class_name Foo`. An inner-class member is not a root-class
-    // member, resolves to no local/Class/Member binding at the cursor, and is not a `class_name`
-    // decl — so the PRE-EXISTING fail-closed firewall (`rename_target_has_project_anchor` → false)
-    // already refuses it before the inner-scope guards are reached. Zero edits, the global decl
-    // untouched. Pinned so the matrix cell stays covered if the firewall's anchor logic ever changes.
+fn rename_189_in_file_type_never_rewrites_the_files_own_extends_of_a_global() {
+    // #189 (the in-file-type residue's over-grab): a file that declares its own root `enum Bar` AND
+    // extends a same-named GLOBAL `class_name Bar`. The in-file type's reference set is a raw
+    // identifier scan, which cannot tell the two apart — so renaming the enum used to rewrite
+    // `extends Bar` (line 0) into a name nothing declares, i.e. a rename that BREAKS the file.
+    // Type-base segments belong to the global (the global registry precedes class-scope members in
+    // both `extends` and `: T` position) and must be subtracted from the in-file set.
+    //   holder.gd line 0 `extends Bar`      → the GLOBAL         — NOT edited
+    //   holder.gd line 1 `enum Bar { A }`   → the in-file enum   — EDITED (col 5)
+    //   holder.gd line 3 `\tprint(Bar.A)`   → expression use     — EDITED (col 7)
+    //   holder.gd line 4 `\tvar y: Bar = null` → annotation      — NOT edited (binds the global)
+    let project = common::sample_project();
+    project.write("src/barclass.gd", "class_name Bar\nextends Node\n");
+    project.write(
+        "src/holder.gd",
+        "extends Bar\nenum Bar { A }\nfunc f() -> void:\n\tprint(Bar.A)\n\tvar y: Bar = null\n\tprint(y)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/barclass.gd", "src/holder.gd"],
+        2,
+    );
+    let barclass_uri = file_uri(&project.root.join("src/barclass.gd"));
+    let holder_uri = file_uri(&project.root.join("src/holder.gd"));
+
+    client
+        .sender
+        .send(request(
+            410,
+            "textDocument/rename",
+            rename_params(&holder_uri, 1, 5, "Kind"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the in-file enum must proceed; got {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.expect("edit")).unwrap());
+    assert!(
+        view.set.iter().all(|(u, _)| *u != barclass_uri.as_str()),
+        "the global `class_name Bar` must never be edited; got {:?}",
+        view.set
+    );
+    let sites: Vec<(u32, u32)> = view
+        .set
+        .iter()
+        .filter(|(u, _)| *u == holder_uri.as_str())
+        .map(|(_, r)| (r.start.line, r.start.character))
+        .collect();
+    assert_eq!(
+        sites,
+        vec![(1, 5), (3, 7)],
+        "exactly the enum decl (1,5) and its expression use (3,7) — `extends Bar` (0,8) and the \
+         `: Bar` annotation (4,8) bind the GLOBAL class and must stay; got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_189_inner_scoped_type_never_reaches_into_another_file() {
+    // #189 (the cross-file half): before the in-file-type predicate became scope-aware, an INNER
+    // class's `enum Bar` fell through to the `RawFloor` residue — whose candidate scan fans out over
+    // `name_referencers("Bar")` and raw-scans each hit. So renaming one file's inner enum rewrote a
+    // DIFFERENT file's `extends Bar`, its own `enum Bar` declaration and its uses: a W16
+    // grep-rename across files, from a symbol that has no cross-file reference at all.
+    let project = common::sample_project();
+    project.write("src/barclass.gd", "class_name Bar\nextends Node\n");
+    // A neighbour that legitimately references the GLOBAL `Bar` at interface level (so it lands in
+    // `name_referencers`) and also declares its own root `enum Bar`.
+    project.write(
+        "src/neighbour.gd",
+        "extends Bar\nenum Bar { A }\nfunc f() -> void:\n\tprint(Bar.A)\n",
+    );
+    project.write(
+        "src/innerholder.gd",
+        "extends Node\nclass Inner:\n\tenum Bar { A }\n\tfunc f() -> void:\n\t\tprint(Bar.A)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/barclass.gd", "src/neighbour.gd", "src/innerholder.gd"],
+        2,
+    );
+    let barclass_uri = file_uri(&project.root.join("src/barclass.gd"));
+    let neighbour_uri = file_uri(&project.root.join("src/neighbour.gd"));
+    let inner_uri = file_uri(&project.root.join("src/innerholder.gd"));
+
+    client
+        .sender
+        .send(request(
+            420,
+            "textDocument/rename",
+            rename_params(&inner_uri, 4, 8, "Kind"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "renaming the inner enum from its use must proceed; got {:?}",
+        resp.error
+    );
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.expect("edit")).unwrap());
+    assert!(
+        view.set
+            .iter()
+            .all(|(u, _)| *u != barclass_uri.as_str() && *u != neighbour_uri.as_str()),
+        "an inner-scoped type has NO cross-file reference — no other file may be edited; got {:?}",
+        view.set
+    );
+    let sites: Vec<(u32, u32)> = view
+        .set
+        .iter()
+        .filter(|(u, _)| *u == inner_uri.as_str())
+        .map(|(_, r)| (r.start.line, r.start.character))
+        .collect();
+    assert_eq!(
+        sites,
+        vec![(2, 6), (4, 8)],
+        "exactly the inner decl (2,6) and its use (4,8); got {sites:?}"
+    );
+    shutdown(&client, server);
+}
+
+#[test]
+fn rename_189_inner_enum_decl_click_with_colliding_global_renames_precisely() {
+    // (the 4th matrix position — inner-type DECL click, #189): cursor on the inner `enum Foo` DECL
+    // token itself, with a same-named global `class_name Foo`. This used to REFUSE — an inner-class
+    // member is not a ROOT-class member, so the fail-closed firewall found no project anchor — which
+    // meant an inner-scoped type could not be renamed at all. It now renames PRECISELY, and the
+    // precision is the point: the occurrences split by POSITION, following Godot's resolution order.
+    //   holder.gd line 3 `\tenum Foo { A }`      → the inner decl (col 6)          — EDITED
+    //   holder.gd line 4 `\tvar y: Foo = Foo.A`  → `: Foo` annotation (col 8)      — NOT edited
+    //                                                (type position: the global registry precedes
+    //                                                 class-scope members, so it binds the GLOBAL)
+    //                                            → `Foo.A` expression base (col 14) — EDITED
+    //                                                (expression position: members first)
+    //   fooclass.gd `class_name Foo`             → NEVER edited
     let project = common::sample_project();
     project.write("src/fooclass.gd", "class_name Foo\nextends Node\n");
     project.write(
@@ -4340,22 +4479,30 @@ fn rename_167_inner_enum_decl_click_with_colliding_global_refuses() {
         .unwrap();
     let resp = recv_response(&client);
     assert!(
-        resp.result.is_none() && resp.error.is_some(),
-        "renaming the inner `enum Foo` decl colliding with a global `class_name Foo` must REFUSE \
-         (zero edits); got result={:?}, error={:?}",
-        resp.result,
+        resp.error.is_none(),
+        "renaming an inner-scoped type must PROCEED (#189); got {:?}",
         resp.error
     );
-    if let Some(v) = resp.result.as_ref() {
-        let view = flatten_edit(&serde_json::from_value::<WorkspaceEdit>(v.clone()).unwrap());
-        assert!(
-            !view.set.iter().any(|(u, _)| *u == fooclass_uri.as_str()),
-            "renaming the inner `enum Foo` decl must NEVER edit the global `class_name Foo` \
-             (fooclass.gd); got {:?}",
-            view.set
-        );
-    }
-    let _ = holder_uri;
+    let view =
+        flatten_edit(&serde_json::from_value::<WorkspaceEdit>(resp.result.expect("edit")).unwrap());
+    assert!(
+        view.set.iter().all(|(u, _)| *u != fooclass_uri.as_str()),
+        "renaming the inner `enum Foo` must NEVER edit the global `class_name Foo` (fooclass.gd); \
+         got {:?}",
+        view.set
+    );
+    let sites: Vec<(u32, u32)> = view
+        .set
+        .iter()
+        .filter(|(u, _)| *u == holder_uri.as_str())
+        .map(|(_, r)| (r.start.line, r.start.character))
+        .collect();
+    assert_eq!(
+        sites,
+        vec![(3, 6), (4, 14)],
+        "exactly the inner decl (3,6) and the EXPRESSION use (4,14) — the `: Foo` annotation (4,8) \
+         binds the global class and must stay; got {sites:?}"
+    );
     shutdown(&client, server);
 }
 
