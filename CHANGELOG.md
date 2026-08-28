@@ -278,6 +278,17 @@ binary. No release cut.
   all say `Method` now, matching the `CompletionItemKind::Method` completion already returned for
   the same symbols; the kind picks the glyph an outline draws, and the two surfaces disagreed.
 
+### Added
+- **signatureHelp for builtin type constructors** (#257): `Vector2(`, `Color(`, `Callable(` and
+  friends answer with one signature per overload, labelled `Type Type(args)` — the shape
+  `Variant::get_constructor_list` implies — filtered by Godot's own arg-index rule so an overload
+  the cursor overruns drops out. A deliberate divergence from Godot's language server, which
+  returns null here and keeps constructor arghints on the completion surface (#194, untouched):
+  under #30 a generic client reads parameter hints from `signatureHelp` and nowhere else, and
+  these are among the most-typed calls in GDScript. Where Godot's filter would show nothing —
+  typing past every overload's arity — the popup stays up with the widest overload first rather
+  than vanishing mid-edit.
+
 ## [1.0.7] — 2026-06-13
 
 Follow-ups to the v1.0.6 utility-as-Callable hotfix, surfaced by its review (#92). Cut from
