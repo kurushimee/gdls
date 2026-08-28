@@ -174,11 +174,19 @@ fn annotate_symbol_details(
 
 /// Map `gd_syntax`'s frontend symbol kind to LSP's. GDScript signals surface as `EVENT` (the LSP
 /// kind editors render for signal/event members).
+///
+/// `func` surfaces as `METHOD`, not `FUNCTION` (#263). A `.gd` file IS a class — every `func` in
+/// it, top-level or inside an inner `class`, is a member of one, and GDScript has no free
+/// functions for `FUNCTION` to mean. The kind picks the glyph an editor's outline, breadcrumb bar
+/// and symbol picker draw, and completion already returns `CompletionItemKind::METHOD` for the
+/// same symbols — the two surfaces must not disagree about what a `func` is. `static func` is
+/// still a `METHOD`: LSP has no static kind, and the distinction rides the `static`
+/// semantic-token modifier, which is already emitted.
 fn symbol_kind(kind: gd_syntax::SymbolKind) -> LspSymbolKind {
     use gd_syntax::SymbolKind::*;
     match kind {
         Class => LspSymbolKind::CLASS,
-        Function => LspSymbolKind::FUNCTION,
+        Function => LspSymbolKind::METHOD,
         Variable => LspSymbolKind::VARIABLE,
         Property => LspSymbolKind::PROPERTY,
         Constant => LspSymbolKind::CONSTANT,
@@ -5934,7 +5942,7 @@ pub fn prepare_call_hierarchy(
                         #[allow(deprecated)]
                         let item = CallHierarchyItem {
                             name,
-                            kind: LspSymbolKind::FUNCTION,
+                            kind: LspSymbolKind::METHOD,
                             tags: None,
                             detail: script_detail(state, &path),
                             uri: callee_uri,
@@ -5987,7 +5995,7 @@ pub fn prepare_call_hierarchy(
     #[allow(deprecated)]
     let item = CallHierarchyItem {
         name: fn_name,
-        kind: LspSymbolKind::FUNCTION,
+        kind: LspSymbolKind::METHOD,
         tags: None,
         detail,
         uri,
@@ -6249,7 +6257,7 @@ pub fn outgoing_calls(
         #[allow(deprecated)]
         let to = CallHierarchyItem {
             name: callee_name.clone(),
-            kind: LspSymbolKind::FUNCTION,
+            kind: LspSymbolKind::METHOD,
             tags: None,
             detail: to_detail,
             uri: to_uri,
@@ -6346,7 +6354,7 @@ pub fn incoming_calls(
             #[allow(deprecated)]
             let from = CallHierarchyItem {
                 name: caller_name.clone(),
-                kind: LspSymbolKind::FUNCTION,
+                kind: LspSymbolKind::METHOD,
                 tags: None,
                 detail: script_detail(state, &path),
                 uri: cand_uri.clone(),
@@ -6715,13 +6723,15 @@ pub fn workspace_symbol_resolve(
     Some(params)
 }
 
+/// The interface-index counterpart of [`symbol_kind`] — same mapping, same reasoning for
+/// `Func` => `METHOD` (#263).
 fn member_kind_to_lsp(k: gd_project::MemberKind) -> LspSymbolKind {
     use gd_project::MemberKind::*;
     match k {
         Const => LspSymbolKind::CONSTANT,
         Var => LspSymbolKind::VARIABLE,
         Property => LspSymbolKind::PROPERTY,
-        Func => LspSymbolKind::FUNCTION,
+        Func => LspSymbolKind::METHOD,
         Signal => LspSymbolKind::EVENT,
         Enum => LspSymbolKind::ENUM,
     }

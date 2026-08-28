@@ -170,6 +170,12 @@ fn document_symbol_projects_nested_outline_with_kinds() {
         "\n",
         "class Inner:\n",
         "\tvar x := 0\n",
+        "\n",
+        "\tfunc tick():\n",
+        "\t\tpass\n",
+        "\n",
+        "static func make():\n",
+        "\treturn null\n",
     );
     did_open(&client, &uri, src);
 
@@ -226,8 +232,13 @@ fn document_symbol_projects_nested_outline_with_kinds() {
             ("MAX", SymbolKind::CONSTANT),
             ("speed", SymbolKind::VARIABLE),
             ("health", SymbolKind::PROPERTY), // has a getter, so PROPERTY not VARIABLE
-            ("_ready", SymbolKind::FUNCTION),
+            // #263: METHOD, not FUNCTION — a `.gd` file is a class, so every `func` in it is a
+            // member of one, and completion already reports these as `CompletionItemKind::METHOD`.
+            ("_ready", SymbolKind::METHOD),
             ("Inner", SymbolKind::CLASS),
+            // A `static func` is still a METHOD — LSP has no static kind, and the distinction
+            // rides the `static` semantic-token modifier instead.
+            ("make", SymbolKind::METHOD),
         ]
     );
 
@@ -248,12 +259,20 @@ fn document_symbol_projects_nested_outline_with_kinds() {
         .iter()
         .all(|c| c.kind == SymbolKind::ENUM_MEMBER));
 
-    // The inner class nests its own member.
-    let inner = members.last().unwrap();
-    let inner_children = inner.children.as_deref().unwrap_or_default();
-    assert_eq!(inner_children.len(), 1);
-    assert_eq!(inner_children[0].name, "x");
-    assert_eq!(inner_children[0].kind, SymbolKind::VARIABLE);
+    // The inner class nests its own members — and its `func` is a METHOD there too (#263).
+    let inner = &members[6];
+    assert_eq!(inner.name, "Inner");
+    let inner_outline: Vec<(&str, SymbolKind)> = inner
+        .children
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|c| (c.name.as_str(), c.kind))
+        .collect();
+    assert_eq!(
+        inner_outline,
+        vec![("x", SymbolKind::VARIABLE), ("tick", SymbolKind::METHOD)]
+    );
 
     // `selection_range` is the identifier; `range` encloses it. `signal hit` → name at col 7 on the
     // line that follows the `@warning_ignore` annotation (line 3 of the source, 0-indexed).

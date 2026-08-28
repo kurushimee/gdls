@@ -97,6 +97,10 @@ fn prepare_fa(client: &Connection, project: &common::TempProject) -> CallHierarc
         .and_then(|v| v.into_iter().next())
         .expect("prepare must return fa's item");
     assert_eq!(item.name, "fa");
+    // #263: a call-hierarchy item for a GDScript `func` is a METHOD, matching documentSymbol and
+    // completion — one symbol must not draw two different glyphs depending on which surface
+    // produced it.
+    assert_eq!(item.kind, lsp_types::SymbolKind::METHOD);
     item
 }
 
