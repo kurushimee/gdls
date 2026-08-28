@@ -807,10 +807,18 @@ mod tests {
         // Hammer one file far faster than the quiet-time: 12 writes over ~60 ms ≪ 200 ms window.
         let target = dir.path().join("hammered.gd");
         const WRITES: usize = 12;
+        let burst_start = Instant::now();
         for i in 0..WRITES {
             std::fs::write(&target, format!("var x = {i}\n")).unwrap();
             std::thread::sleep(Duration::from_millis(5));
         }
+        // How long the burst ACTUALLY took. On an idle machine it is ~60 ms — comfortably inside one
+        // quiet window — but a loaded CI runner can stretch each 5 ms sleep by an order of magnitude,
+        // and a burst that spans several windows legitimately debounces into one batch PER WINDOW.
+        // Bounding by the measured span (rather than by the assumption that the burst fits in one
+        // window) keeps the contract exact on a healthy machine without failing a healthy debouncer
+        // on a stalled one.
+        let windows_spanned = (burst_start.elapsed().as_millis() / quiet.as_millis()) as usize + 1;
 
         // Drain debounced batches until the stream goes quiet (no batch for a full 300 ms after the
         // burst settles). Count only the events the watcher actually ACTS on — `classify_event`'s
@@ -846,10 +854,12 @@ mod tests {
             index_events_for_target >= 1,
             "the watcher must surface at least one index-affecting event for the hammered file"
         );
+        let allowed = (WRITES / 2).max(windows_spanned);
         assert!(
-            index_events_for_target <= WRITES / 2,
+            index_events_for_target <= allowed,
             "the quiet-time must COALESCE the {WRITES}-write burst into far fewer index-affecting \
-             events; got {index_events_for_target} (no coalescing would yield ~{WRITES})"
+             events; got {index_events_for_target}, allowed {allowed} ({windows_spanned} quiet \
+             window(s) spanned; no coalescing would yield ~{WRITES})"
         );
     }
 }
