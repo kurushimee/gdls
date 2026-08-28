@@ -272,6 +272,25 @@ binary. No release cut.
   `PlainText`, which also puts hover on the floor completion and signatureHelp already took, and
   an empty format list takes it too. Every captured editor profile asks for markdown explicitly,
   so nothing real is downgraded.
+- **A dependency edit now refreshes an open dependent** (#255): a file that named a project class
+  ONLY inside a function body — `var d := Dep.new()`, `Global.setting` — had no dependency edge,
+  because the eager-interface pass records `extends`, member annotations, parameter types and
+  `preload`s and nothing else. Editing `Dep` never invalidated it, so an open buffer kept
+  publishing diagnostics computed against the old `Dep` for the rest of the session. The interface
+  now also carries the identifiers a file references anywhere; `recompute_edges` resolves them
+  through the `class_name` registry, so only real project classes become edges and everything else
+  is dropped. They stay out of the `references`/`rename` candidate index on purpose — filling that
+  with every local's name would turn a cursor on an unresolvable identifier into a project-wide
+  analysis. Costs about 1.2 KB of interface per file (8% of the warm-start cache on a 249-file
+  project), and the cache format goes to v9 so a v8 cache is rebuilt rather than warm-loaded
+  without the new edges.
+- **`workspace/diagnostic/refresh` is now sent** (#255): gdls advertises
+  `diagnosticProvider.interFileDependencies: true` — editing one file can change another's
+  diagnostics — but never signalled it, and a pull-diagnostics client only re-pulls what it is
+  editing, so its cached report for every dependent stayed stale. One refresh per reindex batch,
+  gated on `workspace.diagnostics.refreshSupport`, and only when the batch reached past the file
+  the client just edited: a plain body-only edit must not trigger a project-wide re-pull on every
+  keystroke.
 - **`func` reports `SymbolKind.Method`** (#263): a `.gd` file is a class, so every `func` in it —
   top-level, inner-class, or `static` — is a member of one, and GDScript has no free functions for
   `Function` to mean. `documentSymbol` (both shapes), `workspace/symbol` and call-hierarchy items

@@ -194,6 +194,26 @@ pub struct Interface {
     /// but must not look like an interface change to this file's own consumers. Populated only on
     /// the head interface (the `DepGraph` is per-file, so inner-class preloads roll up to it).
     pub preload_deps: Vec<String>,
+    /// #255: every identifier this file *references* anywhere — function bodies included — with
+    /// attribute segments (`d.Dep`) and Lua-style dictionary keys (`{ Dep = 1 }`) excluded, since
+    /// neither names a symbol in scope (the same two exclusions the rename firewall applies,
+    /// #181). Sorted and deduped.
+    ///
+    /// The `Interface` is otherwise the eager-shallow record of what a file *exposes*, and
+    /// [`referenced_names`](crate::index) reads only that: `extends`, member annotations, parameter
+    /// types. So a class used ONLY inside a body — `var d := Dep.new()` — produced no `DepGraph`
+    /// edge, and editing `Dep` never invalidated the file that uses it. That is a real dependency
+    /// (its call sites type-check against `Dep`'s members), so `Index::recompute_edges` resolves
+    /// these through the `class_name` registry and adds the surviving ones as edges. Everything
+    /// that does not name a project class is dropped there, so the over-capture costs nothing
+    /// downstream.
+    ///
+    /// **Excluded from [`Interface::signature_hash`]** for the same reason as [`Self::preload_deps`]:
+    /// this is *what this file depends on*, not *what it exposes*. It is deliberately NOT fed into
+    /// the `name_referencers` index either — that set is the `references`/`rename` candidate
+    /// fast-path, and filling it with every local's name would turn a cursor on an unresolvable
+    /// identifier into a project-wide analysis.
+    pub body_refs: Vec<String>,
 }
 
 impl Interface {
@@ -254,7 +274,51 @@ pub fn extract(tree: &ParseTree) -> Interface {
     // initializers the WP-R2 cycle reaches through — additive edges, so over-capturing a
     // body-level preload only ever invalidates a consumer slightly more eagerly, never less).
     head.preload_deps = collect_preload_deps(tree);
+    // #255: the body-level reference scan, likewise on the head interface only (the `DepGraph` is
+    // per-file, so an inner class's references roll up).
+    head.body_refs = collect_body_refs(tree);
     head
+}
+
+/// #255: every identifier name the file references, minus the two positions that only *look* like
+/// references — the trailing ident of an attribute chain (`obj.x`, a member of some other type) and
+/// a Lua-style dictionary key (`{ x = v }`, folded to a string literal). Those are exactly the
+/// exclusions `ParseTree::ident_is_non_local_position` applies for rename/highlight (#181); this
+/// runs them as two linear arena passes instead of that helper's per-candidate pass, because
+/// extraction visits every identifier, not a handful.
+///
+/// Declaration identifiers (a `var`/`func`/parameter's own name) and local uses are kept: telling
+/// them apart from a class reference needs scope resolution, which is the analyzer's job, not the
+/// shallow pass's. `Index::recompute_edges` filters the result through the `class_name` registry,
+/// so a name that isn't a project class is discarded without ever reaching an edge.
+fn collect_body_refs(tree: &ParseTree) -> Vec<String> {
+    use gd_syntax::ast::{DictStyle, SubscriptAccess};
+    let mut excluded: rustc_hash::FxHashSet<NodeId> = rustc_hash::FxHashSet::default();
+    for id in tree.iter_ids() {
+        match &tree.get(id).kind {
+            NodeKind::Subscript(s) => {
+                if let Some(SubscriptAccess::Attribute(Some(aid))) = s.access {
+                    excluded.insert(aid);
+                }
+            }
+            // `style == None` is the single-element ambiguous case, parsed Lua-style.
+            NodeKind::Dictionary(d) if matches!(d.style, Some(DictStyle::LuaTable) | None) => {
+                excluded.extend(d.elements.iter().filter_map(|kv| kv.key));
+            }
+            _ => {}
+        }
+    }
+    let mut names: Vec<String> = tree
+        .iter_ids()
+        .filter(|id| !excluded.contains(id))
+        .filter_map(|id| match &tree.get(id).kind {
+            NodeKind::Identifier(i) => Some(i.name.clone()),
+            _ => None,
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// WP-RD12: every `res://` path the file `preload(...)`s (a dedicated `PreloadNode`) or
@@ -345,6 +409,8 @@ fn extract_class(
         // WP-RD12: populated only on the head interface by `extract` (the DepGraph is per-file);
         // inner classes' preloads roll up there.
         preload_deps: Vec::new(),
+        // #255: likewise head-interface-only, populated by `extract`.
+        body_refs: Vec::new(),
     }
 }
 
