@@ -1535,10 +1535,7 @@ fn format_member_params(decl: &gd_project::MemberDecl) -> String {
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let type_str = match p {
-                gd_project::TypeExpr::Named { path, .. } => path.join("."),
-                gd_project::TypeExpr::None => "Variant".to_string(),
-            };
+            let type_str = p.render().unwrap_or_else(|| "Variant".to_owned());
             let name_str = decl.param_names.get(i).map(String::as_str).unwrap_or("");
             if name_str.is_empty() {
                 type_str
@@ -1553,15 +1550,12 @@ fn format_member_params(decl: &gd_project::MemberDecl) -> String {
 /// Format a `Func` member as `func name(param_name: ParamType, …) -> ReturnType`.
 fn format_func_signature(fn_name: &str, decl: &gd_project::MemberDecl) -> String {
     let params_str = format_member_params(decl);
-    let ret_str = match &decl.ty {
-        gd_project::TypeExpr::Named { path, .. } => path.join("."),
-        // `interface::type_expr` collapses BOTH an explicit `-> void` (empty type node) and an
-        // absent return annotation to `TypeExpr::None`, so they're indistinguishable here. Render
-        // `void`: explicit-void functions vastly outnumber truly-untyped ones in typed GDScript, so
-        // this is correct far more often than `Variant` would be. (A precise split would need
-        // interface extraction to carry "explicit void" vs "no annotation" — out of scope.)
-        gd_project::TypeExpr::None => "void".to_string(),
-    };
+    // `interface::type_expr` collapses BOTH an explicit `-> void` (empty type node) and an absent
+    // return annotation to `TypeExpr::None`, so they're indistinguishable here. Render `void`:
+    // explicit-void functions vastly outnumber truly-untyped ones in typed GDScript, so this is
+    // correct far more often than `Variant` would be. (A precise split would need interface
+    // extraction to carry "explicit void" vs "no annotation" — out of scope.)
+    let ret_str = decl.ty.render().unwrap_or_else(|| "void".to_owned());
     format!("func {fn_name}({params_str}) -> {ret_str}")
 }
 
@@ -1786,18 +1780,14 @@ fn format_member_signature(name: &str, decl: &gd_project::MemberDecl) -> Option<
             } else {
                 "var"
             };
-            match &decl.ty {
-                gd_project::TypeExpr::Named { path, .. } => {
-                    format!("{keyword} {name}: {}", path.join("."))
-                }
-                gd_project::TypeExpr::None => format!("{keyword} {name}"),
+            match decl.ty.render() {
+                Some(ty) => format!("{keyword} {name}: {ty}"),
+                None => format!("{keyword} {name}"),
             }
         }
-        gd_project::MemberKind::Const => match &decl.ty {
-            gd_project::TypeExpr::Named { path, .. } => {
-                format!("const {name}: {}", path.join("."))
-            }
-            gd_project::TypeExpr::None => format!("const {name}"),
+        gd_project::MemberKind::Const => match decl.ty.render() {
+            Some(ty) => format!("const {name}: {ty}"),
+            None => format!("const {name}"),
         },
         // Named enums keep the analyzer's enum-meta type label (no signature to render).
         gd_project::MemberKind::Enum => return None,

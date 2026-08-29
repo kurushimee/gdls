@@ -63,6 +63,33 @@ impl TypeExpr {
             TypeExpr::Named { path, .. } => path.first().map(String::as_str),
         }
     }
+
+    /// The type as written: `Array`, `Array[Entry]`, `Dictionary[String, int]`, `Outer.Inner`.
+    /// `None` for [`TypeExpr::None`], so a caller can pick its own word for "no annotation"
+    /// (`void` at a return position, nothing at a declaration).
+    ///
+    /// #307: every consumer used to render `path.join(".")`, which silently dropped `args` — so a
+    /// declaration hovered as `var entries: Array` while a USE of the same variable hovered as
+    /// `Array[Entry]`, and `documentSymbol` showed the lossy one. There is one renderer now,
+    /// because the element type is exactly the part a reader needs and the part that was easiest
+    /// to lose one call site at a time.
+    #[must_use]
+    pub fn render(&self) -> Option<String> {
+        let TypeExpr::Named { path, args } = self else {
+            return None;
+        };
+        let base = path.join(".");
+        if args.is_empty() {
+            return Some(base);
+        }
+        // An arg with no annotation of its own can only come from a malformed `Array[]`; render it
+        // as `Variant`, the type Godot gives an unannotated element.
+        let rendered: Vec<String> = args
+            .iter()
+            .map(|a| a.render().unwrap_or_else(|| "Variant".to_owned()))
+            .collect();
+        Some(format!("{base}[{}]", rendered.join(", ")))
+    }
 }
 
 /// Declaration flags that are part of a member's *interface* (they change how callers may use it).

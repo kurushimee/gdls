@@ -379,11 +379,52 @@ fn attribute_items(
         return builtin_static_items(state, dt, render);
     }
     let members = enumerate_members(state, tree, dt);
+    // #306: `MyClass.<cursor>` is the CLASS, not an instance of it. Godot's
+    // `COMPLETION_TYPE_ATTRIBUTE` on a script meta type offers the type-scoped surface only, so
+    // the instance set here was both wrong (`Inventory.add_item` cannot be called) and missing the
+    // one thing anyone actually types after a class name.
+    let members = if dt.is_meta_type && matches!(dt.kind, DtKind::Script | DtKind::Class) {
+        script_meta_items(members)
+    } else {
+        members
+    };
     members
         .into_iter()
         .enumerate()
         .map(|(rank, m)| member_item(&m, rank, render))
         .collect()
+}
+
+/// The completion surface of a script META type (`MyClass.<cursor>`) — the constructor plus
+/// everything reachable without an instance, in the order a user wants them: `new` first, then the
+/// type-scoped names, then the statics.
+///
+/// A GDScript class object exposes `new()`, its `const`s, `enum`s (and their values), its inner
+/// classes, and its `static func`s / `static var`s, all inherited down the `extends` chain. Plain
+/// `var`s and instance methods need an instance and are dropped — offering `Inventory.add_item`
+/// is the same "never lie" breach as offering `Color.lerp` as a static, which the builtin arm
+/// right above has always refused. #306.
+fn script_meta_items(members: Vec<MemberItem>) -> Vec<MemberItem> {
+    // `new` is not an interface member — it is the class object's constructor, synthesized here the
+    // way Godot's editor offers it. Skipped when the chain already declares a `new` of its own, so
+    // the user's entry (with its detail and doc) wins over the synthetic one.
+    let declares_new = members.iter().any(|m| m.name == "new");
+    let mut out: Vec<MemberItem> = Vec::new();
+    if !declares_new {
+        out.push(MemberItem::constructor());
+    }
+    out.extend(members.into_iter().filter(|m| match m.kind {
+        // Type-scoped: reachable through the class object, no instance needed.
+        MemberItemKind::Constant
+        | MemberItemKind::Enum
+        | MemberItemKind::EnumValue
+        | MemberItemKind::Class => true,
+        // Only the static half of the callable/value surface.
+        MemberItemKind::Method | MemberItemKind::Property => m.is_static,
+        // A signal is emitted and connected on an instance.
+        MemberItemKind::Signal => false,
+    }));
+    out
 }
 
 /// Enumerate the members of a resolved type through the project-backed cross-file query.
@@ -679,7 +720,30 @@ fn identifier_items(
             &mut rank,
         );
     }
-    // (4) Native engine class names (`Node`, `Timer`, …) — carry-forward (a), M8 Phase 4. Godot's
+    // (4) Builtin Variant type names (`Vector2`, `Color`, `String`, …) — Godot's
+    // `_find_built_in_variants`, called from `_find_identifiers` itself
+    // (`gdscript_editor.cpp:1618`), so they belong in EXPRESSION position and not only in a type
+    // annotation. Without them `var v := Vec` + invoke-completion offered nothing at all (#308).
+    // `Nil` is excluded, exactly as the upstream loop skips `Variant::Type::NIL`.
+    for builtin in state.workspace.native.builtin_names() {
+        if builtin == "Nil" {
+            continue;
+        }
+        let builtin = builtin.to_string();
+        push(
+            &builtin,
+            CompletionItemKind::CLASS,
+            false,
+            CompletionData::NativeClass {
+                class: builtin.clone(),
+            },
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+
+    // (5) Native engine class names (`Node`, `Timer`, …) — carry-forward (a), M8 Phase 4. Godot's
     // `get_global_map()` includes the native class set in the bare-identifier completion. Lowest
     // priority (after locals, members, and the project registry), via the name-sorted
     // `native_db::class_names()` iterator added in this phase.
@@ -692,6 +756,38 @@ fn identifier_items(
             CompletionData::NativeClass {
                 class: class.clone(),
             },
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+
+    // (6) Godot's fixed keyword tier, verbatim and in its own order — the last thing
+    // `_find_identifiers` appends (`gdscript_editor.cpp:1620-1631`). `PI`/`TAU`/`INF`/`NAN` are
+    // constants and `self`/`super` are neither constants nor keywords, but upstream emits all
+    // fourteen through one `CODE_COMPLETION_KIND_KEYWORD` list, so the port mirrors that rather
+    // than reclassifying them. #318.
+    for kw in [
+        "true",
+        "false",
+        "PI",
+        "TAU",
+        "INF",
+        "NAN",
+        "null",
+        "self",
+        "super",
+        "break",
+        "breakpoint",
+        "continue",
+        "pass",
+        "return",
+    ] {
+        push(
+            kw,
+            CompletionItemKind::KEYWORD,
+            false,
+            CompletionData::Keyword,
             &mut items,
             &mut seen,
             &mut rank,

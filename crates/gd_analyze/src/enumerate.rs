@@ -88,8 +88,9 @@ pub struct MemberItem {
     pub owner: MemberOwner,
     /// A native `static` method (or a builtin static like `Color.from_hsv`). Lets the
     /// `BuiltinTypeStatic` (`Color.`) render keep only statics, and the instance-member render
-    /// drop them — Godot's `Variant::is_builtin_method_static` gate. `false` for every script
-    /// member (GDScript statics aren't distinguished at enumeration here).
+    /// drop them — Godot's `Variant::is_builtin_method_static` gate. A script member carries its
+    /// `MemberFlags::is_static` from the declaring interface, which is what makes the meta-type
+    /// (`MyClass.`) completion set separable from the instance one (#306).
     pub is_static: bool,
     /// A native `virtual` method (`_ready`, `_process`, …) — the overridable set
     /// `OverrideMethod` completion offers from the native tail (Godot's
@@ -116,6 +117,29 @@ impl MemberItem {
     fn with_owner(mut self, owner: MemberOwner) -> Self {
         self.owner = owner;
         self
+    }
+
+    /// Set the `static` flag (builder style), for the arms that know it. #306: the meta-type
+    /// completion set is exactly the static/const surface, so a script `static func` / `static var`
+    /// has to be distinguishable from an instance one.
+    fn with_static(mut self, is_static: bool) -> Self {
+        self.is_static = is_static;
+        self
+    }
+
+    /// The synthetic `new()` entry of a script class object — not an interface member, but what
+    /// Godot's editor offers first after a class name. [`MemberOwner::Unknown`] because no file
+    /// declares it, so `completionItem/resolve` has nothing to re-fetch and leaves it as is. #306.
+    #[must_use]
+    pub fn constructor() -> Self {
+        MemberItem {
+            name: "new".to_owned(),
+            kind: MemberItemKind::Method,
+            detail: Some("new() -> Object".to_owned()),
+            owner: MemberOwner::Unknown,
+            is_static: true,
+            is_virtual: false,
+        }
     }
 }
 
@@ -358,7 +382,8 @@ fn collect_interface_members(
         };
         out.push(
             MemberItem::new(m.name.clone(), kind, interface_member_detail(m))
-                .with_owner(owner.clone()),
+                .with_owner(owner.clone())
+                .with_static(m.flags.is_static),
         );
     }
     // Named-enum value identifiers (`E.A`) — reachable as bare members through the enum, but
@@ -389,10 +414,7 @@ fn collect_interface_members(
 /// A short detail string for an interface member, from its written type annotation (no lattice
 /// re-resolution — Phase 1 enumerates). `None` when untyped.
 fn interface_member_detail(m: &gd_project::MemberDecl) -> Option<String> {
-    match &m.ty {
-        gd_project::TypeExpr::Named { path, .. } => Some(path.join(".")),
-        gd_project::TypeExpr::None => None,
-    }
+    m.ty.render()
 }
 
 /// Every member reachable from a script/class `start` through its `extends` chain, as owned
