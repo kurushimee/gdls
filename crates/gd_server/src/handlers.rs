@@ -666,11 +666,19 @@ pub fn definition(
     // identifier span with the DECLARING file whenever the cross-file member walk
     // (`lookup_script_chain_member`) resolved it — attribute sites (`obj.sig`, `obj.method`) and
     // bare inherited members alike. Projecting the binding inherits the analyzer's resolution by
-    // construction (the same "never lie" shape as the autoload gate below). Class-kind bindings
-    // are excluded — class_name/autoload jumps belong to steps (2)/(D) and their own gates.
+    // construction (the same "never lie" shape as the autoload gate below).
+    //
+    // Class-kind bindings are excluded, because a `class_name` / autoload jump belongs to steps
+    // (2)/(D) and their own gates — with one carve-out (#301). `record_member_use` also stamps
+    // `Class` on an INNER class reached through its owner (`Inventory.Entry`), and that is a
+    // member walk, not a `class_name` resolution: step (2)'s name-only registry lookup cannot
+    // answer it, so excluding it wholesale returned no result at all. The two are told apart
+    // structurally rather than by name — the binding's target must actually BE an inner class of
+    // the declaring interface — so a bare use of a `class_name` never enters here.
     {
         let node_span = parsed.tree.get(node_id).span;
         let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+        let index = &state.workspace.index;
         let target = analyzed.as_deref().and_then(|a| {
             a.bindings().iter().find_map(|b| match b {
                 Binding::Use {
@@ -679,11 +687,14 @@ pub fn definition(
                     target_class_path,
                     target_kind,
                     target_name,
-                } if *site == node_span
-                    && *target_kind != BindingTargetKind::Class
-                    && target_name == &name =>
-                {
-                    Some((*f, target_class_path.clone()))
+                } if *site == node_span && target_name == &name => {
+                    let admit = *target_kind != BindingTargetKind::Class
+                        || iface_at_inner(index, *f, target_class_path).is_some_and(|i| {
+                            i.inner
+                                .iter()
+                                .any(|c| c.class_name.as_deref() == Some(name.as_str()))
+                        });
+                    admit.then(|| (*f, target_class_path.clone()))
                 }
                 _ => None,
             })
@@ -699,11 +710,14 @@ pub fn definition(
         }
     }
 
-    // (1.55) In-file named enum VALUE use (`Direction.NORTH`) → its declaration token (#106). The
-    // `EnumValueLocal` binding at the cursor span carries the QUALIFIED `<EnumName>.<value>`; the
-    // value is declared in THIS file (the binding records only in-file enums), so locate the
-    // declaration ident in `EnumNode.values`. Coherent with `references`/`rename` resolving the same
-    // value by identity. Runs before the call-callee block (an enum value is not a call).
+    // (1.55) Named enum VALUE use (`Direction.NORTH`) → its declaration token (#106). The
+    // `EnumValueLocal` binding at the cursor span carries the QUALIFIED `<EnumName>.<value>` plus
+    // the file that DECLARES the enum, so locate the declaration ident in that file's
+    // `EnumNode.values`. The declaring file is not always this one: a cross-file
+    // `Inventory.Slot.TRINKET` records `inventory.gd` (#158's composite identity, and #301 — this
+    // step used to search the CURRENT file's tree unconditionally, so every cross-file enum value
+    // returned no result). Coherent with `references`/`rename` resolving the same value by
+    // identity. Runs before the call-callee block (an enum value is not a call).
     {
         let node_span = parsed.tree.get(node_id).span;
         let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
@@ -713,25 +727,22 @@ pub fn definition(
             a.bindings().iter().find_map(|b| match b {
                 Binding::Use {
                     target_kind: BindingTargetKind::EnumValueLocal,
+                    target_file: Some(f),
                     target_class_path,
                     target_name,
                     site,
-                    ..
-                } if *site == node_span => Some((target_name.clone(), target_class_path.clone())),
+                } if *site == node_span => {
+                    Some((*f, target_name.clone(), target_class_path.clone()))
+                }
                 _ => None,
             })
         });
-        if let Some((qualified, class_path)) = binding {
+        if let Some((decl_file, qualified, class_path)) = binding {
             if let Some((enum_name, value_name)) = qualified.split_once('.') {
-                if let Some(decl_ident) =
-                    find_enum_value_decl_ident(&parsed.tree, enum_name, value_name, &class_path)
+                if let Some(loc) =
+                    enum_value_decl_location(state, decl_file, &class_path, enum_name, value_name)
                 {
-                    let doc = state.vfs.get(uri.as_str())?;
-                    let mapper = PositionMapper::new(&doc.rope, state.encoding);
-                    return Some(GotoDefinitionResponse::Scalar(Location {
-                        uri: uri.clone(),
-                        range: mapper.span_to_range(parsed.tree.get(decl_ident).span),
-                    }));
+                    return Some(GotoDefinitionResponse::Scalar(loc));
                 }
             }
         }
@@ -2528,6 +2539,108 @@ fn name_is_in_file_type(tree: &ParseTree, byte: usize, name: &str) -> bool {
     }) || name_is_in_file_root_type(tree, name)
 }
 
+/// The inner-class chain of the class that DECLARES the in-file type `name` visible at `byte` —
+/// empty for a member of the file's root class, `["Inner"]` for a member of `class Inner`. `None`
+/// when no class in scope declares it as an `enum` or inner `class`.
+///
+/// Companion to [`name_is_in_file_type`], which answers the same question as a bool. This one
+/// returns the chain because that is what identifies the symbol across files: a cross-file
+/// `Owner.Inner.Thing` records a `Binding::Use` whose `target_class_path` is exactly this chain
+/// (`record_member_use` stamps the OWNING link's `inner`), so the two compare directly. #298.
+///
+/// Only `enum` and inner `class` members qualify. `name_is_in_file_type` also admits a `const`
+/// used in type position, but a const's cross-file uses record `Constant`-kind bindings, which the
+/// type collector does not read — so it stays on the in-file scan, unchanged.
+fn in_file_type_decl_class_path(tree: &ParseTree, byte: usize, name: &str) -> Option<Vec<String>> {
+    fn declares(tree: &ParseTree, members: &[Member], name: &str) -> bool {
+        members.iter().any(|m| match m {
+            Member::Enum(id) => {
+                matches!(&tree.get(*id).kind, NodeKind::Enum(en) if en.identifier.map(|i| ident_name(tree, i)) == Some(name))
+            }
+            Member::Class(id) => {
+                matches!(&tree.get(*id).kind, NodeKind::Class(c) if c.identifier.map(|i| ident_name(tree, i)) == Some(name))
+            }
+            _ => false,
+        })
+    }
+    fn walk(
+        tree: &ParseTree,
+        class_id: NodeId,
+        path: &mut Vec<String>,
+        byte: usize,
+        name: &str,
+        best: &mut Option<Vec<String>>,
+    ) {
+        let NodeKind::Class(class) = &tree.get(class_id).kind else {
+            return;
+        };
+        // Innermost enclosing declarer wins, so record before descending and let a deeper match
+        // overwrite — the same shadowing order `name_is_in_file_type` implies.
+        if declares(tree, &class.members, name) {
+            *best = Some(path.clone());
+        }
+        for m in &class.members {
+            let Member::Class(inner_id) = m else { continue };
+            let node = tree.get(*inner_id);
+            if !(node.span.start <= byte && byte < node.span.end) {
+                continue;
+            }
+            let NodeKind::Class(ic) = &node.kind else {
+                continue;
+            };
+            let Some(seg) = ic.identifier.map(|i| ident_name(tree, i).to_owned()) else {
+                continue;
+            };
+            path.push(seg);
+            walk(tree, *inner_id, path, byte, name, best);
+            path.pop();
+        }
+    }
+    let root = tree.root_id()?;
+    let mut best = None;
+    walk(tree, root, &mut Vec::new(), byte, name, &mut best);
+    best
+}
+
+/// Append a [`Location`] for every cross-file use of the in-file type `name` declared by
+/// `(class_file, class_path)` — occurrence-positive, by binding identity only.
+///
+/// An `enum` or inner `class` has no cross-file BARE reference, which is why the raw name scan is
+/// wrong here, but it very much has qualified ones: `Owner.Thing`, `PreloadConst.Thing`,
+/// `: Owner.Thing`, `Owner.Thing.new()`. Each records a `Binding::Use` whose `target_file` /
+/// `target_class_path` / `target_name` name the declaration exactly, so widening the candidate set
+/// cannot widen what is collected inside one. #298.
+fn push_in_file_type_locations(
+    out: &mut Vec<Location>,
+    result: &AnalysisResult,
+    class_file: gd_project::FileId,
+    class_path: &[String],
+    name: &str,
+    uri: &Uri,
+    mapper: &PositionMapper,
+) {
+    for binding in result.bindings() {
+        if let Binding::Use {
+            target_kind: BindingTargetKind::Class | BindingTargetKind::Enum,
+            target_file: Some(tf),
+            target_class_path,
+            target_name,
+            site,
+        } = binding
+        {
+            if *tf == class_file
+                && target_class_path.as_slice() == class_path
+                && target_name == name
+            {
+                out.push(Location {
+                    uri: uri.clone(),
+                    range: mapper.span_to_range(*site),
+                });
+            }
+        }
+    }
+}
+
 /// `true` iff `node_id` is the DECLARATION identifier of a member of ANY class in this file — the
 /// root class or any inner class, at any nesting depth. [`node_is_root_member`] sees the root
 /// class's members only, so an inner class's `enum Bar` declaration token had no project anchor and
@@ -2622,11 +2735,25 @@ fn member_decl_location(
     inner: &[String],
     name: &str,
 ) -> Option<Location> {
-    let (name_span, decl_span) = iface_at_inner(&state.workspace.index, fid, inner)?
+    let owner = iface_at_inner(&state.workspace.index, fid, inner)?;
+    // #301: an INNER CLASS is not a `members` entry — `extract_class` routes `Member::Class` into
+    // `Interface::inner` instead, and only its own `class_name_loc` records where the name sits.
+    // A named `enum` does leave a `members` marker, which is why `Owner.SomeEnum` jumped correctly
+    // while `Owner.SomeInnerClass` returned no result at all. Both spans below are the identifier,
+    // so the fall-through re-parse and the whole-declaration fallback apply unchanged.
+    let (name_span, decl_span) = owner
         .members
         .iter()
         .find(|m| m.name == name)
-        .map(|m| (m.name_span, m.span))?;
+        .map(|m| (m.name_span, m.span))
+        .or_else(|| {
+            owner
+                .inner
+                .iter()
+                .find(|c| c.class_name.as_deref() == Some(name))
+                .and_then(|c| c.class_name_loc)
+                .map(|(_, span)| (span, span))
+        })?;
     let path = state.workspace.index.path(fid)?.to_path_buf();
     let uri = path_to_file_uri(&path)?;
     let uri_str = uri.as_str().to_owned();
@@ -2659,6 +2786,42 @@ fn member_decl_location(
     Some(Location {
         uri,
         range: mapper.span_to_range(decl_span),
+    })
+}
+
+/// The declaration token of one value of a NAMED enum, in the file that declares it (#301).
+/// `class_path` is the declaring class's inner-class chain, so a root `enum A { X }` and an
+/// `Inner.enum A { X }` of one file stay distinct. Reads the live buffer when the declaring file
+/// is open, so an edited-but-unsaved declaration still anchors correctly.
+fn enum_value_decl_location(
+    state: &mut ServerState,
+    fid: gd_project::FileId,
+    class_path: &[String],
+    enum_name: &str,
+    value_name: &str,
+) -> Option<Location> {
+    let path = state.workspace.index.path(fid)?.to_path_buf();
+    let uri = path_to_file_uri(&path)?;
+    let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+        Some(t) => t,
+        None => match std::fs::read_to_string(path.as_std_path()) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!(
+                    "could not read {path} for enum-value definition of \
+                     `{enum_name}.{value_name}`: {e}; jump degrades to no-result"
+                );
+                return None;
+            }
+        },
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(&uri), &text);
+    let decl_ident = find_enum_value_decl_ident(&parsed.tree, enum_name, value_name, class_path)?;
+    let rope = ropey::Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    Some(Location {
+        uri,
+        range: mapper.span_to_range(parsed.tree.get(decl_ident).span),
     })
 }
 
@@ -3311,7 +3474,9 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     //     same-named local/param/member in a consumer is never rewritten. #163.
     //   - `RawFloor`: a genuinely unresolvable name — the documented over-approximate residue.
     let unresolved_kind = if name_is_in_file_type(&parsed.tree, byte, &name) {
-        UnresolvedKind::InFileType
+        UnresolvedKind::InFileType(
+            in_file_type_decl_class_path(&parsed.tree, byte, &name).unwrap_or_default(),
+        )
     } else if cursor_refers_global_class {
         // `cursor_refers_global_class` already returned `false` when `global_class_file` is `None`
         // (it short-circuits on a missing registry entry), so the `Some` arm is the live path; the
@@ -3529,7 +3694,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                             &mapper,
                         );
                     }
-                    UnresolvedKind::InFileType | UnresolvedKind::RawFloor => {
+                    UnresolvedKind::InFileType(_) | UnresolvedKind::RawFloor => {
                         // Residue floor: the binding scan plus the raw identifier scan, which picks
                         // up `extends Foo`, type annotations, `class_name`, and other parser-level
                         // refs the reducer doesn't record. The dedup pass collapses overlap. An
@@ -3550,7 +3715,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                         // class-scope members in both positions. The raw name scan cannot tell them
                         // apart, so subtract them by identity: renaming the in-file `enum Foo` must
                         // never rewrite this file's `extends Foo` into a name nothing declares.
-                        if matches!(unresolved_kind, UnresolvedKind::InFileType)
+                        if matches!(unresolved_kind, UnresolvedKind::InFileType(_))
                             && global_class_file(state, &name).is_some()
                         {
                             let mut global_owned = Vec::new();
@@ -3619,14 +3784,24 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             NonMethodTarget::EnumValue { .. } => {
                 method_scan_candidate_uris(state, &name, current_fid, "references")
             }
-            // An in-file root type (`enum`/inner-class) used in a type position has NO cross-file
-            // bare-name reference — like a local/enum-value, it fans out EMPTY rather than riding the
-            // raw cross-file candidate scan (which would collect a same-named global `class_name`'s
-            // `: FOO`/`extends FOO` consumers). #162.
+            // An in-file type (`enum`/inner-class) used in a type position has no cross-file
+            // BARE-name reference, so it must never ride the raw cross-file candidate scan — that
+            // would collect a same-named global `class_name`'s `: FOO`/`extends FOO` consumers
+            // (#162). It does have cross-file QUALIFIED references, though: `Inventory.Entry`,
+            // `InvScript.Slot`, `: Inventory.Entry`, `Inventory.Entry.new()`. Fanning out EMPTY
+            // abandoned every one of them, and since `rename` collects through here, renaming an
+            // inner class or a named enum rewrote only the declaring file and left every caller
+            // pointing at a symbol that no longer exists (#298).
+            //
+            // Same shape as the `GlobalClass` arm below: the project-wide textual prefilter picks
+            // candidates, and the per-candidate collection is occurrence-POSITIVE
+            // ([`push_in_file_type_locations`] — Class/Enum use bindings keyed by
+            // `(target_file, target_class_path, target_name)`), so widening the candidate set
+            // cannot widen what is collected inside one.
             NonMethodTarget::Unresolved
-                if matches!(unresolved_kind, UnresolvedKind::InFileType) =>
+                if matches!(unresolved_kind, UnresolvedKind::InFileType(_)) =>
             {
-                Vec::new()
+                method_scan_candidate_uris(state, &name, current_fid, "references")
             }
             // A project `class_name` reaches into consumers' function BODIES (`var h: Hero = Hero.new()`,
             // `o as Hero`, `Hero.CONST`), and the shallow interface pass records only the `extends` head
@@ -3802,8 +3977,22 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                             &cand_mapper,
                         );
                     }
-                    // InFileType never reaches here (its candidate set is empty), but stay exhaustive.
-                    UnresolvedKind::InFileType => {}
+                    UnresolvedKind::InFileType(ref class_path) => {
+                        // Only qualified uses that BIND to this declaration, never a same-spelled
+                        // token: a consumer's own local, member, or unrelated `class_name` named
+                        // `Entry` records no binding pointing at this file and is excluded.
+                        if let Some(decl_file) = current_fid {
+                            push_in_file_type_locations(
+                                &mut locations,
+                                &cand_result,
+                                decl_file,
+                                class_path,
+                                &name,
+                                &cand_uri,
+                                &cand_mapper,
+                            );
+                        }
+                    }
                     UnresolvedKind::RawFloor => {
                         // Residue floor: identifier scan picks up `extends Foo` and other
                         // parser-level refs the reducer doesn't record. De-dupes happen below.
@@ -4087,7 +4276,8 @@ fn collect_in_file_highlight_sites(
     //     occurrence-positive [`push_global_class_locations`] instead of the raw floor.
     //   - `RawFloor`: a genuinely unresolvable name — the over-approximate raw-identifier residue.
     let unresolved_kind = if name_is_in_file_type(&parsed.tree, byte, name) {
-        UnresolvedKind::InFileType
+        // In-file scan only, so the declaring chain is never read here.
+        UnresolvedKind::InFileType(Vec::new())
     } else if cursor_references_global_class(state, uri, &parsed.tree, key, text, byte, name) {
         // `cursor_references_global_class` returns `false` when `global_class_file` is `None` (it
         // short-circuits on a missing registry entry), so the `Some` arm is the live path; the `None`
@@ -4265,7 +4455,7 @@ fn collect_in_file_highlight_sites(
                             mapper,
                         );
                     }
-                    UnresolvedKind::InFileType | UnresolvedKind::RawFloor => {
+                    UnresolvedKind::InFileType(_) | UnresolvedKind::RawFloor => {
                         // Residue floor: the binding scan plus the raw identifier scan, which picks up
                         // `extends Foo`, type annotations, `class_name`, and other parser-level refs
                         // the reducer doesn't record. The caller's dedup collapses overlap.
@@ -4679,11 +4869,14 @@ fn selection_chain_at(
 /// the two structured type/class sub-cases off the raw `push_identifier_locations` floor so a
 /// mutating rename never over-collects a same-spelled token. See the computation site for the
 /// precedence rationale (#162/#163).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum UnresolvedKind {
-    /// An in-file root `enum`/inner-`class` used in TYPE position — no cross-file bare reference, so
-    /// it fans out EMPTY cross-file and keeps only the in-file raw scan. #162.
-    InFileType,
+    /// An in-file `enum`/inner-`class` used in TYPE position. It has no cross-file BARE reference,
+    /// so the raw name scan stays in-file (#162) — but its QUALIFIED cross-file uses
+    /// (`Owner.Thing`, `PreloadConst.Thing`) are real, and are collected by binding identity
+    /// through [`push_in_file_type_locations`]. The payload is the declaring class's inner-class
+    /// chain, which is what those bindings key on. #298.
+    InFileType(Vec<String>),
     /// The cursor positively refers (by identity) to the project `class_name` declared in this file —
     /// collected via the occurrence-positive [`push_global_class_locations`]. #163.
     GlobalClass(gd_project::FileId),
@@ -7324,6 +7517,39 @@ fn rename_target_has_project_anchor(
             } if *site == node_span && Some(*f) == global_class_file(state, name)
         )
     });
+    // (c) An INNER CLASS or a NAMED ENUM reached through its owner — `Inventory.Entry`,
+    //     `InvScript.Slot`, `: Inventory.Entry`. The analyzer recorded a `Class`/`Enum` use at this
+    //     span naming the declaring file, but no `class_name Entry` exists, so (a)'s registry
+    //     identity check cannot see it and the rename refused a symbol it can resolve and collect
+    //     completely (#298). Admitted structurally, never by name: the binding's target must
+    //     actually BE an inner class or a named enum of the declaring interface, so a cursor whose
+    //     name merely collides with one borrows nothing. The reference set for it is the
+    //     occurrence-positive `UnresolvedKind::InFileType` collection, which `definition`'s
+    //     canonicalization reaches by jumping to the declaration first.
+    let nested_type_anchored = result.bindings().iter().any(|b| match b {
+        Binding::Use {
+            target_kind: kind @ (BindingTargetKind::Class | BindingTargetKind::Enum),
+            target_file: Some(f),
+            target_class_path,
+            target_name,
+            site,
+        } if *site == node_span && target_name == name => {
+            iface_at_inner(&state.workspace.index, *f, target_class_path).is_some_and(
+                |i| match kind {
+                    BindingTargetKind::Class => i
+                        .inner
+                        .iter()
+                        .any(|c| c.class_name.as_deref() == Some(name)),
+                    _ => i.enums.iter().any(|e| e.name == name),
+                },
+            )
+        }
+        _ => false,
+    });
+    if nested_type_anchored {
+        return true;
+    }
+
     if class_use_anchored
         || cursor_is_extends_base_segment(&parsed.tree, node_id)
         || cursor_is_type_annotation_base_segment(&parsed.tree, node_id)
