@@ -527,10 +527,19 @@ fn inherited_enum_annotation(ctx: &mut AnalysisContext, name: &str) -> Option<Da
 /// (analyzer.cpp:617-619), which is what keeps `$`/`@onready`/self-compat working through
 /// arbitrary script-to-script chains. An unresolvable chain leaves it empty (permissive).
 pub(crate) fn script_base_datatype(ctx: &AnalysisContext, fid: gd_project::FileId) -> DataType {
-    let sref = ScriptRef {
-        file: fid,
-        inner: Vec::new(),
-    };
+    script_ref_datatype(
+        ctx,
+        ScriptRef {
+            file: fid,
+            inner: Vec::new(),
+        },
+    )
+}
+
+/// The `Script` meta type for a concrete [`ScriptRef`]: the head script when `inner` is empty, one
+/// of its inner classes otherwise. Same shape the cross-file inner-class hop in
+/// [`resolve_datatype`] builds for `Outer.Inner` annotations.
+pub(crate) fn script_ref_datatype(ctx: &AnalysisContext, sref: ScriptRef) -> DataType {
     DataType {
         kind: DtKind::Script,
         type_source: TypeSource::AnnotatedExplicit,
@@ -1159,11 +1168,21 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
                         .iter()
                         .any(|i| i.class_name.as_deref() == Some(name))
                     {
-                        // Found an inner class with this name in a cross-file base.
-                        // Return a Script meta type with the file id — sufficient to mark
-                        // the name as a valid type annotation so the head-segment
-                        // "Could not find type" error doesn't false-positive.
-                        return Some(script_base_datatype(ctx, link.file));
+                        // Found an inner class with this name in a cross-file base. Point the
+                        // ScriptRef at that inner class, the way analyzer.cpp:862-868's CLASS arm
+                        // returns `member.m_class`'s own datatype. Returning the base script here
+                        // instead made the name resolve as a valid annotation but with the WRONG
+                        // type, so `var v: Inner = Inner.new()` failed its assignment check
+                        // against the base script (#284).
+                        let mut inner: Vec<String> = link.inner.clone();
+                        inner.push(name.to_string());
+                        return Some(script_ref_datatype(
+                            ctx,
+                            ScriptRef {
+                                file: link.file,
+                                inner,
+                            },
+                        ));
                     }
                 }
             }
