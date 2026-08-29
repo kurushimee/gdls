@@ -7365,6 +7365,19 @@ impl RequestRefusal {
             message: message.into(),
         }
     }
+
+    /// #339: a mutating recipe whose buffer moved under it. The recipe's payload is a coordinate
+    /// valid only in the snapshot its refuse-gate ran against, so a version bump means the recipe
+    /// names nothing in the current buffer — identity-doubt, which §6.3 answers with a refusal,
+    /// never with a re-derivation inside `resolve`. `ContentModified` (-32801) is LSP's own "the
+    /// request's basis changed, re-request" code, and gdls already answers `codeAction/resolve`
+    /// with it when shedding under memory pressure, so every client already tolerates it here.
+    pub(crate) fn stale(message: impl Into<String>) -> Self {
+        RequestRefusal {
+            code: crate::server::ERR_CONTENT_MODIFIED,
+            message: message.into(),
+        }
+    }
 }
 
 /// `true` iff `name` is a valid GDScript identifier that is NOT a keyword — the rename validity
