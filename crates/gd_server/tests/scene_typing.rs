@@ -67,7 +67,10 @@ fn diags_of(ws: &mut Workspace, p: &TempProject, rel: &str, src: &str) -> Vec<St
 #[test]
 fn dollar_access_does_not_false_positive_on_sibling_downcast() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", API);
     p.write(
         "player.tscn",
@@ -119,7 +122,10 @@ func f():
 #[test]
 fn dollar_cast_to_sibling_does_not_false_positive() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", API);
     p.write(
         "player.tscn",

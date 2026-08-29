@@ -99,7 +99,10 @@ fn reference_params(uri: &lsp_types::Uri, line: u32, character: u32) -> Referenc
 #[test]
 fn document_highlight_provider_advertised() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     p.write("a.gd", "extends Node\n");
 
@@ -131,7 +134,10 @@ fn document_highlight_provider_advertised() {
 #[test]
 fn document_highlight_local_var_read_write_decl() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     // Line 0: `extends Node`
     // Line 2: `func run() -> void:`
@@ -226,7 +232,10 @@ fn document_highlight_local_var_read_write_decl() {
 #[test]
 fn document_highlight_ranges_match_in_file_references_subset_for_global_class() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     p.write("player.gd", "class_name Player\nextends Node\n");
     p.write(
@@ -297,7 +306,10 @@ fn document_highlight_ranges_match_in_file_references_subset_for_global_class() 
 #[test]
 fn document_highlight_off_identifier_returns_null() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     // Line 0: `extends Node`; line 1: blank; line 2: `var hp: int = 0`.
     p.write("a.gd", "extends Node\n\nvar hp: int = 0\n");
@@ -341,7 +353,10 @@ fn document_highlight_off_identifier_returns_null() {
 #[test]
 fn document_highlight_is_scoped_to_request_file() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     // a.gd: `class_name AClass`, member `var hp` (decl at line 2, cols 4..6), read `self.hp` at
     // line 4 cols 13..15.
@@ -453,7 +468,10 @@ fn document_highlight_is_scoped_to_request_file() {
 #[test]
 fn document_highlight_member_read_write() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     // Line 0: `class_name BClass`
     // Line 1: `extends Node`
@@ -528,7 +546,10 @@ fn document_highlight_member_read_write() {
 #[test]
 fn document_highlight_enum_value_decl_and_use_not_unrelated_const() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     // Line 1 `enum Direction { NORTH }`  → value decl `NORTH` at col 17
     // Line 2 `const NORTH := 99`         → UNRELATED const decl `NORTH` at col 6
@@ -587,7 +608,10 @@ fn document_highlight_enum_value_decl_and_use_not_unrelated_const() {
 #[test]
 fn document_highlight_cross_file_member_use_excludes_own_same_named_decl() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     // a.gd: `class_name AClass`, member `var hp` — the resolved target of `a.hp` below.
     p.write("a.gd", "class_name AClass\nextends Node\nvar hp: int = 0\n");

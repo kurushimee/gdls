@@ -1466,7 +1466,7 @@ fn edit_is_safe(state: &mut ServerState, uri: &Uri, edit: &WorkspaceEdit) -> boo
     else {
         return false;
     };
-    let after_parsed = gd_syntax::parse(&after_text);
+    let after_parsed = state.workspace.parse_source(&after_text);
     let after_analysis = state.workspace.analyze_ephemeral(&path, &after_parsed.tree);
     if after_analysis.bailed {
         return false;

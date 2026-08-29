@@ -14,8 +14,9 @@
 mod common;
 
 use common::{options_for, TempProject};
-use gd_project::{LoadOutcome, ProjectModel};
+use gd_project::{DialectOrigin, LoadOutcome, ProjectModel};
 use gd_server::Workspace;
+use gd_syntax::Dialect;
 
 #[test]
 fn load_checked_clean_read_is_loaded() {
@@ -122,5 +123,142 @@ fn reload_over_corrupt_preserves_project_native_and_policy() {
     assert_eq!(
         ws.project.root, root_before,
         "a corrupt reload must NOT replace the project model"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Dialect resolution (4.6 / 4.7 support)
+// ---------------------------------------------------------------------------
+
+/// Write a `project.godot` whose `[application]` section carries `extra` verbatim.
+fn project_with(p: &TempProject, extra: &str) {
+    p.write(
+        "project.godot",
+        &format!("config_version=5\n\n[application]\n\nconfig/name=\"X\"\n{extra}"),
+    );
+}
+
+#[test]
+fn declared_feature_version_selects_the_dialect() {
+    for (tag, want) in [("4.6", Dialect::Godot4_6), ("4.7", Dialect::Godot4_7)] {
+        let p = TempProject::new();
+        project_with(
+            &p,
+            &format!("config/features=PackedStringArray(\"{tag}\")\n"),
+        );
+        let ws = Workspace::load(&p.root, &options_for(&p));
+        assert_eq!(ws.dialect, want, "config/features declared {tag}");
+        assert_eq!(ws.dialect_origin, DialectOrigin::Declared);
+    }
+}
+
+#[test]
+fn renderer_names_are_not_mistaken_for_a_version() {
+    let p = TempProject::new();
+    project_with(
+        &p,
+        "config/features=PackedStringArray(\"4.6\", \"Forward Plus\")\n",
+    );
+    let ws = Workspace::load(&p.root, &options_for(&p));
+    assert_eq!(ws.dialect, Dialect::Godot4_6);
+    assert_eq!(ws.dialect_origin, DialectOrigin::Declared);
+}
+
+#[test]
+fn a_project_file_without_a_version_defaults_to_newest_and_is_reported() {
+    // Godot writes `config/features` on every save, so a project file missing it was hand-edited
+    // or stripped — worth telling the user, since diagnostics may not match their engine.
+    let p = TempProject::new();
+    project_with(&p, "");
+    let ws = Workspace::load(&p.root, &options_for(&p));
+    assert_eq!(ws.dialect, Dialect::NEWEST);
+    assert_eq!(ws.dialect_origin, DialectOrigin::DefaultedNewest);
+    assert!(ws.dialect_origin.is_noteworthy());
+}
+
+#[test]
+fn no_project_file_defaults_to_newest_without_a_notice() {
+    // Editing a loose `.gd` with no project around it is a supported mode, not a broken project.
+    let p = TempProject::new();
+    let ws = Workspace::load(&p.root, &options_for(&p));
+    assert_eq!(ws.dialect, Dialect::NEWEST);
+    assert_eq!(ws.dialect_origin, DialectOrigin::NoProject);
+    assert!(!ws.dialect_origin.is_noteworthy());
+}
+
+#[test]
+fn a_version_newer_than_supported_clamps_down_and_is_reported() {
+    let p = TempProject::new();
+    project_with(&p, "config/features=PackedStringArray(\"9.9\")\n");
+    let ws = Workspace::load(&p.root, &options_for(&p));
+    assert_eq!(ws.dialect, Dialect::NEWEST);
+    assert_eq!(ws.dialect_origin, DialectOrigin::ClampedNewer);
+}
+
+#[test]
+fn the_initialization_option_overrides_the_declared_version() {
+    let p = TempProject::new();
+    project_with(&p, "config/features=PackedStringArray(\"4.6\")\n");
+    let opts = gd_server::config::InitializationOptions::parse(Some(&serde_json::json!({
+        "projectRoot": p.root.as_str(),
+        "autoDumpExtensionApi": false,
+        "dialect": "4.7",
+    })));
+    let ws = Workspace::load(&p.root, &opts);
+    assert_eq!(ws.dialect, Dialect::Godot4_7);
+    assert_eq!(ws.dialect_origin, DialectOrigin::Override);
+}
+
+#[test]
+fn an_unrecognized_dialect_option_falls_back_to_the_declared_version() {
+    // Malformed options never fail the handshake — they are dropped with a warning. An explicit
+    // pin is not silently clamped either, since that would hide the user's typo behind behavior
+    // they did not ask for.
+    let p = TempProject::new();
+    project_with(&p, "config/features=PackedStringArray(\"4.6\")\n");
+    let opts = gd_server::config::InitializationOptions::parse(Some(&serde_json::json!({
+        "projectRoot": p.root.as_str(),
+        "autoDumpExtensionApi": false,
+        "dialect": "nonsense",
+    })));
+    let ws = Workspace::load(&p.root, &opts);
+    assert_eq!(ws.dialect, Dialect::Godot4_6);
+    assert_eq!(ws.dialect_origin, DialectOrigin::Declared);
+}
+
+#[test]
+fn changing_the_declared_version_on_reload_reports_that_a_rebuild_is_needed() {
+    let p = TempProject::new();
+    project_with(&p, "config/features=PackedStringArray(\"4.6\")\n");
+    let opts = options_for(&p);
+    let mut ws = Workspace::load(&p.root, &opts);
+    assert_eq!(ws.dialect, Dialect::Godot4_6);
+
+    // A reload that does NOT move the version stays incremental.
+    assert!(
+        !ws.reload_project_and_native(&opts),
+        "an unchanged version must not demand a rebuild"
+    );
+
+    project_with(&p, "config/features=PackedStringArray(\"4.7\")\n");
+    assert!(
+        ws.reload_project_and_native(&opts),
+        "a changed version invalidates every parse tree in the session"
+    );
+    assert_eq!(ws.dialect, Dialect::Godot4_7);
+}
+
+#[test]
+fn the_cache_key_separates_the_two_dialects() {
+    // Interfaces come out of a parse tree, so a warm cache written under one dialect must never be
+    // served under the other.
+    let p = TempProject::new();
+    project_with(&p, "config/features=PackedStringArray(\"4.6\")\n");
+    let key_46 = Workspace::load(&p.root, &options_for(&p)).cache_key();
+    project_with(&p, "config/features=PackedStringArray(\"4.7\")\n");
+    let key_47 = Workspace::load(&p.root, &options_for(&p)).cache_key();
+    assert_ne!(
+        key_46.dialect, key_47.dialect,
+        "the dialect must be part of the warm-start cache key"
     );
 }

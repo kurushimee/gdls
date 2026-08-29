@@ -50,7 +50,7 @@ fn heavy_project() -> TempProject {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\n",
+        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\n",
     );
     p.write("extension_api.json", common::MINI_API);
     for fam in ["a", "b"] {

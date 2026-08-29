@@ -79,7 +79,12 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// open file whose only use of a class sits in a function body would never refresh when that class
 /// changed. Not `#[serde(default)]` for that reason — v8 files are ignored and rebuilt. One cold
 /// re-index per project on upgrade, self-healing.
-pub const CACHE_FORMAT_VERSION: u32 = 9;
+/// v10 adds `dialect`: the resolved Godot dialect changes what the parser produces, so every
+/// cached interface is dialect-specific. The `project_godot_fingerprint` catches a `config/features`
+/// edit incidentally, but not an `initializationOptions.dialect` override, and the warning-code
+/// renumbering that came with 4.7 support warrants the bump regardless. One cold re-index per
+/// project on upgrade, self-healing.
+pub const CACHE_FORMAT_VERSION: u32 = 10;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
@@ -108,6 +113,12 @@ pub struct CacheKey {
     /// Size + mtime of `project.godot`, mixed into a single `u64`. Invalidates when autoloads,
     /// warning config, or other project-level settings change (those live in `project.godot`).
     pub project_godot_fingerprint: u64,
+    /// The resolved [`gd_syntax::Dialect`] as its `u8` discriminant. Interfaces are extracted from
+    /// a parse tree, and the two dialects do not parse identically, so a cache written under one
+    /// must never be served under the other. Kept separate from the `project.godot` fingerprint
+    /// because the dialect can also come from an `initializationOptions` override that leaves the
+    /// file untouched.
+    pub dialect: u8,
 }
 
 /// Per-file stat snapshot stored alongside the index. B4 computes fresh stats on load and diffs

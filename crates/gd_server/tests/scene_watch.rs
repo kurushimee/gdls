@@ -34,7 +34,10 @@ unique_name_in_owner = true
 #[test]
 fn cold_load_builds_scene_index_from_disk() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("main.gd", "extends Control\n");
     p.write("child.gd", "extends Panel\n");
     p.write("main.tscn", MAIN_TSCN);
@@ -68,7 +71,10 @@ fn cold_load_builds_scene_index_from_disk() {
 #[test]
 fn reindex_scene_keeps_index_live_on_change() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("child.gd", "extends Panel\n");
     p.write("child.tscn", CHILD_TSCN);
 
@@ -109,7 +115,10 @@ unique_name_in_owner = true
 #[test]
 fn remove_scene_drops_it_from_index() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("child.gd", "extends Panel\n");
     p.write("child.tscn", CHILD_TSCN);
 
@@ -134,7 +143,10 @@ fn remove_scene_drops_it_from_index() {
 #[test]
 fn warm_start_round_trips_scene_index() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("main.gd", "extends Control\n");
     p.write("child.gd", "extends Panel\n");
     p.write("main.tscn", MAIN_TSCN);
@@ -179,7 +191,10 @@ fn reconcile_recovers_scene_drift() {
     // stat-diffs `.tscn` (added/modified/removed), so a scene drifted while the watcher was
     // overflowed/off is recovered — not left stale (scenes had no reconcile backstop before).
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("child.gd", "extends Panel\n");
     p.write("child.tscn", CHILD_TSCN);
 
@@ -224,7 +239,10 @@ fn warm_start_reparses_scene_changed_while_offline() {
     // A scene edited while gdls was off must be re-parsed by the warm-start stat-diff (scene
     // freshness rides the FileStat table, since the CacheKey doesn't move on a .tscn edit).
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("child.gd", "extends Panel\n");
     p.write("child.tscn", CHILD_TSCN);
 

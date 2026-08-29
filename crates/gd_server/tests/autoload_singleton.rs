@@ -237,7 +237,7 @@ fn setup_autoload_project() -> TempProject {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
     );
     // global.gd: autoload script with one function.
     // Line 0: `extends Node`
@@ -368,7 +368,7 @@ fn references_on_autoload_name_finds_cross_file_uses() {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
     );
     p.write(
         "global.gd",
@@ -459,7 +459,7 @@ fn references_on_shadowed_autoload_name_stays_local() {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
     );
     p.write(
         "global.gd",
@@ -503,7 +503,7 @@ fn local_var_shadows_autoload_no_script_hover() {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
     );
     p.write(
         "global.gd",
@@ -559,7 +559,7 @@ fn local_var_shadows_autoload_no_definition_jump() {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
     );
     p.write(
         "global.gd",
@@ -616,7 +616,7 @@ fn hover_on_autoload_signal_member_shows_signal_signature() {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
     );
     // Line 2: `signal game_over(score: int)`
     p.write(
@@ -659,7 +659,7 @@ fn hover_on_uncalled_autoload_func_member_shows_signature() {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
     );
     p.write(
         "global.gd",
@@ -733,7 +733,7 @@ fn setup_scene_autoload_project(autoload_line: &str) -> TempProject {
     p.write(
         "project.godot",
         &format!(
-            "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\n{autoload_line}\n"
+            "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\n{autoload_line}\n"
         ),
     );
     p.write(
@@ -812,7 +812,7 @@ fn scene_autoload_miss_converges_with_direct_script_autoload() {
         let p = TempProject::new();
         p.write(
             "project.godot",
-            "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
+            "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nGlobal=\"*res://global.gd\"\n",
         );
         p.write(
             "global.gd",
@@ -892,7 +892,7 @@ fn scriptless_lowercase_scene_autoload_no_false_positive() {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nworld=\"*res://world.tscn\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nworld=\"*res://world.tscn\"\n",
     );
     // A scriptless scene: native Node2D root, no `script=`.
     p.write(
@@ -928,7 +928,7 @@ fn unresolvable_lowercase_scene_autoload_degrades_gracefully() {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nghost=\"*res://ghost.tscn\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nghost=\"*res://ghost.tscn\"\n",
     );
     // ghost.tscn is deliberately NEVER created — the autoload target is unresolvable.
     p.write("caller.gd", "extends Node\n\nfunc test():\n\tghost.foo()\n");
@@ -956,7 +956,7 @@ fn non_singleton_lowercase_autoload_still_not_declared() {
     // No leading `*` → registered but not a singleton.
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nplainnode=\"res://plain.gd\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nplainnode=\"res://plain.gd\"\n",
     );
     p.write("plain.gd", "extends Node\n\nfunc foo() -> void:\n\tpass\n");
     p.write(
@@ -985,7 +985,7 @@ fn uid_autoload_resolves_like_res_path() {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nGlobal=\"*uid://c1testuidauto\"\n",
+        "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nGlobal=\"*uid://c1testuidauto\"\n",
     );
     p.write(
         "global.gd",

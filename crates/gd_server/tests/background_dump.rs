@@ -40,7 +40,10 @@ fn background_dump_adoption_republishes_open_buffers() {
     use std::os::unix::fs::PermissionsExt;
 
     let project = TempProject::new();
-    project.write("project.godot", "config_version=5\n");
+    project.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     project.write(
         "a.gd",
         "extends Node\n\nvar t: Timer = null\nvar c: FakeCustomClass = null\n",

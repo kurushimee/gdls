@@ -52,6 +52,7 @@ fn make_key(root: &Utf8Path) -> CacheKey {
         gdls_version: env!("CARGO_PKG_VERSION").to_string(),
         native_db_content_hash: db.content_hash(),
         project_godot_fingerprint: project_godot_fingerprint(root),
+        dialect: gd_syntax::Dialect::DEFAULT as u8,
     }
 }
 
@@ -205,6 +206,7 @@ fn key_mismatch_yields_none_without_quarantine() {
             NativeDb::empty().content_hash()
         },
         project_godot_fingerprint: project_godot_fingerprint(&root),
+        dialect: gd_syntax::Dialect::DEFAULT as u8,
     };
 
     let result = cache::load(&root, &mismatched_key);

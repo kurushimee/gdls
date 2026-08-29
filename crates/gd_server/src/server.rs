@@ -1050,6 +1050,8 @@ fn serve_inner(
     // which is why it carries `Generic` provenance and why the analyzer will not turn its misses
     // into errors. A stderr line is invisible to most clients; "never lie" covers a degraded
     // surface the user cannot see. One notification per session, at startup, never repeated.
+    notify_dialect(&state);
+
     if state.workspace.native.provenance() == gd_types::ApiProvenance::Generic {
         show_message(
             &state,
@@ -1958,7 +1960,9 @@ fn apply_reaction_batch(
              native DB (coalesced once for the batch)"
         );
         let _progress = server_progress(state, "Reloading Godot API");
-        state.workspace.reload_project_and_native(&state.options);
+        if state.workspace.reload_project_and_native(&state.options) {
+            rebuild_workspace_for_dialect_change(state);
+        }
         republish_all_open_buffers(state);
         // M10 (#72): project/native surface changed → re-request semantic tokens for visible docs.
         send_semantic_tokens_refresh(state);
@@ -2216,9 +2220,8 @@ fn apply_reaction_inner(
                                 state.workspace.update_stat_from_disk(&path);
                                 return;
                             }
-                            state
-                                .workspace
-                                .reindex(&path, &gd_syntax::parse(&text).tree);
+                            let tree = state.workspace.parse_source(&text).tree;
+                            state.workspace.reindex(&path, &tree);
                             state.workspace.record_disk_apply(&path, &text);
                             // Disk-sourced: refresh stat_table so the next warm-load can skip this
                             // file if it hasn't changed again (Issue 1 perf fix).
@@ -2248,7 +2251,8 @@ fn apply_reaction_inner(
                     // open buffer). (Re)index the destination from disk.
                     match std::fs::read_to_string(&to) {
                         Ok(text) => {
-                            state.workspace.reindex(&to, &gd_syntax::parse(&text).tree);
+                            let tree = state.workspace.parse_source(&text).tree;
+                            state.workspace.reindex(&to, &tree);
                             state.workspace.record_disk_apply(&to, &text);
                             // Disk-sourced rename target: refresh stat_table (Issue 1 perf fix).
                             state.workspace.update_stat_from_disk(&to);
@@ -2362,7 +2366,8 @@ fn classify_open_buffer_disk_change(state: &ServerState, path: &Utf8Path) {
     match std::fs::read_to_string(path) {
         Ok(disk_text) => {
             let disk_hash =
-                gd_project::extract_interface(&gd_syntax::parse(&disk_text).tree).signature_hash();
+                gd_project::extract_interface(&state.workspace.parse_source(&disk_text).tree)
+                    .signature_hash();
             if Some(disk_hash) == buf_iface_hash {
                 log::debug!(
                     "watcher: {path} changed on disk but its interface matches the open buffer; no-op"
@@ -2445,6 +2450,47 @@ fn republish_dirty_open_buffers_except(state: &mut ServerState, skip: Option<&Ur
 /// (`project.godot`) or native DB reload (`extension_api.json` / gdextension surface) where the
 /// `Index.dirty` set won't capture the change (the change isn't interface-keyed; it affects every
 /// file's analysis).
+/// Tell the user which Godot version their scripts are being read as, but only when gdls had to
+/// guess or correct rather than read a declared one.
+///
+/// A project that names a supported version stays silent — that is the normal case and needs no
+/// commentary. The noteworthy cases (no version declared, or one outside the supported range) all
+/// mean diagnostics may not match the engine the user is actually running, which is exactly the
+/// kind of degraded surface a stderr line would hide.
+fn notify_dialect(state: &ServerState) {
+    let Some(message) = gd_project::dialect_notice(
+        state.workspace.dialect,
+        state.workspace.dialect_origin,
+        state.workspace.project.declared_engine_version,
+    ) else {
+        return;
+    };
+    show_message(state, lsp_types::MessageType::WARNING, &message);
+}
+
+/// Rebuild the whole workspace after `project.godot` moved the project to another Godot version.
+///
+/// Every parse tree in the session was produced under the old dialect, interfaces in the index
+/// included, so nothing already cached can be trusted. This is deliberately the blunt instrument:
+/// one cold startup's worth of work on an event that essentially never happens, in exchange for not
+/// having to reason about which derived state survives a semantics change. The warm-start cache
+/// misses on the new key, which is exactly right.
+///
+/// Open buffers are re-indexed from the VFS afterwards, since the fresh index was built from disk
+/// and would otherwise serve a saved file's interface in place of the buffer's unsaved content.
+fn rebuild_workspace_for_dialect_change(state: &mut ServerState) {
+    let root = state.workspace.project.root.clone();
+    let dialect = state.workspace.dialect;
+    log::info!("rebuilding the workspace under Godot {dialect} semantics");
+    let mut sink = crate::progress::NoopSink;
+    state.workspace = Workspace::load_with_progress(&root, &state.options, &mut sink);
+    for uri in open_buffer_uris(state) {
+        reindex_open_buffer(state, &uri);
+    }
+    notify_dialect(state);
+    send_semantic_tokens_refresh(state);
+}
+
 fn republish_all_open_buffers(state: &mut ServerState) {
     for uri in open_buffer_uris(state) {
         publish_diagnostics(state, uri, None);
@@ -3331,9 +3377,8 @@ fn reindex_from_disk(state: &mut ServerState, uri: &Uri) {
     }
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            state
-                .workspace
-                .reindex(&path, &gd_syntax::parse(&text).tree);
+            let tree = state.workspace.parse_source(&text).tree;
+            state.workspace.reindex(&path, &tree);
             // Disk-sourced like the watcher arms: record for the M7 (#60) duplicate-delivery
             // gate (the close-time disk state often echoes right back as a watcher event).
             state.workspace.record_disk_apply(&path, &text);

@@ -998,7 +998,10 @@ fn boot_native_member_with_api(
     TempProject,
 ) {
     let project = TempProject::new();
-    project.write("project.godot", "config_version=5\n");
+    project.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     project.write("extension_api.json", api);
     project.write("main.gd", src);
     let stub_cache = project.root.join("stub-cache");
@@ -1213,7 +1216,10 @@ fn rename_class_to_existing_project_class_refused() {
     // file: two files would declare the same global class. Refuse on the NEW-NAME side (-32602).
     let api = RICH_NATIVE_API;
     let project = TempProject::new();
-    project.write("project.godot", "config_version=5\n");
+    project.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     project.write("extension_api.json", api);
     project.write(
         "hero.gd",

@@ -1094,7 +1094,7 @@ fn definition_on_autoload_jumps_to_script() {
     std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
     std::fs::write(fixture_dir.join("save.gd"), "extends Node\n").expect("write save.gd");
     // project.godot declares `Save` as an autoload pointing at res://save.gd.
-    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
+    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
     std::fs::write(fixture_dir.join("project.godot"), project_godot).expect("write project.godot");
     // user.gd references the autoload `Save` in expression position.
     // Line 0: `extends Node`
@@ -1142,7 +1142,7 @@ fn definition_autoload_missing_script_returns_none() {
     let _ = std::fs::remove_dir_all(&fixture_dir);
     std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
     // Declare `Save` autoload pointing at res://save.gd — but do NOT write save.gd to disk.
-    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
+    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
     std::fs::write(fixture_dir.join("project.godot"), project_godot).expect("write project.godot");
     // user.gd references Save in expression position.
     // Line 0: `extends Node`
@@ -1183,7 +1183,7 @@ fn definition_autoload_shadowed_by_local_stays_in_file() {
     let _ = std::fs::remove_dir_all(&fixture_dir);
     std::fs::create_dir_all(&fixture_dir).expect("create fixture dir");
     std::fs::write(fixture_dir.join("save.gd"), "extends Node\n").expect("write save.gd");
-    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
+    let project_godot = "[application]\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\nconfig_version=5\n\n[autoload]\nSave=\"*res://save.gd\"\n";
     std::fs::write(fixture_dir.join("project.godot"), project_godot).expect("write project.godot");
     // shadow.gd has a member `var Save := 1` and a func that references it.
     // Line 0: `extends Node`

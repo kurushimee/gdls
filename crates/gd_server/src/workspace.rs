@@ -11,8 +11,10 @@ use std::rc::Rc;
 use camino::{Utf8Path, Utf8PathBuf};
 use gd_analyze::{code_from_name, AnalysisResult, StrictProfile, StrictSettings, WarnPolicy};
 use gd_project::cache::{self, FileStat};
-use gd_project::{AssetIndex, Index, ProjectModel, SceneIndex};
-use gd_syntax::{ParseResult, ParseTree};
+use gd_project::{
+    resolve_dialect, AssetIndex, DialectOrigin, Index, LoadOutcome, ProjectModel, SceneIndex,
+};
+use gd_syntax::{Dialect, ParseResult, ParseTree};
 use gd_types::{DocXmlError, NativeDb};
 use lru::LruCache;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -75,6 +77,15 @@ pub struct Workspace {
     pub native: NativeDb,
     /// `project.godot`: root, autoloads, warning config, enumerated GDExtensions, UID map.
     pub project: ProjectModel,
+    /// The Godot feature release this project's scripts are read as, resolved once from
+    /// `initializationOptions.dialect` or `project.godot`'s `application/config/features`
+    /// ([`gd_project::resolve_dialect`]). Every parse and analyze in the session uses it, and it
+    /// is part of the warm-start cache key. A `project.godot` edit that changes it forces a full
+    /// reload — see [`Self::reload_project_and_native`].
+    pub dialect: Dialect,
+    /// How [`Self::dialect`] was arrived at, so the server can tell the user when gdls guessed or
+    /// clamped rather than read a declared version.
+    pub dialect_origin: DialectOrigin,
     /// `class_name` registry + per-file interface tables + dependency graph.
     pub index: Index,
     /// Effective per-warning level, resolved from `project.godot` + the client's strict profile +
@@ -179,11 +190,20 @@ impl Workspace {
             file_count = tracing::field::Empty,
         );
         let _enter = _span.enter();
-        let project = ProjectModel::load(root);
+        let (project, project_outcome) = ProjectModel::load_checked(root);
+        let (dialect, dialect_origin) = resolve_dialect(
+            options.dialect(),
+            project.declared_engine_version,
+            project_outcome == LoadOutcome::Loaded,
+        );
+        log::info!(
+            "dialect: reading scripts as Godot {dialect} (origin: {dialect_origin:?},              project.godot declared: {:?})",
+            project.declared_engine_version,
+        );
         let native = load_native(options, &project, root);
 
         // Build the cache key for warm-start attempt.
-        let key = build_cache_key(&native, root);
+        let key = build_cache_key(&native, root, dialect);
 
         // Attempt warm-start: load the persisted cache and stat-diff it against disk.
         // On any failure (missing file, key mismatch, verify failure) fall through to cold build.
@@ -193,13 +213,13 @@ impl Workspace {
                     "cache: warm-start candidate found; stat-diffing {} cached files",
                     loaded.files.len()
                 );
-                warm_index_from_cache(loaded, root, sink)
+                warm_index_from_cache(loaded, root, dialect, sink)
             }
             None => {
                 // Cold build — then sweep all interned files to populate the stat table. The scene
                 // index is cold-built in parallel (its own `.tscn` walk, shared exclusion set), and
                 // the asset index in another (every other project file, same exclusion set).
-                let idx = Index::build_with_progress(root, &mut |done, total| {
+                let idx = Index::build_with_progress(root, dialect, &mut |done, total| {
                     sink.progress(done, Some(total), "parsing scripts");
                 });
                 let scene_idx = SceneIndex::build(root);
@@ -228,6 +248,8 @@ impl Workspace {
         Workspace {
             native,
             project,
+            dialect,
+            dialect_origin,
             index,
             policy,
             parse_cache: LruCache::new(cap),
@@ -320,7 +342,7 @@ impl Workspace {
     /// See [`Self::save_cache`] for the rationale.
     pub fn save_cache_excluding_open(&self, open_paths: &FxHashSet<Utf8PathBuf>) {
         let root = &self.project.root;
-        let key = build_cache_key(&self.native, root);
+        let key = build_cache_key(&self.native, root, self.dialect);
         // Exclude files currently open in an editor buffer: their stat_table entry still reflects
         // the pre-edit disk state (stat_table is only updated by disk-sourced reindexes), so if
         // we persisted that entry, warm-load would see stored==current disk stat (unchanged since
@@ -346,7 +368,7 @@ impl Workspace {
                 return Rc::clone(&entry.value);
             }
         }
-        let parsed = Rc::new(gd_syntax::parse(text));
+        let parsed = Rc::new(parse_in_dialect(text, self.dialect));
         // `LruCache::put` overwrites any existing entry under `key` and, when at capacity,
         // evicts the least-recently-used entry. The evicted slot is returned; we drop it
         // immediately — the only state it carried was the `Rc<ParseResult>`, which the dropped
@@ -388,6 +410,26 @@ impl Workspace {
         text: &str,
     ) -> Rc<AnalysisResult> {
         self.analyze_with_options(key, path, tree, text, gd_analyze::AnalyzeOptions::default())
+    }
+
+    /// The warm-start cache key this workspace would write.
+    ///
+    /// Exposed so a test can prove that a change which must invalidate the cache — the dialect
+    /// above all, since the two dialects do not parse identically — actually reaches the key.
+    #[must_use]
+    pub fn cache_key(&self) -> cache::CacheKey {
+        build_cache_key(&self.native, &self.project.root, self.dialect)
+    }
+
+    /// Parse `text` under this project's dialect, without touching the parse cache.
+    ///
+    /// The one-shot counterpart to [`Self::parse`], for the handlers that need a tree for some
+    /// *other* file while an analysis borrow is live. Going through here rather than
+    /// `gd_syntax::parse` is what keeps a nav or completion parse from reading the project under
+    /// [`Dialect::DEFAULT`] when it is pinned to something else.
+    #[must_use]
+    pub fn parse_source(&self, text: &str) -> ParseResult {
+        parse_in_dialect(text, self.dialect)
     }
 
     /// Return a valid cached analysis for `text` without running the analyzer. Used by the Hard
@@ -434,6 +476,11 @@ impl Workspace {
         if options.checkpoint_delay.is_none() {
             options.checkpoint_delay = self.analyzer_checkpoint_delay;
         }
+        // The dialect is a property of the project, not of the request, so it is stamped here
+        // rather than defaulted: the workspace resolved it once and no caller has a legitimate
+        // reason to analyze one file under a different Godot version than the index was built
+        // with. Overriding unconditionally means a new call site cannot forget it.
+        options.dialect = self.dialect;
         let hash = fingerprint(text);
         // M5 WP-O1: analyze span. The plan's draft field-set is `file, version, ... elapsed_us,
         // diagnostics_count`; the cache is content-addressed (no LSP version threads through
@@ -669,7 +716,10 @@ impl Workspace {
             &self.native,
             &xfile,
             &self.policy,
-            gd_analyze::AnalyzeOptions::default(),
+            gd_analyze::AnalyzeOptions {
+                dialect: self.dialect,
+                ..Default::default()
+            },
         )
     }
 
@@ -924,10 +974,13 @@ impl Workspace {
         self.stat_table.remove(path);
     }
 
-    /// Re-read `project.godot` from disk (file changed via the M4 watcher) and rebuild the policy
-    /// + re-load the native DB (because the gdextensions list is in `ProjectModel` and the doc-XML
-    ///   merge step reads them). Cheaper than a full re-`load`: keeps the index and parse cache.
-    pub fn reload_project_and_native(&mut self, options: &InitializationOptions) {
+    /// Re-read `project.godot` from disk (file changed via the M4 watcher), rebuild the policy, and
+    /// re-load the native DB (the gdextensions list lives in `ProjectModel` and the doc-XML merge
+    /// step reads it). Cheaper than a full re-`load`: keeps the index and parse cache.
+    ///
+    /// Returns `true` when the reload changed the resolved dialect, meaning the caller must do a
+    /// full workspace reload rather than trusting anything the index or caches already hold.
+    pub fn reload_project_and_native(&mut self, options: &InitializationOptions) -> bool {
         let root = self.project.root.clone();
         let (project, outcome) = ProjectModel::load_checked(&root);
         // WP-RD13: a *present-but-unreadable* project.godot (locked mid-save, permission denied) OR
@@ -944,8 +997,29 @@ impl Workspace {
                 "project.godot reload {outcome:?}; keeping the previous project model, native DB, \
                  and warning policy rather than resetting to defaults"
             );
-            return;
+            return false;
         }
+        let (dialect, dialect_origin) = resolve_dialect(
+            options.dialect(),
+            project.declared_engine_version,
+            outcome == LoadOutcome::Loaded,
+        );
+        // A `config/features` edit that moves the project to another Godot version invalidates
+        // every parse tree in the session, interfaces in the index included — the two dialects do
+        // not parse identically. Report it and let the caller rebuild from scratch rather than
+        // patching caches that were derived under the old rules.
+        if dialect != self.dialect {
+            log::info!(
+                "dialect changed {} -> {dialect} on project.godot reload; the workspace must be \
+                 rebuilt",
+                self.dialect,
+            );
+            self.dialect = dialect;
+            self.dialect_origin = dialect_origin;
+            self.project = project;
+            return true;
+        }
+        self.dialect_origin = dialect_origin;
         self.project = project;
         // Mid-session reloads never spawn Godot (no resolution path does since v1.0.2); a
         // `.gdextension` change marks the auto-dump meta stale and the next startup's background
@@ -957,6 +1031,7 @@ impl Workspace {
         self.policy = WarnPolicy::build(&self.project.warnings, &strict_settings(&options.strict));
         self.analysis_cache.clear();
         self.analysis_generation += 1;
+        false
     }
 
     /// Re-load only the native DB (extension_api.json + every installed gdextension's doc XML).
@@ -1238,7 +1313,7 @@ impl Workspace {
                     continue;
                 }
             };
-            let tree = gd_syntax::parse(&text).tree;
+            let tree = parse_in_dialect(&text, self.dialect).tree;
             let new_iface = gd_project::extract_interface(&tree);
             let is_added = self.index.interface_of(&path).is_none();
             self.index.txn(&path, |idx| {
@@ -1406,12 +1481,26 @@ impl ReconciliationReport {
 /// Build the cache key from the live native DB and project root. Used by both `load` (warm-start
 /// attempt) and `save_cache` (persist after build/reconcile) so the key construction is
 /// identical — a divergent key is the silent always-cold failure mode.
-fn build_cache_key(native: &NativeDb, root: &Utf8Path) -> cache::CacheKey {
+/// Parse under an explicit dialect. The single funnel for every production parse in `gd_server`,
+/// so a new call site cannot silently fall back to [`Dialect::DEFAULT`] and index a project under
+/// the wrong Godot version.
+pub(crate) fn parse_in_dialect(text: &str, dialect: Dialect) -> ParseResult {
+    gd_syntax::parse_with_options(
+        text,
+        &gd_syntax::ParseOptions {
+            dialect,
+            ..Default::default()
+        },
+    )
+}
+
+fn build_cache_key(native: &NativeDb, root: &Utf8Path, dialect: Dialect) -> cache::CacheKey {
     cache::CacheKey {
         cache_format_version: cache::CACHE_FORMAT_VERSION,
         gdls_version: env!("CARGO_PKG_VERSION").to_string(),
         native_db_content_hash: native.content_hash(),
         project_godot_fingerprint: cache::project_godot_fingerprint(root),
+        dialect: dialect as u8,
     }
 }
 
@@ -1433,6 +1522,7 @@ fn build_cache_key(native: &NativeDb, root: &Utf8Path) -> cache::CacheKey {
 fn warm_index_from_cache(
     loaded: gd_project::cache::LoadedCache,
     root: &Utf8Path,
+    dialect: Dialect,
     sink: &mut dyn crate::progress::ProgressSink,
 ) -> (
     Index,
@@ -1562,7 +1652,7 @@ fn warm_index_from_cache(
                         // `.gd` → the script index, exactly as before. `is_added` is checked before
                         // the txn (which would otherwise have already interned the interface).
                         let is_added = index.interface_of(&path).is_none();
-                        let tree = gd_syntax::parse(&text).tree;
+                        let tree = parse_in_dialect(&text, dialect).tree;
                         let iface = gd_project::extract_interface(&tree);
                         index.txn(&path, |idx| {
                             idx.on_file_changed(&path, iface);

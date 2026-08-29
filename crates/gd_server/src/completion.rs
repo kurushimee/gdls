@@ -1949,7 +1949,7 @@ fn script_override_stub(
     let name_span = decl.name_span;
     let path = state.workspace.index.path(file)?;
     let src = file_text_at(state, path)?;
-    let parsed = gd_syntax::parse(&src);
+    let parsed = state.workspace.parse_source(&src);
     let (func_id, func) = function_at_name_span(&parsed.tree, name_span, name)?;
     let signature = verbatim_signature(&parsed.tree, &src, func_id, func)?;
     Some(format!("{name}{signature}"))

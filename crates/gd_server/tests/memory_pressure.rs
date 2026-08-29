@@ -59,7 +59,10 @@ fn empty_analysis() -> AnalysisResult {
 #[test]
 fn lru_cache_evicts_on_insert_once_capacity_is_reached() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     let mut ws = Workspace::load(&p.root, &options_with_cache_capacity(&p, 4));
 
     // Stuff 10 distinct entries — capacity 4 means 6 must be evicted on the way through.
@@ -85,7 +88,10 @@ fn lru_cache_evicts_on_insert_once_capacity_is_reached() {
 #[test]
 fn evict_half_drops_the_oldest_half_of_both_caches() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     let mut ws = Workspace::load(&p.root, &options_with_cache_capacity(&p, 16));
 
     for i in 0..8 {
@@ -116,7 +122,10 @@ fn evict_half_drops_the_oldest_half_of_both_caches() {
 #[test]
 fn evict_half_on_empty_caches_is_a_no_op() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     let mut ws = Workspace::load(&p.root, &options_with_cache_capacity(&p, 8));
     assert_eq!(ws.cache_lens(), (0, 0));
     assert_eq!(ws.evict_half(), 0);
@@ -129,7 +138,10 @@ fn evict_half_on_empty_caches_is_a_no_op() {
 #[test]
 fn default_cache_capacity_matches_documented_default() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     let opts = InitializationOptions::parse(Some(&serde_json::json!({
         "projectRoot": p.root.as_str(),
     "autoDumpExtensionApi": false,
@@ -154,7 +166,10 @@ fn default_cache_capacity_matches_documented_default() {
 #[test]
 fn zero_capacity_is_clamped_to_the_default() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     let mut ws = Workspace::load(&p.root, &options_with_cache_capacity(&p, 0));
     // The fact that load() returned at all proves the clamp engaged (a raw 0 would have
     // panicked inside NonZeroUsize::new(0).expect(...) in the constructor). Belt + suspenders:

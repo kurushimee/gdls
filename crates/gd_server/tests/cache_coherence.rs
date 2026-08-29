@@ -33,7 +33,10 @@ fn key_for(p: &TempProject, rel: &str) -> CanonicalKey {
 #[test]
 fn parse_cache_is_content_addressed_not_version_keyed() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     let mut ws = Workspace::load(&p.root, &options(&p));
     let key = key_for(&p, "foo.gd");
 
@@ -67,7 +70,10 @@ fn parse_cache_is_content_addressed_not_version_keyed() {
 #[test]
 fn a_bailed_analysis_is_not_cached() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     let src = "extends Node\nfunc f() -> void:\n\tvar a := 1\n\tvar b := 2\n\tvar c := 3\n";
     p.write("foo.gd", src);
     let mut ws = Workspace::load(&p.root, &options(&p));
@@ -101,7 +107,10 @@ fn a_bailed_analysis_is_not_cached() {
 #[test]
 fn analysis_cache_is_content_addressed() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("foo.gd", "var a = 1\n");
     let mut ws = Workspace::load(&p.root, &options(&p));
     let key = key_for(&p, "foo.gd");
@@ -133,7 +142,10 @@ fn analysis_cache_is_content_addressed() {
 #[test]
 fn dirty_dependent_bypasses_stale_analysis_cache() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write(
         "base.gd",
         "class_name Base\nextends Node\nfunc foo() -> int:\n\treturn 1\n",
@@ -196,7 +208,10 @@ fn dirty_dependent_bypasses_stale_analysis_cache() {
 #[test]
 fn path_extends_dependent_bypasses_stale_analysis_cache() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write(
         "base.gd",
         "class_name Base\nextends Node\nfunc foo() -> int:\n\treturn 1\n",
@@ -255,7 +270,10 @@ fn path_extends_dependent_bypasses_stale_analysis_cache() {
 #[test]
 fn dep_epoch_propagates_through_three_deep_extends_chain() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write(
         "c.gd",
         "class_name C\nextends Node\nfunc foo() -> int:\n\treturn 1\n",
@@ -302,7 +320,10 @@ fn dep_epoch_propagates_through_three_deep_extends_chain() {
 #[test]
 fn cold_index_skips_excluded_directories() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("src/real.gd", "class_name Real\nextends Node\n");
     p.write("target/copy.gd", "class_name Copied\nextends Node\n");
     p.write(".git/hook.gd", "class_name Ghost\nextends Node\n");
@@ -331,7 +352,10 @@ fn cold_index_skips_excluded_directories() {
 #[test]
 fn junction_path_resolves_to_single_index_entry() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("real/x.gd", "class_name JunctionX\nextends Node\n");
 
     let target = p.root.join("real");
@@ -371,7 +395,10 @@ fn junction_path_resolves_to_single_index_entry() {
 #[test]
 fn differently_cased_path_resolves_to_single_index_entry() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("Game/x.gd", "class_name CaseX\nextends Node\n");
 
     // Canonicalize the root so only the leaf component case (`Game` vs `game`) differs — the temp
@@ -394,7 +421,10 @@ fn differently_cased_path_resolves_to_single_index_entry() {
 #[test]
 fn reload_project_and_native_clears_analysis_cache() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("foo.gd", "var a = 1\n");
     let opts = options(&p);
     let mut ws = Workspace::load(&p.root, &opts);
@@ -519,7 +549,10 @@ fn reconcile_keeps_open_buffer_whose_disk_copy_vanished() {
 #[test]
 fn reconcile_skips_removal_pass_when_walk_errors_preserving_indexed_files() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("src/keep.gd", "class_name Keep\nextends Node\n");
     p.write("locked/secret.gd", "class_name Secret\nextends Node\n");
     let mut ws = Workspace::load(&p.root, &options(&p));
@@ -576,7 +609,10 @@ fn reconcile_skips_removal_pass_when_walk_errors_preserving_indexed_files() {
 #[test]
 fn cross_file_member_cycle_fires_through_workspace_cache() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     let a_src = "class_name CycA\nconst Other = preload(\"res://b.gd\")\nvar v = Other.v\n";
     let b_src = "class_name CycB\nconst Other = preload(\"res://a.gd\")\nvar v = Other.v\n";
     p.write("a.gd", a_src);

@@ -602,7 +602,7 @@ fn script_parameter_names(
     let path = state.workspace.index.path(file)?;
     let decl_src = file_text(state, path);
     let src = decl_src.as_deref().unwrap_or(text);
-    let parsed = gd_syntax::parse(src);
+    let parsed = state.workspace.parse_source(src);
     let func = function_at_name_span(&parsed.tree, name_span, method)?;
     Some(
         func.parameters

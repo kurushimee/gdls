@@ -19,7 +19,10 @@ fn options(root: &camino::Utf8Path) -> InitializationOptions {
 #[test]
 fn cold_load_builds_asset_index_from_disk() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     // Scripts + scenes are indexed elsewhere; arbitrary assets are the asset index's job.
     p.write("src/hero.gd", "extends Node\n");
     p.write("scenes/main.tscn", "[gd_scene format=3]\n");
@@ -52,7 +55,10 @@ fn cold_load_builds_asset_index_from_disk() {
 #[test]
 fn reindex_asset_keeps_index_live_on_add() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
 
     let mut ws = Workspace::load(&p.root, &options(&p.root));
     assert!(!ws.assets().contains("res://art/icon.png"));
@@ -71,7 +77,10 @@ fn reindex_asset_keeps_index_live_on_add() {
 #[test]
 fn remove_asset_drops_it_from_index() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("art/icon.png", "PNG-PLACEHOLDER");
 
     let mut ws = Workspace::load(&p.root, &options(&p.root));
@@ -91,7 +100,10 @@ fn remove_asset_drops_it_from_index() {
 #[test]
 fn warm_start_round_trips_asset_index() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("art/icon.png", "PNG-PLACEHOLDER");
     p.write("data/config.tres", "[gd_resource type=\"Resource\"]\n");
 
@@ -120,7 +132,10 @@ fn reconcile_recovers_asset_drift() {
     // (added/removed), so an asset drifted while the watcher was overflowed/off is recovered — the
     // same backstop scenes get.
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("art/icon.png", "PNG-PLACEHOLDER");
 
     let mut ws = Workspace::load(&p.root, &options(&p.root));

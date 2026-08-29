@@ -686,7 +686,7 @@ fn script_method_sig(
     // A one-shot parse of just the declaring file (not the cached `Workspace::parse`, which needs
     // `&mut` the analysis borrow already holds). Parameter names + defaults need the parse *tree*;
     // the index interface alone can't supply the default expressions.
-    let parsed = gd_syntax::parse(decl_src);
+    let parsed = state.workspace.parse_source(decl_src);
     let func = function_at_name_span(&parsed.tree, name_span, name)?;
     Some(vec![Sig::from_function_node(
         &parsed.tree,
