@@ -216,6 +216,14 @@ pub struct AnalysisContext<'a> {
     /// Mirrors Godot's choice to invoke `reduce_identifier_from_base` (no-access-check) from
     /// `reduce_call` rather than the standalone `reduce_identifier` (with-access-check).
     pub reducing_callee: bool,
+    /// Godot's `reduce_identifier(p_identifier, can_be_builtin)` flag (analyzer.cpp:4388), carried
+    /// on the context rather than as a parameter so `reduce_expression`'s dispatcher signature
+    /// stays identical to upstream's. `true` only while reducing the **base of a subscript**
+    /// (analyzer.cpp:4799, the single upstream site that passes it), which is what lets
+    /// `Side.NOT_EXIST` name a global enum while a bare `Side.size()` callee base — reduced
+    /// through plain `reduce_expression` (analyzer.cpp:2652) — raises
+    /// `Global enum "Side" cannot be used on its own.`
+    pub identifier_can_be_builtin: bool,
     /// Identifiers that resolved to a **native** (ClassDB) property, mapped to the native class the
     /// lookup started from — Godot's `IdentifierNode::INHERITED_VARIABLE` source plus the
     /// `scope_type.native_type` it reports. `warn_confusable_temporary_modification`
@@ -394,6 +402,7 @@ impl<'a> AnalysisContext<'a> {
             current_resolving_member: None,
             static_context: false,
             reducing_callee: false,
+            identifier_can_be_builtin: false,
             native_property_scope: FxHashMap::default(),
             current_enum: None,
             enum_element_values: FxHashMap::default(),

@@ -422,5 +422,6 @@
 # the `is_global_like` hedge was standing in for two harness gaps (#312, #313), and once those
 # were fixed the hedge came out (#300) and the file passed. The cross-file scope walk that
 # `lookup_class.gd` needs came out of the same probe (#314). Ratchet back to 1.00 with the
-# remaining entry, `enum_declaration_and_usage.gd`.
-0.99
+# remaining entry, `enum_declaration_and_usage.gd`. That file now passes too (#325), so the
+# ratchet is back at its ceiling: every eligible analyzer golden matches, both dialects.
+1.00
