@@ -255,6 +255,10 @@ fn warning_ignore_accepts_a_name_only_from_the_release_that_has_it() {
 /// `_process_doc_line`'s `[br][br]` handling is 4.7-only, and hover is where a user sees it: 4.7
 /// collapses the pair into one real paragraph break before the BBCode ever reaches the renderer,
 /// where 4.6 hands both `[br]`s through and the renderer turns each into a markdown hard break.
+///
+/// #310: the ported string keeps Godot's lone `\n` (its rich-text paragraph break), and the
+/// markdown converter widens it to a blank line — otherwise the 4.7 behavior was invisible on the
+/// wire, since a lone newline is not a paragraph break in Markdown.
 #[test]
 fn a_doc_comments_paragraph_break_renders_per_release() {
     const SRC: &str = "extends Node\n\n## First.[br][br]Second.\nvar speed := 1.0\n";
@@ -266,7 +270,7 @@ fn a_doc_comments_paragraph_break_renders_per_release() {
 
     let at_47 = hover_text_at("4.7", SRC, position);
     assert!(
-        at_47.ends_with("First.\nSecond."),
+        at_47.ends_with("First.\n\nSecond."),
         "4.7 collapses the pair into a paragraph break: {at_47:?}"
     );
     let at_46 = hover_text_at("4.6", SRC, position);

@@ -170,7 +170,43 @@ fn node_text(n: Node) -> String {
             }
         }
     }
-    buf.trim().to_owned()
+    dedent(&buf).trim().to_owned()
+}
+
+/// Godot's `String::dedent` (`core/string/ustring.cpp:4024`), which the engine's own doc tooling
+/// runs over every description before writing it out (`doc_tools.cpp:73`).
+///
+/// The class-reference XML indents a `<description>` body one level deeper than its tag, so every
+/// line but the first arrives with the block's own leading tabs still on it. A trailing `trim()`
+/// only reaches the first and last lines, and a tab-led line is a **code block** in Markdown — so a
+/// two-paragraph addon description rendered its second paragraph as code (#304). Native classes
+/// never showed it because the JSON dump arrives already de-indented.
+///
+/// The indent is the leading whitespace of the FIRST line that carries text; every later line drops
+/// as much of that prefix as it actually matches, and a whitespace-only line collapses to a bare
+/// newline.
+fn dedent(s: &str) -> String {
+    let mut indent: Option<&str> = None;
+    let mut out = String::with_capacity(s.len());
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        // Godot's `c > 32`: the first character that is not a space, tab, or control byte.
+        let Some(text_at) = line.find(|c: char| c > ' ') else {
+            continue; // whitespace-only line — the newline above is the whole of it
+        };
+        let ind = *indent.get_or_insert(&line[..text_at]);
+        // Drop the established indent only as far as this line actually reproduces it, and never
+        // past the start of its text.
+        let matched = line
+            .bytes()
+            .zip(ind.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        out.push_str(&line[matched.min(text_at)..]);
+    }
+    out
 }
 
 fn params(parent: Node) -> Vec<ArgumentDef> {
@@ -261,5 +297,52 @@ mod tests {
         assert_eq!(class.methods[0].description, "Returns the bar.");
         assert_eq!(class.properties[0].description, "An x member.");
         assert_eq!(class.signals[0].description, "Fired on ping.");
+    }
+
+    /// A multi-paragraph `<description>`, formatted exactly the way `doc/classes/*.xml` and every
+    /// addon's `doc_classes/*.xml` are: the body indented one level past its tag. Every line after
+    /// the first must arrive de-indented — a tab-led line is a code block in Markdown (#304).
+    #[test]
+    fn a_multi_paragraph_description_is_dedented() {
+        let xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>
+<class name=\"Terrain3D\" inherits=\"Node3D\">
+\t<brief_description>
+\t\tA large heightmapped surface.
+\t</brief_description>
+\t<description>
+\t\tTerrain3D draws a large heightmapped surface from region tiles.[br][br]
+\t\tAdd it to a scene, then call [method set_region_size] before any region is written.
+\t</description>
+\t<methods>
+\t\t<method name=\"set_region_size\">
+\t\t\t<return type=\"void\" />
+\t\t\t<description>
+\t\t\t\tSets the region size.[br][br]
+\t\t\t\tCall this before writing any region.
+\t\t\t</description>
+\t\t</method>
+\t</methods>
+</class>
+";
+        let class = parse_class(xml).expect("parses");
+        assert_eq!(class.brief_description, "A large heightmapped surface.");
+        assert_eq!(
+            class.description,
+            "Terrain3D draws a large heightmapped surface from region tiles.[br][br]\nAdd it to a scene, then call [method set_region_size] before any region is written."
+        );
+        assert_eq!(
+            class.methods[0].description,
+            "Sets the region size.[br][br]\nCall this before writing any region."
+        );
+    }
+
+    /// A line indented DEEPER than the block keeps the extra depth (a nested list, an example), and
+    /// a blank line stays blank. Godot's `dedent` removes the common block indent, never more.
+    #[test]
+    fn dedent_keeps_relative_indentation_and_blank_lines() {
+        assert_eq!(
+            dedent("\n\t\tone\n\n\t\t\tdeeper\n\t\ttwo\n\t"),
+            "\none\n\n\tdeeper\ntwo\n"
+        );
     }
 }
