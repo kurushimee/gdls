@@ -44,14 +44,13 @@ impl Dialect {
     /// The oldest release gdls still serves.
     pub const OLDEST: Dialect = Dialect::Godot4_6;
 
-    /// What an unspecified dialect means.
+    /// What an unspecified dialect means: the newest release gdls ports.
     ///
-    /// Pinned to [`Dialect::OLDEST`] during the 4.7 port so every existing call site, test, and
-    /// fuzz target keeps its current behavior while the 4.7 arms are written. It flips to
-    /// [`Dialect::NEWEST`] in the same change that vendors the 4.7 conformance corpus — at that
-    /// point "no dialect given" means "newest", matching what the server resolves for a project
-    /// that declares no version.
-    pub const DEFAULT: Dialect = Dialect::OLDEST;
+    /// This is what a bare `parse` / `analyze` call, a unit test, and a fuzz target get. It also
+    /// matches what the server resolves for a project whose `project.godot` declares no version at
+    /// all — which real projects never do, since Godot writes the feature list itself, so that path
+    /// also logs a notice.
+    pub const DEFAULT: Dialect = Dialect::NEWEST;
 
     /// The `major.minor` this dialect corresponds to — the shape found in `config/features`.
     #[must_use]
@@ -114,6 +113,11 @@ impl std::fmt::Display for Dialect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_is_the_newest_port() {
+        assert_eq!(Dialect::default(), Dialect::NEWEST);
+    }
 
     #[test]
     fn ordering_is_oldest_to_newest() {

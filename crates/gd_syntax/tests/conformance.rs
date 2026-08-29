@@ -15,10 +15,25 @@
 //! Ratchet (hybrid): a per-file `known_failures.txt` regression net (primary) plus an aggregate
 //! `fidelity_floor.txt` (secondary). Setting `GDLS_BLESS_CONFORMANCE=1` prints the regenerated state
 //! to stdout for a human to commit — it never writes files.
+//!
+//! ## Suites
+//!
+//! [`SUITES`] pairs a corpus tree with the dialect its goldens were generated at. The newest
+//! supported release carries the full vendored tree; an older one carries only the files whose
+//! *parse-phase* result actually differs at that tag. Every reported path is prefixed with its
+//! suite tag, so a `known_failures.txt` line names both the file and the dialect it failed under.
+//!
+//! 4.6 currently has **no** subset: the two tags' parser corpora differ only in test-harness helper
+//! calls and in files that parse cleanly at both, so no file's parse-phase result diverges. The
+//! guarded parser and lexer behaviors are pinned directly instead, in `tests/dialect_delta.rs`.
+//! Adding a subset later is a directory plus one [`SUITES`] row — see
+//! `scripts/conformance/demote_corpus.py`.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use gd_syntax::{Dialect, ParseOptions};
 
 /// What the `.out` pins about the parse phase. `None` from [`classify`] means "skip at M1".
 enum Expect {
@@ -27,6 +42,21 @@ enum Expect {
     /// `GDTEST_PARSER_ERROR` — the first parser error message must equal this string.
     ParserError(String),
 }
+
+/// One corpus tree and the dialect its `.out` goldens were generated at.
+struct Suite {
+    /// Path under `tests/conformance/`.
+    dir: &'static str,
+    /// Prefix on every reported path, so a known-failures entry names its suite.
+    tag: &'static str,
+    dialect: Dialect,
+}
+
+const SUITES: &[Suite] = &[Suite {
+    dir: "corpus/parser",
+    tag: "4.7",
+    dialect: Dialect::Godot4_7,
+}];
 
 fn conformance_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/conformance")
@@ -107,71 +137,84 @@ fn bullet_list(items: &BTreeSet<&String>) -> String {
 #[test]
 fn parse_phase_fidelity() {
     let conformance = conformance_dir();
-    let corpus = conformance.join("corpus/parser");
-    assert!(
-        corpus.is_dir(),
-        "corpus missing at {} — see PROVENANCE.md to vendor it",
-        corpus.display()
-    );
-
-    let mut gd_files = Vec::new();
-    collect_gd_files(&corpus, &mut gd_files);
-    gd_files.sort();
-    assert!(
-        !gd_files.is_empty(),
-        "no .gd files found under {}",
-        corpus.display()
-    );
 
     let mut eligible = 0usize;
     let mut matched = 0usize;
     let mut skipped = 0usize;
+    let mut total_files = 0usize;
     let mut failures: BTreeSet<String> = BTreeSet::new();
     let mut samples: Vec<String> = Vec::new();
 
-    for gd in &gd_files {
-        let name = gd.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        if name.ends_with(".notest.gd") {
-            skipped += 1;
-            continue;
-        }
+    for suite in SUITES {
+        let corpus = conformance.join(suite.dir);
+        assert!(
+            corpus.is_dir(),
+            "corpus missing at {} — see PROVENANCE.md to vendor it",
+            corpus.display()
+        );
 
-        let rel = rel_path(&corpus, gd);
-        let source = fs::read_to_string(gd).expect("read .gd source");
-        let out_path = gd.with_extension("out");
-        let out_content = fs::read_to_string(&out_path)
-            .unwrap_or_else(|_| panic!("missing .out for {rel} (expected {})", out_path.display()));
+        let mut gd_files = Vec::new();
+        collect_gd_files(&corpus, &mut gd_files);
+        gd_files.sort();
+        assert!(
+            !gd_files.is_empty(),
+            "no .gd files found under {}",
+            corpus.display()
+        );
+        total_files += gd_files.len();
 
-        let Some(expect) = classify(&out_content) else {
-            skipped += 1;
-            continue;
-        };
-
-        eligible += 1;
-        let result = gd_syntax::parse(&source);
-        let passed = match &expect {
-            // M1 emits only syntax-error diagnostics, so "no parser error" == empty set. Once the M3
-            // analyzer puts *warnings* into the same `diagnostics` vec, this must filter by severity
-            // (errors only) — otherwise every `GDTEST_OK` file carrying a `~~` warning would fail.
-            Expect::NoParserError => result.diagnostics.is_empty(),
-            Expect::ParserError(msg) => first_message(&result) == Some(msg.as_str()),
-        };
-
-        if passed {
-            matched += 1;
-        } else {
-            if samples.len() < 40 {
-                let got = match first_message(&result) {
-                    Some(m) => format!("error {m:?}"),
-                    None => "no parser error".to_string(),
-                };
-                let want = match &expect {
-                    Expect::NoParserError => "no parser error".to_string(),
-                    Expect::ParserError(m) => format!("error {m:?}"),
-                };
-                samples.push(format!("  {rel}\n      want: {want}\n      got:  {got}"));
+        for gd in &gd_files {
+            let name = gd.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name.ends_with(".notest.gd") {
+                skipped += 1;
+                continue;
             }
-            failures.insert(rel);
+
+            let rel = format!("{}/{}", suite.tag, rel_path(&corpus, gd));
+            let source = fs::read_to_string(gd).expect("read .gd source");
+            let out_path = gd.with_extension("out");
+            let out_content = fs::read_to_string(&out_path).unwrap_or_else(|_| {
+                panic!("missing .out for {rel} (expected {})", out_path.display())
+            });
+
+            let Some(expect) = classify(&out_content) else {
+                skipped += 1;
+                continue;
+            };
+
+            eligible += 1;
+            let result = gd_syntax::parse_with_options(
+                &source,
+                &ParseOptions {
+                    dialect: suite.dialect,
+                    script_path: "",
+                },
+            );
+            let passed = match &expect {
+                // M1 emits only syntax-error diagnostics, so "no parser error" == empty set. Once
+                // the M3 analyzer puts *warnings* into the same `diagnostics` vec, this must filter
+                // by severity (errors only) — otherwise every `GDTEST_OK` file carrying a `~~`
+                // warning would fail.
+                Expect::NoParserError => result.diagnostics.is_empty(),
+                Expect::ParserError(msg) => first_message(&result) == Some(msg.as_str()),
+            };
+
+            if passed {
+                matched += 1;
+            } else {
+                if samples.len() < 40 {
+                    let got = match first_message(&result) {
+                        Some(m) => format!("error {m:?}"),
+                        None => "no parser error".to_string(),
+                    };
+                    let want = match &expect {
+                        Expect::NoParserError => "no parser error".to_string(),
+                        Expect::ParserError(m) => format!("error {m:?}"),
+                    };
+                    samples.push(format!("  {rel}\n      want: {want}\n      got:  {got}"));
+                }
+                failures.insert(rel);
+            }
         }
     }
 
@@ -182,8 +225,7 @@ fn parse_phase_fidelity() {
     };
     let summary = format!(
         "parse-phase fidelity: {matched}/{eligible} = {fidelity:.4}  \
-         ({skipped} skipped, {} total .gd)",
-        gd_files.len()
+         ({skipped} skipped, {total_files} total .gd)"
     );
     println!("{summary}");
 

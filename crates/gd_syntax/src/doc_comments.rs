@@ -863,10 +863,26 @@ class Inner:
 
     #[test]
     fn comment_only_or_empty_sources_produce_empty_tables() {
-        for src in ["", "## floating doc\n", "# plain\n# comments\n"] {
-            let (_r, t) = docs(src);
-            assert!(t.is_empty(), "source {src:?} must yield no docs");
+        for d in [Dialect::Godot4_6, Dialect::Godot4_7] {
+            for src in ["", "# plain\n# comments\n"] {
+                let (_r, t) = docs_in(src, d);
+                assert!(t.is_empty(), "source {src:?} must yield no docs at {d}");
+            }
         }
+    }
+
+    /// DIALECT(4.7): a file that is *nothing but* a `##` run. The head-class doc scan runs up to
+    /// `head->end_line` when the class has no members (`gdscript_parser.cpp:845`), and that line
+    /// comes from the parser's `previous` token — which 4.7 default-constructs at line 1 instead
+    /// of line 0 (`gdscript_tokenizer.h`, see `empty_token`). So the scan reaches line 1 and picks
+    /// the comment up at 4.7, where 4.6 stopped one line short of it.
+    #[test]
+    fn a_file_of_only_doc_comments_attaches_them_to_the_head_class_only_at_4_7() {
+        let src = "## floating doc\n";
+        assert!(docs_in(src, Dialect::Godot4_6).1.is_empty());
+        let (_r, t) = docs_in(src, Dialect::Godot4_7);
+        let root = crate::parse(src).tree.root_id().expect("root");
+        assert_eq!(t.class_docs[&root].brief, "floating doc");
     }
 
     // ===============================================================================================

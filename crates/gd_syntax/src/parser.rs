@@ -5123,4 +5123,21 @@ mod tests {
             .iter()
             .any(|c| c.kind == SymbolKind::Class && c.name == "Inner"));
     }
+
+    /// `Nested typed collections are not supported.` (`gdscript_parser.cpp:3904`). Godot's own
+    /// corpus never covers this message, so it is pinned here rather than in the vendored tree.
+    #[test]
+    fn nested_typed_collections_are_rejected() {
+        for src in [
+            "var x: Array[Array[int]]",
+            "var d: Dictionary[int, Array[int]]",
+        ] {
+            let errs = crate::parse(src).diagnostics;
+            assert_eq!(
+                errs.first().map(|d| d.message.as_str()),
+                Some("Nested typed collections are not supported."),
+                "{src:?} produced {errs:?}"
+            );
+        }
+    }
 }

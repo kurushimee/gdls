@@ -1,4 +1,8 @@
-# Empty after Phase E (M5 close); all parse-phase corpus fixtures now match Godot.
+# Empty after Phase E (M5 close); all parse-phase corpus fixtures now match Godot, and still empty
+# after the corpus was re-vendored at 4.7.2 (P5).
+#
+# Each line would be `<tag>/<path>`, where the tag names the suite (see `SUITES` in conformance.rs)
+# and the path is relative to that suite's corpus root.
 #
 # Historical context (kept so future drift is easy to read against): WP-C (M1 parser port) reached
 # 181/186 = 0.9731. The remaining five fixtures lived here until M5 Phase E ported the five
