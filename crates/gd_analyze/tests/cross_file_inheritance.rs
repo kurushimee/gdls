@@ -1222,3 +1222,270 @@ fn cross_file_enum_identity_matches_the_in_file_one() {
     let result = analyze_file(&project, "res://holder2.gd", ENUM_HOLDER_GD);
     assert_eq!(error_messages(&result), Vec::<String>::new());
 }
+
+// ---------------------------------------------------------------------------------------------
+// #299: a member miss on a META script base (`ClassName.X`) is a provable negative.
+// ---------------------------------------------------------------------------------------------
+
+const META_OWNER_GD: &str = "\
+class_name MetaOwner
+extends Node
+enum Slot { WEAPON, ARMOR }
+const MAX_SLOTS := 32
+class Entry:
+\tvar count: int = 0
+var hp: int = 3
+func boost() -> void:
+\tpass
+";
+
+/// Godot 4.7.2 on this exact shape:
+///   Cannot find member "NoSuchInner" in base "MetaOwner".
+///   Cannot find member "NO_SUCH_CONST" in base "MetaOwner".
+/// gdls degraded every Script-branch miss to a silent Variant, so neither fired.
+#[test]
+fn meta_script_base_member_miss_is_an_error() {
+    let project = Project::new(&[("res://owner.gd", META_OWNER_GD), ("res://user.gd", "")]);
+    let src = "\
+extends Node
+func a() -> void:
+\tprint(MetaOwner.NO_SUCH_CONST)
+func b() -> void:
+\tvar x = MetaOwner.NoSuchInner.new()
+\tprint(x)
+";
+    let result = analyze_file(&project, "res://user.gd", src);
+    let errs = error_messages(&result);
+    assert!(
+        errs.iter()
+            .any(|m| m == r#"Cannot find member "NO_SUCH_CONST" in base "MetaOwner"."#),
+        "missing the const miss; got {errs:?}"
+    );
+    assert!(
+        errs.iter()
+            .any(|m| m == r#"Cannot find member "NoSuchInner" in base "MetaOwner"."#),
+        "missing the inner-class miss; got {errs:?}"
+    );
+}
+
+/// Every real member of the same class must stay silent — the negative may only fire on a name
+/// the chain genuinely does not carry.
+#[test]
+fn meta_script_base_real_members_stay_clean() {
+    let project = Project::new(&[("res://owner.gd", META_OWNER_GD), ("res://user.gd", "")]);
+    let src = "\
+extends Node
+func a() -> void:
+\tprint(MetaOwner.MAX_SLOTS)
+\tprint(MetaOwner.Slot)
+\tprint(MetaOwner.Slot.WEAPON)
+\tvar e = MetaOwner.Entry.new()
+\tprint(e)
+\tvar o = MetaOwner.new()
+\tprint(o)
+";
+    let result = analyze_file(&project, "res://user.gd", src);
+    assert!(
+        error_messages(&result).is_empty(),
+        "real members must not error; got {:?}",
+        error_messages(&result)
+    );
+}
+
+/// A member inherited from the chain's own script base, and one from the chain's NATIVE root,
+/// must both count as present.
+#[test]
+fn meta_script_base_inherited_members_stay_clean() {
+    let project = Project::new(&[
+        ("res://base.gd", BASE_GD),
+        (
+            "res://derived.gd",
+            "class_name DerivedThing\nextends BaseThing\nconst OWN := 1\n",
+        ),
+        ("res://user.gd", ""),
+    ]);
+    let src = "\
+extends Node
+func a() -> void:
+\tprint(DerivedThing.OWN)
+\tprint(DerivedThing.SPEED)
+";
+    let result = analyze_file(&project, "res://user.gd", src);
+    assert!(
+        error_messages(&result).is_empty(),
+        "inherited members must not error; got {:?}",
+        error_messages(&result)
+    );
+}
+
+/// The soundness gate: when the chain cannot be fully walked the miss is gdls's view, not the
+/// user's code, so it must stay silent. `Mystery` extends a class no interface is registered for.
+#[test]
+fn meta_script_base_miss_stays_silent_when_the_chain_is_unresolvable() {
+    let project = Project::new(&[
+        (
+            "res://mystery.gd",
+            "class_name Mystery\nextends SomeUnknownForkClass\nconst OWN := 1\n",
+        ),
+        ("res://user.gd", ""),
+    ]);
+    let src = "\
+extends Node
+func a() -> void:
+\tprint(Mystery.NO_SUCH_CONST)
+";
+    let result = analyze_file(&project, "res://user.gd", src);
+    assert!(
+        error_messages(&result).is_empty(),
+        "an unresolvable chain must stay permissive; got {:?}",
+        error_messages(&result)
+    );
+}
+
+/// An INSTANCE base keeps Godot's dynamic-lookup semantics: no error, only the existing
+/// UNSAFE_PROPERTY_ACCESS warning (#256). The new arm must not leak onto this path.
+#[test]
+fn instance_script_base_member_miss_stays_a_warning() {
+    let project = Project::new(&[("res://owner.gd", META_OWNER_GD), ("res://user.gd", "")]);
+    let src = "\
+extends Node
+func a() -> void:
+\tvar o := MetaOwner.new()
+\tprint(o.no_such_property)
+";
+    let result = analyze_file(&project, "res://user.gd", src);
+    assert!(
+        error_messages(&result).is_empty(),
+        "an instance miss must not be an error; got {:?}",
+        error_messages(&result)
+    );
+}
+
+/// The type-annotation half of #299. Godot 4.7.2:
+///   Could not find type "NoSuchType" under base "MetaOwner".
+#[test]
+fn qualified_type_annotation_miss_is_an_error() {
+    let project = Project::new(&[("res://owner.gd", META_OWNER_GD), ("res://user.gd", "")]);
+    let src = "\
+extends Node
+func a() -> void:
+\tvar y: MetaOwner.NoSuchType = null
+\tprint(y)
+";
+    let result = analyze_file(&project, "res://user.gd", src);
+    let errs = error_messages(&result);
+    assert!(
+        errs.iter()
+            .any(|m| m == r#"Could not find type "NoSuchType" under base "MetaOwner"."#),
+        "got {errs:?}"
+    );
+}
+
+/// Every real nested type must keep resolving — including an enum and an inner class reached
+/// through an inner class, and both inherited from a script base.
+#[test]
+fn qualified_type_annotation_real_nested_types_stay_clean() {
+    let project = Project::new(&[
+        (
+            "res://nest.gd",
+            "class_name Nest\nextends Node\nenum Top { A }\nclass Mid:\n\tenum Deep { B }\n\tclass Leaf:\n\t\tvar v: int = 0\n",
+        ),
+        (
+            "res://nestchild.gd",
+            "class_name NestChild\nextends Nest\nconst OWN := 1\n",
+        ),
+        ("res://user.gd", ""),
+    ]);
+    let src = "\
+extends Node
+func a() -> void:
+\tvar t: Nest.Top = Nest.Top.A
+\tvar m: Nest.Mid = null
+\tvar d: Nest.Mid.Deep = Nest.Mid.Deep.B
+\tvar l: Nest.Mid.Leaf = null
+\tvar i: NestChild.Top = NestChild.Top.A
+\tprint(t, m, d, l, i)
+";
+    let result = analyze_file(&project, "res://user.gd", src);
+    assert!(
+        error_messages(&result).is_empty(),
+        "real nested types must not error; got {:?}",
+        error_messages(&result)
+    );
+}
+
+/// The same soundness gate as the member arm: an unresolvable chain stays permissive.
+#[test]
+fn qualified_type_annotation_miss_stays_silent_when_the_chain_is_unresolvable() {
+    let project = Project::new(&[
+        (
+            "res://mystery.gd",
+            "class_name Mystery\nextends SomeUnknownForkClass\nconst OWN := 1\n",
+        ),
+        ("res://user.gd", ""),
+    ]);
+    let src = "\
+extends Node
+func a() -> void:
+\tvar y: Mystery.NoSuchType = null
+\tprint(y)
+";
+    let result = analyze_file(&project, "res://user.gd", src);
+    assert!(
+        error_messages(&result).is_empty(),
+        "an unresolvable chain must stay permissive; got {:?}",
+        error_messages(&result)
+    );
+}
+
+/// A companion to `qualified_type_annotation_real_nested_types_stay_clean`, which on its own
+/// cannot tell "resolved" from "silently degraded to Variant" — both produce zero errors. Here an
+/// int is assigned to each nested type, so the annotation MUST have resolved for the assignment
+/// check to reject it. Guards against the miss-is-an-error arm being reached by a real type.
+#[test]
+fn qualified_type_annotations_actually_resolve_not_just_degrade() {
+    let project = Project::new(&[
+        (
+            "res://nest.gd",
+            "class_name Nest\nextends Node\nenum Top { A }\nclass Mid:\n\tenum Deep { B }\n\tclass Leaf:\n\t\tvar v: int = 0\n",
+        ),
+        (
+            "res://nestchild.gd",
+            "class_name NestChild\nextends Nest\nconst OWN := 1\n",
+        ),
+        ("res://user.gd", ""),
+    ]);
+    for (annotation, label) in [
+        ("Nest.Mid", "head inner class"),
+        ("Nest.Mid.Leaf", "inner class under an inner class"),
+        ("NestChild.Mid", "inner class inherited from a script base"),
+    ] {
+        let src =
+            format!("extends Node\nfunc a() -> void:\n\tvar x: {annotation} = 1\n\tprint(x)\n");
+        let result = analyze_file(&project, "res://user.gd", &src);
+        let errs = error_messages(&result);
+        assert!(
+            errs.iter().any(|m| m.contains("Cannot assign")),
+            "{label} (`{annotation}`) did not resolve — an int assignment was accepted; got {errs:?}"
+        );
+        assert!(
+            !errs.iter().any(|m| m.contains("Could not find type")),
+            "{label} (`{annotation}`) wrongly reported as absent; got {errs:?}"
+        );
+    }
+    // Enum leaves: assigning an int to an enum-typed var is the same discriminator.
+    for (annotation, label) in [
+        ("Nest.Top", "head enum"),
+        ("Nest.Mid.Deep", "enum under an inner class"),
+        ("NestChild.Top", "enum inherited from a script base"),
+    ] {
+        let src =
+            format!("extends Node\nfunc a() -> void:\n\tvar x: {annotation} = \"s\"\n\tprint(x)\n");
+        let result = analyze_file(&project, "res://user.gd", &src);
+        let errs = error_messages(&result);
+        assert!(
+            errs.iter().any(|m| m.contains("Cannot assign")),
+            "{label} (`{annotation}`) did not resolve — a String assignment was accepted; got {errs:?}"
+        );
+    }
+}
