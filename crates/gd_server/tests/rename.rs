@@ -1987,13 +1987,14 @@ fn rename_180_root_and_inner_same_named_enum_value_stay_distinct() {
 }
 
 #[test]
-fn rename_refuses_cross_file_enum_value() {
-    // A cross-file enum value (`Lib.Dir.NORTH`, where `enum Dir { NORTH }` is declared in lib.gd)
-    // currently REFUSES: the analyzer records no positive in-file anchor for it (the cross-file enum
-    // metatype carries `script_type`, not `class_node`, so reduce_identifier_from_base records no
-    // `EnumValueLocal` binding) — so the fail-closed firewall refuses rather than raw-scan-and-edit.
-    // This is the documented #106 boundary (in-file enum values only); refusing is safe (no
-    // corruption), and admitting cross-file would require an anchor the analyzer does not yet carry.
+fn rename_from_a_cross_file_enum_value_use_edits_the_declaration_too() {
+    // #331: a cross-file enum value (`Lib.Dir.NORTH`, declared in lib.gd) renames from the USE
+    // site, edit-for-edit identical to renaming from the declaration. This used to refuse — the
+    // `EnumValueLocal` binding carries the declaring file and the qualified `"Dir.NORTH"`, but the
+    // classifier demanded the declaration token be in the CURRENT tree, so a cross-file cursor fell
+    // through to the fail-closed residue. It now carries `decl_ident: None` and resolves the
+    // declaration through the declaring file instead; the collection identity
+    // (`decl_file`, `class_path`, `qualified`) never depended on which file the cursor was in.
     let project = common::sample_project();
     project.write(
         "src/lib.gd",
@@ -2012,17 +2013,54 @@ fn rename_refuses_cross_file_enum_value() {
         2,
     );
     let use_uri = file_uri(&project.root.join("src/use.gd"));
+    let lib_uri = file_uri(&project.root.join("src/lib.gd"));
     // `Lib.Dir.NORTH` on line 3: tab(0) `var d = `(1-8) `Lib`(9-11) `.`(12) `Dir`(13-15) `.`(16)
     // `NORTH`(17). Click `NORTH` at col 17.
-    assert_rename_refused(&client, 205, &use_uri, 3, 17, "UP");
+    client
+        .sender
+        .send(request(
+            205,
+            "textDocument/rename",
+            rename_params(&use_uri, 3, 17, "UP"),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "got error {:?}", resp.error);
+    let edit: WorkspaceEdit =
+        serde_json::from_value(resp.result.expect("a WorkspaceEdit")).unwrap();
+    let mut got: Vec<(String, u32, u32)> = flatten_edit(&edit)
+        .set
+        .iter()
+        .map(|(u, r)| (u.clone(), r.start.line, r.start.character))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (lib_uri.as_str().to_owned(), 3, 11),
+            (use_uri.as_str().to_owned(), 3, 17),
+        ],
+        "the declaration in lib.gd and the use in use.gd, and nothing else"
+    );
+    // `SOUTH`, the sibling value, must be untouched — the identity is the qualified `"Dir.NORTH"`.
+    assert!(
+        !flatten_edit(&edit)
+            .set
+            .iter()
+            .any(|(u, r)| *u == lib_uri.as_str() && r.start.character == 18),
+        "the sibling value `SOUTH` must never be edited"
+    );
     shutdown(&client, server);
 }
 
 #[test]
 fn rename_cross_file_enum_value_does_not_retarget_same_named_local_symbol() {
-    // CORRUPTION GUARD (the dangerous cross-file case): `Lib.Dir.NORTH` clicked WHILE the current file
-    // ALSO declares a `const NORTH`. The rename must REFUSE (the cross-file enum value has no positive
-    // anchor) — it must NOT silently retarget to the local `const NORTH` and rename that instead.
+    // CORRUPTION GUARD (the dangerous cross-file case): `Lib.Dir.NORTH` clicked WHILE the current
+    // file ALSO declares a `const NORTH`. Since #331 the rename SUCCEEDS on the enum value, so the
+    // guard is sharper than it was under the old refusal: the edit set must be exactly the enum
+    // value's two sites, and must NOT contain the `const NORTH` declaration or its bare use. That
+    // holds by construction — collection is keyed on `(decl_file, class_path, "Dir.NORTH")`
+    // `EnumValueLocal` bindings, and neither the const nor its use records one.
     let project = common::sample_project();
     project.write(
         "src/lib.gd",
@@ -2042,7 +2080,7 @@ fn rename_cross_file_enum_value_does_not_retarget_same_named_local_symbol() {
     );
     let use_uri = file_uri(&project.root.join("src/use.gd"));
     // `Lib.Dir.NORTH` on line 5: tab(0) `var d = `(1-8) `Lib`(9-11) `.`(12) `Dir`(13-15) `.`(16)
-    // `NORTH`(17). Click the cross-file enum value `NORTH` at col 17 — must refuse, ZERO edits.
+    // `NORTH`(17). Click the cross-file enum value `NORTH` at col 17.
     client
         .sender
         .send(request(
@@ -2053,11 +2091,27 @@ fn rename_cross_file_enum_value_does_not_retarget_same_named_local_symbol() {
         .unwrap();
     let resp = recv_response(&client);
     assert!(
-        resp.error.is_some() && resp.result.is_none(),
-        "a cross-file enum value must REFUSE with zero edits (never retarget the local `const NORTH`); \
-         got result={:?} error={:?}",
-        resp.result,
+        resp.error.is_none(),
+        "a cross-file enum value renames by identity (#331); got error={:?}",
         resp.error
+    );
+    let lib_uri = file_uri(&project.root.join("src/lib.gd"));
+    let edit: WorkspaceEdit =
+        serde_json::from_value(resp.result.expect("a WorkspaceEdit")).unwrap();
+    let mut got: Vec<(String, u32, u32)> = flatten_edit(&edit)
+        .set
+        .iter()
+        .map(|(u, r)| (u.clone(), r.start.line, r.start.character))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (lib_uri.as_str().to_owned(), 3, 11),
+            (use_uri.as_str().to_owned(), 5, 17),
+        ],
+        "THE GUARD: the enum value's declaration and its one qualified use — never the `const \
+         NORTH` declaration (2, 6) and never its bare use (6, 12)"
     );
     shutdown(&client, server);
 }
@@ -2284,12 +2338,13 @@ fn rename_cross_file_class_name_enum_value_decoy_matrix_is_occurrence_positive()
 }
 
 #[test]
-fn rename_cross_file_enum_value_colliding_with_class_name_refuses() {
+fn rename_cross_file_enum_value_colliding_with_class_name_renames_only_the_value() {
     // CORRUPTION GUARD (fusion-found, pre-existing signal-3 leak): a cross-file enum value whose name
-    // collides with a project `class_name` must REFUSE — it must NOT silently rename the unrelated
-    // class project-wide. Before the fix, the name-only signal-3 (`find_global_class_definition`)
-    // admitted the cursor and `definition`'s name-only class fallback canonicalized onto the class,
-    // so `references` rewrote `class_name Idle` instead of the enum value.
+    // collides with a project `class_name` must rename THE VALUE — and must never touch the unrelated
+    // class. The original leak was the name-only signal-3 (`find_global_class_definition`) admitting
+    // the cursor while `definition`'s name-only class fallback canonicalized onto the class, so
+    // `references` rewrote `class_name Idle`. That was contained by refusing outright; since #331 the
+    // cross-file value renames by identity, so the guard is now the exact edit set.
     //   anim.gd:  `class_name Foo` + `enum AnimState { Idle, Walk }`
     //   idle.gd:  `class_name Idle` (the unrelated state class that must NOT be touched)
     //   use.gd:   `return Foo.AnimState.Idle`  (the cross-file enum value the user clicks)
@@ -2311,11 +2366,11 @@ fn rename_cross_file_enum_value_colliding_with_class_name_refuses() {
         &["src/anim.gd", "src/idle.gd", "src/use.gd"],
         2,
     );
+    let anim_uri = file_uri(&project.root.join("src/anim.gd"));
     let use_uri = file_uri(&project.root.join("src/use.gd"));
     let idle_uri = file_uri(&project.root.join("src/idle.gd"));
     // `Foo.AnimState.Idle` on line 3: tab(0) `return `(1-7) `Foo`(8-10) `.`(11) `AnimState`(12-20)
-    // `.`(21) `Idle`(22). Click the cross-file enum value `Idle` at col 22 — must REFUSE, zero edits,
-    // and NEVER rewrite `class_name Idle`.
+    // `.`(21) `Idle`(22). Click the cross-file enum value `Idle` at col 22.
     client
         .sender
         .send(request(
@@ -2326,25 +2381,34 @@ fn rename_cross_file_enum_value_colliding_with_class_name_refuses() {
         .unwrap();
     let resp = recv_response(&client);
     assert!(
-        resp.result.is_none(),
-        "a cross-file enum value colliding with a `class_name` must REFUSE with zero edits (never \
-         rename the unrelated `class_name Idle`); got result={:?}",
-        resp.result
+        resp.error.is_none(),
+        "a cross-file enum value renames by identity (#331); got error={:?}",
+        resp.error
+    );
+    let edit: WorkspaceEdit =
+        serde_json::from_value(resp.result.expect("a WorkspaceEdit")).unwrap();
+    let view = flatten_edit(&edit);
+    let mut got: Vec<(String, u32, u32)> = view
+        .set
+        .iter()
+        .map(|(u, r)| (u.clone(), r.start.line, r.start.character))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            // `enum AnimState { Idle, Walk }`: `enum `(0-4) `AnimState`(5-13) ` {`(14-15) ` `(16)
+            // `Idle`(17).
+            (anim_uri.as_str().to_owned(), 3, 17),
+            (use_uri.as_str().to_owned(), 3, 22),
+        ],
+        "THE GUARD: the enum value's declaration and its one qualified use — never `class_name Idle`"
     );
     assert!(
-        resp.error.is_some(),
-        "the refusal must be a typed error, not a silent null"
+        !view.set.iter().any(|(u, _)| *u == idle_uri.as_str()),
+        "the `class_name Idle` declaration must NEVER be edited by an enum-value rename: {:?}",
+        view.set
     );
-    // Belt-and-suspenders: even if some result existed, the idle.gd class declaration must be absent.
-    if let Some(v) = resp.result.as_ref() {
-        let edit: WorkspaceEdit = serde_json::from_value(v.clone()).unwrap();
-        let view = flatten_edit(&edit);
-        assert!(
-            !view.set.iter().any(|(u, _)| *u == idle_uri.as_str()),
-            "the `class_name Idle` declaration must NEVER be edited by an enum-value rename: {:?}",
-            view.set
-        );
-    }
     shutdown(&client, server);
 }
 
@@ -5221,11 +5285,13 @@ fn rename_cons_sites(
 }
 
 #[test]
-fn rename_181_qualified_enum_suffix_with_colliding_local_var_refuses_never_local() {
+fn rename_181_qualified_enum_suffix_edits_only_the_enum_value_never_the_colliding_local() {
     // THE #181 reproducer. `Foo.Direction.NORTH` use-click with a colliding `var NORTH := 2` in
-    // scope: the cross-file enum value cannot project-anchor (the documented #158 cross-file boundary
-    // — it records no `class_node`), so the firewall REFUSES. The load-bearing invariant: it must
-    // NEVER edit the local `var NORTH` decl (line 2) or its uses (lines 4, 5).
+    // scope. The cross-file enum value now anchors (#331) and renames by identity; the load-bearing
+    // invariant is unchanged and is what this test is really for: the local `var NORTH` decl
+    // (line 2) and its uses (lines 4, 5) must NEVER be edited. Collection is keyed on
+    // `(decl_file, class_path, "Direction.NORTH")` `EnumValueLocal` bindings, and a local records
+    // none — so it is excluded by construction, not by a name filter.
     let (err, sites) = rename_cons_sites(
         Some("class_name Foo\nextends Node\nenum Direction { NORTH, SOUTH }\n"),
         // line0 extends; line1 func; line2 `\tvar NORTH := 2`; line3 `\tvar a = Foo.Direction.NORTH`;
@@ -5238,13 +5304,12 @@ fn rename_181_qualified_enum_suffix_with_colliding_local_var_refuses_never_local
         "UP",
         300,
     );
-    assert!(
-        err,
-        "the cross-file enum-value suffix cannot project-anchor → must REFUSE (the #158 boundary)"
-    );
-    assert!(
-        sites.is_empty(),
-        "REFUSE means ZERO edits — the colliding local `var NORTH` must NOT be touched: {sites:?}"
+    assert!(!err, "a cross-file enum value renames by identity (#331)");
+    assert_eq!(
+        sites,
+        vec![(3, 23)],
+        "only the qualified suffix in this file is edited — never the local `var NORTH` decl (2, 5) \
+         or its bare uses (4, 9) / (5, 14)"
     );
 }
 
@@ -5310,10 +5375,10 @@ fn rename_181_obj_member_attr_with_colliding_local_param_renames_member_never_lo
 }
 
 #[test]
-fn rename_181_qualified_enum_suffix_with_colliding_for_iter_refuses_never_local() {
+fn rename_181_qualified_enum_suffix_never_touches_a_colliding_for_iterator() {
     // Qualified `Foo.Direction.NORTH` suffix click with a colliding `for NORTH in ...` iterator in
-    // scope. Same as the var case: cross-file enum value refuses; the `for` iterator binding (decl +
-    // body uses) is NEVER touched.
+    // scope. Same shape as the var case: the enum value renames by identity (#331) and the `for`
+    // iterator binding — decl and body uses alike — is never touched.
     let (err, sites) = rename_cons_sites(
         Some("class_name Foo\nextends Node\nenum Direction { NORTH, SOUTH }\n"),
         // line0 extends; line1 func; line2 `\tfor NORTH in [1, 2]:`; line3 `\t\tprint(NORTH)`;
@@ -5326,13 +5391,12 @@ fn rename_181_qualified_enum_suffix_with_colliding_for_iter_refuses_never_local(
         "UP",
         303,
     );
-    assert!(
-        err,
-        "cross-file enum-value suffix refuses (the #158 boundary)"
-    );
-    assert!(
-        sites.is_empty(),
-        "REFUSE → zero edits; the colliding `for NORTH` iterator must NOT be touched: {sites:?}"
+    assert!(!err, "a cross-file enum value renames by identity (#331)");
+    assert_eq!(
+        sites,
+        vec![(4, 23)],
+        "only the qualified suffix is edited — never the `for NORTH` iterator decl (2, 5) or its \
+         body use (3, 8)"
     );
 }
 
