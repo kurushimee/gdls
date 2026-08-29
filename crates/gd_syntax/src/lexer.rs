@@ -9,6 +9,7 @@
 //! keep a parallel byte-offset table so every token also carries a [`ByteSpan`] for LSP ranges.
 //! `column` is 1-based and tab-expanded exactly as Godot does, for `(line, column)` fidelity.
 
+use crate::dialect::Dialect;
 use crate::span::{ByteSpan, LineCol, LineColRange};
 use crate::token::{Literal, Token, TokenKind};
 
@@ -199,6 +200,9 @@ pub struct CommentData {
 
 /// The GDScript lexer. Drive it with [`Lexer::scan`] until it returns [`TokenKind::Eof`].
 pub struct Lexer {
+    /// The Godot feature release whose tokenizer semantics are in force. See [`Dialect`] for the
+    /// `DIALECT(...)` guard convention.
+    dialect: Dialect,
     chars: Vec<char>,
     /// `byte_offsets[i]` is the byte offset of `chars[i]`; `byte_offsets[len]` is the total length.
     byte_offsets: Vec<usize>,
@@ -231,7 +235,13 @@ pub struct Lexer {
 }
 
 impl Lexer {
+    /// A lexer at [`Dialect::DEFAULT`]. Prefer [`Self::new_with_dialect`] anywhere the project's
+    /// dialect is known.
     pub fn new(source: &str) -> Self {
+        Self::new_with_dialect(source, Dialect::DEFAULT)
+    }
+
+    pub fn new_with_dialect(source: &str, dialect: Dialect) -> Self {
         let chars: Vec<char> = source.chars().collect();
         let mut byte_offsets = Vec::with_capacity(chars.len() + 1);
         let mut acc = 0usize;
@@ -241,6 +251,7 @@ impl Lexer {
         }
         byte_offsets.push(acc);
         Self {
+            dialect,
             chars,
             byte_offsets,
             pos: 0,
@@ -263,6 +274,12 @@ impl Lexer {
             errors: Vec::new(),
             comments: std::collections::HashMap::new(),
         }
+    }
+
+    /// The dialect this lexer tokenizes under.
+    #[must_use]
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
     }
 
     /// Suppress newlines/indentation while parsing inside `()[]{}` or a lambda (parser-driven).
@@ -1404,7 +1421,12 @@ impl Lexer {
 /// (`gd_server`) is its first consumer.
 #[must_use]
 pub fn tokenize(source: &str) -> (Vec<Token>, Vec<LexError>) {
-    let mut lx = Lexer::new(source);
+    tokenize_with_dialect(source, Dialect::DEFAULT)
+}
+
+/// [`tokenize`] under an explicit dialect.
+pub fn tokenize_with_dialect(source: &str, dialect: Dialect) -> (Vec<Token>, Vec<LexError>) {
+    let mut lx = Lexer::new_with_dialect(source, dialect);
     let mut tokens = Vec::new();
     loop {
         let t = lx.scan();
