@@ -149,10 +149,11 @@ The analyzer resolves every call expression during reduce (`gd_analyze::reducer`
 ### 7.4 `workspace/symbol`: fuzzy match over the registry plus interface tables
 
 1. Flatten `ClassNameRegistry.iter()` to a `(name, kind=Class, location)` list.
-2. Flatten `Index.interfaces.iter()` to per-file member tuples `(name, kind ∈ {Function, Constant, Variable, Signal, Enum}, location, containerName=class_name)`.
-3. Fuzzy-match the union via `nucleo-matcher`.
-4. Order by prefix match on class name, then prefix match on member name, then fuzzy score.
-5. Cap at 256 results, to bound latency on projects with 10k+ symbols. An empty query returns everything, capped.
+2. Flatten `Index.interfaces.iter()` to per-file member tuples `(name, kind ∈ {Function, Constant, Variable, Signal, Enum}, location, containerName=class_name)`. The walk recurses through `Interface.inner`, so an inner class is its own `Class` row and its members carry the dotted container (`Inventory.Entry`), and each named enum contributes its values as `EnumMember` rows under the enum. What `documentSymbol` lists for a file, `workspace/symbol` finds project-wide.
+3. Add the autoload singletons whose script declares no `class_name`. The name is a project-wide global that `definition` and `hover` already resolve, and no registry entry covers it; a script that does declare a `class_name` is already a registry row under that name, and a non-`*` autoload is not a global in Godot at all.
+4. Fuzzy-match the union via `nucleo-matcher`.
+5. Order by prefix match on class name, then prefix match on member name, then fuzzy score.
+6. Cap at 256 results, to bound latency on projects with 10k+ symbols. An empty query returns everything, capped.
 
 If the client advertises `workspace.symbol.resolveSupport`, gdls returns `WorkspaceSymbol[]` with no `range`, resolved on demand via `workspaceSymbol/resolve`. Otherwise it returns `SymbolInformation[]` with the full `Location` up front.
 
