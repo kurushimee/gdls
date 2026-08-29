@@ -2,7 +2,7 @@
   "_comment": [
     "Filled M6 acceptance session for Pixelorama (https://github.com/Orama-Interactive/Pixelorama),",
     "a 243-file GDScript-only Godot 4.x project compatible with 4.6.3. Built per",
-    "scripts/m6-acceptance/README.md from walk.json; positions verified against the M6 OSS",
+    "scripts/acceptance/README.md from walk.json; positions verified against the M6 OSS",
     "acceptance walk. __PROJECT_ROOT__ / __EXTENSION_API__ are substituted by run.sh.",
     "Targets: hover/references on `cel.on_remove()` (cel: BaseCel, cross-file via typed var),",
     "definition on `AnimationTag` in expression position, on a preload(\"res://….gd\") string,",

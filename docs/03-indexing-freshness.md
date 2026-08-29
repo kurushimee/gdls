@@ -1,374 +1,214 @@
-# 03 — Symbol environment, project indexing, incrementalism, and freshness
+# 03. Symbol environment, project indexing, incrementalism, and freshness
 
-This is where the two "scariest" requirements (native classes, and live recognition of
-class changes) are solved — and where they turn out to be the *easy* parts of this design.
+Two requirements sound scary up front, recognizing every native class and noticing class changes live, and both turn out to be small well-understood components. This is where they live.
 
-## 1. Native class DB (`gd_types`) — engine classes
+## 1. Native class DB (`gd_types`): engine classes
 
-**Source:** `extension_api.json`, produced by running the **godot binary** once:
+The source is `extension_api.json`, produced by running the godot binary once:
 
 ```
-godot --dump-extension-api
+godot --dump-extension-api-with-docs
 ```
 
-Because the dump iterates `ClassDB`, **every class Godot registers** (via the normal
-`ClassDB`/`GDREGISTER_CLASS` path) **appears automatically** — no C++ parsing required. This is the canonical
-way to feed custom native classes to an external analyzer.
+Because the dump iterates `ClassDB`, every class Godot registers through the normal `ClassDB`/`GDREGISTER_CLASS` path appears automatically, with no C++ parsing. This is the canonical way to feed custom native classes to an external analyzer.
 
-> **Scope note:** the dump is a snapshot of whatever is registered in `ClassDB` *at the moment it runs*. A
-> bare-binary dump therefore contains engine classes but **not** third-party GDExtensions installed in
-> the project — those are handled in §2.
+> **Scope note:** the dump snapshots whatever is registered in `ClassDB` at the moment it runs. A bare-binary dump therefore contains engine classes but not third-party GDExtensions installed in the project. Those are handled in §2.
 
-**Consumed fields** (per class): `name`, `inherits` (→ full inheritance chains), `methods` (each with
-`name`, `arguments` [name/type/default], `return_value` type, and flags `is_const` / `is_static` /
-`is_virtual` / `is_vararg`), `properties`, `signals`, `enums`, `constants`. Plus builtin/Variant classes,
-global enums, and utility functions. This is exactly the signature/return/virtual/inheritance information
-the analyzer and `hover` need.
+**Consumed fields**, per class: `name`, `inherits` (which gives full inheritance chains), `methods` (each with `name`, `arguments` carrying name, type, and default, `return_value` type, and the `is_const`, `is_static`, `is_virtual`, `is_vararg` flags), `properties`, `signals`, `enums`, `constants`, plus the `description` and `brief_description` prose. Plus builtin and Variant classes, global enums, and utility functions. That is exactly the signature, return, virtual, inheritance, and documentation information the analyzer, hover, and completion need.
 
-**Build structures:** an interned class graph and per-class method/property/signal tables for O(1) lookup.
+**Structures:** an interned class graph plus per-class method, property, and signal tables for O(1) lookup.
 
-**Versioning & reload:** store the dump's version header and a content hash. The watcher reloads the DB when
-the file changes (i.e., after you rebuild the engine). If the file is **absent**, degrade gracefully: treat
-native types as unknown/dynamic and surface one informational notice — never crash.
+**Versioning and reload:** the DB stores the dump's version header and a content hash. The watcher reloads it when the file changes, which is to say after an engine rebuild. If the file is absent, resolution degrades gracefully per the provenance rules in `02-frontend-port.md` §11b: types stay dynamic, one informational notice goes out, and nothing crashes.
 
-**Auto-dump (v1.0.1 — the user does nothing).** When `extensionApiPath` is NOT set, gdls manages the
-dump itself: discover a Godot binary (`godotBinaryPath` option → `GDLS_GODOT` env, where empty/`off`
-hard-disables → `godot4`/`godot` on PATH), run
-`godot --headless --path <root> --dump-extension-api-with-docs` at session startup, and keep the result
-plus staleness metadata (binary path+size+mtime, the project's `.gdextension` file set) under `.gdls/`.
-Operational facts the implementation is built around (verified on 4.6.3): the dump lands in the
-**project root** regardless of the child's cwd (so a pre-existing user `<root>/extension_api.json`
-suppresses the dump entirely — never clobber — and the fresh output is moved into
-`.gdls/extension_api.json`); Godot may abort on exit *after* writing a complete dump, so the artifact
-decides, never the exit status; and a **never-imported** project (no `.godot/extension_list.cfg`) loads
-no GDExtensions, so its dump misses their classes — gdls detects the symptom (declared extensions, none
-of their class hints resolving) and logs the remediation (open the project in the editor once). The
-resolution ladder when no explicit path is set: fresh `.gdls` dump → auto-dump → stale `.gdls` dump →
-unmanaged `<root>/extension_api.json` → empty/dynamic. Spawning happens only at session startup, only
-for real projects (`project.godot` present), with the child's stdout/stderr piped (stdout is the LSP
-wire) and a 5 min kill-timeout (off the critical path since v1.0.2, so the budget is deliberately
-generous — and a deadline-killed dump that already wrote its artifact is still adopted).
+**Auto-dump, where the user does nothing.** When `extensionApiPath` is not set, gdls manages the dump itself. It discovers a Godot binary (`godotBinaryPath` option, then the `GDLS_GODOT` env var where empty or `off` hard-disables, then `godot4`/`godot` on `PATH`), runs `godot --headless --path <root> --dump-extension-api-with-docs` at session startup, and keeps the result plus staleness metadata (binary path, size and mtime, and the project's `.gdextension` file set) under `.gdls/`.
 
-**Manual workflow (auto-dump disabled or no binary):** after rebuilding Godot, re-run
-`--dump-extension-api-with-docs` from inside the project and point gdls at the JSON via
-`initializationOptions.extensionApiPath` (an explicit path always wins and never triggers a spawn).
+Operational facts the implementation is built around, verified on 4.6.3:
 
-> Alternative source considered: `doc/classes/*.xml`. Rejected as primary for engine classes because it
-> is doc-oriented and Godot's classes need their own `doc_classes` XML to appear; `extension_api.json` is
-> complete by construction. (Doc XML *is* used for GDExtensions — see §2.)
+- The dump lands in the project root regardless of the child's cwd. So a pre-existing user `<root>/extension_api.json` suppresses the dump entirely (never clobber it), and the fresh output is moved into `.gdls/extension_api.json`.
+- Godot may abort on exit *after* writing a complete dump, so the artifact decides, never the exit status.
+- A never-imported project (no `.godot/extension_list.cfg`) loads no GDExtensions, so its dump misses their classes. gdls detects the symptom (declared extensions, none of their class hints resolving) and logs the remediation: open the project in the editor once.
+
+The resolution ladder when no explicit path is set: fresh `.gdls` dump, then auto-dump, then stale `.gdls` dump, then unmanaged `<root>/extension_api.json`, then the embedded stock surface, then empty and dynamic. Spawning happens only at session startup, only for real projects (`project.godot` present), with the child's stdout and stderr piped (stdout is the LSP wire) and a 5 minute kill-timeout. The dump runs on a background thread and is adopted mid-session, so the budget is deliberately generous, and a deadline-killed dump that already wrote its artifact is still adopted.
+
+**Manual workflow**, when auto-dump is disabled or no binary is found: after rebuilding Godot, re-run `--dump-extension-api-with-docs` from inside the project and point gdls at the JSON with `initializationOptions.extensionApiPath`. An explicit path always wins and never triggers a spawn.
+
+> `doc/classes/*.xml` was considered and rejected as the primary source for engine classes. It is doc-oriented, and a Godot class needs its own `doc_classes` XML to appear at all, whereas `extension_api.json` is complete by construction. Doc XML *is* used for GDExtensions; see §2.
 
 ## 2. Third-party GDExtensions installed in the project
 
-GDExtension classes (addons providing native `.dll`/`.so`/`.dylib` classes) are registered into `ClassDB`
-only when their library is **loaded**, after which they are *indistinguishable from core classes* and the
-editor autocompletes them. gdls must therefore capture them explicitly; they then occupy the **same
-native-symbol lookup tier** as engine classes (`02-frontend-port.md` §7).
+GDExtension classes (addons providing native `.dll`, `.so`, or `.dylib` classes) are registered into `ClassDB` only when their library is loaded, after which they are indistinguishable from core classes and the editor autocompletes them. gdls captures them explicitly, and they then occupy the same native-symbol lookup tier as engine classes (`02-frontend-port.md` §7).
 
-**Enumeration.** Scan `res://**/*.gdextension` to discover installed extensions. A `.gdextension` file is
-*configuration only* (per-platform `libraries` + `entry_symbol`); it does **not** contain the class API, so
-it is used to *enumerate* extensions and locate their docs, not for signatures.
+**Enumeration.** A scan of `res://**/*.gdextension` discovers installed extensions. A `.gdextension` file is configuration only (per-platform `libraries` plus `entry_symbol`); it does not contain the class API, so it locates extensions and their docs, never signatures.
 
-**Capture (robust, multi-source — a project may mix all of these):**
+**Capture** is multi-source, since a project may mix all of these:
 
-1. **In-project API dump (preferred when available).** Take the `extension_api.json` dump in the project
-   context with extensions loaded, so their `ClassDB` entries are captured in the same JSON as engine
-   classes. Since you build Godot, the most deterministic form is a small Godot-side command that loads the
-   project's extensions and serializes `ClassDB` to JSON. Offline / regenerate-on-change — **not** a runtime
-   dependency.
-2. **`doc_classes` XML (pure-static fallback).** Many GDExtensions ship documentation in the **same XML
-   format as Godot's class reference** (method/property/signal signatures), authored via
-   `godot --doctool --gdextension-docs`. When present, ingest it directly — no execution required. The same
-   XML reader serves the engine `doc/classes/*.xml` path.
-3. **Graceful degradation.** An extension present in neither the dump nor any `doc_classes` XML has its
-   classes treated as **unknown/dynamic** (no false positives) with one informational notice — identical to a
-   missing `extension_api.json`.
+1. **In-project API dump, preferred.** The `extension_api.json` dump taken in the project context, with extensions loaded, so their `ClassDB` entries land in the same JSON as engine classes. This is what the auto-dump in §1 produces.
+2. **`doc_classes` XML, the pure-static fallback.** Many GDExtensions ship documentation in the same XML format as Godot's class reference (method, property, and signal signatures), authored with `godot --doctool --gdextension-docs`. When it is present, gdls ingests it directly, no execution required. The same XML reader serves the engine `doc/classes/*.xml` path.
+3. **Graceful degradation.** An extension present in neither the dump nor any `doc_classes` XML has its classes treated as unknown and dynamic, so no false positives, with one informational notice. Identical to a missing `extension_api.json`.
 
-**Reload.** The watcher treats `.gdextension` files and any ingested `doc_classes` XML as inputs: adding or
-removing an addon, or updating its docs, re-runs enumeration + ingestion (§6).
+**Reload.** The watcher treats `.gdextension` files and any ingested `doc_classes` XML as inputs, so adding or removing an addon, or updating its docs, re-runs enumeration and ingestion (§6).
 
-## 3. Project globals & `project.godot`
+## 3. Project globals and `project.godot`
 
-`project.godot` is parsed at startup and on change (it is INI-like; a small dedicated parser, or
-tree-sitter-godot-resource, suffices). It supplies:
+`project.godot` is parsed at startup and on change. It is INI-like, so a small dedicated parser is enough. It supplies:
 
-- **Autoloads** — the `[autoload]` section maps singleton names → script/scene paths; their *type* comes from
-  the referenced script's `class_name`/base. (Autoload typing is subtle even in Godot; track the referenced
-  script and resolve its type via the normal pipeline.)
-- **`res://` root** — needed to resolve `preload`/`load("res://…")` and to map paths.
-- **Warning configuration** — which warnings are enabled/disabled/promoted (feeds `04-diagnostics-strict-mode.md`).
+- **Autoloads.** The `[autoload]` section maps singleton names to script or scene paths; the *type* comes from the referenced script's `class_name` or base. Autoload typing is subtle even in Godot, so gdls tracks the referenced script and resolves its type through the normal pipeline. A scene target resolves through its `uid://` to the scene's root script; a scriptless root falls to the bare `Node` floor.
+- **The `res://` root**, needed to resolve `preload` and `load("res://…")` and to map paths.
+- **Warning configuration**: which warnings are enabled, disabled, or promoted. Feeds `04-diagnostics-strict-mode.md`.
 
-The **`class_name` registry** maps each global type name → its script path and resolved type, built from the
-eager interface pass (§4).
+The `class_name` registry maps each global type name to its script path and resolved type, built from the eager interface pass (§4).
 
-## 4. Project indexer — eager interfaces, lazy bodies
+## 4. Project indexer: eager interfaces, lazy bodies
 
-**Eager interface pass (startup, O(files)):** tokenize + parse + *shallow*-analyze every `.gd` to extract its
-interface: `extends`, `class_name`, member signatures (vars/consts/funcs with types), signals, enums, inner
-classes. Populate the `class_name` registry and per-script interface tables. This is fast and is all that
-cross-file resolution requires.
+**Eager interface pass, at startup, O(files):** tokenize, parse, and shallow-analyze every `.gd` to extract its interface, meaning `extends`, `class_name`, member signatures (vars, consts, funcs with types), signals, enums, and inner classes. This populates the `class_name` registry and the per-script interface tables. It is fast, and it is all cross-file resolution requires.
 
-**Lazy full pass (on demand):** full statement/expression type-checking and the complete warning set run only
-when a file's diagnostics or a query need them. Results are cached and invalidated on change.
+**Lazy full pass, on demand:** full statement and expression type checking plus the complete warning set run only when a file's diagnostics or a query need them. Results are cached and invalidated on change.
 
-## 5. Incrementalism (designed for 3,000–10,000+ files)
+**Two sibling indices** are built by the same scan. The `SceneIndex` parses every `.tscn` as text, never by instantiating anything, into the node tree plus each node's `type=` and `script=`, which is what `$`/`%` navigation and node-path completion read (`02-frontend-port.md` §11). The `AssetIndex` enumerates every other project file, so `load` and `preload` completion can offer real `res://` paths. Assets are defined by exclusion, meaning everything that is not a script, scene, or engine-managed file, since `res://LICENSE` is a perfectly listable asset.
 
-- **Dependency graph.** Each file records its dependencies: `extends` target, `preload`/`load` targets, used
-  `class_name`s, and referenced autoloads. Maintain forward and reverse edges. Lives in
-  `gd_project::DepGraph` (`reverse_closure`-driven invalidation); built in M2; driven by the
-  watcher in M4.
-- **Invalidation.** A change to file Y: (1) re-run Y's interface extraction; (2) if Y's *interface* changed
-  (e.g., a renamed method, a new/removed `class_name`), invalidate the cached **full** analysis of Y and of
-  Y's reverse-dependents; (3) if only Y's *bodies* changed, invalidate only Y.
-- **Memory.** Keep full ASTs only for open documents; for closed files keep just the interface table and
-  re-parse on demand. This bounds memory at large scale. `gd_server::Workspace::forget` (called on
-  `didClose`) drops both parse and analysis caches; `Workspace::reindex` then re-extracts the
-  interface from a fresh disk parse so the index stays accurate.
-- **Optional incremental engine.** `salsa`-style memoized queries can manage the dependency/invalidation
-  bookkeeping; a hand-rolled invalidation map is the fallback. **Choice made**: hand-rolled (no `salsa`
-  dependency). The trait-based [cross-file query seam](02-frontend-port.md#10-cross-file-query-seam-crossfilequery)
-  is what carries dependency information across the `gd_analyze` ↔ `gd_project` boundary.
-- **Persistent warm-start cache (M6, required for v1).** Serialize the eager-interface index so a second
-  launch skips the cold scan. Whole-cache key = `(cache_format_version, gdls_version,
-  NativeDb::content_hash, project.godot fingerprint)`; **per-file** validity is a read-free
-  `(size, mtime_ns)` stat check (content hash only as a fallback if mtime proves unreliable), so a warm
-  start is a stat sweep plus a handful of re-parses rather than a full re-scan. `NativeDb` already carries
-  the `content_hash` field. Stored project-local in `<root>/.gdls/` (which M6 adds to the §6 exclusion
-  set); writes are atomic (temp + rename, last-writer-wins) so two gdls processes on one project stay
-  safe, and any read/verify failure degrades to a cold index. Pulled forward from Phase 2 — it gates v1.
-  Full design: [`08-m6-v1-ship.md`](08-m6-v1-ship.md) §3.
-- **Cross-file member-initializer cycle detection (M4).** WP-R2 (M3) added
-  `CrossFileQuery::member_initializer_xrefs`, inert in the production `SyntacticQuery` impl —
-  cycle detection fires only in the conformance harness's `CorpusQuery`. M4 activates it in the
-  LSP **without introducing a separate cache structure**: the analyzer records the per-file
-  xref set inline on `AnalysisResult.member_xrefs`, and a thin `gd_server::xfile::WorkspaceXFileQuery`
-  wrapper over `SyntacticQuery` reads that field from the existing analysis cache. Invalidation
-  comes free — when `analysis_cache` evicts an entry on `didChange`, the xrefs go with it. See §7.5.
-  (The `Diagnostic.line` null-source-line override stays plumbing-only at the LSP boundary today;
-  no downstream LSP renderer needs it.)
+## 5. Incrementalism at 3,000 to 10,000+ files
 
-## 6. Freshness watcher — the staleness killer
+**Dependency graph.** Each file records its dependencies: the `extends` target, `preload`/`load` targets, used `class_name`s, and referenced autoloads. Forward and reverse edges are both maintained. Lives in `gd_project::DepGraph`, with `reverse_closure` driving invalidation.
 
-- **`notify`** (with `notify-debouncer-full`) recursively watches the `res://` tree, excluding `.godot/` and
-  import caches.
-- Events are debounced, then classified as create / delete / modify / rename. Rename is detected from
-  create+delete pairs to preserve identity where possible.
-- **Reactions:**
-  - `.gd` change → re-extract interface; update the `class_name` registry **immediately** (add/rename/remove
-    a global type); invalidate dependents per §5. A file *appearing* re-links the consumers waiting on it
-    both by **name** (`extends MyBase` referencing a just-added `class_name`) and by **path** (`extends
-    "res://b.gd"` whose target file is just created) — the latter via `Index`'s `path_referencers` reverse
-    index, the path-keyed analogue of `name_referencers`, so a path-extends consumer's stale "unknown base"
-    diagnostics refresh without waiting for the consumer itself to be edited.
-  - `project.godot` change → reload autoloads, `res://` root, and warning config. Call
-    `gd_server::Workspace::rebuild_policy` to drop the analysis cache so subsequent
-    `publishDiagnostics` runs under the new strict configuration.
-  - `extension_api.json` change → reload the native class DB (§1).
-  - `.gdextension` add/remove, or a watched `doc_classes` XML change → re-enumerate + re-ingest GDExtension
-    classes (§2).
-  - `.tscn` change → Phase 2 (node-type reindex).
-- **Why this fixes the pain:** there is no `EditorFileSystem`, no focus-gated rescan, and no editor sync in
-  the loop. A new/renamed/deleted class is reflected in the index as soon as the file changes on disk —
-  independent of which file Claude Code currently has open.
-- **Status:** the dependency graph and the `Workspace::rebuild_policy` entry point are in code
-  (built in M2 / M3 respectively); the `notify` driver and `.gdextension` re-enumeration landed in M4.
+**Invalidation.** On a change to file Y: re-run Y's interface extraction; if Y's *interface* changed (a renamed method, a new or removed `class_name`), invalidate the cached full analysis of Y and of Y's reverse-dependents; if only Y's *bodies* changed, invalidate only Y.
 
-### 6.1 Operational specifics (M4)
+**Memory.** Full ASTs are kept only for open documents. A closed file keeps just its interface table and re-parses on demand, which bounds memory at large scale. `gd_server::Workspace::forget` (called on `didClose`) drops both parse and analysis caches, and `Workspace::reindex` then re-extracts the interface from a fresh disk parse so the index stays accurate. Both caches are LRU-bounded and sit under the memory-pressure ladder in `06-testing-fidelity.md` §7.3.
 
-These are the concrete decisions the spec deferred to M4 kickoff; they live here so the M4
-implementation plan and the watcher integration tests pin to one answer.
+**Cold start is paid once.** The eager-interface index is serialized to disk so later launches skip the scan; see §8.
 
-- **Debouncer.** `notify-debouncer-full` with a **250 ms quiet-time** policy: emit the coalesced
-  event set once no further FS event has arrived for the file (or directory) for 250 ms. This
-  round-trips burst writes from atomic-write editors (which create a `.tmp`, write, and rename) into
-  a single Modify event, matches the cadence users tolerate in editor LSPs, and stays well under
-  the 1 s budget for bulk operations (see "Bulk-event budget" below).
-- **Exclusion list (always excluded).** Path *components* `.godot/` (engine editor cache + import
-  artifacts), `.import/` (per-resource import caches), `.git/`, plus `target/` and `node_modules/`
-  (defensive entries for projects that share a directory with non-Godot tooling); and file-name
-  *suffixes* `.tmp`, `.bak`, `.swp`, `~`. **`addons/` is deliberately NOT excluded** — Godot installs
-  addon `.gd` scripts, `.gdextension` files, and `doc_classes/*.xml` there and the index/watcher must
-  surface them. `notify` exposes no per-path ignore API, so this is **not** a watch-time filter: a
-  single shared predicate (`gd_project::is_excluded`, used identically by the cold index, by
-  `Workspace::reconcile`, and by the watcher) is applied *post-receipt* to every debounced batch, and
-  gates `WalkDir::filter_entry` for the cold-scan and reconcile walks. Matching is case-insensitive on
-  the component name (macOS HFS+, Windows NTFS default). User-defined exclusions are deferred to Phase 2.
-- **Path normalization.** All paths flow through `camino::Utf8PathBuf`; on Windows backslashes
-  are converted to forward slashes at the watcher boundary so downstream `Index` keys match the
-  cold-scan output (which uses forward-slash paths from `walkdir`). macOS case-folding is handled
-  inside `Index::normalize` (`crates/gd_project/src/index.rs`).
-- **Concurrency model.** The server is single-threaded by construction — `lsp_server` is synchronous
-  and `Workspace` carries no `Mutex` / `RwLock`. `notify-debouncer-full` runs its own internal
-  thread and delivers events on a `crossbeam_channel::Receiver<DebouncedEvent>`. The main loop in
-  `gd_server::server::run` uses `crossbeam_channel::select!` over the LSP `Connection::receiver`
-  and the watcher receiver; the only mutator on `Workspace` is the main loop. No locks, no shared
-  mutable state. (This mirrors rust-analyzer's "the event loop accepts an `enum` of possible
-  events" pattern — see rust-analyzer's architecture doc, "Observability".)
-- **Lifecycle ordering (v1.0.1).** The watcher is constructed in `serve()` after the `initialize`
-  *response* has been sent and **before** `Workspace::load` — every filesystem change that lands
-  while the load's stat pass runs is then a queued channel event, replayed once the loop arms.
-  Arming is cheap since the debouncer runs `NoCache` (the default `FileIdMap` cache walked the
-  ENTIRE tree opening a handle per file just to pair rename events — 7–9 s and ~70 MB on a
-  2.3k-file NTFS project, issue #14 — and gdls handles unpaired rename halves anyway). The server
-  does **not** send an `initialized` notification — `initialized` is a client→server message it
-  only receives and logs. (The module doc on `crates/gd_server/src/watcher.rs` is authoritative
-  for this ordering.)
-- **Reconciliation backstop after load.** After the load settles, the server walks
-  `res://**/*.gd` once more and diffs against the index. With a live watcher armed (the normal
-  case) this runs in **`DiscoverOnly` mode**: paths already in the stat table were just validated
-  by the load itself and modifications in the gap are queued watcher events, so the backstop only
-  stats/parses files *added* while the server was off, plus the standard removal pass —
-  enumeration-only for everything known (the per-file stat reuses the directory enumeration's own
-  metadata, which costs zero extra syscalls on Windows). When no watcher armed (construction
-  failed) the backstop runs `FullStat` — the historical stat-diff of every file — as do the
-  watcher `need_rescan` overflow path, the watcher-disabled fallback tick, and
-  `gdls diagnose --reconcile` (ad-hoc recovery after wake-from-suspend or remote-FS hiccups).
-  Logged with the `cold_index_reconciled … mode=discover|full` marker (a `tracing` span since M5
-  WP-O1). This split is the load-bearing fix for `notify` dropping events during heavy startup
-  AND for the NTFS wall-clock cost of re-statting a large tree at every launch.
-- **Atomic-write / rename heuristics.** `notify-debouncer-full`'s rename detection (create+delete
-  within the debounce window classified as Rename) is used as-is; pathological cases (`mv a.gd b.gd
-  && mv c.gd a.gd` within the same 250 ms window) are treated as two Modify events on the final
-  inhabitants of those names, which is correct semantically.
-- **Bulk-event budget.** Target: **≥ 500 file change events processed in &lt; 1 s** end-to-end
-  (debouncer to `Index::on_file_changed` applied to every event). Measured in M4 integration tests
-  and tracked in the M5 perf budget (`bench/budget.toml`).
-- **Diagnostic publish on dependency change — explicitly deferred.** The watcher updates the index
-  and invalidates the analysis cache for dependents (via `DepGraph::reverse_closure`); it does
-  **not** call `publishDiagnostics` for them. The next `didOpen` / `didChange` / `didSave` on a
-  dependent re-runs analyze under the now-fresh state — this is the policy in
-  `04-diagnostics-strict-mode.md §2` and is load-bearing for noise control.
+**Cross-file member-initializer cycles.** The analyzer records the per-file xref set inline on `AnalysisResult.member_xrefs`, and the `gd_server::xfile::WorkspaceXFileQuery` wrapper over `SyntacticQuery` reads that field from the existing analysis cache to answer `CrossFileQuery::member_initializer_xrefs`. Invalidation comes free, since the xrefs go with the entry when `analysis_cache` evicts it on `didChange`. See §7.5.
 
-## 7. M4 navigation indices
+## 6. The freshness watcher
 
-The four M4 nav handlers (`references`, `implementation`, `prepareCallHierarchy` +
-`callHierarchy/incomingCalls` + `callHierarchy/outgoingCalls`, `workspace/symbol`) share one
-architectural choice: **derive from existing structures rather than build new precomputed
-indices.** The M2 eager-interface scan already exposes every `class_name` global, member
-signatures, and extends edges; the M3 analyzer already records typed bindings at every resolved
-call/use site; `Index.name_referencers` (`crates/gd_project/src/index.rs:53`) already maps each
-referenced name to the set of files referencing it. M4's handler implementations are projections
-over these. Per `05-lsp-cc-integration.md §1` and the LSP 3.17 spec
-(<https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/>).
+`notify` (with `notify-debouncer-full`) recursively watches the `res://` tree, excluding `.godot/` and import caches. Events are debounced, then classified as create, delete, modify, or rename. Rename is detected from create plus delete pairs, to preserve identity where possible.
 
-### 7.1 `references` — `Index.name_referencers` + per-file binding scan
+Reactions:
 
-For the identifier at the request's `TextDocumentPositionParams` (per LSP 3.17 `ReferenceParams`):
+- **A `.gd` change** re-extracts the interface, updates the `class_name` registry immediately (adding, renaming, or removing a global type), and invalidates dependents per §5. A file *appearing* re-links the consumers waiting on it both by name (`extends MyBase` referencing a just-added `class_name`) and by path (`extends "res://b.gd"` whose target file was just created). The path case goes through `Index`'s `path_referencers` reverse index, the path-keyed analogue of `name_referencers`, so a path-extends consumer's stale "unknown base" diagnostics refresh without waiting for the consumer itself to be edited.
+- **A `project.godot` change** reloads autoloads, the `res://` root, and warning config, then calls `gd_server::Workspace::rebuild_policy` to drop the analysis cache so later `publishDiagnostics` runs under the new strict configuration.
+- **An `extension_api.json` change** reloads the native class DB (§1).
+- **A `.gdextension` add or remove, or a watched `doc_classes` XML change**, re-enumerates and re-ingests GDExtension classes (§2).
+- **A `.tscn` change** reindexes the scene (`reindex_scene`, `remove_scene`). It does not re-diagnose the scene's attached scripts, because a `$` or `%` type is scene-independent and republishing would be byte-identical churn (`02-frontend-port.md` §11).
+- **Any other file** updates the asset index, so `load` and `preload` completion stay current.
 
-1. Resolve the identifier to a `(kind, qualified_name)` pair via the analyzer (the same cursor →
-   smallest-typed-ancestor walk `hover` and `definition` use,
-   `gd_server::handlers::smallest_typed_containing`).
+**Why this fixes the pain:** there is no `EditorFileSystem`, no focus-gated rescan, and no editor sync in the loop. A new, renamed, or deleted class shows up in the index as soon as the file changes on disk, no matter which file the client has open.
+
+### 6.1 Operational specifics
+
+**Debouncer.** `notify-debouncer-full` with a 250 ms quiet-time policy: emit the coalesced event set once no further filesystem event has arrived for the file or directory for 250 ms. This turns burst writes from atomic-write editors (create a `.tmp`, write, rename) into a single Modify event, matches the cadence users tolerate in editor LSPs, and stays well under the bulk-event budget below.
+
+**Exclusion list, always excluded.** Path *components* `.godot/` (engine editor cache and import artifacts), `.import/` (per-resource import caches), `.git/`, and `.gdls/` (gdls's own managed dump and warm-start cache), plus `target/` and `node_modules/` as defensive entries for projects sharing a directory with non-Godot tooling. Plus file-name *suffixes* `.tmp`, `.bak`, `.swp`, and `~`. `addons/` is deliberately not excluded, since Godot installs addon `.gd` scripts, `.gdextension` files, and `doc_classes/*.xml` there and the index and watcher must surface them. `notify` exposes no per-path ignore API, so this is not a watch-time filter: a single shared predicate (`gd_project::is_excluded`, used identically by the cold index, by `Workspace::reconcile`, and by the watcher) is applied post-receipt to every debounced batch, and gates `WalkDir::filter_entry` for the cold-scan and reconcile walks. Matching is case-insensitive on the component name, for macOS HFS+ and Windows NTFS defaults.
+
+**Path normalization.** All paths flow through `camino::Utf8PathBuf`. On Windows, backslashes are converted to forward slashes at the watcher boundary so downstream `Index` keys match the cold-scan output, which uses forward-slash paths from `walkdir`. macOS case-folding is handled inside `Index::normalize` (`crates/gd_project/src/index.rs`). A file reached through an NTFS junction or a differently-cased path interns to one `FileId`, via `dunce`-backed canonicalization in `gd_server::uri::CanonicalKey`.
+
+**Threading.** The watcher's debouncer runs its own thread and delivers events on a `crossbeam_channel::Receiver<DebouncedEvent>`. The main loop selects over that and the LSP receiver, and is the only mutator on `Workspace`. See `01-architecture.md` §5.
+
+**Lifecycle ordering.** The watcher is constructed in `serve()` after the `initialize` *response* has been sent and before `Workspace::load`, so every filesystem change landing during the load's stat pass is a queued channel event, replayed once the loop arms. Arming is cheap because the debouncer runs `NoCache`: the default `FileIdMap` cache walked the entire tree opening a handle per file purely to pair rename events, costing 7 to 9 s and about 70 MB on a 2.3k-file NTFS project, and gdls handles unpaired rename halves anyway. The server does not send an `initialized` notification; `initialized` is a client-to-server message it only receives and logs. The module doc on `crates/gd_server/src/watcher.rs` is authoritative for this ordering.
+
+**Reconciliation backstop after load.** After the load settles, the server walks `res://**/*.gd` once more and diffs against the index. With a live watcher armed (the normal case) this runs in `DiscoverOnly` mode: paths already in the stat table were just validated by the load itself, and modifications in the gap are queued watcher events, so the backstop only stats and parses files *added* while the server was off, plus the standard removal pass. Everything known is enumeration-only, and the per-file stat reuses the directory enumeration's own metadata, which costs zero extra syscalls on Windows. When no watcher armed (construction failed) the backstop runs `FullStat`, the stat-diff of every file, as do the watcher `need_rescan` overflow path, the watcher-disabled fallback tick, and `gdls diagnose --reconcile` for ad-hoc recovery after wake-from-suspend or remote-filesystem hiccups. Logged with the `cold_index_reconciled … mode=discover|full` marker. This split handles both `notify` dropping events during heavy startup and the NTFS wall-clock cost of re-statting a large tree at every launch.
+
+**Atomic-write and rename heuristics.** `notify-debouncer-full`'s rename detection (create plus delete within the debounce window classified as Rename) is used as-is. Pathological cases such as `mv a.gd b.gd && mv c.gd a.gd` within the same 250 ms window are treated as two Modify events on the final inhabitants of those names, which is semantically correct.
+
+**Bulk-event budget.** At least 500 file change events processed in under 1 s end to end, from debouncer to `Index::on_file_changed` applied to every event. Covered by integration tests and tracked in `bench/budget.toml`.
+
+**Dependency changes do not trigger a publish.** The watcher updates the index and invalidates the analysis cache for dependents via `DepGraph::reverse_closure`; it does not call `publishDiagnostics` for them. The next `didOpen`, `didChange`, or `didSave` on a dependent re-runs analysis under the now-fresh state. This is the policy in `04-diagnostics-strict-mode.md` §2, and it is what keeps noise down.
+
+## 7. Navigation indices
+
+The navigation handlers share one architectural choice: derive from existing structures instead of building new precomputed indices. The eager-interface scan already exposes every `class_name` global, member signatures, and extends edges. The analyzer already records typed bindings at every resolved call and use site. `Index.name_referencers` already maps each referenced name to the set of files referencing it. The handlers are projections over those. Protocol shapes are in `05-lsp-cc-integration.md` §1.
+
+### 7.1 `references`: `Index.name_referencers` plus a per-file binding scan
+
+For the identifier at the request's `TextDocumentPositionParams`:
+
+1. Resolve the identifier to a `(kind, qualified_name)` pair via the analyzer, using the same cursor-to-smallest-typed-ancestor walk `hover` and `definition` use (`gd_server::handlers::smallest_typed_containing`).
 2. Query `Index.name_referencers[name]` for the candidate file set.
-3. For each candidate, consult `Workspace::analysis_cache[file]` (parse + analyze lazily on
-   cache-miss) and filter the recorded bindings to those whose resolved target matches
-   `(kind, qualified_name)`.
-4. Map each binding's byte span to LSP `Location` via `PositionMapper`.
+3. For each candidate, consult `Workspace::analysis_cache[file]` (parse and analyze lazily on a cache miss) and filter the recorded bindings to those whose resolved target matches `(kind, qualified_name)`. For a method or signal target, matching `Binding::Call` call sites are projected too, so a cross-file `c.get_current_value()` through a typed local is found; the callee-identifier sub-span is extracted to avoid wide duplicates, and results are de-duped against the identifier scan.
+4. Map each binding's byte span to an LSP `Location` via `PositionMapper`.
 
-The `ReferenceParams.context.includeDeclaration: boolean` from the spec adds the declaration site
-to the result when true. Returns `Location[] | null`.
+`ReferenceParams.context.includeDeclaration` adds the declaration site when true.
 
-### 7.2 `implementation` — linear walk over `Index.interfaces`
+### 7.2 `implementation`: a linear walk over `Index.interfaces`
 
-For a class C resolved from the cursor:
+For a class C resolved from the cursor, a linear scan of `Index.interfaces` (about 10k entries at scale, sub-millisecond) finds any interface whose `extends.target` resolves to C, directly or transitively, walking one level at a time and following `class_name` through `ClassNameRegistry`. Each subclass's declaration site becomes an LSP `Location`.
 
-1. Linear-scan `Index.interfaces` (~10k entries at scale, sub-millisecond) for any interface whose
-   `extends.target` resolves to C — directly or transitively (walk one level at a time, follow
-   `class_name` via `ClassNameRegistry`).
-2. Return each subclass's declaration site as LSP `Location`.
+For a virtual or abstract method M on class C: the same scan, plus a per-candidate check that the subclass declares a member with the same name and a compatible signature. `MemberDecl.kind`, `MemberFlags`, and `params` carry what is needed.
 
-For a virtual / abstract method M on class C: same scan, plus per-candidate check that the
-subclass declares a member with the same name and a compatible signature (the existing
-`MemberDecl.kind` / `MemberFlags` / `params` carry what's needed). Returns `Location | Location[]
-| LocationLink[] | null` per LSP 3.17.
+There is no precomputed subclass index. At this scale the linear scan is faster than the maintenance cost of an incrementally-invalidated reverse-inheritance map.
 
-No precomputed subclass index. At Phase 1 scale the linear scan is faster than the maintenance
-cost of an incrementally-invalidated reverse-inheritance map; revisit if M5 soak surfaces it as a
-hot path.
+### 7.3 Call hierarchy: piggyback on analyzer bindings
 
-### 7.3 `prepareCallHierarchy` — piggyback on analyzer bindings
+The analyzer resolves every call expression during reduce (`gd_analyze::reducer`), and records a typed `Binding::Call { callee_file, callee_name, span }` in `AnalysisResult.bindings` for free during that walk.
 
-The analyzer already resolves every call expression during reduce (`gd_analyze::reducer`); M4
-adds a typed `Binding::Call { callee_file: FileId, callee_name: String, span: ByteSpan }` variant
-to the existing `AnalysisResult.bindings` Vec — recorded for free during the existing walk.
+- `textDocument/prepareCallHierarchy` resolves the symbol under the cursor to a `CallHierarchyItem[]` (name, kind, uri, range, selectionRange).
+- `callHierarchy/outgoingCalls` filters the caller's bindings for `Call` variants and emits one outgoing call per unique callee, with `fromRanges` covering every call site within the caller.
+- `callHierarchy/incomingCalls` queries `Index.name_referencers[callee_name]`, lazy-analyzes each candidate file, filters its `Binding::Call` records to those targeting the callee, and emits one incoming call per unique caller.
 
-- `textDocument/prepareCallHierarchy`: resolve the symbol under cursor to a
-  `CallHierarchyItem[]` per LSP 3.17 (name, kind, uri, range, selectionRange).
-- `callHierarchy/outgoingCalls`: filter the caller's `AnalysisResult.bindings` for `Call`
-  variants; emit one `CallHierarchyOutgoingCall { to: CallHierarchyItem, fromRanges: Range[] }`
-  per unique callee, with `fromRanges` covering all call sites within the caller per the spec
-  ("range relative to the caller, e.g. the item passed to `callHierarchy/outgoingCalls`").
-- `callHierarchy/incomingCalls`: query `Index.name_referencers[callee_name]`, lazy-analyze each
-  candidate file, filter its `Binding::Call` records to those targeting our callee, emit
-  `CallHierarchyIncomingCall { from: CallHierarchyItem, fromRanges: Range[] }`.
+**Limitations**, intentional and matching both Godot's editor LSP and rust-analyzer's approach: dynamic dispatch through `Variant` or `Callable`, signal connections via dynamic name strings, and lambda invocations through opaque callables are not captured. Static method resolution and direct call expressions are.
 
-**Limitations** (intentional, match Godot's editor LSP and rust-analyzer's approach): dynamic
-dispatch through `Variant` or `Callable`, signal connections via dynamic name strings, and
-lambda invocations through opaque callables are not captured. Static method-resolution and
-direct call expressions are.
-
-### 7.4 `workspace/symbol` — fuzzy match over registry + interface tables
-
-LSP 3.17 `workspace/symbol` returns `SymbolInformation[] | WorkspaceSymbol[] | null` for a query
-string. Implementation:
+### 7.4 `workspace/symbol`: fuzzy match over the registry plus interface tables
 
 1. Flatten `ClassNameRegistry.iter()` to a `(name, kind=Class, location)` list.
-2. Flatten `Index.interfaces.iter()` to per-file member tuples `(name, kind ∈ {Function,
-   Constant, Variable, Signal, Enum}, location, containerName=class_name)`.
-3. Fuzzy-match the union via `nucleo-matcher` (or `fuzzy-matcher`).
-4. Order by (a) prefix match on class name, then (b) prefix match on member name, then
-   (c) Smith-Waterman fuzzy score.
-5. Cap at 256 results (configurable via `initializationOptions.workspaceSymbolMaxResults`).
+2. Flatten `Index.interfaces.iter()` to per-file member tuples `(name, kind ∈ {Function, Constant, Variable, Signal, Enum}, location, containerName=class_name)`.
+3. Fuzzy-match the union via `nucleo-matcher`.
+4. Order by prefix match on class name, then prefix match on member name, then fuzzy score.
+5. Cap at 256 results, to bound latency on projects with 10k+ symbols. An empty query returns everything, capped.
 
-If the client advertises `workspace.symbol.resolveSupport`, return 3.17 `WorkspaceSymbol[]` with
-no `range` (resolved on demand via `workspaceSymbol/resolve`); otherwise return
-`SymbolInformation[]` with full `Location` up-front.
+If the client advertises `workspace.symbol.resolveSupport`, gdls returns `WorkspaceSymbol[]` with no `range`, resolved on demand via `workspaceSymbol/resolve`. Otherwise it returns `SymbolInformation[]` with the full `Location` up front.
 
-### 7.5 Cross-file member-initializer cycle — inline in `AnalysisResult`
+### 7.5 Cross-file member-initializer xrefs, inline in `AnalysisResult`
 
-WP-R2 (M3) added `CrossFileQuery::member_initializer_xrefs(file, member) -> Vec<(FileId, String)>`,
-inert in `SyntacticQuery`. M4 activates it **without a separate cache impl**:
+`CrossFileQuery::member_initializer_xrefs(file, member) -> Vec<(FileId, String)>` is answered without a separate cache:
 
-1. The analyzer's reducer, while resolving `const X = B.Y` (and equivalent) expressions, records
-   each cross-file xref it walks in
-   `AnalysisResult.member_xrefs: FxHashMap<MemberName, Vec<MemberXref>>` (WP-RD15 newtyped the
-   former `FxHashMap<String, Vec<(FileId, String)>>`). One HashMap insert per cross-file member
-   access on the existing hot path.
-2. The production `CrossFileQuery` impl in `gd_server::xfile::WorkspaceXFileQuery` (a thin wrapper
-   holding `&SyntacticQuery` + `&Workspace::analysis_cache`) answers `member_initializer_xrefs`
-   by reading the cache. Cache-miss returns the default empty `Vec`: detection is
-   eventually-consistent, activating once both files have been analyzed at least once. Conformance
-   stays green because `CorpusQuery` (the test impl) parses on demand and finds the xrefs
-   immediately.
-3. **No new cache structure, no new lifecycle, no new invalidation code.** When `analysis_cache`
-   evicts an entry on `didChange`, the xrefs go with it.
+1. The reducer, while resolving `const X = B.Y` and equivalents, records each cross-file xref it walks in `AnalysisResult.member_xrefs: FxHashMap<MemberName, Vec<MemberXref>>`. That is one HashMap insert per cross-file member access on the existing hot path.
+2. `gd_server::xfile::WorkspaceXFileQuery`, a thin wrapper holding `&SyntacticQuery` plus `&Workspace::analysis_cache`, answers the query by reading the cache. A cache miss returns the default empty `Vec`, so detection is eventually consistent, activating once both files have been analyzed at least once. Conformance stays green because `CorpusQuery`, the test impl, parses on demand and finds the xrefs immediately.
+3. No new cache structure, no new lifecycle, no new invalidation code. When `analysis_cache` evicts an entry on `didChange`, the xrefs go with it.
 
-This replaces the originally-named `DeepResolutionCache`. The 4th `CrossFileQuery` impl is just
-the thin `WorkspaceXFileQuery` wrapper — see `02-frontend-port.md §10` table.
+### 7.6 `IndexMutation`, the post-apply invariant checker
 
-### 7.6 `IndexMutation` — post-apply invariant checker
+Every mutation to `gd_project::Index` (from `Workspace::reindex`, `::remove`, or the watcher) flows through a thin `IndexMutation` wrapper that:
 
-Every mutation to `gd_project::Index` (from `Workspace::reindex`, `::remove`, the M4 watcher, or
-any future caller) flows through a thin `IndexMutation` wrapper that:
+1. Applies the requested change, delegating to `Index::on_file_changed` or `::on_file_removed`.
+2. Runs `Index::verify()`, which checks that every `FileId` in `interfaces` has a path in `paths`; that every `class_name` in `registry` resolves to a `FileId` that exists; that `DepGraph.forward` and `DepGraph.reverse` are mutual inverses, every forward edge having its reverse counterpart and the other way round; and that `name_referencers` values are subsets of `interfaces` keys.
+3. Reacts to a violation by build profile. In debug it panics with a structured message. In release it logs `index_invariant_violated{file, invariant}` via `tracing`, quarantines the offending file by dropping it from the index, and keeps going: never lie, never serve stale data, but also never crash mid-session.
 
-1. Applies the requested change (delegates to `Index::on_file_changed` / `::on_file_removed`).
-2. Runs `Index::verify()`:
-   - Every `FileId` in `interfaces` has a path in `paths`.
-   - Every `class_name` in `registry` resolves to a `FileId` that exists.
-   - `DepGraph.forward` and `DepGraph.reverse` are mutual inverses (every forward edge has its
-     reverse counterpart and vice versa).
-   - `name_referencers` values are subsets of `interfaces` keys.
-3. **Debug:** invariant violation panics with a structured message. **Release:** the violation
-   is logged as `index_invariant_violated{file, invariant}` via `tracing`, the offending file is
-   dropped from the index (quarantined), and processing continues — never lie, never serve stale
-   data, but also never crash mid-session. Aligns with the "never crash, never lie" project
-   convention (CLAUDE.md, Project-specific conventions).
+## 8. Persistent warm-start cache
 
-## 8. Sources
+Without a cache, every launch pays the full startup cost twice. `Index::build` reads, parses, and interface-extracts every `.gd`. Then `Workspace::reconcile` re-reads and re-parses every file again to diff `signature_hash`. The event loop only arms after both, so on a 2,338-file project that was roughly 12 s of unresponsiveness at every start. Paying that once is fine; paying it every launch is not.
 
-- `extension_api.json` contents & custom-class inclusion (ClassDB snapshot) — https://deepwiki.com/godotengine/godot/15.1-gdextension-api
-- GDExtension classes are indistinguishable from core (editor autocomplete/help) — https://godotengine.org/article/introducing-gd-extensions/
-- The `.gdextension` file (config only: `libraries`, `entry_symbol`) — https://docs.godotengine.org/en/stable/tutorials/scripting/gdextension/gdextension_file.html
-- GDExtension documentation system (`doc_classes` XML; same format as core; `--doctool --gdextension-docs`) — https://docs.godotengine.org/en/4.4/tutorials/scripting/gdextension/gdextension_docs_system.html
-- Optionally include docs in the API dump (`--dump-extension-api-with-docs`) — https://github.com/godotengine/godot/pull/82331
-- Autoloads / singletons — https://docs.godotengine.org/en/stable/tutorials/scripting/singletons_autoload.html
-- `project.godot` / scene resource format parser — https://github.com/PrestonKnopp/tree-sitter-godot-resource
-- Documented external-editor staleness (motivation) — https://github.com/godotengine/godot/issues/69485 · https://github.com/godotengine/godot/issues/107592
+**What is persisted.** The eager-interface `Index`: the per-file `Interface` table plus `ClassNameRegistry`. The reverse indexes (`name_referencers`, `path_referencers`, `deps.reverse`, `file_refs`) are all derivable, so the forward data is stored and the edges are rebuilt on load.
+
+**Whole-cache key.** `(cache_format_version, gdls_version, NativeDb::content_hash, project.godot fingerprint)`. Any mismatch discards the whole cache, since a changed native lattice or config means every interface is stale.
+
+**Per-file validity** is a read-free `(size, mtime_ns)` stat check. Unchanged means reuse the cached `Interface`; changed or new means re-parse just those; missing means drop. This is the win: warm start becomes a stat sweep plus a handful of re-parses instead of thousands of full parses. A content hash is the fallback if mtime ever proves unreliable. The same stat table lets `reconcile` skip its full re-parse, which is what removes the second startup block.
+
+**Storage** is project-local, `<root>/.gdls/index.<format-ver>.bin`, which is simple, discoverable, and user-clearable. `.gdls/` is in the §6.1 exclusion set so the cache never re-enters the index.
+
+**Load path safety**, non-negotiable under "never crash, never lie":
+
+1. Read the cache. On any parse or IO error, log and fall back to a full cold index. Never trust blind.
+2. Validate the whole-cache key. On mismatch, discard and cold-index.
+3. Preserve `FileId` stability. The `paths` arena is append-only and ids must not shift, so `paths` deserializes in exact stored order and new files append.
+4. Run per-file stat validation, and re-parse the deltas.
+5. Run `Index::verify()` and quarantine violators exactly as `Index::build` does. A corrupt cache degrades; it never poisons the session.
+6. Still run the cheap stat-based reconcile as the drift backstop for changes made while the server was off.
+
+**Write timing.** The cache is written after the initial index is built and reconciled, a one-time few-ms serialize, guarded so a write failure only logs.
+
+**Multi-instance safety.** Two gdls processes on one project (a Claude Code session plus an IDE, say) is the normal case, and the rest of the server is already safe for it: a session writes nothing, each process holds its own in-memory `Index`, VFS, and caches, and multiple `ReadDirectoryChangesW` or inotify watches on one tree coexist. The cache is the one shared writable artifact, so:
+
+- **Atomic writes, last writer wins.** Serialize to a unique temp file in the same directory, then atomically rename over the target (`tempfile::NamedTempFile::persist`). A reader only ever sees a complete old file or a complete new one, never a torn one. Two concurrent writers both write a valid full cache and the last rename wins; since the cache is derived from identical on-disk project state, either is correct. On Windows the replace tolerates the target being open by another reader. A replace error skips the write rather than failing the session, and the next start cold-indexes.
+- **No hard lock.** A cross-process advisory lock is unnecessary and fragile, since a killed process leaves a stale-lock deadlock. The cache is throwaway: a lost write costs exactly one cold index next launch.
+- **Tolerant reads**, per the safety list above. Any read, parse, key, or `verify()` failure falls back to a cold index.
+- **Per-process temp-file names** so two simultaneous writers do not collide on the temp path. `NamedTempFile` already randomizes.
+
+## 9. Sources
+
+- [`extension_api.json` contents and custom-class inclusion (a ClassDB snapshot)](https://deepwiki.com/godotengine/godot/15.1-gdextension-api)
+- [GDExtension classes are indistinguishable from core, per editor autocomplete and help](https://godotengine.org/article/introducing-gd-extensions/)
+- [The `.gdextension` file: config only, `libraries` and `entry_symbol`](https://docs.godotengine.org/en/stable/tutorials/scripting/gdextension/gdextension_file.html)
+- [GDExtension documentation system: `doc_classes` XML, same format as core, `--doctool --gdextension-docs`](https://docs.godotengine.org/en/4.4/tutorials/scripting/gdextension/gdextension_docs_system.html)
+- [Optionally include docs in the API dump (`--dump-extension-api-with-docs`)](https://github.com/godotengine/godot/pull/82331)
+- [Autoloads and singletons](https://docs.godotengine.org/en/stable/tutorials/scripting/singletons_autoload.html)
+- [`project.godot` and scene resource format parser](https://github.com/PrestonKnopp/tree-sitter-godot-resource)
+- Documented external-editor staleness, the motivation: [godot#69485](https://github.com/godotengine/godot/issues/69485) and [godot#107592](https://github.com/godotengine/godot/issues/107592)

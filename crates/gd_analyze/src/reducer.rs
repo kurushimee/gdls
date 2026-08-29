@@ -6215,7 +6215,7 @@ fn reduce_identifier_from_base(
                 // resolve would loop. Emit both diagnostics anchored at this identifier.
                 if let Some(cur) = ctx.current_resolving_member.clone() {
                     // WP-R2: record_member_xref — stable marker for cross-references (docs/03 §7.5,
-                    // docs/07 cite this site by marker, not a drift-prone line number; WP-RD15).
+                    // the docs cite this site by marker, not a drift-prone line number).
                     // Record so the inverse cross-file query (consumed by `WorkspaceXFileQuery`
                     // under the LSP) can detect cycles when this side has not yet been
                     // re-analyzed. Additive — never changes any other diagnostic or type.

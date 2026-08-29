@@ -5,11 +5,12 @@ body:
   - type: markdown
     attributes:
       value: |
-        Before filing, please skim the roadmap: **M6** (the v1-ship milestone) and **Phase 2** are tracked in
-        [Milestones](https://github.com/kurushimee/gdls/milestones) and in
-        [`docs/07-milestones-risks.md`](https://github.com/kurushimee/gdls/blob/main/docs/07-milestones-risks.md).
-        Some things — `.tscn` node typing for `$`/`%`, `completion`, `signatureHelp`, `rename` —
-        are already **deliberately Phase 2**.
+        Before filing, please check what's already decided. The full LSP surface, including the
+        capabilities gdls deliberately does not serve and why, is in
+        [`docs/09-lsp-conventions.md`](https://github.com/kurushimee/gdls/blob/main/docs/09-lsp-conventions.md) §5.
+        Out-of-scope areas (running GDScript, a GUI or debugger, a built-in formatter, Godot's custom
+        protocol extensions) are in
+        [`docs/00-overview.md`](https://github.com/kurushimee/gdls/blob/main/docs/00-overview.md) §3.
   - type: textarea
     id: problem
     attributes:

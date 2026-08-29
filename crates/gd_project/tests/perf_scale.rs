@@ -4,7 +4,7 @@
 //! disk, and asserts (a) it scales — every class registers, the chain resolves end-to-end, no
 //! duplicate `FileId`s — and (b) it does so within a *generous* wall-time ceiling that only catches an
 //! accidental O(N²) regression. The tight, machine-calibrated ratchet "floor" is a CI-config concern
-//! (`docs/07`), deliberately not hard-coded here (CLAUDE.md: targets aren't guessed in source). The
+//! (`docs/06` §7.2), deliberately not hard-coded here (CLAUDE.md: targets aren't guessed in source). The
 //! `#[ignore]`d 10k variant prints the real timing for a local calibration run.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -114,7 +114,7 @@ fn cold_index_scales_to_500_files() {
     let elapsed = index_and_check(n);
     eprintln!("cold-indexed {n} files in {elapsed:?}");
     // Generous ceiling: a correct O(N) cold index of 500 tiny files is far under this; only an
-    // accidental O(N²) blowup trips it. (Calibrated ratchet floor lives in CI config — docs/07.)
+    // accidental O(N²) blowup trips it. (Reference budgets live in bench/budget.toml — docs/06 §7.2.)
     assert!(
         elapsed.as_secs() < 20,
         "cold index of {n} files took {elapsed:?} — suspect a super-linear regression"

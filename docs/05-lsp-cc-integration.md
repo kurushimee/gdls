@@ -1,97 +1,60 @@
-# 05 — LSP surface & Claude Code integration
+# 05. The LSP surface, configuration, and deployment
 
-## 1. Target LSP surface (driven by what Claude Code consumes)
+## 1. What gdls serves
 
-Per Claude Code's docs, its LSP client uses the following. v1 exposes all of them; the rest are Phase 2.
-(Several exposed handlers are wired but still have Godot-parity gaps that **M6** closes before v1 ships —
-see the parity note below the table.)
+gdls speaks LSP 3.17 over stdio. Every capability below is advertised only when it is wired to real work, and every one that a client capability guards is gated on that exact capability path. The wire conventions for each family, and the reasoning behind them, are in `09-lsp-conventions.md`.
 
-| Capability | LSP method(s) | v1? | Notes |
-|---|---|---|---|
-| Diagnostics (push, after edit) | `textDocument/publishDiagnostics` | ✅ M3 | Per-file (see `04-diagnostics-strict-mode.md`). CC uses **push**, not pull. |
-| List symbols in a file | `textDocument/documentSymbol` | ✅ M1 | From per-script symbol tables. |
-| Workspace symbol search | `workspace/symbol` | ✅ M4 | From the `class_name` registry + interface tables. Wired in M4 (`crates/gd_server/src/server.rs`). |
-| Go to definition | `textDocument/definition` | ✅ M3 | From analyzer-recorded bindings. |
-| Find references | `textDocument/references` | ✅ M4 | Needs the reverse-reference index. Wired in M4. |
-| Hover / type info | `textDocument/hover` | ✅ M3 | Resolved type + signature + doc prose (see "Hover doc-string source" below). |
-| Find implementations | `textDocument/implementation` | ✅ M4 | Subtypes / overrides via the class graph. Wired in M4. |
-| Call hierarchy | `textDocument/prepareCallHierarchy` (+ incoming/outgoing) | ✅ M4 | From the call graph built during analysis. Wired in M4. |
-| Signature help | `textDocument/signatureHelp` | ❌ Phase 2 (M8) | Not documented as consumed by CC; editors need it. See `09-phase-2.md`. |
-| Completion | `textDocument/completion` | ❌ Phase 2 (M8) | Not documented as consumed by CC; editors need it. See `09-phase-2.md`. |
-| Rename / formatting / code actions / semantic tokens | — | ❌ v1 | Out of scope *for v1*; now specified as Phase 2 M9/M10 (formatting: external-bridge only, M11) in `09-phase-2.md`. |
+**Lifecycle and sync.** `initialize`, `initialized`, `shutdown`, `exit`, `serverInfo`. Incremental `textDocumentSync` (`didOpen`, `didChange`, `didSave`, `didClose`). `positionEncoding` negotiated across UTF-8, UTF-16, and UTF-32. `$/cancelRequest` with true preemption: a cancelled request returns `RequestCancelled`, and one made stale by an edit returns `ContentModified`. `workDoneProgress` on the cold index, warm start, reconcile, and re-index, plus client tokens on `references` and `workspace/symbol`.
 
-> **Parity note (M6).** A ✅ above means the capability is *exposed and wired*, not that it already
-> matches Godot's own LSP on every input. Five have parity gaps that **M6** closes before v1 is tagged:
-> hierarchical `documentSymbol` (M6-A); `definition` on `class_name`-in-expression / `preload` strings /
-> autoloads (M6-B/C/D); project-wide `references` through typed vars (M6-E); `hover` member/call/`preload`
-> signatures (M6-F); and `implementation` for method overrides (M6-G). Until then they are safe but
-> sometimes incomplete — never wrong. See [`08-m6-v1-ship.md`](08-m6-v1-ship.md).
+**Diagnostics.** Push `textDocument/publishDiagnostics` and pull `textDocument/diagnostic`, computing the same items either way. `workspace/diagnostic` is deliberately absent (`04-diagnostics-strict-mode.md` §2).
+
+**Configuration and files.** `workspace/didChangeConfiguration` plus `workspace/configuration` for runtime re-config. `workspace/didChangeWatchedFiles`, dynamically registered when the client offers it, merged with the native watcher and de-duplicated by content fingerprint. `workspace/willRenameFiles` plus the `did*` notifications.
+
+| Family | Methods |
+|---|---|
+| Symbols | `textDocument/documentSymbol` (hierarchical, with a flat fallback), `workspace/symbol`, `workspaceSymbol/resolve` |
+| Navigation | `textDocument/definition`, `declaration`, `typeDefinition`, `references`, `implementation`, `documentLink` |
+| Hierarchies | `textDocument/prepareCallHierarchy` with `callHierarchy/incomingCalls` and `outgoingCalls`; `textDocument/prepareTypeHierarchy` with `typeHierarchy/supertypes` and `subtypes` |
+| Editing | `textDocument/completion` plus `completionItem/resolve`; `textDocument/signatureHelp`; `textDocument/rename` plus `prepareRename` |
+| Reading | `textDocument/hover`, `documentHighlight`, `foldingRange`, `selectionRange` |
+| Presentation | `textDocument/semanticTokens` (full, delta, range), `inlayHint` plus `inlayHint/resolve`, `documentColor` plus `colorPresentation` |
+| Actions | `textDocument/codeAction` plus `codeAction/resolve`, `workspace/executeCommand` (exactly one command, `gdls.applyWarningIgnore`), `workspace/applyEdit` |
+| Formatting | `textDocument/formatting`, advertised only when a formatter command is configured |
+
+The index designs behind the navigation handlers are in `03-indexing-freshness.md` §7.
+
+### Trigger characters and defaults
+
+`completion` triggers on `.`, `$`, `%`, `"`, and `@`, all non-identifier characters. `signatureHelp` triggers on `(` and `,`, and retriggers on `)`. Completion documentation and detail are resolved lazily through `completionItem/resolve`, and `data` carries a compact file-plus-symbol-path key rather than the request params.
+
+`semanticTokens` advertises a fixed legend of 10 standard token types and 6 standard modifiers, with zero custom names, at full width always so delta correlation keeps stable wire indices. Per-client legend intersection happens at emit time, never by shrinking the advertised legend.
+
+### Cross-file navigation limits
+
+Dynamic dispatch through `Variant` or `Callable`, signal connections made with dynamic name strings, and lambda invocations through opaque callables are not captured by `references` or the call hierarchy. Static method resolution and direct call expressions are. This matches both Godot's editor LSP and rust-analyzer.
 
 ### Hover doc-string source
 
-Doc prose for `textDocument/hover` resolves through this priority order:
+Doc prose for `textDocument/hover` resolves in this order:
 
-1. **`--dump-extension-api-with-docs` description fields** — engine classes pulled from the
-   in-project API dump (`description` and `brief_description` per class / method / property /
-   signal). This is the primary source.
-2. **`doc_classes` XML** — fallback for GDExtension classes whose addons ship XML but were absent
-   from the dump (and for older dumps without docs); merged into the same native DB. Same XML
-   format Godot's class reference uses. See `03-indexing-freshness.md` §1–§2 for the multi-source
-   capture story.
-3. **GDScript `##` doc comments (shipped in M7, #62)** — project-class/member prose: the lexer
-   records comments into a side-channel (token stream untouched; ratchets unaffected) and a
-   post-parse pass ports Godot's association rules (`gd_syntax::doc_comments`). Docs ride the
-   `Interface` outside the signature hash, so a doc-only edit never invalidates dependents.
-4. **Absent** — if no tier carries prose, hover shows the type signature alone.
+1. **`--dump-extension-api-with-docs` description fields.** Engine classes pulled from the in-project API dump (`description` and `brief_description` per class, method, property, and signal). The primary source.
+2. **`doc_classes` XML.** The fallback for GDExtension classes whose addons ship XML but were absent from the dump, and for older dumps without docs. Merged into the same native DB. See `03-indexing-freshness.md` §1 and §2.
+3. **GDScript `##` doc comments.** Project class and member prose. The lexer records comments into a side channel, leaving the token stream untouched so the fidelity ratchets are unaffected, and a post-parse pass applies Godot's association rules (`gd_syntax::doc_comments`). Docs ride the `Interface` outside the signature hash, so a doc-only edit never invalidates dependents.
+4. **Absent.** If no tier carries prose, hover shows the type signature alone.
 
-All outgoing prose — dump descriptions and `##` docs alike are BBCode-flavored — flows through
-the single converter in `gd_server::docs` (`09-phase-2.md` §7.2): GFM out (fenced signature,
-`---` rule, prose — the rust-analyzer hover shape), or stripped plaintext when the client's
-`hover.contentFormat` prefers it. Raw BBCode never reaches the wire (anti-catalog W8). M8 feeds
-completion/signatureHelp documentation through the same converter.
+All outgoing prose flows through the single converter in `gd_server::docs`, since dump descriptions and `##` docs are both BBCode-flavored. Output is either GitHub-Flavored Markdown (a fenced signature, a `---` rule, then prose, the rust-analyzer hover shape) or stripped plaintext when the client's `hover.contentFormat` prefers it. Raw BBCode never reaches the wire. Completion and signature help documentation go through the same converter. Details: `09-lsp-conventions.md` §7.2.
 
-### M4 nav handler semantics
+## 2. Lifecycle and capabilities
 
-Specifies each M4 handler's parameter and result shape (per the LSP 3.17 spec —
-<https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/>) and
-where each derives its data from. The full index designs live in
-`03-indexing-freshness.md §7`; this is the protocol contract.
+- **Text sync.** Incremental (`TextDocumentSyncKind.Incremental`), applied to the `ropey` buffer.
+- **Position encoding.** Internally gdls uses byte offsets and converts at the boundary. LSP defaults to UTF-16; if the client negotiates `utf-8` or `utf-32` via `general.positionEncodings`, gdls honors it.
+- **One server instance per workspace root** for the session. The `res://` root comes from `initializationOptions.projectRoot`, else `workspaceFolders`/`rootUri`, else the directory containing the nearest `project.godot`. `res://` is internal vocabulary only; the wire carries `file://` URIs.
+- **Streams.** JSON-RPC on stdout, all logs on stderr. Writing logs to stdout corrupts the protocol.
+- **Multi-root sessions are a non-goal.** One Godot project is one gdls, and editors spawn one instance per workspace.
 
-| Handler | LSP request → result | gdls semantics |
-|---|---|---|
-| `textDocument/references` | `ReferenceParams` (`TextDocumentPositionParams + context.includeDeclaration: boolean`) → `Location[] \| null` | Resolves identifier under cursor via the analyzer's smallest-typed-containing walk, queries `Index.name_referencers[name]` for candidate files, lazy-analyzes each and filters bindings to those matching the resolved `(kind, qualified_name)`. Includes the declaration when `includeDeclaration: true`. Cross-file walks share the analysis cache with `definition`. |
-| `textDocument/implementation` | `ImplementationParams` (`TextDocumentPositionParams`) → `Location \| Location[] \| LocationLink[] \| null` | For a class C, returns the declaration sites of all direct + transitive subclasses (linear walk of `Index.interfaces` checking `extends.target`). For a virtual/abstract method M on class C, also requires each candidate subclass to declare a member with the same name (same scan, plus a per-candidate `MemberDecl` lookup). |
-| `textDocument/prepareCallHierarchy` | `CallHierarchyPrepareParams` (`TextDocumentPositionParams`) → `CallHierarchyItem[] \| null` | Resolves the symbol under cursor (function, method, or constructor) to a `CallHierarchyItem` with the declaration's name, kind, uri, full range, and selectionRange (identifier-only span). Returns one item per overload when the cursor is on a multiply-defined name. |
-| `callHierarchy/incomingCalls` | `CallHierarchyIncomingCallsParams` (`{ item: CallHierarchyItem }`) → `CallHierarchyIncomingCall[] \| null` | Queries `Index.name_referencers[item.name]` for caller candidates, lazy-analyzes each, filters `AnalysisResult.bindings` for `Binding::Call` variants targeting `item`, returns one `CallHierarchyIncomingCall { from: CallHierarchyItem (the caller), fromRanges: Range[] (the call sites within the caller) }` per unique caller. |
-| `callHierarchy/outgoingCalls` | `CallHierarchyOutgoingCallsParams` (`{ item: CallHierarchyItem }`) → `CallHierarchyOutgoingCall[] \| null` | Filters `item`'s own `AnalysisResult.bindings` for `Binding::Call` variants, groups by callee, returns one `CallHierarchyOutgoingCall { to: CallHierarchyItem (the callee), fromRanges: Range[] (the call sites within `item`) }` per unique callee. |
-| `workspace/symbol` | `WorkspaceSymbolParams` (`{ query: string }`) → `SymbolInformation[] \| WorkspaceSymbol[] \| null` | Fuzzy match against the flat union of `ClassNameRegistry` entries + every `MemberDecl` across `Index.interfaces`. Ordering: (1) prefix match on class name, (2) prefix match on member name, (3) fuzzy score. Capped at 256 results (configurable via `initializationOptions.workspaceSymbolMaxResults`). If the client advertises `workspace.symbol.resolveSupport` (3.17), gdls returns `WorkspaceSymbol[]` without `range` and resolves on demand via `workspaceSymbol/resolve`; otherwise returns full `SymbolInformation[]`. |
+## 3. Client configuration
 
-**Call-graph limitations** (intentional, matching Godot's editor LSP and rust-analyzer's
-approach): dynamic dispatch through `Variant` or `Callable`, signal connections via dynamic name
-strings, and lambda invocations through opaque callables are **not** captured. Static
-method-resolution and direct call expressions are.
-
-**Cancellation.** Per LSP 3.17 `$/cancelRequest`, a cancelled request still returns a response —
-gdls returns an error with `ErrorCodes.RequestCancelled`. M5 plumbs a cancellation token through
-the analyzer with cooperative checkpoints (see `06-testing-fidelity.md §8`).
-
-## 2. Lifecycle & capabilities
-
-- Implement `initialize` / `initialized` / `shutdown` / `exit`. Advertise exactly the capabilities in §1.
-- **Text sync:** advertise **incremental** sync (`TextDocumentSyncKind.Incremental`); apply edits to the
-  `ropey` buffer. Handle `didOpen` / `didChange` / `didSave` / `didClose`.
-- **Position encoding:** LSP defaults to **UTF-16** offsets. Internally gdls uses byte offsets; convert at
-  the boundary. (If the client negotiates `utf-8` via `general.positionEncodings`, prefer it.)
-- **One server instance per workspace root** for the session (standard CC behavior). The `res://` root is
-  taken from `initializationOptions.projectRoot`, else the workspace folder, else the directory containing
-  the nearest `project.godot`.
-- **Streams:** JSON-RPC on **stdout**; **all logs on stderr** (writing logs to stdout corrupts the protocol).
-
-## 3. Claude Code configuration
-
-Claude Code launches the server over stdio; the **binary must be discoverable on `PATH`**, and CC does
-**not** ship the server (you build/install it). Register via a plugin `.lsp.json` (or the `lspServers` key
-in `plugin.json`):
+The binary must be discoverable on `PATH`. Claude Code launches the server over stdio; register it via a plugin `.lsp.json`, or the `lspServers` key in `plugin.json`:
 
 ```jsonc
 // .lsp.json
@@ -109,36 +72,39 @@ in `plugin.json`):
 }
 ```
 
+Other Claude Code config fields that work here: `transport` (`"stdio"` is the default; `"socket"` exists but is undocumented, so stay on stdio), `env`, `startupTimeout`, `shutdownTimeout`.
+
 ### `initializationOptions` schema
 
 | Key | Type | Meaning |
 |---|---|---|
-| `projectRoot` | string (path) | `res://` root. Optional; falls back to workspace folder / nearest `project.godot`. |
-| `extensionApiPath` | string (path) | Pin a hand-made `extension_api.json`. Optional — when absent, the auto-dump resolution applies (`03-indexing-freshness.md` §1); when no project-derived source resolves, the embedded stock fallback serves builtins. Pinning also skips the background auto-dump entirely — the managed dump can never be served while a path is pinned. |
-| `godotBinaryPath` | string (path) | Godot 4.x executable for the auto-dump. Optional; discovery falls back to `GDLS_GODOT`, then `godot4`/`godot` on PATH. |
-| `autoDumpExtensionApi` | bool | Allow gdls to spawn Godot to (re)generate the managed dump under `.gdls/`. Since v1.0.2 the dump runs on a background thread and is adopted mid-session (reload + republish) — it never blocks a request. Default `true`; `false` forbids spawning entirely. |
-| `embeddedApiFallback` | bool | v1.0.2: when every native-API source misses, fall back to a bundled stock 4.6.3 class surface instead of an empty DB, so builtins always resolve on a fresh install. Under this fallback (`Generic` provenance) unknown-type/member negatives are suppressed — only a project-derived (`Exact`) dump may claim a name doesn't exist. Default `true`. |
+| `projectRoot` | string (path) | The `res://` root. Optional; falls back to the workspace folder, then the nearest `project.godot`. |
+| `extensionApiPath` | string (path) | Pin a hand-made `extension_api.json`. Optional. When absent, the auto-dump resolution applies (`03-indexing-freshness.md` §1), and when no project-derived source resolves, the embedded stock fallback serves builtins. Pinning also skips the background auto-dump entirely, so the managed dump can never be served while a path is pinned. |
+| `godotBinaryPath` | string (path) | Godot 4.x executable for the auto-dump. Optional; discovery falls back to `GDLS_GODOT`, then `godot4`/`godot` on `PATH`. |
+| `autoDumpExtensionApi` | bool | Allow gdls to spawn Godot to regenerate the managed dump under `.gdls/`. The dump runs on a background thread and is adopted mid-session (reload plus republish), so it never blocks a request. Default `true`; `false` forbids spawning entirely. |
+| `embeddedApiFallback` | bool | When every native-API source misses, fall back to a bundled stock 4.6.3 class surface instead of an empty DB, so builtins always resolve on a fresh install. Under this fallback (`Generic` provenance) unknown-type and unknown-member negatives are suppressed: only a project-derived (`Exact`) dump may claim a name does not exist. Default `true`. See `02-frontend-port.md` §11b. |
 | `strict.profile` | `"godot"` \| `"strict"` \| `"off"` | Diagnostics profile (see `04-diagnostics-strict-mode.md`). Default `"godot"`. |
-| `strict.enableWarnings` / `disableWarnings` / `errorWarnings` | string[] | Fine-grained overrides. |
-| `stubCacheDir` | string | v1.0.4 (#34): override the root under which native-class API stubs (the `definition` targets for native symbols) are materialized. Default: the user-level gdls cache (`%LOCALAPPDATA%\gdls` / `~/.cache/gdls`) — deliberately outside any workspace root. Normally left unset; the in-process tests point it at a tempdir. |
+| `strict.enableWarnings` / `disableWarnings` / `errorWarnings` | string[] | Fine-grained warning overrides. |
+| `completion.snippets` | bool | Emit snippet placeholders for callable completions. Gated a second time by the client's `completionItem.snippetSupport`. Default `true`. |
+| `completion.callArgumentStyle` | enum | How a callable's call parentheses render when snippets are on. Default `parensWithCursor`, the gopls style: accepting `foo` yields `foo()` with the cursor between the parens. |
+| `inlayHint.typeHints` | bool | Inferred type on `var x := …` and on an inferred `for` variable. Default `true`. |
+| `inlayHint.parameterHints` | bool | Parameter-name labels at resolved call sites. Default `true`. Single-argument calls never get one regardless. |
+| `formatter.command` / `formatter.args` | string / string[] | The external formatter executable and its argument vector. No shell is involved, so neither value can be interpreted as a shell expression. `documentFormattingProvider` is advertised only when `command` is set. |
+| `memory.cacheCapacity` / `softCapMb` / `hardCapMb` | number | Parse and analysis cache size, and the memory-pressure ladder thresholds (`06-testing-fidelity.md` §7.3). |
+| `analyzer.iterLimit` / `checkpointDelayUs` | number | The per-file fixpoint iteration cap and the cancellation-checkpoint interval. |
+| `stubCacheDir` | string | Override the root under which native-class API stubs, the `definition` targets for native symbols, are materialized. Default: the user-level gdls cache (`%LOCALAPPDATA%\gdls` or `~/.cache/gdls`), deliberately outside any workspace root. Normally left unset. |
 
-Other config fields supported by CC and usable here: `transport` (`"stdio"` default; `"socket"` exists but
-is undocumented — stay on stdio), `env`, `startupTimeout`, `shutdownTimeout`.
+Malformed options fall back to documented defaults with a `window/showMessage(Warning)`; `initialize` never fails on them.
 
 ## 4. Deployment
 
-- Ship a single static `gdls` (Rust release build) and place it on `PATH` (or reference it from a plugin
-  that ensures it is installed).
-- `extension_api.json` is auto-managed since v1.0.1 (gdls dumps it via the discovered Godot binary and
-  regenerates on binary / `.gdextension` changes — `03-indexing-freshness.md` §1). Manual generation is
-  only needed when `autoDumpExtensionApi` is disabled or no Godot binary is discoverable.
-- No other runtime files required; the server is stateless across restarts except for the
-  `.gdls/` warm-start cache + managed dump.
+- Ship a single static `gdls` (Rust release build) and put it on `PATH`, or reference it from a plugin that makes sure it is installed.
+- `extension_api.json` is auto-managed: gdls dumps it via the discovered Godot binary and regenerates on binary or `.gdextension` changes (`03-indexing-freshness.md` §1). Manual generation is only needed when `autoDumpExtensionApi` is disabled or no Godot binary is discoverable.
+- No other runtime files are required. The server is stateless across restarts apart from the `.gdls/` warm-start cache and managed dump.
 
 ## 5. Sources
 
-- LSP servers in plugins (`.lsp.json`, `command`/`args`/`extensionToLanguage`, transport, `restartOnCrash`,
-  binary must be on PATH) — https://code.claude.com/docs/en/plugins-reference.md
-- LSP tool behavior (diagnostics after edit; definition/references/hover/symbols/implementation/call
-  hierarchy) — https://code.claude.com/docs/en/tools-reference.md
-- LSP position encoding (UTF-16 default) — https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#positionEncodingKind
+- [LSP 3.17 spec](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/)
+- [LSP servers in plugins: `.lsp.json`, `command`/`args`/`extensionToLanguage`, transport, `restartOnCrash`, and the binary having to be on PATH](https://code.claude.com/docs/en/plugins-reference.md)
+- [LSP tool behavior: diagnostics after edit, definition, references, hover, symbols, implementation, call hierarchy](https://code.claude.com/docs/en/tools-reference.md)
+- [LSP position encoding, UTF-16 default](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#positionEncodingKind)

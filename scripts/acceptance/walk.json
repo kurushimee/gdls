@@ -4,7 +4,7 @@
     "absolute path to the project root before passing to lsp-poke.py.",
     "The token __EXTENSION_API__ must be substituted with the real path to extension_api.json.",
     "File paths and line/column positions are project-specific: copy this file into",
-    "scripts/m6-acceptance/sessions/<project-name>.json, substitute __PROJECT_ROOT__ and",
+    "scripts/acceptance/sessions/<project-name>.json, substitute __PROJECT_ROOT__ and",
     "__EXTENSION_API__, then fill in real (line, character) positions for each request.",
     "run.sh does this substitution automatically when given --project/--api/--session."
   ],

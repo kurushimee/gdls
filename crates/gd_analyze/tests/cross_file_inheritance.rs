@@ -381,7 +381,7 @@ func go() -> void:
 /// The sweep-driven v1.0.1 batch, pinned as one zero-diagnostics fixture: every shape here
 /// errored on a real OSS project (Pixelorama @ stock 4.6.3) after the first fix wave. Kitchen
 /// sink by design — the gate that proved them is the full-project sweep
-/// (`scripts/m6-acceptance/scan_diags.py`), and this is its in-repo distillation.
+/// (`scripts/acceptance/scan_diags.py`), and this is its in-repo distillation.
 #[test]
 fn sweep_batch_shapes_publish_no_errors() {
     let base = "\

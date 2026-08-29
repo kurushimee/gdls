@@ -7,7 +7,7 @@
 //! [`LEGEND_TYPES`] / [`LEGEND_MODIFIERS`] tables + a snapshot test); **no `gdscript/`-prefixed or
 //! otherwise custom name is ever emitted.**
 //!
-//! ## Classification (docs/09 §6-M10 mapping)
+//! ## Classification (docs/09 §6.5 mapping)
 //!
 //! A document is classified by walking the parse tree ([`classify_document`]) and tagging every
 //! relevant identifier-bearing position with a [`TokType`] + a modifier bitset. The walk is the

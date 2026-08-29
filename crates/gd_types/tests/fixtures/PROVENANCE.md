@@ -1,30 +1,16 @@
-# `gd_types` test fixtures — provenance
+# `gd_types` test fixtures provenance
 
-## `mini_api.json` — synthetic
-Hand-authored, **not** generated. A minimal but format-faithful `extension_api.json`
-covering every shape the ingester must handle: an inheritance chain (`MiniNode` →
-`MiniObject`), method flags (`const`/`static`/`vararg`/`virtual`), an absent
-`return_value` (void), and one of every `TypeRef` encoding the dump emits —
-`typedarray::`, `typeddictionary::K;V`, `enum::Class.Name`, `enum::Global`,
-`bitfield::Class.Name`, `void*`, `Variant`. Small enough to assert exact contents.
+## `mini_api.json`, synthetic
 
-## `trimmed_api.json` — real, trimmed by CLASS, complete within each
-Extracted from a real in-project dump (see workflow below) with `jq`. The trim is by
-class NAME only: it keeps the canonical `Object → RefCounted` / `Node → CanvasItem →
-Node2D` chains plus the handful of other classes and builtins the corpus reaches for —
-but each one it keeps, it keeps WHOLE (every method, member, constant, enum,
-constructor and operator), and the `utility_functions` table is the complete one.
-Doc prose (`description` / `brief_description`) is stripped to keep it small;
-signatures are real. This is the CI oracle that proves real Godot output parses.
+Hand-authored, not generated. A minimal but format-faithful `extension_api.json` covering every shape the ingester has to handle: an inheritance chain (`MiniNode` to `MiniObject`), method flags (`const`, `static`, `vararg`, `virtual`), an absent `return_value` for void, and one of every `TypeRef` encoding the dump emits (`typedarray::`, `typeddictionary::K;V`, `enum::Class.Name`, `enum::Global`, `bitfield::Class.Name`, `void*`, `Variant`). Small enough to assert exact contents.
 
-**Why complete-within-each matters (#256).** `NativeDb::from_json` stamps
-`ApiProvenance::Exact`, and every negative claim the analyzer makes — `Function "x()"
-not found in base self.`, `Cannot find member "x" in base "Vector2".`,
-`UNSAFE_METHOD_ACCESS` — is gated on exactly that. So a fixture that claims `Exact`
-while carrying nine of the engine's 114 utilities makes every `typeof(…)` in the
-conformance corpus read as a typo. Trim classes out; never trim a kept class's members.
+## `trimmed_api.json`, real, trimmed by class, complete within each
 
-Regenerate (from the workspace root, with the full dump at `api/extension_api.json`):
+Extracted from a real in-project dump (see the workflow below) with `jq`. The trim is by class name only. It keeps the canonical `Object` to `RefCounted` and `Node` to `CanvasItem` to `Node2D` chains, plus the handful of other classes and builtins the corpus reaches for, and every class it keeps it keeps whole: every method, member, constant, enum, constructor, and operator. The `utility_functions` table is the complete one. Doc prose (`description`, `brief_description`) is stripped to keep it small; the signatures are real. This is the CI oracle proving that real Godot output parses.
+
+**Why complete-within-each matters (#256).** `NativeDb::from_json` stamps `ApiProvenance::Exact`, and every negative claim the analyzer makes is gated on exactly that: `Function "x()" not found in base self.`, `Cannot find member "x" in base "Vector2".`, `UNSAFE_METHOD_ACCESS`. So a fixture claiming `Exact` while carrying nine of the engine's 114 utilities makes every `typeof(…)` in the conformance corpus read as a typo. Trim classes out, and never trim a kept class's members.
+
+Regenerate from the workspace root, with the full dump at `api/extension_api.json`:
 
 ```bash
 jq 'walk(if type=="object" then del(.description, .brief_description) else . end)
@@ -38,12 +24,11 @@ jq 'walk(if type=="object" then del(.description, .brief_description) else . end
   api/extension_api.json > crates/gd_types/tests/fixtures/trimmed_api.json
 ```
 
-A few methods are hand-added on top: the ClassDB-resolvable names the dump omits
-(`Object.free`, `Node.free`), which `NativeDb` also seeds at ingest. Re-apply them after
-a regeneration, or the `free`-related tests fail.
+A few methods are hand-added on top: the ClassDB-resolvable names the dump omits (`Object.free`, `Node.free`), which `NativeDb` also seeds at ingest. Re-apply them after a regeneration, or the `free`-related tests fail.
 
 ## Generating the full dump (`api/extension_api.json`, git-ignored)
-Run the `godot` binary **inside the project** so its context is loaded:
+
+Run the `godot` binary inside the project, so its context is loaded:
 
 ```bash
 cd /path/to/your/godot/project && godot --headless --dump-extension-api-with-docs
@@ -51,8 +36,4 @@ cd /path/to/your/godot/project && godot --headless --dump-extension-api-with-doc
 mv /path/to/your/godot/project/extension_api.json api/extension_api.json
 ```
 
-Two gotchas observed (2026-05): the binary can **crash on
-shutdown** *after* writing a complete, valid file — so validate the dump by content
-(header + closing brace), not by exit code. And the stock dump **omits installed
-GDExtensions** (`ClassDB` is snapshotted before they load) — their types come from the
-`doc_classes` XML reader, not this JSON.
+Two gotchas observed in 2026-05. The binary can crash on shutdown *after* writing a complete, valid file, so validate the dump by content (the header plus the closing brace) rather than by exit code. And the stock dump omits installed GDExtensions, since `ClassDB` is snapshotted before they load; their types come from the `doc_classes` XML reader, not this JSON.

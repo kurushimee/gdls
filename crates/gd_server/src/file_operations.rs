@@ -7,7 +7,7 @@
 //! `preload`/`load` `res://`-path string ARGUMENT that pointed at the *old* path so it points at the
 //! *new* one — otherwise the move silently breaks those load references. The write-set is scoped to
 //! `preload(…)` / `load(…)` / `ResourceLoader.load(…)` / `ResourceLoader.load_threaded_request(…)`
-//! argument literals POSITIVELY (the spec's `preload`/`load` scope — docs/09 §141,§252) — NOT every
+//! argument literals POSITIVELY (the spec's `preload`/`load` scope — docs/09 §6.7) — NOT every
 //! `res://` literal that resolves: a `res://` string used as a *value* (`if p == "res://moved.gd"`,
 //! a `const PATH := "res://moved.gd"` nothing loads, a dict key/value) is left untouched, because
 //! rewriting a non-load literal would CHANGE program behavior (flip a guard, alter a display value)
