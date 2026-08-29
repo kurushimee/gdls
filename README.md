@@ -1,38 +1,29 @@
-# gdls — a standalone GDScript language server for Godot 4.6.3-stable
+# gdls, a standalone GDScript language server for Godot 4.6.3-stable
 
 [![CI](https://github.com/kurushimee/gdls/actions/workflows/ci.yml/badge.svg)](https://github.com/kurushimee/gdls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-dea584.svg?logo=rust)](rust-toolchain.toml)
 [![Godot conformance](https://img.shields.io/badge/Godot%20conformance-1.0000-brightgreen.svg)](docs/06-testing-fidelity.md)
 
-A single self-contained language server providing **type-aware GDScript diagnostics and
-navigation** to Claude Code (and any LSP client) over stdio — **with no Godot engine or editor
-process running at runtime**.
+One binary that gives Claude Code (or any LSP client) type-aware GDScript diagnostics and navigation over stdio, with no Godot engine or editor running.
 
-`gdls` is a faithful Rust port of the GDScript frontend (tokenizer → parser → analyzer) of
-Godot 4.6.3-stable. It exists to fix the editor LSP's weight, staleness, and engine coupling at
-the 3,000–10,000+ `.gd` scale. Only the frontend is ported — the compiler/bytecode/VM half is out
-of scope (diagnostics only).
+`gdls` is a faithful Rust port of the GDScript frontend (tokenizer, parser, analyzer) from Godot 4.6.3-stable. It exists because the editor's built-in LSP is heavy, goes stale, and needs the engine running, which hurts at 3,000 to 10,000+ `.gd` files. Only the frontend is ported. The compiler, bytecode, and VM half is out of scope, so this is diagnostics and navigation only.
 
 ## Install
 
-`gdls` is not shipped by Claude Code; you grab a release binary (or build one) and put it on `PATH`.
+`gdls` does not ship with Claude Code. Grab a release binary or build one, then put it on `PATH`.
 
-- **Prebuilt binaries** — download `gdls` (Linux x86_64) or `gdls.exe` (Windows x86_64) from
-  [GitHub Releases](https://github.com/kurushimee/gdls/releases).
+Prebuilt binaries: download `gdls` (Linux x86_64) or `gdls.exe` (Windows x86_64) from [GitHub Releases](https://github.com/kurushimee/gdls/releases).
 
-- **From source (cargo)** — builds straight from this repo and installs the `gdls` binary into
-  `~/.cargo/bin` (no checkout needed):
+From source, straight from this repo, into `~/.cargo/bin` (no checkout needed):
 
-  ```sh
-  cargo install --git https://github.com/kurushimee/gdls gd_server
-  ```
+```sh
+cargo install --git https://github.com/kurushimee/gdls gd_server
+```
 
 The toolchain is pinned by `rust-toolchain.toml` (stable).
 
-`gdls` speaks JSON-RPC over **stdio**, so a bare `gdls` invocation just waits for an LSP client on
-stdin. To smoke-test the binary without wiring up a client, point its index pass at a project — it
-exits cleanly and prints a reconcile summary to stderr:
+`gdls` speaks JSON-RPC over stdio, so running it bare just waits for a client. To smoke-test the binary without wiring up an editor, point its index pass at a project. It prints a reconcile summary to stderr and exits cleanly:
 
 ```sh
 gdls diagnose --reconcile --root /path/to/your/godot/project
@@ -40,104 +31,56 @@ gdls diagnose --reconcile --root /path/to/your/godot/project
 
 ## Quick start
 
-1. **Register the server** with your LSP client. For Claude Code, install the official plugin
-   from the [`kurushimee/gdls-plugin`](https://github.com/kurushimee/gdls-plugin) marketplace —
-   inside a Claude Code session:
+Register the server with your LSP client. For Claude Code, install the plugin from the [`kurushimee/gdls-plugin`](https://github.com/kurushimee/gdls-plugin) marketplace, inside a session:
 
-   ```
-   /plugin marketplace add kurushimee/gdls-plugin
-   /plugin install gdls@gdls-plugin
-   ```
+```
+/plugin marketplace add kurushimee/gdls-plugin
+/plugin install gdls@gdls-plugin
+```
 
-   For any other LSP client (or a hand-rolled plugin), the core registration is five lines:
+For any other client, the core registration is five lines:
 
-   ```json
-   {
-     "gdscript": {
-       "command": "gdls",
-       "extensionToLanguage": { ".gd": "gdscript" }
-     }
-   }
-   ```
+```json
+{
+  "gdscript": {
+    "command": "gdls",
+    "extensionToLanguage": { ".gd": "gdscript" }
+  }
+}
+```
 
-2. **Native types: nothing to do** (since v1.0.1). gdls finds your Godot binary
-   (`godotBinaryPath` option → `GDLS_GODOT` env → `godot4`/`godot` on PATH), runs
-   `--dump-extension-api-with-docs` with project context — which is what captures the project's
-   GDExtension classes — and manages the result under `.gdls/`, regenerating only when the
-   binary or the project's `.gdextension` set changes. Since v1.0.2 the dump runs in the
-   background (it never delays a request; the session re-checks open files the moment it lands),
-   and when no binary is discoverable at all, a bundled stock 4.6.3 class surface keeps builtins
-   (`Node`, `Timer`, …) resolving — without inventing "unknown type" errors for classes only
-   your engine build knows. To pin a hand-made dump instead, set
-   `initializationOptions.extensionApiPath`; to forbid gdls from ever spawning Godot, set
-   `autoDumpExtensionApi: false` (or `GDLS_GODOT=off`) and dump manually from inside the
-   project directory:
+Native types need no setup. gdls finds your Godot binary (`godotBinaryPath` option, then the `GDLS_GODOT` env var, then `godot4`/`godot` on `PATH`), runs `--dump-extension-api-with-docs` with project context so the project's GDExtension classes are captured, and keeps the result under `.gdls/`, regenerating only when the binary or the project's `.gdextension` set changes. The dump runs in the background, so it never delays a request; the session re-checks open files as soon as it lands. If no binary is discoverable, a bundled stock 4.6.3 class surface keeps builtins like `Node` and `Timer` resolving, and gdls will not invent "unknown type" errors for classes only your engine build knows about.
 
-   ```sh
-   godot --dump-extension-api-with-docs
-   ```
+To pin a hand-made dump instead, set `initializationOptions.extensionApiPath`. To stop gdls from ever spawning Godot, set `autoDumpExtensionApi: false` (or `GDLS_GODOT=off`) and dump manually from inside the project directory:
 
-   Details and the multi-source capture story (incl. `doc_classes` XML fallback) are in
-   [`docs/03-indexing-freshness.md`](docs/03-indexing-freshness.md) §1–§2.
+```sh
+godot --dump-extension-api-with-docs
+```
+
+[`docs/03-indexing-freshness.md`](docs/03-indexing-freshness.md) §1 and §2 cover the details, including the `doc_classes` XML fallback.
+
+## What it serves
+
+Diagnostics (push and pull), hover, definition, declaration, type definition, references, implementation, call hierarchy, type hierarchy, document and workspace symbols, completion, signature help, rename, document highlight, semantic tokens, inlay hints, document colors, code actions, folding and selection ranges, document links, and file-rename edits. Any editor gets the whole set with no gdls-specific client code and none of the Godot editor LSP's custom protocol. The full surface is in [`docs/05-lsp-cc-integration.md`](docs/05-lsp-cc-integration.md), and the capabilities gdls deliberately does not serve, with reasons, are in [`docs/09-lsp-conventions.md`](docs/09-lsp-conventions.md) §5.
+
+Both fidelity ratchets sit at 1.0000 against the vendored Godot 4.6.3-stable corpus: parser 186/186, analyzer 300/300.
+
+The latest release is v1.0.7; `main` is ahead of it. [`CHANGELOG.md`](CHANGELOG.md) has the release history, and [`docs/08-history.md`](docs/08-history.md) has how the project was built.
 
 ## Configuration
 
-The server is configured entirely through LSP `initializationOptions` —
-`projectRoot`, the auto-dump pair (`godotBinaryPath`, `autoDumpExtensionApi`),
-`extensionApiPath` to pin a manual dump, and the `strict` diagnostics profile
-(`godot` / `strict` / `off`) plus per-warning overrides. The full schema and a worked manifest are
-in [`docs/05-lsp-cc-integration.md`](docs/05-lsp-cc-integration.md) §3.
+Everything is configured through LSP `initializationOptions`, and everything has a working default: `projectRoot`, the auto-dump pair (`godotBinaryPath`, `autoDumpExtensionApi`), `extensionApiPath` to pin a manual dump, the `strict` diagnostics profile (`godot`, `strict`, or `off`) with per-warning overrides, completion and inlay-hint toggles, and the `formatter` command that bridges to gdformat or any other external formatter. Settings can also change mid-session through `workspace/configuration`. The full schema and a worked manifest are in [`docs/05-lsp-cc-integration.md`](docs/05-lsp-cc-integration.md) §3.
 
 ## Architecture
 
-- **Problem, goal, and locked decisions** — [`docs/00-overview.md`](docs/00-overview.md).
-- **Components, control loops, and the crate DAG** (`gd_syntax` → `gd_types` →
-  `gd_analyze` / `gd_project` → `gd_server`) — [`docs/01-architecture.md`](docs/01-architecture.md).
-
-## Status
-
-**Phase 1 = M0–M6 = v1. Complete.** Both fidelity ratchets are at **1.0000** (parser 186/186, analyzer
-300/300) against the vendored Godot 4.6.3-stable conformance corpus. **M6** closed the exposed-capability
-parity gaps vs Godot's own LSP (hover member signatures, `definition`/`documentLink` on
-`class_name`/`preload`/autoloads, project-wide `references`, hierarchical `documentSymbol`,
-`implementation` overrides, autoload-singleton typing) and added a persistent, multi-instance-safe
-warm-start index cache (a warm relaunch is **>5×** faster than a cold scan). Verified by capability
-walks against a real Godot 4.6.3 OSS project and a Windows-native 2,338-script production project.
-**v1.0.4** is the current release — the native-surface completeness release: hover and
-`definition` now work on native classes and members (declaration-line hover pinned to Godot's
-own LSP detail formats; `definition` jumps into readable API stubs materialized under the user
-cache), `workspace/symbol` anchors `class_name` declarations instead of line 0, the analyzer
-restores upstream's class→native fall-through so int-typed native surfaces type faithfully, and
-`UNSAFE_PROPERTY_ACCESS` — the one deliberately-deferred warning — now fires, provenance-gated
-so it never false-positives on incomplete class surfaces. Before it, **v1.0.3** made the full
-Godot warning set actually fire (19 silent codes ported function-for-function) with exact
-`@warning_ignore` spans, **v1.0.2** made the first run robust (background `extension_api.json`
-auto-dump, embedded stock 4.6.3 fallback), and **v1.0.1** fixed the cross-file false-positive
-families a full-project diagnostics sweep exposed right after v1.0.0.
-See [`docs/08-m6-v1-ship.md`](docs/08-m6-v1-ship.md) for the M6 scope and
-[`CHANGELOG.md`](CHANGELOG.md) for the milestone history.
-
-Phase 2 (post-v1) is the **generic-language-server phase** — milestones **M7–M11**: full
-editor-grade LSP surface (completion, signature help, rename, document highlight, type hierarchy,
-semantic tokens with the standard legend only, inlay hints, code actions, folding/selection
-ranges, pull diagnostics, cancellation preemption, progress reporting) plus `.tscn` node typing
-for `$`/`%`, so any editor — Helix, VS Code, Neovim, Zed, Emacs, Sublime — gets the complete
-feature set with zero gdls-specific client code, and none of the Godot-editor LSP's custom
-protocol. (The persistent warm-start index cache was pulled forward into **M6** — it gated v1.)
-Full spec: [`docs/09-phase-2.md`](docs/09-phase-2.md); roadmap table in
-[`docs/07-milestones-risks.md`](docs/07-milestones-risks.md).
+[`docs/00-overview.md`](docs/00-overview.md) has the problem statement and the design decisions. [`docs/01-architecture.md`](docs/01-architecture.md) has the components, the control loops, and the crate layering (`gd_syntax` → `gd_types` → `gd_analyze` / `gd_project` → `gd_server`).
 
 ## Contributing
 
-Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). The one thing to read first is the
-*faithful-port discipline*: `gdls` mirrors Godot's frontend function-for-function and matches its
-diagnostics byte-for-byte, so fidelity to the upstream source is reviewed ahead of Rust idiom. The dev
-loop is the CI gate (`cargo fmt --all --check`, `cargo lint`, `cargo build`, `cargo test`).
+Contributions are welcome. See [`CONTRIBUTING.md`](CONTRIBUTING.md), and read the faithful-port rule first: `gdls` mirrors Godot's frontend function for function and matches its diagnostics byte for byte, so fidelity to the upstream source is reviewed ahead of Rust idiom. The dev loop is the CI gate: `cargo fmt --all --check`, `cargo lint`, `cargo build`, `cargo test`.
 
 ## License
 
 `gdls` is released under the [MIT License](LICENSE).
 
-It is a faithful port of the GDScript frontend of [Godot Engine](https://github.com/godotengine/godot),
-which is also MIT-licensed; substantial portions of this software are derived from Godot's source, and the
-Godot Engine copyright notice is retained in [`LICENSE`](LICENSE) as that license requires.
+It is a faithful port of the GDScript frontend of [Godot Engine](https://github.com/godotengine/godot), which is also MIT-licensed. Substantial portions of this software are derived from Godot's source, and the Godot Engine copyright notice is retained in [`LICENSE`](LICENSE) as that license requires.

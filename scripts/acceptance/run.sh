@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# m6-acceptance/run.sh — M6 v1 capability acceptance runner.
+# acceptance/run.sh — LSP capability acceptance runner.
 #
 # Drives lsp-poke.py against any GDScript project to verify:
 #   1. Every exposed M6 LSP capability returns real data (not null/placeholder).
@@ -23,14 +23,14 @@
 # Optional:
 #   --api     / EXTENSION_API  Path to an existing extension_api.json.
 #                              If absent, dumped via GODOT_BIN.
-#   --session SESSION_JSON     Session template (default: scripts/m6-acceptance/walk.json).
+#   --session SESSION_JSON     Session template (default: scripts/acceptance/walk.json).
 #                              Tokens __PROJECT_ROOT__ and __EXTENSION_API__ are substituted
 #                              automatically. File-placeholder tokens (__CALLER_FILE__ etc.)
 #                              must already be filled in the template, OR use a project-specific
-#                              session from scripts/m6-acceptance/sessions/<project>.json.
+#                              session from scripts/acceptance/sessions/<project>.json.
 #
 # Output:
-#   target/m6-acceptance/oss-report.json  (gitignored — C2 adds the ignore glob)
+#   target/acceptance/oss-report.json  (gitignored — C2 adds the ignore glob)
 #
 # Exit codes:
 #   0 — all capabilities pass AND warm start >=5x faster than cold (the speedup gate is
@@ -61,7 +61,7 @@ One of these required unless --api is supplied:
 Optional:
   --api     PATH   / EXTENSION_API=PATH   Pre-dumped extension_api.json.
   --session PATH                          Session template JSON.
-                                          Default: scripts/m6-acceptance/walk.json
+                                          Default: scripts/acceptance/walk.json
 
 Example:
   run.sh --project ~/projects/pixelorama --godot /usr/local/bin/godot4
@@ -73,7 +73,7 @@ die() {
    echo "ERROR: $*" >&2
    exit 1
 }
-info() { echo "[m6-acceptance] $*"; }
+info() { echo "[acceptance] $*"; }
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -162,7 +162,7 @@ info "gdls built: ${GDLS}"
 # (see README.md for how to build one).
 # ---------------------------------------------------------------------------
 
-OUT_DIR="${REPO_ROOT}/target/m6-acceptance"
+OUT_DIR="${REPO_ROOT}/target/acceptance"
 mkdir -p "${OUT_DIR}"
 
 CONCRETE_SESSION="${OUT_DIR}/concrete-session.json"
@@ -205,10 +205,10 @@ info "Concrete session: ${CONCRETE_SESSION}"
 if grep -q '__[A-Z_]*_FILE__' "${CONCRETE_SESSION}" 2>/dev/null; then
    remaining="$(grep -o '__[A-Z_]*_FILE__' "${CONCRETE_SESSION}" | sort -u | tr '\n' ' ')"
    die "Session still contains unfilled file-role placeholders: ${remaining}
-Copy walk.json into scripts/m6-acceptance/sessions/<project>.json, replace
+Copy walk.json into scripts/acceptance/sessions/<project>.json, replace
 each __*_FILE__ token with the relative path (from project root) to a real
 project file, fill in real positions, then pass --session <your-session.json>.
-See scripts/m6-acceptance/README.md for step-by-step instructions."
+See scripts/acceptance/README.md for step-by-step instructions."
 fi
 
 # ---------------------------------------------------------------------------
@@ -417,7 +417,7 @@ else:
         tag = "FAIL"
     else:
         tag = "INFO — not enforced"
-    print(f"[m6-acceptance] cold={cold_ms}ms  warm={warm_ms}ms  ratio={ratio:.2f}x  [{tag}]")
+    print(f"[acceptance] cold={cold_ms}ms  warm={warm_ms}ms  ratio={ratio:.2f}x  [{tag}]")
     if ratio < SPEEDUP_THRESHOLD:
         if bench_enforced:
             failures.append(
@@ -426,7 +426,7 @@ else:
             )
         else:
             print(
-                f"[m6-acceptance] speedup gate not enforced: {gd_file_count} .gd files "
+                f"[acceptance] speedup gate not enforced: {gd_file_count} .gd files "
                 f"< {BENCH_ENFORCE_FLOOR} — at this scale the ratio measures fixed LSP "
                 "overhead, not the cache (README bench caveat); the >=5x criterion is "
                 "proven at scale by cache_warm_start.rs."
@@ -446,13 +446,13 @@ report = {
 os.makedirs(os.path.dirname(report_path), exist_ok=True)
 with open(report_path, "w") as f:
     json.dump(report, f, indent=2)
-print(f"[m6-acceptance] Report: {report_path}")
+print(f"[acceptance] Report: {report_path}")
 
 if failures:
-    print("\n[m6-acceptance] FAILED:", file=sys.stderr)
+    print("\n[acceptance] FAILED:", file=sys.stderr)
     for msg in failures:
         print(f"  - {msg}", file=sys.stderr)
     sys.exit(1)
 
-print("[m6-acceptance] PASSED — all capability checks green (bench details in the report).")
+print("[acceptance] PASSED — all capability checks green (bench details in the report).")
 PYEOF

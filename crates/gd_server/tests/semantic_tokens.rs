@@ -331,7 +331,7 @@ fn at(decoded: &[Decoded], line: u32, start: u32) -> &Decoded {
         .unwrap_or_else(|| panic!("no token at ({line},{start}); got {decoded:#?}"))
 }
 
-/// Criterion 2: the full docs/09 §6-M10 mapping, spot-checked on `RICH`. Each mapped kind colors
+/// Criterion 2: the full docs/09 §6.5 mapping, spot-checked on `RICH`. Each mapped kind colors
 /// with the right (type, modifiers).
 #[test]
 fn full_request_maps_every_kind() {

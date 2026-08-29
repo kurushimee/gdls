@@ -1,106 +1,96 @@
-# gdls — Standalone GDScript Language Server for Godot 4.6.3-stable
+# 00. Overview
 
-> **Codename:** `gdls`. A single self-contained language server providing type-aware GDScript
-> diagnostics and navigation to Claude Code **without running any Godot engine or editor instance**.
+`gdls` is a standalone GDScript language server: one static Rust binary that gives any LSP client type-aware diagnostics and navigation over stdio, with no Godot engine or editor running.
 
 | | |
 |---|---|
-| **Spec date** | 2026-05-20 |
-| **Status** | Original design spec, retained for rationale. Phase 1 = **M0–M6** = v1 — shipped (v1.0.0 through v1.0.5; see [`08-m6-v1-ship.md`](08-m6-v1-ship.md), [`../CHANGELOG.md`](../CHANGELOG.md), [`../README.md`](../README.md)). Phase 2 = **M7–M11** (the generic-language-server phase) is specified in [`09-phase-2.md`](09-phase-2.md). |
-| **Target language** | GDScript 2.0 as shipped in **Godot 4.6.3-stable** |
-| **Engine** | Official Godot (`godotengine/godot`) at tag `4.6.3-stable` — the GDScript frontend is the port's source of truth (unchanged from upstream; only native C++ classes differ). Native classes are ingested from the `godot` binary's `extension_api.json`. |
-| **Consumer** | Claude Code's native LSP client (stdio) |
+| **Target language** | GDScript 2.0 as shipped in Godot 4.6.3-stable |
+| **Engine reference** | Official Godot (`godotengine/godot`) at tag `4.6.3-stable`. The GDScript frontend is the port's source of truth: it is unchanged from upstream, and only native C++ classes differ. Native classes are ingested from the `godot` binary's `extension_api.json`. |
+| **Transport** | LSP over stdio, one server per workspace root |
 
----
+## 1. What it does
 
-## 1. Problem statement
+gdls does its own tokenizing, parsing, and type analysis. It emits the same compile-time diagnostics Godot's own analyzer emits, errors plus the GDScript warning set (45 active warnings, and 3 more behind Godot's `DISABLE_DEPRECATED` guard), and it adds an opt-in stricter mode on top.
 
-The motivating context is a very large game (**3,000–10,000+ `.gd` files**) in Godot, worked on
-primarily through Claude Code. Today GDScript intelligence comes from the Godot editor's built-in LSP,
-which has three problems:
+It recognizes every native engine class and every third-party GDExtension class installed in the project. Its own filesystem watcher picks up new, renamed, and deleted classes as they land on disk.
 
-1. **Weight.** The editor is heavy; at this scale it becomes unresponsive ("wonky").
-2. **Staleness.** Diagnostics depend on what the editor has synced/imported. New `class_name`s, renames,
-   and deletions are not recognized until the editor regains focus and rescans — a documented Godot bug
-   class (see references in §7).
-3. **Coupling.** It requires keeping the editor (or a headless engine) running.
+On top of diagnostics it serves the full generic LSP surface: hover, definition, declaration, type definition, references, implementation, call hierarchy, type hierarchy, document and workspace symbols, completion, signature help, rename, document highlight, semantic tokens, inlay hints, document colors, code actions, folding and selection ranges, document links, and file-rename edits. `05-lsp-cc-integration.md` has the full list.
 
-## 2. Goal
+## 2. Why it exists
 
-A standalone server, **gdls**, that:
+The motivating context is a very large game (3,000 to 10,000+ `.gd` files) worked on mainly through Claude Code. The alternative is the Godot editor's built-in LSP, which has three problems at that scale:
 
-- Runs as a **single static binary, no Godot process at runtime**.
-- Does its own tokenizing, parsing, and **type analysis**, emitting **compile-time diagnostics that match
-  Godot's own analyzer** (errors + the GDScript warning set — 45 active + 3 deprecated-gated in Godot),
-  plus an opt-in stricter mode.
-- Recognizes **all native engine classes and third-party GDExtension classes installed in the
-  project**.
-- **Auto-recognizes new/renamed/deleted classes live**, via its own filesystem watcher — eliminating the
-  staleness problem by construction.
-- Speaks LSP to Claude Code over **stdio**.
+1. **Weight.** The editor is heavy, and at this scale it gets unresponsive.
+2. **Staleness.** Its diagnostics depend on what the editor has synced and imported. New `class_name`s, renames, and deletions go unrecognized until the editor regains focus and rescans. This is a documented Godot bug class (references in §7).
+3. **Coupling.** It requires keeping the editor, or a headless engine, running.
 
-## 3. Non-goals (v1)
+gdls has no `EditorFileSystem`, no focus-gated rescan, and no editor in the loop, so the staleness problem is gone by construction rather than worked around.
 
-- Running GDScript (no bytecode/VM — diagnostics only; the `compiler`/`codegen` half of Godot's frontend
-  is out of scope).
-- Parsing `.tscn` for precise `$Node` / `%Unique` typing → **Phase 2** (now specified: `09-phase-2.md` M11).
-- `signatureHelp` / `completion` → **Phase 2** (Claude Code does not consume them per its docs; editors do — `09-phase-2.md` M8).
-- Any GUI, debugger, formatter, or scene/resource editing. (Phase 2 adds an optional *external*-formatter bridge only — `09-phase-2.md` §6-M11.)
+## 3. Out of scope
 
-## 4. Locked decisions (from brainstorming)
+- **Running GDScript.** No bytecode and no VM. Only Godot's frontend is ported; the `compiler` and `codegen` half of the module is deliberately excluded.
+- **Any GUI, debugger, or scene and resource editing.**
+- **A built-in formatter.** There is no formatter in Godot's frontend to port. gdls bridges to an external command instead (`09-lsp-conventions.md` §6.6).
+- **Godot's custom LSP protocol extensions** (`gdscript/*`, `gdscript_client/*`). Permanently excluded; see the anti-catalog in `09-lsp-conventions.md` §3.
+
+## 4. Design decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| Godot runtime dependency | **None, ever** | A `--headless` Godot is the whole engine + the same `EditorFileSystem` staleness. Rejected by the user. |
-| Build strategy | **Faithful port** of Godot's tokenizer + parser + analyzer | Highest fidelity to "exactly what Godot has"; validated against Godot's own test corpus. |
-| Implementation language | **Rust** | Fast on huge projects; single static `.exe`; strong parser/LSP ecosystem. |
-| Native-class source | **`extension_api.json`** from the `godot` binary (`--dump-extension-api`), taken **in-project** so installed GDExtensions are captured too; `doc_classes` XML as a static fallback | Engine classes included automatically; GDExtensions enumerated via `res://**/*.gdextension`; static; regenerated on engine rebuild / addon change. See `03-indexing-freshness.md` §1–§2. |
-| Diagnostics fidelity | **Match Godot exactly + opt-in always-strict typing** | Validatable via the `.gd/.out` corpus; strict mode = promote typing warnings to errors. |
-| Diagnostics trigger | **Per-file, on open/edit** (not whole-project) | Matches Claude Code's push-after-edit model; less noise. |
-| Scene/project parsing | `project.godot` **mandatory**; `.tscn` node typing **Phase 2** | Autoloads/paths/warning-config are cheap & essential; scene typing is a heavier subsystem. |
-| `$` / `%` in v1 | **Permissive deferred-node type** (zero false positives) | Never feed Claude Code a phantom error before scene typing exists (see `02-frontend-port.md` §11). |
+| Godot runtime dependency | None, ever | A `--headless` Godot is the whole engine plus the same `EditorFileSystem` staleness. |
+| Build strategy | Faithful port of Godot's tokenizer, parser, and analyzer | Highest fidelity to "exactly what Godot has", and validatable against Godot's own test corpus. |
+| Implementation language | Rust | Fast on huge projects, single static executable, strong parser and LSP ecosystem. |
+| Native-class source | `extension_api.json` from the `godot` binary (`--dump-extension-api-with-docs`), taken in-project so installed GDExtensions are captured too, with `doc_classes` XML as a static fallback | Engine classes come along automatically; GDExtensions are enumerated via `res://**/*.gdextension`. Static, and regenerated on engine rebuild or addon change. See `03-indexing-freshness.md` §1 and §2. |
+| Diagnostics fidelity | Match Godot exactly, plus opt-in always-strict typing | Validatable against the `.gd`/`.out` corpus. Strict mode promotes typing warnings to errors. |
+| Diagnostics trigger | Per file, on open and edit, never whole-project | Matches Claude Code's push-after-edit model, and makes less noise. |
+| Scene and project parsing | `project.godot` mandatory; `.tscn` parsed as text, never instantiated | Autoloads, paths, and warning config are cheap and essential. Scene knowledge comes from reading the file, not from running the engine. |
+| `$` and `%` typing | Bare `NATIVE Node` in the analyzer, precise scene types for navigation only | This is what Godot's own analyzer does. Feeding a precise scene type into the diagnostic path would false-positive on downcasts Godot tolerates. See `02-frontend-port.md` §11. |
 
-## 5. Why the alternatives were rejected (grounded)
+Three rules run through every file in this spec:
 
-- **Headless Godot LSP.** `--headless` runs the full engine minus rendering; it hosts the LSP among many
-  other subsystems, is heavy, and inherits the same `EditorFileSystem`/global-cache staleness. User-confirmed,
-  and consistent with the documented external-editor staleness bugs.
-- **Embedding Godot's analyzer as a clean library.** No standalone build exists; maintainers state GDScript
-  2.0 is "still designed for tight engine integration, using Godot's custom datatypes" (proposal #6199), and
-  accurate diagnostics require a **populated `ClassDB`**, which is filled by the very engine modules one would
-  strip out. Even initializing only Godot core is "a Godot instance," violating the hard constraint, and the
-  LSP type is "bound to Godot's `Object` system" (proposal #11056).
-- **Existing external tools.** None are type-aware: gdtoolkit's `gdlint` is syntax + style only;
-  tree-sitter-gdscript is parser-only. We are building net-new capability — there is nothing to fork.
+**Never crash.** The parser always returns a possibly-partial AST, so the server can always respond. Position conversions clamp out-of-range input instead of panicking. `panic = "unwind"` keeps a stray panic to a logged error mid-session, not a dead process.
+
+**Never lie.** A negative claim needs a basis. When the native surface is not project-derived, an unknown type or member stays dynamic rather than becoming an error (`02-frontend-port.md` §11b). A shallow-interface gap degrades to `Variant` instead of surfacing as a warning. Malformed `initializationOptions` fall back to documented defaults with a warning, never failing `initialize`.
+
+**Unknown stays dynamic.** Where Godot would have a populated `ClassDB` and gdls does not, the answer is `Variant`, not a diagnostic.
+
+## 5. Why not the alternatives
+
+**Headless Godot LSP.** `--headless` runs the full engine minus rendering. It hosts the LSP among many other subsystems, it is heavy, and it inherits the same `EditorFileSystem` and global-cache staleness.
+
+**Embedding Godot's analyzer as a library.** No standalone build exists. Maintainers state that GDScript 2.0 is "still designed for tight engine integration, using Godot's custom datatypes" (proposal #6199), and accurate diagnostics need a populated `ClassDB`, which is filled by the very engine modules one would strip out. Even initializing only Godot core is a Godot instance, and the LSP type is "bound to Godot's `Object` system" (proposal #11056).
+
+**Existing external tools.** None are type-aware. gdtoolkit's `gdlint` is syntax and style only; tree-sitter-gdscript is parser-only. There was nothing to fork.
 
 ## 6. Document map
 
 | File | Contents |
 |---|---|
-| `01-architecture.md` | Components, control loops, technology choices |
-| `02-frontend-port.md` | Tokenizer/parser/analyzer port, type system, name resolution, `$`/`%` policy |
-| `03-indexing-freshness.md` | Native-class ingestion, project indexer, incrementalism, filesystem watcher |
+| `01-architecture.md` | Components, control loops, crate layering |
+| `02-frontend-port.md` | Tokenizer, parser, and analyzer port; type system; name resolution; `$` and `%` policy |
+| `03-indexing-freshness.md` | Native-class ingestion, project indexer, incrementalism, warm-start cache, filesystem watcher |
 | `04-diagnostics-strict-mode.md` | Diagnostics model, per-file policy, strict mode, warning config |
-| `05-lsp-cc-integration.md` | LSP surface, Claude Code config & deployment |
-| `06-testing-fidelity.md` | Conformance corpus, differential testing, robustness |
-| `07-milestones-risks.md` | Phased milestones, effort, risks, maintenance |
-| `08-m6-v1-ship.md` | **M6** (the v1 ship milestone): exposed-capability parity gaps vs Godot's own LSP, the warm-start index cache, multi-instance safety, exit criteria |
-| `09-phase-2.md` | **Phase 2 (M7–M11)**: the generic-language-server phase — full editor-grade LSP surface (completion, semantic tokens, rename, …), the Godot-LSP weirdness anti-catalog, `.tscn` scene typing, exit criteria |
+| `05-lsp-cc-integration.md` | The LSP surface, configuration, deployment |
+| `06-testing-fidelity.md` | Conformance corpus, differential oracle, fuzzing, observability, perf budgets |
+| `07-maintenance.md` | Tracking upstream Godot, regenerating the API dump, the release gate, known risks |
+| `08-history.md` | How the project was built, milestone by milestone |
+| `09-lsp-conventions.md` | The generic-LSP contract: governing rules, the Godot-LSP anti-catalog, capability gating, per-feature wire conventions |
 
-## 7. References (sources)
+## 7. Sources
 
-- Godot GDScript module overview & pipeline — https://github.com/godotengine/godot/blob/master/modules/gdscript/README.md
-- GDScript warning codes (orientation; Godot's `gdscript_warning.h` is authoritative — 45 active + 3 deprecated-gated) — https://github.com/godotengine/godot/blob/master/modules/gdscript/gdscript_warning.h
-- GDScript conformance test runner (`.gd`/`.out`) — https://github.com/godotengine/godot/blob/master/modules/gdscript/tests/gdscript_test_runner.cpp
-- GDScript warning system docs — https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/warning_system.html
-- GDExtension API / `extension_api.json` — https://deepwiki.com/godotengine/godot/15.1-gdextension-api
-- Proposal #6199 — standalone/embeddable GDScript — https://github.com/godotengine/godot-proposals/discussions/6199
-- Proposal #11056 — refactor the GDScript Language Server — https://github.com/godotengine/godot-proposals/issues/11056
-- Proposal #3300 — headless LSP CLI argument — https://github.com/godotengine/godot-proposals/issues/3300
-- gdtoolkit linter (syntax + style only) — https://github.com/Scony/godot-gdscript-toolkit/wiki/3.-Linter
-- tree-sitter-gdscript (parser only) — https://github.com/PrestonKnopp/tree-sitter-gdscript
-- tree-sitter-godot-resource (`.tscn` / `project.godot`) — https://github.com/PrestonKnopp/tree-sitter-godot-resource
-- Autoloads / singletons — https://docs.godotengine.org/en/stable/tutorials/scripting/singletons_autoload.html
-- Nodes & scene instances (`$` typing) — https://docs.godotengine.org/en/stable/tutorials/scripting/nodes_and_scene_instances.html
-- Claude Code — Plugins Reference (LSP servers) — https://code.claude.com/docs/en/plugins-reference.md
-- Claude Code — Tools Reference (LSP tool behavior) — https://code.claude.com/docs/en/tools-reference.md
+- [Godot GDScript module overview and pipeline](https://github.com/godotengine/godot/blob/master/modules/gdscript/README.md)
+- [GDScript warning codes; Godot's `gdscript_warning.h` is authoritative, 45 active plus 3 deprecated-gated](https://github.com/godotengine/godot/blob/master/modules/gdscript/gdscript_warning.h)
+- [GDScript conformance test runner (`.gd`/`.out`)](https://github.com/godotengine/godot/blob/master/modules/gdscript/tests/gdscript_test_runner.cpp)
+- [GDScript warning system docs](https://docs.godotengine.org/en/stable/tutorials/scripting/gdscript/warning_system.html)
+- [GDExtension API and `extension_api.json`](https://deepwiki.com/godotengine/godot/15.1-gdextension-api)
+- [Proposal #6199, standalone/embeddable GDScript](https://github.com/godotengine/godot-proposals/discussions/6199)
+- [Proposal #11056, refactor the GDScript Language Server](https://github.com/godotengine/godot-proposals/issues/11056)
+- [Proposal #3300, headless LSP CLI argument](https://github.com/godotengine/godot-proposals/issues/3300)
+- Documented external-editor staleness, the motivation: [godot#69485](https://github.com/godotengine/godot/issues/69485) and [godot#107592](https://github.com/godotengine/godot/issues/107592)
+- [gdtoolkit linter, syntax and style only](https://github.com/Scony/godot-gdscript-toolkit/wiki/3.-Linter)
+- [tree-sitter-gdscript, parser only](https://github.com/PrestonKnopp/tree-sitter-gdscript)
+- [tree-sitter-godot-resource (`.tscn` and `project.godot`)](https://github.com/PrestonKnopp/tree-sitter-godot-resource)
+- [Autoloads and singletons](https://docs.godotengine.org/en/stable/tutorials/scripting/singletons_autoload.html)
+- [Nodes and scene instances (`$` typing)](https://docs.godotengine.org/en/stable/tutorials/scripting/nodes_and_scene_instances.html)
+- [Claude Code, Plugins Reference (LSP servers)](https://code.claude.com/docs/en/plugins-reference.md)
+- [Claude Code, Tools Reference (LSP tool behavior)](https://code.claude.com/docs/en/tools-reference.md)
