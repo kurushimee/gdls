@@ -1083,3 +1083,122 @@ fn reassigned_class_level_lambda_var_refuses() {
 
     shutdown(&client, server_thread);
 }
+
+// ===================================================================================================
+// #335: `X.new(` on an INNER class.
+// ===================================================================================================
+
+/// `Outer.Inner.new(` must show *Inner's* `_init`, not the outer class's. Resolving the constructor
+/// at the file root answered with the outer `_init()` — plausible-looking and wrong.
+#[test]
+fn a_qualified_inner_class_constructor_shows_its_own_init() {
+    let p = sig_project();
+    p.write(
+        "src/outer.gd",
+        "class_name Outer\nextends Node\n\nclass Inner:\n\tfunc _init(a: int, b: String) -> void:\n\t\tpass\n\nfunc _init() -> void:\n\tpass\n",
+    );
+    let src =
+        "extends Node\n\nfunc f() -> void:\n\tvar i := Outer.Inner.new(1, \"x\")\n\tprint(i)\n";
+    let uri = file_uri(&p.root.join("src/use.gd"));
+    p.write("src/use.gd", src);
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // line 3: tab(0) `var i := `(1-9) `Outer.Inner.new(`(10-25) — the cursor sits just past the `(`.
+    let h = sig(
+        &client,
+        10,
+        &uri,
+        Position {
+            line: 3,
+            character: 26,
+        },
+    );
+    assert_eq!(
+        only_label(&h),
+        "void _init(a: int, b: String)",
+        "the constructor of the INNER class, with its real parameters"
+    );
+    assert_eq!(h.active_parameter, Some(0));
+    shutdown(&client, server_thread);
+}
+
+/// The same-file shape, in a file with NO `class_name` — the case that produced the bare `_init(...)`
+/// placeholder, because the root fallback had no class name to render either.
+#[test]
+fn a_same_file_inner_class_constructor_shows_its_own_init() {
+    let p = sig_project();
+    let src = "extends Node\n\nclass Entry:\n\tfunc _init(p_id: int, p_label: String) -> void:\n\t\tpass\n\nfunc f() -> void:\n\tvar e := Entry.new(1, \"x\")\n\tprint(e)\n";
+    let uri = file_uri(&p.root.join("src/reg.gd"));
+    p.write("src/reg.gd", src);
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // line 7: tab(0) `var e := `(1-9) `Entry.new(`(10-19) — cursor past the `(`.
+    let h = sig(
+        &client,
+        11,
+        &uri,
+        Position {
+            line: 7,
+            character: 20,
+        },
+    );
+    assert_eq!(
+        only_label(&h),
+        "void _init(p_id: int, p_label: String)",
+        "an inner class in a file with no `class_name` still resolves its own `_init`, never the \
+         `_init(...)` placeholder"
+    );
+    shutdown(&client, server_thread);
+}
+
+/// `activeParameter` still advances inside an inner-class constructor — the signature is a real
+/// resolved one, not a placeholder that cannot track arguments.
+#[test]
+fn an_inner_class_constructor_tracks_the_active_parameter() {
+    let p = sig_project();
+    let src = "extends Node\n\nclass Entry:\n\tfunc _init(p_id: int, p_label: String) -> void:\n\t\tpass\n\nfunc f() -> void:\n\tvar e := Entry.new(1, \"x\")\n\tprint(e)\n";
+    let uri = file_uri(&p.root.join("src/reg2.gd"));
+    p.write("src/reg2.gd", src);
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor after `Entry.new(1, ` → the second parameter.
+    let h = sig(
+        &client,
+        12,
+        &uri,
+        Position {
+            line: 7,
+            character: 23,
+        },
+    );
+    assert_eq!(only_label(&h), "void _init(p_id: int, p_label: String)");
+    assert_eq!(
+        h.active_parameter,
+        Some(1),
+        "the cursor is past the first comma"
+    );
+    shutdown(&client, server_thread);
+}
+
+/// The top-level case must not move: a `class_name` class's own `_init` was already correct.
+#[test]
+fn a_top_level_class_constructor_is_unchanged() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f() -> void:\n\tvar h := Hero.new(\"a\", 2)\n\tprint(h)\n";
+    let uri = file_uri(&p.root.join("src/use2.gd"));
+    p.write("src/use2.gd", src);
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // line 3: tab(0) `var h := `(1-9) `Hero.new(`(10-18) — cursor past the `(`.
+    let h = sig(
+        &client,
+        13,
+        &uri,
+        Position {
+            line: 3,
+            character: 19,
+        },
+    );
+    assert_eq!(only_label(&h), "void _init(name: String, level: int = 1)");
+    shutdown(&client, server_thread);
+}

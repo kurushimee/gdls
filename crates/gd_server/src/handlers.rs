@@ -431,6 +431,16 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
                 .as_deref()
                 .and_then(|a| hover_attribute_member_signature(state, &parsed.tree, byte, a))
         })
+        // #333/#334: a bare (`helper()`) or `super.` (`super.describe()`) callee. Neither has a
+        // subscript base for `hover_member_signature` to read a type off, so both used to fall
+        // through to the type label and render the callee's value type — `Callable` — which tells
+        // the user nothing. Projected from the `Binding::Call` the reducer already resolved, so the
+        // answer is the analyzer's own, including `super`'s parent-chain walk.
+        .or_else(|| {
+            analyzed
+                .as_deref()
+                .and_then(|a| hover_call_binding_signature(state, &parsed.tree, byte, a))
+        })
         // v1.0.4 (#35): bare calls — an inherited native method / signal through the implicit
         // self (`stop()` under `extends AudioStreamPlayer`), or a `@GlobalScope` utility
         // (`print(...)`). Runs last so any project-script resolution above keeps shadowing.
@@ -521,6 +531,15 @@ pub fn definition(
         if let Some(loc) = type_decl_location(state, &dt) {
             return Some(GotoDefinitionResponse::Scalar(loc));
         }
+    }
+
+    // (C3) #333: a bare `super()`. The parser gives the Call no callee at all and fills
+    // `function_name` with the ENCLOSING function's name (gdscript_parser.cpp:3487-3499), so the
+    // cursor lands on the `super` token, which is no identifier — `cursor_identifier` below would
+    // end the walk with `null`. The call's own `Binding::Call` already names the parent's
+    // implementation, so project it exactly as the `super.method()` arm (0.8) does.
+    if let Some(loc) = bare_super_call_definition(state, &uri, &parsed.tree, &text, byte) {
+        return Some(GotoDefinitionResponse::Scalar(loc));
     }
 
     let name = cursor_identifier(&parsed.tree, node_id)?;
@@ -653,6 +672,50 @@ pub fn definition(
                 return Some(GotoDefinitionResponse::Scalar(loc));
             }
         }
+    }
+
+    // (0.8) A `super.method()` callee (#333). `super.X` names the PARENT's `X` by language
+    // definition, never the current class's own override — so this must run BEFORE step (1)'s
+    // name-only in-file scan, which would otherwise match the override doing the calling and
+    // answer the cursor with itself. The reducer records exactly one thing at a super site, the
+    // `Binding::Call` whose callee target `reduce_call`'s super branch resolved against the parent
+    // (reducer.rs, faithful to analyzer.cpp:3560-3562), so projecting it inherits the analyzer's
+    // own chain walk — the same "never lie" shape as (1.5)/(1.6). A super callee is never answered
+    // by any later step: an `Unresolved` callee returns None rather than falling through to a
+    // self-answer.
+    if cursor_is_super_call_callee(&parsed.tree, node_id) {
+        let node_byte = byte;
+        let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
+        let target = analyzed.as_deref().and_then(|a| {
+            let mut spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
+            a.bindings().iter().find_map(|b| match b {
+                Binding::Call {
+                    callee,
+                    callee_name,
+                    call_site,
+                    ..
+                } if callee_name == &name => {
+                    let spans = spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
+                    let ident = spans.get(call_site).copied()?;
+                    (ident.start <= node_byte && node_byte < ident.end).then(|| callee.clone())
+                }
+                _ => None,
+            })
+        });
+        return match target {
+            Some(CalleeTarget::Script { file, class_path }) => {
+                member_decl_location(state, file, &class_path, &name)
+                    .map(GotoDefinitionResponse::Scalar)
+            }
+            Some(CalleeTarget::Native { class }) => native_member_stub_location(
+                state,
+                &class,
+                &name,
+                state.options.stub_cache_dir.as_deref(),
+            )
+            .map(GotoDefinitionResponse::Scalar),
+            _ => None,
+        };
     }
 
     // (1) In-file member.
@@ -1462,6 +1525,61 @@ fn native_member_hover_md(
     // at the response boundary.
     crate::docs::append_doc(&mut md, crate::docs::ProseFormat::Markdown, desc);
     md
+}
+
+/// #333/#334: hover for a callee identifier that has no subscript base to read a type from — a
+/// bare call (`helper()`, `next_id()`) and a `super.method()` call. Both used to fall through to
+/// the generic type label, which renders the callee's *value* type (`Callable`) rather than the
+/// method it names.
+///
+/// The resolution is not redone here: `reduce_call` already walked the chain and recorded a
+/// `Binding::Call` whose callee target names the declaring script or native class, so this
+/// projects that. For `super` that walk starts at the PARENT (analyzer.cpp:3560-3562), which is
+/// what makes an override's `super.describe()` render the base's signature rather than its own.
+///
+/// Returns `None` for an `Unresolved` callee, leaving the native bare-call fallback and the type
+/// label to answer — never a guess.
+fn hover_call_binding_signature(
+    state: &ServerState,
+    tree: &ParseTree,
+    cursor_byte: usize,
+    analyzed: &AnalysisResult,
+) -> Option<String> {
+    let spans = callee_name_token_spans(tree);
+    let (callee, name) = analyzed.bindings().iter().find_map(|b| match b {
+        Binding::Call {
+            callee,
+            callee_name,
+            call_site,
+            ..
+        } => {
+            let ident = spans.get(call_site).copied()?;
+            (ident.start <= cursor_byte && cursor_byte < ident.end)
+                .then(|| (callee.clone(), callee_name.clone()))
+        }
+        _ => None,
+    })?;
+    match callee {
+        CalleeTarget::Script { file, class_path } => {
+            let iface = iface_at_inner(&state.workspace.index, file, &class_path)?;
+            let decl = iface.members.iter().find(|m| m.name.as_str() == name)?;
+            let mut md = format!("```gdscript\n{}\n```", format_func_signature(&name, decl));
+            if let Some(doc) = &decl.doc {
+                crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
+            }
+            Some(md)
+        }
+        CalleeTarget::Native { class } => {
+            let (decl, member) = state.workspace.native.lookup_member(&class, &name)?;
+            let declaring = state.workspace.native.name_of(decl.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Bare-call hover (v1.0.4 #35): the callee identifier of `stop()` under
@@ -2440,6 +2558,68 @@ fn cursor_identifier(tree: &ParseTree, id: NodeId) -> Option<String> {
 /// before same-file class-scope members, so a matching base segment is a global-class reference when
 /// that class exists even if the extending class also declares an enum/inner class/const with the
 /// same name.
+/// A bare `super()` at `cursor_byte`: the enclosing implicit super call's target declaration.
+///
+/// `super()` parses as `Call { is_super: true, callee: None, function_name: <enclosing func> }`
+/// (gdscript_parser.cpp:3487-3499), so there is no identifier under the cursor at all — the whole
+/// resolution has to come from the call's `Binding::Call`, which `reduce_call`'s super branch
+/// resolved against the parent chain. The cursor is gated to the `super` keyword itself (the span
+/// before the argument list) so hovering an ARGUMENT of `super(a, b)` still answers with that
+/// argument.
+fn bare_super_call_definition(
+    state: &mut ServerState,
+    uri: &Uri,
+    tree: &ParseTree,
+    text: &str,
+    cursor_byte: usize,
+) -> Option<Location> {
+    let (call_span, name) = tree.iter_ids().find_map(|nid| {
+        let node = tree.get(nid);
+        let NodeKind::Call(c) = &node.kind else {
+            return None;
+        };
+        if !c.is_super || c.callee.is_some() || c.function_name.is_empty() {
+            return None;
+        }
+        // Only the `super` keyword itself, never the arguments: the token is at the call's start.
+        let kw_end = node.span.start + "super".len();
+        (node.span.start <= cursor_byte && cursor_byte < kw_end)
+            .then(|| (node.span, c.function_name.clone()))
+    })?;
+    let analyzed = analyze_if_gd(state, uri, tree, text)?;
+    let callee = analyzed.bindings().iter().find_map(|b| match b {
+        Binding::Call {
+            callee,
+            callee_name,
+            call_site,
+            ..
+        } if *call_site == call_span && callee_name == &name => Some(callee.clone()),
+        _ => None,
+    })?;
+    match callee {
+        CalleeTarget::Script { file, class_path } => {
+            member_decl_location(state, file, &class_path, &name)
+        }
+        CalleeTarget::Native { class } => native_member_stub_location(
+            state,
+            &class,
+            &name,
+            state.options.stub_cache_dir.as_deref(),
+        ),
+        _ => None,
+    }
+}
+
+/// Is `ident_id` the callee identifier of a `super.method()` call? `super.X()` parses as
+/// `Call { is_super: true, callee: Identifier("X") }` (gdscript_parser.cpp:3503-3509), so the
+/// cursor lands on a bare `Identifier` that nonetheless names the PARENT's method — the one shape
+/// where a bare callee must not be resolved in the current scope (#333).
+fn cursor_is_super_call_callee(tree: &ParseTree, ident_id: NodeId) -> bool {
+    tree.iter_ids().any(|nid| {
+        matches!(&tree.get(nid).kind, NodeKind::Call(c) if c.is_super && c.callee == Some(ident_id))
+    })
+}
+
 fn cursor_is_extends_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
     tree.iter_ids().any(|nid| match &tree.get(nid).kind {
         NodeKind::Class(c) => c.extends.first() == Some(&ident_id),
@@ -2665,6 +2845,13 @@ fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
                 {
                     owning_subscript = Some(nid);
                 }
+            }
+            // `super.method()` — the callee is a bare `Identifier`, but it names a METHOD, so it
+            // belongs on the method path with `l.method()` rather than the non-method
+            // classification a bare identifier would otherwise get (#333). A bare NON-super callee
+            // stays off this path: its `Binding::Use` is what recall rides.
+            NodeKind::Call(c) if c.is_super && c.callee == Some(ident_id) => {
+                return true;
             }
             NodeKind::Call(c) => {
                 if let Some(callee) = c.callee {
@@ -5445,10 +5632,16 @@ fn push_identifier_locations(
 /// Build, in one pass over `tree`, a map from each subscript-call's full [`ByteSpan`] to the span
 /// of its callee attribute-identifier (e.g. `l.helper()` → span of the `helper` identifier, not
 /// the whole `l.helper()` expression), following `CallNode.callee → SubscriptNode →
-/// Attribute(ident_id)`. Callees that aren't a subscript-attribute (bare function calls,
-/// `super()`, …) are absent from the map by design — their callee identifier is pre-reduced into a
-/// `Binding::Use` (reducer Call arm) and reported via [`push_binding_locations`], so projecting them
-/// here too would only double-report the same narrow span (which the de-dupe would then collapse).
+/// Attribute(ident_id)`. A bare function call's callee is absent from the map by design — its
+/// callee identifier is pre-reduced into a `Binding::Use` (reducer Call arm) and reported via
+/// [`push_binding_locations`], so projecting it here too would only double-report the same narrow
+/// span (which the de-dupe would then collapse).
+///
+/// A **`super.method()`** callee IS mapped, even though it is a bare `Identifier` node: since #333
+/// the reducer does not pre-reduce a super callee (Godot never does — `analyzer.cpp:3269`/`:3731`
+/// gate every such site on `!p_call->is_super`), so no `Use` binding exists to carry it. Its only
+/// record is the `Binding::Call`, whose callee target is the PARENT's declaration — which is the
+/// correct answer, and the one that was being overridden by the mis-attributed `Use`.
 ///
 /// [`push_callee_ident_locations`] consults this instead of re-scanning the whole arena once per
 /// matched `Binding::Call` — that was O(nodes × matching_bindings) per file, slow on a large
@@ -5466,10 +5659,17 @@ fn callee_ident_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
         let Some(callee_id) = call.callee else {
             continue;
         };
-        if let NodeKind::Subscript(sub) = &tree.get(callee_id).kind {
-            if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
-                map.insert(node.span, tree.get(attr_id).span);
+        match &tree.get(callee_id).kind {
+            NodeKind::Subscript(sub) => {
+                if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
+                    map.insert(node.span, tree.get(attr_id).span);
+                }
             }
+            // `super.method()` — a bare identifier callee that only a super call has here.
+            NodeKind::Identifier(_) if call.is_super => {
+                map.insert(node.span, tree.get(callee_id).span);
+            }
+            _ => {}
         }
     }
     map
