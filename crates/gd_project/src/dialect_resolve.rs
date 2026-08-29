@@ -31,6 +31,24 @@ pub enum DialectOrigin {
 }
 
 impl DialectOrigin {
+    /// Whether the release was pinned by actual evidence — the user's override, or what
+    /// `project.godot` declared (clamped or not) — rather than assumed.
+    ///
+    /// The two assumed origins are the ones where a native dump's own header is the better
+    /// witness: gdls guessed [`Dialect::NEWEST`] because nothing said otherwise, so a dump that
+    /// disagrees is more likely right than the guess. Read by the server before it will replace
+    /// or demote a dump over a release mismatch.
+    #[must_use]
+    pub fn is_evidenced(self) -> bool {
+        matches!(
+            self,
+            DialectOrigin::Override
+                | DialectOrigin::Declared
+                | DialectOrigin::ClampedNewer
+                | DialectOrigin::ClampedOlder
+        )
+    }
+
     /// Whether this origin warrants telling the user, rather than only the log.
     #[must_use]
     pub fn is_noteworthy(self) -> bool {

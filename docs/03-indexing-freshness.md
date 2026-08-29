@@ -18,7 +18,7 @@ Because the dump iterates `ClassDB`, every class Godot registers through the nor
 
 **Structures:** an interned class graph plus per-class method, property, and signal tables for O(1) lookup.
 
-**Versioning and reload:** the DB stores the dump's version header and a content hash. The watcher reloads it when the file changes, which is to say after an engine rebuild. If the file is absent, resolution degrades gracefully per the provenance rules in `02-frontend-port.md` §11b: types stay dynamic, one informational notice goes out, and nothing crashes.
+**Versioning and reload:** the DB stores the dump's version header and a content hash. The watcher reloads it when the file changes, which is to say after an engine rebuild. If the file is absent, resolution degrades gracefully per the provenance rules in `02-frontend-port.md` §11b: types stay dynamic, one informational notice goes out, and nothing crashes. The header is not just for logs: a dump that names an older release than `project.godot` declares is replaced by the embedded stock surface for the declared release (`07-maintenance.md` §2), because everything the newer release added is missing from it and each miss would surface as an invented error.
 
 **Auto-dump, where the user does nothing.** When `extensionApiPath` is not set, gdls manages the dump itself. It discovers a Godot binary (`godotBinaryPath` option, then the `GDLS_GODOT` env var where empty or `off` hard-disables, then `godot4`/`godot` on `PATH`), runs `godot --headless --path <root> --dump-extension-api-with-docs` at session startup, and keeps the result plus staleness metadata (binary path, size and mtime, and the project's `.gdextension` file set) under `.gdls/`.
 
