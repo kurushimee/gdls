@@ -174,6 +174,23 @@ pub enum LocalKind {
 pub struct EnumValue {
     pub identifier: Option<NodeId>,
     pub custom_value: Option<NodeId>,
+    /// The `enum { … }` node this value was declared in (`parent_enum`, parser.cpp:1623). The
+    /// analyzer needs it because an unnamed enum's values are *also* hoisted to class members, so
+    /// the member alone no longer says which block a sibling reference may reach.
+    pub parent_enum: Option<NodeId>,
+    /// Position within `parent_enum.values` (`index`, parser.cpp:1646). `-1` when unset.
+    pub index: i32,
+}
+
+impl Default for EnumValue {
+    fn default() -> Self {
+        Self {
+            identifier: None,
+            custom_value: None,
+            parent_enum: None,
+            index: -1,
+        }
+    }
 }
 
 /// A `DictionaryNode`/`PatternNode` key→value pair.

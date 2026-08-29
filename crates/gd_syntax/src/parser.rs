@@ -2752,11 +2752,15 @@ impl Parser {
                     }
                 }
 
-                let value = EnumValue {
+                let mut value = EnumValue {
                     identifier: ident,
                     custom_value,
+                    parent_enum: Some(enum_node),
+                    ..EnumValue::default()
                 };
                 if let NodeKind::Enum(e) = &mut self.tree.get_mut(enum_node).kind {
+                    // parser.cpp:1646 — the index is the position this value is about to take.
+                    value.index = e.values.len() as i32;
                     e.values.push(value.clone());
                 }
                 if !named {

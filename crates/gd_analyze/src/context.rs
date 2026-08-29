@@ -224,6 +224,12 @@ pub struct AnalysisContext<'a> {
     /// Recorded at the single choke point (`try_native_member`'s property arm) rather than
     /// re-derived, since re-running identifier resolution would re-emit its diagnostics.
     pub native_property_scope: FxHashMap<NodeId, String>,
+    /// Godot's `current_enum` (analyzer.cpp:4392-4412): the [`NodeKind::Enum`] whose values are
+    /// being resolved right now, so an entry may refer to its siblings. `None` outside one.
+    pub current_enum: Option<NodeId>,
+    /// Godot's per-element `resolved` flag plus `value` (`EnumNode::Value`), which live on the AST
+    /// upstream and can't here — keyed by the element's identifier node. Present means resolved.
+    pub enum_element_values: FxHashMap<NodeId, i64>,
     /// The nearest **concrete** (non-lambda) function in the current resolution path. When a
     /// lambda body is being resolved, `current_function` points at the lambda's synthesized
     /// FunctionNode (so identifier / parameter lookup works) while `concrete_function` continues
@@ -389,6 +395,8 @@ impl<'a> AnalysisContext<'a> {
             static_context: false,
             reducing_callee: false,
             native_property_scope: FxHashMap::default(),
+            current_enum: None,
+            enum_element_values: FxHashMap::default(),
             concrete_function: None,
             pending_lambda_bodies: Vec::new(),
             current_lambda_stack: Vec::new(),
