@@ -5061,7 +5061,16 @@ fn reduce_type_test(ctx: &mut AnalysisContext, id: NodeId) {
     // `is Array[int]` test even though the lax-collections check would pass.
     let operand_is_constant = ctx.folds.get(operand).is_some();
     if operand_is_constant {
-        if !is_type_compatible_strict_collections(ctx, &test_type, &operand_type) {
+        // DIALECT(4.7): gdscript_analyzer.cpp reduce_type_test() —
+        // `is_type_compatible_strict_collections` did not exist at 4.6, which used the plain
+        // bidirectional-capable check here. So `[] is Array[int]` on a constant is an error at
+        // 4.7 and silent at 4.6.
+        let compatible = if ctx.dialect < Dialect::Godot4_7 {
+            is_type_compatible(ctx, &test_type, &operand_type, false)
+        } else {
+            is_type_compatible_strict_collections(ctx, &test_type, &operand_type)
+        };
+        if !compatible {
             let op_str = class_identifier_name_or_default(ctx, &operand_type);
             let test_str = class_identifier_name_or_default(ctx, &test_type);
             ctx.push_error(

@@ -139,3 +139,27 @@ fn an_untyped_override_of_a_typed_parent_still_rejects_an_incompatible_value_at_
     );
     assert!(errors(src, Dialect::Godot4_6).is_empty());
 }
+
+// ===================================================================================================
+// `reduce_type_test`'s constant arm: `is_type_compatible_strict_collections` is 4.7-only.
+// ===================================================================================================
+
+#[test]
+fn a_constant_array_type_test_is_silent_in_both_dialects_today() {
+    // 4.7 added `is_type_compatible_strict_collections` here, so `[] is Array[int]` on a constant
+    // became an error. gdls carries the guard, but cannot reach it: its fold model has no Array
+    // value, so a `const A = []` never counts as a constant operand and the arm is skipped. The
+    // guard goes live with array folding; until then this pins that neither tag errors.
+    for src in [
+        "func test():\n\tconst A = []\n\tprint(A is Array[int])\n",
+        "func test():\n\tconst A = []\n\tprint(A is Array)\n",
+    ] {
+        for d in [Dialect::Godot4_6, Dialect::Godot4_7] {
+            assert!(
+                errors(src, d).is_empty(),
+                "dialect {d:?} on {src:?}: {:?}",
+                errors(src, d)
+            );
+        }
+    }
+}

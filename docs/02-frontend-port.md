@@ -162,6 +162,29 @@ Every frontend difference between the two supported tags is either a guard or a 
 | `GDScriptWarning` gained start and end columns, moving Godot's own LSP off whole-line ranges | **No-op.** gdls already emits node ranges from `ByteSpan`. Porting the fields would add dead state to the Godot-column space, which exists only for `.out` printing, and `.out` prints no columns. |
 | Doc comments use `lstrip`/`rstrip(" \t")` instead of `strip_edges`, and `[br][br]` becomes a paragraph break | Guarded, `doc_comments.rs`. User-visible in hover, and no diagnostics gate would catch a regression, so it carries its own dialect tests. |
 
+## 11d. The 4.6 → 4.7 analyzer delta
+
+Same rule as §11c: every difference is a `DIALECT(4.7)` guard or a documented no-op. The analyzer diff is the larger half by line count and the smaller half by consequence, because most of what moved lives in machinery gdls never ported.
+
+| Upstream change | Where it lands in gdls |
+|---|---|
+| An untyped override inherits the parent's return type; an untyped `_get_property_list` gets bare `Array` (GH-118877) | Guarded, `resolver.rs` `adopt_parent_return_type`. gdls already did the *script*-parent half at both tags, which was a 4.6 fidelity bug; the native half, walking on into ClassDB, is new. |
+| `resolve_return` gains an `expected_type.is_hard_type()` gate | Guarded, `resolver.rs` `check_return_compatibility`. Currently unreachable: nothing in gdls produces a function return type that is both soft and non-Variant. Kept so the guard is already right if one ever does. |
+| `reduce_type_test`'s constant arm switches to `is_type_compatible_strict_collections` | Guarded, `reducer.rs`. Also currently unreachable: gdls's fold model has no `Array` value, so `const A = []` is never a constant operand. gdls had the strict version at both tags, which was another 4.6 fidelity bug. |
+| New warning `CONFUSABLE_TEMPORARY_MODIFICATION` | Guarded, `reducer.rs` `warn_confusable_temporary_modification`, with the 4.7 corpus fixture and its own dialect tests. |
+| `resolve_class_inheritance` accumulates inner-class errors | Guarded, `resolver.rs`. 4.6 returned on the first failure, hiding the siblings' own errors. |
+| `type_from_script` replaces `make_script_meta_type` on the three typed-container element paths | **No-op.** Those are the `ARRAY`/`DICTIONARY`/`OBJECT` arms of `type_from_variant`, which gdls stops before: its `FoldedValue` has no array, dictionary, or object value to carry a script reference. |
+| Four new fallback reducers (binary op, ternary, cast, type test), and annotation arguments routed through `make_expression_reduced_value` | **No-op.** gdls does not port `make_expression_reduced_value` or any of the `make_*_reduced_value` family — that is Godot's second, separate constant evaluator for annotation arguments and container defaults. |
+| Constant folding skips shared operands; the hardcoded 13-case switch becomes `Variant::is_type_shared`; the `< PACKED_BYTE_ARRAY` clause is dropped | **No-op, and a no-op upstream too.** `is_type_shared` is true for exactly the 13 types the switch listed, and it is true for every type at or past `PACKED_BYTE_ARRAY`, so the dropped clause was already redundant. gdls also folds no shared value. |
+| `reduce_identifier` skips the globals lookup when `ClassDB::class_exists(name)` | **No-op.** The `TODO` above it wants `globals` to hold only publicly available things; gdls's global-constant arm already holds exactly `PI`, `TAU`, `INF`, `NAN`, none of which is a class. |
+| `type_from_property` deduplicated into `type_from_property_hint_string`, which accepts `"Variant"` and yields a `VARIANT` element type on failure | **No-op.** gdls reads element types from the dump's structured `TypeRef` (`typedarray::T`, `typeddictionary::K;V`), never from a `PropertyInfo` hint string, so there is no parse to share and no failure path to change. |
+| `Failed to construct "%s".` removed | **No-op.** It lived in `make_call_reduced_value`, which gdls does not port. |
+| `type_exists` moved behind `DISABLE_DEPRECATED` | **No-op** for a default build, which is what gdls mirrors. |
+| `resolve_for` / `resolve_while` call `reduce_expression` instead of `resolve_node(…, false)` | **No-op.** A `for` list and a `while` condition are always expressions, and `resolve_node`'s expression arm is `reduce_expression(node, p_is_root)` with the same argument. |
+| `resolve_pending_lambda_bodies` moves the pending list instead of copying it | **No-op.** A C++ allocation detail with no Rust analogue. |
+
+Two of the guards above are inert today, and both are marked so rather than dropped: an inert guard costs one comparison and is the difference between "handled" and "missed" the next time someone audits the port against a new tag.
+
 ## 12. Sources
 
 - [Module pipeline and the shallow/full cache](https://github.com/godotengine/godot/blob/master/modules/gdscript/README.md)
