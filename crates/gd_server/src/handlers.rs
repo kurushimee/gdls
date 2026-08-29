@@ -3527,17 +3527,37 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                 if let Some(loc) = find_autoload_definition(state, &name) {
                     decls.push(loc);
                 }
-            } else if let NonMethodTarget::Local { decl_ident, .. }
-            | NonMethodTarget::EnumValue { decl_ident, .. } = &non_method_target
-            {
-                // A local's / enum value's declaration is its own resolved identifier —
-                // find_in_file_definition would wrongly return a same-named class member's (or, for
-                // an enum value, the enum's own NAME token), and a same-named sibling must not be
-                // reported. The enum value's decl ident is the precise value token in `EnumNode.values`.
+            } else if let NonMethodTarget::Local { decl_ident, .. } = &non_method_target {
+                // A local's declaration is its own resolved identifier — find_in_file_definition
+                // would wrongly return a same-named class member's, and a same-named sibling must
+                // not be reported.
                 decls.push(Location {
                     uri: uri.clone(),
                     range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
                 });
+            } else if let NonMethodTarget::EnumValue {
+                decl_ident,
+                qualified,
+                decl_file,
+                class_path,
+            } = &non_method_target
+            {
+                // The enum value's declaration is the precise value token in `EnumNode.values` —
+                // never `find_in_file_definition`, which would match the enum's own NAME token or a
+                // same-named member. In this tree when this file declares the enum; otherwise
+                // resolved through the declaring file (#331).
+                if let Some(id) = decl_ident {
+                    decls.push(Location {
+                        uri: uri.clone(),
+                        range: mapper.span_to_range(parsed.tree.get(*id).span),
+                    });
+                } else if let Some((enum_name, value_name)) = qualified.split_once('.') {
+                    if let Some(loc) = enum_value_decl_location(
+                        state, *decl_file, class_path, enum_name, value_name,
+                    ) {
+                        decls.push(loc);
+                    }
+                }
             } else if let NonMethodTarget::Member {
                 file: tf,
                 class_path,
@@ -4308,14 +4328,32 @@ fn collect_in_file_highlight_sites(
         }
     } else if let NonMethodTarget::Local { .. } = &non_method_target {
         // decl token is emitted by push_local_binding_locations below.
-    } else if let NonMethodTarget::EnumValue { decl_ident, .. } = &non_method_target {
+    } else if let NonMethodTarget::EnumValue {
+        decl_ident,
+        qualified,
+        decl_file,
+        class_path,
+    } = &non_method_target
+    {
         // An enum value's declaration is its precise token in `EnumNode.values` — the
         // `push_enum_value_binding_locations` scan below emits USE sites only, so the decl is added
         // here (NOT via find_in_file_definition, which matches the enum's NAME / a same-named member).
-        locations.push(Location {
-            uri: uri.clone(),
-            range: mapper.span_to_range(parsed.tree.get(*decl_ident).span),
-        });
+        // A cross-file cursor has no token in this tree, so its declaration comes from the declaring
+        // file (#331) — which is what makes the reference set click-site-independent, and therefore
+        // what makes renaming from a cross-file use safe.
+        if let Some(id) = decl_ident {
+            locations.push(Location {
+                uri: uri.clone(),
+                range: mapper.span_to_range(parsed.tree.get(*id).span),
+            });
+        } else if let Some((enum_name, value_name)) = qualified.split_once('.') {
+            let (decl_file, class_path) = (*decl_file, class_path.clone());
+            if let Some(loc) =
+                enum_value_decl_location(state, decl_file, &class_path, enum_name, value_name)
+            {
+                locations.push(loc);
+            }
+        }
     } else if let NonMethodTarget::Member {
         file: tf,
         class_path,
@@ -4909,7 +4947,13 @@ enum NonMethodTarget {
     /// so the candidate set is the files referencing `decl_file`'s `class_name` and each contributes
     /// ONLY its `(decl_file, qualified)`-keyed `EnumValueLocal` bindings (#158). #106 (in-file).
     EnumValue {
-        decl_ident: NodeId,
+        /// The value's declaration token **in the current tree** — `Some` when this file declares
+        /// the enum (a decl-click, or an in-file `Direction.NORTH` use), `None` for a cross-file
+        /// use (`Inventory.Slot.WEAPON`), whose declaration lives in another file's tree and is
+        /// resolved through [`enum_value_decl_location`] instead. The identity that drives
+        /// collection is `(decl_file, class_path, qualified)`, which is file-independent, so a
+        /// cross-file cursor collects exactly the same set (#331).
+        decl_ident: Option<NodeId>,
         qualified: String,
         decl_file: gd_project::FileId,
         /// The declaring enum's inner-class chain (empty = root class). A root `enum A { X }` and an
@@ -4937,16 +4981,22 @@ fn classify_non_method_target(
     name: &str,
     current_fid: Option<gd_project::FileId>,
 ) -> NonMethodTarget {
-    // (0a) Enum-value USE-site click (`Direction.NORTH`): the `EnumValueLocal` binding at the cursor
-    // span carries the QUALIFIED `<EnumName>.<value>` as its `target_name` and the DECLARING file as
-    // its `target_file`. This path admits ONLY an IN-FILE click — `find_enum_value_decl_ident` locates
-    // the value's declaration token in THIS tree, which succeeds iff the enum is declared here. A
-    // CROSS-FILE use-click (`Foo.Direction.NORTH` where `Foo` is another file) records a binding whose
-    // `target_file != current_fid` and whose declaration is NOT in this tree, so it FALLS THROUGH here
-    // (and the member loop below excludes `EnumValueLocal`, so it never misclassifies as a Member) →
-    // `Unresolved` → the firewall refuses it (fail-closed: a cross-file use-click stays a refuse, the
-    // documented safe boundary). Renaming from the DECLARATION (#158) is the supported cross-file
-    // entry point. Runs before the member loop (an enum value is not a member). #106 / #158.
+    // (0a) Enum-value USE-site click (`Direction.NORTH`, `Inventory.Slot.WEAPON`): the
+    // `EnumValueLocal` binding at the cursor span carries the QUALIFIED `<EnumName>.<value>` as its
+    // `target_name` and the DECLARING file as its `target_file`. That pair is the whole identity the
+    // collection needs — `push_enum_value_binding_locations` is keyed on
+    // `(decl_file, class_path, qualified)` and the candidate fan-out is project-wide — so a
+    // cross-file click resolves to exactly the same symbol and the same reference set as a click on
+    // the declaration.
+    //
+    // #331: this used to require `current_fid == Some(*tf)`, on the reasoning that a cross-file
+    // click has no declaration token in THIS tree. True, but the fix is to carry `None` there and
+    // resolve the declaration through the declaring file (`enum_value_decl_location`), not to give
+    // up on the symbol: the old fall-through left the enum's *values* as the one nested symbol that
+    // could not be renamed from a use site, while its name and an inner class both could (#298), and
+    // left `references` on such a click silently stopping at the file edge.
+    //
+    // Runs before the member loop (an enum value is not a member). #106 / #158 / #180 / #331.
     for b in result.bindings() {
         if let Binding::Use {
             target_kind: BindingTargetKind::EnumValueLocal,
@@ -4956,14 +5006,25 @@ fn classify_non_method_target(
             site,
         } = b
         {
-            if *site == node_span && current_fid == Some(*tf) {
+            if *site == node_span {
                 if let Some((enum_name, value_name)) = target_name.split_once('.') {
                     // #180: resolve the value's decl in the enum's DECLARING class (the binding's
                     // `target_class_path`), not just the root — an inner-class enum value resolves
                     // here, and the path is carried so the binding scan stays root-vs-inner distinct.
-                    if let Some(decl_ident) =
-                        find_enum_value_decl_ident(tree, enum_name, value_name, target_class_path)
-                    {
+                    let decl_ident = (current_fid == Some(*tf))
+                        .then(|| {
+                            find_enum_value_decl_ident(
+                                tree,
+                                enum_name,
+                                value_name,
+                                target_class_path,
+                            )
+                        })
+                        .flatten();
+                    // An in-file binding whose decl token cannot be found in this tree is a
+                    // resolution gap, not a cross-file click — fall through rather than claim a
+                    // declaration-less in-file target.
+                    if decl_ident.is_some() || current_fid != Some(*tf) {
                         return NonMethodTarget::EnumValue {
                             decl_ident,
                             qualified: target_name.clone(),
@@ -4983,7 +5044,7 @@ fn classify_non_method_target(
             if let Some((decl_ident, qualified, class_path)) = enum_value_decl_at(tree, ident_id) {
                 if tree.get(decl_ident).span == node_span {
                     return NonMethodTarget::EnumValue {
-                        decl_ident,
+                        decl_ident: Some(decl_ident),
                         qualified,
                         decl_file: fid,
                         class_path,

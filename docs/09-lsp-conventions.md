@@ -128,6 +128,8 @@ Triggers on `(` and `,`, retriggers on `)`. `activeParameter` per spec. `[start,
 
 **Mutating consumers need their own firewall.** `references` and `definition` are read-tuned, and their inaccuracies become silent source corruption under `rename`, `codeAction` edits, `willRenameFiles`, and autoload renames. The pattern that holds: a fail-closed positive-project-resolution gate, binding-correct collection (never name-only), and refusing outright rather than half-applying. Widening a *candidate set* is safe; widening what is *collected inside* one is not.
 
+A refusal is the right answer only when the identity itself is in doubt, never as a stand-in for a collector that cannot reach across files. An enum value is the case that made the difference: its identity is the triple `(declaring file, class path, "Enum.VALUE")`, which is file-independent, so a click on `Lib.Dir.NORTH` in another file names exactly the same thing as a click on the declaration and renames the same two sites — even where a `const NORTH` or a `class_name Idle` shares the bare name, since neither records that binding. Refusing those clicks, as gdls did before, only hid a collector that was keyed on an in-tree `NodeId`.
+
 ### 6.4 Inlay hints and colors
 
 `inlayHint` covers inferred types on `:=` declarations and parameter names at resolved call sites, each independently toggleable, with parameter hints suppressed on single-argument calls regardless. With `inlayHint.resolveSupport` the tooltip is pulled lazily via a `data` blob; without it hints arrive complete. The `textEdit` is always eager, so applying a hint never needs a resolve round-trip.
