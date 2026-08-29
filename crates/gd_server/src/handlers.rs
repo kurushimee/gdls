@@ -1173,9 +1173,8 @@ pub(crate) fn analyze_with_request_token(
         tree,
         text,
         gd_analyze::AnalyzeOptions {
-            iter_limit: None,
             cancellation: token.as_ref(),
-            checkpoint_delay: None,
+            ..Default::default()
         },
     )
 }

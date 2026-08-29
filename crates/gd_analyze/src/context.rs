@@ -13,7 +13,7 @@
 
 use gd_project::FileId;
 use gd_syntax::ast::{Node, NodeId};
-use gd_syntax::{ByteSpan, ParseTree};
+use gd_syntax::{ByteSpan, Dialect, ParseTree};
 use gd_types::NativeDb;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -309,6 +309,12 @@ pub struct AnalysisContext<'a> {
     /// on a statement whose nested expression is the cast).
     warning_ignored_lines: FxHashMap<crate::warnings::WarningCode, rustc_hash::FxHashSet<u32>>,
 
+    /// The Godot feature release whose analyzer semantics are in force. Set by
+    /// [`crate::analyze_with_options`] from `AnalyzeOptions.dialect`; the bare
+    /// [`AnalysisContext::new`] path leaves it at [`Dialect::DEFAULT`]. See `gd_syntax::dialect`
+    /// for the `DIALECT(...)` guard convention.
+    pub dialect: Dialect,
+
     /// M5 WP-O3: fixpoint loop governor. Incremented at each `reduce_expression` /
     /// `resolve_node` / lambda-drain self-call entry. Crossing [`Self::iter_limit`] bails the
     /// current resolution with a synthetic `analyzer: fixpoint iteration budget exceeded
@@ -395,6 +401,7 @@ impl<'a> AnalysisContext<'a> {
             // conformance / fuzz path continues exactly as it did pre-M5;
             // [`crate::analyze_with_options`] overrides them from `AnalyzeOptions` for the LSP
             // server's per-request analyze.
+            dialect: Dialect::DEFAULT,
             iter_count: 0,
             iter_limit: 0,
             cancellation: None,

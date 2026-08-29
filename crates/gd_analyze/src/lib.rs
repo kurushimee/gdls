@@ -66,7 +66,7 @@ pub use warnings::{code_from_name, name_from_code, WarnLevel, WarningCode, WARNI
 pub const DEFAULT_ITER_LIMIT: u32 = 100_000;
 
 use gd_project::FileId;
-use gd_syntax::ParseTree;
+use gd_syntax::{Dialect, ParseTree};
 use gd_types::NativeDb;
 
 /// Analyze one parsed file, mirroring `GDScriptAnalyzer::analyze()` (analyzer.cpp:6609): clear, then
@@ -120,6 +120,10 @@ pub fn analyze(
 /// without touching their signatures.
 #[derive(Default)]
 pub struct AnalyzeOptions<'a> {
+    /// The Godot feature release whose analyzer semantics apply. Defaults to
+    /// [`Dialect::DEFAULT`]; the LSP server sets it from the project's resolved dialect. See
+    /// `gd_syntax::dialect` for the `DIALECT(...)` guard convention.
+    pub dialect: Dialect,
     /// WP-O3: per-file fixpoint iteration budget. `None` means "use [`DEFAULT_ITER_LIMIT`]"; an
     /// explicit `Some(N)` overrides it (used by the LSP server's `initializationOptions.analyzer.iterLimit`).
     pub iter_limit: Option<u32>,
@@ -148,6 +152,7 @@ pub fn analyze_with_options<'a>(
     options: AnalyzeOptions<'a>,
 ) -> AnalysisResult {
     let mut ctx = AnalysisContext::new(tree, native, xfile, file, script_path, policy);
+    ctx.dialect = options.dialect;
     ctx.iter_limit = options.iter_limit.unwrap_or(DEFAULT_ITER_LIMIT);
     ctx.cancellation = options.cancellation;
     ctx.checkpoint_delay = options.checkpoint_delay;

@@ -8,6 +8,7 @@
 //! (`docs/02-frontend-port.md`). Type checking and warnings arrive later in `gd_analyze` (M3).
 
 pub mod ast;
+pub mod dialect;
 pub mod doc_comments;
 pub mod lexer;
 pub mod parser;
@@ -15,8 +16,9 @@ pub mod span;
 pub mod token;
 
 pub use ast::ParseTree;
+pub use dialect::Dialect;
 pub use doc_comments::{ClassDoc, DocTable, MemberDoc};
-pub use lexer::{tokenize, CommentData, LexError, Lexer};
+pub use lexer::{tokenize, tokenize_with_dialect, CommentData, LexError, Lexer};
 pub use span::{ByteSpan, LineCol, LineColRange};
 pub use token::{Literal, Token, TokenKind};
 
@@ -73,11 +75,31 @@ pub struct ParseResult {
     pub comments: std::collections::HashMap<u32, CommentData>,
 }
 
+/// Per-parse knobs. Kept as a struct, mirroring `gd_analyze::AnalyzeOptions`, so every new knob
+/// lands here without touching the signatures of [`parse`]'s many test and fuzz call sites.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ParseOptions<'a> {
+    /// The Godot feature release whose frontend semantics apply. Defaults to [`Dialect::DEFAULT`].
+    pub dialect: Dialect,
+    /// The `res://` path of the script, or `""` when unknown (an untitled buffer, a fuzz input, a
+    /// `.gd` outside the project). Godot's parser reads it only to reject `class_name` in a
+    /// built-in script, so an empty path simply never triggers that check.
+    pub script_path: &'a str,
+}
+
 /// Parse a GDScript source file into a (possibly partial) tree, its syntax diagnostics, and a
 /// projected symbol outline. Mirrors `GDScriptParser::parse` + `parse_program`
 /// (`docs/02-frontend-port.md`); never fails to return a result.
+///
+/// Parses at [`Dialect::DEFAULT`]; use [`parse_with_options`] where the project's dialect is known.
 pub fn parse(source: &str) -> ParseResult {
-    let mut parser = parser::Parser::new(source);
+    parse_with_options(source, &ParseOptions::default())
+}
+
+/// [`parse`] with per-parse knobs — see [`ParseOptions`]. The single source of truth for the parse
+/// pipeline; the bare [`parse`] wrapper is the test and fuzz default.
+pub fn parse_with_options(source: &str, options: &ParseOptions<'_>) -> ParseResult {
+    let mut parser = parser::Parser::new_with_options(source, options);
     parser.parse_program();
     let comments = parser.take_comments();
     let (mut tree, diagnostics) = parser.into_parts();

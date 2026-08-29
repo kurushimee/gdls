@@ -23,10 +23,11 @@
 use std::collections::HashMap;
 
 use crate::ast::*;
+use crate::dialect::Dialect;
 use crate::lexer::Lexer;
 use crate::span::ByteSpan;
 use crate::token::{Literal, Token, TokenKind};
-use crate::{Diagnostic, DocumentSymbol, SymbolKind};
+use crate::{Diagnostic, DocumentSymbol, ParseOptions, SymbolKind};
 
 /// Maximum expression/statement nesting before the parser bails with an error instead of risking a
 /// native stack overflow (an uncatchable abort). Deliberate deviation from Godot for fuzz safety.
@@ -447,6 +448,12 @@ fn capitalize_first(s: &str) -> String {
 /// The parser. Holds the lexer, single-token lookahead (`previous`/`current`), the node arena, and
 /// the contextual stacks Godot's `GDScriptParser` keeps.
 pub struct Parser {
+    /// The Godot feature release whose parser semantics are in force. See [`Dialect`] for the
+    /// `DIALECT(...)` guard convention.
+    dialect: Dialect,
+    /// The `res://` path of the script being parsed, or `""` when unknown. Godot's parser reads it
+    /// only to reject `class_name` in a built-in (scene-embedded) script.
+    script_path: String,
     lexer: Lexer,
     previous: Token,
     current: Token,
@@ -480,10 +487,18 @@ fn empty_token() -> Token {
 }
 
 impl Parser {
+    /// A parser at [`Dialect::DEFAULT`] with no script path. Prefer [`Self::new_with_options`]
+    /// anywhere the project's dialect is known.
     pub fn new(source: &str) -> Self {
-        let mut lexer = Lexer::new(source);
+        Self::new_with_options(source, &ParseOptions::default())
+    }
+
+    pub fn new_with_options(source: &str, options: &ParseOptions<'_>) -> Self {
+        let mut lexer = Lexer::new_with_dialect(source, options.dialect);
         let current = lexer.scan();
         let mut parser = Parser {
+            dialect: options.dialect,
+            script_path: options.script_path.to_owned(),
             lexer,
             previous: empty_token(),
             current,
@@ -504,6 +519,18 @@ impl Parser {
         };
         parser.prime_first_token();
         parser
+    }
+
+    /// The dialect this parser parses under.
+    #[must_use]
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
+    /// The `res://` path of the script being parsed, or `""` when unknown.
+    #[must_use]
+    pub fn script_path(&self) -> &str {
+        &self.script_path
     }
 
     /// Load `current` for the first time, skipping leading `ERROR` and `NEWLINE` tokens

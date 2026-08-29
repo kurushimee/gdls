@@ -78,8 +78,7 @@ fn a_bailed_analysis_is_not_cached() {
     // `iter_limit = 1` forces the fixpoint governor to bail on the first checkpoint → partial result.
     let tiny = || gd_analyze::AnalyzeOptions {
         iter_limit: Some(1),
-        cancellation: None,
-        checkpoint_delay: None,
+        ..Default::default()
     };
     let a1 = ws.analyze_with_options(&key, &path, &parsed.tree, src, tiny());
     assert!(
