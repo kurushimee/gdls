@@ -303,6 +303,8 @@ pub(crate) fn will_rename_files(
             &renamed_tscn_old_res,
             &FxHashSet::default(),
         );
+        warn_dangling_autoload_entries(state, &renamed_gd_old_res);
+        warn_dangling_autoload_entries(state, &renamed_tscn_old_res);
         return None;
     }
 
@@ -330,6 +332,8 @@ pub(crate) fn will_rename_files(
         &renamed_tscn_old_res,
         &rewritten_scenes,
     );
+    warn_dangling_autoload_entries(state, &renamed_gd_old_res);
+    warn_dangling_autoload_entries(state, &renamed_tscn_old_res);
 
     // (2b) Scan every indexed `.gd` ONCE (loops inverted: O(files), not O(renames × files)). For each
     // `preload`/`load` `res://` argument literal (positive identification — `collect_load_path_literals`),
@@ -1039,6 +1043,60 @@ fn warn_dangling_scene_references(
             ),
         );
     }
+}
+
+/// Emit one `window/showMessage(Warning)` naming the autoload entries a move leaves pointing at a
+/// dead path (#309).
+///
+/// `project.godot` is deliberately outside `willRenameFiles`'s edit scope (`docs/09` §6.7 scopes it
+/// to `preload`/`load` argument literals), so returning no edit for it is correct — but returning
+/// *nothing at all* is the same silent degradation [`warn_dangling_scene_references`] exists to
+/// prevent one seam over. Godot's own editor rewrites the entry; a headless server cannot, so it
+/// has to say so.
+///
+/// Matched by resolved target, not by raw text: an autoload declared as `Name="*uid://…"` whose
+/// sidecar maps to the renamed script dangles exactly the same way, and a `res://./x.gd` spelling
+/// must not slip past a string compare.
+fn warn_dangling_autoload_entries(state: &ServerState, renamed_old_res: &[String]) {
+    if renamed_old_res.is_empty() {
+        return;
+    }
+    let renamed: FxHashSet<String> = renamed_old_res
+        .iter()
+        .map(|r| gd_project::scene::normalize_res(r))
+        .collect();
+    let mut affected: Vec<String> = Vec::new();
+    for autoload in &state.workspace.project.autoloads {
+        let Some(target) = state.workspace.project.resolve_target(&autoload.target) else {
+            continue;
+        };
+        let res = match target {
+            gd_project::ResTarget::Script(p) | gd_project::ResTarget::Scene(p) => p,
+            _ => continue,
+        };
+        if renamed.contains(&gd_project::scene::normalize_res(&res)) {
+            affected.push(format!("{}={res}", autoload.name));
+        }
+    }
+    if affected.is_empty() {
+        return;
+    }
+    affected.sort(); // deterministic message
+    let list = affected.join(", ");
+    show_message(
+        state,
+        MessageType::WARNING,
+        &format!(
+            "gdls: moving this file will leave {} in `project.godot`'s `[autoload]` section \
+             pointing at a dead path — gdls does not edit `project.godot`; update it manually: \
+             {list}",
+            if affected.len() == 1 {
+                "an autoload entry"
+            } else {
+                "autoload entries"
+            },
+        ),
+    );
 }
 
 /// `workspace/didRenameFiles`: route a client-observed batch of renames into the index-reconcile

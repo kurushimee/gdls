@@ -275,3 +275,78 @@ fn a_doc_comments_paragraph_break_renders_per_release() {
         "4.6 renders both `[br]`s as markdown hard breaks: {at_46:?}"
     );
 }
+
+/// #302: the stock-fallback notice must name the release actually ingested. Since v3.0.0 the stock
+/// asset is picked per project from `application/config/features`, so a hardcoded version told a
+/// 4.7 user the 4.6 surface was loaded — while the stderr line one step earlier said otherwise,
+/// and it is the first thing a new user sees on the auto-dump path too.
+#[test]
+fn the_stock_fallback_notice_names_the_release_it_actually_loaded() {
+    for (tag, want) in [("4.6", "Godot 4.6."), ("4.7", "Godot 4.7.")] {
+        let dir = tempfile::Builder::new()
+            .prefix("gdls_stock_")
+            .tempdir()
+            .expect("temp dir");
+        let root = dir
+            .path()
+            .to_str()
+            .expect("utf-8 temp dir")
+            .replace('\\', "/");
+        std::fs::write(
+            dir.path().join("project.godot"),
+            format!(
+                "config_version=5\n\n[application]\n\nconfig/features=PackedStringArray(\"{tag}\")\n"
+            ),
+        )
+        .unwrap();
+
+        let (server, client) = Connection::memory();
+        let handle = std::thread::spawn(move || {
+            gd_server::serve(server).expect("serve() returned an error");
+        });
+        let init = InitializeParams {
+            initialization_options: Some(serde_json::json!({
+                "projectRoot": root,
+                "autoDumpExtensionApi": false,
+            })),
+            ..Default::default()
+        };
+        client
+            .sender
+            .send(request(
+                1,
+                "initialize",
+                serde_json::to_value(init).unwrap(),
+            ))
+            .unwrap();
+        assert!(recv_response(&client).error.is_none());
+        client
+            .sender
+            .send(notification(
+                "initialized",
+                serde_json::to_value(InitializedParams {}).unwrap(),
+            ))
+            .unwrap();
+
+        let mut notice: Option<String> = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && notice.is_none() {
+            match client.receiver.recv_timeout(Duration::from_millis(300)) {
+                Ok(Message::Notification(n)) if n.method == "window/showMessage" => {
+                    let msg = n.params["message"].as_str().unwrap_or("").to_owned();
+                    if msg.contains("built-in stock") {
+                        notice = Some(msg);
+                    }
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+        let msg = notice.unwrap_or_else(|| panic!("no stock-fallback notice arrived at {tag}"));
+        assert!(
+            msg.contains(want),
+            "the {tag} stock notice must name a {want}x surface; got: {msg}"
+        );
+        shutdown(&client, handle);
+    }
+}

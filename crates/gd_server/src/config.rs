@@ -35,9 +35,9 @@ pub struct InitializationOptions {
     /// never configures native types; set false to forbid gdls from ever spawning Godot.
     pub auto_dump_extension_api: bool,
     /// v1.0.2: when every native-API source misses (no `extensionApiPath`, no cached dump, no
-    /// auto-dump, no project-root file), fall back to a bundled stock 4.6.3 `extension_api.json`
-    /// instead of an empty DB, so builtins (`Node`, `Timer`, …) always resolve on a fresh
-    /// install. Default **true**; set false to reproduce the bare-DB degraded mode (tests,
+    /// auto-dump, no project-root file), fall back to a bundled stock `extension_api.json` — one
+    /// asset per supported release, picked from the project's dialect — instead of an empty DB, so
+    /// builtins (`Node`, `Timer`, …) always resolve on a fresh install. Default **true**; set false to reproduce the bare-DB degraded mode (tests,
     /// memory-floor measurements).
     pub embedded_api_fallback: bool,
     /// Pin the Godot dialect (`"4.6"` / `"4.7"`) instead of reading it from `project.godot`'s
@@ -106,7 +106,8 @@ impl InitializationOptions {
             Some((d, v)) if d.version() == v => Some(d),
             _ => {
                 log::warn!(
-                    "initializationOptions.dialect={raw:?} is not a Godot version gdls supports                      ({} .. {}); ignoring it and reading the version from project.godot",
+                    "initializationOptions.dialect={raw:?} is not a Godot version gdls supports ({} .. {}); \
+                     ignoring it and reading the version from project.godot",
                     Dialect::OLDEST,
                     Dialect::NEWEST,
                 );

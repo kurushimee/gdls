@@ -1045,22 +1045,33 @@ fn serve_inner(
     register_watched_files(&mut state, watcher.is_some());
 
     // #259: say once, on the wire, which native surface this session actually got. The embedded
-    // fallback is a complete STOCK 4.6.3 surface (documentation included), but it is not the
-    // user's engine: a different Godot version, and every GDExtension class, is simply absent —
+    // fallback is a complete stock surface for the project's own declared release (documentation
+    // included), but it is not the user's engine: a custom build, and every GDExtension class,
+    // is simply absent —
     // which is why it carries `Generic` provenance and why the analyzer will not turn its misses
     // into errors. A stderr line is invisible to most clients; "never lie" covers a degraded
     // surface the user cannot see. One notification per session, at startup, never repeated.
     notify_dialect(&state);
 
     if state.workspace.native.provenance() == gd_types::ApiProvenance::Generic {
+        // #302: name the release actually ingested. Since v3.0.0 the stock asset is picked per
+        // project from `application/config/features`, so a hardcoded version told a 4.7 user the
+        // 4.6 surface was loaded while the log line right above said otherwise.
+        let h = state.workspace.native.header();
+        let served = format!(
+            "Godot {}.{}.{}",
+            h.version_major, h.version_minor, h.version_patch
+        );
         show_message(
             &state,
             lsp_types::MessageType::INFO,
-            "gdls is using its built-in stock Godot 4.6.3 API surface — no project dump was \
-             found. Engine classes and their documentation are available, but classes from your \
-             own Godot build or from GDExtensions are not. To use your engine's real API, set \
-             `godotBinaryPath` (or the GDLS_GODOT environment variable), or point \
-             `extensionApiPath` at an extension_api.json.",
+            &format!(
+                "gdls is using its built-in stock {served} API surface — no project dump was \
+                 found. Engine classes and their documentation are available, but classes from \
+                 your own Godot build or from GDExtensions are not. To use your engine's real \
+                 API, set `godotBinaryPath` (or the GDLS_GODOT environment variable), or point \
+                 `extensionApiPath` at an extension_api.json."
+            ),
         );
     }
 
@@ -1620,7 +1631,8 @@ fn handle_outbound_response(state: &mut ServerState, resp: Response) {
         },
         OutboundKind::WorkspaceDiagnosticRefresh => match &resp.error {
             Some(err) => log::debug!(
-                "client declined workspace/diagnostic/refresh ({}); its pull results for                  dependents stay stale until it re-pulls on its own cadence",
+                "client declined workspace/diagnostic/refresh ({}); its pull results for dependents \
+                 stay stale until it re-pulls on its own cadence",
                 err.message
             ),
             None => log::debug!("client acknowledged the workspace diagnostic refresh"),
@@ -2058,7 +2070,8 @@ fn register_watched_files(state: &mut ServerState, native_watcher_armed: bool) {
     let asset_catch_all = (!native_watcher_armed).then(|| watcher("**/*"));
     if native_watcher_armed {
         log::debug!(
-            "watch registration: native watcher is armed, omitting the `**/*` asset catch-all              (asset freshness rides the native watcher)"
+            "watch registration: native watcher is armed, omitting the `**/*` asset catch-all \
+             (asset freshness rides the native watcher)"
         );
     }
     let id = state.shared.next_outgoing_id();

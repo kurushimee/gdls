@@ -101,7 +101,7 @@ pub fn sample_project() -> TempProject {
     // sample project is read under one consistent Godot version.
     p.write(
         "project.godot",
-        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\n         config/features=PackedStringArray(\"4.6\")\n",
+        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\n",
     );
     p.write("extension_api.json", MINI_API);
     p.write(
