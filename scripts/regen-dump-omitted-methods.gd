@@ -12,6 +12,11 @@ extends SceneTree
 #
 #     godot --headless --script scripts/regen-dump-omitted-methods.gd -- <stock-dump.json> <out.txt>
 #
+# Two tables are written: `<out.txt>` holds DUMP_OMITTED_NATIVE_METHODS' rows, and `<out.txt>.sig`
+# holds DUMP_OMITTED_VIRTUAL_SIGNATURES' rows — the real MethodInfo signature of every row whose
+# METHOD_FLAG_VIRTUAL bit is set, which is what an override-method completion renders and what the
+# override-compat check compares a user's override against.
+#
 # Derivation (mirrors the committed table's header doc): for every class the stock dump carries, take
 # `ClassDB.class_get_method_list(cls, true)` (own methods only — the `no_inheritance` flag) and keep
 # the names the dump's OWN method set for that class does not contain. `is_virtual` is the method's
@@ -69,7 +74,23 @@ func _init() -> void:
 	for row in rows:
 		f.store_line('    ("%s", "%s", %s),' % [row[0], row[1], "true" if row[2] else "false"])
 	f.close()
-	print("wrote %d rows to %s" % [rows.size(), out_path])
+
+	# The signature half: only the real engine virtuals, in the same (class, method) order.
+	var sig_path := out_path + ".sig"
+	var sf := FileAccess.open(sig_path, FileAccess.WRITE)
+	if sf == null:
+		push_error("cannot open signature output file: %s" % sig_path)
+		quit(1)
+		return
+	var sig_count := 0
+	for row in rows:
+		if not row[2]:
+			continue
+		sf.store_line('    ("%s", "%s", &[%s], "%s"),' % [row[0], row[1], row[3], row[4]])
+		sig_count += 1
+	sf.close()
+
+	print("wrote %d rows to %s (%d signature rows to %s)" % [rows.size(), out_path, sig_count, sig_path])
 	quit(0)
 
 
@@ -104,8 +125,33 @@ func _derive_rows(dump: Dictionary) -> Array:
 			if name.is_empty() or dump_methods.has(name):
 				continue
 			var is_virtual := (int(m.get("flags", 0)) & METHOD_FLAG_VIRTUAL) != 0
-			rows.append([class_id, name, is_virtual])
+			# Params + return in the dump's own type spelling, so `gd_types::type_ref::decode`
+			# ingests them exactly like a dumped method. Only meaningful for the virtual rows.
+			var params: Array[String] = []
+			for a in m.get("args", []):
+				params.append('("%s", "%s")' % [a.get("name", ""), _dump_type(a)])
+			rows.append([class_id, name, is_virtual, ", ".join(params), _dump_type(m.get("return", {}))])
 	return rows
+
+
+# One MethodInfo argument/return entry rendered in `extension_api.json`'s type spelling: a typed
+# Array becomes `typedarray::ELEM`, a typed Dictionary `typeddictionary::KEY;VALUE`, an untyped
+# NIL-is-Variant slot `Variant`, and a plain NIL `void`.
+func _dump_type(a: Dictionary) -> String:
+	var t := int(a.get("type", TYPE_NIL))
+	var class_id := String(a.get("class_name", ""))
+	if class_id != "":
+		return class_id
+	if t == TYPE_NIL:
+		return "Variant" if (int(a.get("usage", 0)) & PROPERTY_USAGE_NIL_IS_VARIANT) else "void"
+	var hint := int(a.get("hint", 0))
+	var hint_string := String(a.get("hint_string", ""))
+	if t == TYPE_ARRAY and hint == PROPERTY_HINT_ARRAY_TYPE and hint_string != "":
+		return "typedarray::%s" % hint_string
+	if t == TYPE_DICTIONARY and hint == PROPERTY_HINT_DICTIONARY_TYPE and hint_string != "":
+		# Godot spells the dictionary hint `KEY;VALUE`, which is already the dump's encoding.
+		return "typeddictionary::%s" % hint_string
+	return type_string(t)
 
 
 # Strict (class, method) ordering — matches the committed table's sort and Rust's tuple `<`.

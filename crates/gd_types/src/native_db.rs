@@ -768,13 +768,19 @@ impl NativeDb {
 /// `docs/02`). A seeded method has no real signature in the dump, so it is synthesized as a
 /// no-argument `Variant`-returning method — only its NAME participates in the method-existence
 /// lookup the warning arm consults; the analyzer never type-checks a seeded call's arguments
-/// (the lookup binds, the call stays permissive). `is_virtual` is the method's real
+/// (the lookup binds, the call stays permissive). The twelve real engine virtuals among them are
+/// the exception — see [`DUMP_OMITTED_VIRTUAL_SIGNATURES`]. `is_virtual` is the method's real
 /// `METHOD_FLAG_VIRTUAL` bit, carried per-row in the table (NOT the `_`-prefix — most `_`-prefixed
 /// internal/editor methods are real non-virtual `MethodBind`s, not engine virtuals). It is the same
 /// flag Godot's super-call virtual check (`gdscript_analyzer.cpp:3630-3636`) and `native_base`
 /// override gate read, so the firing conditions match Godot by construction.
 /// Applied only when the class is present (a trimmed fixture omitting a class simply gets no seed
 /// for it).
+///
+/// The twelve `Object`-core virtuals are the exception to "name-only": they carry their real
+/// `ClassDB` signature from [`DUMP_OMITTED_VIRTUAL_SIGNATURES`], so an override stub renders
+/// `_set(property: StringName, value: Variant) -> bool:` and the override-compat check has a real
+/// parent contract to compare against.
 fn seed_dump_omitted_methods(classes: &mut FxHashMap<Sym, NativeClass>, it: &mut Interner) {
     for &(class_name, method_name, is_virtual) in DUMP_OMITTED_NATIVE_METHODS {
         let Some(class_sym) = it.get(class_name) else {
@@ -787,22 +793,113 @@ fn seed_dump_omitted_methods(classes: &mut FxHashMap<Sym, NativeClass>, it: &mut
         if nc.methods.iter().any(|m| m.name == method_sym) {
             continue; // already carried by the dump — never shadow the real entry
         }
+        // The `Object`-core virtuals carry a real signature (they are what an override-method
+        // completion renders and what the override-compat check compares against); every other
+        // seeded row is name-only.
+        let sig = DUMP_OMITTED_VIRTUAL_SIGNATURES
+            .iter()
+            .find(|&&(c, m, _, _)| c == class_name && m == method_name);
+        let (params, return_type, arity_known) = match sig {
+            Some(&(_, _, params, ret)) => (
+                params
+                    .iter()
+                    .map(|&(pname, pty)| Param {
+                        name: it.intern(pname),
+                        ty: crate::type_ref::decode(pty, it),
+                        default_value: None,
+                    })
+                    .collect(),
+                crate::type_ref::decode(ret, it),
+                true,
+            ),
+            // Seed carries NO real parameter list (the dump omitted the method; only the name
+            // participates in the existence lookup). Its empty `params` is not the true arity, so
+            // the call must never be arity-checked against it — ClassDB has the real signature.
+            None => (Vec::new(), TypeRef::Variant, false),
+        };
+        // `classes` was borrowed above only to check for a pre-existing entry; re-borrow now that
+        // the interner is free again (the signature decode above interns names).
+        let Some(nc) = classes.get_mut(&class_sym) else {
+            continue;
+        };
         nc.methods.push(Method {
             name: method_sym,
             is_const: false,
             is_static: false,
             is_vararg: false,
             is_virtual,
-            return_type: TypeRef::Variant,
-            params: Vec::new(),
+            return_type,
+            params,
             description: String::new(),
-            // Seed carries NO real parameter list (the dump omitted the method; only the name
-            // participates in the existence lookup). Its empty `params` is not the true arity, so
-            // the call must never be arity-checked against it — ClassDB has the real signature.
-            arity_known: false,
+            arity_known,
         });
     }
 }
+
+/// One [`DUMP_OMITTED_VIRTUAL_SIGNATURES`] row: `(class, method, parameters, return type)`, where
+/// each parameter is `(name, dump type spelling)`.
+pub type OmittedVirtualSignature = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
+/// The real signatures of the seeded rows that are genuine engine virtuals — the `Object`-core
+/// twelve. **GENERATED — do not hand-edit.** Each row is
+/// `(class, method, [(param name, dump type)], return dump type)`, read from
+/// `ClassDB.class_get_method_list(cls, true)`'s `MethodInfo` (the same call
+/// [`DUMP_OMITTED_NATIVE_METHODS`] reads its `is_virtual` bit from) and re-encoded into the dump's
+/// type spelling, so [`crate::type_ref::decode`] ingests them exactly like a dumped method.
+/// Regenerated by the same `scripts/regen-dump-omitted-methods.sh` run that regenerates the name
+/// table; identical at 4.6.3 and 4.7.2.
+///
+/// A seeded row WITHOUT an entry here stays name-only (`arity_known: false`) — those 170 rows are
+/// internal/editor `MethodBind`s nobody overrides, and inventing a signature for them would arm the
+/// arity check against a method the dump never described. The twelve here are different: they are
+/// what `func <cursor>` offers as an override stub, and what
+/// `resolver::check_override_signature` compares a user's override against, so without their real
+/// signature gdls both renders `_set() -> Variant:` (a stub that overrides nothing) and silently
+/// accepts `func _to_string() -> int:` where Godot rejects it.
+pub const DUMP_OMITTED_VIRTUAL_SIGNATURES: &[OmittedVirtualSignature] = &[
+    ("Object", "_get", &[("property", "StringName")], "Variant"),
+    (
+        "Object",
+        "_get_property_list",
+        &[],
+        "typedarray::Dictionary",
+    ),
+    ("Object", "_init", &[], "void"),
+    ("Object", "_iter_get", &[("iter", "Variant")], "Variant"),
+    ("Object", "_iter_init", &[("iter", "Array")], "bool"),
+    ("Object", "_iter_next", &[("iter", "Array")], "bool"),
+    ("Object", "_notification", &[("what", "int")], "void"),
+    (
+        "Object",
+        "_property_can_revert",
+        &[("property", "StringName")],
+        "bool",
+    ),
+    (
+        "Object",
+        "_property_get_revert",
+        &[("property", "StringName")],
+        "Variant",
+    ),
+    (
+        "Object",
+        "_set",
+        &[("property", "StringName"), ("value", "Variant")],
+        "bool",
+    ),
+    ("Object", "_to_string", &[], "String"),
+    (
+        "Object",
+        "_validate_property",
+        &[("property", "Dictionary")],
+        "void",
+    ),
+];
 
 /// The `(class, method, is_virtual)` triples `ClassDB` resolves but `extension_api.json` omits —
 /// see [`seed_dump_omitted_methods`]. **GENERATED — do not hand-edit.** Derivation (Godot
@@ -2030,6 +2127,78 @@ mod tests {
             m.is_virtual,
             "seeded `_notification` carries its real METHOD_FLAG_VIRTUAL bit (it is an Object-core \
              virtual)"
+        );
+    }
+
+    /// The signature table covers EXACTLY the `is_virtual == true` rows of the name table. A regen
+    /// that adds a virtual without its signature would silently re-open the `_x() -> Variant:`
+    /// stub bug; a signature row with no matching name row is dead weight that never seeds.
+    #[test]
+    fn dump_omitted_virtual_signatures_cover_exactly_the_virtual_rows() {
+        let mut named: Vec<(&str, &str)> = DUMP_OMITTED_NATIVE_METHODS
+            .iter()
+            .filter(|&&(_, _, is_virtual)| is_virtual)
+            .map(|&(class, method, _)| (class, method))
+            .collect();
+        let mut signed: Vec<(&str, &str)> = DUMP_OMITTED_VIRTUAL_SIGNATURES
+            .iter()
+            .map(|&(class, method, _, _)| (class, method))
+            .collect();
+        named.sort_unstable();
+        signed.sort_unstable();
+        assert_eq!(
+            named, signed,
+            "DUMP_OMITTED_VIRTUAL_SIGNATURES must carry one row per is_virtual=true name-table row"
+        );
+    }
+
+    /// Every signature row decodes into a real type and names every parameter — the shape a
+    /// hand-edit breaks first (an empty return string decodes to a bare `Named("")`, which then
+    /// renders as an empty type in a completion stub).
+    #[test]
+    fn dump_omitted_virtual_signature_rows_are_well_formed() {
+        for &(class, method, params, ret) in DUMP_OMITTED_VIRTUAL_SIGNATURES {
+            assert!(
+                !ret.is_empty(),
+                "{class}::{method} has an empty return type"
+            );
+            for &(pname, pty) in params {
+                assert!(
+                    !pname.is_empty() && !pty.is_empty(),
+                    "{class}::{method} has an unnamed or untyped parameter"
+                );
+            }
+        }
+    }
+
+    /// The seeded virtuals land with their real signature, arity included — this is what an
+    /// override stub renders and what the override-compat check compares against.
+    #[test]
+    fn dump_omitted_seed_carries_the_real_virtual_signature() {
+        let db = trimmed_db();
+        let Some((_, NativeMember::Method(m))) = db.lookup_member("Object", "_set") else {
+            panic!("seeded `_set` must resolve on Object post-seed");
+        };
+        assert!(m.arity_known, "a signed seed reports a real arity");
+        assert_eq!(m.params.len(), 2);
+        assert_eq!(db.name_of(m.params[0].name), "property");
+        assert_eq!(db.display_type(&m.params[0].ty, None), "StringName");
+        assert_eq!(db.display_type(&m.return_type, None), "bool");
+
+        let Some((_, NativeMember::Method(pl))) = db.lookup_member("Object", "_get_property_list")
+        else {
+            panic!("seeded `_get_property_list` must resolve on Object post-seed");
+        };
+        assert_eq!(db.display_type(&pl.return_type, None), "Array[Dictionary]");
+
+        // An UNSIGNED seeded row stays name-only: its empty parameter list is not an arity claim.
+        let Some((_, NativeMember::Method(edit))) = db.lookup_member("Node2D", "_edit_get_rect")
+        else {
+            panic!("seeded `_edit_get_rect` must resolve on Node2D post-seed");
+        };
+        assert!(
+            !edit.arity_known,
+            "an internal MethodBind stays name-only (no invented arity)"
         );
     }
 }
