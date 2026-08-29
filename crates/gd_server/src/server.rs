@@ -1053,7 +1053,14 @@ fn serve_inner(
     // surface the user cannot see. One notification per session, at startup, never repeated.
     notify_dialect(&state);
 
-    if state.workspace.native.provenance() == gd_types::ApiProvenance::Generic {
+    // #329: a dump that named a different Godot release than the project declared was rejected
+    // (or demoted) during load. That is a different story from "no dump was found", and the user
+    // has to hear the real one — the fix is on their side, in project.godot or in which binary
+    // dumped the API. Takes precedence over the generic-surface notice below, which would
+    // otherwise tell them nothing was found when something was.
+    if let Some(notice) = state.workspace.native_release_notice.clone() {
+        show_message(&state, lsp_types::MessageType::WARNING, &notice);
+    } else if state.workspace.native.provenance() == gd_types::ApiProvenance::Generic {
         // #302: name the release actually ingested. Since v3.0.0 the stock asset is picked per
         // project from `application/config/features`, so a hardcoded version told a 4.7 user the
         // 4.6 surface was loaded while the log line right above said otherwise.

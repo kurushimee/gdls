@@ -86,6 +86,10 @@ pub struct Workspace {
     /// How [`Self::dialect`] was arrived at, so the server can tell the user when gdls guessed or
     /// clamped rather than read a declared version.
     pub dialect_origin: DialectOrigin,
+    /// Set when a native dump was rejected for naming a different Godot release than the project
+    /// declared (#329) — the message to show the user, already phrased for the wire. `None` in
+    /// the ordinary case where the dump and the project agree.
+    pub native_release_notice: Option<String>,
     /// `class_name` registry + per-file interface tables + dependency graph.
     pub index: Index,
     /// Effective per-warning level, resolved from `project.godot` + the client's strict profile +
@@ -201,7 +205,8 @@ impl Workspace {
              project.godot declared: {:?})",
             project.declared_engine_version,
         );
-        let native = load_native(options, &project, root, dialect);
+        let (native, native_release_notice) =
+            load_native(options, &project, root, dialect, dialect_origin);
 
         // Build the cache key for warm-start attempt.
         let key = build_cache_key(&native, root, dialect);
@@ -255,6 +260,7 @@ impl Workspace {
             project,
             dialect,
             dialect_origin,
+            native_release_notice,
             index,
             policy,
             parse_cache: LruCache::new(cap),
@@ -1033,7 +1039,14 @@ impl Workspace {
         // Mid-session reloads never spawn Godot (no resolution path does since v1.0.2); a
         // `.gdextension` change marks the auto-dump meta stale and the next startup's background
         // dump refreshes it.
-        let native = load_native(options, &self.project, &root, self.dialect);
+        let (native, notice) = load_native(
+            options,
+            &self.project,
+            &root,
+            self.dialect,
+            self.dialect_origin,
+        );
+        self.native_release_notice = notice;
         // No content-hash dedupe here: a doc-XML merge changes the DB without changing the dump
         // text the hash covers, and this path IS the doc-XML/gdextension reaction.
         self.adopt_native(native, false);
@@ -1052,7 +1065,14 @@ impl Workspace {
     /// only on `true`. Never spawns Godot — see [`Self::reload_project_and_native`].
     pub fn reload_native(&mut self, options: &InitializationOptions) -> bool {
         let root = self.project.root.clone();
-        let native = load_native(options, &self.project, &root, self.dialect);
+        let (native, notice) = load_native(
+            options,
+            &self.project,
+            &root,
+            self.dialect,
+            self.dialect_origin,
+        );
+        self.native_release_notice = notice;
         self.adopt_native(native, true)
     }
 
@@ -1885,7 +1905,8 @@ fn load_native(
     project: &ProjectModel,
     root: &Utf8Path,
     dialect: Dialect,
-) -> NativeDb {
+    dialect_origin: DialectOrigin,
+) -> (NativeDb, Option<String>) {
     let mut db = match options.extension_api_path.as_deref() {
         Some(path) => match NativeDb::load(path) {
             Ok(db) => {
@@ -1923,6 +1944,11 @@ fn load_native(
         None => crate::api_dump::resolve_native_db(options, project, root, dialect),
     };
 
+    // #329: every source above arrives stamped `Exact` without anyone comparing the dump's own
+    // header against the release the project declared. A dump from an OLDER release cannot carry
+    // that claim, so this is where a stale one is replaced or demoted.
+    let release_notice = reconcile_release(&mut db, options, dialect, dialect_origin);
+
     let mut merged = 0usize;
     for ext in &project.gdextensions {
         let before = merged;
@@ -1955,23 +1981,107 @@ fn load_native(
     if merged > 0 {
         log::info!("merged {merged} GDExtension class(es) from doc XML");
     }
-    if let Some(notice) = version_mismatch_notice(&db, dialect) {
-        log::warn!("native API: {notice}");
+    (db, release_notice)
+}
+
+/// Act on a native surface whose release is not the one the project is read as (#329).
+///
+/// Every source but the embedded fallback can disagree with the dialect: a pinned
+/// `extensionApiPath` left over from an upgrade, a cached auto-dump from the binary that used to
+/// be on `PATH`, a checked-in `extension_api.json`. All of them arrive stamped
+/// [`ApiProvenance::Exact`], which is the claim that this dump IS the engine surface — and that
+/// claim is what unlocks every negative gdls emits (`Identifier "X" not declared`,
+/// `Cannot find member`, `Function "f()" not found in base`).
+///
+/// A dump from an **older** release cannot carry that claim. Each API the newer release added is
+/// simply missing from it, and the miss reads as a user error: Pixelorama shipped a checked-in
+/// 4.6.3 dump under `config/features=("4.7")`, and gdls fabricated four errors out of 4.7-only
+/// APIs. Since v3.0.0 there is a better answer sitting right there — the embedded stock surface
+/// is the complete official API *for the project's own declared release* — so that is what
+/// replaces it. The GDExtension `doc_classes` merge runs afterwards either way, so extension
+/// classes are not lost with the dump. Where the embedded asset is unavailable
+/// (`embeddedApiFallback` off, or a corrupt asset), the stale dump is kept but demoted to
+/// `Generic`, which at least stops it from disproving names it never knew.
+///
+/// A **newer** dump is left alone: it is a superset, so absence from it still proves absence from
+/// the older engine and every negative stays sound. Only the positives can over-offer, and
+/// provenance does not gate those.
+fn reconcile_release(
+    db: &mut NativeDb,
+    options: &InitializationOptions,
+    dialect: Dialect,
+    dialect_origin: DialectOrigin,
+) -> Option<String> {
+    if !dialect_origin.is_evidenced() {
+        // Nothing pinned the release: `project.godot` declared none, or there is no project file
+        // at all, and gdls fell back to `Dialect::NEWEST`. The dump's own header is then better
+        // evidence of the engine than that default, so it wins — replacing a real 4.6 dump on the
+        // strength of a guess would be the more damaging mistake.
+        return None;
     }
-    db
+    let notice = version_mismatch_notice(db, dialect)?;
+    log::warn!("native API: {notice}");
+
+    let (major, minor) = dialect.version();
+    let (dump_major, dump_minor) = {
+        let h = db.header();
+        (h.version_major, h.version_minor)
+    };
+    if (dump_major, dump_minor) > (major, minor) {
+        // Superset: absence from it still proves absence from the older engine, so every negative
+        // stays sound and the log line above is the whole response.
+        return None;
+    }
+    let dump_release = format!("{dump_major}.{dump_minor}");
+
+    match options
+        .embedded_api_fallback
+        .then(|| crate::api_dump::embedded_stock_db(dialect))
+        .flatten()
+    {
+        Some(stock) => {
+            log::warn!(
+                "native API: replacing it with the embedded stock Godot {dialect} surface, which \
+                 is complete for that release; GDExtension classes still merge from their doc XML"
+            );
+            *db = stock;
+            Some(format!(
+                "gdls ignored the Godot {dump_release} extension_api.json it found: this project \
+                 declares Godot {dialect}, and every API added since {dump_release} is missing \
+                 from that dump, so code that is fine would be reported as errors. The built-in \
+                 stock {dialect} surface is being used instead, which means classes from your own \
+                 Godot build are not available. Re-dump with a {dialect} binary (set \
+                 `godotBinaryPath`, or the GDLS_GODOT environment variable), or fix \
+                 `application/config/features` in project.godot."
+            ))
+        }
+        None => {
+            log::warn!(
+                "native API: no embedded stock Godot {dialect} surface to replace it with — \
+                 keeping the older dump, but gdls will not report unknown identifiers or members \
+                 against it"
+            );
+            db.set_provenance(gd_types::ApiProvenance::Generic);
+            Some(format!(
+                "the extension_api.json gdls found is for Godot {dump_release} but this project \
+                 declares Godot {dialect}. gdls will not report unknown identifiers or members \
+                 against it, since every API added since {dump_release} is missing from it. \
+                 Re-dump with a {dialect} binary (set `godotBinaryPath`, or the GDLS_GODOT \
+                 environment variable), or fix `application/config/features` in project.godot."
+            ))
+        }
+    }
 }
 
 /// Say so when the native surface gdls ended up with is not the release the project is read as.
 ///
-/// Every source but the embedded fallback can disagree with the dialect: a pinned
-/// `extensionApiPath` left over from an upgrade, a cached auto-dump from the binary that used to
-/// be on `PATH`, a checked-in `extension_api.json`. Signatures, enum values, and the class list all
-/// shift between feature releases, so a mismatch shows up as diagnostics the user cannot explain
-/// from their own code. It stays a log line rather than a diagnostic: the dump is still the best
-/// answer available, and refusing it would leave every engine type dynamic.
+/// Signatures, enum values, and the class list all shift between feature releases, so a mismatch
+/// shows up as diagnostics the user cannot explain from their own code.
 ///
 /// `None` when they agree, and when the dump carries no version at all — an empty DB or a
-/// hand-written test fixture has nothing to disagree with.
+/// hand-written test fixture has nothing to disagree with. Real Godot dumps always carry a
+/// header; treating a headerless one as a mismatch would silence the very negatives the
+/// hand-written fixtures exist to pin.
 fn version_mismatch_notice(db: &NativeDb, dialect: Dialect) -> Option<String> {
     let header = db.header();
     let (major, minor) = dialect.version();
@@ -2019,6 +2129,144 @@ mod version_mismatch_tests {
     #[test]
     fn a_versionless_dump_says_nothing() {
         assert!(version_mismatch_notice(&NativeDb::empty(), Dialect::Godot4_7).is_none());
+    }
+
+    // --- #329: acting on the mismatch, not just logging it ---
+
+    fn opts(embedded_fallback: bool) -> InitializationOptions {
+        InitializationOptions::parse(Some(&serde_json::json!({
+            "autoDumpExtensionApi": false,
+            "embeddedApiFallback": embedded_fallback,
+        })))
+    }
+
+    /// The reproduction from the issue: a 4.6 dump under a project that declares 4.7. The dump is
+    /// dropped for the embedded stock 4.7 surface, which is complete for that release, and the
+    /// user is told what happened and how to fix it.
+    #[test]
+    fn an_older_dump_is_replaced_by_the_declared_releases_stock_surface() {
+        let mut db = db_at(4, 6);
+        let notice = reconcile_release(
+            &mut db,
+            &opts(true),
+            Dialect::Godot4_7,
+            DialectOrigin::Declared,
+        )
+        .expect("the user must hear about a rejected dump");
+
+        assert_eq!(
+            (db.header().version_major, db.header().version_minor),
+            (4, 7),
+            "the surface in use must be the declared release's"
+        );
+        assert!(
+            db.class_count() > 100,
+            "the embedded stock surface should be a real class list, got {}",
+            db.class_count()
+        );
+        assert!(notice.contains("4.6") && notice.contains("4.7"), "{notice}");
+        assert!(
+            notice.contains("godotBinaryPath") && notice.contains("config/features"),
+            "the notice must name both fixes: {notice}"
+        );
+    }
+
+    /// With no stock surface to swap in, the dump is kept — it is still the only positives gdls
+    /// has — but demoted, so it can no longer disprove a name it never knew.
+    #[test]
+    fn an_older_dump_without_a_fallback_is_kept_but_demoted() {
+        let mut db = db_at(4, 6);
+        let notice = reconcile_release(
+            &mut db,
+            &opts(false),
+            Dialect::Godot4_7,
+            DialectOrigin::Declared,
+        )
+        .expect("a demoted surface is still worth telling the user about");
+
+        assert_eq!(
+            (db.header().version_major, db.header().version_minor),
+            (4, 6),
+            "the dump itself must be kept"
+        );
+        assert_eq!(db.provenance(), gd_types::ApiProvenance::Generic);
+        assert!(notice.contains("4.6") && notice.contains("4.7"), "{notice}");
+    }
+
+    /// A NEWER dump is a superset: absence from it still proves absence from the older engine, so
+    /// the negatives stay sound and nothing is replaced, demoted, or shown to the user.
+    #[test]
+    fn a_newer_dump_is_left_alone() {
+        let mut db = db_at(4, 7);
+        let notice = reconcile_release(
+            &mut db,
+            &opts(true),
+            Dialect::Godot4_6,
+            DialectOrigin::Declared,
+        );
+
+        assert!(notice.is_none(), "{notice:?}");
+        assert_eq!(
+            (db.header().version_major, db.header().version_minor),
+            (4, 7)
+        );
+        assert_eq!(db.provenance(), gd_types::ApiProvenance::Exact);
+    }
+
+    /// When nothing declared a release, `Dialect::NEWEST` is a guess, and the dump's own header is
+    /// the better witness — so the guess must not be allowed to throw the dump away.
+    #[test]
+    fn an_unevidenced_dialect_never_overrides_the_dump() {
+        for origin in [DialectOrigin::DefaultedNewest, DialectOrigin::NoProject] {
+            let mut db = db_at(4, 6);
+            let notice = reconcile_release(&mut db, &opts(true), Dialect::Godot4_7, origin);
+            assert!(notice.is_none(), "at {origin:?}: {notice:?}");
+            assert_eq!(
+                (db.header().version_major, db.header().version_minor),
+                (4, 6),
+                "at {origin:?}"
+            );
+            assert_eq!(
+                db.provenance(),
+                gd_types::ApiProvenance::Exact,
+                "at {origin:?}"
+            );
+        }
+    }
+
+    /// A matching dump is untouched on every evidenced origin — the ordinary case must cost
+    /// nothing.
+    #[test]
+    fn a_matching_dump_is_untouched() {
+        for origin in [
+            DialectOrigin::Override,
+            DialectOrigin::Declared,
+            DialectOrigin::ClampedNewer,
+            DialectOrigin::ClampedOlder,
+        ] {
+            let mut db = db_at(4, 7);
+            let notice = reconcile_release(&mut db, &opts(true), Dialect::Godot4_7, origin);
+            assert!(notice.is_none(), "at {origin:?}: {notice:?}");
+            assert_eq!(
+                db.provenance(),
+                gd_types::ApiProvenance::Exact,
+                "at {origin:?}"
+            );
+        }
+    }
+
+    /// A hand-written fixture with no header has nothing to disagree with — treating it as a
+    /// mismatch would silence the very negatives those fixtures exist to pin.
+    #[test]
+    fn a_versionless_dump_is_never_reconciled() {
+        let mut db = NativeDb::empty();
+        assert!(reconcile_release(
+            &mut db,
+            &opts(true),
+            Dialect::Godot4_7,
+            DialectOrigin::Declared
+        )
+        .is_none());
     }
 }
 
