@@ -24,7 +24,14 @@ jq 'walk(if type=="object" then del(.description, .brief_description) else . end
   api/extension_api.json > crates/gd_types/tests/fixtures/trimmed_api.json
 ```
 
-A few methods are hand-added on top: the ClassDB-resolvable names the dump omits (`Object.free`, `Node.free`), which `NativeDb` also seeds at ingest. Re-apply them after a regeneration, or the `free`-related tests fail.
+`Line2D` and the `PackedVector2Array` builtin are kept for the 4.7
+`CONFUSABLE_TEMPORARY_MODIFICATION` fixture, which needs a native property whose type is a packed
+array plus that array's method list (to tell the mutating `clear()` from the `const` `size()`).
+
+A few methods are hand-added on top, and must be re-applied after a regeneration:
+
+- `Object.free` and `Node.free`, ClassDB-resolvable names the dump omits, which `NativeDb` also seeds at ingest. Without them the `free`-related tests fail.
+- `Object._get_property_list`, returning `typedarray::Dictionary`. The dump omits `Object`'s script virtuals entirely, and `seed_dump_omitted_methods` deliberately synthesizes every seeded method as `Variant`-returning, since only the name takes part in the existence lookup. The real signature is what 4.7's `_get_property_list` return-type exception turns on, so this fixture carries it and `crates/gd_analyze/tests/inherited_return_type.rs` pins the behavior. A stock dump therefore leaves that exception inert in a real session; the code is still correct, and goes live the moment a DB carries the real return type.
 
 ## Generating the full dump (`api/extension_api.json`, git-ignored)
 
