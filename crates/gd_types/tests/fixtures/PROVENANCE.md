@@ -8,6 +8,8 @@ Hand-authored, not generated. A minimal but format-faithful `extension_api.json`
 
 Extracted from a real in-project dump (see the workflow below) with `jq`. The trim is by class name only. It keeps the canonical `Object` to `RefCounted` and `Node` to `CanvasItem` to `Node2D` chains, plus the handful of other classes and builtins the corpus reaches for, and every class it keeps it keeps whole: every method, member, constant, enum, constructor, and operator. The `utility_functions` table is the complete one. Doc prose (`description`, `brief_description`) is stripped to keep it small; the signatures are real. This is the CI oracle proving that real Godot output parses.
 
+The same rule binds the global enums: keep an enum or drop it, but never truncate its values. `Variant.Type` once carried four of its 40, so `TYPE_OBJECT` and friends read as undeclared identifiers in the corpus while `TYPE_INT` resolved (#313).
+
 **Why complete-within-each matters (#256).** `NativeDb::from_json` stamps `ApiProvenance::Exact`, and every negative claim the analyzer makes is gated on exactly that: `Function "x()" not found in base self.`, `Cannot find member "x" in base "Vector2".`, `UNSAFE_METHOD_ACCESS`. So a fixture claiming `Exact` while carrying nine of the engine's 114 utilities makes every `typeof(…)` in the conformance corpus read as a typo. Trim classes out, and never trim a kept class's members.
 
 Regenerate from the workspace root, with the full dump at `api/extension_api.json`:
@@ -15,7 +17,7 @@ Regenerate from the workspace root, with the full dump at `api/extension_api.jso
 ```bash
 jq 'walk(if type=="object" then del(.description, .brief_description) else . end)
   | { header,
-      global_enums:      [.global_enums[]      | select(.name=="Variant.Operator" or .name=="Error" or .name=="Side")],
+      global_enums:      [.global_enums[]      | select(.name | IN("Variant.Operator","Variant.Type","ClockDirection","Error","Side"))],
       global_constants:  .global_constants,
       utility_functions: .utility_functions,
       builtin_classes:   [.builtin_classes[]   | select(.name | IN("Vector2","Vector2i","Vector3","Array","Dictionary","Color","Callable"))],

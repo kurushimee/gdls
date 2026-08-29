@@ -1489,3 +1489,116 @@ fn qualified_type_annotations_actually_resolve_not_just_degrade() {
         );
     }
 }
+
+// --- #314: the cross-file lexical scope, not just the inheritance chain -------------------------
+// Godot's `get_class_node_current_scope_classes` (analyzer.cpp:320-344) walks each class's base
+// AND its outer class, transitively. gdls walked only the base chain past the file boundary, so a
+// constant declared on a cross-file base's *enclosing* class read as undeclared. Shape lifted from
+// upstream's own `analyzer/features/lookup_class.gd`.
+
+const OUTER_SCOPE_GD: &str = "\
+class A:
+	const TARGET := \"wrong\"
+
+	class B:
+		const TARGET := \"wrong\"
+		const WAITING := \"godot\"
+
+		class D extends C:
+			pass
+
+class C:
+	const TARGET := \"right\"
+
+class E extends A.B.D:
+	pass
+";
+
+#[test]
+fn cross_file_base_enclosing_class_constant_resolves() {
+    let project = Project::new(&[
+        ("res://outer_scope.gd", OUTER_SCOPE_GD),
+        ("res://user.gd", ""),
+    ]);
+    // `WAITING` lives on `A.B`, which is nowhere in `E`'s inheritance (`E` → `A.B.D` → `C`) —
+    // only in `A.B.D`'s outer chain.
+    let src = "\
+const External := preload(\"res://outer_scope.gd\")
+
+class Mine extends External.E:
+	func a() -> void:
+		print(TARGET)
+		print(WAITING)
+";
+    let errs = error_messages(&analyze_file(&project, "res://user.gd", src));
+    assert!(
+        errs.is_empty(),
+        "a constant on a cross-file base's enclosing class must resolve; got {errs:?}"
+    );
+}
+
+#[test]
+fn cross_file_base_enclosing_class_does_not_leak_into_qualified_access() {
+    let project = Project::new(&[
+        ("res://outer_scope.gd", OUTER_SCOPE_GD),
+        ("res://user.gd", ""),
+    ]);
+    // The scope walk is for BARE identifiers only. `External.E` exposes what `E` inherits, and
+    // `WAITING` is not one of those — Godot's `reduce_identifier_from_base` never consults the
+    // outer chain. Widening the qualified lookup too would invent a member.
+    let src = "\
+const External := preload(\"res://outer_scope.gd\")
+
+func a() -> void:
+	print(External.E.WAITING)
+";
+    let errs = error_messages(&analyze_file(&project, "res://user.gd", src));
+    assert!(
+        errs.iter()
+            .any(|m| m.contains("WAITING") && m.contains("Cannot find member")),
+        "a qualified `Base.member` access must NOT reach the base's enclosing class; got {errs:?}"
+    );
+}
+
+/// Same shape as [`OUTER_SCOPE_GD`], with the three `TARGET` declarations given different types
+/// so a diagnostic can tell which one won.
+const SHADOW_SCOPE_GD: &str = "\
+class A:
+	const TARGET := 1.5
+
+	class B:
+		const TARGET := \"str\"
+
+		class D extends C:
+			pass
+
+class C:
+	const TARGET := 7
+
+class E extends A.B.D:
+	pass
+";
+
+#[test]
+fn cross_file_scope_walk_prefers_the_base_over_the_outer() {
+    let project = Project::new(&[
+        ("res://shadow_scope.gd", SHADOW_SCOPE_GD),
+        ("res://user.gd", ""),
+    ]);
+    // `TARGET` is declared three times: `float` on `A`, `String` on `A.B`, `int` on `C`.
+    // `D extends C`, so the base wins over both outers — analyzer.cpp:332-343 recurses into the
+    // base BEFORE the outer, and the walk dedups, so whichever it reaches first is the answer.
+    let src = "\
+const External := preload(\"res://shadow_scope.gd\")
+
+class Mine extends External.E:
+	func a() -> void:
+		var x: int = TARGET
+		print(x)
+";
+    let errs = error_messages(&analyze_file(&project, "res://user.gd", src));
+    assert!(
+        errs.is_empty(),
+        "base-declared TARGET (int) must shadow both outer-declared ones; got {errs:?}"
+    );
+}

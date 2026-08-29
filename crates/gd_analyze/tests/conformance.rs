@@ -23,7 +23,7 @@
 //! regression net (primary) plus an aggregate `analyze_fidelity_floor.txt` (secondary).
 //! `GDLS_BLESS_CONFORMANCE=1` prints the regenerated state to stdout for a human to commit.
 
-use gd_syntax::Dialect;
+use gd_syntax::{Dialect, ParseOptions};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -428,11 +428,52 @@ fn corpus_index(suite: &Suite) -> &'static Index {
                 let root = Utf8Path::from_path(&root_buf)
                     .expect("corpus root utf-8")
                     .to_path_buf();
-                Index::build(&root)
+                let mut index = Index::build(&root);
+                add_support_sources(&mut index, s.dialect);
+                index
             })
             .collect()
     });
     &built[suite.slot]
+}
+
+/// Index `corpus/support/`, the sources Godot's own runner resolves from *outside* the vendored
+/// subtree. `corpus/analyzer/` is a byte-for-byte mirror checked with a bare `diff -rq`, so a
+/// helper the fixtures reference but upstream keeps a level higher cannot live inside it. The
+/// fidelity pass only walks the suite directories, so nothing here is ever run as a case; the
+/// index just needs the `class_name` and the signatures. #312.
+fn add_support_sources(index: &mut Index, dialect: Dialect) {
+    let dir = conformance_dir().join("corpus/support");
+    let entries = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read corpus/support entries");
+    let mut paths: Vec<PathBuf> = entries
+        .into_iter()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "gd"))
+        .collect();
+    // Deterministic order: `read_dir` is filesystem-ordered, and two files declaring the same
+    // `class_name` would otherwise register whichever landed last.
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "corpus/support has no .gd files — {} is what makes `Utils` resolvable",
+        dir.display()
+    );
+    for path in paths {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let utf8 = Utf8PathBuf::from_path_buf(path.clone())
+            .unwrap_or_else(|_| panic!("support path not utf-8: {}", path.display()));
+        let options = ParseOptions {
+            dialect,
+            ..Default::default()
+        };
+        index.set_interface_from_tree(&utf8, &gd_syntax::parse_with_options(&text, &options).tree);
+    }
+    // Recompute dependency edges now the registry carries the support class names too.
+    index.finish_cold_index();
 }
 
 /// One corpus tree plus the dialect its goldens were generated at.
