@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use camino::{Utf8Path, Utf8PathBuf};
 use gd_project::cache::FileStat;
 use gd_project::ProjectModel;
+use gd_syntax::Dialect;
 use gd_types::NativeDb;
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +87,7 @@ pub(crate) fn resolve_native_db(
     options: &InitializationOptions,
     project: &ProjectModel,
     root: &Utf8Path,
+    dialect: Dialect,
 ) -> NativeDb {
     let managed = dump_path(root);
     let binary = discover_binary(options);
@@ -143,7 +145,7 @@ pub(crate) fn resolve_native_db(
     // "Could not find type" errors (a custom engine build legitimately has classes this stock
     // dump doesn't).
     if options.embedded_api_fallback {
-        if let Some(db) = embedded_stock_db() {
+        if let Some(db) = embedded_stock_db(dialect) {
             log::warn!(
                 "native API: no project-derived source (no extensionApiPath, no cached dump, \
                  auto-dump {}); using the embedded stock {} surface — project-specific native \
@@ -261,26 +263,41 @@ pub(crate) fn spawn_background_dump(
     }
 }
 
+/// The stock asset for one release. One `include_bytes!` arm per [`Dialect`] variant, so adding a
+/// release is a compile error here until its asset is vendored — not a silent fallback onto the
+/// wrong engine surface.
+fn embedded_stock_bytes(dialect: Dialect) -> &'static [u8] {
+    match dialect {
+        Dialect::Godot4_6 => include_bytes!("../assets/extension_api_4.6.3_stock.min.json.gz"),
+        Dialect::Godot4_7 => include_bytes!("../assets/extension_api_4.7.2_stock.min.json.gz"),
+    }
+}
+
 /// The bundled stock-Godot class surface, gunzipped + ingested on demand.
 ///
 /// It carries the DOCUMENTATION fields (#259): this is the first-run path for a user who installs
 /// gdls with no Godot on `PATH`, and a docs-free asset gave them correct signatures with no prose
 /// anywhere in the engine surface — silently, with nothing saying why.
 ///
-/// Regenerate with `scripts/regen-stock-api.py`, from a STOCK binary of the pinned reference
-/// version (`godot --headless --dump-extension-api-with-docs`, run outside any project so no
-/// GDExtension gets baked in). That script keeps exactly the fields `gd_types::api` reads and
-/// drops the GDExtension ABI sections gdls never touches, which pays for much of the prose.
+/// There is one asset per supported feature release, picked by `dialect`: a 4.6 project asking a
+/// 4.7 surface about its engine classes gets wrong signatures, wrong enums, and classes that do
+/// not exist for it yet.
+///
+/// Regenerate with `scripts/regen-stock-api.py`, from a STOCK binary of the matching release
+/// (`godot --headless --dump-extension-api-with-docs`, run outside any project so no GDExtension
+/// gets baked in). That script keeps exactly the fields `gd_types::api` reads and drops the
+/// GDExtension ABI sections gdls never touches, which pays for much of the prose, and it names the
+/// output from the dump's own header so it cannot overwrite another release's asset.
 ///
 /// `None` only if the embedded bytes fail to decompress/parse — corrupt vendored asset, caught
 /// by `embedded_stock_db_loads` in CI — so callers degrade rather than unwrap.
-pub(crate) fn embedded_stock_db() -> Option<NativeDb> {
+pub(crate) fn embedded_stock_db(dialect: Dialect) -> Option<NativeDb> {
     use std::io::Read;
 
-    const EMBEDDED_GZ: &[u8] = include_bytes!("../assets/extension_api_4.6.3_stock.min.json.gz");
+    let embedded_gz: &[u8] = embedded_stock_bytes(dialect);
     let start = Instant::now();
     let mut text = String::new();
-    if let Err(e) = flate2::read::GzDecoder::new(EMBEDDED_GZ).read_to_string(&mut text) {
+    if let Err(e) = flate2::read::GzDecoder::new(embedded_gz).read_to_string(&mut text) {
         log::error!("native API: embedded stock dump failed to decompress: {e}");
         return None;
     }
@@ -288,7 +305,7 @@ pub(crate) fn embedded_stock_db() -> Option<NativeDb> {
         Ok(mut db) => {
             db.set_provenance(gd_types::ApiProvenance::Generic);
             log::info!(
-                "native API: embedded stock fallback ingested ({} classes, {} ms)",
+                "native API: embedded stock {dialect} fallback ingested ({} classes, {} ms)",
                 db.class_count(),
                 start.elapsed().as_millis()
             );
@@ -704,7 +721,19 @@ mod tests {
     /// first-run path, which is exactly the failure this pins.
     #[test]
     fn embedded_stock_db_loads() {
-        let db = embedded_stock_db().expect("embedded stock dump must ingest");
+        for dialect in [Dialect::Godot4_6, Dialect::Godot4_7] {
+            embedded_stock_db_loads_for(dialect);
+        }
+    }
+
+    fn embedded_stock_db_loads_for(dialect: Dialect) {
+        let db = embedded_stock_db(dialect).expect("embedded stock dump must ingest");
+        let (major, minor) = dialect.version();
+        assert_eq!(
+            (db.header().version_major, db.header().version_minor),
+            (major, minor),
+            "the {dialect} asset is not a {dialect} dump"
+        );
         assert_eq!(db.provenance(), gd_types::ApiProvenance::Generic);
         for class in ["Node", "Timer", "Marker3D", "CollisionObject3D", "Object"] {
             assert!(
@@ -749,15 +778,34 @@ mod tests {
         );
     }
 
+    /// The dialect actually picks the surface, and the two surfaces are not interchangeable: 4.7
+    /// added engine classes 4.6 has no idea about. Without this, a wrong-release asset would fail
+    /// only as mysterious diagnostics in a user's project.
+    #[test]
+    fn each_dialect_gets_its_own_engine_surface() {
+        let old = embedded_stock_db(Dialect::Godot4_6).expect("4.6 stock dump must ingest");
+        let new = embedded_stock_db(Dialect::Godot4_7).expect("4.7 stock dump must ingest");
+        for class in ["AccessibilityServer", "AreaLight3D", "AwaitTweener"] {
+            assert!(
+                new.class_named(class).is_some(),
+                "{class} must be in the 4.7 surface"
+            );
+            assert!(
+                old.class_named(class).is_none(),
+                "{class} does not exist at 4.6 — the 4.6 asset is the wrong dump"
+            );
+        }
+        // Everything 4.6 knows, 4.7 still knows: the surface only grew.
+        assert!(new.class_count() > old.class_count());
+    }
+
     /// The RAW, un-seeded embedded stock dump (parsed straight into [`gd_types::api::ExtensionApi`],
     /// NOT via `embedded_stock_db()` — `NativeDb::from_json` runs the seed *during* ingest, so the
     /// seeded names would already be present and the subset check below would be vacuous).
-    fn raw_stock_extension_api() -> gd_types::api::ExtensionApi {
+    fn raw_stock_extension_api(dialect: Dialect) -> gd_types::api::ExtensionApi {
         use std::io::Read;
-        const EMBEDDED_GZ: &[u8] =
-            include_bytes!("../assets/extension_api_4.6.3_stock.min.json.gz");
         let mut text = String::new();
-        flate2::read::GzDecoder::new(EMBEDDED_GZ)
+        flate2::read::GzDecoder::new(embedded_stock_bytes(dialect))
             .read_to_string(&mut text)
             .expect("embedded stock dump must decompress");
         serde_json::from_str(&text).expect("embedded stock dump must parse as ExtensionApi")
@@ -770,19 +818,25 @@ mod tests {
     /// fails CI. The complementary structural invariants live in `gd_types::native_db` tests.
     #[test]
     fn dump_omitted_methods_are_the_strict_omitted_set_of_the_stock_dump() {
+        // The table is one shared list across releases, so it has to hold against every vendored
+        // dump: a name ClassDB resolves but the dump omits is an editor-side omission, not a
+        // per-release API change.
+        for dialect in [Dialect::Godot4_6, Dialect::Godot4_7] {
+            dump_omitted_methods_hold_for(dialect);
+        }
+    }
+
+    fn dump_omitted_methods_hold_for(dialect: Dialect) {
         use std::collections::{HashMap, HashSet};
 
-        let api = raw_stock_extension_api();
+        let api = raw_stock_extension_api(dialect);
 
-        // The table must be regenerated FOR the version the vendored dump ships — a bump that does
-        // not regenerate the table is exactly the silent drift #172 guards against.
+        // The table must be regenerated FOR the versions the vendored dumps ship — a bump that
+        // does not regenerate the table is exactly the silent drift #172 guards against.
+        let (major, minor) = dialect.version();
         assert_eq!(
-            (
-                api.header.version_major,
-                api.header.version_minor,
-                api.header.version_patch
-            ),
-            (4, 6, 3),
+            (api.header.version_major, api.header.version_minor),
+            (major, minor),
             "embedded stock dump version != the version DUMP_OMITTED_NATIVE_METHODS was generated \
              for — regenerate the table with scripts/regen-dump-omitted-methods.sh"
         );
@@ -802,21 +856,24 @@ mod tests {
         for &(class, method, _) in gd_types::DUMP_OMITTED_NATIVE_METHODS {
             // (a) every table class is present in the stock dump (a seed for an absent class is dead).
             let own = raw_own.get(class).unwrap_or_else(|| {
-                panic!("DUMP_OMITTED_NATIVE_METHODS class {class:?} is absent from the stock dump")
+                panic!(
+                    "DUMP_OMITTED_NATIVE_METHODS class {class:?} is absent from the {dialect} \
+                     stock dump"
+                )
             });
             // (b) no table row is ALREADY an own-method of the dump — the table is strictly the
             //     OMITTED set; a row the dump now carries means the dump moved and the table is stale.
             assert!(
                 !own.contains(method),
-                "{class}::{method} is already an own-method of the stock dump — it is no longer \
-                 omitted; regenerate DUMP_OMITTED_NATIVE_METHODS"
+                "{class}::{method} is already an own-method of the {dialect} stock dump — it is \
+                 no longer omitted; regenerate DUMP_OMITTED_NATIVE_METHODS"
             );
         }
 
         // The seed END-TO-END: known omitted methods the RAW dump lacks resolve on the SEEDED DB.
         // `Object::free` (the lone non-`_` omission) and `CanvasItem::_edit_get_rect` (a per-class
         // editor method) both miss the raw dump but must resolve post-seed.
-        let seeded = embedded_stock_db().expect("embedded stock dump must ingest");
+        let seeded = embedded_stock_db(dialect).expect("embedded stock dump must ingest");
         for (class, method) in [("Object", "free"), ("CanvasItem", "_edit_get_rect")] {
             assert!(
                 !raw_own[class].contains(method),
@@ -940,7 +997,7 @@ mod tests {
             );
             // The next resolution serves the adopted dump as step (1) — and a fresh
             // spawn_background_dump declines (nothing stale).
-            let db = resolve_native_db(&options, &project, &root);
+            let db = resolve_native_db(&options, &project, &root, Dialect::NEWEST);
             assert_eq!(db.provenance(), gd_types::ApiProvenance::Exact);
             assert_eq!(db.class_count(), 2);
             assert!(spawn_background_dump(&options, &project, &root).is_none());

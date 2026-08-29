@@ -131,7 +131,7 @@ The static-function and non-Node-class `$`/`%` context errors (`reduce_get_node`
 
 ## 11b. Native-surface provenance gating (a deliberate deviation)
 
-Godot can never run without its own ClassDB. gdls can: when no project-derived `extension_api.json` resolves, it serves an embedded stock 4.6.3 surface (`Generic` provenance) or, with the fallback disabled, an empty DB (`Absent`). In those states a *negative* claim, "this type or member does not exist", has no basis, because a custom engine build's class is indistinguishable from a typo.
+Godot can never run without its own ClassDB. gdls can: when no project-derived `extension_api.json` resolves, it serves an embedded stock surface for the project's own release (`Generic` provenance) or, with the fallback disabled, an empty DB (`Absent`). In those states a *negative* claim, "this type or member does not exist", has no basis, because a custom engine build's class is indistinguishable from a typo.
 
 **The rule.** The analyzer's native-rooted negative diagnostics fire only under `Exact` provenance, meaning a project-context dump, a pinned `extensionApiPath`, or a project-root `extension_api.json`. Those diagnostics are `Could not find type "X" in the current scope.`, the super-call miss templates, `Cannot find member "X" in base "Y".` on native-rooted bases, and the `UNSAFE_PROPERTY_ACCESS` warning (promoted to an error under the strict profile) on native-rooted attribute misses. Under `Generic` or `Absent` the unknown degrades to a silent Variant, the "unknown stays dynamic" rule from `00-overview.md` §4.
 

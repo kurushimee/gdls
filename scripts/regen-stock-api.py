@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Regenerate the embedded stock-Godot API asset from a `--dump-extension-api-with-docs` dump.
+"""Regenerate an embedded stock-Godot API asset from a `--dump-extension-api-with-docs` dump.
 
-The asset (`crates/gd_server/assets/extension_api_4.6.3_stock.min.json.gz`) is gdls's last-resort
-native surface: it is what a user gets on a fresh install with no Godot binary anywhere. It must
-carry the DOCUMENTATION fields, or hover and completion on every engine class show correct
-signatures and no prose at all (#259).
+The assets in `crates/gd_server/assets/` are gdls's last-resort native surface: what a user gets on
+a fresh install with no Godot binary anywhere. There is one per supported feature release, since a
+4.6 project asking a 4.7 surface about its engine classes gets wrong answers. They must carry the
+DOCUMENTATION fields, or hover and completion on every engine class show correct signatures and no
+prose at all (#259).
+
+The output filename comes from the dump's own header, so running this against a 4.7.2 binary writes
+`extension_api_4.7.2_stock.min.json.gz` and cannot silently overwrite another release's asset. When
+you add a release, add its arm to `EMBEDDED` in `crates/gd_server/src/api_dump.rs` too.
 
 The transform keeps exactly the fields `gd_types::api` deserializes and drops everything else —
 `builtin_class_sizes`, `builtin_class_member_offsets` and `native_structures` are GDExtension ABI
@@ -15,9 +20,8 @@ Usage:
     godot --headless --dump-extension-api-with-docs     # writes ./extension_api.json
     scripts/regen-stock-api.py extension_api.json
 
-Run it from a stock binary of the pinned reference version (4.6.3-stable), NOT from inside a
-project: the asset is the STOCK surface, and a project dump would bake in that project's
-GDExtensions.
+Run it from a stock binary of a supported release, NOT from inside a project: the asset is the
+STOCK surface, and a project dump would bake in that project's GDExtensions.
 """
 
 import gzip
@@ -25,7 +29,7 @@ import json
 import os
 import sys
 
-ASSET = "crates/gd_server/assets/extension_api_4.6.3_stock.min.json.gz"
+ASSET_DIR = "crates/gd_server/assets"
 
 ARG_KEYS = ("name", "type", "default_value")
 
@@ -140,11 +144,15 @@ def main():
         "classes": [klass(c) for c in src.get("classes", [])],
         "singletons": src.get("singletons", []),
     }
+    version = ".".join(
+        str(header[k]) for k in ("version_major", "version_minor", "version_patch")
+    )
+    asset = os.path.join(ASSET_DIR, f"extension_api_{version}_stock.min.json.gz")
     text = json.dumps(out, separators=(",", ":"))
     blob = gzip.compress(text.encode("utf-8"), 9)
-    with open(ASSET, "wb") as f:
+    with open(asset, "wb") as f:
         f.write(blob)
-    print(f"{ASSET}: {len(blob) / 1024:.0f} KB gzipped, {len(text) / 1e6:.1f} MB raw")
+    print(f"{asset}: {len(blob) / 1024:.0f} KB gzipped, {len(text) / 1e6:.1f} MB raw")
     print(f"  {len(out['classes'])} classes, {len(out['builtin_classes'])} builtins, "
           f"{len(out['utility_functions'])} utilities, from {header['version_full_name']}")
 
