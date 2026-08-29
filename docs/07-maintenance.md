@@ -24,7 +24,7 @@ A native surface can also disagree with the dialect without being the embedded o
 
 ## 3. The ratchets
 
-Parse sits at 1.0000 with an empty known-failures list; analyze sits at 0.9898 with two entries, both gaps the 4.7 corpus exposed and both described in the file itself (`06-testing-fidelity.md` §3). CI enforces both on every change, which is what prevents silent fidelity regressions as the port evolves.
+Parse sits at 1.0000 with an empty known-failures list; analyze sits at 0.9949 with one entry, a gap the 4.7 corpus exposed and described in the file itself (`06-testing-fidelity.md` §3). CI enforces both on every change, which is what prevents silent fidelity regressions as the port evolves.
 
 Raising a floor is deliberate: update the floor file and say so in the commit message. Lowering one is not a normal operation — the one time it happened, the corpus itself had been replaced with a larger one, and the reason is written into the floor file's header.
 

@@ -927,11 +927,12 @@
 # at 4.6 — the old tree simply never reached them — so neither is a dialect regression, and both
 # are tracked as their own follow-ups rather than being papered over.
 #
-# gdls has no global-name tables: `CoreConstants::is_global_enum` and
-# `GDScriptLanguage::has_any_global_constant` have no port, so `reduce_identifier` hedges every
-# PascalCase name it cannot place (reducer.rs step 10, `is_global_like`) instead of rejecting it.
-# Lifting that hedge without the tables behind it costs 13 other corpus files, so it stays.
-4.7/errors/invalid_identifier.gd
+# `invalid_identifier.gd` was listed here for the `is_global_like` hedge, which skipped the
+# `Identifier "X" not declared in the current scope.` negative for every uppercase-initial name.
+# Lifting it looked like it cost 13 other files; all 13 turned out to be harness gaps, not
+# analyzer ones — a truncated `Variant.Type` in `trimmed_api.json` (#313) and the unindexed
+# `utils.notest.gd` (#312). With those closed the hedge is gone (#300), replaced by the
+# `ApiProvenance::Exact` gate the sibling negatives already use, and this file passes.
 # The same hole from the call side, plus the enum-callee arm it feeds. Needs four coupled pieces:
 # `can_be_builtin` threaded into `reduce_identifier` (analyzer.cpp:4645-4652) for `Global enum "X"
 # cannot be used on its own.`; the ENUM-meta arm in `reduce_call` (analyzer.cpp:3725-3730) so a

@@ -1545,7 +1545,9 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // variables.
     if !ctx.reducing_callee {
         if let Some(sr) = current_class_script_base(ctx) {
-            if let Some((dt, fold, kind)) = lookup_script_chain_member(ctx, &sr, &name, false, id) {
+            // The SCOPE walk, not the chain walk: a bare identifier also sees what each base's
+            // enclosing class declares (analyzer.cpp:320-344). #314.
+            if let Some((dt, fold, kind)) = lookup_script_scope_member(ctx, &sr, &name, false, id) {
                 if let Some(fv) = fold {
                     ctx.folds.set(id, fv);
                 }
@@ -1654,8 +1656,27 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
+    // 8b. `@GlobalScope` integer constants the dump carries (`UINT8_MAX`, `INT64_MIN`, … — 11
+    //    of them at 4.7, none at 4.6, where the dump's `global_constants` array is empty). Read
+    //    from the DB rather than listed here, so a release that adds one needs no code change.
+    if let Some(val) = ctx.native.global_constant(&name) {
+        ctx.set_type(
+            id,
+            DataType {
+                type_source: TypeSource::AnnotatedExplicit,
+                kind: DtKind::Builtin,
+                builtin_type: VariantType::Int,
+                is_constant: true,
+                ..Default::default()
+            },
+        );
+        ctx.folds.set(id, FoldedValue::Int(val));
+        return;
+    }
+
     // 8. Global constants (PI, TAU, INF, NAN) — Godot's `GDScriptLanguage::get_global_map()`
-    //    exposes these as global constants. Hard-code the set that appears in the corpus.
+    //    exposes these as global constants. The dump does not carry them (its `global_constants`
+    //    array holds only the integer limits handled above), so the float set is listed here.
     if matches!(name.as_str(), "PI" | "TAU" | "INF" | "NAN") {
         ctx.set_type(
             id,
@@ -1792,24 +1813,38 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     }
 
     // 10. analyzer.cpp:4658-4660 — `Identifier "X" not declared in the current scope.` fires as
-    //    the last fallthrough after all lookup paths are exhausted. gdls hasn't ported global
-    //    enums, autoloads, or native properties fully, so we gate on: identifier has no type
-    //    set, not a call callee, not self/super, not a plausible native member (walked via the
-    //    class's native base chain), and not starting with an uppercase letter (likely a native
-    //    class or global enum not in the trimmed DB).
+    //    the last fallthrough after all lookup paths are exhausted: the identifier has no type
+    //    set, it is not a call callee, and it is not `self`/`super`.
+    //
+    //    #300: this used to also skip any name starting with an uppercase letter, on the theory
+    //    that it was "likely a native class or global enum not in the trimmed DB". That
+    //    suppressed the error for every misspelled PascalCase or SCREAMING_CASE identifier there
+    //    is — `Vector4i` typed `Vector4l`, `Nod`, `TYPE_OBJEKT` — which is most of the names a
+    //    Godot script reaches for. The two things it was really compensating for were both
+    //    outside this function: an incomplete conformance fixture (#313) and a corpus support
+    //    file the harness never indexed (#312). With those fixed, the guard comes out.
+    //
+    //    What replaces it is a provenance gate, but a looser one than the sibling negatives use.
+    //    `Cannot find member "x" in base "Y".` requires `Exact` because it asks the dump about
+    //    ONE class, and a stock surface that is missing a GDExtension's class answers wrongly.
+    //    This negative fires only after every project-side lookup has missed too — locals,
+    //    params, class members, the `class_name` registry, builtins, global enums, utilities,
+    //    autoloads — so the dump is one contributor among many, and since v3.0.0 the stock
+    //    surface is the complete official API for the project's own declared release. `Absent`
+    //    is the state where nothing is knowable: every native lookup misses, so an ungated
+    //    step 10 would report `position` on a `Node2D` as undeclared. That is the one provenance
+    //    this must stay silent under.
     if !ctx.reducing_callee && name != "self" && name != "super" {
         let dt = ctx.get_type(id);
-        if !dt.is_set() {
+        if !dt.is_set() && ctx.native.provenance() != gd_types::ApiProvenance::Absent {
             let is_native_member = is_plausible_native_member(ctx, &name);
-            let is_global_like = name.starts_with(|c: char| c.is_ascii_uppercase());
             // A registered autoload whose typing couldn't be resolved this pass (unresolvable uid,
             // un-indexed scene/script) is STILL declared in Godot's eyes (every autoload is at least
-            // `Node`), so it must not be flagged undeclared. `is_global_like` already covers a
-            // PascalCase name like `Global`; this closes the lowercase-named hole (e.g. a scene
-            // autoload `game="*res://ghost.tscn"` whose scene is missing) — without it, `game.foo()`
-            // would false-positive here. Corpus-safe: `is_autoload` is `false` for every corpus query.
+            // `Node`), so it must not be flagged undeclared — e.g. a scene autoload
+            // `game="*res://ghost.tscn"` whose scene is missing. Without it, `game.foo()` would
+            // false-positive here. Corpus-safe: `is_autoload` is `false` for every corpus query.
             let is_autoload = ctx.xfile.is_autoload(&name);
-            if !is_native_member && !is_global_like && !is_autoload {
+            if !is_native_member && !is_autoload {
                 ctx.push_error(
                     format!(r#"Identifier "{name}" not declared in the current scope."#),
                     id,
@@ -5670,6 +5705,9 @@ fn script_chain_has_member(
         .is_some_and(|root| ctx.native.lookup_member(root, name).is_some())
 }
 
+/// Look `name` up through `start`'s cross-file **inheritance chain** — what a qualified
+/// `Base.member` access walks, and what an implicit-self access walks for everything but a bare
+/// identifier. See [`lookup_script_scope_member`] for the wider set.
 pub(crate) fn lookup_script_chain_member(
     ctx: &mut AnalysisContext,
     start: &crate::data_type::ScriptRef,
@@ -5678,8 +5716,33 @@ pub(crate) fn lookup_script_chain_member(
     bind_site: NodeId,
 ) -> Option<(DataType, Option<FoldedValue>, BindingSymbolKind)> {
     let chain = crate::script_chain::resolve_script_chain(ctx, start);
+    lookup_in_links(ctx, &chain.links, name, base_is_meta, bind_site)
+}
+
+/// Look `name` up through `start`'s full cross-file **lexical scope** — every base *and* every
+/// base's enclosing class ([`crate::script_chain::scope_refs`]). Only a bare identifier resolves
+/// this widely; Godot splits the two walks the same way, and using this for a qualified
+/// `Base.member` access would invent members the base does not expose. #314.
+pub(crate) fn lookup_script_scope_member(
+    ctx: &mut AnalysisContext,
+    start: &crate::data_type::ScriptRef,
+    name: &str,
+    base_is_meta: bool,
+    bind_site: NodeId,
+) -> Option<(DataType, Option<FoldedValue>, BindingSymbolKind)> {
+    let scope = crate::script_chain::scope_refs(ctx, start);
+    lookup_in_links(ctx, &scope, name, base_is_meta, bind_site)
+}
+
+fn lookup_in_links(
+    ctx: &mut AnalysisContext,
+    links: &[crate::data_type::ScriptRef],
+    name: &str,
+    base_is_meta: bool,
+    bind_site: NodeId,
+) -> Option<(DataType, Option<FoldedValue>, BindingSymbolKind)> {
     let xf = ctx.xfile;
-    for link in chain.links.iter() {
+    for link in links.iter() {
         let Some(iface) = crate::script_chain::link_interface(xf, link) else {
             continue;
         };

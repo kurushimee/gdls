@@ -218,9 +218,9 @@ fn lowercase_scriptless_autoload_no_not_declared_false_positive() {
 
 /// The pure `is_autoload` suppression gate (step 10): a registered autoload whose typing could NOT
 /// be resolved this pass (unresolvable uid / missing scene — no FileId, no native type) is STILL
-/// "declared" in Godot's eyes. A *lowercase*-named one (`unresolved_auto`) must NOT be flagged
-/// `Identifier "…" not declared` — the `is_global_like` uppercase gate doesn't save it, only
-/// `is_autoload` does. This is the path the resolved (script / native-floor) tests never reach.
+/// "declared" in Godot's eyes, so it must NOT be flagged `Identifier "…" not declared` — nothing
+/// but `is_autoload` saves it. This is the path the resolved (script / native-floor) tests never
+/// reach.
 #[test]
 fn unresolvable_autoload_no_not_declared_false_positive() {
     let fid = FileId::new(42);

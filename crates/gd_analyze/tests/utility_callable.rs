@@ -256,15 +256,19 @@ fn variant_utility_resolves_under_absent_db() {
     assert!(reduced, "utility Callable must fold under an Absent DB");
 }
 
-/// The fix is scoped to known utilities: a genuinely-undeclared lowercase identifier still errors
-/// even with no DB — step-10 is not blanket-suppressed under Absent provenance.
+/// The negative at `undeclared_identifier_still_errors` above fires against a project-derived
+/// dump — and only there. Under `Absent` provenance every native lookup
+/// misses, so the analyzer cannot tell a typo from a real native member and must say nothing —
+/// the #256 rule that already governs `Cannot find member "x" in base "Y".`. `position` is the
+/// case that proves it: it is a real `Node2D` property, and an empty DB knows nothing about it,
+/// so an ungated step 10 would report a valid script as undeclared. #300.
 #[test]
-fn undeclared_identifier_still_errors_under_absent_db() {
-    let src = "extends Node\n\n\nfunc test() -> void:\n\tblah.call_deferred(1)\n";
-    assert_eq!(
-        errors_absent(src),
-        vec![r#"Identifier "blah" not declared in the current scope."#.to_owned()]
-    );
+fn undeclared_identifier_stays_silent_under_absent_db() {
+    let typo = "extends Node\n\n\nfunc test() -> void:\n\tblah.call_deferred(1)\n";
+    assert_eq!(errors_absent(typo), Vec::<String>::new());
+
+    let real = "extends Node2D\n\n\nfunc test() -> void:\n\tprint(position)\n";
+    assert_eq!(errors_absent(real), Vec::<String>::new());
 }
 
 // --- Same-utility dictionary keys ----------------------------------------------------------------
@@ -321,5 +325,63 @@ fn utility_callable_operator_error_names_callable() {
     assert_eq!(
         errors(src),
         vec!["Invalid operands to operator +, Callable and int.".to_owned()]
+    );
+}
+
+// --- #300: `@GlobalScope` integer constants come from the dump ------------------------------------
+// 4.7 added `UINT8_MAX` / `INT64_MIN` and nine siblings to the dump's `global_constants` array
+// (4.6's is empty). `reduce_identifier` step 8 used to hard-code only the float set
+// (`PI`/`TAU`/`INF`/`NAN`), so every one of these read as undeclared once the uppercase hedge came
+// out. The `trimmed_api.json` fixture is a 4.6 dump and carries none of them, so the DB is built
+// inline here.
+
+/// A minimal `Exact` DB carrying one global constant and nothing else.
+fn db_with_global_constant() -> gd_types::NativeDb {
+    gd_types::NativeDb::from_json(
+        r#"{
+            "header": {"version_major":4,"version_minor":7,"version_patch":2,
+                       "version_status":"stable","version_build":"official",
+                       "version_full_name":"Godot Engine v4.7.2.stable.official",
+                       "precision":"single"},
+            "global_constants": [{"name":"INT32_MAX","value":2147483647,"is_bitfield":false}],
+            "global_enums": [], "utility_functions": [],
+            "builtin_classes": [], "classes": [], "singletons": []
+        }"#,
+    )
+    .expect("inline dump parses")
+}
+
+fn errors_with(db: &gd_types::NativeDb, src: &str) -> Vec<String> {
+    let tree = gd_syntax::parse(src).tree;
+    let result = analyze(&tree, None, "t.gd", db, &NoCrossFile, &policy());
+    result
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == Severity::Error)
+        .map(|d| d.message().to_owned())
+        .collect()
+}
+
+#[test]
+fn dump_global_constant_resolves_and_folds_as_int() {
+    let db = db_with_global_constant();
+    // No `print` — the inline DB carries no utilities either.
+    let src = "func test() -> void:\n\tvar x: int = INT32_MAX\n\tx += 1\n";
+    assert_eq!(
+        errors_with(&db, src),
+        Vec::<String>::new(),
+        "a global constant the dump carries must resolve, and as `int` (an `int` annotation is \
+         what proves the type, not just that it resolved)"
+    );
+}
+
+#[test]
+fn misspelled_global_constant_is_reported() {
+    let db = db_with_global_constant();
+    let src = "func test() -> void:\n\tvar x = INT32_MAXX\n\tx = 1\n";
+    assert_eq!(
+        errors_with(&db, src),
+        vec![r#"Identifier "INT32_MAXX" not declared in the current scope."#.to_owned()],
+        "the lookup must be a real membership test, not a prefix or shape heuristic"
     );
 }

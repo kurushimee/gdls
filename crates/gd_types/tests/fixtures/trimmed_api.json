@@ -20,6 +20,102 @@
 				{
 					"name": "OP_NOT_EQUAL",
 					"value": 1
+				},
+				{
+					"name": "OP_LESS",
+					"value": 2
+				},
+				{
+					"name": "OP_LESS_EQUAL",
+					"value": 3
+				},
+				{
+					"name": "OP_GREATER",
+					"value": 4
+				},
+				{
+					"name": "OP_GREATER_EQUAL",
+					"value": 5
+				},
+				{
+					"name": "OP_ADD",
+					"value": 6
+				},
+				{
+					"name": "OP_SUBTRACT",
+					"value": 7
+				},
+				{
+					"name": "OP_MULTIPLY",
+					"value": 8
+				},
+				{
+					"name": "OP_DIVIDE",
+					"value": 9
+				},
+				{
+					"name": "OP_NEGATE",
+					"value": 10
+				},
+				{
+					"name": "OP_POSITIVE",
+					"value": 11
+				},
+				{
+					"name": "OP_MODULE",
+					"value": 12
+				},
+				{
+					"name": "OP_POWER",
+					"value": 13
+				},
+				{
+					"name": "OP_SHIFT_LEFT",
+					"value": 14
+				},
+				{
+					"name": "OP_SHIFT_RIGHT",
+					"value": 15
+				},
+				{
+					"name": "OP_BIT_AND",
+					"value": 16
+				},
+				{
+					"name": "OP_BIT_OR",
+					"value": 17
+				},
+				{
+					"name": "OP_BIT_XOR",
+					"value": 18
+				},
+				{
+					"name": "OP_BIT_NEGATE",
+					"value": 19
+				},
+				{
+					"name": "OP_AND",
+					"value": 20
+				},
+				{
+					"name": "OP_OR",
+					"value": 21
+				},
+				{
+					"name": "OP_XOR",
+					"value": 22
+				},
+				{
+					"name": "OP_NOT",
+					"value": 23
+				},
+				{
+					"name": "OP_IN",
+					"value": 24
+				},
+				{
+					"name": "OP_MAX",
+					"value": 25
 				}
 			]
 		},
@@ -263,6 +359,7 @@
 		},
 		{
 			"name": "Variant.Type",
+			"is_bitfield": false,
 			"values": [
 				{
 					"name": "TYPE_NIL",
@@ -279,6 +376,150 @@
 				{
 					"name": "TYPE_FLOAT",
 					"value": 3
+				},
+				{
+					"name": "TYPE_STRING",
+					"value": 4
+				},
+				{
+					"name": "TYPE_VECTOR2",
+					"value": 5
+				},
+				{
+					"name": "TYPE_VECTOR2I",
+					"value": 6
+				},
+				{
+					"name": "TYPE_RECT2",
+					"value": 7
+				},
+				{
+					"name": "TYPE_RECT2I",
+					"value": 8
+				},
+				{
+					"name": "TYPE_VECTOR3",
+					"value": 9
+				},
+				{
+					"name": "TYPE_VECTOR3I",
+					"value": 10
+				},
+				{
+					"name": "TYPE_TRANSFORM2D",
+					"value": 11
+				},
+				{
+					"name": "TYPE_VECTOR4",
+					"value": 12
+				},
+				{
+					"name": "TYPE_VECTOR4I",
+					"value": 13
+				},
+				{
+					"name": "TYPE_PLANE",
+					"value": 14
+				},
+				{
+					"name": "TYPE_QUATERNION",
+					"value": 15
+				},
+				{
+					"name": "TYPE_AABB",
+					"value": 16
+				},
+				{
+					"name": "TYPE_BASIS",
+					"value": 17
+				},
+				{
+					"name": "TYPE_TRANSFORM3D",
+					"value": 18
+				},
+				{
+					"name": "TYPE_PROJECTION",
+					"value": 19
+				},
+				{
+					"name": "TYPE_COLOR",
+					"value": 20
+				},
+				{
+					"name": "TYPE_STRING_NAME",
+					"value": 21
+				},
+				{
+					"name": "TYPE_NODE_PATH",
+					"value": 22
+				},
+				{
+					"name": "TYPE_RID",
+					"value": 23
+				},
+				{
+					"name": "TYPE_OBJECT",
+					"value": 24
+				},
+				{
+					"name": "TYPE_CALLABLE",
+					"value": 25
+				},
+				{
+					"name": "TYPE_SIGNAL",
+					"value": 26
+				},
+				{
+					"name": "TYPE_DICTIONARY",
+					"value": 27
+				},
+				{
+					"name": "TYPE_ARRAY",
+					"value": 28
+				},
+				{
+					"name": "TYPE_PACKED_BYTE_ARRAY",
+					"value": 29
+				},
+				{
+					"name": "TYPE_PACKED_INT32_ARRAY",
+					"value": 30
+				},
+				{
+					"name": "TYPE_PACKED_INT64_ARRAY",
+					"value": 31
+				},
+				{
+					"name": "TYPE_PACKED_FLOAT32_ARRAY",
+					"value": 32
+				},
+				{
+					"name": "TYPE_PACKED_FLOAT64_ARRAY",
+					"value": 33
+				},
+				{
+					"name": "TYPE_PACKED_STRING_ARRAY",
+					"value": 34
+				},
+				{
+					"name": "TYPE_PACKED_VECTOR2_ARRAY",
+					"value": 35
+				},
+				{
+					"name": "TYPE_PACKED_VECTOR3_ARRAY",
+					"value": 36
+				},
+				{
+					"name": "TYPE_PACKED_COLOR_ARRAY",
+					"value": 37
+				},
+				{
+					"name": "TYPE_PACKED_VECTOR4_ARRAY",
+					"value": 38
+				},
+				{
+					"name": "TYPE_MAX",
+					"value": 39
 				}
 			]
 		}

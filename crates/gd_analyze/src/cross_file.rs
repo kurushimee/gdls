@@ -184,10 +184,8 @@ pub trait CrossFileQuery {
     /// for any registered autoload whose typing couldn't be resolved (a `uid://` that doesn't
     /// dereference, a scene missing from the index, a script not yet indexed): Godot types EVERY
     /// registered autoload as at least `Node` (`gdscript_analyzer.cpp:4570-4577`), so flagging one as
-    /// undeclared is a false positive. The `is_global_like` (uppercase-name) gate already covers a
-    /// PascalCase autoload like `Global`; this closes the LOWERCASE-named-and-unresolvable hole that
-    /// gate misses. Distinct from [`Self::autoload_file`] / [`Self::autoload_native_type`], which only
-    /// return `Some` when the typing actually resolved.
+    /// undeclared is a false positive. Distinct from [`Self::autoload_file`] /
+    /// [`Self::autoload_native_type`], which only return `Some` when the typing actually resolved.
     ///
     /// **Default `false`** (no project autoload table). Overridden only by `gd_server`'s
     /// `WorkspaceXFileQuery`. The conformance corpus has no autoloads → always `false` → no

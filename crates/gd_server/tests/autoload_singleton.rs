@@ -884,9 +884,9 @@ fn uid_scene_autoload_resolves_to_root_script() {
 }
 
 /// A SCRIPTLESS scene autoload with a LOWERCASE name degrades to the bare-`Node` floor — and
-/// CRUCIALLY produces NO "Identifier not declared" false positive (the lowercase name is what the
-/// uppercase `is_global_like` gate would miss). Definition on the name degrades cleanly (no panic,
-/// no wrong jump) on the `file: None` native-floor binding.
+/// CRUCIALLY produces NO "Identifier not declared" false positive; only `is_autoload` stands
+/// between it and that error. Definition on the name degrades cleanly (no panic, no wrong jump)
+/// on the `file: None` native-floor binding.
 #[test]
 fn scriptless_lowercase_scene_autoload_no_false_positive() {
     let p = TempProject::new();
@@ -947,8 +947,9 @@ fn unresolvable_lowercase_scene_autoload_degrades_gracefully() {
 /// `is_singleton` gate (analyzer.cpp:4572): a `project.godot` autoload declared WITHOUT the leading
 /// `*` (`autoload/plainnode="res://x.gd"`) is registered but NOT a global singleton. Godot skips the
 /// whole autoload arm for it, so a bare `plainnode` reference is `Identifier "plainnode" not
-/// declared`. The lowercase name means the `is_global_like` gate can't suppress it — only the
-/// `is_autoload` gate could, and it MUST NOT (non-singletons are excluded from the membership set).
+/// declared`. Only the `is_autoload` gate could suppress it, and it MUST NOT (non-singletons are
+/// excluded from the membership set). This boot has no dump, so it runs on the stock `Generic`
+/// surface — which step 10 still reports under; only `Absent` silences it (#300).
 /// Regression guard: the autoload-typing layer must not shield a non-singleton from "not declared".
 #[test]
 fn non_singleton_lowercase_autoload_still_not_declared() {
