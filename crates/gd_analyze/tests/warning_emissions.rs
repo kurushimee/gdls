@@ -7,6 +7,7 @@ use gd_analyze::warn_policy::{StrictSettings, WarnPolicy};
 use gd_analyze::warnings::WarningCode;
 use gd_analyze::NoCrossFile;
 use gd_project::WarningConfig;
+use gd_syntax::Dialect;
 use gd_types::NativeDb;
 
 /// `from_json` stamps [`gd_types::ApiProvenance::Exact`], which since #256 is the claim that a
@@ -30,7 +31,11 @@ fn mini_native() -> NativeDb {
 }
 
 fn godot_policy() -> WarnPolicy {
-    WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default())
+    WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    )
 }
 
 /// Default policy plus `enable_warnings` for ignore-by-default codes under test.
@@ -39,7 +44,7 @@ fn policy_enabling(names: &[&str]) -> WarnPolicy {
         enable_warnings: names.iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     };
-    WarnPolicy::build(&WarningConfig::default(), &strict)
+    WarnPolicy::build(&WarningConfig::default(), &strict, Dialect::DEFAULT)
 }
 
 /// Analyze `src` and return each warning as `(code, 1-based line of the diagnostic span start)`.

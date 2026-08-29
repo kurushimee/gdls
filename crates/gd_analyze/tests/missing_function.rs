@@ -7,6 +7,7 @@
 //! already gates on it. Each expectation below was cross-checked against the real
 //! `Godot_v4.6.3-stable` binary (`--headless --check-only --quit --script`).
 
+use gd_syntax::Dialect;
 use std::path::Path;
 
 use gd_analyze::{analyze, NoCrossFile, Severity, StrictSettings, WarnPolicy};
@@ -25,6 +26,7 @@ fn policy() -> WarnPolicy {
     WarnPolicy::build(
         &gd_project::WarningConfig::default(),
         &StrictSettings::default(),
+        Dialect::DEFAULT,
     )
 }
 

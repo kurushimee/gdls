@@ -9,7 +9,7 @@ The core of gdls is a faithful Rust port of Godot 4.6.3-stable's GDScript fronte
 | `gdscript_tokenizer.cpp` | ~1,650 | Source to tokens, with exact positions |
 | `gdscript_parser.cpp` | ~6,500 | Tokens to AST (recursive descent, single-token lookahead) |
 | `gdscript_analyzer.cpp` | ~6,700 | Type checking and semantic analysis (the "reduce" and "resolve" passes) |
-| `gdscript_warning.{h,cpp}` | ~280 | The warning codes (45 active plus 3 deprecated-gated) and messages |
+| `gdscript_warning.{h,cpp}` | ~280 | The warning codes (45 active plus 3 deprecated-gated at 4.6; 46 plus 3 at 4.7) and messages |
 
 `gdscript_compiler.cpp`, `gdscript_byte_codegen.cpp`, and `gdscript_vm.cpp` are not ported. Bytecode and the VM are not needed for diagnostics.
 
@@ -60,7 +60,7 @@ Gradual typing is modeled faithfully: the analyzer tracks when a value is static
 
 A single sink mirroring Godot's `push_error` and `push_warning`.
 
-The 45 active warning codes, plus the 3 deprecated-gated ones behind `#ifndef DISABLE_DEPRECATED`, are a Rust enum mirroring `GDScriptWarning::Code`, with the same message templates and default levels: 33 `WARN`, 8 `IGNORE`, 4 `ERROR`. The whole `GDScriptWarning` class is `#ifdef DEBUG_ENABLED`. The 4 that are errors by default are `INFERENCE_ON_VARIANT`, `NATIVE_METHOD_OVERRIDE`, `GET_NODE_DEFAULT_WITHOUT_ONREADY`, and `ONREADY_WITH_EXPORT`.
+The active warning codes, plus the 3 deprecated-gated ones behind `#ifndef DISABLE_DEPRECATED`, are a Rust enum mirroring `GDScriptWarning::Code`, with the same message templates and default levels: 33 `WARN`, 8 `IGNORE`, 4 `ERROR` at 4.6. 4.7 inserts `CONFUSABLE_TEMPORARY_MODIFICATION` between `CONFUSABLE_CAPTURE_REASSIGNMENT` and `INFERENCE_ON_VARIANT` at level `WARN`, shifting every later ordinal. The enum carries the newest tag's order and `WARNING_SINCE` gates the rest, since `@warning_ignore`, `debug/gdscript/warnings/<name>`, the `.out` goldens, and the LSP diagnostic code are all keyed on the name, never the number. The whole `GDScriptWarning` class is `#ifdef DEBUG_ENABLED`. The 4 that are errors by default are `INFERENCE_ON_VARIANT`, `NATIVE_METHOD_OVERRIDE`, `GET_NODE_DEFAULT_WITHOUT_ONREADY`, and `ONREADY_WITH_EXPORT`.
 
 Each diagnostic carries severity, code, message, and a source range. Ranges are stored as byte offsets internally and converted to LSP positions at the boundary (`05-lsp-cc-integration.md`).
 

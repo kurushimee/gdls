@@ -16,6 +16,7 @@
 //! direct flag assertions are the only coverage — per the reproduce-first / direct-emission-test
 //! discipline.
 
+use gd_syntax::Dialect;
 use std::path::Path;
 
 use gd_analyze::{analyze, NoCrossFile, StrictSettings, WarnPolicy};
@@ -32,7 +33,11 @@ fn native_db() -> NativeDb {
 }
 
 fn policy() -> WarnPolicy {
-    WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default())
+    WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    )
 }
 
 /// Analyze `src` and report whether its (single) lambda was marked as using `self`.

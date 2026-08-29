@@ -12,6 +12,7 @@
 //! corrected behaviour; the single-file corpus fixture `overriding_native_method` has no
 //! script-ancestor companion, so this is the only coverage for the chain case.
 
+use gd_syntax::Dialect;
 use std::path::Path;
 
 use gd_analyze::{analyze, NoCrossFile, StrictSettings, WarnPolicy, WarningCode};
@@ -29,7 +30,11 @@ fn native_db() -> NativeDb {
 }
 
 fn policy() -> WarnPolicy {
-    WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default())
+    WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    )
 }
 
 /// Count how many `NATIVE_METHOD_OVERRIDE` diagnostics `src` produces. The code is error-by-default,

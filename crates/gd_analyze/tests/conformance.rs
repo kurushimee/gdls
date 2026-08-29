@@ -23,6 +23,7 @@
 //! regression net (primary) plus an aggregate `analyze_fidelity_floor.txt` (secondary).
 //! `GDLS_BLESS_CONFORMANCE=1` prints the regenerated state to stdout for a human to commit.
 
+use gd_syntax::Dialect;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -82,7 +83,7 @@ fn policy() -> WarnPolicy {
             .levels
             .insert(name.to_ascii_lowercase(), ProjLevel::Warn);
     }
-    WarnPolicy::build(&config, &StrictSettings::default())
+    WarnPolicy::build(&config, &StrictSettings::default(), Dialect::DEFAULT)
 }
 
 fn collect_gd_files(dir: &Path, out: &mut Vec<PathBuf>) {

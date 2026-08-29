@@ -5583,6 +5583,7 @@ mod tests {
     use crate::diagnostic::{Diagnostic, Severity};
     use crate::warn_policy::{StrictSettings, WarnPolicy};
     use gd_project::{FileId, WarningConfig};
+    use gd_syntax::Dialect;
     use gd_syntax::ParseTree;
     use gd_types::NativeDb;
 
@@ -5604,7 +5605,11 @@ mod tests {
     }
 
     fn policy() -> WarnPolicy {
-        WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default())
+        WarnPolicy::build(
+            &WarningConfig::default(),
+            &StrictSettings::default(),
+            Dialect::DEFAULT,
+        )
     }
 
     /// Analyze a single isolated file (no project classes) and return its diagnostics.

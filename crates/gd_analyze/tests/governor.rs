@@ -16,6 +16,7 @@ use gd_analyze::{
 };
 use gd_project::{FileId, WarningConfig};
 use gd_syntax::parse;
+use gd_syntax::Dialect;
 use gd_types::NativeDb;
 
 fn db() -> NativeDb {
@@ -23,7 +24,11 @@ fn db() -> NativeDb {
 }
 
 fn policy() -> WarnPolicy {
-    WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default())
+    WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    )
 }
 
 #[test]

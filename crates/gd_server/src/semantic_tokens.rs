@@ -1348,6 +1348,7 @@ pub(crate) fn semantic_tokens_no_id(data: Vec<SemanticToken>) -> SemanticTokens 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gd_syntax::Dialect;
     use lsp_types::SemanticTokensDelta;
 
     /// Build a NativeDb from the committed trimmed-API fixture (carries the Variant utility table:
@@ -1365,6 +1366,7 @@ mod tests {
         let policy = gd_analyze::WarnPolicy::build(
             &gd_project::WarningConfig::default(),
             &gd_analyze::StrictSettings::default(),
+            Dialect::DEFAULT,
         );
         let analysis = gd_analyze::analyze(
             &parsed.tree,

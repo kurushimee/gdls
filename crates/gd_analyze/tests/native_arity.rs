@@ -11,6 +11,7 @@
 //! same dump the conformance harness loads). The conformance ratchet is emission-blind for added
 //! errors in a clean corpus, so this direct net is the real coverage.
 
+use gd_syntax::Dialect;
 use std::path::Path;
 
 use gd_analyze::{analyze, NoCrossFile, Severity, StrictSettings, WarnPolicy};
@@ -26,7 +27,11 @@ fn native_db() -> NativeDb {
 }
 
 fn policy() -> WarnPolicy {
-    WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default())
+    WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    )
 }
 
 /// Analyze `src` and return every bare (non-warning) error as `(message, span_start_byte)`.

@@ -4,6 +4,7 @@
 //! strings, so what the analyzer sees here is byte-identical to production; only the lookup
 //! plumbing (`CrossFileQuery`) is mocked.
 
+use gd_syntax::Dialect;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -26,6 +27,7 @@ fn policy() -> WarnPolicy {
     WarnPolicy::build(
         &gd_project::WarningConfig::default(),
         &StrictSettings::default(),
+        Dialect::DEFAULT,
     )
 }
 
@@ -973,7 +975,11 @@ fn policy_enabling(names: &[&str]) -> WarnPolicy {
         enable_warnings: names.iter().map(|s| s.to_string()).collect(),
         ..Default::default()
     };
-    WarnPolicy::build(&gd_project::WarningConfig::default(), &strict)
+    WarnPolicy::build(
+        &gd_project::WarningConfig::default(),
+        &strict,
+        Dialect::DEFAULT,
+    )
 }
 
 fn analyze_file_with(

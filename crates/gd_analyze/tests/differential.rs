@@ -46,6 +46,7 @@
 //! deliberately stays silent on unresolved uppercase identifiers (the "unknown stays dynamic /
 //! never false-positive" policy, docs/00). A NEW sub-1.0 fixture is a real regression.
 
+use gd_syntax::Dialect;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
@@ -154,7 +155,11 @@ fn gdls_diag_codes(source: &str, script_path: &str) -> BTreeSet<String> {
         return BTreeSet::from(["error".to_owned()]);
     }
     let xfile = NoCrossFile;
-    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let policy = WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    );
     let result = gd_analyze::analyze(
         &parsed.tree,
         Some(FileId::new(1)),

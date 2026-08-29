@@ -10,8 +10,11 @@
 //! these at the call site (WP-G).
 
 use gd_project::{WarnLevel as ProjLevel, WarningConfig};
+use gd_syntax::Dialect;
 
-use crate::warnings::{code_from_name, WarnLevel, WarningCode, DEFAULT_LEVELS, WARNING_MAX};
+use crate::warnings::{
+    code_from_name, WarnLevel, WarningCode, DEFAULT_LEVELS, WARNING_MAX, WARNING_SINCE,
+};
 
 /// The diagnostics profile (`docs/04` §3). Mirrors `gd_server::config::StrictProfile`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -55,7 +58,7 @@ pub struct WarnPolicy {
 impl WarnPolicy {
     /// Resolve every warning's level by applying the precedence chain (excluding the per-scope
     /// `@warning_ignore`, which the analyzer layers on at emit time).
-    pub fn build(project: &WarningConfig, strict: &StrictSettings) -> Self {
+    pub fn build(project: &WarningConfig, strict: &StrictSettings, dialect: Dialect) -> Self {
         let mut levels = DEFAULT_LEVELS;
 
         // (1) project.godot. `enable = false` silences everything; otherwise apply per-name levels.
@@ -103,6 +106,16 @@ impl WarnPolicy {
             }
         }
 
+        // (4) a code Godot added after this project's version does not exist for it, so no
+        // configuration can switch it on. The emission sites are behind dialect guards too; this is
+        // the belt to that suspenders, and it keeps a stray
+        // `debug/gdscript/warnings/<newer_code>` line inert rather than surprising.
+        for (i, level) in levels.iter_mut().enumerate() {
+            if WARNING_SINCE[i] > dialect {
+                *level = WarnLevel::Ignore;
+            }
+        }
+
         WarnPolicy { levels }
     }
 
@@ -130,7 +143,11 @@ mod tests {
 
     #[test]
     fn defaults_pass_through_under_godot_profile() {
-        let p = WarnPolicy::build(&empty_project(), &StrictSettings::default());
+        let p = WarnPolicy::build(
+            &empty_project(),
+            &StrictSettings::default(),
+            Dialect::DEFAULT,
+        );
         assert_eq!(
             p.effective_level(WarningCode::UnusedVariable),
             WarnLevel::Warn
@@ -152,7 +169,7 @@ mod tests {
             profile: StrictProfile::Off,
             ..Default::default()
         };
-        let p = WarnPolicy::build(&empty_project(), &strict);
+        let p = WarnPolicy::build(&empty_project(), &strict, Dialect::DEFAULT);
         assert_eq!(
             p.effective_level(WarningCode::UnusedVariable),
             WarnLevel::Ignore
@@ -169,7 +186,7 @@ mod tests {
             profile: StrictProfile::Strict,
             ..Default::default()
         };
-        let p = WarnPolicy::build(&empty_project(), &strict);
+        let p = WarnPolicy::build(&empty_project(), &strict, Dialect::DEFAULT);
         for c in STRICT_PROMOTED {
             assert_eq!(
                 p.effective_level(c),
@@ -193,7 +210,7 @@ mod tests {
         project
             .levels
             .insert("integer_division".to_owned(), ProjLevel::Error);
-        let p = WarnPolicy::build(&project, &StrictSettings::default());
+        let p = WarnPolicy::build(&project, &StrictSettings::default(), Dialect::DEFAULT);
         assert_eq!(
             p.effective_level(WarningCode::UnusedVariable),
             WarnLevel::Ignore
@@ -213,7 +230,7 @@ mod tests {
             error_warnings: vec!["narrowing_conversion".to_owned()],
             ..Default::default()
         };
-        let p = WarnPolicy::build(&empty_project(), &strict);
+        let p = WarnPolicy::build(&empty_project(), &strict, Dialect::DEFAULT);
         assert_eq!(
             p.effective_level(WarningCode::UnsafeCast),
             WarnLevel::Ignore
@@ -230,7 +247,7 @@ mod tests {
         let pg = gd_project::parse_project_godot(
             "[debug]\ngdscript/warnings/unassigned_variable=0\ngdscript/warnings/untyped_declaration=2\n",
         );
-        let p = WarnPolicy::build(&pg.warnings, &StrictSettings::default());
+        let p = WarnPolicy::build(&pg.warnings, &StrictSettings::default(), Dialect::DEFAULT);
         assert_eq!(
             p.effective_level(WarningCode::UnassignedVariable),
             WarnLevel::Ignore
@@ -239,5 +256,62 @@ mod tests {
             p.effective_level(WarningCode::UntypedDeclaration),
             WarnLevel::Error
         );
+    }
+}
+
+#[cfg(test)]
+mod dialect_tests {
+    use super::*;
+    use crate::warnings::WarningCode;
+    use gd_syntax::Dialect;
+
+    fn project_enabling(name: &str) -> WarningConfig {
+        let mut c = WarningConfig::default();
+        c.levels.insert(name.to_owned(), ProjLevel::Error);
+        c
+    }
+
+    #[test]
+    fn a_code_from_a_newer_godot_cannot_be_switched_on() {
+        // A stray `debug/gdscript/warnings/confusable_temporary_modification` in a 4.6 project is
+        // inert: that setting does not exist for that engine, so neither does the warning.
+        let p = WarnPolicy::build(
+            &project_enabling("confusable_temporary_modification"),
+            &StrictSettings::default(),
+            Dialect::Godot4_6,
+        );
+        assert_eq!(
+            p.effective_level(WarningCode::ConfusableTemporaryModification),
+            WarnLevel::Ignore
+        );
+    }
+
+    #[test]
+    fn the_same_setting_applies_under_the_release_that_has_it() {
+        let p = WarnPolicy::build(
+            &project_enabling("confusable_temporary_modification"),
+            &StrictSettings::default(),
+            Dialect::Godot4_7,
+        );
+        assert_eq!(
+            p.effective_level(WarningCode::ConfusableTemporaryModification),
+            WarnLevel::Error
+        );
+    }
+
+    #[test]
+    fn shared_codes_are_unaffected_by_the_dialect() {
+        for dialect in [Dialect::Godot4_6, Dialect::Godot4_7] {
+            let p = WarnPolicy::build(
+                &project_enabling("unused_variable"),
+                &StrictSettings::default(),
+                dialect,
+            );
+            assert_eq!(
+                p.effective_level(WarningCode::UnusedVariable),
+                WarnLevel::Error,
+                "dialect {dialect}"
+            );
+        }
     }
 }

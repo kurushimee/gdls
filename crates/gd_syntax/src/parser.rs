@@ -27,6 +27,7 @@ use crate::dialect::Dialect;
 use crate::lexer::Lexer;
 use crate::span::ByteSpan;
 use crate::token::{Literal, Token, TokenKind};
+use crate::warning_names::warning_name_is_valid;
 use crate::{Diagnostic, DocumentSymbol, ParseOptions, SymbolKind};
 
 /// Maximum expression/statement nesting before the parser bails with an error instead of risking a
@@ -336,65 +337,6 @@ pub const REGISTERED_ANNOTATIONS: &[(&str, bool)] = &[
     ("@warning_ignore_restore", true),
     ("@rpc", true),
 ];
-
-/// `GDScriptWarning::get_code_from_name`'s accepted `PNAME`s, copied into `gd_syntax` because the
-/// Godot applies `@warning_ignore*` annotations in the parser while gdls keeps warning policy in the
-/// analyzer crate. This tiny validity table lets parser diagnostics match Godot without adding a
-/// reverse dependency from `gd_syntax` to `gd_analyze`.
-const WARNING_NAMES: [&str; 48] = [
-    "UNASSIGNED_VARIABLE",
-    "UNASSIGNED_VARIABLE_OP_ASSIGN",
-    "UNUSED_VARIABLE",
-    "UNUSED_LOCAL_CONSTANT",
-    "UNUSED_PRIVATE_CLASS_VARIABLE",
-    "UNUSED_PARAMETER",
-    "UNUSED_SIGNAL",
-    "SHADOWED_VARIABLE",
-    "SHADOWED_VARIABLE_BASE_CLASS",
-    "SHADOWED_GLOBAL_IDENTIFIER",
-    "UNREACHABLE_CODE",
-    "UNREACHABLE_PATTERN",
-    "STANDALONE_EXPRESSION",
-    "STANDALONE_TERNARY",
-    "INCOMPATIBLE_TERNARY",
-    "UNTYPED_DECLARATION",
-    "INFERRED_DECLARATION",
-    "UNSAFE_PROPERTY_ACCESS",
-    "UNSAFE_METHOD_ACCESS",
-    "UNSAFE_CAST",
-    "UNSAFE_CALL_ARGUMENT",
-    "UNSAFE_VOID_RETURN",
-    "RETURN_VALUE_DISCARDED",
-    "STATIC_CALLED_ON_INSTANCE",
-    "MISSING_TOOL",
-    "REDUNDANT_STATIC_UNLOAD",
-    "REDUNDANT_AWAIT",
-    "MISSING_AWAIT",
-    "ASSERT_ALWAYS_TRUE",
-    "ASSERT_ALWAYS_FALSE",
-    "INTEGER_DIVISION",
-    "NARROWING_CONVERSION",
-    "INT_AS_ENUM_WITHOUT_CAST",
-    "INT_AS_ENUM_WITHOUT_MATCH",
-    "ENUM_VARIABLE_WITHOUT_DEFAULT",
-    "EMPTY_FILE",
-    "DEPRECATED_KEYWORD",
-    "CONFUSABLE_IDENTIFIER",
-    "CONFUSABLE_LOCAL_DECLARATION",
-    "CONFUSABLE_LOCAL_USAGE",
-    "CONFUSABLE_CAPTURE_REASSIGNMENT",
-    "INFERENCE_ON_VARIANT",
-    "NATIVE_METHOD_OVERRIDE",
-    "GET_NODE_DEFAULT_WITHOUT_ONREADY",
-    "ONREADY_WITH_EXPORT",
-    "PROPERTY_USED_AS_FUNCTION",
-    "CONSTANT_USED_AS_FUNCTION",
-    "FUNCTION_USED_AS_PROPERTY",
-];
-
-fn warning_name_is_valid(upper_name: &str) -> bool {
-    WARNING_NAMES.contains(&upper_name)
-}
 
 /// The lowercase noun Godot uses for a class member of this kind (`Member::get_type_name`).
 fn member_type_name(member: &Member) -> &'static str {
@@ -3047,7 +2989,7 @@ impl Parser {
             let Some(raw) = self.literal_string_value(arg) else {
                 continue;
             };
-            if !warning_name_is_valid(&raw.to_uppercase()) {
+            if !warning_name_is_valid(&raw.to_uppercase(), self.dialect) {
                 self.push_error_at(annotation, format!(r#"Invalid warning name: "{raw}"."#));
             }
         }
@@ -3119,7 +3061,7 @@ impl Parser {
                 };
                 let code_name = raw.to_uppercase();
 
-                if !warning_name_is_valid(&code_name) {
+                if !warning_name_is_valid(&code_name, self.dialect) {
                     self.push_error_at(ann_id, format!(r#"Invalid warning name: "{raw}"."#));
                     continue;
                 }
