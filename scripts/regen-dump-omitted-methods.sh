@@ -14,6 +14,8 @@
 # dump's version (the .gd refuses on a mismatch). Output (the paste-ready table body) goes to STDOUT;
 # diagnostics go to STDERR. Paste the rows between the `&[` / `];` markers of
 # DUMP_OMITTED_NATIVE_METHODS, then run `cargo fmt --all` (rustfmt re-wraps the few >100-col rows).
+# The signature half follows on stdout after a `// --- DUMP_OMITTED_VIRTUAL_SIGNATURES ---` marker
+# line; those rows go between that table's own `&[` / `];` markers, same crate, same `cargo fmt`.
 set -euo pipefail
 
 GODOT="${1:-godot}"
@@ -51,5 +53,7 @@ if [[ ! -s "$OUT_TXT" ]]; then
 	exit 1
 fi
 
-# The paste-ready table body to stdout.
+# The paste-ready table bodies to stdout, name table first, signature table after its marker.
 cat "$OUT_TXT"
+echo "// --- DUMP_OMITTED_VIRTUAL_SIGNATURES ---"
+cat "$OUT_TXT.sig"

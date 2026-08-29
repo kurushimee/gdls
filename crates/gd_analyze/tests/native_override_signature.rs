@@ -141,3 +141,72 @@ fn a_script_ancestor_shadows_the_native_signature() {
         );
     }
 }
+
+/// The `Object`-core virtuals the dump omits (`_to_string`, `_notification`, `_set`, …) are seeded
+/// with their real `ClassDB` signature, so they are checked like any other native virtual. Before
+/// that they were name-only stubs, which made `native_parent_signature` bail on `!arity_known` and
+/// silently accept every mismatch Godot rejects (confirmed against `godot --check-only` 4.7.2).
+#[test]
+fn the_seeded_object_core_virtuals_are_checked_like_any_native_virtual() {
+    for d in TAGS {
+        assert_eq!(
+            errors("extends Node\n\nfunc _to_string() -> int:\n\treturn 1\n", d),
+            vec![
+                r#"The function signature doesn't match the parent. Parent signature is "_to_string() -> String"."#
+                    .to_owned()
+            ],
+            "at {d:?}"
+        );
+        assert_eq!(
+            errors("extends Node\n\nfunc _notification(what, extra):\n\tprint(what, extra)\n", d),
+            vec![
+                r#"The function signature doesn't match the parent. Parent signature is "_notification(int) -> void"."#
+                    .to_owned()
+            ],
+            "at {d:?}"
+        );
+        assert_eq!(
+            errors(
+                "extends Node\n\nfunc _set(property: StringName, value: Variant) -> bool:\n\tprint(property, value)\n\treturn false\n",
+                d
+            ),
+            Vec::<String>::new(),
+            "a matching `_set` override at {d:?}"
+        );
+    }
+}
+
+/// `_init` is the constructor, and Godot skips the whole override-compat block for it
+/// (analyzer.cpp:1830 takes the constructor branch, and the check lives in the trailing `else`).
+/// Seeding `Object::_init` with its real `() -> void` must not change that — every project that
+/// writes `func _init(a, b)` would light up otherwise.
+#[test]
+fn the_constructor_is_still_exempt_from_the_native_signature_check() {
+    for d in TAGS {
+        assert_eq!(
+            errors(
+                "extends Node\n\nfunc _init(a: int, b: int) -> void:\n\tprint(a + b)\n",
+                d
+            ),
+            Vec::<String>::new(),
+            "at {d:?}"
+        );
+    }
+}
+
+/// A seeded row that is NOT a real engine virtual stays name-only, so its empty parameter list is
+/// never read as an arity claim. `Node2D::_edit_get_rect` is an internal `MethodBind`; a same-named
+/// method with parameters must stay silent.
+#[test]
+fn an_unsigned_seeded_internal_method_is_still_not_arity_checked() {
+    for d in TAGS {
+        assert_eq!(
+            errors(
+                "extends Node2D\n\nfunc _edit_get_rect(a, b) -> Rect2:\n\tprint(a, b)\n\treturn Rect2()\n",
+                d
+            ),
+            Vec::<String>::new(),
+            "at {d:?}"
+        );
+    }
+}
