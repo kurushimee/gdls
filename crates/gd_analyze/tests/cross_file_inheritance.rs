@@ -1140,3 +1140,46 @@ func go() -> void:
     let result = analyze_file_with(&project, "res://c.gd", consumer, &policy);
     assert_eq!(warning_messages(&result).len(), 1, "exactly one warning");
 }
+
+const BASE_WITH_INNER_GD: &str = "\
+class_name Holder
+extends RefCounted
+class Inner:
+\tvar x: int = 0
+";
+
+/// #284: an inner class inherited from a cross-file base, named bare in a type annotation, must
+/// resolve to that INNER class — not to the base script. Resolving it to the base made the
+/// declared type read as the base while the initializer reduced to the inner class, so
+/// `var v: Inner = Inner.new()` failed its assignment check.
+#[test]
+fn inherited_inner_class_as_bare_annotation_types_as_the_inner_class() {
+    let child = "\
+extends Holder
+func go() -> void:
+\tvar v: Inner = Inner.new()
+\tprint(v.x)
+";
+    let project = Project::new(&[
+        ("res://holder.gd", BASE_WITH_INNER_GD),
+        ("res://child.gd", ""),
+    ]);
+    let result = analyze_file(&project, "res://child.gd", child);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+
+    let tree = parse(child).tree;
+    let mut found = false;
+    for id in tree.iter_ids() {
+        if let gd_syntax::ast::NodeKind::Variable(_) = &tree.get(id).kind {
+            let dt = result.types.get(id);
+            if dt.is_set() {
+                assert!(
+                    format!("{dt}").ends_with(".Inner"),
+                    "`v` must type as the inner class, got `{dt}`"
+                );
+                found = true;
+            }
+        }
+    }
+    assert!(found, "expected a typed `v` variable");
+}
