@@ -5616,7 +5616,7 @@ fn lookup_script_chain_member(
         // meta AND instance bases). Yields the enum's META type; `.VALUE` then lands in the
         // Enum-meta arm above.
         if let Some(enum_decl) = iface.enums.iter().find(|e| e.name == name) {
-            let base_path = link_basename(ctx, link);
+            let base_path = link_fqcn(ctx, link);
             let mut dt = crate::resolver::make_enum_type(name, &base_path, true);
             dt.script_type = Some(link.clone());
             dt.is_constant = true;
@@ -5677,7 +5677,7 @@ fn lookup_script_chain_member(
             MK::Const => {
                 if iface.unnamed_enum_values.iter().any(|v| v == name) {
                     // Anonymous-enum hoist — Godot's ENUM_VALUE arm (analyzer.cpp:4203-4209).
-                    let base_path = link_basename(ctx, link);
+                    let base_path = link_fqcn(ctx, link);
                     let mut dt =
                         crate::resolver::make_enum_type("<anonymous enum>", &base_path, false);
                     dt.script_type = Some(link.clone());
@@ -5777,9 +5777,28 @@ fn record_member_use(
 
 /// The basename of a chain link's file, for the `<file.gd>.<EnumName>` fqcn shape Godot's
 /// `make_class_enum_type` renders for cross-file enums (analyzer.cpp:147).
-fn link_basename(ctx: &AnalysisContext, link: &crate::data_type::ScriptRef) -> String {
+/// The fully qualified class name of a cross-file link, the way Godot's parser stamps
+/// `ClassNode::fqcn`: `class_name` wins over the script path for the head class
+/// (gdscript_parser.cpp:981), and each inner class hangs off its outer as `<outer>::<Inner>`
+/// (gdscript_parser.cpp:935-941). `make_class_enum_type` wires this into an enum's `native_type`
+/// so the same enum reads identically no matter which context resolves it (analyzer.cpp:151-158);
+/// deriving it from the file path alone gave the in-file and cross-file sides two spellings of
+/// one enum, and the identity check rejected the pair (#286).
+fn link_fqcn(ctx: &AnalysisContext, link: &crate::data_type::ScriptRef) -> String {
+    let mut fqcn = file_fqcn(ctx, link.file);
+    for seg in &link.inner {
+        fqcn = format!("{fqcn}::{seg}");
+    }
+    fqcn
+}
+
+/// [`link_fqcn`] for a file's head class.
+fn file_fqcn(ctx: &AnalysisContext, file: gd_project::FileId) -> String {
+    if let Some(name) = ctx.xfile.interface(file).and_then(|i| i.class_name.clone()) {
+        return name;
+    }
     ctx.xfile
-        .file_path(link.file)
+        .file_path(file)
         .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_owned())
         .unwrap_or_default()
 }
@@ -5795,11 +5814,7 @@ pub(crate) fn cross_file_named_enum(
     meta: bool,
 ) -> Option<DataType> {
     let enum_decl = ctx.xfile.lookup_file_enum(file, name)?;
-    let base_path = ctx
-        .xfile
-        .file_path(file)
-        .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_owned())
-        .unwrap_or_default();
+    let base_path = file_fqcn(ctx, file);
     let mut dt = crate::resolver::make_enum_type(name, &base_path, meta);
     dt.script_type = Some(crate::data_type::ScriptRef {
         file,
