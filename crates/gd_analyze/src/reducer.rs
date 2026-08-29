@@ -151,7 +151,15 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
             // enum metas, builtin methods, static methods, etc.). The dispatcher reduces the
             // callee's base here so reduce_call can read `base_type` directly; reduce_call
             // performs the rest of the lookup + the diagnostics.
-            if let Some(callee) = c.callee {
+            // analyzer.cpp:3269 / :3731 — a SUPER callee is never reduced as an identifier.
+            // `super.describe()` parses as `Call { is_super: true, callee: Identifier("describe") }`
+            // (gdscript_parser.cpp:3503-3509), and every site that would resolve that identifier is
+            // gated `!p_call->is_super`; the name is answered only by `get_function_signature`
+            // against the PARENT's type, which `reduce_call`'s super branch below does. Reducing it
+            // here resolved the name in the CURRENT scope, which for an override lands on the
+            // overriding method itself — typing the callee `Callable` and recording a `Binding::Use`
+            // pointing at the wrong class, the two halves of #333.
+            if let Some(callee) = c.callee.filter(|_| !c.is_super) {
                 match &ctx.node(callee).kind {
                     NodeKind::Subscript(s)
                         if matches!(
