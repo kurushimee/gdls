@@ -5670,7 +5670,7 @@ fn script_chain_has_member(
         .is_some_and(|root| ctx.native.lookup_member(root, name).is_some())
 }
 
-fn lookup_script_chain_member(
+pub(crate) fn lookup_script_chain_member(
     ctx: &mut AnalysisContext,
     start: &crate::data_type::ScriptRef,
     name: &str,
@@ -6334,9 +6334,7 @@ fn reduce_identifier_from_base(
             }
         }
         // Native tail (the analyzer.cpp:4280-4360 continuation): the chain's native root carries
-        // the inherited native members. A miss here stays a SILENT Variant — unlike the pure
-        // NATIVE branch below, an interface gap on a script base must never become a
-        // `Cannot find member` ("never lie").
+        // the inherited native members.
         if let Some(sr) = base.script_type.as_ref() {
             if let Some(root) = crate::script_chain::chain_native_root(ctx, sr) {
                 if try_native_member(
@@ -6350,6 +6348,41 @@ fn reduce_identifier_from_base(
                     false,
                     identifier_id,
                 ) {
+                    return;
+                }
+            }
+        }
+        // #299: a total miss on a META script base (`ClassName.X`) is a STATIC lookup in Godot —
+        // `reduce_identifier_from_base` leaves the type unset and the subscript caller emits
+        // `Cannot find member "X" in base "Y".` (analyzer.cpp:4095/4139). gdls used to degrade
+        // EVERY Script-branch miss to a silent Variant, on the grounds that "interfaces are
+        // shallow extracts and a gap in them must never become an error". That conflates two
+        // meanings of shallow: `Interface` is shallow in resolved TYPES, not in NAMES —
+        // `gd_project::interface::extract_class` handles every `Member` variant the parser
+        // produces, and the one it skips (`Member::Group`, an `@export_group`) declares no name.
+        // So the negative IS provable, under exactly the soundness bar #256 set for the
+        // instance-side UNSAFE_PROPERTY_ACCESS warning:
+        //   - `Exact` provenance, so the chain's native tail really is the user's engine surface
+        //     (the same gate as reducer.rs:4519 / :4654 / :5310 / :5386), and
+        //   - `chain_native_root(...).is_some()`, which per `script_chain`'s module doc means the
+        //     whole chain was walkable: `walk` bails to `native_root: None` the moment any link's
+        //     interface is missing, its `extends` head is unresolvable, or a cycle closes.
+        // Anything less and the miss is gdls's view rather than the user's code, so the historical
+        // silent-Variant degrade stands. Under `NoCrossFile` every interface is absent, so
+        // `native_root` is always `None` and the conformance corpus never reaches this arm.
+        //
+        // INSTANCE bases keep Godot's dynamic-lookup semantics — a miss there is not an error,
+        // only #256's warning — so this is gated on a meta-and-constant base, the exact
+        // complement of that block's `(!is_meta_type || !is_constant)`.
+        if base.is_meta_type
+            && base.is_constant
+            && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+        {
+            if let Some(sr) = base.script_type.as_ref() {
+                if crate::script_chain::chain_native_root(ctx, sr).is_some() {
+                    // Leave the type UNSET: `reduce_subscript`'s `!valid` arm renders the message
+                    // (and re-checks provenance for native-rooted bases), so there is exactly one
+                    // `Cannot find member` construction site.
                     return;
                 }
             }

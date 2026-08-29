@@ -825,43 +825,55 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         // Cross-file nested types under a global-class / autoload head: an enum leaf
         // (`-> BaseLayer.BlendModes`) or inner-class hops (`Keychain.InputAction`). Godot
         // resolves these through the depended parser's members (analyzer.cpp:908-939); gdls
-        // walks the interface. A miss degrades to a SILENT Variant — interfaces are shallow
-        // extracts and a gap in them must never become a `Could not find type` error (the same
-        // rule as the cross-file hop in `resolve_extends`).
+        // walks the interface chain.
+        //
+        // #299: the segment lookup now goes through `lookup_script_chain_member`, the same walk
+        // the expression path uses. That buys three things over the old hand-rolled probe: enums
+        // and inner classes INHERITED from a script base resolve (the old code only looked at the
+        // named link itself), an enum leaf under an inner class resolves (the old enum probe was
+        // gated on `sr.inner.is_empty()`), and the walk records a `Binding::Use` so `definition` /
+        // `references` can address a nested type named in type position.
         for (i, &id) in chain[1..].iter().enumerate() {
             let seg = ident_name(ctx, id).unwrap_or_default();
             let is_last = i + 1 == chain.len() - 1;
             let Some(sr) = result.script_type.clone() else {
                 return bad_type;
             };
-            // Named enum as the LEAF (enums cannot contain nested types) — head-class enums
-            // only; inner-class enum leaves degrade below.
-            if is_last && sr.inner.is_empty() {
-                if let Some(dt) = crate::reducer::cross_file_named_enum(ctx, sr.file, &seg, true) {
-                    result = dt;
-                    continue;
+            if let Some((dt, _fold, kind)) =
+                crate::reducer::lookup_script_chain_member(ctx, &sr, &seg, true, id)
+            {
+                // Only a TYPE may appear in a type-annotation chain. A value member that happens
+                // to share the name is `Member "X" under base "Y" is not a valid type.` upstream
+                // (analyzer.cpp:918); gdls does not emit that message yet, so a non-type match
+                // degrades silently rather than mis-reporting it as absent.
+                match kind {
+                    crate::binding::BindingTargetKind::Class => {
+                        result = dt;
+                        continue;
+                    }
+                    // Enums cannot contain nested types, so one may only appear as the leaf.
+                    crate::binding::BindingTargetKind::Enum if is_last => {
+                        result = dt;
+                        continue;
+                    }
+                    _ => return bad_type,
                 }
             }
-            // Inner-class hop.
-            let mut inner: Vec<&str> = sr.inner.iter().map(String::as_str).collect();
-            inner.push(&seg);
-            if ctx.xfile.resolve_inner_chain(sr.file, &inner).is_some() {
-                let inner_owned: Vec<String> = inner.into_iter().map(String::from).collect();
-                let next = ScriptRef {
-                    file: sr.file,
-                    inner: inner_owned,
-                };
-                result = DataType {
-                    kind: DtKind::Script,
-                    type_source: TypeSource::AnnotatedExplicit,
-                    is_meta_type: true,
-                    builtin_type: VariantType::Object,
-                    native_type: crate::script_chain::chain_native_root(ctx, &next)
-                        .unwrap_or_default(),
-                    script_type: Some(next),
-                    ..Default::default()
-                };
-                continue;
+            // analyzer.cpp:915 — `Could not find type "X" under base "Y".` Same soundness bar as
+            // the member miss in `reduce_identifier_from_base` (#299): the negative is only
+            // provable when gdls saw the base's whole surface, which means an `Exact` dump and a
+            // chain that was fully walkable (`chain_native_root` is `Some` — `None` means some
+            // link's interface was missing, its head unresolvable, or a cycle closed, and
+            // `script_chain`'s module doc requires consumers to stay permissive there). Under
+            // `NoCrossFile` no interface resolves, so the corpus never reaches this arm.
+            if ctx.native.provenance() == gd_types::ApiProvenance::Exact
+                && crate::script_chain::chain_native_root(ctx, &sr).is_some()
+            {
+                let base_name = crate::reducer::class_identifier_name_or_default(ctx, &result);
+                ctx.push_error(
+                    format!(r#"Could not find type "{seg}" under base "{base_name}"."#),
+                    id,
+                );
             }
             return bad_type;
         }
