@@ -231,7 +231,11 @@ impl Workspace {
             }
         };
 
-        let policy = WarnPolicy::build(&project.warnings, &strict_settings(&options.strict));
+        let policy = WarnPolicy::build(
+            &project.warnings,
+            &strict_settings(&options.strict),
+            dialect,
+        );
         let file_count = index.file_count();
         log::info!(
             "indexed {} script(s); {} class_name(s); {} native class(es)",
@@ -296,7 +300,11 @@ impl Workspace {
     /// diagnostics were filtered through the old policy; content hash + epoch can't see that,
     /// hence the generation bump). The caller republishes open buffers.
     pub fn apply_strict(&mut self, strict: &StrictConfig) {
-        self.policy = WarnPolicy::build(&self.project.warnings, &strict_settings(strict));
+        self.policy = WarnPolicy::build(
+            &self.project.warnings,
+            &strict_settings(strict),
+            self.dialect,
+        );
         self.analysis_cache.clear();
         self.analysis_generation += 1;
     }
@@ -1028,7 +1036,11 @@ impl Workspace {
         // No content-hash dedupe here: a doc-XML merge changes the DB without changing the dump
         // text the hash covers, and this path IS the doc-XML/gdextension reaction.
         self.adopt_native(native, false);
-        self.policy = WarnPolicy::build(&self.project.warnings, &strict_settings(&options.strict));
+        self.policy = WarnPolicy::build(
+            &self.project.warnings,
+            &strict_settings(&options.strict),
+            self.dialect,
+        );
         self.analysis_cache.clear();
         self.analysis_generation += 1;
         false

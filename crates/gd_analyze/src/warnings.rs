@@ -62,6 +62,8 @@ pub enum WarningCode {
     ConfusableLocalDeclaration,
     ConfusableLocalUsage,
     ConfusableCaptureReassignment,
+    /// 4.7 (`gdscript_warning.h:90`). Absent from 4.6 — see [`WARNING_SINCE`].
+    ConfusableTemporaryModification,
     InferenceOnVariant,
     NativeMethodOverride,
     GetNodeDefaultWithoutOnready,
@@ -73,8 +75,9 @@ pub enum WarningCode {
     FunctionUsedAsProperty,
 }
 
-/// Godot's `WARNING_MAX` (45 active + 3 deprecated).
-pub const WARNING_MAX: usize = 48;
+/// Godot's `WARNING_MAX` at the newest supported tag (46 active + 3 deprecated). 4.6 has 48; the
+/// extra code is gated by [`WARNING_SINCE`] rather than by a second table.
+pub const WARNING_MAX: usize = gd_syntax::WARNING_COUNT;
 
 /// Every code in discriminant order — lets [`code_from_name`] map an index back to a `WarningCode`
 /// without an `unsafe` transmute.
@@ -122,6 +125,7 @@ pub const ALL: [WarningCode; WARNING_MAX] = {
         ConfusableLocalDeclaration,
         ConfusableLocalUsage,
         ConfusableCaptureReassignment,
+        ConfusableTemporaryModification,
         InferenceOnVariant,
         NativeMethodOverride,
         GetNodeDefaultWithoutOnready,
@@ -133,56 +137,32 @@ pub const ALL: [WarningCode; WARNING_MAX] = {
 };
 
 /// `PNAME` strings from `get_name_from_code` (`gdscript_warning.cpp:198`), in code order.
-pub const WARN_NAMES: [&str; WARNING_MAX] = [
-    "UNASSIGNED_VARIABLE",
-    "UNASSIGNED_VARIABLE_OP_ASSIGN",
-    "UNUSED_VARIABLE",
-    "UNUSED_LOCAL_CONSTANT",
-    "UNUSED_PRIVATE_CLASS_VARIABLE",
-    "UNUSED_PARAMETER",
-    "UNUSED_SIGNAL",
-    "SHADOWED_VARIABLE",
-    "SHADOWED_VARIABLE_BASE_CLASS",
-    "SHADOWED_GLOBAL_IDENTIFIER",
-    "UNREACHABLE_CODE",
-    "UNREACHABLE_PATTERN",
-    "STANDALONE_EXPRESSION",
-    "STANDALONE_TERNARY",
-    "INCOMPATIBLE_TERNARY",
-    "UNTYPED_DECLARATION",
-    "INFERRED_DECLARATION",
-    "UNSAFE_PROPERTY_ACCESS",
-    "UNSAFE_METHOD_ACCESS",
-    "UNSAFE_CAST",
-    "UNSAFE_CALL_ARGUMENT",
-    "UNSAFE_VOID_RETURN",
-    "RETURN_VALUE_DISCARDED",
-    "STATIC_CALLED_ON_INSTANCE",
-    "MISSING_TOOL",
-    "REDUNDANT_STATIC_UNLOAD",
-    "REDUNDANT_AWAIT",
-    "MISSING_AWAIT",
-    "ASSERT_ALWAYS_TRUE",
-    "ASSERT_ALWAYS_FALSE",
-    "INTEGER_DIVISION",
-    "NARROWING_CONVERSION",
-    "INT_AS_ENUM_WITHOUT_CAST",
-    "INT_AS_ENUM_WITHOUT_MATCH",
-    "ENUM_VARIABLE_WITHOUT_DEFAULT",
-    "EMPTY_FILE",
-    "DEPRECATED_KEYWORD",
-    "CONFUSABLE_IDENTIFIER",
-    "CONFUSABLE_LOCAL_DECLARATION",
-    "CONFUSABLE_LOCAL_USAGE",
-    "CONFUSABLE_CAPTURE_REASSIGNMENT",
-    "INFERENCE_ON_VARIANT",
-    "NATIVE_METHOD_OVERRIDE",
-    "GET_NODE_DEFAULT_WITHOUT_ONREADY",
-    "ONREADY_WITH_EXPORT",
-    "PROPERTY_USED_AS_FUNCTION",
-    "CONSTANT_USED_AS_FUNCTION",
-    "FUNCTION_USED_AS_PROPERTY",
-];
+///
+/// Projected from `gd_syntax::WARNINGS` rather than copied: Godot's parser reads the same table for
+/// `@warning_ignore`, and gdls needs it in both crates. The asserts below pin this enum to it.
+pub const WARN_NAMES: [&str; WARNING_MAX] = {
+    let mut out = [""; WARNING_MAX];
+    let mut i = 0;
+    while i < WARNING_MAX {
+        out[i] = gd_syntax::WARNINGS[i].0;
+        i += 1;
+    }
+    out
+};
+
+/// The Godot release each code first appeared in, from the same table.
+///
+/// A code newer than the project's dialect can never fire: [`crate::warn_policy::WarnPolicy`]
+/// resolves it to `Ignore`, and its emission site is behind a dialect guard.
+pub const WARNING_SINCE: [gd_syntax::Dialect; WARNING_MAX] = {
+    let mut out = [gd_syntax::Dialect::Godot4_6; WARNING_MAX];
+    let mut i = 0;
+    while i < WARNING_MAX {
+        out[i] = gd_syntax::WARNINGS[i].1;
+        i += 1;
+    }
+    out
+};
 
 /// Default level per code, from `default_warning_levels[]` (`gdscript_warning.h:105`): 33 `Warn`,
 /// 8 `Ignore`, 4 `Error`. (Deprecated codes are `Warn` but never produced.)
@@ -230,6 +210,7 @@ pub const DEFAULT_LEVELS: [WarnLevel; WARNING_MAX] = {
         Warn,   // CONFUSABLE_LOCAL_DECLARATION
         Warn,   // CONFUSABLE_LOCAL_USAGE
         Warn,   // CONFUSABLE_CAPTURE_REASSIGNMENT
+        Warn,   // CONFUSABLE_TEMPORARY_MODIFICATION
         Error,  // INFERENCE_ON_VARIANT
         Error,  // NATIVE_METHOD_OVERRIDE
         Error,  // GET_NODE_DEFAULT_WITHOUT_ONREADY
@@ -242,9 +223,25 @@ pub const DEFAULT_LEVELS: [WarnLevel; WARNING_MAX] = {
 
 // Compile-time parity guards (mirror Godot's `static_assert`s).
 const _: () = assert!(WarningCode::FunctionUsedAsProperty as usize == WARNING_MAX - 1);
+const _: () = assert!(WARNING_SINCE.len() == WARNING_MAX);
 const _: () = assert!(WARN_NAMES.len() == WARNING_MAX);
 const _: () = assert!(DEFAULT_LEVELS.len() == WARNING_MAX);
 const _: () = assert!(ALL.len() == WARNING_MAX);
+
+impl WarningCode {
+    /// Whether this code exists in `dialect`. A code Godot added in a later release must never be
+    /// produced for a project pinned to an earlier one.
+    #[must_use]
+    pub fn exists_in(self, dialect: gd_syntax::Dialect) -> bool {
+        WARNING_SINCE[self as usize] <= dialect
+    }
+
+    /// The release this code first appeared in.
+    #[must_use]
+    pub fn since(self) -> gd_syntax::Dialect {
+        WARNING_SINCE[self as usize]
+    }
+}
 
 /// Godot's `get_name_from_code`.
 pub fn name_from_code(code: WarningCode) -> &'static str {
@@ -409,6 +406,21 @@ pub fn format_warning(code: WarningCode, symbols: &[String]) -> String {
             r#"Reassigning lambda capture does not modify the outer local variable "{0}"."#,
             g(0)
         ),
+        // Two shapes, picked by symbol count exactly as Godot does (`gdscript_warning.cpp:157`):
+        // three symbols when a non-`const` builtin method is the culprit, two for a plain
+        // assignment chain. Note the argument order — the class name is `symbols[0]` but reads
+        // last in both sentences.
+        ConfusableTemporaryModification if symbols.len() > 2 => format!(
+            r#"The built-in property "{1}" will not be modified as a result of calling the method "{2}()". Consider assigning the desired value to the property instead, or check the "{0}" class for a specialized API."#,
+            g(0),
+            g(1),
+            g(2)
+        ),
+        ConfusableTemporaryModification => format!(
+            r#"The built-in property "{1}" will not be modified in the assignment chain. Consider using a temporary variable and assigning it back instead, or check the "{0}" class for a specialized API."#,
+            g(0),
+            g(1)
+        ),
         InferenceOnVariant => format!(
             "The {0} type is being inferred from a Variant value, so it will be typed as Variant.",
             g(0)
@@ -449,13 +461,71 @@ mod tests {
     #[test]
     fn level_distribution_matches_godot() {
         let count = |lvl: WarnLevel| DEFAULT_LEVELS.iter().filter(|&&l| l == lvl).count();
-        assert_eq!(
-            count(WarnLevel::Warn),
-            36,
-            "33 active + 3 deprecated default to Warn"
-        );
+        // At the newest supported tag: 34 active + 3 deprecated default to Warn.
+        assert_eq!(count(WarnLevel::Warn), 37);
         assert_eq!(count(WarnLevel::Ignore), 8);
         assert_eq!(count(WarnLevel::Error), 4);
+        assert_eq!(
+            count(WarnLevel::Warn) + count(WarnLevel::Ignore) + count(WarnLevel::Error),
+            WARNING_MAX
+        );
+    }
+
+    #[test]
+    fn the_46_subset_keeps_its_own_distribution() {
+        // 4.7 only added a code; it must not have moved any level 4.6 already had.
+        let in_46 = |lvl: WarnLevel| {
+            DEFAULT_LEVELS
+                .iter()
+                .zip(WARNING_SINCE)
+                .filter(|(&l, since)| l == lvl && *since <= gd_syntax::Dialect::Godot4_6)
+                .count()
+        };
+        assert_eq!(in_46(WarnLevel::Warn), 36, "33 active + 3 deprecated");
+        assert_eq!(in_46(WarnLevel::Ignore), 8);
+        assert_eq!(in_46(WarnLevel::Error), 4);
+    }
+
+    #[test]
+    fn the_47_addition_is_the_only_new_code() {
+        let new_in_47: Vec<&str> = WARNING_SINCE
+            .iter()
+            .zip(WARN_NAMES)
+            .filter(|(&since, _)| since == gd_syntax::Dialect::Godot4_7)
+            .map(|(_, name)| name)
+            .collect();
+        assert_eq!(new_in_47, ["CONFUSABLE_TEMPORARY_MODIFICATION"]);
+        assert!(
+            !WarningCode::ConfusableTemporaryModification.exists_in(gd_syntax::Dialect::Godot4_6)
+        );
+        assert!(
+            WarningCode::ConfusableTemporaryModification.exists_in(gd_syntax::Dialect::Godot4_7)
+        );
+        // Everything else predates 4.7 and is available in both.
+        for code in ALL {
+            if code != WarningCode::ConfusableTemporaryModification {
+                assert!(code.exists_in(gd_syntax::Dialect::Godot4_6), "{code:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_new_messages_match_godot_verbatim() {
+        let sym = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            format_warning(
+                WarningCode::ConfusableTemporaryModification,
+                &sym(&["Node2D", "position"])
+            ),
+            r#"The built-in property "position" will not be modified in the assignment chain. Consider using a temporary variable and assigning it back instead, or check the "Node2D" class for a specialized API."#
+        );
+        assert_eq!(
+            format_warning(
+                WarningCode::ConfusableTemporaryModification,
+                &sym(&["Node2D", "position", "normalize"])
+            ),
+            r#"The built-in property "position" will not be modified as a result of calling the method "normalize()". Consider assigning the desired value to the property instead, or check the "Node2D" class for a specialized API."#
+        );
     }
 
     #[test]

@@ -594,6 +594,15 @@ impl<'a> AnalysisContext<'a> {
         at_node: gd_syntax::ast::NodeId,
         related: Vec<crate::diagnostic::RelatedInfo>,
     ) {
+        // A code Godot introduced after this project's version must never reach a user. Every
+        // such emission site is behind a `DIALECT(...)` guard and `WarnPolicy` resolves the code
+        // to `Ignore` anyway, so reaching here means one of those two went missing.
+        debug_assert!(
+            code.exists_in(self.dialect),
+            "{} does not exist in Godot {} — its emission site is missing a dialect guard",
+            crate::warnings::name_from_code(code),
+            self.dialect,
+        );
         // Suppression mirrors Godot's `apply_pending_warnings` (gdscript_parser.cpp:269-281):
         // drop when the anchor's 1-based start line is in `warning_ignored_lines[code]` — the
         // per-line set [`build_warning_ignored_lines`] expands from each `@warning_ignore`'s
@@ -927,7 +936,11 @@ mod checkpoint_tests {
     use gd_project::WarningConfig;
 
     fn default_policy() -> WarnPolicy {
-        WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default())
+        WarnPolicy::build(
+            &WarningConfig::default(),
+            &StrictSettings::default(),
+            Dialect::DEFAULT,
+        )
     }
 
     /// A token cancelled before analysis begins must bail on the FIRST checkpoint — not 256 nodes
@@ -1037,7 +1050,11 @@ mod warning_ignore_span_tests {
     /// Warning codes of all warning diagnostics `src` analyzes to.
     fn warning_codes(src: &str) -> Vec<WarningCode> {
         let tree = gd_syntax::parse(src).tree;
-        let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+        let policy = WarnPolicy::build(
+            &WarningConfig::default(),
+            &StrictSettings::default(),
+            Dialect::DEFAULT,
+        );
         let result = crate::analyze(
             &tree,
             Some(FileId::new(1)),

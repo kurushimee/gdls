@@ -26,6 +26,7 @@
 mod common;
 
 use common::{notification, recv, request, shutdown, MINI_API};
+use gd_syntax::Dialect;
 use lsp_server::{Connection, Message};
 use lsp_types::{
     InitializeParams, InitializedParams, WorkspaceSymbolParams, WorkspaceSymbolResponse,
@@ -338,7 +339,11 @@ fn inherited_bare_call_records_non_script_callee() {
     let file = index.set_interface(camino::Utf8Path::new("/proj/src/foo.gd"), iface);
     index.finish_cold_index();
     let xfile = SyntacticQuery::new(&index, &native);
-    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let policy = WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    );
 
     let result = analyze(&parse.tree, Some(file), "foo.gd", &native, &xfile, &policy);
 
@@ -386,7 +391,11 @@ fn bare_native_call_with_methods_dump_records_native_target() {
     );
     index.finish_cold_index();
     let xfile = SyntacticQuery::new(&index, &native);
-    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let policy = WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    );
 
     let result = analyze(&parse.tree, Some(file), "foo.gd", &native, &xfile, &policy);
     let callee = result
@@ -441,7 +450,11 @@ fn recorded_call_is_in_file(source: &str, callee_name: &str) -> Option<bool> {
     let file = index.set_interface(camino::Utf8Path::new("/proj/src/foo.gd"), iface);
     index.finish_cold_index();
     let xfile = SyntacticQuery::new(&index, &native);
-    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let policy = WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    );
     let result = analyze(&parse.tree, Some(file), "foo.gd", &native, &xfile, &policy);
 
     result.bindings().iter().find_map(|b| match b {
@@ -514,7 +527,11 @@ fn inner_class_bare_call_records_owning_class_path() {
     );
     index.finish_cold_index();
     let xfile = SyntacticQuery::new(&index, &native);
-    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let policy = WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    );
     let result = analyze(&parse.tree, Some(file), "foo.gd", &native, &xfile, &policy);
 
     let callees: Vec<CalleeTarget> = result
@@ -573,7 +590,11 @@ fn in_file_attribute_read_records_use_binding() {
     );
     index.finish_cold_index();
     let xfile = SyntacticQuery::new(&index, &native);
-    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let policy = WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    );
     let result = analyze(&parse.tree, Some(file), "own.gd", &native, &xfile, &policy);
 
     let use_spans: Vec<gd_syntax::ByteSpan> = result
@@ -630,7 +651,11 @@ fn inherited_bare_call_attributes_to_declaring_base() {
         .file_id(camino::Utf8Path::new("/proj/base.gd"))
         .expect("base.gd interned");
     let xfile = SyntacticQuery::new(&index, &native);
-    let policy = WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default());
+    let policy = WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    );
     let parse = gd_syntax::parse(derived_src);
     let result = analyze(
         &parse.tree,

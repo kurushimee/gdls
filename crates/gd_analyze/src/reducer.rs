@@ -7035,6 +7035,7 @@ mod tests {
     use crate::warn_policy::{StrictSettings, WarnPolicy};
     use gd_project::{FileId, WarningConfig};
     use gd_syntax::ast::{BinaryOpNode, LiteralNode, Node, NodeKind, ParseTree, UnaryOpNode};
+    use gd_syntax::Dialect;
     use gd_types::NativeDb;
 
     fn mini_native() -> NativeDb {
@@ -7048,7 +7049,11 @@ mod tests {
     }
 
     fn policy() -> WarnPolicy {
-        WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default())
+        WarnPolicy::build(
+            &WarningConfig::default(),
+            &StrictSettings::default(),
+            Dialect::DEFAULT,
+        )
     }
 
     /// Build a minimal `ParseTree` containing exactly the nodes we hand-shape, so the reducer can

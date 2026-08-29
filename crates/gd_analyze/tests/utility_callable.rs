@@ -7,6 +7,7 @@
 //! a constant initializer. Every positive/negative expectation here is oracle-pinned against
 //! godot 4.6.3-stable `--headless --check-only` (see #88).
 
+use gd_syntax::Dialect;
 use std::path::Path;
 
 use gd_analyze::{
@@ -29,6 +30,7 @@ fn policy() -> WarnPolicy {
     WarnPolicy::build(
         &gd_project::WarningConfig::default(),
         &StrictSettings::default(),
+        Dialect::DEFAULT,
     )
 }
 

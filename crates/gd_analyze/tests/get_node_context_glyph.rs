@@ -5,6 +5,7 @@
 //! where Godot prints `("%")`. No corpus `.out` covers `%` in these contexts (the conformance
 //! ratchet cannot catch this), so these direct message assertions are the only coverage.
 
+use gd_syntax::Dialect;
 use std::path::Path;
 
 use gd_analyze::{analyze, NoCrossFile, StrictSettings, WarnPolicy};
@@ -20,7 +21,11 @@ fn native_db() -> NativeDb {
 }
 
 fn policy() -> WarnPolicy {
-    WarnPolicy::build(&WarningConfig::default(), &StrictSettings::default())
+    WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        Dialect::DEFAULT,
+    )
 }
 
 /// All diagnostic messages produced for `src`.

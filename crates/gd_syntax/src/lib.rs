@@ -14,6 +14,7 @@ pub mod lexer;
 pub mod parser;
 pub mod span;
 pub mod token;
+pub mod warning_names;
 
 pub use ast::ParseTree;
 pub use dialect::Dialect;
@@ -21,6 +22,7 @@ pub use doc_comments::{ClassDoc, DocTable, MemberDoc};
 pub use lexer::{tokenize, tokenize_with_dialect, CommentData, LexError, Lexer};
 pub use span::{ByteSpan, LineCol, LineColRange};
 pub use token::{Literal, Token, TokenKind};
+pub use warning_names::{warning_name_is_valid, WARNINGS, WARNING_COUNT};
 
 /// A frontend diagnostic. In M1 this carries syntax errors; the analyzer reuses the same shape for
 /// type errors and warnings later.

@@ -5,6 +5,7 @@
 //! INSTANCE type (not dynamic `Variant`) — so `Global.popup_error("x")` resolves `popup_error`
 //! through the instance type rather than degrading to Variant.
 
+use gd_syntax::Dialect;
 use std::path::Path;
 
 use gd_analyze::{
@@ -26,6 +27,7 @@ fn policy() -> WarnPolicy {
     WarnPolicy::build(
         &gd_project::WarningConfig::default(),
         &StrictSettings::default(),
+        Dialect::DEFAULT,
     )
 }
 
