@@ -37,7 +37,7 @@ pub(crate) fn bbcode_to(format: ProseFormat, input: &str) -> String {
     let mut rest = input;
     let md = format == ProseFormat::Markdown;
     while let Some(lb) = rest.find('[') {
-        out.push_str(&rest[..lb]);
+        push_prose(&mut out, md, &rest[..lb]);
         let after = &rest[lb + 1..];
         let Some(rb) = after.find(']') else {
             // Unterminated bracket — emit the rest verbatim.
@@ -156,8 +156,47 @@ pub(crate) fn bbcode_to(format: ProseFormat, input: &str) -> String {
             }
         }
     }
-    out.push_str(rest);
+    push_prose(&mut out, md, rest);
     out.trim().to_string()
+}
+
+/// Copy a run of plain prose, turning a paragraph-break newline into a blank line for markdown.
+///
+/// Godot's rich-text renderer treats a lone `\n` as a paragraph break, so that is what both doc
+/// sources hand us: a 4.7 `[br][br]` is stored as one `\n` (`gd_syntax::doc_comments`), and the
+/// engine's own class descriptions separate their `Note:` / `Warning:` paragraphs the same way. In
+/// Markdown a lone newline is not a break at all, so all of it ran together in hover (#310). A run
+/// of newlines collapses to exactly one blank line; plaintext keeps what it already renders right.
+///
+/// This is deliberately the converter's job and not the port's: `doc_comments.rs` keeps emitting
+/// the `\n` Godot emits, and only the wire representation changes.
+fn push_prose(out: &mut String, md: bool, text: &str) {
+    if !md {
+        out.push_str(text);
+        return;
+    }
+    let mut rest = text;
+    while let Some(nl) = rest.find('\n') {
+        out.push_str(&rest[..nl]);
+        push_break(out);
+        rest = rest[nl..].trim_start_matches('\n');
+    }
+    out.push_str(rest);
+}
+
+/// Close the current paragraph, absorbing whatever break is already at the seam.
+///
+/// Class-reference XML routinely writes `[br][br]` at the END of a source line and starts the next
+/// paragraph on the line below, so the converter meets two hard breaks and then a newline for one
+/// paragraph boundary. Rewinding to the last real character keeps that a single blank line instead
+/// of a growing pile of them. Nothing is emitted at the very start of a body.
+fn push_break(out: &mut String) {
+    while out.ends_with('\n') || out.ends_with(' ') {
+        out.pop();
+    }
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
 }
 
 /// Append a converted doc paragraph below a signature block, rust-analyzer style: a `---` rule
@@ -535,7 +574,28 @@ mod tests {
     fn codeblock_renders_a_gdscript_fence() {
         assert_eq!(
             md("Example:\n[codeblock]\nvar x = 1\nif x:\n    pass\n[/codeblock]\nDone."),
-            "Example:\n```gdscript\nvar x = 1\nif x:\n    pass\n```\nDone."
+            "Example:\n\n```gdscript\nvar x = 1\nif x:\n    pass\n```\n\nDone."
+        );
+    }
+
+    /// Godot separates paragraphs with a lone `\n` (its rich-text renderer'"'"'s paragraph break, and
+    /// what a 4.7 `[br][br]` collapses to). Markdown needs a blank line, so the converter widens it
+    /// — and a run of newlines still collapses to exactly one blank line. #310.
+    #[test]
+    fn a_paragraph_break_newline_becomes_a_blank_line_in_markdown() {
+        assert_eq!(
+            md("First paragraph.\nSecond paragraph."),
+            "First paragraph.\n\nSecond paragraph."
+        );
+        assert_eq!(
+            md("First.\n\n\nSecond."),
+            "First.\n\nSecond.",
+            "a run of newlines is one paragraph break, not three"
+        );
+        // Plaintext already renders a lone newline as a break, so it keeps what it had.
+        assert_eq!(
+            bbcode_to(ProseFormat::PlainText, "First.\nSecond."),
+            "First.\nSecond."
         );
     }
 

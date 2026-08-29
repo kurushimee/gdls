@@ -505,6 +505,15 @@ fn process_doc_line(
                     owned_line = format!("[br]{line}");
                     return process_doc_line_inner(&owned_line, text, state, dialect, "");
                 }
+            } else if text.ends_with('\n') {
+                // DIALECT(4.7): gdscript_parser.cpp _process_doc_line() — 4.7 also refuses the
+                // space join when the accumulator already ends in a newline, which is exactly what
+                // its own `[br][br]` paragraph break leaves behind; without it every paragraph
+                // after the first opens with a stray space. 4.6 has no paragraph break to protect,
+                // and joined unconditionally.
+                if dialect < Dialect::Godot4_7 {
+                    line_join = " ";
+                }
             } else {
                 line_join = " ";
             }
@@ -902,6 +911,17 @@ class Inner:
     fn br_br_spanning_two_doc_lines_is_a_paragraph_break_at_4_7() {
         // The pair meets across the line join: a trailing `[br]` plus a leading `[br]`.
         let src = "extends Node\n## First.[br]\n## [br]Second.\nvar x := 1\n";
+        assert_eq!(member_desc(src, Dialect::Godot4_6), "First.[br][br]Second.");
+        assert_eq!(member_desc(src, Dialect::Godot4_7), "First.\nSecond.");
+    }
+
+    /// The paragraph break is produced by the END of one doc line, so the NEXT line joins onto a
+    /// string that already ends in `\n`. 4.7 refuses the space join there
+    /// (`!r_text.ends_with("\n")`, gdscript_parser.cpp); without that the second paragraph opened
+    /// with a stray space.
+    #[test]
+    fn a_paragraph_break_at_a_line_end_joins_the_next_line_without_a_space_at_4_7() {
+        let src = "extends Node\n## First.[br][br]\n## Second.\nvar x := 1\n";
         assert_eq!(member_desc(src, Dialect::Godot4_6), "First.[br][br]Second.");
         assert_eq!(member_desc(src, Dialect::Godot4_7), "First.\nSecond.");
     }

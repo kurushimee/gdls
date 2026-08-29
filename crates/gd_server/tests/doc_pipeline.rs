@@ -536,3 +536,75 @@ fn an_inner_class_in_a_type_position_carries_its_doc() {
 
     common::shutdown(&client, server_thread);
 }
+
+/// #304 + #310: a GDExtension class-reference XML, formatted exactly the way `doc/classes/*.xml`
+/// and every addon's `doc_classes/*.xml` are — body indented one level past its tag, and a
+/// `[br][br]` paragraph break at the end of a source line.
+///
+/// The XML reader used to hand the continuation lines through with their tabs still on, and a
+/// tab-led line is a **code block** in Markdown, so the second paragraph of every multi-paragraph
+/// addon doc rendered as code. Native classes never showed it: the JSON dump arrives de-indented.
+/// The `[br][br]` + newline at the seam is one paragraph boundary, not three.
+const TERRAIN_XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>
+<class name=\"Terrain3D\" inherits=\"Node\">
+\t<brief_description>
+\t\tA clipmap terrain node.
+\t</brief_description>
+\t<description>
+\t\tTerrain3D draws a large heightmapped surface from region tiles.[br][br]
+\t\tAdd it to a scene, then call [method set_region_size] before any region is written.
+\t</description>
+\t<methods>
+\t\t<method name=\"set_region_size\">
+\t\t\t<return type=\"void\" />
+\t\t\t<param index=\"0\" name=\"size\" type=\"int\" />
+\t\t\t<description>
+\t\t\t\tSets the edge length of every region tile.[br][br]
+\t\t\t\tMust be a power of two.
+\t\t\t</description>
+\t\t</method>
+\t</methods>
+</class>
+";
+
+#[test]
+fn a_multi_paragraph_gdextension_doc_hovers_without_tabs_or_stray_breaks() {
+    let p = common::sample_project();
+    p.write(
+        "addons/terrain_3d/terrain3d.gdextension",
+        "[configuration]\n\nentry_symbol = \"terrain_3d_init\"\n\n[libraries]\n\nlinux.debug.x86_64 = \"res://addons/terrain_3d/bin/libterrain.so\"\n",
+    );
+    p.write("addons/terrain_3d/doc_classes/Terrain3D.xml", TERRAIN_XML);
+    let use_src = "extends Node\n\nfunc f(t: Terrain3D) -> void:\n\tt.set_region_size(64)\n";
+    p.write("src/ext_user.gd", use_src);
+
+    let (client, server_thread) = boot(&p, hover_caps(vec![MarkupKind::Markdown]));
+    let uri = file_uri(&p.root.join("src/ext_user.gd"));
+    did_open(&client, &uri, use_src);
+
+    let (_, class_doc) = hover_at(&client, 40, &uri, 2, 10); // `Terrain3D` in the annotation
+    assert!(
+        !class_doc.contains('\t'),
+        "no line reaches the wire tab-indented (a tab-led line is a Markdown code block): \
+         {class_doc:?}"
+    );
+    assert!(
+        class_doc.contains(
+            "Terrain3D draws a large heightmapped surface from region tiles.\n\nAdd it to a scene,"
+        ),
+        "`[br][br]` at a line end plus the source newline is ONE blank line: {class_doc:?}"
+    );
+
+    let (_, method_doc) = hover_at(&client, 41, &uri, 3, 6); // `set_region_size`
+    assert!(
+        !method_doc.contains('\t'),
+        "a method description is de-indented too: {method_doc:?}"
+    );
+    assert!(
+        method_doc
+            .contains("Sets the edge length of every region tile.\n\nMust be a power of two."),
+        "the method's paragraph break survives as a blank line: {method_doc:?}"
+    );
+
+    common::shutdown(&client, server_thread);
+}
