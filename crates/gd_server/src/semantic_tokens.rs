@@ -2069,23 +2069,25 @@ mod tests {
         );
     }
 
-    /// A user-defined `func Vector2()` SHADOWS the builtin type: the bare `Vector2()` callee resolves
-    /// to the in-file method binding and colors `method`, never `class`. Pins the precedence (in-file
-    /// member binding wins over the name-matched builtin table), mirroring the utility-shadow test.
+    /// A user-defined `func Vector2()` does NOT shadow the builtin type — the opposite of the
+    /// utility-shadow case above. `reduce_call` tests the callee name against the builtin table
+    /// before any member lookup and returns from the constructor arm (analyzer.cpp:3279-3283), so
+    /// `Vector2()` constructs a `Vector2` no matter what the file declares. Confirmed against
+    /// `godot --check-only`: with `func Vector2() -> int`, `var v: int = Vector2()` still reports
+    /// `Cannot assign a value of type "Vector2" as "int".` The callee therefore colors `class`.
     #[test]
-    fn user_defined_func_shadows_builtin_constructor_callee() {
+    fn a_user_defined_func_does_not_shadow_a_builtin_constructor_callee() {
         let db = trimmed_db();
         let src = "func Vector2() -> void:\n\tpass\nfunc test() -> void:\n\tVector2()\n";
         let (parsed, analysis) = analyze_for(src, &db);
         let raw = classify_document(&parsed.tree, Some(&analysis), &db, None);
 
         let callee_byte = src.rfind("Vector2").unwrap();
-        let callee =
-            tok_at(&raw, callee_byte).expect("the shadowing-method callee must be colored");
+        let callee = tok_at(&raw, callee_byte).expect("the constructor callee must be colored");
         assert_eq!(
             callee.ty,
-            TokType::Method,
-            "an in-file `func Vector2()` shadows the builtin type — the callee is `method`"
+            TokType::Class,
+            "the builtin constructor wins over an in-file `func` of the same name — the callee is `class`"
         );
     }
 
