@@ -4,9 +4,11 @@ All notable changes to `gdls` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.0.0] - 2026-08-29
 
-M7, Phase 2 protocol foundations (#57 through #63), merged 2026-06-13. No release cut: Phase 2 milestones land on `main` and release together once the phase matures.
+Phase 2. The tag was reserved for `.tscn` node typing on `$` and `%`, `signatureHelp`, and `completion`; it ships those plus the rest of the generic LSP surface, so gdls now answers every capability it advertises.
+
+M7, Phase 2 protocol foundations (#57 through #63), merged 2026-06-13.
 
 ### Added
 - True `$/cancelRequest` preemption (#57): a router thread drains the wire and flips cancellation tokens the moment a cancel arrives, so the analyzer's cooperative checkpoints abort mid-handler. Results invalidated by an intervening edit return `ContentModified` (-32801). The shutdown handshake no longer risks lsp-server's 30 s `handle_shutdown` stall.
@@ -21,13 +23,13 @@ M7, Phase 2 protocol foundations (#57 through #63), merged 2026-06-13. No releas
 ### Changed
 - The warm-start cache format bumped from v4 to v5 for the doc-carrying `Interface` shape. That means one cold re-index per project on first launch after upgrading, self-healing.
 
-M8, Phase 2 editing core (#64, #65), merged 2026-06-13. No release cut.
+M8, Phase 2 editing core (#64, #65), merged 2026-06-13.
 
 ### Added
 - `textDocument/completion` plus `completionItem/resolve` (#64): a `CompletionList`, never a bare array. Member-access, identifier, and type-position contexts are driven token-primary. `textEdit`, `sortText` (fixed-width rank), `filterText`, snippets, `InsertReplaceEdit`, and `commitCharacters` are all capability-gated, with lazy `documentation` and `detail` via resolve behind a compact self-sufficient `data` key. 99.6% member-access agreement against Godot's headless LSP differential.
 - `textDocument/signatureHelp` (#65): triggers `(` and `,`, retrigger `)`; `activeParameter` per spec; label offsets gated on `labelOffsetSupport`; native and project signatures with default values; and a string-safe backward bracket and comma scan.
 
-M9, Phase 2 navigation and refactoring completeness (#66 through #71), merged 2026-06-14. No release cut.
+M9, Phase 2 navigation and refactoring completeness (#66 through #71), merged 2026-06-14.
 
 ### Added
 - `textDocument/documentHighlight` (#67): in-file Read and Write highlights reusing the references engine's binding-backed resolution. Write is derived from assignment and compound-assignment LHS, excluding attribute-position identifiers, over identifier-token ranges.
@@ -38,7 +40,7 @@ M9, Phase 2 navigation and refactoring completeness (#66 through #71), merged 20
 - `textDocument/rename` plus `prepareRename` (#66): workspace-wide semantic rename reusing the references engine for the edit set. Versioned `documentChanges` with zero stale-version edits, gated on `workspace.workspaceEdit.documentChanges`, with the legacy `changes` map otherwise; `prepareRename` returns `{range, placeholder}` gated on `rename.prepareSupport`. A fail-closed corruption firewall applies positive project resolution: native engine symbols, native methods on non-Native bases, stub files, and new-name engine or registry collisions all refuse with a typed error and zero edits, refusing rather than corrupting. The local edit set is binding-correct, excluding `self.x`-attribute over-capture. Round-trips on the Pixelorama acceptance project with zero stale-version edits.
 - The M9 §7.4 editor-profile walk extended over the rename, foldingRange, and workspaceSymbol gated projections (`tests/editor_profiles.rs`).
 
-M10, Phase 2 presentation and code actions (#72 through #75), merged 2026-06-14. No release cut.
+M10, Phase 2 presentation and code actions (#72 through #75), merged 2026-06-14.
 
 ### Added
 - `textDocument/semanticTokens` full, delta, and range, plus refresh (#72): syntax-aware highlighting over the standard LSP legend only, with zero `gdscript/`-prefixed or custom token names. That is the #30 generic-LSP highlighting target, since every theme already maps the 10 standard types and 6 standard modifiers. The advertised legend is always full width for stable wire indices, and the client's advertised legend is a pure allow-filter applied at emit time: per LSP 3.17 the wire integers index the server-advertised legend, so gdls always emits its own server-legend indices and modifier bits and drops any type or modifier the client didn't declare, never shrinking the advertised legend. `full/delta` emits a minimal flat-array edit against the cached prior array, which matters on 10k-line files. `range` is parse-priced and served even at Hard memory pressure, while full and delta are analysis-priced and shed. A `workspace/semanticTokens/refresh` is sent only with `workspace.semanticTokens.refreshSupport`.
@@ -50,7 +52,7 @@ M10, Phase 2 presentation and code actions (#72 through #75), merged 2026-06-14.
 ### Fixed
 - `textDocument/semanticTokens` now emits server-legend indices, treating the client's advertised legend as an allow-filter rather than a remap table. This fixes a wire-index mishighlight on clients whose legend differs from gdls's in membership or order (#121).
 
-M11, Phase 2 scenes and file operations (#76 through #80), merged 2026-06-15. No release cut.
+M11, Phase 2 scenes and file operations (#76 through #80), merged 2026-06-15.
 
 ### Added
 - `.tscn` scene index plus `$`/`%` typing (#76): a panic-free `.tscn` *text* parser feeds a `SceneIndex` in `gd_project`, covering the node tree, types, script attachments, `%`-unique names, and instanced sub-scenes resolved by recursive text rather than engine instantiation (anti-catalog W16). The warm-start cache bumps from v5 to v6, the watcher tracks `**/*.tscn`, and a new `scene_parse` fuzz target joins the gate, now five targets. **Premise correction**, verified by fusion review and against the real 4.6.3 binary: Godot's analyzer types `$` and `%` as a hard bare `NATIVE Node` (`gdscript_analyzer.cpp:3866-3886`), not scene-precise, so feeding a precise scene type into the diagnostic path would manufacture false positives Godot never emits, on sibling downcasts. So `reduce_get_node` types a valid `$` or `%` as bare `Node`, retiring the over-permissive `Variant` deviation (`docs/02` §11): a member miss now fires `UNSAFE_PROPERTY_ACCESS`, while sibling downcasts and casts stay silent, exactly as Godot does. The precise scene-derived types are repurposed for phase-3 navigation, with the resolution substrate shipping dormant, and exit criterion #4 is reframed to bare-Node parity.
@@ -68,7 +70,7 @@ M11, Phase 2 scenes and file operations (#76 through #80), merged 2026-06-15. No
 
 **Phase 2 is now complete (M7 through M11 shipped); a release will be cut from `main` as a separate step.**
 
-Post-Phase-2 hardening (#99, #125, #132, #157, #161, #189, #193, #204, #246), merged 2026-08-28. No release cut. Closes out every remaining tracker item, so the issue tracker is empty.
+Post-Phase-2 hardening (#99, #125, #132, #157, #161, #189, #193, #204, #246), merged 2026-08-28. Closes out every remaining tracker item, so the issue tracker is empty.
 
 ### Added
 - Precise `$`/`%` navigation typing (#125): `hover`, `definition`, and `typeDefinition` on a `$Path`, `%Name`, or `get_node("literal")` access answer with the scene-precise node type, meaning the engine class of the node the access reaches, or the `class_name` of the script attached to it, instead of bare `Node` (and, for `definition`, instead of nothing at all). It is built in `gd_server::scene_nav` from the scene-index fact and handed straight to the renderers, so it never enters an `AnalysisResult`: the diagnostic path keeps seeing bare `Node`, and the sibling downcasts Godot tolerates stay silent. Conservative by design, so an absolute path, a scene-less script, or two attaching scenes disagreeing all fall back to bare `Node`.
@@ -85,7 +87,7 @@ Post-Phase-2 hardening (#99, #125, #132, #157, #161, #189, #193, #204, #246), me
 - The completion and signatureHelp perf budget rows (#99) replaced their estimates with measurements from a 2414-file project, with provenance recorded in `bench/budget.toml`.
 - Test-only: the rename canonicalization class-decl backstop is pinned white-box (#161, unreachable from legal source by design), and the watcher coalescing bound is now measured only when the write burst actually fits inside one quiet window (#249, #252). A stalled CI runner has nothing to coalesce, which was the long-standing flake.
 
-Generic-client conformance wave (#255 through #265), merged 2026-08-29. These are findings from an end-to-end verification of the release binary, driven over stdio by a synthetic LSP client across four client capability profiles, with disputed analyzer behaviour cross-checked against the Godot 4.6.3-stable binary. No release cut.
+Generic-client conformance wave (#255 through #265), merged 2026-08-29. These are findings from an end-to-end verification of the release binary, driven over stdio by a synthetic LSP client across four client capability profiles, with disputed analyzer behaviour cross-checked against the Godot 4.6.3-stable binary.
 
 ### Fixed
 - The `exit` status tests now build a Windows-safe root URI (#279). They pasted a temp path straight after the `file://` scheme, which is fine on a POSIX root and unparseable on a Windows drive path, so `initialize` failed to deserialize and the server exited 1 before indexing anything. Every test then saw status 1, and the one expecting 1 passed for the wrong reason, leaving Windows CI red for twelve commits. They go through the production URI helper now, and read the `initialize` response back so a handshake-time death is a named failure on any platform.
@@ -108,6 +110,12 @@ Generic-client conformance wave (#255 through #265), merged 2026-08-29. These ar
 - `@deprecated` and `@experimental` are visible (#258). Both were parsed and then dropped. They now lead the hover body as a banner, above the prose, so a reader who stops at the first line still learns the symbol is on its way out. `@deprecated` additionally sets `CompletionItem.tags: [Deprecated]`, downgraded to the pre-3.15 `deprecated: true` boolean for a client that never advertised `completionItem.tagSupport`, never both, and the standard `deprecated` semantic-token modifier on the declaration and on every resolved use, meaning a member read, a call site, or a class name, each resolved through the declaring file's interface rather than by name. The modifier was in the advertised legend since M10 with nothing behind it. Engine symbols never carry either signal, since `extension_api.json` has no deprecation field in 4.6.3, with or without docs, so there is nothing to claim one from.
 - `workspace/diagnostic/refresh` now reaches real clients (#277). The refresh #255 added was gated on `workspace.diagnostic.refreshSupport`, which is what lsp-types 0.97 deserializes, but LSP 3.17 spells the key `workspace.diagnostics`, plural, and that is what VS Code, Neovim, Zed, and Sublime all send. No editor had ever received it, so the pull half of the staleness fix was inert while the push half worked. The key is now read off the raw capabilities object, with the typed field kept as a fallback, and the test builds the capability as JSON so a typed round-trip can no longer hide the same class of bug.
 - An inner class hovers with its doc in a type position too (#277). `func f(i: Outer.Inner)` showed a bare `Outer.Inner` while `Outer.Inner.new()` showed the doc, because the `Inner` segment has no `class_name` registry entry to route through. The analyzer already pins a script type there, and following it reaches the same declaring interface.
+
+Release-gate fixes (#284, #286), merged 2026-08-29. Both surfaced in the comparative diagnostics sweep against the v1.0.7 binary, and both are cross-file type-identity bugs: a name that resolved to a valid type, but the wrong one.
+
+### Fixed
+- An inherited inner class named bare in a type annotation resolves to that inner class (#284). The cross-file scope search found it in the base's interface and then returned the base script's own meta type, which was enough to clear the `Could not find type` path it was written for and wrong for everything downstream, so `var v: Inner = Inner.new()` failed its assignment check against the base. The qualified form, the inferred form, and same-file inner classes were all correct already.
+- A cross-file enum carries its declaring class's fqcn (#286). Godot names a class enum after the class's `fqcn` so the name is stable whichever context reaches it, and `class_name` overrides that fqcn for the head class. gdls derived it from the file path on the cross-file side only, so one enum reached two ways read as `Handler.EId` and `handler.gd.EId`, and passing a value of it to a parameter typed with it errored. Inner classes now carry the `::` chain too.
 
 ## [1.0.7] - 2026-06-13
 
@@ -308,4 +316,4 @@ The raised ship bar is met. Background: [`docs/08-history.md`](docs/08-history.m
 
 ---
 
-**Tag conventions.** `v1.0.0` is tagged with M6 landed, so the persistent warm-start cache ships *in* v1, not later. Subsequent Godot-tracked re-ports become `v1.x.0` minor releases (Godot 4.8, 4.9, and so on). `v2.0.0` is reserved for Phase 2 features: `.tscn` node typing for `$` and `%`, `signatureHelp`, and `completion`.
+**Tag conventions.** `v1.0.0` is tagged with M6 landed, so the persistent warm-start cache ships *in* v1, not later. Subsequent Godot-tracked re-ports become `v1.x.0` minor releases (Godot 4.8, 4.9, and so on). `v2.0.0` carries Phase 2: `.tscn` node typing for `$` and `%`, `signatureHelp`, and `completion`.

@@ -72,7 +72,7 @@ Two principles span files:
 
 ## Project state
 
-`gdls` is complete and running. Every capability in `docs/05` §1 is shipped and advertised, both conformance ratchets hold at 1.0 with empty known-failures lists, and the issue tracker is empty. The last release is v1.0.7 (2026-06-13); `main` is ahead of it and a release will be cut as a separate step. `CHANGELOG.md` has the release history and `docs/08-history.md` has how it was built.
+`gdls` is complete and running. Every capability in `docs/05` §1 is shipped and advertised, both conformance ratchets hold at 1.0 with empty known-failures lists, and the issue tracker is empty. The last release is v2.0.0 (2026-08-29), which ships Phase 2. `CHANGELOG.md` has the release history and `docs/08-history.md` has how it was built.
 
 Three lessons from that work still apply to anything new:
 

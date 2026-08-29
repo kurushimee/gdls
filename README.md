@@ -65,7 +65,7 @@ Diagnostics (push and pull), hover, definition, declaration, type definition, re
 
 Both fidelity ratchets sit at 1.0000 against the vendored Godot 4.6.3-stable corpus: parser 186/186, analyzer 300/300.
 
-The latest release is v1.0.7; `main` is ahead of it. [`CHANGELOG.md`](CHANGELOG.md) has the release history, and [`docs/08-history.md`](docs/08-history.md) has how the project was built.
+The latest release is v2.0.0. [`CHANGELOG.md`](CHANGELOG.md) has the release history, and [`docs/08-history.md`](docs/08-history.md) has how the project was built.
 
 ## Configuration
 
