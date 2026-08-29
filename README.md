@@ -67,7 +67,7 @@ Diagnostics (push and pull), hover, definition, declaration, type definition, re
 
 Against Godot's own vendored corpus, the parser ratchet sits at 1.0000 (185/185) and the analyzer at 0.9898 (194/196). The two analyzer misses are listed with what each needs in `crates/gd_analyze/tests/conformance/analyze_known_failures.txt`.
 
-The latest release is v2.0.0. [`CHANGELOG.md`](CHANGELOG.md) has the release history, and [`docs/08-history.md`](docs/08-history.md) has how the project was built.
+The latest release is v3.0.0. [`CHANGELOG.md`](CHANGELOG.md) has the release history, and [`docs/08-history.md`](docs/08-history.md) has how the project was built.
 
 ## Configuration
 

@@ -4,6 +4,28 @@ All notable changes to `gdls` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-08-29
+
+Godot 4.7 support. One binary now serves both 4.6 and 4.7, and each project is read as the release it targets, so upgrading gdls does not change what a 4.6 project sees.
+
+### Added
+- **Per-project Godot dialect.** The version comes from `project.godot`'s `application/config/features` and flows into the tokenizer, the parser, the analyzer, the warning set, the bundled engine surface, and the warm-start cache key. `initializationOptions.dialect` pins it by hand; a version newer than anything ported clamps to the newest, one older clamps to the oldest, and a project that declares nothing at all gets the newest with a notice — Godot writes that entry itself, so a real project always has one.
+- **The 4.7 frontend delta, ported behavior by behavior.** A tab advances the column by one instead of by the indent size; a default-constructed token starts at line 1 rather than 0; `class_name` is rejected in a script embedded in a scene; `super` enters multiline mode only when the `(` is really there; `_process_doc_line` trims only spaces and tabs and turns a `[br][br]` pair into a real paragraph break; an untyped override inherits its parent's return type, from ClassDB as well as from a script ancestor, with `_get_property_list` keeping bare `Array` for compatibility (GH-118877); `resolve_class_inheritance` accumulates inner-class errors rather than stopping at the first; and `reduce_type_test`'s constant arm compares collections strictly. Every guard carries a `DIALECT(4.7):` marker, so `grep -rn "DIALECT("` is the whole audit surface, and the no-ops are written down beside them in `docs/02-frontend-port.md` §11c and §11d.
+- **`CONFUSABLE_TEMPORARY_MODIFICATION`**, the one warning 4.7 adds: modifying a built-in property in place through a subscript or a mutating method changes a temporary and is silently lost. The warning set is 45 active at 4.6 and 46 at 4.7, and `@warning_ignore` accepts a name only from the release that has it.
+- **A stock engine surface per release.** The bundled last-resort native API was one 4.6.3 dump served to every project; a 4.6 project asking a 4.7 surface about its engine classes gets wrong signatures, wrong enum values, and 13 classes that do not exist for it yet. There is now one asset per release, picked by dialect, and adding a release is a compile error until its asset is vendored. When the surface that actually wins is from another release — a pinned `extensionApiPath` left over from an upgrade, a cached auto-dump from the binary that used to be on `PATH` — the session says so.
+- **Conformance suites.** Each harness reads a set of corpus trees, one per supported release, each paired with the dialect its goldens came from. The newest release carries the full upstream tree byte for byte, older ones only what genuinely diverges, and one aggregate fidelity number covers them all. `scripts/conformance/demote_corpus.py` does the mechanical half of the next version bump.
+
+### Changed
+- **The corpora are Godot 4.7.2's.** The parser tree holds at 1.0000 (185/185) with no 4.6 subset at all, since no `.gd` in it parses differently at the two tags. The analyzer's 4.6 subset is two files, both because 4.7's test runner sorts the printed error list by line where 4.6 printed it in emission order.
+- **The analyzer floor moves to 0.98** over a corpus that changed underneath it. Upstream consolidated its analyzer tests — 4.6.3's 300 mostly one-error files became 194 grouped ones that each cover more — so the denominator fell while coverage rose, and the rise reached two gaps the older tree never did. Both want global-name tables gdls has no port of (`CoreConstants::is_global_enum`, `has_any_global_constant`), both are equally present at 4.6, and both are named with what each needs in `analyze_known_failures.txt`.
+- **The warm-start cache key carries the dialect**, since an interface extracted under one release is not reusable under another. That means one cold re-index per project on first launch after upgrading, self-healing.
+
+### Fixed
+Three analyzer gaps the fuller 4.7 corpus exposed. All three predate this release and were equally wrong at 4.6.
+- **An enum value may name a sibling of its own block** (`current_enum`, analyzer.cpp:1156/1218/4392). Until that sibling resolves, the reference is `Cannot use another enum element before it was declared.`, not a cyclic member reference, and a class-side enum value read is unconditionally constant — which is what keeps a genuine cycle to one error instead of two.
+- **A native parent's signature is compared on an override.** Godot resolves an override's parent through one lookup that walks the script chain and then falls into ClassDB, so a script whose only ancestor is native still has its `_ready` and `_process` overrides measured. gdls checked the script half only.
+- **Native typed containers keep their element types.** `Array[T]` and `Dictionary[K, V]` from the engine dump were flattening to `Variant`, so a return type like `Array[Dictionary]` could not be compared against anything.
+
 ## [2.0.0] - 2026-08-29
 
 Phase 2. The tag was reserved for `.tscn` node typing on `$` and `%`, `signatureHelp`, and `completion`; it ships those plus the rest of the generic LSP surface, so gdls now answers every capability it advertises.
@@ -316,4 +338,4 @@ The raised ship bar is met. Background: [`docs/08-history.md`](docs/08-history.m
 
 ---
 
-**Tag conventions.** `v1.0.0` is tagged with M6 landed, so the persistent warm-start cache ships *in* v1, not later. Subsequent Godot-tracked re-ports become `v1.x.0` minor releases (Godot 4.8, 4.9, and so on). `v2.0.0` carries Phase 2: `.tscn` node typing for `$` and `%`, `signatureHelp`, and `completion`.
+**Tag conventions.** `v1.0.0` is tagged with M6 landed, so the persistent warm-start cache ships *in* v1, not later. Subsequent Godot-tracked re-ports become `v1.x.0` minor releases (Godot 4.8, 4.9, and so on). `v2.0.0` carries Phase 2: `.tscn` node typing for `$` and `%`, `signatureHelp`, and `completion`. `v3.0.0` adds Godot 4.7 alongside 4.6, so the Godot-tracked re-port cadence starts here: the newest supported release is what an unmarked project is read as, and changing that default can change an existing project's diagnostics, which is why it is a major.
