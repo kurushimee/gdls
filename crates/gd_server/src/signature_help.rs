@@ -290,8 +290,18 @@ fn resolve_attribute_call(
         DtKind::Script => {
             let sr = base_dt.script_type.as_ref()?;
             if method == "new" {
-                // `ScriptInstance.new(` is unusual but valid; resolve the chain's `_init`.
-                return script_init_sig(state, text, sr.file);
+                // The analyzer's resolved callee carries the inner-class `class_path` precisely,
+                // which the base VALUE's `ScriptRef` may not (#113) — prefer it, exactly as the
+                // method path below does. Without a class path an inner class's `new(` answered
+                // with the OUTER class's `_init` (#335).
+                if let Some(CalleeTarget::Script { file, class_path }) =
+                    call_target_at_open_paren(analyzed, tokens[open_idx].span.start)
+                {
+                    if let Some(sig) = script_init_sig(state, text, file, &class_path) {
+                        return Some(sig);
+                    }
+                }
+                return script_init_sig(state, text, sr.file, &sr.inner);
             }
             // Prefer the analyzer's resolved callee for THIS call: it carries the inner-class
             // `class_path` precisely, which the base VALUE's `ScriptRef` does not (an inner-class
@@ -565,7 +575,7 @@ fn resolve_typed_new(state: &ServerState, text: &str, base_name: &str) -> Option
     // A project `class_name` → the declaring file's `_init` (or a no-arg constructor).
     if let Some(entry) = state.workspace.index.registry().get(base_name) {
         if let Some(fid) = state.workspace.index.file_id(&entry.path) {
-            return script_init_sig(state, text, fid)
+            return script_init_sig(state, text, fid, &[])
                 .or_else(|| Some(vec![Sig::constructor(base_name)]));
         }
     }
@@ -697,21 +707,32 @@ fn script_method_sig(
     )])
 }
 
-/// The `_init` constructor signature of the script class in file `fid` (or the head of its chain),
-/// built from the declaring file's tree. Falls back to a no-arg `_init()` shape when the class
-/// declares no explicit `_init`.
-fn script_init_sig(state: &ServerState, text: &str, fid: gd_project::FileId) -> Option<Vec<Sig>> {
-    // `_init` may be declared on the class itself or inherited; the head interface is the common
-    // case (a constructor is rarely inherited as-is). Try the head file's `_init` first.
-    if let Some(sig) = script_method_sig(state, text, fid, &[], "_init") {
+/// The `_init` constructor signature of the script class at `class_path` inside file `fid` (the
+/// file root for an empty path), built from the declaring file's tree. Falls back to a no-arg
+/// constructor shape when the class declares no explicit `_init`.
+///
+/// `class_path` is what makes `Outer.Inner.new(` and a same-file `Inner.new(` show *Inner's*
+/// `_init` (#335). Resolving at the file root instead answered both with the OUTER class's
+/// constructor — or, in a file with no `class_name` to fall back on, with a bare `_init(...)`
+/// placeholder — while `documentSymbol` was reporting the real signature all along.
+fn script_init_sig(
+    state: &ServerState,
+    text: &str,
+    fid: gd_project::FileId,
+    class_path: &[String],
+) -> Option<Vec<Sig>> {
+    // `_init` may be declared on the class itself or inherited; the owning class's own declaration
+    // is the common case (a constructor is rarely inherited as-is). Try it first.
+    if let Some(sig) = script_method_sig(state, text, fid, class_path, "_init") {
         return Some(sig);
     }
-    // No explicit `_init` — the implicit no-arg constructor.
-    let class = state
-        .workspace
-        .index
-        .interface(fid)
-        .and_then(|i| i.class_name.clone())
+    // No explicit `_init` — the implicit no-arg constructor, named for the class actually being
+    // constructed rather than the file's root class.
+    let iface = state.workspace.index.interface(fid);
+    let class = class_path
+        .last()
+        .cloned()
+        .or_else(|| iface.and_then(|i| i.class_name.clone()))
         .unwrap_or_else(|| "_init".to_string());
     Some(vec![Sig::constructor(&class)])
 }
