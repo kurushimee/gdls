@@ -221,6 +221,26 @@ pub fn typed_container_element(t: VariantType) -> Option<VariantType> {
     })
 }
 
+/// `_variant_type_to_typed_array_element_type` (`gdscript_parser.cpp:5496`) reduced to the
+/// predicate `DataType::is_typed_container_type` (`:5520`) actually asks: is this one of the
+/// packed arrays? Those are the types whose native-property getters hand back a *copy*.
+pub fn is_packed_array(t: VariantType) -> bool {
+    use VariantType::*;
+    matches!(
+        t,
+        PackedByteArray
+            | PackedInt32Array
+            | PackedInt64Array
+            | PackedFloat32Array
+            | PackedFloat64Array
+            | PackedStringArray
+            | PackedVector2Array
+            | PackedVector3Array
+            | PackedColorArray
+            | PackedVector4Array
+    )
+}
+
 /// `Variant::get_type_name(p_type)` (`core/variant/variant.cpp:43`). Used in Godot's verbatim
 /// "Invalid operands to operator …" error message (analyzer.cpp:3130). Lowercase for the atomic
 /// types (`bool`/`int`/`float`/`Nil`) and capitalized for the rest, matching Godot exactly.
@@ -367,6 +387,11 @@ pub struct DataType {
 }
 
 impl DataType {
+    /// `DataType::is_typed_container_type` (`gdscript_parser.cpp:5520`): a builtin packed array.
+    pub fn is_typed_container_type(&self) -> bool {
+        self.kind == DtKind::Builtin && is_packed_array(self.builtin_type)
+    }
+
     /// Godot `is_set()`: a determined kind (not `Resolving`/`Unresolved`).
     #[inline]
     pub fn is_set(&self) -> bool {
@@ -497,6 +522,9 @@ impl std::fmt::Display for DataType {
                 // render as `Array[T]` / `Dictionary[K, V]`. Unparameterized variants fall through
                 // to the bare builtin name.
                 match self.builtin_type {
+                    // gdscript_parser.cpp:5341 — a builtin `NIL` renders as `null`, not as
+                    // `Variant::get_type_name(NIL)`'s `"Nil"`. Same at both supported tags.
+                    VariantType::Nil => f.write_str("null"),
                     VariantType::Array if !self.container_element_types.is_empty() => {
                         write!(f, "Array[{}]", self.container_element_types[0])
                     }

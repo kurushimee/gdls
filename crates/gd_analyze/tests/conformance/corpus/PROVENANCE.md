@@ -9,13 +9,24 @@ This directory is a vendored, fixed copy of Godot's GDScript golden-file test co
 | | |
 |---|---|
 | Repo | `godotengine/godot` |
-| Reference release | `4.6.3-stable` (commit `7d41c59c`) |
 | Subtree vendored | `modules/gdscript/tests/scripts/analyzer/` |
-| Vendored on | 2026-05-23 |
+
+## Suites
+
+gdls serves more than one Godot feature release, and their goldens differ. Each supported release is one **suite**: a corpus tree plus the dialect its goldens were generated at. `conformance.rs` walks every suite and reports one aggregate fidelity number, so no file can be lost by moving between them.
+
+| Suite | Directory | Reference release | Vendored on |
+|---|---|---|---|
+| 4.6 | `analyzer/` | `4.6.3-stable` (commit `7d41c59c`) | 2026-05-23 |
+| 4.7 | `analyzer-4.7/` | `4.7.2-stable` (commit `ed1daf0b`) | 2026-08-29 |
+
+The **oldest** supported release carries the full vendored tree; every newer one carries only the files that actually diverge from it. A version bump is therefore "vendor the new release's full corpus, then demote the previous full tree to its divergence subset" — never a wholesale copy of files that are identical across the two.
 
 ## What is here, and what is not
 
-Only `analyzer/` is vendored: `errors/` (170), `features/` (107), and `warnings/` (23), giving 300 testable `.gd` plus 300 `.out`, along with 28 `*.notest.gd` multi-file companions. Those companions have no `.out`; they are loaded into the index so the file under test can resolve cross-file references, and are never run standalone.
+Only `analyzer/` is vendored: at 4.6.3, `errors/` (170), `features/` (107), and `warnings/` (23), giving 300 testable `.gd` plus 300 `.out`, along with 28 `*.notest.gd` multi-file companions. Those companions have no `.out`; they are loaded into the index so the file under test can resolve cross-file references, and are never run standalone.
+
+The 4.7 subset is the files whose goldens 4.7 changed or added: `untyped_override_return_incompatible_type`, `untyped_override_untyped_return`, `untyped_override_return_compatible_type` (an untyped override now inherits the parent's return type) and `constant_expressions` (the new constant-folding fallback reducers).
 
 `runtime/` is not vendored, since its `.out` files are dominated by VM stdout, which the diagnostics-only frontend port does not produce. `completion/` and `lsp/` are intentionally excluded, as Godot's own runner skips them too.
 

@@ -17,14 +17,17 @@
 //! then, an un-fold-able binary/unary op typesafe-degrades to `Variant` — the project's "unknown
 //! stays dynamic, never a phantom error" rule (`docs/00`).
 
+use gd_syntax::ast::SubscriptAccess;
 use gd_syntax::ast::{BinaryOp, NodeId, NodeKind, UnaryOp};
 use gd_syntax::token::Literal;
+use gd_syntax::Dialect;
 
 use crate::binding::{Binding, BindingTargetKind as BindingSymbolKind, CalleeTarget};
 use crate::context::AnalysisContext;
 use crate::data_type::{self, DataType, DtKind, TypeSource, VariantType};
 use crate::foldtable::{FoldedValue, UtilityCallableId, UtilityScope};
 use crate::resolver::type_from_metatype;
+use crate::warnings::WarningCode;
 
 /// Bare identifier of the enclosing concrete (non-lambda) function, for recording
 /// `Binding::Call.caller_function` (it is the raw `i.name`, never class-qualified — see that
@@ -2867,6 +2870,10 @@ fn reduce_assignment(ctx: &mut AnalysisContext, id: NodeId) {
         reduce_expression(ctx, a, false);
     }
 
+    // analyzer.cpp:2923 — after the assignee is reduced (so the subscript chain is typed) and
+    // after the capture-reassignment block, before the missing-side guards.
+    warn_confusable_temporary_modification(ctx, id);
+
     let (Some(assignee_id), Some(value_id)) = (assign.assignee, assign.assigned_value) else {
         // analyzer.cpp:2905-2907 — bail when either side is missing (parser-error path).
         return;
@@ -3639,6 +3646,10 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     }
                 }
             }
+            // analyzer.cpp:3607 — a call through a subscript callee. `reduce_subscript` never
+            // runs on a callee (the dispatcher reduces only its base), so this is the only place
+            // `points.clear()` can be seen.
+            warn_confusable_temporary_modification(ctx, callee);
         }
     } else {
         // analyzer.cpp:3584 — invalid call. Set Variant, return.
@@ -4718,8 +4729,8 @@ pub(crate) fn class_identifier_name_or_default(ctx: &AnalysisContext, dt: &DataT
 
 /// `return_dt` is the return type; the size pair is min/max arity for arg-count messages.
 #[derive(Default)]
-struct CallSig {
-    return_dt: DataType,
+pub(crate) struct CallSig {
+    pub(crate) return_dt: DataType,
     par_types: Vec<DataType>,
     min_params: usize,
     max_params: usize,
@@ -4738,7 +4749,7 @@ struct CallSig {
     /// `super.<v>()` that resolves to a parent-class virtual that the parent doesn't override emits
     /// `Cannot call the parent class' virtual function "<v>()" because it hasn't been defined.`.
     /// Only `lookup_native_method` sets it; in-file/script sigs leave it `false`.
-    is_virtual: bool,
+    pub(crate) is_virtual: bool,
     /// Whether `(min_params, max_params)` reflect the method's REAL parameter list and may drive
     /// the arity check (analyzer.cpp:5944). `false` for a native method seeded by
     /// `seed_dump_omitted_methods` — those carry an empty `params` purely so the name-existence
@@ -4951,7 +4962,11 @@ fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> 
 /// (analyzer.cpp:5923) for the arity check at analyzer.cpp:5944. Per-param types route through
 /// [`type_from_type_ref`] — `TypeRef::Named` for which the dump has no class / builtin entry degrades
 /// silently to Variant, mirroring the trimmed-dump permissiveness used across the rest of reduce_call.
-fn lookup_native_method(ctx: &AnalysisContext, native: &str, name: &str) -> Option<CallSig> {
+pub(crate) fn lookup_native_method(
+    ctx: &AnalysisContext,
+    native: &str,
+    name: &str,
+) -> Option<CallSig> {
     let mut cur = Some(native.to_owned());
     while let Some(c) = cur {
         let nc = ctx.native.class_named(&c)?;
@@ -5046,7 +5061,16 @@ fn reduce_type_test(ctx: &mut AnalysisContext, id: NodeId) {
     // `is Array[int]` test even though the lax-collections check would pass.
     let operand_is_constant = ctx.folds.get(operand).is_some();
     if operand_is_constant {
-        if !is_type_compatible_strict_collections(ctx, &test_type, &operand_type) {
+        // DIALECT(4.7): gdscript_analyzer.cpp reduce_type_test() —
+        // `is_type_compatible_strict_collections` did not exist at 4.6, which used the plain
+        // bidirectional-capable check here. So `[] is Array[int]` on a constant is an error at
+        // 4.7 and silent at 4.6.
+        let compatible = if ctx.dialect < Dialect::Godot4_7 {
+            is_type_compatible(ctx, &test_type, &operand_type, false)
+        } else {
+            is_type_compatible_strict_collections(ctx, &test_type, &operand_type)
+        };
+        if !compatible {
             let op_str = class_identifier_name_or_default(ctx, &operand_type);
             let test_str = class_identifier_name_or_default(ctx, &test_type);
             ctx.push_error(
@@ -5159,6 +5183,9 @@ fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: b
             }
         }
     }
+
+    // analyzer.cpp:5156 — after the subscript's own datatype is stamped.
+    warn_confusable_temporary_modification(ctx, id);
 }
 
 /// The `is_attribute` branch of `reduce_subscript` (analyzer.cpp:4779-4884), split out so the index
@@ -6329,6 +6356,10 @@ fn try_native_member(
     // 1. Property (analyzer.cpp:4317-4326). Walk inherits chain to find the declaring class.
     if let Some(prop) = lookup_native_property(ctx, native_name, name) {
         ctx.set_type(identifier_id, prop);
+        // Godot's `IdentifierNode::INHERITED_VARIABLE` source, plus the scope it was reached
+        // through — see `AnalysisContext::native_property_scope`.
+        ctx.native_property_scope
+            .insert(identifier_id, native_name.to_owned());
         // Godot marks the enclosing lambda `use_self` for an instance member reached through the
         // implicit `self` (analyzer.cpp:4428 MEMBER_VARIABLE). The explicit-base path
         // (`obj.position`, analyzer.cpp:4040-4378) has no such site, so only the implicit-self
@@ -7026,6 +7057,132 @@ fn reduce_lambda(ctx: &mut AnalysisContext, id: NodeId) {
             captured_suite_stack: ctx.suite_stack.clone(),
             captured_lambda_stack: ctx.current_lambda_stack.clone(),
         });
+}
+
+// ===================================================================================================
+// warn_confusable_temporary_modification — analyzer.cpp:6203 (4.7)
+// ===================================================================================================
+
+/// `GDScriptAnalyzer::warn_confusable_temporary_modification` (analyzer.cpp:6203), new in 4.7.
+///
+/// A native property whose type is a packed array is returned **by copy**, so
+/// `points[0] = Vector2.ONE` or `points.clear()` on `Line2D.points` modifies a temporary and the
+/// write is silently lost. The walk climbs the subscript chain from the assignee (or from the
+/// subscript itself), and at each link asks whether the base is a packed array that came out of a
+/// native property getter.
+///
+/// Two shapes produce two messages: a plain assignment chain names the property, and a call
+/// through a non-`const` builtin method also names the method.
+pub(crate) fn warn_confusable_temporary_modification(ctx: &mut AnalysisContext, expr_id: NodeId) {
+    // DIALECT(4.7): gdscript_warning.h — CONFUSABLE_TEMPORARY_MODIFICATION does not exist at 4.6.
+    if ctx.dialect < Dialect::Godot4_7 {
+        return;
+    }
+    let is_assignment = matches!(ctx.node(expr_id).kind, NodeKind::Assignment(_));
+    let mut current = match &ctx.node(expr_id).kind {
+        NodeKind::Assignment(a) => a.assignee,
+        NodeKind::Subscript(_) => Some(expr_id),
+        _ => return,
+    };
+
+    while let Some(cur) = current {
+        let NodeKind::Subscript(sub) = ctx.node(cur).kind.clone() else {
+            break;
+        };
+        let Some(base) = sub.base else {
+            break;
+        };
+        let base_dt = ctx.get_type(base).clone();
+        if base_dt.is_typed_container_type() && !base_dt.is_meta_type {
+            if let Some((base_id, scope_native)) = confusable_base_identifier(ctx, base) {
+                let name = subscript_identifier_name(ctx, base_id);
+                if !name.is_empty()
+                    && ctx.native_property_scope.get(&base_id) == Some(&scope_native)
+                    && lookup_native_property(ctx, &scope_native, &name).is_some()
+                {
+                    if is_assignment {
+                        ctx.push_warning(
+                            WarningCode::ConfusableTemporaryModification,
+                            &[scope_native.clone(), name.clone()],
+                            expr_id,
+                        );
+                    } else if let Some(member) = subscript_attribute_name(ctx, cur) {
+                        // Only a *mutating* builtin method loses the write; `points.size()` is
+                        // `const` and reads the copy harmlessly.
+                        if builtin_method_is_mutating(ctx, base_dt.builtin_type, &member) {
+                            ctx.push_warning(
+                                WarningCode::ConfusableTemporaryModification,
+                                &[scope_native.clone(), name.clone(), member],
+                                cur,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        current = Some(base);
+    }
+}
+
+/// The identifier a subscript chain's base names, plus the native class its lookup was scoped to.
+///
+/// `points[0]` bottoms out in a bare `Identifier`, scoped to the current class's native root
+/// (Godot's `type_from_metatype(current_class->datatype).native_type`). `base.points[0]` bottoms
+/// out in an attribute subscript, scoped to the attribute base's own native type.
+fn confusable_base_identifier(ctx: &AnalysisContext, base: NodeId) -> Option<(NodeId, String)> {
+    match &ctx.node(base).kind {
+        NodeKind::Identifier(_) => {
+            let class_id = ctx.current_class?;
+            let native = crate::resolver::nearest_native_ancestor(ctx, class_id)?;
+            Some((base, native))
+        }
+        NodeKind::Subscript(sub) => {
+            let SubscriptAccess::Attribute(attr) = sub.access? else {
+                return None;
+            };
+            let attr = attr?;
+            let scope = ctx.get_type(sub.base?).native_type.clone();
+            if scope.is_empty() {
+                return None;
+            }
+            Some((attr, scope))
+        }
+        _ => None,
+    }
+}
+
+/// The attribute name a subscript reads (`points.clear` → `clear`), or `None` for an index.
+fn subscript_attribute_name(ctx: &AnalysisContext, subscript: NodeId) -> Option<String> {
+    let NodeKind::Subscript(sub) = &ctx.node(subscript).kind else {
+        return None;
+    };
+    let SubscriptAccess::Attribute(attr) = sub.access? else {
+        return None;
+    };
+    let name = subscript_identifier_name(ctx, attr?);
+    (!name.is_empty()).then_some(name)
+}
+
+/// `Variant::has_builtin_method(t, m) && !Variant::is_builtin_method_const(t, m)`.
+fn builtin_method_is_mutating(ctx: &AnalysisContext, builtin: VariantType, member: &str) -> bool {
+    let Some(bt) = ctx
+        .native
+        .builtin_named(crate::data_type::variant_type_name(builtin))
+    else {
+        return false;
+    };
+    bt.methods
+        .iter()
+        .find(|m| ctx.native.name_of(m.name) == member)
+        .is_some_and(|m| !m.is_const)
+}
+
+/// The text of an `Identifier` node, or `""` for anything else.
+fn subscript_identifier_name(ctx: &AnalysisContext, id: NodeId) -> String {
+    match &ctx.node(id).kind {
+        NodeKind::Identifier(i) => i.name.clone(),
+        _ => String::new(),
+    }
 }
 
 #[cfg(test)]

@@ -216,6 +216,14 @@ pub struct AnalysisContext<'a> {
     /// Mirrors Godot's choice to invoke `reduce_identifier_from_base` (no-access-check) from
     /// `reduce_call` rather than the standalone `reduce_identifier` (with-access-check).
     pub reducing_callee: bool,
+    /// Identifiers that resolved to a **native** (ClassDB) property, mapped to the native class the
+    /// lookup started from — Godot's `IdentifierNode::INHERITED_VARIABLE` source plus the
+    /// `scope_type.native_type` it reports. `warn_confusable_temporary_modification`
+    /// (analyzer.cpp:6203) is the only reader: it needs to know a packed-array value came out of a
+    /// native property getter, which returns a *copy*, so writing through it is silently lost.
+    /// Recorded at the single choke point (`try_native_member`'s property arm) rather than
+    /// re-derived, since re-running identifier resolution would re-emit its diagnostics.
+    pub native_property_scope: FxHashMap<NodeId, String>,
     /// The nearest **concrete** (non-lambda) function in the current resolution path. When a
     /// lambda body is being resolved, `current_function` points at the lambda's synthesized
     /// FunctionNode (so identifier / parameter lookup works) while `concrete_function` continues
@@ -380,6 +388,7 @@ impl<'a> AnalysisContext<'a> {
             current_resolving_member: None,
             static_context: false,
             reducing_callee: false,
+            native_property_scope: FxHashMap::default(),
             concrete_function: None,
             pending_lambda_bodies: Vec::new(),
             current_lambda_stack: Vec::new(),
