@@ -1070,3 +1070,72 @@ fn string_node_path_plain_slash_segment_unchanged() {
         "the last `/`-delimited segment is replaced"
     );
 }
+
+// ===================================================================================================
+// Declaration names offer nothing (Godot's `COMPLETION_DECLARATION`, 4.7 parser lines 941/1003/
+// 1238/1476/1546/1594 — and the same empty result at 4.6, which never opens a context there).
+// ===================================================================================================
+
+#[test]
+fn bare_declaration_keyword_offers_nothing() {
+    for m in [
+        "var |",
+        "const |",
+        "signal |",
+        "enum |",
+        "class |",
+        "class_name |",
+        "static var |",
+        "func f():\n\tvar |",
+        "func f():\n\tconst |",
+    ] {
+        assert_eq!(at(m).kind, CompletionKind::None, "fixture {m:?}");
+    }
+}
+
+#[test]
+fn partial_declaration_name_offers_nothing() {
+    // The user is inventing a name; every identifier in scope is a name already taken.
+    for m in [
+        "var spe|",
+        "const FO|",
+        "signal hea|",
+        "enum Sta|",
+        "class Inn|",
+        "class_name Pla|",
+        "static var sha|",
+        "func f():\n\tvar loc|",
+    ] {
+        let ctx = at(m);
+        assert_eq!(ctx.kind, CompletionKind::None, "fixture {m:?}");
+        assert_eq!(ctx.prefix, None, "a suppressed context carries no prefix");
+    }
+}
+
+#[test]
+fn declaration_suppression_stops_at_the_name() {
+    // Only the name position is suppressed — the type, the initializer, and `extends` after a
+    // `class_name` all keep their own contexts.
+    assert_eq!(
+        at("func f():\n\tvar speed: Vec|").kind,
+        CompletionKind::TypeName
+    );
+    // At class level the same `:` is Godot's `COMPLETION_PROPERTY_DECLARATION_OR_TYPE`, since the
+    // declaration could still turn into a property block.
+    assert_eq!(
+        at("var speed: Vec|").kind,
+        CompletionKind::PropertyDeclarationOrType
+    );
+    assert_eq!(at("var speed = |").kind, CompletionKind::Assign);
+    assert_eq!(
+        at("class_name Player extends Nod|").kind,
+        CompletionKind::InheritType
+    );
+    assert_eq!(
+        at("class Inner extends Nod|").kind,
+        CompletionKind::InheritType
+    );
+    // `func <name>` is a declaration too, but Godot gives it override-method completion, not
+    // `COMPLETION_DECLARATION`. It must not be swept up here.
+    assert_eq!(at("func _rea|").kind, CompletionKind::OverrideMethod);
+}

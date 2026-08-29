@@ -418,11 +418,27 @@ pub struct Parser {
     depth: u32,
 }
 
-fn empty_token() -> Token {
+/// The default-constructed `Token` the parser's `previous` starts as.
+///
+/// DIALECT(4.7): gdscript_tokenizer.h `Token` — the four position fields default to `1` rather
+/// than `0`. The parser positions context-free errors at `previous`, so anything raised before the
+/// first `advance()` used to report line 0 / column 0; Godot's own comment calls that reading
+/// uninitialized memory, and an LSP conversion turned it into a negative position. Observable here
+/// through `reset_extents_from_previous` and `eof_line`, which stamp `previous.loc` onto nodes.
+fn empty_token(dialect: Dialect) -> Token {
+    let one = crate::span::LineCol::new(1, 1);
+    let loc = if dialect < Dialect::Godot4_7 {
+        crate::span::LineColRange::default()
+    } else {
+        crate::span::LineColRange {
+            start: one,
+            end: one,
+        }
+    };
     Token {
         kind: TokenKind::Empty,
         span: ByteSpan::default(),
-        loc: crate::span::LineColRange::default(),
+        loc,
         literal: None,
         source: Box::from(""),
     }
@@ -442,7 +458,7 @@ impl Parser {
             dialect: options.dialect,
             script_path: options.script_path.to_owned(),
             lexer,
-            previous: empty_token(),
+            previous: empty_token(options.dialect),
             current,
             panic_mode: false,
             tree: ParseTree::new(),
@@ -1314,8 +1330,20 @@ impl Parser {
 
         if self.previous.kind == TokenKind::Super {
             is_super = true;
-            if self.check(TokenKind::ParenthesisOpen) {
+            // DIALECT(4.7): gdscript_parser.cpp parse_call() — 4.6 entered multiline mode on
+            // seeing `super` at all, so a malformed `super` (one with no parentheses) left the
+            // tokenizer swallowing NEWLINE/INDENT/DEDENT and cascaded junk errors across the
+            // lines that followed. 4.7 enters it only once the `(` is really there. Every message
+            // and position is identical either way; what differs is the follow-on error set after
+            // a bad `super`.
+            let eager_multiline = self.dialect < Dialect::Godot4_7;
+            if eager_multiline {
                 self.push_multiline(true);
+            }
+            if self.check(TokenKind::ParenthesisOpen) {
+                if !eager_multiline {
+                    self.push_multiline(true);
+                }
                 self.advance();
                 match self.current_function {
                     None => {
@@ -1336,6 +1364,9 @@ impl Parser {
                     TokenKind::Identifier,
                     r#"Expected function name after "."."#,
                 ) {
+                    if eager_multiline {
+                        self.pop_multiline();
+                    }
                     self.complete_extents(id);
                     return None;
                 }
@@ -1345,10 +1376,17 @@ impl Parser {
                     .map(|i| self.identifier_name(i))
                     .unwrap_or_default();
                 if self.check(TokenKind::ParenthesisOpen) {
-                    self.push_multiline(true);
+                    if !eager_multiline {
+                        self.push_multiline(true);
+                    }
                     self.advance();
                 } else {
+                    // 4.6 raised this through `consume`, which positions at `previous` exactly as
+                    // this bare `push_error` does — the text and span are the same.
                     self.push_error(r#"Expected "(" after function name."#);
+                    if eager_multiline {
+                        self.pop_multiline();
+                    }
                     self.complete_extents(id);
                     return None;
                 }
@@ -1895,6 +1933,23 @@ impl Parser {
                 }
             }
         }
+
+        // DIALECT(4.7): gdscript_parser.cpp parse_class_name() — a script embedded in a scene or
+        // resource cannot declare a global class name. The check is purely lexical on the script
+        // path: `res://` prefix plus a `::` marker, which is how Godot spells a built-in script
+        // (`res://main.tscn::GDScript_abc12`). Raised after the identifier has already been
+        // recorded, so the AST still carries the name.
+        //
+        // gdls is handed a real file path for every buffer it serves, so this is dormant in
+        // practice; it is ported because a caller may pass a `res://` path, and because a silent
+        // gap is worse than an unused branch.
+        if self.dialect >= Dialect::Godot4_7
+            && self.script_path.starts_with("res://")
+            && self.script_path.contains("::")
+        {
+            self.push_error(r#""class_name" isn't allowed in built-in scripts."#);
+        }
+
         if self.match_token(TokenKind::Extends) {
             self.parse_extends();
             self.end_statement("superclass");
