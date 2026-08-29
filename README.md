@@ -3,7 +3,7 @@
 [![CI](https://github.com/kurushimee/gdls/actions/workflows/ci.yml/badge.svg)](https://github.com/kurushimee/gdls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-dea584.svg?logo=rust)](rust-toolchain.toml)
-[![Godot conformance](https://img.shields.io/badge/Godot%20conformance-parser%201.0000%20%7C%20analyzer%200.9898-brightgreen.svg)](docs/06-testing-fidelity.md)
+[![Godot conformance](https://img.shields.io/badge/Godot%20conformance-parser%201.0000%20%7C%20analyzer%201.0000-brightgreen.svg)](docs/06-testing-fidelity.md)
 
 One binary that gives Claude Code (or any LSP client) type-aware GDScript diagnostics and navigation over stdio, with no Godot engine or editor running.
 
@@ -65,7 +65,7 @@ godot --dump-extension-api-with-docs
 
 Diagnostics (push and pull), hover, definition, declaration, type definition, references, implementation, call hierarchy, type hierarchy, document and workspace symbols, completion, signature help, rename, document highlight, semantic tokens, inlay hints, document colors, code actions, folding and selection ranges, document links, and file-rename edits. Any editor gets the whole set with no gdls-specific client code and none of the Godot editor LSP's custom protocol. The full surface is in [`docs/05-lsp-cc-integration.md`](docs/05-lsp-cc-integration.md), and the capabilities gdls deliberately does not serve, with reasons, are in [`docs/09-lsp-conventions.md`](docs/09-lsp-conventions.md) §5.
 
-Against Godot's own vendored corpus, the parser ratchet sits at 1.0000 (185/185) and the analyzer at 0.9898 (194/196). The two analyzer misses are listed with what each needs in `crates/gd_analyze/tests/conformance/analyze_known_failures.txt`.
+Against Godot's own vendored corpus, both ratchets sit at 1.0000 — the parser at 185/185 and the analyzer at 196/196, with empty known-failures lists on either side.
 
 The latest release is v3.0.0. [`CHANGELOG.md`](CHANGELOG.md) has the release history, and [`docs/08-history.md`](docs/08-history.md) has how the project was built.
 

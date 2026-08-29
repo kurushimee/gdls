@@ -933,11 +933,16 @@
 # analyzer ones — a truncated `Variant.Type` in `trimmed_api.json` (#313) and the unindexed
 # `utils.notest.gd` (#312). With those closed the hedge is gone (#300), replaced by the
 # `ApiProvenance::Exact` gate the sibling negatives already use, and this file passes.
-# The same hole from the call side, plus the enum-callee arm it feeds. Needs four coupled pieces:
-# `can_be_builtin` threaded into `reduce_identifier` (analyzer.cpp:4645-4652) for `Global enum "X"
-# cannot be used on its own.`; the ENUM-meta arm in `reduce_call` (analyzer.cpp:3725-3730) so a
-# native or global enum answers `The native enum "X" does not behave like Dictionary ...` rather
-# than gdls's current Dictionary-method error; the `Static function "f()" not found in base "B".`
-# fallthrough; and `Native class X used in script doesn't exist or isn't exposed.`
-# (analyzer.cpp:5944) for a dotted native enum used as a call base.
-4.7/errors/enum_declaration_and_usage.gd
+# `enum_declaration_and_usage.gd` was the same hole from the call side, plus the enum-callee arm
+# it feeds. It took four coupled pieces (#325): `can_be_builtin` threaded into `reduce_identifier`
+# (analyzer.cpp:4646-4652) for `Global enum "X" cannot be used on its own.`; the ENUM-meta arm in
+# `reduce_call` (analyzer.cpp:3724-3730), which branches on the enum's own `builtin_type` so a
+# native or global enum answers `The native enum "X" does not behave like Dictionary ...` instead
+# of the Dictionary-method error only a script enum earns; the `Static function "f()" not found in
+# base "B".` fallthrough widened from `Class` metas to `Enum` and `Variant` ones; and
+# `Native class X used in script doesn't exist or isn't exposed.` (analyzer.cpp:5944) for a dotted
+# native enum used as a call base, which needed the subscript `!valid` arm to stop wiping the
+# degraded type's `native_type` (analyzer.cpp:4913 sets the KIND only).
+#
+# The list is empty: analyze fidelity is 196/196 = 1.0000. Keep it that way — a new entry here is
+# a regression unless the same PR explains why the file cannot pass.

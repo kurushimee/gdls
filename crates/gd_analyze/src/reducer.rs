@@ -1319,6 +1319,9 @@ fn folded_key_display(v: &FoldedValue) -> String {
 /// list, then the current class's members + the in-file class-base chain, then native/global/
 /// builtin lookups.
 fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
+    // Godot's `can_be_builtin` parameter, taken off the context and cleared so a nested reduction
+    // started from here does not inherit it. See [`reduce_identifier_with_flags`].
+    let can_be_builtin = std::mem::take(&mut ctx.identifier_can_be_builtin);
     let name = match &ctx.node(id).kind {
         NodeKind::Identifier(i) => i.name.clone(),
         _ => return,
@@ -1653,6 +1656,15 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     if ctx.native.global_enum(&name).is_some() {
         let dt = crate::resolver::make_global_enum_type(ctx, &name, "", true);
         ctx.set_type(id, dt);
+        // analyzer.cpp:4646-4652 — the enum NAME on its own is a pseudo-type. Only a subscript
+        // base may spell it (`Side.CORNER_LEFT`); anywhere else — including the base of a call
+        // callee, which `reduce_call` reduces through plain `reduce_expression` — it is an error.
+        if !can_be_builtin {
+            ctx.push_error(
+                format!(r#"Global enum "{name}" cannot be used on its own."#),
+                id,
+            );
+        }
         return;
     }
 
@@ -3886,6 +3898,31 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         return;
     }
 
+    // analyzer.cpp:5939-5945 — before any method walk, Godot rejects a base whose `native_type`
+    // names a class ClassDB does not know: `Native class %s used in script doesn't exist or isn't
+    // exposed.`, then returns false so the not-found branch runs. The shape that reaches it here
+    // is a pseudo-type that already failed its own "cannot be used on its own" check — the
+    // subscript arm keeps `native_type` (`"Vector3.Axis"`, `"TileSet.TileShape"`) while dropping
+    // the kind to `Variant`, and no such dotted name is a ClassDB class.
+    //
+    // Narrowed against upstream on purpose: `Class` / `Script` bases carry the native_type of
+    // their *extends* ancestor, which for a GDExtension root is legitimately absent from a stock
+    // `extension_api.json` even at `Exact` provenance, so asserting non-existence there would be
+    // a false positive on exactly the projects gdls is meant to serve. Godot has the whole
+    // ClassDB and needs no such carve-out. Builtin and Enum bases return earlier upstream and are
+    // excluded for the same reason they are there.
+    if matches!(base_type.kind, DtKind::Variant | DtKind::Native)
+        && !base_type.native_type.is_empty()
+        && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+        && ctx.native.class_named(&base_type.native_type).is_none()
+    {
+        let native = base_type.native_type.clone();
+        ctx.push_error(
+            format!("Native class {native} used in script doesn't exist or isn't exposed."),
+            id,
+        );
+    }
+
     // --- Method/return-type resolution -----------------------------------------------------------
     // analyzer.cpp:3610 — `get_function_signature` walks the native + script + in-file class
     // hierarchy looking for a method by name. E3f does a narrower lookup that covers the cases
@@ -4193,13 +4230,19 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             }
         }
     }
-    // analyzer.cpp:5937-5942 — enum base: look up Dictionary methods, reject non-const.
-    // analyzer.cpp:5937-5942 — enum base: look up Dictionary methods, reject non-const.
-    if !found && base_type.kind == DtKind::Enum {
-        if let Some(s) = lookup_builtin_method(ctx, VariantType::Dictionary, &function_name) {
+    // analyzer.cpp:5901-5911 + 5928-5933 — enum base. Godot rewrites a **meta** enum into a
+    // BUILTIN of the enum's own `builtin_type` and searches that Variant's method table. Only a
+    // script-declared enum carries `DICTIONARY` there; `make_native_enum_type` /
+    // `make_builtin_enum_type` / `make_global_enum_type` all stamp `NIL` ("… are not
+    // dictionaries"), whose method table is empty, so `Side.size()` finds nothing and falls
+    // through to the native-enum error below. A non-meta enum (an enum *value*) is not callable
+    // at all.
+    if !found && base_type.kind == DtKind::Enum && base_type.is_meta_type {
+        let enum_builtin = base_type.builtin_type;
+        if let Some(s) = lookup_builtin_method(ctx, enum_builtin, &function_name) {
             let method_is_const = ctx
                 .native
-                .builtin_named("Dictionary")
+                .builtin_named(data_type::variant_type_name(enum_builtin))
                 .and_then(|bt| {
                     bt.methods
                         .iter()
@@ -4513,8 +4556,48 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             None => None,
         };
 
+        // analyzer.cpp:3724-3730 — an enum METAtype has no methods of its own beyond the
+        // Dictionary ones a script-declared enum borrows. Godot branches on the enum's
+        // `builtin_type`: `DICTIONARY` for a script enum (so the miss is a real Dictionary-method
+        // miss), `NIL` for a native / built-in / global one (which never behaved like a Dictionary
+        // at all). This arm is an `else if` chain head upstream, so the callee-as-value resolution
+        // below is skipped for it.
+        //
+        // The DICTIONARY half is a negative claim about the dump's `Dictionary` method table, so
+        // it carries the usual `Exact` gate; the NIL half claims nothing about the dump — a
+        // NIL-typed enum meta has no method table by construction (analyzer.cpp:174-176 and its
+        // built-in / global twins) — so it fires unconditionally.
+        let mut enum_meta_base = false;
+        if base_type.kind == DtKind::Enum && base_type.is_meta_type {
+            let enum_name = if base_type.enum_type.is_empty() {
+                base_type.native_type.clone()
+            } else {
+                base_type.enum_type.clone()
+            };
+            let anchor = call.callee.unwrap_or(id);
+            if base_type.builtin_type == VariantType::Dictionary {
+                if ctx.native.provenance() == gd_types::ApiProvenance::Exact {
+                    enum_meta_base = true;
+                    ctx.push_error(
+                        format!(
+                            r#"Enums only have Dictionary built-in methods. Function "{function_name}()" does not exist for enum "{enum_name}"."#
+                        ),
+                        anchor,
+                    );
+                }
+            } else {
+                enum_meta_base = true;
+                ctx.push_error(
+                    format!(
+                        r#"The native enum "{enum_name}" does not behave like Dictionary and does not have methods of its own."#
+                    ),
+                    anchor,
+                );
+            }
+        }
+
         let mut name_is_value = false;
-        if !call.is_super {
+        if !enum_meta_base && !call.is_super {
             if let Some(callee) = callee_id {
                 reduce_identifier_from_base(ctx, callee, Some(&base_type));
                 let cdt = ctx.get_type(callee).clone();
@@ -4606,7 +4689,10 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             && !is_self
             && base_type.is_hard_type()
             && base_type.is_meta_type
-            && base_type.kind == DtKind::Class
+            && matches!(
+                base_type.kind,
+                DtKind::Class | DtKind::Enum | DtKind::Variant
+            )
         {
             // analyzer.cpp:3746-3747 — static-call fall-through on a meta base
             // (e.g. `MyClass.not_existing_method()`). gdls only emits on in-file `Class` meta
@@ -5474,7 +5560,12 @@ fn reduce_subscript_attribute(
                 attr_id,
             );
         }
-        result_type = DataType::variant();
+        // analyzer.cpp:4913 — Godot sets the KIND only; every other field the attribute lookup
+        // already stamped survives. That matters downstream: `Vector3.Axis` keeps
+        // `native_type = "Vector3.Axis"`, `is_meta_type`, and the enum's ANNOTATED_EXPLICIT
+        // source, which is what lets a following `.size()` call report the unexposed native
+        // class and then the static-function miss on base "Variant".
+        result_type.kind = DtKind::Variant;
     }
 
     ctx.set_type(sub_id, result_type);
@@ -6869,15 +6960,16 @@ fn builtin_variant_from_name(name: &str) -> Option<VariantType> {
 }
 
 /// Thin wrapper over [`reduce_identifier`] that honors the `can_be_builtin` flag. Godot's
-/// `reduce_identifier(..., bool can_be_builtin)` errors on a standalone builtin name (analyzer.cpp:
-/// 4531-4539) — the standalone-error gate joins with WP-F when its hosting context (call/subscript)
-/// has full reducers; until then this just exposes the builtin metatype (matches the existing
-/// behavior of [`reduce_identifier`]).
-fn reduce_identifier_with_flags(ctx: &mut AnalysisContext, id: NodeId, _can_be_builtin: bool) {
-    // The flag plumbing is here so future E3 slices can wire the standalone-builtin gate without
-    // touching every caller; right now the underlying reduce_identifier already exposes builtins
-    // unconditionally, which is what the corpus expects.
+/// `reduce_identifier(..., bool can_be_builtin)` (analyzer.cpp:4388) takes the flag as a
+/// parameter; gdls carries it on the context so `reduce_expression`'s dispatcher keeps upstream's
+/// signature. The flag reaches two gates: the standalone-builtin-name error (analyzer.cpp:
+/// 4557-4562), still deliberately unwired here since gdls exposes the metatype unconditionally,
+/// and the global-enum gate at analyzer.cpp:4646-4652, which is live.
+fn reduce_identifier_with_flags(ctx: &mut AnalysisContext, id: NodeId, can_be_builtin: bool) {
+    let prev = ctx.identifier_can_be_builtin;
+    ctx.identifier_can_be_builtin = can_be_builtin;
     reduce_expression(ctx, id, false);
+    ctx.identifier_can_be_builtin = prev;
 }
 
 // ===================================================================================================
