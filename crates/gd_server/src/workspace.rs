@@ -200,7 +200,7 @@ impl Workspace {
             "dialect: reading scripts as Godot {dialect} (origin: {dialect_origin:?},              project.godot declared: {:?})",
             project.declared_engine_version,
         );
-        let native = load_native(options, &project, root);
+        let native = load_native(options, &project, root, dialect);
 
         // Build the cache key for warm-start attempt.
         let key = build_cache_key(&native, root, dialect);
@@ -1032,7 +1032,7 @@ impl Workspace {
         // Mid-session reloads never spawn Godot (no resolution path does since v1.0.2); a
         // `.gdextension` change marks the auto-dump meta stale and the next startup's background
         // dump refreshes it.
-        let native = load_native(options, &self.project, &root);
+        let native = load_native(options, &self.project, &root, self.dialect);
         // No content-hash dedupe here: a doc-XML merge changes the DB without changing the dump
         // text the hash covers, and this path IS the doc-XML/gdextension reaction.
         self.adopt_native(native, false);
@@ -1051,7 +1051,7 @@ impl Workspace {
     /// only on `true`. Never spawns Godot — see [`Self::reload_project_and_native`].
     pub fn reload_native(&mut self, options: &InitializationOptions) -> bool {
         let root = self.project.root.clone();
-        let native = load_native(options, &self.project, &root);
+        let native = load_native(options, &self.project, &root, self.dialect);
         self.adopt_native(native, true)
     }
 
@@ -1883,6 +1883,7 @@ fn load_native(
     options: &InitializationOptions,
     project: &ProjectModel,
     root: &Utf8Path,
+    dialect: Dialect,
 ) -> NativeDb {
     let mut db = match options.extension_api_path.as_deref() {
         Some(path) => match NativeDb::load(path) {
@@ -1898,7 +1899,7 @@ fn load_native(
                 // stock surface (Generic provenance) before degrading to the empty DB.
                 match options
                     .embedded_api_fallback
-                    .then(crate::api_dump::embedded_stock_db)
+                    .then(|| crate::api_dump::embedded_stock_db(dialect))
                     .flatten()
                 {
                     Some(db) => {
@@ -1918,7 +1919,7 @@ fn load_native(
         // No explicit path: the managed resolution — fresh .gdls dump → stale dump →
         // project-root file → embedded stock → empty (crate::api_dump has the full ladder +
         // logs). Never spawns; the auto-dump is `spawn_background_dump`'s job.
-        None => crate::api_dump::resolve_native_db(options, project, root),
+        None => crate::api_dump::resolve_native_db(options, project, root, dialect),
     };
 
     let mut merged = 0usize;
@@ -1953,7 +1954,71 @@ fn load_native(
     if merged > 0 {
         log::info!("merged {merged} GDExtension class(es) from doc XML");
     }
+    if let Some(notice) = version_mismatch_notice(&db, dialect) {
+        log::warn!("native API: {notice}");
+    }
     db
+}
+
+/// Say so when the native surface gdls ended up with is not the release the project is read as.
+///
+/// Every source but the embedded fallback can disagree with the dialect: a pinned
+/// `extensionApiPath` left over from an upgrade, a cached auto-dump from the binary that used to
+/// be on `PATH`, a checked-in `extension_api.json`. Signatures, enum values, and the class list all
+/// shift between feature releases, so a mismatch shows up as diagnostics the user cannot explain
+/// from their own code. It stays a log line rather than a diagnostic: the dump is still the best
+/// answer available, and refusing it would leave every engine type dynamic.
+///
+/// `None` when they agree, and when the dump carries no version at all — an empty DB or a
+/// hand-written test fixture has nothing to disagree with.
+fn version_mismatch_notice(db: &NativeDb, dialect: Dialect) -> Option<String> {
+    let header = db.header();
+    let (major, minor) = dialect.version();
+    if header.version_major == 0 || (header.version_major, header.version_minor) == (major, minor) {
+        return None;
+    }
+    Some(format!(
+        "the loaded dump is Godot {}.{} but scripts are read as Godot {dialect} — engine \
+         signatures, enum values, and the class list differ between releases, so some diagnostics \
+         will not match what Godot reports. Point extensionApiPath or godotBinaryPath at a \
+         {dialect} build, or set the dialect explicitly.",
+        header.version_major, header.version_minor,
+    ))
+}
+
+#[cfg(test)]
+mod version_mismatch_tests {
+    use super::*;
+
+    fn db_at(major: u32, minor: u32) -> NativeDb {
+        let json = format!(
+            r#"{{"header":{{"version_major":{major},"version_minor":{minor},"version_patch":0}},
+                "classes":[],"builtin_classes":[],"global_enums":[],"global_constants":[],
+                "utility_functions":[],"singletons":[]}}"#
+        );
+        NativeDb::from_json(&json).expect("fixture dump must ingest")
+    }
+
+    #[test]
+    fn a_matching_dump_says_nothing() {
+        assert!(version_mismatch_notice(&db_at(4, 7), Dialect::Godot4_7).is_none());
+        assert!(version_mismatch_notice(&db_at(4, 6), Dialect::Godot4_6).is_none());
+    }
+
+    #[test]
+    fn a_dump_from_another_release_names_both_versions() {
+        let notice = version_mismatch_notice(&db_at(4, 6), Dialect::Godot4_7)
+            .expect("a 4.6 dump under a 4.7 project must be called out");
+        assert!(notice.contains("Godot 4.6"), "{notice}");
+        assert!(notice.contains("Godot 4.7"), "{notice}");
+    }
+
+    /// An empty DB (no native source at all) has no version to disagree with, and the "native API
+    /// unavailable" path already said so — a second, wronger line would just be noise.
+    #[test]
+    fn a_versionless_dump_says_nothing() {
+        assert!(version_mismatch_notice(&NativeDb::empty(), Dialect::Godot4_7).is_none());
+    }
 }
 
 #[cfg(test)]
