@@ -197,7 +197,8 @@ impl Workspace {
             project_outcome == LoadOutcome::Loaded,
         );
         log::info!(
-            "dialect: reading scripts as Godot {dialect} (origin: {dialect_origin:?},              project.godot declared: {:?})",
+            "dialect: reading scripts as Godot {dialect} (origin: {dialect_origin:?}, \
+             project.godot declared: {:?})",
             project.declared_engine_version,
         );
         let native = load_native(options, &project, root, dialect);

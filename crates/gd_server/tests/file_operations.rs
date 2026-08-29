@@ -1573,3 +1573,102 @@ fn fail_closed_unsafe_tscn_rewrite_keeps_warning() {
 
     shutdown(&client, thread);
 }
+
+// ---------------------------------------------------------------------------------------------
+// 8. Autoload entries a move leaves dangling get a warning (#309)
+// ---------------------------------------------------------------------------------------------
+
+/// Moving a script registered as an autoload leaves `project.godot`'s `[autoload]` entry pointing
+/// at a dead path. gdls deliberately does not edit `project.godot` (`docs/09` §6.7 scopes the edit
+/// to `preload`/`load` argument literals), so the empty edit set is right — but returning nothing
+/// at all told the user nothing, which is the degradation the sibling scene warning already covers.
+#[test]
+fn autoload_script_move_warns_that_project_godot_will_dangle() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\n\n[autoload]\n\nGameState=\"*res://autoload/game_state.gd\"\n",
+    );
+    p.write("extension_api.json", MINI_API);
+    p.write("autoload/game_state.gd", "extends Node\n\nvar score := 0\n");
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &["autoload/game_state.gd"]);
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    let params = RenameFilesParams {
+        files: vec![FileRename {
+            old_uri: file_uri(&p.root.join("autoload/game_state.gd"))
+                .as_str()
+                .to_string(),
+            new_uri: file_uri(&p.root.join("autoload/state.gd"))
+                .as_str()
+                .to_string(),
+        }],
+    };
+    client
+        .sender
+        .send(request(10, "workspace/willRenameFiles", params))
+        .unwrap();
+
+    let mut warned = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline && !warned {
+        match try_recv(&client, Duration::from_millis(200)) {
+            Some(Message::Notification(n)) if n.method == "window/showMessage" => {
+                let msg = n.params["message"].as_str().unwrap_or("");
+                warned = msg.contains("GameState") && msg.contains("autoload");
+            }
+            Some(_) => continue,
+            None => continue,
+        }
+    }
+    assert!(
+        warned,
+        "moving an autoload's script must warn that `project.godot` is left pointing at a dead path"
+    );
+    shutdown(&client, thread);
+}
+
+/// The warning is keyed on the autoload's RESOLVED target, so an unrelated move is silent — the
+/// message must not become noise on every rename.
+#[test]
+fn unrelated_move_does_not_warn_about_autoloads() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\n\n[autoload]\n\nGameState=\"*res://autoload/game_state.gd\"\n",
+    );
+    p.write("extension_api.json", MINI_API);
+    p.write("autoload/game_state.gd", "extends Node\n\nvar score := 0\n");
+    p.write("other.gd", "extends Node\n");
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &["other.gd"]);
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    let params = RenameFilesParams {
+        files: vec![FileRename {
+            old_uri: file_uri(&p.root.join("other.gd")).as_str().to_string(),
+            new_uri: file_uri(&p.root.join("moved.gd")).as_str().to_string(),
+        }],
+    };
+    client
+        .sender
+        .send(request(11, "workspace/willRenameFiles", params))
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if let Some(Message::Notification(n)) = try_recv(&client, Duration::from_millis(200)) {
+            if n.method == "window/showMessage" {
+                let msg = n.params["message"].as_str().unwrap_or("");
+                assert!(
+                    !msg.contains("autoload"),
+                    "an unrelated move must not warn about autoloads; got: {msg}"
+                );
+            }
+        }
+    }
+    shutdown(&client, thread);
+}

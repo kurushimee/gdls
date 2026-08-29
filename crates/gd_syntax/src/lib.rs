@@ -1,5 +1,6 @@
-//! `gd_syntax` — a faithful Rust port of Godot 4.6.3-stable's GDScript front-of-frontend: the tokenizer, the
-//! recursive-descent + Pratt parser, and the AST.
+//! `gd_syntax` — a faithful Rust port of Godot's GDScript front-of-frontend: the tokenizer, the
+//! recursive-descent + Pratt parser, and the AST. The unguarded body of every ported function
+//! mirrors [`Dialect::NEWEST`]; older releases are reached through `DIALECT(...)` guards.
 //!
 //! This crate has **no engine knowledge** (no type system, no native classes) so it can be fuzzed
 //! and unit-tested in isolation. M1 lands the tokenizer ([`token`] + the lexer), the [`ast`] arena,

@@ -1,5 +1,7 @@
-//! `gdls` — a standalone GDScript language server for Godot 4.6.3-stable,
-//! speaking LSP to Claude Code over stdio with no Godot process at runtime.
+//! `gdls` — a standalone GDScript language server for Godot, speaking LSP to Claude Code over
+//! stdio with no Godot process at runtime. One binary serves every release from
+//! [`Dialect::OLDEST`](gd_syntax::Dialect::OLDEST) to
+//! [`Dialect::NEWEST`](gd_syntax::Dialect::NEWEST), picked per project.
 //!
 //! The binary is a thin wrapper; all logic lives in the `gd_server` library so it can be
 //! integration-tested over an in-memory connection.
@@ -25,6 +27,7 @@ use camino::Utf8PathBuf;
 use gd_server::bench::{BenchRecorder, DEFAULT_TRACE_CAPACITY};
 use gd_server::config::InitializationOptions;
 use gd_server::Workspace;
+use gd_syntax::Dialect;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -56,13 +59,13 @@ fn main() -> Result<()> {
 /// that silently waits on a `Content-Length` header.
 fn print_usage() {
     println!(
-        "gdls {} — a standalone GDScript language server for Godot 4.6.3-stable\n\
+        "gdls {} — a standalone GDScript language server for Godot {} to {}\n\
          \n\
          USAGE:\n\
          \x20   gdls                                  Run the LSP server on stdio (default)\n\
          \x20   gdls --version | -V                   Print version and exit\n\
          \x20   gdls --help | -h                      Print this help and exit\n\
-         \x20   gdls diagnose [--reconcile] [--path-audit] [--root <path>]\n\
+         \x20   gdls diagnose (--reconcile | --path-audit) [--root <path>]\n\
          \x20                                         One-shot index health check (no session)\n\
          \x20   gdls bench --record <path> | --replay <path>\n\
          \x20                                         Record / replay a request trace (local repro)\n\
@@ -70,7 +73,9 @@ fn print_usage() {
          The server is normally launched by an LSP client (the Claude Code plugin lives at\n\
          github.com/kurushimee/gdls-plugin). Logs go to stderr; set GDLS_LOG (e.g.\n\
          GDLS_LOG=info) to tune verbosity and GDLS_TRACE for the hierarchical span profiler.",
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        Dialect::OLDEST.as_str(),
+        Dialect::NEWEST.as_str()
     );
 }
 
@@ -78,7 +83,9 @@ fn diagnose(args: &[String]) -> Result<()> {
     let do_reconcile = args.iter().any(|a| a == "--reconcile");
     let do_audit = args.iter().any(|a| a == "--path-audit");
     if !do_reconcile && !do_audit {
-        eprintln!("usage: gdls diagnose [--reconcile] [--path-audit] [--root <path>]");
+        // At least one of the two is required, so the usage line must not bracket both as
+        // optional — it contradicted the exit-2 it was printed alongside (#309).
+        eprintln!("usage: gdls diagnose (--reconcile | --path-audit) [--root <path>]");
         std::process::exit(2);
     }
     // Initialize the log backend so warn/error from Workspace::load / reconcile / IndexMutation
