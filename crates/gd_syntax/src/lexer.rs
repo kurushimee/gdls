@@ -7,12 +7,17 @@
 //!
 //! Godot operates on UTF-32 (`char32_t`); we operate on a `Vec<char>` (one entry per code point) and
 //! keep a parallel byte-offset table so every token also carries a [`ByteSpan`] for LSP ranges.
-//! `column` is 1-based and tab-expanded exactly as Godot does, for `(line, column)` fidelity.
+//! `column` is 1-based and matches Godot's tokenizer for `(line, column)` fidelity. Under 4.6 a
+//! tab widens it to `TAB_SIZE` columns; under 4.7 a tab is one column (see the `DIALECT(4.7)`
+//! notes in `check_indent` / `skip_whitespace`). Either way this space exists only for `.out`
+//! message fidelity — LSP positions are derived from byte spans, never from here.
 
 use crate::dialect::Dialect;
 use crate::span::{ByteSpan, LineCol, LineColRange};
 use crate::token::{Literal, Token, TokenKind};
 
+/// Godot's `tab_size`. Under both dialects a tab is worth this many *indent* units; under 4.6 it
+/// additionally widens the reported `column` by this much.
 const TAB_SIZE: u32 = 4;
 
 // --- Character classification, ported from `core/string/char_utils.h`. ---
@@ -953,7 +958,14 @@ impl Lexer {
             while !self.is_at_end() {
                 let space = self.peek(0);
                 if space == '\t' {
-                    self.column = self.column.saturating_add(TAB_SIZE - 1);
+                    // DIALECT(4.7): gdscript_tokenizer.cpp check_indent() — a tab advances
+                    // `column` by one, not by `tab_size`. Indent DEPTH is unchanged: a tab is
+                    // still worth `TAB_SIZE` indent units, which is what keeps mixed
+                    // tabs-and-spaces resolving the same way. Only the reported column moved, and
+                    // with it Godot's own LSP dropped all its tab-expansion machinery.
+                    if self.dialect < Dialect::Godot4_7 {
+                        self.column = self.column.saturating_add(TAB_SIZE - 1);
+                    }
                     indent_count = indent_count.saturating_add(TAB_SIZE as i32);
                 } else if space == ' ' {
                     indent_count = indent_count.saturating_add(1);
@@ -1076,7 +1088,13 @@ impl Lexer {
                 }
                 '\t' => {
                     self.advance();
-                    self.column = self.column.saturating_add(TAB_SIZE - 1);
+                    // DIALECT(4.7): gdscript_tokenizer.cpp _skip_whitespace() — see the
+                    // matching note in `check_indent`. 4.6 widened a tab to `tab_size` columns
+                    // (editor-configurable, so column numbers depended on a user setting); 4.7
+                    // counts it as the single character it is.
+                    if self.dialect < Dialect::Godot4_7 {
+                        self.column = self.column.saturating_add(TAB_SIZE - 1);
+                    }
                 }
                 '\r' => {
                     self.advance();

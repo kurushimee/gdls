@@ -34,6 +34,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{Member, NodeId, NodeKind, ParseTree};
+use crate::dialect::Dialect;
 use crate::lexer::CommentData;
 
 /// `MemberDocData` (`gdscript_parser.h`): one member's doc prose + deprecation/experimental
@@ -90,6 +91,9 @@ enum DocLineState {
 
 struct Associator<'a> {
     source: &'a str,
+    /// The dialect whose doc-comment rules apply — 4.7 changed how lines are trimmed and made
+    /// `[br][br]` a paragraph break.
+    dialect: Dialect,
     tree: &'a ParseTree,
     comments: &'a HashMap<u32, CommentData>,
     /// `GDScriptParser::min_member_doc_line` — bumped to `member.end_line + 1` after every
@@ -104,6 +108,16 @@ struct Associator<'a> {
 /// Associate the lexer's recorded comments with the tree's declarations. Pure and read-only;
 /// returns an empty table for an empty tree.
 pub fn associate(source: &str, tree: &ParseTree, comments: &HashMap<u32, CommentData>) -> DocTable {
+    associate_with_dialect(source, tree, comments, Dialect::DEFAULT)
+}
+
+/// [`associate`] under an explicit dialect.
+pub fn associate_with_dialect(
+    source: &str,
+    tree: &ParseTree,
+    comments: &HashMap<u32, CommentData>,
+    dialect: Dialect,
+) -> DocTable {
     let Some(root) = tree.root_id() else {
         return DocTable::default();
     };
@@ -112,6 +126,7 @@ pub fn associate(source: &str, tree: &ParseTree, comments: &HashMap<u32, Comment
     }
     let mut assoc = Associator {
         source,
+        dialect,
         tree,
         comments,
         min_member_doc_line: 1,
@@ -344,8 +359,13 @@ impl Associator<'_> {
                     }
                 }
             }
-            let chunk = process_doc_line(doc_line, &result.description, &space_prefix, &mut state);
-            result.description.push_str(&chunk);
+            process_doc_line(
+                doc_line,
+                &mut result.description,
+                &space_prefix,
+                &mut state,
+                self.dialect,
+            );
         }
         (result, start)
     }
@@ -393,8 +413,7 @@ impl Associator<'_> {
             } else {
                 &mut result.description
             };
-            let chunk = process_doc_line(doc_line, target, &space_prefix, &mut state);
-            target.push_str(&chunk);
+            process_doc_line(doc_line, target, &space_prefix, &mut state, self.dialect);
         }
         (result, start)
     }
@@ -452,12 +471,21 @@ fn parse_tutorial(rest: &str) -> Option<(String, String)> {
 /// fences) while tracking the opaque-content state machine for `[code]`/`[codeblock]`/`[kbd]`.
 fn process_doc_line(
     p_line: &str,
-    text: &str,
+    text: &mut String,
     space_prefix: &str,
     state: &mut DocLineState,
-) -> String {
+    dialect: Dialect,
+) {
+    // DIALECT(4.7): gdscript_parser.cpp _process_doc_line() — `strip_edges` became
+    // `lstrip(" \t")` / `rstrip(" \t")`, so only spaces and tabs are trimmed. A `\r` left by CRLF
+    // handling now survives into the doc text instead of being silently eaten.
+    let owned_line: String;
     let line: &str = if *state == DocLineState::Normal {
-        p_line.trim_start()
+        if dialect < Dialect::Godot4_7 {
+            p_line.trim_start()
+        } else {
+            p_line.trim_start_matches([' ', '\t'])
+        }
     } else {
         p_line.strip_prefix(space_prefix).unwrap_or(p_line)
     };
@@ -467,13 +495,35 @@ fn process_doc_line(
         if *state == DocLineState::Normal {
             if text.ends_with("[/codeblock]") {
                 line_join = "\n";
-            } else if !text.ends_with("[br]") {
+            } else if text.ends_with("[br]") {
+                // DIALECT(4.7): a `[br]` ending the previous line and a `[br]` opening this one
+                // together mean a paragraph break. The trailing `[br]` is moved off the
+                // accumulator and onto the front of this line so the `[br][br]` pair meets in one
+                // string, where the tag scan below turns it into a newline.
+                if dialect >= Dialect::Godot4_7 {
+                    text.truncate(text.len() - "[br]".len());
+                    owned_line = format!("[br]{line}");
+                    return process_doc_line_inner(&owned_line, text, state, dialect, "");
+                }
+            } else {
                 line_join = " ";
             }
         } else {
             line_join = "\n";
         }
     }
+    process_doc_line_inner(line, text, state, dialect, line_join);
+}
+
+/// The tag-scanning half of [`process_doc_line`], split out so the 4.7 `[br][br]` path can
+/// re-enter it with a rewritten line and no join.
+fn process_doc_line_inner(
+    line: &str,
+    text: &mut String,
+    state: &mut DocLineState,
+    dialect: Dialect,
+    line_join: &str,
+) {
     let mut line_join = line_join.to_string();
 
     let mut result = String::new();
@@ -493,7 +543,15 @@ fn process_doc_line(
                 let rb_pos = lb_pos + 1 + rb_rel;
                 from = rb_pos + 1;
                 let tag = &line[lb_pos + 1..rb_pos];
-                if tag == "code" || tag.starts_with("code ") {
+                // DIALECT(4.7): `[br][br]` collapses to a real paragraph break.
+                if dialect >= Dialect::Godot4_7 && tag == "br" {
+                    if line[from..].starts_with("[br]") {
+                        result.push_str(&line[buffer_start..lb_pos]);
+                        result.push('\n');
+                        from += "[br]".len();
+                        buffer_start = from;
+                    }
+                } else if tag == "code" || tag.starts_with("code ") {
                     *state = DocLineState::InCode;
                 } else if tag == "codeblock" || tag.starts_with("codeblock ") {
                     if lb_pos == 0 {
@@ -553,9 +611,16 @@ fn process_doc_line(
     result.push_str(&line[buffer_start..]);
     let mut out = result;
     if *state == DocLineState::Normal {
-        out.truncate(out.trim_end().len());
+        // DIALECT(4.7): the `rstrip(" \t")` half of the `strip_edges` change above.
+        let kept = if dialect < Dialect::Godot4_7 {
+            out.trim_end().len()
+        } else {
+            out.trim_end_matches([' ', '\t']).len()
+        };
+        out.truncate(kept);
     }
-    format!("{line_join}{out}")
+    text.push_str(&line_join);
+    text.push_str(&out);
 }
 
 #[cfg(test)]
@@ -564,9 +629,25 @@ mod tests {
     use crate::ast::Member;
 
     fn docs(source: &str) -> (crate::ParseResult, DocTable) {
-        let result = crate::parse(source);
+        docs_in(source, Dialect::DEFAULT)
+    }
+
+    fn docs_in(source: &str, dialect: Dialect) -> (crate::ParseResult, DocTable) {
+        let result = crate::parse_with_options(
+            source,
+            &crate::ParseOptions {
+                dialect,
+                ..Default::default()
+            },
+        );
         let table = result.tree.docs.clone();
         (result, table)
+    }
+
+    /// The first member's description under one dialect.
+    fn member_desc(source: &str, dialect: Dialect) -> String {
+        let (r, t) = docs_in(source, dialect);
+        t.member_docs[&member_id(&r, 0)].description.clone()
     }
 
     /// The id of the head class's `index`-th member (panics on classless trees).
@@ -786,5 +867,43 @@ class Inner:
             let (_r, t) = docs(src);
             assert!(t.is_empty(), "source {src:?} must yield no docs");
         }
+    }
+
+    // ===============================================================================================
+    // The 4.7 `_process_doc_line` delta: `strip_edges` → `lstrip`/`rstrip(" \t")`, and `[br][br]`
+    // as a paragraph break. User-visible in hover, and no diagnostics gate would catch a regression.
+    // ===============================================================================================
+
+    #[test]
+    fn br_br_is_a_paragraph_break_only_at_4_7() {
+        // A `[br][br]` pair inside one line.
+        let src = "extends Node\n## First.[br][br]Second.\nvar x := 1\n";
+        assert_eq!(member_desc(src, Dialect::Godot4_6), "First.[br][br]Second.");
+        assert_eq!(member_desc(src, Dialect::Godot4_7), "First.\nSecond.");
+    }
+
+    #[test]
+    fn br_br_spanning_two_doc_lines_is_a_paragraph_break_at_4_7() {
+        // The pair meets across the line join: a trailing `[br]` plus a leading `[br]`.
+        let src = "extends Node\n## First.[br]\n## [br]Second.\nvar x := 1\n";
+        assert_eq!(member_desc(src, Dialect::Godot4_6), "First.[br][br]Second.");
+        assert_eq!(member_desc(src, Dialect::Godot4_7), "First.\nSecond.");
+    }
+
+    #[test]
+    fn a_lone_br_is_untouched_in_both_dialects() {
+        let src = "extends Node\n## First.[br]Second.\nvar x := 1\n";
+        for d in [Dialect::Godot4_6, Dialect::Godot4_7] {
+            assert_eq!(member_desc(src, d), "First.[br]Second.", "dialect {d:?}");
+        }
+    }
+
+    #[test]
+    fn a_carriage_return_survives_the_trim_only_at_4_7() {
+        // CRLF leaves a `\r` at the end of the doc line. 4.6's `strip_edges` ate it; 4.7's
+        // `rstrip(" \t")` does not.
+        let src = "extends Node\r\n## Speed.\r\nvar x := 1\r\n";
+        assert_eq!(member_desc(src, Dialect::Godot4_6), "Speed.");
+        assert_eq!(member_desc(src, Dialect::Godot4_7), "Speed.\r");
     }
 }

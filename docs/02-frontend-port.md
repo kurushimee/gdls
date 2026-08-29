@@ -145,6 +145,23 @@ Positive resolution is unaffected: under the embedded fallback, builtins resolve
 
 The session upgrades itself. When the background auto-dump is adopted mid-session it swaps in an `Exact` DB, re-analyzes, and republishes, so first-run diagnostics converge to exactly what a warm session reports. Implementation: `gd_types::ApiProvenance`, with gates in `gd_analyze::resolver::resolve_datatype` and `gd_analyze::reducer`.
 
+## 11c. The 4.6 → 4.7 tokenizer and parser delta
+
+Every frontend difference between the two supported tags is either a guard or a deliberate no-op, and the two halves together are the audit surface for the next version bump. The guards are greppable: `grep -rn "DIALECT("`. The no-ops are only here, so this table is what stops a future auditor from "fixing" one.
+
+| Upstream change | Where it lands in gdls |
+|---|---|
+| A tab advances `column` by 1 instead of `tab_size` | Guarded, `lexer.rs` `check_indent` and `skip_whitespace`. `indent_count` is unaffected, so indent depth does not move. |
+| Token position fields default to `1` instead of `0`/`-1` | Guarded, `parser.rs` `empty_token`. |
+| `Token::cursor_position` removed; the multi-line-interior branch sets `cursor_place = CURSOR_MIDDLE` | **No-op.** gdls never ported Godot's cursor machinery. Completion contexts are classified from the token frame plus the cursor byte in `gd_server::completion_context`, not from `make_completion_context` hooks inside the parser, so there is no `cursor_place` to fix and no dead field to delete. |
+| `ParserError` carries a full range; three tokenizer-error sites point at the bad token rather than `previous` | **No-op, plus one accepted divergence.** gdls has always carried a `ByteSpan` range on every diagnostic. It has also always pointed those three sites at the bad token, so it matched 4.7 before 4.7 existed. Restoring 4.6's off-by-one token would be replicating a fixed engine bug, and it would cascade into worse follow-on ranges for 4.6 users. It is invisible to the corpus, since `GDTEST_PARSER_ERROR` prints only the first message and no position. |
+| `Node` extents default to `-1` as a recovery-node sentinel | **No-op.** gdls stores extents as `u32`, which cannot hold the sentinel, and it is unobservable anyway: positions are clamped at the LSP boundary and the `.out` format never prints an extent. |
+| New error `"class_name" isn't allowed in built-in scripts.` | Guarded, `parser.rs` `parse_class_name`, keyed on `ParseOptions::script_path`. |
+| The `super` branch enters multiline mode only when `(` is really there | Guarded, `parser.rs` `parse_call`. This one changes which follow-on errors cascade after a malformed `super`, so the 4.6 arm restores the old unconditional `push_multiline`. |
+| `COMPLETION_DECLARATION` promoted from a TODO, with six emission sites | **No-op across the two tags, but gdls changed anyway.** 4.7 handles the new context with a bare `break` — no completions in a declaration's name position — and 4.6 reaches the same empty result incidentally, because `parse_identifier` deliberately never opens a context. So there is nothing to gate. gdls was offering identifiers at `var spe`, `class_name Fo`, and their four siblings; it now offers nothing at both tags. `func <name>` stays an override-method completion. |
+| `GDScriptWarning` gained start and end columns, moving Godot's own LSP off whole-line ranges | **No-op.** gdls already emits node ranges from `ByteSpan`. Porting the fields would add dead state to the Godot-column space, which exists only for `.out` printing, and `.out` prints no columns. |
+| Doc comments use `lstrip`/`rstrip(" \t")` instead of `strip_edges`, and `[br][br]` becomes a paragraph break | Guarded, `doc_comments.rs`. User-visible in hover, and no diagnostics gate would catch a regression, so it carries its own dialect tests. |
+
 ## 12. Sources
 
 - [Module pipeline and the shallow/full cache](https://github.com/godotengine/godot/blob/master/modules/gdscript/README.md)

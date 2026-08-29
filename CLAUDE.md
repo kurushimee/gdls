@@ -63,6 +63,7 @@ Two principles span files:
 1. **Newest is primary.** The unguarded body of a ported function mirrors the newest supported tag (`Dialect::NEWEST`). The *older* behavior is what gets wrapped, never the other way around, so the next upstream diff applies to the primary text as it always has.
 2. **Ordered comparisons only** — `if self.dialect < Dialect::Godot4_7 { … }`, never `==`. A later release then leaves existing guards alone unless it touched the same site again.
 3. **One greppable marker** per guard: `// DIALECT(4.7): gdscript_tokenizer.cpp:939 — a tab advances column by 1, not tab_size.` `grep -rn "DIALECT("` is the whole audit surface, the checklist for the next bump, and the deletion list when a dialect is retired.
+4. **A no-op is documented, not silent.** Where an upstream change needs no guard because gdls never had the thing it fixes, or already behaved that way, it goes in the delta table in `docs/02` §11c. That table plus `grep -rn "DIALECT("` together cover every difference between the tags, which is what lets an auditor tell "handled" from "missed". Guarded behavior is pinned at both tags by `crates/gd_syntax/tests/dialect_delta.rs`, since the conformance corpus only ever runs one tag's goldens.
 
 The dialect rides as a struct field on `Lexer`, `Parser`, and `AnalysisContext`, never as an extra parameter, so ported signatures stay identical to Godot's. `Dialect::DEFAULT` is what "unspecified" means and is pinned to the *oldest* dialect while the 4.7 arms are being written; it flips to `NEWEST` with the 4.7 corpus.
 

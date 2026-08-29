@@ -108,7 +108,7 @@ pub fn parse_with_options(source: &str, options: &ParseOptions<'_>) -> ParseResu
     // M7 (#62): associate `##` doc comments post-parse — a read-only pass over the finished
     // tree + the lexer's comment side-channel, so the ported grammar (and both conformance
     // ratchets) never sees them.
-    tree.docs = doc_comments::associate(source, &tree, &comments);
+    tree.docs = doc_comments::associate_with_dialect(source, &tree, &comments, options.dialect);
     let symbols = parser::document_symbols(&tree);
     // M9 (#70): hand the same comment side-channel through to the result so `foldingRange` can
     // see comment runs / `#region` markers. `associate` borrowed `&comments`, so it is intact to

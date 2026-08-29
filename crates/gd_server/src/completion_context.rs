@@ -35,8 +35,9 @@
 //! 2. **Member access** — anchor is `.` (or an identifier immediately preceded by `.`). Wins even
 //!    inside a call: `print(foo.` is `Attribute`, not a call argument. `super.` ⇒ `SuperMethod`.
 //! 3. **Punctuation-anchored** — `[` (subscript), `=`/`+=`/… (assign), `@…` (annotation), an
-//!    identifier in a type position (`var x: Vec`, `-> `, `Array[`), `extends <name>`, or
-//!    `func <name>` at class-body statement start (override).
+//!    identifier in a type position (`var x: Vec`, `-> `, `Array[`), `extends <name>`,
+//!    `func <name>` at class-body statement start (override), or a declaration's own name
+//!    (`var spe`, `class_name Fo`, …), which yields [`CompletionKind::None`].
 //! 4. **Call / identifier** — otherwise consult the enclosing unclosed `(`: a **call** paren (the
 //!    token before it is a callee, not a `func` declaration, not an annotation, not grouping) ⇒
 //!    `CallArguments` (arg index = depth-0 commas from the `(` to the cursor); else a bare/partial
@@ -1025,6 +1026,19 @@ fn classify_anchored(
                         CompletionKind::OverrideMethod,
                         prefix,
                     ));
+                }
+                // A declaration's own *name* (`var spe`, `const FO`, `signal on`, `enum St`,
+                // `class In`, `class_name Fo`). The user is inventing a new name, so nothing in
+                // scope is a candidate — offering identifiers here would suggest exactly the names
+                // that are already taken. Godot agrees at both supported tags: 4.7 marks these six
+                // positions `COMPLETION_DECLARATION`, which `_get_code_completion` handles with a
+                // bare `break`, and 4.6 reaches the same empty result incidentally, because
+                // `parse_identifier` deliberately never opens a context (the `HACK:` note above
+                // `COMPLETION_IDENTIFIER` in `parse_precedence`). Same observable behavior in both,
+                // so this is not dialect-gated. `func <name>` is *not* in this list — it stays an
+                // override-method completion, matching `COMPLETION_OVERRIDE_METHOD`.
+                Var | Const | Signal | Enum | Class | ClassName => {
+                    return Some(CompletionContext::new(CompletionKind::None, None));
                 }
                 _ => {}
             }
