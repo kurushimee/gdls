@@ -79,6 +79,7 @@ Other Claude Code config fields that work here: `transport` (`"stdio"` is the de
 | Key | Type | Meaning |
 |---|---|---|
 | `projectRoot` | string (path) | The `res://` root. Optional; falls back to the workspace folder, then the nearest `project.godot`. |
+| `dialect` | `"4.6"` \| `"4.7"` | Pin the Godot feature release whose frontend semantics apply, instead of reading it from `project.godot`'s `application/config/features`. Optional, and normally left unset — Godot writes that entry itself, so a real project always declares one. A version outside the supported range is ignored with a warning rather than failing `initialize`. |
 | `extensionApiPath` | string (path) | Pin a hand-made `extension_api.json`. Optional. When absent, the auto-dump resolution applies (`03-indexing-freshness.md` §1), and when no project-derived source resolves, the embedded stock fallback serves builtins. Pinning also skips the background auto-dump entirely, so the managed dump can never be served while a path is pinned. |
 | `godotBinaryPath` | string (path) | Godot 4.x executable for the auto-dump. Optional; discovery falls back to `GDLS_GODOT`, then `godot4`/`godot` on `PATH`. |
 | `autoDumpExtensionApi` | bool | Allow gdls to spawn Godot to regenerate the managed dump under `.gdls/`. The dump runs on a background thread and is adopted mid-session (reload plus republish), so it never blocks a request. Default `true`; `false` forbids spawning entirely. |

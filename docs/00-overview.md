@@ -4,13 +4,15 @@
 
 | | |
 |---|---|
-| **Target language** | GDScript 2.0 as shipped in Godot 4.6.3-stable |
-| **Engine reference** | Official Godot (`godotengine/godot`) at tag `4.6.3-stable`. The GDScript frontend is the port's source of truth: it is unchanged from upstream, and only native C++ classes differ. Native classes are ingested from the `godot` binary's `extension_api.json`. |
+| **Target language** | GDScript 2.0 as shipped in Godot 4.6 and 4.7, from one binary, chosen per project |
+| **Engine reference** | Official Godot (`godotengine/godot`) at tags `4.6.3-stable` and `4.7.2-stable`. The GDScript frontend is the port's source of truth: it is unchanged from upstream, and only native C++ classes differ. Native classes are ingested from the `godot` binary's `extension_api.json`. |
 | **Transport** | LSP over stdio, one server per workspace root |
 
 ## 1. What it does
 
-gdls does its own tokenizing, parsing, and type analysis. It emits the same compile-time diagnostics Godot's own analyzer emits, errors plus the GDScript warning set (45 active warnings, and 3 more behind Godot's `DISABLE_DEPRECATED` guard), and it adds an opt-in stricter mode on top.
+gdls does its own tokenizing, parsing, and type analysis. It emits the same compile-time diagnostics Godot's own analyzer emits, errors plus the GDScript warning set (45 active warnings at 4.6, 46 at 4.7, and 3 more behind Godot's `DISABLE_DEPRECATED` guard), and it adds an opt-in stricter mode on top.
+
+It reads each project as the Godot release that project targets. The version comes from `project.godot`'s `application/config/features`, and everything downstream — tokenizer, parser, analyzer, warning set, and the bundled engine surface — follows it, so a 4.6 project keeps getting 4.6 answers after 4.7 support lands. `02-frontend-port.md` §11c and §11d list every behavior that differs.
 
 It recognizes every native engine class and every third-party GDExtension class installed in the project. Its own filesystem watcher picks up new, renamed, and deleted classes as they land on disk.
 

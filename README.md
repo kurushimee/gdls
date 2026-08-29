@@ -1,13 +1,15 @@
-# gdls, a standalone GDScript language server for Godot 4.6.3-stable
+# gdls, a standalone GDScript language server for Godot 4.6 and 4.7
 
 [![CI](https://github.com/kurushimee/gdls/actions/workflows/ci.yml/badge.svg)](https://github.com/kurushimee/gdls/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-dea584.svg?logo=rust)](rust-toolchain.toml)
-[![Godot conformance](https://img.shields.io/badge/Godot%20conformance-1.0000-brightgreen.svg)](docs/06-testing-fidelity.md)
+[![Godot conformance](https://img.shields.io/badge/Godot%20conformance-parser%201.0000%20%7C%20analyzer%200.9898-brightgreen.svg)](docs/06-testing-fidelity.md)
 
 One binary that gives Claude Code (or any LSP client) type-aware GDScript diagnostics and navigation over stdio, with no Godot engine or editor running.
 
-`gdls` is a faithful Rust port of the GDScript frontend (tokenizer, parser, analyzer) from Godot 4.6.3-stable. It exists because the editor's built-in LSP is heavy, goes stale, and needs the engine running, which hurts at 3,000 to 10,000+ `.gd` files. Only the frontend is ported. The compiler, bytecode, and VM half is out of scope, so this is diagnostics and navigation only.
+`gdls` is a faithful Rust port of the GDScript frontend (tokenizer, parser, analyzer). It exists because the editor's built-in LSP is heavy, goes stale, and needs the engine running, which hurts at 3,000 to 10,000+ `.gd` files. Only the frontend is ported. The compiler, bytecode, and VM half is out of scope, so this is diagnostics and navigation only.
+
+One binary serves both Godot 4.6 and 4.7. Each project is read as the release it targets, taken from `project.godot`, so upgrading gdls does not change what a 4.6 project sees.
 
 ## Install
 
@@ -49,7 +51,7 @@ For any other client, the core registration is five lines:
 }
 ```
 
-Native types need no setup. gdls finds your Godot binary (`godotBinaryPath` option, then the `GDLS_GODOT` env var, then `godot4`/`godot` on `PATH`), runs `--dump-extension-api-with-docs` with project context so the project's GDExtension classes are captured, and keeps the result under `.gdls/`, regenerating only when the binary or the project's `.gdextension` set changes. The dump runs in the background, so it never delays a request; the session re-checks open files as soon as it lands. If no binary is discoverable, a bundled stock 4.6.3 class surface keeps builtins like `Node` and `Timer` resolving, and gdls will not invent "unknown type" errors for classes only your engine build knows about.
+Native types need no setup. gdls finds your Godot binary (`godotBinaryPath` option, then the `GDLS_GODOT` env var, then `godot4`/`godot` on `PATH`), runs `--dump-extension-api-with-docs` with project context so the project's GDExtension classes are captured, and keeps the result under `.gdls/`, regenerating only when the binary or the project's `.gdextension` set changes. The dump runs in the background, so it never delays a request; the session re-checks open files as soon as it lands. If no binary is discoverable, a bundled stock class surface for your project's own Godot release keeps builtins like `Node` and `Timer` resolving, and gdls will not invent "unknown type" errors for classes only your engine build knows about.
 
 To pin a hand-made dump instead, set `initializationOptions.extensionApiPath`. To stop gdls from ever spawning Godot, set `autoDumpExtensionApi: false` (or `GDLS_GODOT=off`) and dump manually from inside the project directory:
 
@@ -63,7 +65,7 @@ godot --dump-extension-api-with-docs
 
 Diagnostics (push and pull), hover, definition, declaration, type definition, references, implementation, call hierarchy, type hierarchy, document and workspace symbols, completion, signature help, rename, document highlight, semantic tokens, inlay hints, document colors, code actions, folding and selection ranges, document links, and file-rename edits. Any editor gets the whole set with no gdls-specific client code and none of the Godot editor LSP's custom protocol. The full surface is in [`docs/05-lsp-cc-integration.md`](docs/05-lsp-cc-integration.md), and the capabilities gdls deliberately does not serve, with reasons, are in [`docs/09-lsp-conventions.md`](docs/09-lsp-conventions.md) §5.
 
-Both fidelity ratchets sit at 1.0000 against the vendored Godot 4.6.3-stable corpus: parser 186/186, analyzer 300/300.
+Against Godot's own vendored corpus, the parser ratchet sits at 1.0000 (185/185) and the analyzer at 0.9898 (194/196). The two analyzer misses are listed with what each needs in `crates/gd_analyze/tests/conformance/analyze_known_failures.txt`.
 
 The latest release is v2.0.0. [`CHANGELOG.md`](CHANGELOG.md) has the release history, and [`docs/08-history.md`](docs/08-history.md) has how the project was built.
 

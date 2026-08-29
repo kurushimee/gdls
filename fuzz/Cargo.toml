@@ -29,6 +29,9 @@ gd_server = { path = "../crates/gd_server" }
 # Own workspace root → not absorbed by the parent gdls workspace.
 [workspace]
 
+# `fuzz_targets/common.rs` is shared by the targets through `#[path]`, not listed here: a
+# cargo-fuzz crate is a set of `[[bin]]`s with no lib target to hang a module off.
+
 [[bin]]
 name = "parse"
 path = "fuzz_targets/parse.rs"

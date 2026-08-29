@@ -16,6 +16,8 @@ Faithful-port discipline governs the frontend; it does not govern this layer. Th
 
 Audited in `modules/gdscript/language_server/` at `4.6.3-stable`. This is the baseline gdls measured itself against, and it explains why several gdls capabilities have no parity bar at all: Godot does not advertise them.
 
+4.7 reworked the module (~670 lines added, ~475 removed) without moving the parity bar in any row below. Two changes are worth naming: `documentHighlightProvider` flipped from `false` to `true`, and `initialize` now reads exactly one entry out of `ClientCapabilities`, `completion.completionItem.snippetSupport`, to decide whether brace completion emits a snippet. The rest is a new scene cache and internal restructuring. Neither change touches the anti-catalog in §3: reading one capability path is not gating on capabilities (W7), and `documentHighlight` was already a gdls capability. Nothing here has bearing on gdls's own dialect support, which is a frontend concern; this module is not ported.
+
 | Capability | Godot's own LSP | gdls |
 |---|---|---|
 | `hover` | signature, doc, and a "Defined in" link, including member and method signatures (`text_document.cpp:347`, `godot_lsp.h:1284`) | full signatures for members, calls, and `preload`, plus doc prose |
@@ -28,7 +30,7 @@ Audited in `modules/gdscript/language_server/` at `4.6.3-stable`. This is the ba
 | `callHierarchy` | not supported | full prepare, incoming, outgoing |
 | `workspace/symbol` | not supported (`workspaceSymbolProvider=false`) | fuzzy-ranked, with lazy `workspaceSymbol/resolve` |
 | `completion` / `signatureHelp` | supported | supported, per §6.1 and §6.2 |
-| `rename`, `documentHighlight`, `declaration`, `onTypeFormatting` | supported | all but `onTypeFormatting`, which is meaningless without a built-in formatter |
+| `rename`, `documentHighlight`, `declaration`, `onTypeFormatting` | supported; `documentHighlight` was advertised only from 4.7 | all but `onTypeFormatting`, which is meaningless without a built-in formatter |
 
 ## 3. The anti-catalog: Godot-LSP behavior gdls must never replicate
 
@@ -42,7 +44,7 @@ Catalogued from `modules/gdscript/language_server/` at `4.6.3-stable`, where the
 | W4 | Custom server-to-client notifications required for core function: `gdscript/show_native_symbol` (native go-to-definition routes out of band and the LSP result is `[]`), `gdscript/capabilities`, and `gdscript_client/changeWorkspace`, the last sent *before* the `initialize` response (`gdscript_language_protocol.cpp:219-264`) | None of these, ever. Native navigation returns real `Location`s into materialized stubs. If a Godot-editor bridge is ever wanted, it is additive, opt-in, advertised under `capabilities.experimental`, and nothing may depend on it. |
 | W5 | `textDocument/nativeSymbol`, a custom request hiding under the standard namespace (`gdscript_language_protocol.cpp:574`) | No fake-namespaced methods. |
 | W6 | Positions are UTF-32 columns, tab-expanded using the editor's indent-size setting, with no `positionEncoding` negotiation (`gdscript_extend_parser.cpp:39-127`) | Byte offsets internally, exact negotiated UTF-8/16/32 at the boundary. Column math never depends on user settings. |
-| W7 | `ClientCapabilities` ignored entirely: markdown assumed, hierarchical `documentSymbol` assumed, snippets unannounced (`gdscript_language_protocol.cpp:185-247`) | Rule 3: gate everything. `MarkupContent` kind is chosen from `contentFormat`/`documentationFormat`, with a plaintext fallback. |
+| W7 | `ClientCapabilities` all but ignored: markdown assumed, hierarchical `documentSymbol` assumed, snippets unannounced (`gdscript_language_protocol.cpp:185-247`; 4.7 reads exactly one path, `completion.completionItem.snippetSupport`) | Rule 3: gate everything. `MarkupContent` kind is chosen from `contentFormat`/`documentationFormat`, with a plaintext fallback. |
 | W8 | Raw BBCode leaks in `documentSymbol.documentation` and native-symbol payloads, converted only on some paths; docs localized via editor `DTR()` (`godot_lsp.h:1248-1273,1927-2125`) | One BBCode-to-Markdown pipeline for all outgoing prose (§7.2), spec fields only, never localized engine-side. |
 | W9 | Non-spec fields injected into standard responses (`native_class`, `documentation` on every symbol node) | Extensions ride only in `data` fields or documented `initializationOptions`, so standard consumers see pure spec shapes. |
 | W10 | "Smart resolve", on by default: failed resolution returns every same-named symbol project-wide as definitions and hovers, in the deprecated `MarkedString[]` shape (`gdscript_language_protocol.cpp:363-365,498-532`) | Resolution is semantic and binding-backed, or absent. No name-match guessing in standard methods. |
