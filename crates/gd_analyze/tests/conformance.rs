@@ -70,7 +70,7 @@ fn native_db() -> &'static NativeDb {
 /// `~~ WARNING …` lines reproducible for warnings that default to Error in production (the four
 /// `inference_on_variant` / `native_method_override` / `get_node_default_without_onready` /
 /// `onready_with_export` codes); without this demotion the corpus would expect `>> ERROR` lines.
-fn policy() -> WarnPolicy {
+fn policy(dialect: Dialect) -> WarnPolicy {
     use gd_project::WarnLevel as ProjLevel;
     let mut config = WarningConfig::default();
     for &name in gd_analyze::warnings::WARN_NAMES.iter() {
@@ -83,7 +83,7 @@ fn policy() -> WarnPolicy {
             .levels
             .insert(name.to_ascii_lowercase(), ProjLevel::Warn);
     }
-    WarnPolicy::build(&config, &StrictSettings::default(), Dialect::DEFAULT)
+    WarnPolicy::build(&config, &StrictSettings::default(), dialect)
 }
 
 fn collect_gd_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -418,24 +418,68 @@ fn collect_member_initializer_xrefs(
 /// The cold-built corpus index, populated once. Mirrors the project-startup index `gd_server`
 /// builds on `initialize`. Re-used across every fixture in the conformance run, so cross-file
 /// fixtures (features/external_*, lookup_class, preload_enum_error, …) can resolve their peers.
-fn corpus_index() -> &'static Index {
-    static INDEX: OnceLock<Index> = OnceLock::new();
-    INDEX.get_or_init(|| {
-        let corpus_root_buf = conformance_dir().join("corpus/analyzer");
-        let corpus_root = Utf8Path::from_path(&corpus_root_buf)
-            .expect("corpus root utf-8")
-            .to_path_buf();
-        Index::build(&corpus_root)
-    })
+fn corpus_index(suite: &Suite) -> &'static Index {
+    static INDEXES: OnceLock<Vec<Index>> = OnceLock::new();
+    let built = INDEXES.get_or_init(|| {
+        SUITES
+            .iter()
+            .map(|s| {
+                let root_buf = conformance_dir().join(s.dir);
+                let root = Utf8Path::from_path(&root_buf)
+                    .expect("corpus root utf-8")
+                    .to_path_buf();
+                Index::build(&root)
+            })
+            .collect()
+    });
+    &built[suite.slot]
 }
+
+/// One corpus tree plus the dialect its goldens were generated at.
+///
+/// The oldest supported tag keeps the *full* vendored corpus; every newer tag carries only the
+/// files that actually diverge, so a version bump is "vendor the new full corpus, demote the
+/// previous one to its divergence subset" rather than a wholesale copy. Fidelity is one aggregate
+/// number over every suite, so a file cannot be lost by moving between them.
+struct Suite {
+    /// Path under `tests/conformance/`.
+    dir: &'static str,
+    /// Prefix on every reported path, so a known-failures entry names its suite.
+    tag: &'static str,
+    dialect: Dialect,
+    /// Index into the lazily built per-suite index vector.
+    slot: usize,
+}
+
+const SUITES: &[Suite] = &[
+    Suite {
+        dir: "corpus/analyzer",
+        tag: "4.6",
+        dialect: Dialect::Godot4_6,
+        slot: 0,
+    },
+    Suite {
+        dir: "corpus/analyzer-4.7",
+        tag: "4.7",
+        dialect: Dialect::Godot4_7,
+        slot: 1,
+    },
+];
 
 /// Analyze one source and render its diagnostics to `.out` lines, in publish (offset) order.
 /// `script_path` is the corpus file's basename (e.g. `enum_class_var_assign_with_wrong_enum_type.gd`),
 /// passed through to the head class's `fqcn` so error messages render `<file.gd>.<EnumName>` to
 /// match Godot's golden `.out` lines (WP-J — analyzer.cpp:702/147).
-fn gdls_diag_lines(source: &str, script_path: &str, gd_path: &Path) -> Vec<String> {
-    let tree = gd_syntax::parse(source).tree;
-    let index = corpus_index();
+fn gdls_diag_lines(source: &str, script_path: &str, gd_path: &Path, suite: &Suite) -> Vec<String> {
+    let tree = gd_syntax::parse_with_options(
+        source,
+        &gd_syntax::ParseOptions {
+            dialect: suite.dialect,
+            script_path: "",
+        },
+    )
+    .tree;
+    let index = corpus_index(suite);
     let fixture_dir_buf = Utf8PathBuf::from_path_buf(
         gd_path
             .parent()
@@ -455,7 +499,18 @@ fn gdls_diag_lines(source: &str, script_path: &str, gd_path: &Path) -> Vec<Strin
         .map(|p| clean_path_components(&p))
         .and_then(|p| index.file_id(&p));
 
-    let result = gd_analyze::analyze(&tree, file_id, script_path, native_db(), &xfile, &policy());
+    let result = gd_analyze::analyze_with_options(
+        &tree,
+        file_id,
+        script_path,
+        native_db(),
+        &xfile,
+        &policy(suite.dialect),
+        gd_analyze::AnalyzeOptions {
+            dialect: suite.dialect,
+            ..Default::default()
+        },
+    );
     result
         .diagnostics
         .iter()
@@ -514,94 +569,99 @@ fn bullet_list(items: &BTreeSet<&String>) -> String {
 #[test]
 fn analyze_phase_fidelity() {
     let conformance = conformance_dir();
-    let corpus = conformance.join("corpus/analyzer");
-    assert!(
-        corpus.is_dir(),
-        "corpus missing at {} — see PROVENANCE.md to vendor it",
-        corpus.display()
-    );
-
-    let mut gd_files = Vec::new();
-    collect_gd_files(&corpus, &mut gd_files);
-    gd_files.sort();
-    assert!(
-        !gd_files.is_empty(),
-        "no .gd files under {}",
-        corpus.display()
-    );
 
     let mut eligible = 0usize;
     let mut matched = 0usize;
     let mut skipped = 0usize;
+    let mut total_files = 0usize;
     let mut failures: BTreeSet<String> = BTreeSet::new();
     let mut samples: Vec<String> = Vec::new();
     // For `GDLS_BLESS_FULL_DIFFS=1` dump (see bless block below).
     let mut all_diffs: Vec<String> = Vec::new();
 
-    for gd in &gd_files {
-        let name = gd.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        if name.ends_with(".notest.gd") {
-            skipped += 1;
-            continue;
-        }
+    for suite in SUITES {
+        let corpus = conformance.join(suite.dir);
+        assert!(
+            corpus.is_dir(),
+            "corpus missing at {} — see PROVENANCE.md to vendor it",
+            corpus.display()
+        );
 
-        let rel = rel_path(&corpus, gd);
-        let source = fs::read_to_string(gd).expect("read .gd source");
-        let out_path = gd.with_extension("out");
-        let Ok(out_content) = fs::read_to_string(&out_path) else {
-            skipped += 1; // no `.out` (e.g. a stray companion) — nothing to compare
-            continue;
-        };
+        let mut gd_files = Vec::new();
+        collect_gd_files(&corpus, &mut gd_files);
+        gd_files.sort();
+        assert!(
+            !gd_files.is_empty(),
+            "no .gd files under {}",
+            corpus.display()
+        );
+        total_files += gd_files.len();
 
-        let Some(expect) = classify(&out_content) else {
-            skipped += 1;
-            continue;
-        };
-
-        eligible += 1;
-        // Godot's `parser->script_path` is the source-file path; the head class's `fqcn` derives
-        // from it via `canonicalize_path` (analyzer.cpp:702), and the resulting `<file.gd>.<EnumName>`
-        // rendering appears in the corpus's golden `.out` lines. We pass the basename so the
-        // `Display for DataType` `get_file()` mirror produces the same string.
-        let script_path = gd.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        let mut got = gdls_diag_lines(&source, script_path, gd);
-        // gdscript_test_runner.cpp:571-585 — when the analyzer returns an error, Godot's
-        // runner outputs only `>> ERROR …` lines and skips the `~~ WARNING …` block (the
-        // `#ifdef DEBUG_ENABLED` warning loop sits AFTER the early return). The corpus's
-        // `GDTEST_ANALYZER_ERROR` golden files reflect this — they only list errors. Drop
-        // warnings from gdls's output for these cases so the harness comparison mirrors
-        // Godot's stripping rather than treating any incidental warning as a regression.
-        if matches!(expect, Expect::AnalyzerError(_)) {
-            got.retain(|line| line.starts_with(">>"));
-        }
-        let want = match &expect {
-            Expect::Ok(warnings) => warnings,
-            Expect::AnalyzerError(diags) => diags,
-        };
-
-        if &got == want {
-            matched += 1;
-        } else {
-            if samples.len() < 40 {
-                samples.push(format!(
-                    "  {rel}\n      want: {want:?}\n      got:  {got:?}"
-                ));
+        for gd in &gd_files {
+            let name = gd.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if name.ends_with(".notest.gd") {
+                skipped += 1;
+                continue;
             }
-            // For bless-mode full-diff dump.
-            let mut diff_buf = String::new();
-            diff_buf.push_str(&format!("===== {rel} =====\n"));
-            diff_buf.push_str("--- want ---\n");
-            for l in want {
-                diff_buf.push_str(l);
-                diff_buf.push('\n');
+
+            let rel = format!("{}/{}", suite.tag, rel_path(&corpus, gd));
+            let source = fs::read_to_string(gd).expect("read .gd source");
+            let out_path = gd.with_extension("out");
+            let Ok(out_content) = fs::read_to_string(&out_path) else {
+                skipped += 1; // no `.out` (e.g. a stray companion) — nothing to compare
+                continue;
+            };
+
+            let Some(expect) = classify(&out_content) else {
+                skipped += 1;
+                continue;
+            };
+
+            eligible += 1;
+            // Godot's `parser->script_path` is the source-file path; the head class's `fqcn` derives
+            // from it via `canonicalize_path` (analyzer.cpp:702), and the resulting `<file.gd>.<EnumName>`
+            // rendering appears in the corpus's golden `.out` lines. We pass the basename so the
+            // `Display for DataType` `get_file()` mirror produces the same string.
+            let script_path = gd.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let mut got = gdls_diag_lines(&source, script_path, gd, suite);
+            // gdscript_test_runner.cpp:571-585 — when the analyzer returns an error, Godot's
+            // runner outputs only `>> ERROR …` lines and skips the `~~ WARNING …` block (the
+            // `#ifdef DEBUG_ENABLED` warning loop sits AFTER the early return). The corpus's
+            // `GDTEST_ANALYZER_ERROR` golden files reflect this — they only list errors. Drop
+            // warnings from gdls's output for these cases so the harness comparison mirrors
+            // Godot's stripping rather than treating any incidental warning as a regression.
+            if matches!(expect, Expect::AnalyzerError(_)) {
+                got.retain(|line| line.starts_with(">>"));
             }
-            diff_buf.push_str("--- got ---\n");
-            for l in &got {
-                diff_buf.push_str(l);
-                diff_buf.push('\n');
+            let want = match &expect {
+                Expect::Ok(warnings) => warnings,
+                Expect::AnalyzerError(diags) => diags,
+            };
+
+            if &got == want {
+                matched += 1;
+            } else {
+                if samples.len() < 40 {
+                    samples.push(format!(
+                        "  {rel}\n      want: {want:?}\n      got:  {got:?}"
+                    ));
+                }
+                // For bless-mode full-diff dump.
+                let mut diff_buf = String::new();
+                diff_buf.push_str(&format!("===== {rel} =====\n"));
+                diff_buf.push_str("--- want ---\n");
+                for l in want {
+                    diff_buf.push_str(l);
+                    diff_buf.push('\n');
+                }
+                diff_buf.push_str("--- got ---\n");
+                for l in &got {
+                    diff_buf.push_str(l);
+                    diff_buf.push('\n');
+                }
+                all_diffs.push(diff_buf);
+                failures.insert(rel);
             }
-            all_diffs.push(diff_buf);
-            failures.insert(rel);
         }
     }
 
@@ -612,8 +672,7 @@ fn analyze_phase_fidelity() {
     };
     let summary = format!(
         "analyze-phase fidelity: {matched}/{eligible} = {fidelity:.4}  \
-         ({skipped} skipped, {} total .gd)",
-        gd_files.len()
+         ({skipped} skipped, {total_files} total .gd)"
     );
     println!("{summary}");
 

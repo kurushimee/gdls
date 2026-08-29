@@ -21,6 +21,7 @@
 //! later pass or a known-failure corpus case, never a crash.
 
 use gd_syntax::ast::{Member, NodeId, NodeKind};
+use gd_syntax::Dialect;
 
 use crate::context::AnalysisContext;
 use crate::data_type::{DataType, DtKind, MethodSig, ScriptRef, TypeSource, VariantType};
@@ -53,12 +54,25 @@ fn resolve_class_inheritance_recursive(
     recursive: bool,
 ) -> Result<(), ()> {
     resolve_class_inheritance(ctx, class_id, None)?;
+    let mut first_err = Ok(());
     if recursive {
         for inner in inner_classes(ctx, class_id) {
-            resolve_class_inheritance_recursive(ctx, inner, true)?;
+            // DIALECT(4.7): gdscript_analyzer.cpp resolve_class_inheritance(p_class, p_recursive)
+            // — 4.6 returned on the first failing inner class, so its siblings were never resolved
+            // and their own inheritance errors never appeared. 4.7 resolves every inner class and
+            // reports the first error it saw.
+            let inner_err = resolve_class_inheritance_recursive(ctx, inner, true);
+            if inner_err.is_err() {
+                if ctx.dialect < Dialect::Godot4_7 {
+                    return inner_err;
+                }
+                if first_err.is_ok() {
+                    first_err = inner_err;
+                }
+            }
         }
     }
-    Ok(())
+    first_err
 }
 
 /// `resolve_class_inheritance(p_class, const Node *p_source)` (analyzer.cpp:346).
@@ -1823,7 +1837,7 @@ pub(crate) fn resolve_function_signature(ctx: &mut AnalysisContext, func_id: Nod
         let native_override = if script_ancestor_defines_function(ctx, &name) {
             None
         } else {
-            enclosing_native_base(ctx, func_id)
+            enclosing_native_base(ctx)
                 .and_then(|native| find_native_class_with_method(ctx, &native, &name))
         };
         if let Some(defining_class) = native_override {
@@ -1876,17 +1890,55 @@ pub(crate) fn resolve_function_signature(ctx: &mut AnalysisContext, func_id: Nod
 /// return-value compat checks inside the body fire against the inherited type
 /// (analyzer.cpp:1878-1879).
 fn adopt_parent_return_type(ctx: &mut AnalysisContext, func_id: NodeId, name: &str) {
+    // DIALECT(4.7): gdscript_analyzer.cpp resolve_function_signature() — 4.6 left an untyped
+    // override at soft Variant, so its body was never checked against the parent's contract.
+    // 4.7 adopts the parent's return type (GH-118877).
+    if ctx.dialect < Dialect::Godot4_7 {
+        return;
+    }
     let Some(current_class) = ctx.current_class else {
         return;
     };
-    let Some(parent_fn) = find_parent_function(ctx, current_class, name) else {
+    let Some(parent_return) = parent_return_type(ctx, current_class, name) else {
         return;
     };
-    let parent = function_signature(ctx, parent_fn);
     let child_return = ctx.get_type(func_id).clone();
     if !child_return.is_hard_type() {
-        ctx.set_type(func_id, parent.return_type.clone());
+        ctx.set_type(func_id, parent_return);
     }
+}
+
+/// `get_function_signature`'s return-type half (analyzer.cpp:5905-6015): the in-file script chain
+/// first, then the native base's ClassDB entry.
+fn parent_return_type(
+    ctx: &AnalysisContext,
+    current_class: NodeId,
+    name: &str,
+) -> Option<DataType> {
+    if let Some(parent_fn) = find_parent_function(ctx, current_class, name) {
+        return Some(function_signature(ctx, parent_fn).return_type);
+    }
+    // Godot keeps walking into `ClassDB` when no script ancestor declares the method, so an
+    // untyped `func _ready():` inherits `Node._ready`'s `void`. Same suppression gate as
+    // NATIVE_METHOD_OVERRIDE above: only the class whose resolution actually reaches the native
+    // method adopts from it.
+    if script_ancestor_defines_function(ctx, name) {
+        return None;
+    }
+    let native = enclosing_native_base(ctx)?;
+    let sig = crate::reducer::lookup_native_method(ctx, &native, name)?;
+    // The GH-118877 compatibility exception: an untyped `_get_property_list` override keeps a
+    // plain `Array` rather than the declared `Array[Dictionary]`, because the mismatch can only
+    // be detected at runtime and too much existing code returns an untyped array.
+    if name == "_get_property_list" && sig.is_virtual {
+        return Some(DataType {
+            type_source: TypeSource::AnnotatedInferred,
+            kind: DtKind::Builtin,
+            builtin_type: VariantType::Array,
+            ..Default::default()
+        });
+    }
+    Some(sig.return_dt)
 }
 
 /// Emit the override-signature-mismatch error (body-pass step). Runs after the body so the
@@ -2258,7 +2310,7 @@ fn script_ancestor_defines_function(ctx: &AnalysisContext, name: &str) -> bool {
 /// (the in-file class → base mapping) from the current class upward; returns the first base
 /// whose `kind == Native` (or returns `None` if the chain ends without a native ancestor —
 /// e.g. the function is in a class that extends a Script base not currently in the index).
-fn enclosing_native_base(ctx: &AnalysisContext, _func_id: NodeId) -> Option<String> {
+fn enclosing_native_base(ctx: &AnalysisContext) -> Option<String> {
     let mut cur = ctx.current_class?;
     loop {
         let base = ctx.bases.get(&cur).cloned().unwrap_or_default();
@@ -5225,10 +5277,6 @@ fn resolve_return(ctx: &mut AnalysisContext, ret_id: NodeId) {
         NodeKind::Return(r) => r.return_value,
         _ => return,
     };
-    let Some(v) = value else {
-        return;
-    };
-
     // The function's `TypeTable` entry is its return type (see `resolve_function_signature`
     // analyzer.cpp:1729-1862 and gdls's mirror at the head of this file). A hard-typed
     // `Builtin NIL` return is Godot's `is_void_function`.
@@ -5236,6 +5284,21 @@ fn resolve_return(ctx: &mut AnalysisContext, ret_id: NodeId) {
     let is_void_function = expected_type.as_ref().is_some_and(|t| {
         t.is_hard_type() && t.kind == DtKind::Builtin && t.builtin_type == VariantType::Nil
     });
+    let Some(v) = value else {
+        // analyzer.cpp:2534-2540 — a bare `return` yields a hard, constant `null`, and the compat
+        // check below still runs against it. gdls used to bail here, which was invisible while an
+        // untyped function's return type stayed a soft Variant.
+        let nil = DataType {
+            type_source: TypeSource::AnnotatedExplicit,
+            kind: DtKind::Builtin,
+            builtin_type: VariantType::Nil,
+            is_constant: true,
+            ..Default::default()
+        };
+        check_return_compatibility(ctx, ret_id, expected_type.clone(), &nil);
+        ctx.set_type(ret_id, nil);
+        return;
+    };
     let is_call = matches!(ctx.node(v).kind, NodeKind::Call(_));
 
     // Reduce the return expression first so subsequent type queries see its resolved DataType.
@@ -5321,26 +5384,57 @@ fn resolve_return(ctx: &mut AnalysisContext, ret_id: NodeId) {
     // rendering is identical either way — `return 'string'` is a single source line — but
     // anchoring at the same node keeps the stable insertion order intact through
     // `DiagnosticSink::finish`'s `sort_by_key(span.start)`.
-    if !expected_type.is_variant() && !result.is_variant() && result.is_hard_type() {
+    check_return_compatibility(ctx, v, Some(expected_type), &result);
+
+    // analyzer.cpp:2590 — stamp the return node's type so `decide_suite_type` can propagate it.
+    ctx.set_type(ret_id, result);
+}
+
+/// analyzer.cpp:2578-2600 — the declared-return-type compatibility check, shared by the
+/// value-returning and bare-`return` paths.
+///
+/// `anchor` is the node the diagnostic attaches to: the return *value* when there is one, the
+/// `return` statement itself otherwise. See the emission-order note at the call site.
+fn check_return_compatibility(
+    ctx: &mut AnalysisContext,
+    anchor: NodeId,
+    expected_type: Option<DataType>,
+    result: &DataType,
+) {
+    let Some(expected_type) = expected_type else {
+        return;
+    };
+    if !expected_type.is_set() {
+        return;
+    }
+    // DIALECT(4.7): gdscript_analyzer.cpp resolve_return() — the whole compat check gained
+    // `expected_type.is_hard_type()`. A function whose return type was only *inferred* no longer
+    // rejects a return value, since the inferred type is a guess about the body, not a contract
+    // the user wrote.
+    let expected_is_checkable = !expected_type.is_variant()
+        && (ctx.dialect < Dialect::Godot4_7 || expected_type.is_hard_type());
+    if expected_is_checkable && !result.is_variant() && result.is_hard_type() {
         // The forward check passes `p_return` upstream (analyzer.cpp:2572/2575); gdls anchors
         // at the return value (same line) per the emission-order note above.
-        let target_to_source =
-            crate::reducer::is_type_compatible_with_source(ctx, &expected_type, &result, true, v);
+        let target_to_source = crate::reducer::is_type_compatible_with_source(
+            ctx,
+            &expected_type,
+            result,
+            true,
+            anchor,
+        );
         if !target_to_source {
-            let reverse = crate::reducer::is_type_compatible(ctx, &result, &expected_type, false);
+            let reverse = crate::reducer::is_type_compatible(ctx, result, &expected_type, false);
             if !reverse {
                 ctx.push_error(
                     format!(
                         r#"Cannot return value of type "{result}" because the function return type is "{expected_type}"."#
                     ),
-                    v,
+                    anchor,
                 );
             }
         }
     }
-
-    // analyzer.cpp:2590 — stamp the return node's type so `decide_suite_type` can propagate it.
-    ctx.set_type(ret_id, result);
 }
 
 /// `resolve_assert` (analyzer.cpp:2385): reduce the condition + message. The `Expected string for

@@ -497,6 +497,9 @@ impl std::fmt::Display for DataType {
                 // render as `Array[T]` / `Dictionary[K, V]`. Unparameterized variants fall through
                 // to the bare builtin name.
                 match self.builtin_type {
+                    // gdscript_parser.cpp:5341 — a builtin `NIL` renders as `null`, not as
+                    // `Variant::get_type_name(NIL)`'s `"Nil"`. Same at both supported tags.
+                    VariantType::Nil => f.write_str("null"),
                     VariantType::Array if !self.container_element_types.is_empty() => {
                         write!(f, "Array[{}]", self.container_element_types[0])
                     }

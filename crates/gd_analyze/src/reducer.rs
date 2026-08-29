@@ -4718,8 +4718,8 @@ pub(crate) fn class_identifier_name_or_default(ctx: &AnalysisContext, dt: &DataT
 
 /// `return_dt` is the return type; the size pair is min/max arity for arg-count messages.
 #[derive(Default)]
-struct CallSig {
-    return_dt: DataType,
+pub(crate) struct CallSig {
+    pub(crate) return_dt: DataType,
     par_types: Vec<DataType>,
     min_params: usize,
     max_params: usize,
@@ -4738,7 +4738,7 @@ struct CallSig {
     /// `super.<v>()` that resolves to a parent-class virtual that the parent doesn't override emits
     /// `Cannot call the parent class' virtual function "<v>()" because it hasn't been defined.`.
     /// Only `lookup_native_method` sets it; in-file/script sigs leave it `false`.
-    is_virtual: bool,
+    pub(crate) is_virtual: bool,
     /// Whether `(min_params, max_params)` reflect the method's REAL parameter list and may drive
     /// the arity check (analyzer.cpp:5944). `false` for a native method seeded by
     /// `seed_dump_omitted_methods` — those carry an empty `params` purely so the name-existence
@@ -4951,7 +4951,11 @@ fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> 
 /// (analyzer.cpp:5923) for the arity check at analyzer.cpp:5944. Per-param types route through
 /// [`type_from_type_ref`] — `TypeRef::Named` for which the dump has no class / builtin entry degrades
 /// silently to Variant, mirroring the trimmed-dump permissiveness used across the rest of reduce_call.
-fn lookup_native_method(ctx: &AnalysisContext, native: &str, name: &str) -> Option<CallSig> {
+pub(crate) fn lookup_native_method(
+    ctx: &AnalysisContext,
+    native: &str,
+    name: &str,
+) -> Option<CallSig> {
     let mut cur = Some(native.to_owned());
     while let Some(c) = cur {
         let nc = ctx.native.class_named(&c)?;
