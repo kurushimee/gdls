@@ -56,13 +56,23 @@ Phase 2 reframed Phase 1's ship bar as the problem. Parity with Godot's LSP is a
 | M10 | Presentation and actions | `semanticTokens` full, delta, and range on the standard legend; `inlayHint`; `documentColor`; `codeAction` quickfixes plus `source.fixAll` (#72 through #75) |
 | M11 | Scenes and file operations | The `.tscn` scene index feeding `$`/`%` typing, scene-aware completion, autoload `uid://` scene typing, `willRenameFiles`, the external-formatter bridge (#76 through #80) |
 
-M7 through M11 shipped and closed by 2026-06-15. A post-phase hardening wave then closed every remaining follow-up (#99, #125, #132, #157, #161, #189, #193, #204, #246, plus the M9, M10, and M11 deferral lists), and the issue tracker reached zero on 2026-08-28. No release has been cut from Phase 2 yet.
+M7 through M11 shipped and closed by 2026-06-15. A post-phase hardening wave then closed every remaining follow-up (#99, #125, #132, #157, #161, #189, #193, #204, #246, plus the M9, M10, and M11 deferral lists), and the issue tracker reached zero on 2026-08-28. Phase 2 shipped as **v2.0.0** on 2026-08-29, after two rounds of end-to-end verification against the release binary found fourteen more issues (#255 through #265, then #277, #279, #280) and the release gate itself found two more (#284, #286).
 
 ### The `$`/`%` premise correction
 
 M11 was specified around precise scene-derived types for `$Node` and `%Unique`, retiring what Phase 1 had documented as a permissive-`Variant` deviation. Reading Godot's analyzer closed that question differently: `reduce_get_node` types every `$` and `%` as a hard bare `NATIVE Node`, and the precise per-node type the editor shows comes from a separate scene-instantiation path, not from the analyzer.
 
 Feeding a precise type into gdls's analyzer would therefore have been the *less* faithful choice. A `DataType` is used symmetrically in compatibility checks, so a precise `$Health: Node2D` would turn `var c: Control = $Health` into a false-positive error that Godot does not emit. The scene index shipped, and its resolution seam drives navigation only. The reasoning is now in `02-frontend-port.md` §11.
+
+## Two releases at once (v3.0.0)
+
+By the time Phase 2 shipped, stable Godot had moved to 4.7. Supporting it by re-porting would have dropped 4.6, and shipping two binaries would have doubled every future re-port, so the release became a per-project setting instead: one binary, the dialect read from `project.godot`, and every ported function carrying the newest behavior with the older one wrapped in a guard.
+
+`git diff 4.6.3-stable 4.7.2-stable -- modules/gdscript/` produced 24 behavioral differences. Nine turned out to be no-ops for gdls — either the change fixed an engine bug gdls never had (the `ParserError` range, the retargeted tokenizer error sites), or it touched machinery gdls does not port (`cursor_position`, `GDScriptWarning`'s columns, the `-1` extent sentinel). Writing each of those down beside the guards, in the delta tables in `02-frontend-port.md` §11c and §11d, mattered as much as the guards themselves: a no-op that is not recorded looks like an omission on the next re-port.
+
+Two findings were worth more than the delta itself. Vendoring the 4.7.2 corpus byte for byte against the Godot checkout revealed that the tree filed as "4.6.3" contained a gdls-authored test pair that exists in neither tag, and one file that was already 4.7.2 content — which is why the byte-exact-mirror rule is now in `PROVENANCE.md` and why gdls-authored cases live in unit tests. And upstream had consolidated its analyzer corpus, 300 mostly one-error files down to 194 grouped ones, so coverage rose while the denominator fell. That rise is what exposed three real analyzer gaps, all of them equally wrong at 4.6: enum values could not name their siblings, an override against a purely native ancestor was never signature-checked, and native `Array[T]` return types were flattening to `Variant`.
+
+The default for a project that declares no version is the **newest** port, which is why this is a major release: an existing undeclared project can see different diagnostics after the upgrade. Godot writes that entry itself, so a real project always has one.
 
 ## Three lessons that still apply
 
