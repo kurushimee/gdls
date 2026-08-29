@@ -1324,6 +1324,40 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         _ => return,
     };
 
+    // 0. Sibling lookup inside the `enum { … }` block being resolved (analyzer.cpp:4392-4412).
+    //    This runs ahead of every other lookup, and returns unconditionally on a name match, so a
+    //    value naming a sibling never reaches the class-member path (where an unnamed enum's
+    //    hoisted members would read the self-reference as a cyclic one instead).
+    if let Some(enum_id) = ctx.current_enum {
+        if let Some((ident_id, enum_name)) = enum_element_named(ctx, enum_id, &name) {
+            let class_id = ctx.current_class.or_else(|| ctx.tree.root_id());
+            let mut t = crate::resolver::make_class_enum_type(
+                ctx,
+                enum_name.as_deref().unwrap_or("<anonymous enum>"),
+                class_id.unwrap_or(enum_id),
+                false,
+            );
+            // Godot only stamps `enum_type` for a *named* enum (analyzer.cpp:4399-4401).
+            if enum_name.is_none() {
+                t.enum_type = String::new();
+            }
+            match ctx.enum_element_values.get(&ident_id).copied() {
+                Some(v) => {
+                    t.is_constant = true;
+                    ctx.folds.set(id, crate::foldtable::FoldedValue::Int(v));
+                }
+                None => {
+                    ctx.push_error(
+                        "Cannot use another enum element before it was declared.",
+                        id,
+                    );
+                }
+            }
+            ctx.set_type(id, t);
+            return; // Found anyway.
+        }
+    }
+
     // 1. Suite-local lookup (analyzer.cpp:4416-4434, LOCAL_VARIABLE/LOCAL_CONSTANT/LOCAL_ITERATOR/
     //    LOCAL_BIND). Walk the active suite chain top-to-bottom — innermost wins.
     // Before resolving, check for CONFUSABLE_LOCAL_USAGE (analyzer.cpp:4443-4445): when the
@@ -2091,9 +2125,19 @@ fn lookup_class_member(
                         .and_then(|init| ctx.folds.get(init).cloned());
                     Some((dt, fold))
                 }
-                gd_syntax::ast::Member::EnumValue(ev) => ev
-                    .identifier
-                    .map(|iid| (ctx.get_type(iid).clone(), ctx.folds.get(iid).cloned())),
+                // analyzer.cpp:4212-4218 — an enum value read through the class is
+                // *unconditionally* constant, carrying `element.value`, which is still the 0
+                // default while that element is mid-resolution. The fallback is what keeps a
+                // cyclic sibling reference (`enum { A = B }` / `enum { B = A }`) constant, so it
+                // draws only the cycle error and not a spurious `Enum values must be constant.`
+                gd_syntax::ast::Member::EnumValue(ev) => ev.identifier.map(|iid| {
+                    let fold = ctx
+                        .folds
+                        .get(iid)
+                        .cloned()
+                        .unwrap_or(crate::foldtable::FoldedValue::Int(0));
+                    (ctx.get_type(iid).clone(), Some(fold))
+                }),
                 gd_syntax::ast::Member::Group(_) => None,
             }
             .map(|(dt, fold)| (dt, fold, class));
@@ -4731,14 +4775,14 @@ pub(crate) fn class_identifier_name_or_default(ctx: &AnalysisContext, dt: &DataT
 #[derive(Default)]
 pub(crate) struct CallSig {
     pub(crate) return_dt: DataType,
-    par_types: Vec<DataType>,
-    min_params: usize,
-    max_params: usize,
-    is_vararg: bool,
+    pub(crate) par_types: Vec<DataType>,
+    pub(crate) min_params: usize,
+    pub(crate) max_params: usize,
+    pub(crate) is_vararg: bool,
     /// Whether the resolved method itself is declared `static`. Drives the static-context call
     /// check (analyzer.cpp:3644) — calling a non-static method from a static context is the
     /// "Cannot call non-static function X from the static function Y" error.
-    is_static: bool,
+    pub(crate) is_static: bool,
     /// Whether the resolved function is a coroutine (its body contains `await`). Godot's
     /// parser sets `FunctionNode::is_coroutine` in `parse_await` (gdscript_parser.cpp:3232-3234)
     /// and `get_function_signature` stamps it onto the return type at analyzer.cpp:6012 so
@@ -4760,7 +4804,7 @@ pub(crate) struct CallSig {
     /// dumped native/builtin lookups) sets it `true`; the derived `Default` leaves it `false`,
     /// which is safe because the `CallSig::default()` stubs (constructor, Variant-degrade) are
     /// already excluded from the arity check by `sig_resolved`.
-    arity_known: bool,
+    pub(crate) arity_known: bool,
 }
 
 /// Read an in-file function's signature snapshot for the count + per-arg compat checks. Needs
@@ -6616,10 +6660,31 @@ fn type_from_type_ref(ctx: &AnalysisContext, ty: &gd_types::TypeRef) -> DataType
             t.is_meta_type = false;
             t
         }
-        TypeRef::Variant
-        | TypeRef::TypedArray(_)
-        | TypeRef::TypedDict(_, _)
-        | TypeRef::Pointer(_) => DataType::variant(),
+        // `type_from_property` (analyzer.cpp:5760-5790): a hinted `Array`/`Dictionary` carries its
+        // element type(s), which is what makes an override of `_get_property_list` measurable
+        // against the declared `Array[Dictionary]`.
+        TypeRef::TypedArray(elem) => {
+            let mut t = DataType {
+                type_source: TypeSource::AnnotatedExplicit,
+                kind: DtKind::Builtin,
+                builtin_type: VariantType::Array,
+                ..Default::default()
+            };
+            t.container_element_types = vec![type_from_type_ref(ctx, elem)];
+            t
+        }
+        TypeRef::TypedDict(key, value) => {
+            let mut t = DataType {
+                type_source: TypeSource::AnnotatedExplicit,
+                kind: DtKind::Builtin,
+                builtin_type: VariantType::Dictionary,
+                ..Default::default()
+            };
+            t.container_element_types =
+                vec![type_from_type_ref(ctx, key), type_from_type_ref(ctx, value)];
+            t
+        }
+        TypeRef::Variant | TypeRef::Pointer(_) => DataType::variant(),
     }
 }
 
@@ -7183,6 +7248,34 @@ fn subscript_identifier_name(ctx: &AnalysisContext, id: NodeId) -> String {
         NodeKind::Identifier(i) => i.name.clone(),
         _ => String::new(),
     }
+}
+
+/// The element of `enum_id` named `name`, as `(identifier node, enum name)` — the `values` walk at
+/// the head of `reduce_identifier` (analyzer.cpp:4393-4395). The enum name is `None` for an
+/// unnamed block, Godot's `UNNAMED_ENUM`.
+fn enum_element_named(
+    ctx: &AnalysisContext,
+    enum_id: NodeId,
+    name: &str,
+) -> Option<(NodeId, Option<String>)> {
+    let NodeKind::Enum(e) = &ctx.node(enum_id).kind else {
+        return None;
+    };
+    let enum_name = e.identifier.and_then(|i| match &ctx.node(i).kind {
+        NodeKind::Identifier(id) => Some(id.name.clone()),
+        _ => None,
+    });
+    for v in &e.values {
+        let Some(ident_id) = v.identifier else {
+            continue;
+        };
+        if let NodeKind::Identifier(i) = &ctx.node(ident_id).kind {
+            if i.name == name {
+                return Some((ident_id, enum_name));
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

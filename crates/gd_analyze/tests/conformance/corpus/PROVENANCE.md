@@ -17,16 +17,18 @@ gdls serves more than one Godot feature release, and their goldens differ. Each 
 
 | Suite | Directory | Reference release | Vendored on |
 |---|---|---|---|
-| 4.6 | `analyzer/` | `4.6.3-stable` (commit `7d41c59c`) | 2026-05-23 |
-| 4.7 | `analyzer-4.7/` | `4.7.2-stable` (commit `ed1daf0b`) | 2026-08-29 |
+| 4.7 | `analyzer/` | `4.7.2-stable` (commit `ed1daf0b`, subtree `0c8c912e`) | 2026-08-29 |
+| 4.6 | `analyzer-4.6/` | `4.6.3-stable` (commit `35e80b3a`, subtree `50c20a36`) | 2026-08-29 |
 
-The **oldest** supported release carries the full vendored tree; every newer one carries only the files that actually diverge from it. A version bump is therefore "vendor the new release's full corpus, then demote the previous full tree to its divergence subset" — never a wholesale copy of files that are identical across the two.
+The **newest** supported release carries the full vendored tree, byte for byte, verifiable with a single `diff -rq`. Every older release carries only the files whose analyze-phase result actually differs at that tag. A version bump is therefore "vendor the new release's full corpus, then demote the previous full tree to its divergence subset" — never a wholesale copy of files that behave the same at both. `scripts/conformance/demote_corpus.py` does the mechanical half; deciding which candidates genuinely diverge is a manual review.
+
+**The 4.6 subset is two files**, both for the same reason: `errors/abstract_methods` and `errors/variadic_functions`. 4.7's test *runner* stable-sorts the error list by start line before printing (`gdscript_test_runner.cpp:578-591`); 4.6 printed them in emission order. These two are the only corpus files where the two orders differ. Nothing else in the 4.6 goldens diverges once the guarded behaviors are accounted for, and those are pinned directly instead — the parser and lexer ones in `crates/gd_syntax/tests/dialect_delta.rs`, the analyzer ones in `crates/gd_analyze/tests/inherited_return_type.rs` and its siblings. See `docs/02-frontend-port.md` §11c and §11d for the full delta tables, including the no-ops.
 
 ## What is here, and what is not
 
-Only `analyzer/` is vendored: at 4.6.3, `errors/` (170), `features/` (107), and `warnings/` (23), giving 300 testable `.gd` plus 300 `.out`, along with 28 `*.notest.gd` multi-file companions. Those companions have no `.out`; they are loaded into the index so the file under test can resolve cross-file references, and are never run standalone.
+Only `analyzer/` is vendored: at 4.7.2, `errors/` (63), `features/` (107), and `warnings/` (24), giving 194 testable `.gd` plus 194 `.out`, along with 28 `*.notest.gd` multi-file companions. Those companions have no `.out`; they are loaded into the index so the file under test can resolve cross-file references, and are never run standalone.
 
-The 4.7 subset is the files whose goldens 4.7 changed or added: `untyped_override_return_incompatible_type`, `untyped_override_untyped_return`, `untyped_override_return_compatible_type` (an untyped override now inherits the parent's return type) and `constant_expressions` (the new constant-folding fallback reducers).
+That is 103 fewer `.gd` than 4.6.3 carried, which is a consolidation rather than a loss: 4.7 merged many one-error files into grouped ones, so `cyclic_ref_const` / `cyclic_ref_enum` / `cyclic_ref_enum_value` and the rest now live inside `errors/cyclic_reference.gd`, the two `bitwise_float_*_operand` files inside `errors/bitwise_float.gd`, the four `cast_*` files inside `errors/invalid_cast.gd`, and so on. The merged files also cover more than the originals did, which is what surfaced the two gaps recorded in `analyze_known_failures.txt`.
 
 `runtime/` is not vendored, since its `.out` files are dominated by VM stdout, which the diagnostics-only frontend port does not produce. `completion/` and `lsp/` are intentionally excluded, as Godot's own runner skips them too.
 
@@ -49,12 +51,23 @@ The oracle and comparison semantics mirror `modules/gdscript/tests/gdscript_test
 A deliberate manual step. Do it in its own commit and re-stamp the table above:
 
 ```bash
-# $GODOT = a local checkout of godotengine/godot at tag 4.6.3-stable
+# $GODOT = a local checkout of godotengine/godot at the newest supported tag
 src="$GODOT/modules/gdscript/tests/scripts/analyzer"
 dst="crates/gd_analyze/tests/conformance/corpus/analyzer"
 rsync -a --delete --include='*/' --include='*.gd' --include='*.out' --exclude='*' "$src/" "$dst/"
+diff -rq "$src" "$dst"   # must print nothing
 git -C "$GODOT" rev-parse HEAD
 git -C "$GODOT" rev-parse "HEAD:modules/gdscript/tests/scripts/analyzer"
 ```
 
 Then re-bless the ratchet with `GDLS_BLESS_CONFORMANCE=1 cargo test -p gd_analyze --test conformance -- --nocapture` and review the diff to `analyze_known_failures.txt` and `analyze_fidelity_floor.txt`.
+
+## Adding support for a newer release
+
+Bringing in the next release demotes the current tree to a subset:
+
+```bash
+scripts/conformance/demote_corpus.py analyzer --from 4.7 --to 4.8 --godot "$GODOT"
+```
+
+That leaves `analyzer-4.7/` holding the candidate divergences, refreshes `analyzer/` from the new tag, and prints the `SUITES` row to add. Then review every candidate by hand and delete the ones whose analyze-phase result does not actually differ — a renamed helper or an added case that behaves the same at both tags belongs in neither tree.

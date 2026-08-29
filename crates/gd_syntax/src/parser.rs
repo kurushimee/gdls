@@ -2752,11 +2752,15 @@ impl Parser {
                     }
                 }
 
-                let value = EnumValue {
+                let mut value = EnumValue {
                     identifier: ident,
                     custom_value,
+                    parent_enum: Some(enum_node),
+                    ..EnumValue::default()
                 };
                 if let NodeKind::Enum(e) = &mut self.tree.get_mut(enum_node).kind {
+                    // parser.cpp:1646 — the index is the position this value is about to take.
+                    value.index = e.values.len() as i32;
                     e.values.push(value.clone());
                 }
                 if !named {
@@ -5118,5 +5122,22 @@ mod tests {
             .children
             .iter()
             .any(|c| c.kind == SymbolKind::Class && c.name == "Inner"));
+    }
+
+    /// `Nested typed collections are not supported.` (`gdscript_parser.cpp:3904`). Godot's own
+    /// corpus never covers this message, so it is pinned here rather than in the vendored tree.
+    #[test]
+    fn nested_typed_collections_are_rejected() {
+        for src in [
+            "var x: Array[Array[int]]",
+            "var d: Dictionary[int, Array[int]]",
+        ] {
+            let errs = crate::parse(src).diagnostics;
+            assert_eq!(
+                errs.first().map(|d| d.message.as_str()),
+                Some("Nested typed collections are not supported."),
+                "{src:?} produced {errs:?}"
+            );
+        }
     }
 }

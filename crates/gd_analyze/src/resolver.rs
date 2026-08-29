@@ -1521,8 +1521,33 @@ fn resolve_class_member(
                 // Set RESOLVING so a cyclic custom-value reference re-entering this member
                 // triggers the cyclic_ref check at the top of `resolve_class_member`.
                 ctx.set_type(iid, resolving());
+                let mut resolved = true;
                 if let Some(cv) = ev.custom_value {
+                    // analyzer.cpp:1218-1221 — an unnamed enum's values are hoisted to class
+                    // members, so the block a sibling reference may reach comes from the value's
+                    // own `parent_enum` back-pointer rather than from a surrounding loop.
+                    let prev_enum = ctx.current_enum;
+                    ctx.current_enum = ev.parent_enum;
+                    let errors_before = ctx.diagnostic_count();
                     crate::reducer::reduce_expression(ctx, cv, false);
+                    ctx.current_enum = prev_enum;
+                    let raised = ctx.diagnostic_count() > errors_before;
+                    // analyzer.cpp:1223-1231. gdls's fold table can't tell "not constant" from
+                    // "constant we don't model", so the emission is gated on the reduction having
+                    // raised an error, the same hedge `resolve_enum_type` uses.
+                    match ctx.folds.get(cv).cloned() {
+                        Some(crate::foldtable::FoldedValue::Int(_)) => {}
+                        Some(_) => {
+                            ctx.push_error("Enum values must be integers.", cv);
+                            resolved = false;
+                        }
+                        None => {
+                            if raised {
+                                ctx.push_error("Enum values must be constant.", cv);
+                            }
+                            resolved = false;
+                        }
+                    }
                 }
                 let mut t = make_class_enum_type(ctx, "<anonymous enum>", class_id, false);
                 t.is_constant = true;
@@ -1535,6 +1560,9 @@ fn resolve_class_member(
                 // itself isn't used by the assignment-compat check, only `is_constant` and
                 // `is_reduced` (the latter via the fold-table membership).
                 ctx.folds.set(iid, crate::foldtable::FoldedValue::Int(0));
+                if resolved {
+                    ctx.enum_element_values.insert(iid, 0);
+                }
             }
         }
         Member::Group(_) => {}
@@ -1941,6 +1969,38 @@ fn parent_return_type(
     Some(sig.return_dt)
 }
 
+/// The `ClassDB` half of `get_function_signature` (analyzer.cpp:5905-6015), shaped as a
+/// [`FunctionSig`] so the override check can compare against a native virtual the script chain
+/// never redeclares — `Object._get_property_list`, `Node._process`, and the rest.
+///
+/// Gated the same way [`parent_return_type`] is: a script ancestor that declares the name owns the
+/// contract, and only the class whose base chain actually reaches the native method compares
+/// against it. A `seed_dump_omitted_methods` stub is skipped outright — its empty parameter list
+/// is a name-only placeholder, so comparing arity against it would invent a mismatch.
+fn native_parent_signature(ctx: &AnalysisContext, name: &str) -> Option<FunctionSig> {
+    if script_ancestor_defines_function(ctx, name) {
+        return None;
+    }
+    let native = enclosing_native_base(ctx)?;
+    let sig = crate::reducer::lookup_native_method(ctx, &native, name)?;
+    if !sig.arity_known {
+        return None;
+    }
+    // `default_par_count` is the trailing run the dump marks with a default value; gdls's
+    // `min_params` already counts the ones without.
+    let total = sig.par_types.len().max(sig.max_params);
+    let mut has_default = vec![false; total];
+    for slot in has_default.iter_mut().skip(sig.min_params) {
+        *slot = true;
+    }
+    Some(FunctionSig {
+        return_type: sig.return_dt,
+        param_types: sig.par_types,
+        has_default,
+        is_vararg: sig.is_vararg,
+    })
+}
+
 /// Emit the override-signature-mismatch error (body-pass step). Runs after the body so the
 /// emission lands AFTER any sibling functions' interface-pass errors — matching Godot's
 /// observed emission order in corpus `.out` files (analyzer.cpp:1865-1960).
@@ -1948,12 +2008,19 @@ fn check_override_signature(ctx: &mut AnalysisContext, func_id: NodeId, name: &s
     let Some(current_class) = ctx.current_class else {
         return;
     };
-    let Some(parent_fn) = find_parent_function(ctx, current_class, name) else {
-        return;
+    // Godot resolves the parent through one `get_function_signature` call, which walks the script
+    // chain and then falls into `ClassDB` (analyzer.cpp:1875). Only the script half yields a
+    // `parent_fn`, and only that half can be the cyclic-override case below.
+    let parent_fn = find_parent_function(ctx, current_class, name);
+    let parent = match parent_fn {
+        Some(f) => function_signature(ctx, f),
+        None => match native_parent_signature(ctx, name) {
+            Some(p) => p,
+            None => return,
+        },
     };
 
     let child = function_signature(ctx, func_id);
-    let parent = function_signature(ctx, parent_fn);
 
     if signatures_match(ctx, &child, &parent) {
         return;
@@ -1968,7 +2035,7 @@ fn check_override_signature(ctx: &mut AnalysisContext, func_id: NodeId, name: &s
     // InnerB which extends InnerA).
     let current_class_name = class_identifier_name(ctx, current_class).unwrap_or_default();
     if !current_class_name.is_empty()
-        && parent_default_references_class(ctx, parent_fn, &current_class_name)
+        && parent_fn.is_some_and(|f| parent_default_references_class(ctx, f, &current_class_name))
     {
         ctx.push_error(
             format!(r#"Could not resolve member "{name}": Cyclic reference."#),
@@ -2847,10 +2914,17 @@ fn resolve_enum_type(
 ) -> DataType {
     let mut enum_type = make_class_enum_type(ctx, name, class_id, true);
     let entries = enum_values(ctx, enum_id);
+    // analyzer.cpp:1156-1157 — an element's custom value may name a sibling of the same block, so
+    // `reduce_identifier`'s head arm needs to know which block is open. Saved and restored around
+    // the loop (`prev_enum`) because a nested class member can be resolved from inside it.
+    let prev_enum = ctx.current_enum.replace(enum_id);
     // `prev_value` matches Godot's `values[index-1].value` chain: -1 lets the first non-custom
     // entry fall into the `index == 0` branch (analyzer.cpp:1176) and resolve to 0.
     let mut prev_value: i64 = -1;
     for (ident_id, custom_value, ident_name) in entries {
+        // Godot's `element.resolved`: true only when the value actually landed, so a *later*
+        // sibling referring to a failed element still gets the forward-reference error.
+        let mut resolved = true;
         let value: i64 = if let Some(cv) = custom_value {
             let errors_before = ctx.diagnostic_count();
             crate::reducer::reduce_expression(ctx, cv, false);
@@ -2861,6 +2935,7 @@ fn resolve_enum_type(
                     // Godot's analyzer.cpp:1167-1168 check; we only emit when the fold succeeds
                     // (so a non-int constant) — a literal `0.0` or `"hello"` reaches this arm.
                     ctx.push_error("Enum values must be integers.", cv);
+                    resolved = false;
                     prev_value.saturating_add(1)
                 }
                 None => {
@@ -2877,6 +2952,7 @@ fn resolve_enum_type(
                     if errors_after > errors_before {
                         ctx.push_error("Enum values must be constant.", cv);
                     }
+                    resolved = false;
                     prev_value.saturating_add(1)
                 }
             }
@@ -2898,6 +2974,11 @@ fn resolve_enum_type(
         if let Some(iid) = ident_id {
             ctx.folds
                 .set(iid, crate::foldtable::FoldedValue::Int(value));
+            // `element.resolved = true` (analyzer.cpp:1171/1179) — what makes a *later* sibling's
+            // reference to this one a constant rather than the forward-reference error.
+            if resolved {
+                ctx.enum_element_values.insert(iid, value);
+            }
             let mut value_dt = enum_type.clone();
             value_dt.is_meta_type = false;
             value_dt.builtin_type = VariantType::Int;
@@ -2906,6 +2987,8 @@ fn resolve_enum_type(
         }
         prev_value = value;
     }
+    // analyzer.cpp:1193.
+    ctx.current_enum = prev_enum;
     enum_type
 }
 
@@ -2950,7 +3033,7 @@ pub(crate) fn make_enum_type(enum_name: &str, base_name: &str, meta: bool) -> Da
 /// compatibility checks compare disambiguated names and error messages render
 /// `<file.gd>.<EnumName>` / `<file.gd>::Inner.<EnumName>` after `Display`'s `get_file()` strips
 /// the leading `<dir>/`.
-fn make_class_enum_type(
+pub(crate) fn make_class_enum_type(
     ctx: &AnalysisContext,
     enum_name: &str,
     class_id: NodeId,

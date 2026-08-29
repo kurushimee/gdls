@@ -12,6 +12,14 @@ Two caveats shape the harness. `.out` files also carry runtime output, and they 
 
 The vendored copy is fixed and refreshed deliberately, never automatically. Each corpus directory's `PROVENANCE.md` records the reference tag it came from. Godot regenerates its expected outputs with the `--gdscript-generate-tests` flag.
 
+### Suites, one per supported release
+
+gdls serves several Godot feature releases from one binary, and their goldens differ, so each harness reads a **set** of corpus trees. A suite is a tree plus the dialect its goldens were generated at (`SUITES` in each `conformance.rs`), and every reported path is prefixed with its suite tag, so a `known_failures.txt` line names both the file and the dialect it failed under. One aggregate fidelity number covers all suites, which is what makes it impossible to lose a file by moving it between them.
+
+The newest supported release carries the full vendored tree, byte for byte — `diff -rq` against the Godot checkout must print nothing, so a gdls-authored regression case never lives inside it. Older releases carry only the files whose phase-relevant result actually differs at that tag. Today that is `analyzer-4.6/` with two files (4.7's runner sorts the printed error list by line; 4.6 printed it in emission order) and no parser subset at all, because no `.gd` in the parser corpus parses differently at the two tags. The guarded behaviors that *do* differ are pinned directly instead, in `crates/gd_syntax/tests/dialect_delta.rs` and the analyzer's dialect test files; `docs/02-frontend-port.md` §11c and §11d carry the full delta tables.
+
+Adding support for a newer release therefore *demotes* the current full tree to a subset. `scripts/conformance/demote_corpus.py <corpus> --from <old> --to <new> --godot <checkout>` does the mechanical half: it refuses to run if the vendored tree has drifted from the tag it claims, writes the textual divergences into the subset directory, refreshes the main tree, and prints the suite row and provenance facts. Which of those candidates genuinely diverge is a manual review — a renamed test helper or an added case that behaves the same at both tags belongs in neither tree, and an empty subset is a real outcome.
+
 ## 2. Differential oracle: the godot binary, offline
 
 For fidelity against real code, including project-specific native classes, the godot binary runs over a sample corpus of an actual project to produce its diagnostics, and gdls diffs against them. This catches divergences the upstream corpus cannot, especially around Godot's native API and a project's own typing patterns. It runs offline, never at runtime.
@@ -24,7 +32,9 @@ It lives in `crates/gd_analyze/tests/differential.rs` and is env-gated: when nei
 
 Fidelity is the percentage of corpus diagnostics that match on exact code, range, and message, tracked per phase. CI runs the corpus on every change and fails on any regression below the recorded floor. The number makes "match Godot exactly" a visible, defendable target rather than a claim.
 
-Both phases sit at 1.0000: parse 186/186 (`crates/gd_syntax/tests/conformance/fidelity_floor.txt`) and analyze 300/300 (`crates/gd_analyze/tests/conformance/analyze_fidelity_floor.txt`). Both `known_failures.txt` files are empty. Each floor file carries a header comment documenting the commit that set it and the intentionally excluded fixtures: `.notest.gd` and `.textonly.gd`, the `completion/` and `lsp/` folders, and the runtime and debug lines the curation layer filters.
+Parse sits at 1.0000, 185/185 over the full 4.7.2 tree (`crates/gd_syntax/tests/conformance/fidelity_floor.txt`), with an empty `known_failures.txt`. Analyze sits at 0.9898, 194/196 (`crates/gd_analyze/tests/conformance/analyze_fidelity_floor.txt`, floor 0.98), with two entries in `analyze_known_failures.txt`: both want global-name tables gdls has no port of, and both are described there with exactly what each needs. Each floor file carries a header comment documenting the commit that set it and the intentionally excluded fixtures: `.notest.gd` and `.textonly.gd`, the `completion/` and `lsp/` folders, and the runtime and debug lines the curation layer filters.
+
+The two counts moved together when the corpus was re-vendored at 4.7.2. Upstream consolidated its analyzer tests — 4.6.3's 300 mostly one-error files became 194 grouped ones that each cover more — so the denominator fell while the coverage rose, and the rise is what surfaced those two entries. They are gaps the older tree never reached, not regressions: both are equally present at 4.6.
 
 Raising a floor is manual and recorded in the commit message. Nothing outside the ported frontend is under the ratchet: the LSP surface is server glue, tested by protocol-shape tests instead.
 

@@ -454,14 +454,14 @@ struct Suite {
 const SUITES: &[Suite] = &[
     Suite {
         dir: "corpus/analyzer",
-        tag: "4.6",
-        dialect: Dialect::Godot4_6,
+        tag: "4.7",
+        dialect: Dialect::Godot4_7,
         slot: 0,
     },
     Suite {
-        dir: "corpus/analyzer-4.7",
-        tag: "4.7",
-        dialect: Dialect::Godot4_7,
+        dir: "corpus/analyzer-4.6",
+        tag: "4.6",
+        dialect: Dialect::Godot4_6,
         slot: 1,
     },
 ];
@@ -558,6 +558,14 @@ fn read_floor(path: &Path) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// The `N` in `>> ERROR at line N: …`, for the 4.7 runner's stable line sort.
+fn out_line_number(line: &str) -> u32 {
+    line.split_once("at line ")
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .and_then(|(n, _)| n.trim().parse().ok())
+        .unwrap_or(u32::MAX)
+}
+
 fn bullet_list(items: &BTreeSet<&String>) -> String {
     items
         .iter()
@@ -632,6 +640,14 @@ fn analyze_phase_fidelity() {
             // Godot's stripping rather than treating any incidental warning as a regression.
             if matches!(expect, Expect::AnalyzerError(_)) {
                 got.retain(|line| line.starts_with(">>"));
+                // DIALECT(4.7): gdscript_test_runner.cpp:578-591 — the runner stable-sorts the
+                // error list by `start_line` before printing, so within one line the primary
+                // error comes first and cascading ones follow. 4.6 printed raw emission order.
+                // This lives in Godot's *test runner*, not its analyzer, so it belongs here and
+                // not in `DiagnosticSink`: real LSP output is unaffected.
+                if suite.dialect >= Dialect::Godot4_7 {
+                    got.sort_by_key(|line| out_line_number(line));
+                }
             }
             let want = match &expect {
                 Expect::Ok(warnings) => warnings,

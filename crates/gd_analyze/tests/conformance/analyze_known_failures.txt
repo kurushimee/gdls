@@ -1,5 +1,6 @@
-# Analyze-phase corpus files that gd_analyze::analyze does NOT yet match Godot on (relative to
-# tests/conformance/corpus/analyzer/). The harness fails if a file fails that is NOT listed here
+# Analyze-phase corpus files that gd_analyze::analyze does NOT yet match Godot on. Each line is
+# `<tag>/<path>`, where the tag names the suite (see `SUITES` in conformance.rs) and the path is
+# relative to that suite's corpus root. The harness fails if a file fails that is NOT listed here
 # (a regression) or PASSES while still listed (delete the stale line). Regenerate with:
 #   GDLS_BLESS_CONFORMANCE=1 cargo test -p gd_analyze --test conformance -- --nocapture
 #
@@ -919,3 +920,23 @@
 #       byte-derived line, faithfully reproducing Godot's null-source path.
 # Conformance renderer also threads `d.line` through `render(...)`.
 # Lifts `errors/match_with_subscript.gd`. Reaches 300/300 = 1.0000.
+
+# === P5: the full 4.7.2 corpus ===
+# The `4.7` suite replaced the hand-curated tree with upstream's own, file for file, which more
+# than doubled the analyzer coverage and exposed two pre-existing gaps. Both are equally present
+# at 4.6 — the old tree simply never reached them — so neither is a dialect regression, and both
+# are tracked as their own follow-ups rather than being papered over.
+#
+# gdls has no global-name tables: `CoreConstants::is_global_enum` and
+# `GDScriptLanguage::has_any_global_constant` have no port, so `reduce_identifier` hedges every
+# PascalCase name it cannot place (reducer.rs step 10, `is_global_like`) instead of rejecting it.
+# Lifting that hedge without the tables behind it costs 13 other corpus files, so it stays.
+4.7/errors/invalid_identifier.gd
+# The same hole from the call side, plus the enum-callee arm it feeds. Needs four coupled pieces:
+# `can_be_builtin` threaded into `reduce_identifier` (analyzer.cpp:4645-4652) for `Global enum "X"
+# cannot be used on its own.`; the ENUM-meta arm in `reduce_call` (analyzer.cpp:3725-3730) so a
+# native or global enum answers `The native enum "X" does not behave like Dictionary ...` rather
+# than gdls's current Dictionary-method error; the `Static function "f()" not found in base "B".`
+# fallthrough; and `Native class X used in script doesn't exist or isn't exposed.`
+# (analyzer.cpp:5944) for a dotted native enum used as a call base.
+4.7/errors/enum_declaration_and_usage.gd
