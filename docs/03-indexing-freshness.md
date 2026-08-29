@@ -178,7 +178,7 @@ Without a cache, every launch pays the full startup cost twice. `Index::build` r
 
 **What is persisted.** The eager-interface `Index`: the per-file `Interface` table plus `ClassNameRegistry`. The reverse indexes (`name_referencers`, `path_referencers`, `deps.reverse`, `file_refs`) are all derivable, so the forward data is stored and the edges are rebuilt on load.
 
-**Whole-cache key.** `(cache_format_version, gdls_version, NativeDb::content_hash, project.godot fingerprint)`. Any mismatch discards the whole cache, since a changed native lattice or config means every interface is stale.
+**Whole-cache key.** `(cache_format_version, gdls_version, NativeDb::content_hash, project.godot fingerprint, dialect)`. Any mismatch discards the whole cache, since a changed native lattice, config, or Godot release means every interface is stale. The dialect is in the key because the two supported releases do not parse identically, so an interface extracted under one is not reusable under the other.
 
 **Per-file validity** is a read-free `(size, mtime_ns)` stat check. Unchanged means reuse the cached `Interface`; changed or new means re-parse just those; missing means drop. This is the win: warm start becomes a stat sweep plus a handful of re-parses instead of thousands of full parses. A content hash is the fallback if mtime ever proves unreliable. The same stat table lets `reconcile` skip its full re-parse, which is what removes the second startup block.
 

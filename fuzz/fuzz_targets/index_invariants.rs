@@ -4,6 +4,10 @@ use libfuzzer_sys::fuzz_target;
 
 use camino::Utf8PathBuf;
 use gd_project::{extract_interface, Index};
+use gd_syntax::ParseOptions;
+
+#[path = "common.rs"]
+mod common;
 
 // Layer-3 fuzz target (M4 WP-T2): drive `Index::on_file_changed` + `::on_file_removed` with random
 // sequences and assert `Index::verify()` holds after every mutation. The contract under test is
@@ -84,9 +88,13 @@ const TEMPLATES: &[&str] = &[
 ];
 
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 3 {
+    if data.len() < 4 {
         return;
     }
+    // The leading byte picks the dialect every template is parsed at, matching a session, where one
+    // resolved dialect governs the whole index. The op stream starts after it.
+    let dialect = common::dialect_from(data[0]);
+    let data = &data[1..];
     let mut idx = Index::new(Utf8PathBuf::from("/proj"));
     let mut cursor = 0usize;
 
@@ -106,7 +114,14 @@ fuzz_target!(|data: &[u8]| {
         match op {
             0 => {
                 let text = TEMPLATES[template_idx];
-                let tree = gd_syntax::parse(text).tree;
+                let tree = gd_syntax::parse_with_options(
+                    text,
+                    &ParseOptions {
+                        dialect,
+                        script_path: "",
+                    },
+                )
+                .tree;
                 let iface = extract_interface(&tree);
                 idx.txn(&path, |i| i.on_file_changed(&path, iface));
             }

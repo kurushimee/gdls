@@ -1,6 +1,6 @@
 # 02. Frontend port (tokenizer, parser, analyzer) and the type system
 
-The core of gdls is a faithful Rust port of Godot 4.6.3-stable's GDScript frontend, so diagnostics match Godot exactly. Only the frontend is ported; the compiler and bytecode half is out of scope.
+The core of gdls is a faithful Rust port of Godot's GDScript frontend, so diagnostics match Godot exactly. Only the frontend is ported; the compiler and bytecode half is out of scope. Two feature releases are supported from one binary, 4.6 and 4.7, chosen per project; the unguarded text of every ported function is the newest one, and §11c and §11d list everything that differs.
 
 ## 1. What is ported
 
@@ -13,7 +13,7 @@ The core of gdls is a faithful Rust port of Godot 4.6.3-stable's GDScript fronte
 
 `gdscript_compiler.cpp`, `gdscript_byte_codegen.cpp`, and `gdscript_vm.cpp` are not ported. Bytecode and the VM are not needed for diagnostics.
 
-Total ported logic is roughly 15k lines. The source of truth is the Godot 4.6.3-stable source from a local Godot checkout, never this document. Where a doc cites a concrete number it may have drifted; Godot's file wins.
+Total ported logic is roughly 15k lines. The source of truth is the Godot source from a local checkout carrying both supported tags, never this document. Where a doc cites a concrete number it may have drifted; Godot's file wins.
 
 Mirror Godot's structure function for function, so behavior, error and warning message strings, and source ranges all match, and so upstream changes stay easy to diff and re-apply. Resist improving the algorithms; fidelity is the requirement. Derive every enum, count, and message template mechanically from the Godot source, and grep Godot to confirm counts at port time.
 
