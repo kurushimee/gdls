@@ -6788,26 +6788,121 @@ pub fn workspace_symbol(
             name_span: entry.name_span,
         });
     }
-    // Per-file interface members — every Const / Var / Func / Signal / Enum reachable at file
-    // scope. Inner classes' members aren't surfaced; M4 limitation, documented for future
-    // expansion.
-    for (fid, iface) in state.workspace.index.iter_interfaces() {
-        let Some(path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
-            continue;
-        };
-        let container = iface.class_name.clone();
+    // Per-file interface members — every Const / Var / Func / Signal / Enum, at file scope AND
+    // inside every inner class, plus each named enum's values. #305: the walk used to stop at file
+    // scope, so `Inventory.Entry`, its fields, and `Slot.WEAPON` were all in `documentSymbol` and
+    // none of them in `workspace/symbol` — a cut exactly at the nesting boundary, for information
+    // that is already in the interface.
+    fn push_interface(
+        out: &mut Vec<SymbolCandidate>,
+        iface: &gd_project::Interface,
+        path: &camino::Utf8Path,
+        // The dotted class path this interface's members live under (`Inventory`,
+        // `Inventory.Entry`), which is what a client shows as the container.
+        container: Option<&str>,
+    ) {
         for member in &iface.members {
-            let kind = member_kind_to_lsp(member.kind);
-            candidates.push(SymbolCandidate {
+            out.push(SymbolCandidate {
                 name: member.name.clone(),
-                kind,
-                container: container.clone(),
-                path: path.clone(),
+                kind: member_kind_to_lsp(member.kind),
+                container: container.map(str::to_owned),
+                path: path.to_path_buf(),
                 line: member.line,
                 is_class: false,
                 name_span: member.name_span,
             });
         }
+        // A named enum's values are reachable as `Enum.VALUE`, so their container is the enum, not
+        // the class. The enum itself is already a `MemberKind::Enum` member above.
+        for e in &iface.enums {
+            let enum_container = match container {
+                Some(c) => format!("{c}.{}", e.name),
+                None => e.name.clone(),
+            };
+            for value in &e.values {
+                out.push(SymbolCandidate {
+                    name: value.name.clone(),
+                    kind: LspSymbolKind::ENUM_MEMBER,
+                    container: Some(enum_container.clone()),
+                    path: path.to_path_buf(),
+                    line: value.line,
+                    is_class: false,
+                    name_span: value.name_span,
+                });
+            }
+        }
+        for nested in &iface.inner {
+            let Some(name) = nested.class_name.as_deref() else {
+                continue;
+            };
+            let nested_container = match container {
+                Some(c) => format!("{c}.{name}"),
+                None => name.to_owned(),
+            };
+            // The inner class itself. Only the head class is in the `class_name` registry, so this
+            // is the only place `Inventory.Entry` can enter the candidate set. `is_class` so it
+            // outranks its own members on a tied score, the same way a registry entry does.
+            if let Some((line, name_span)) = nested.class_name_loc {
+                out.push(SymbolCandidate {
+                    name: name.to_owned(),
+                    kind: LspSymbolKind::CLASS,
+                    container: container.map(str::to_owned),
+                    path: path.to_path_buf(),
+                    line,
+                    is_class: true,
+                    name_span,
+                });
+            }
+            push_interface(out, nested, path, Some(&nested_container));
+        }
+    }
+    for (fid, iface) in state.workspace.index.iter_interfaces() {
+        let Some(path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        push_interface(&mut candidates, iface, &path, iface.class_name.as_deref());
+    }
+    // Autoload singletons whose script carries no `class_name`. The name is a real project-wide
+    // global — `definition` and `hover` both resolve it — so it belongs in the symbol list, and
+    // without this the most-navigated symbol in many projects (Pixelorama's `Global`) is the one
+    // thing `workspace/symbol` cannot find. A script that DOES declare a `class_name` is already a
+    // registry entry under that name; adding the autoload alias too would be a duplicate row.
+    for autoload in &state.workspace.project.autoloads {
+        // Godot only makes a `*`-prefixed autoload a global singleton; a plain one is not a name in
+        // scope, so it is not a project symbol either.
+        if !autoload.is_singleton {
+            continue;
+        }
+        let Some(gd_project::AutoloadTyping::Script(res)) = state
+            .workspace
+            .project
+            .autoload_typing(&autoload.name, &state.workspace.scenes)
+        else {
+            continue;
+        };
+        let Some(fid) = state.workspace.index.resolve_res_path(&res) else {
+            continue;
+        };
+        let Some(iface) = state.workspace.index.interface(fid) else {
+            continue;
+        };
+        if iface.class_name.is_some() {
+            continue;
+        }
+        let Some(path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
+            continue;
+        };
+        candidates.push(SymbolCandidate {
+            name: autoload.name.clone(),
+            kind: LspSymbolKind::CLASS,
+            container: None,
+            path,
+            // The script has no `class_name` identifier to anchor on, so the file's first line is
+            // the honest answer; `workspaceSymbol/resolve` degrades to a zero-width range there.
+            line: 1,
+            is_class: true,
+            name_span: ByteSpan::default(),
+        });
     }
 
     // Fuzzy-match every candidate's name. nucleo's Utf32Str takes a scratch buffer; reuse one

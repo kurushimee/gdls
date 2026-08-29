@@ -173,6 +173,14 @@ pub struct EnumValueDecl {
     /// also unknown. Consumers must degrade permissively on `None`: suppress value-dependent
     /// diagnostics, never guess.
     pub value: Option<i64>,
+    /// 1-based source line of the value's identifier, and the identifier's own byte span. The same
+    /// anchor pair [`MemberDecl`] carries, and for the same reason: `workspace/symbol` reports an
+    /// enum value at its own declaration rather than at the enum's (#305). **Excluded from
+    /// [`Interface::signature_hash`]**, like every other span — an edit that only shifts a line
+    /// must not read as an interface change to dependents.
+    pub line: u32,
+    /// See [`Self::line`].
+    pub name_span: ByteSpan,
 }
 
 /// The shallow interface of one class: what it exposes, with no types resolved.
@@ -275,10 +283,16 @@ impl Interface {
             inner.signature_hash().hash(h);
         }
         for e in &self.enums {
-            // EnumValueDecl::value participates deliberately: explicit enum-value edits shift the
-            // value-dependent diagnostics of dependents (INT_AS_ENUM_WITHOUT_MATCH,
-            // ENUM_VARIABLE_WITHOUT_DEFAULT), so they must re-analyze.
-            e.hash(h);
+            e.name.hash(h);
+            for v in &e.values {
+                v.name.hash(h);
+                // EnumValueDecl::value participates deliberately: explicit enum-value edits shift
+                // the value-dependent diagnostics of dependents (INT_AS_ENUM_WITHOUT_MATCH,
+                // ENUM_VARIABLE_WITHOUT_DEFAULT), so they must re-analyze.
+                v.value.hash(h);
+                // v.line / v.name_span are intentionally NOT hashed (spans, like MemberDecl::span);
+                // neither is v.doc (docs are not interface-relevant for invalidation).
+            }
         }
         self.unnamed_enum_values.hash(h);
     }
@@ -658,6 +672,8 @@ fn enum_decl(tree: &ParseTree, id: NodeId) -> Option<EnumDecl> {
             Some(cv) => int_literal_value(tree, cv),
         };
         prev = value;
+        // `ident_name` above already proved the identifier resolves, so this cannot fail.
+        let ident = v.identifier.map(|i| tree.get(i));
         values.push(EnumValueDecl {
             name: value_name,
             doc: tree
@@ -667,6 +683,8 @@ fn enum_decl(tree: &ParseTree, id: NodeId) -> Option<EnumDecl> {
                 .cloned()
                 .map(Box::new),
             value,
+            line: ident.map(|n| n.loc.start.line).unwrap_or_default(),
+            name_span: ident.map(|n| n.span).unwrap_or_default(),
         });
     }
     Some(EnumDecl { name, values })

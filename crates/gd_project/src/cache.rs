@@ -84,7 +84,12 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// edit incidentally, but not an `initializationOptions.dialect` override, and the warning-code
 /// renumbering that came with 4.7 support warrants the bump regardless. One cold re-index per
 /// project on upgrade, self-healing.
-pub const CACHE_FORMAT_VERSION: u32 = 10;
+/// v11 (#305): `EnumValueDecl` gained `line`/`name_span`, so `workspace/symbol` can report a named
+/// enum's value at its own declaration instead of not at all. A v10 cache predates the fields and
+/// would deserialize-fail; not `#[serde(default)]` for the same reason as v4's `name_span` — a
+/// defaulted zero-width span warm-loaded from an old cache silently degrades every anchor it feeds.
+/// One cold re-index per project on upgrade, self-healing.
+pub const CACHE_FORMAT_VERSION: u32 = 11;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
