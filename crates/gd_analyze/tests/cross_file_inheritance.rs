@@ -1183,3 +1183,36 @@ func go() -> void:
     }
     assert!(found, "expected a typed `v` variable");
 }
+
+const ENUM_HOLDER_GD: &str = "\
+extends RefCounted
+class_name Holder2
+enum EId { A = 0, B }
+class Inner:
+\tvar identifier: EId
+\tfunc _init(_identifier: EId):
+\t\tidentifier = _identifier
+func go(list: Array[EnumUser]) -> void:
+\tfor data: EnumUser in list:
+\t\tvar _v: Inner = Inner.new(data.identifier)
+";
+
+const ENUM_USER_GD: &str = "\
+extends RefCounted
+class_name EnumUser
+var identifier: Holder2.EId
+";
+
+/// #286: one enum reached two ways must carry one identity. The in-file side names it after the
+/// declaring class's fqcn, which `class_name` overrides, so the cross-file side has to do the
+/// same — deriving it from the file path gave `Holder2.EId` and `holder2.gd.EId` for the same
+/// enum, and the argument check rejected the pair.
+#[test]
+fn cross_file_enum_identity_matches_the_in_file_one() {
+    let project = Project::new(&[
+        ("res://holder2.gd", ENUM_HOLDER_GD),
+        ("res://enum_user.gd", ENUM_USER_GD),
+    ]);
+    let result = analyze_file(&project, "res://holder2.gd", ENUM_HOLDER_GD);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}
