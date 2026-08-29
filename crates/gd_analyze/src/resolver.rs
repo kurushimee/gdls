@@ -5183,6 +5183,15 @@ fn resolve_for(ctx: &mut AnalysisContext, for_id: NodeId) {
             // Already solved.
         } else if list_type.is_variant() {
             variable_type.kind = DtKind::Variant;
+        } else if !list_type.container_element_types.is_empty() {
+            // analyzer.cpp:2307-2309 — `has_container_element_type(0)`: the FIRST container
+            // element type, which is `Array[T]`'s element AND `Dictionary[K, V]`'s KEY (iterating
+            // a dictionary yields its keys). Ordered ahead of the builtin table exactly as
+            // upstream, so it also beats the packed-array arm. The dictionary half was the
+            // missing one: `for node in typed_dict` left the loop variable with no type at all,
+            // which then poisoned every member access on it.
+            variable_type = list_type.container_element_types[0].clone();
+            variable_type.type_source = list_type.type_source;
         } else if list_type.kind == DtKind::Builtin {
             // analyzer.cpp:2300-2329 — element-type-by-list-type table.
             match list_type.builtin_type {
@@ -5212,16 +5221,11 @@ fn resolve_for(ctx: &mut AnalysisContext, for_id: NodeId) {
                     variable_type.builtin_type = crate::data_type::typed_container_element(bt)
                         .expect("invariant: guard above checked is_some");
                 }
-                VariantType::Array if !list_type.container_element_types.is_empty() => {
-                    // analyzer.cpp:2310-2317 — typed Array[T] yields T as the iterator var
-                    // type. Element type carries its own type_source; we stamp it directly.
-                    variable_type = list_type.container_element_types[0].clone();
-                }
                 VariantType::Object | VariantType::Array | VariantType::Dictionary => {
-                    // Object._iter_get / untyped Array / Dictionary key-type each need the
-                    // full reducer machinery (Object's `_iter_get` method walk + Dictionary
-                    // key-type extraction). Untyped Array's element type is genuinely Variant.
-                    // The typed-Dictionary arm joins later when the iterator infers keys.
+                    // analyzer.cpp:2338 — an UNtyped array or dictionary genuinely yields
+                    // `Variant`; the typed ones were taken by the container-element arm above.
+                    // `Object`'s `_iter_get` walk (analyzer.cpp:2325-2337) needs the full method
+                    // machinery and still degrades here.
                     variable_type.kind = DtKind::Variant;
                 }
                 _ if !list_type.is_hard_type() => {
@@ -5247,14 +5251,11 @@ fn resolve_for(ctx: &mut AnalysisContext, for_id: NodeId) {
             // ARRAY/DICTIONARY/!is_hard_type arm at analyzer.cpp:2325 — variable degrades to
             // Variant. gdls's `kind` is `Enum` so we route explicitly.
             variable_type.kind = DtKind::Variant;
-        } else if list_type.kind == DtKind::Class && list_type.class_node.is_some() {
+        } else if let (DtKind::Class, Some(class_id)) = (list_type.kind, list_type.class_node) {
             // analyzer.cpp:2333-2345 — iterating an Object instance: look up the class's
             // `_iter_get(p_iter) -> T` method and use T as the iterator variable type. gdls
             // walks the in-file Class member directly; the cross-file Script + Native variants
             // join later slices.
-            let class_id = list_type
-                .class_node
-                .expect("invariant: list_type.class_node.is_some() — checked at the outer `else if` guard above");
             let iter_get = match &ctx.node(class_id).kind {
                 NodeKind::Class(c) => c.members_indices.get("_iter_get").copied(),
                 _ => None,

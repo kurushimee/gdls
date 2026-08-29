@@ -1849,6 +1849,22 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
                     format!(r#"Identifier "{name}" not declared in the current scope."#),
                     id,
                 );
+                // analyzer.cpp:4691-4693 — Godot's `dummy`: `VARIANT` with the DEFAULT
+                // `UNDETECTED` source, "just so type is set to something". The source matters:
+                // `has_no_type()` reads it, and it is how `X.new()` on an undeclared `X` reaches
+                // `Cannot infer the type of "a" variable because the value doesn't have a set
+                // type.` Only this branch stamps it — the paths that stay deliberately silent
+                // (an `Absent` dump, a plausible native member, an unresolvable autoload) must
+                // keep the permissive soft `Variant` the tail-guard gives them, or every one of
+                // them would start reporting an inference failure gdls has no grounds for.
+                ctx.set_type(
+                    id,
+                    DataType {
+                        kind: DtKind::Variant,
+                        type_source: TypeSource::Undetected,
+                        ..Default::default()
+                    },
+                );
             }
         }
     }
@@ -4694,7 +4710,22 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 id,
             );
         }
-        call_type = DataType::variant();
+        // A base that carries Godot's undeclared-identifier dummy (`VARIANT` / `UNDETECTED`)
+        // propagates its no-type-ness through the call, exactly as upstream: `get_function_signature`
+        // fails, `call_type` is never assigned, and the call reads as "no set type"
+        // (analyzer.cpp:3745). gdls cannot leave it UNRESOLVED — the `reduce_expression` tail-guard
+        // would promote that straight back to a soft `Variant` — so it carries the same dummy
+        // forward. Everything else keeps the permissive soft `Variant`: a method miss here is far
+        // more often a gdls lookup gap than a real one.
+        call_type = if base_type.has_no_type() {
+            DataType {
+                kind: DtKind::Variant,
+                type_source: TypeSource::Undetected,
+                ..Default::default()
+            }
+        } else {
+            DataType::variant()
+        };
     }
 
     // Record the call site for every dispatched callee shape — bare (`helper()`), dotted
