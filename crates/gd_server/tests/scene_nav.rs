@@ -49,7 +49,10 @@ const MAIN_GD: &str = "extends Node2D\n\n\
 /// unique-named `Control` (`%Special`).
 fn scene_project() -> TempProject {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", API);
     p.write("health.gd", "class_name Health\nextends Node2D\n");
     p.write("main.gd", MAIN_GD);

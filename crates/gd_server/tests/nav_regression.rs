@@ -62,7 +62,11 @@ fn lsp_responds_under_space_containing_project_path() {
         return;
     }
 
-    std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/features=PackedStringArray(\"4.6\")\n",
+    )
+    .unwrap();
     std::fs::write(root.join("extension_api.json"), MINI_API).unwrap();
     std::fs::create_dir_all(root.join("src")).unwrap();
     std::fs::write(
@@ -139,7 +143,11 @@ fn workspace_symbol_anchors_class_at_declaration_line() {
     let root =
         camino::Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("temp dir is UTF-8");
 
-    std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/features=PackedStringArray(\"4.6\")\n",
+    )
+    .unwrap();
     std::fs::write(root.join("extension_api.json"), MINI_API).unwrap();
     std::fs::write(
         root.join("knight.gd"),
@@ -222,7 +230,11 @@ fn workspace_symbol_ranges_cover_the_name_token() {
                func reload(clip: int) -> bool:\n\
                \treturn clip > 0\n\
                enum Mode { SAFE, BURST }\n";
-    std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+    std::fs::write(
+        root.join("project.godot"),
+        "config_version=5\n\n[application]\n\nconfig/features=PackedStringArray(\"4.6\")\n",
+    )
+    .unwrap();
     std::fs::write(root.join("extension_api.json"), MINI_API).unwrap();
     std::fs::write(root.join("arsenal.gd"), src).unwrap();
 

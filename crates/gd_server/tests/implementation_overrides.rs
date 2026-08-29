@@ -54,7 +54,10 @@ fn init_and_open(project: &TempProject, client: &Connection, files: &[&str]) {
 #[test]
 fn implementation_on_method_returns_overrides() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // base.gd: class_name Base; func act()
@@ -164,7 +167,10 @@ fn implementation_on_method_returns_overrides() {
 #[test]
 fn implementation_on_unnamed_script_func_does_not_leak_class_subclasses() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // unnamed.gd: NO class_name; declares `func Helper()`.
@@ -233,7 +239,10 @@ fn implementation_on_unnamed_script_func_does_not_leak_class_subclasses() {
 #[test]
 fn implementation_on_local_named_like_method_does_not_return_overrides() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     p.write(
         "base.gd",
@@ -286,7 +295,10 @@ fn implementation_on_local_named_like_method_does_not_return_overrides() {
 #[test]
 fn implementation_follows_path_extends_subclasses() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     p.write(
@@ -363,7 +375,10 @@ fn implementation_follows_path_extends_subclasses() {
 #[test]
 fn implementation_override_span_uses_matching_root_decl_not_inner_function() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     p.write(
         "base.gd",

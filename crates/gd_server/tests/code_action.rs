@@ -62,7 +62,10 @@ const STANDALONE_EXPR_LINE: u32 = 4;
 /// A base project (project.godot + minimal api), no source files — tests write their own.
 fn base_project() -> TempProject {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     p
 }

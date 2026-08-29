@@ -10,6 +10,7 @@
 //! the reader merges physical lines into logical lines using bracket/quote depth before splitting on
 //! `=`, even though those big values are then thrown away.
 
+use gd_syntax::Dialect;
 use rustc_hash::FxHashMap;
 
 /// A GDScript warning level (`debug/gdscript/warnings/<name>` = `0`/`1`/`2`).
@@ -92,6 +93,13 @@ pub struct Autoload {
 #[derive(Clone, Debug, Default)]
 pub struct ProjectGodot {
     pub config_version: u32,
+    /// The Godot feature release the project declares, from `application/config/features` (e.g.
+    /// `PackedStringArray("4.7", "Forward Plus")` → `Some((4, 7))`). `None` when the key is absent
+    /// or carries no version-shaped entry.
+    ///
+    /// This is the only signal for the dialect. `config_version` is the *config file format*
+    /// version (5 across all of 4.x) and says nothing about the feature release.
+    pub declared_engine_version: Option<(u32, u32)>,
     pub main_scene: Option<ResTarget>,
     pub autoloads: Vec<Autoload>,
     pub warnings: WarningConfig,
@@ -147,6 +155,8 @@ pub fn parse_with_confidence(text: &str) -> (ProjectGodot, f32) {
             pg.config_version = val.parse().unwrap_or(0);
         } else if full == "application/run/main_scene" {
             pg.main_scene = Some(classify(&unquote(val)));
+        } else if full == "application/config/features" {
+            pg.declared_engine_version = parse_features_version(val);
         } else if let Some(name) = full.strip_prefix("autoload/") {
             let raw = unquote(val);
             let is_singleton = raw.starts_with('*');
@@ -241,6 +251,31 @@ fn is_config_identifier(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Pull the engine feature version out of an `application/config/features` value.
+///
+/// The value is a `PackedStringArray("4.7", "Forward Plus")` literal whose entries mix the engine
+/// version tag with renderer names and any custom feature tags the project defines. Only entries
+/// shaped exactly `<major>.<minor>` count, so a renderer name can never be read as a version, and
+/// the largest is taken if a malformed file somehow lists several.
+///
+/// Godot writes this key on every project save, so a real project always has it; a missing or
+/// version-less value means a hand-edited or stripped file.
+fn parse_features_version(value: &str) -> Option<(u32, u32)> {
+    let trimmed = value.trim();
+    // Take whatever sits between the first `(` and a trailing `)`, which covers the
+    // `PackedStringArray(...)` Godot writes as well as a bare `(...)`. A value with no parens at
+    // all is read as the list itself — the reader is deliberately forgiving everywhere else, and a
+    // version is too cheap to lose to a syntax quibble.
+    let inner = match (trimmed.find('('), trimmed.strip_suffix(')')) {
+        (Some(open), Some(body)) => &body[open + 1..],
+        _ => trimmed,
+    };
+    inner
+        .split(',')
+        .filter_map(|entry| Dialect::parse_version(&unquote(entry)))
+        .max()
+}
+
 fn unquote(s: &str) -> String {
     let s = s.trim();
     s.strip_prefix('"')
@@ -309,6 +344,49 @@ mod tests {
     use super::*;
 
     // Mirrors a real large-project structure, including the multi-line Object(...) trap.
+    #[test]
+    fn sample_declares_its_engine_version() {
+        // The `[application]` section's `config/features` carries the version tag alongside the
+        // renderer name; only the version-shaped entry is picked up.
+        assert_eq!(parse(SAMPLE).declared_engine_version, Some((4, 6)));
+    }
+
+    #[test]
+    fn features_version_ignores_renderer_and_custom_tags() {
+        for (value, want) in [
+            (r#"PackedStringArray("4.7", "Forward Plus")"#, Some((4, 7))),
+            (r#"PackedStringArray("Mobile", "4.6")"#, Some((4, 6))),
+            (r#"PackedStringArray("4.7")"#, Some((4, 7))),
+            // No version-shaped entry at all.
+            (r#"PackedStringArray("Forward Plus")"#, None),
+            (r#"PackedStringArray()"#, None),
+            // A patch-qualified tag is not the shape Godot writes and is not a feature version.
+            (r#"PackedStringArray("4.7.2")"#, None),
+            // Unwrapped forms, since the reader is forgiving everywhere else.
+            (r#"("4.7", "Mobile")"#, Some((4, 7))),
+        ] {
+            assert_eq!(parse_features_version(value), want, "value: {value}");
+        }
+    }
+
+    #[test]
+    fn features_version_survives_a_custom_tag_that_looks_numeric() {
+        // A project may define its own feature tags; only two-component numerics count, and the
+        // largest wins if a file somehow lists more than one version.
+        assert_eq!(
+            parse_features_version(r#"PackedStringArray("4.6", "4.7", "phase2")"#),
+            Some((4, 7))
+        );
+    }
+
+    #[test]
+    fn missing_features_key_leaves_the_version_undeclared() {
+        assert_eq!(
+            parse("[application]\nconfig/name=\"X\"\n").declared_engine_version,
+            None
+        );
+    }
+
     const SAMPLE: &str = r#"; comment
 config_version=5
 

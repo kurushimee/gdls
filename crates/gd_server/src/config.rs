@@ -4,6 +4,7 @@
 
 use std::num::NonZeroUsize;
 
+use gd_syntax::Dialect;
 use serde::Deserialize;
 
 /// Options passed by the client under `initializationOptions`.
@@ -39,6 +40,13 @@ pub struct InitializationOptions {
     /// install. Default **true**; set false to reproduce the bare-DB degraded mode (tests,
     /// memory-floor measurements).
     pub embedded_api_fallback: bool,
+    /// Pin the Godot dialect (`"4.6"` / `"4.7"`) instead of reading it from `project.godot`'s
+    /// `application/config/features`. Optional, and normally unnecessary — Godot writes that key
+    /// on every project save. Useful for a project whose config is hand-managed, or to check how
+    /// a codebase reads under the other version. A value gdls does not recognize is ignored with a
+    /// logged warning, falling back to the declared version (malformed options never fail
+    /// `initialize`). Session-structural: a runtime re-config cannot change it.
+    pub dialect: Option<String>,
     /// Diagnostics strictness (consumed starting in M3).
     pub strict: StrictConfig,
     /// M5 WP-O3 / WP-O4 — per-call analyzer knobs the LSP server threads into
@@ -81,6 +89,33 @@ pub struct InitializationOptions {
 /// Manual so `parse(None)`, `parse(Some({}))`, and a missing single field all agree —
 /// `auto_dump_extension_api` defaults TRUE, which a derived `Default` (false) would silently
 /// disagree with under the container-level `#[serde(default)]`.
+impl InitializationOptions {
+    /// The pinned [`Dialect`], if the client named one gdls recognizes.
+    ///
+    /// An unrecognized value is dropped with a warning rather than failing the handshake, matching
+    /// how every other malformed option is handled.
+    #[must_use]
+    pub fn dialect(&self) -> Option<Dialect> {
+        let raw = self.dialect.as_deref()?;
+        let tag = raw.trim().trim_start_matches('v');
+        match Dialect::parse_version(tag)
+            .map(|(major, minor)| (Dialect::from_version(major, minor), (major, minor)))
+        {
+            // Only accept a version gdls actually ports; silently clamping an explicit pin would
+            // hide the user's mistake behind behavior they did not ask for.
+            Some((d, v)) if d.version() == v => Some(d),
+            _ => {
+                log::warn!(
+                    "initializationOptions.dialect={raw:?} is not a Godot version gdls supports                      ({} .. {}); ignoring it and reading the version from project.godot",
+                    Dialect::OLDEST,
+                    Dialect::NEWEST,
+                );
+                None
+            }
+        }
+    }
+}
+
 impl Default for InitializationOptions {
     fn default() -> Self {
         InitializationOptions {
@@ -89,6 +124,7 @@ impl Default for InitializationOptions {
             godot_binary_path: None,
             auto_dump_extension_api: true,
             embedded_api_fallback: true,
+            dialect: None,
             strict: StrictConfig::default(),
             analyzer: AnalyzerConfig::default(),
             memory: MemoryConfig::default(),

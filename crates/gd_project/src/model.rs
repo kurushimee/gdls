@@ -36,6 +36,10 @@ pub enum AutoloadTyping {
 pub struct ProjectModel {
     pub root: Utf8PathBuf,
     pub config_version: u32,
+    /// The Godot feature release declared by `application/config/features`, or `None` when the key
+    /// is missing or version-less. See [`crate::ProjectGodot::declared_engine_version`]; resolved
+    /// into an actual dialect by [`crate::resolve_dialect`].
+    pub declared_engine_version: Option<(u32, u32)>,
     pub main_scene: Option<ResTarget>,
     pub autoloads: Vec<Autoload>,
     pub warnings: WarningConfig,
@@ -127,6 +131,7 @@ impl ProjectModel {
             ProjectModel {
                 root: root.to_path_buf(),
                 config_version: project.config_version,
+                declared_engine_version: project.declared_engine_version,
                 main_scene: project.main_scene,
                 autoloads: project.autoloads,
                 warnings: project.warnings,
@@ -259,6 +264,7 @@ mod tests {
         let model = ProjectModel {
             root: Utf8PathBuf::from("/tmp/project"),
             config_version: 5,
+            declared_engine_version: None,
             main_scene: None,
             autoloads: vec![
                 Autoload {
@@ -314,6 +320,7 @@ mod tests {
         ProjectModel {
             root: Utf8PathBuf::from("/tmp/project"),
             config_version: 5,
+            declared_engine_version: None,
             main_scene: None,
             autoloads,
             warnings: WarningConfig::default(),

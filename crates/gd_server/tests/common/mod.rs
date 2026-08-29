@@ -96,9 +96,12 @@ pub const MINI_API: &str = r#"{
 /// native dump rooted at `extension_api.json`.
 pub fn sample_project() -> TempProject {
     let p = TempProject::new();
+    // `config/features` carries the engine version, exactly as Godot writes it on every project
+    // save. It pins the fixture to the same 4.6 surface `MINI_API`'s header declares, so the
+    // sample project is read under one consistent Godot version.
     p.write(
         "project.godot",
-        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\n",
+        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\n         config/features=PackedStringArray(\"4.6\")\n",
     );
     p.write("extension_api.json", MINI_API);
     p.write(

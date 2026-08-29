@@ -99,7 +99,7 @@ fn project() -> TempProject {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\n",
+        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\n",
     );
     p.write("main.gd", "extends Node\nfunc _ready() -> void:\n\tpass\n");
     p

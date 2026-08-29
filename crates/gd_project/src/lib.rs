@@ -11,6 +11,7 @@
 pub mod asset_index;
 pub mod cache;
 pub mod depgraph;
+pub mod dialect_resolve;
 pub mod exclude;
 pub mod gdextension;
 pub mod index;
@@ -28,6 +29,7 @@ pub use cache::{
     CacheKey, FileStat, LoadedCache, CACHE_FORMAT_VERSION,
 };
 pub use depgraph::{DepGraph, FileId};
+pub use dialect_resolve::{dialect_notice, resolve_dialect, DialectOrigin};
 pub use exclude::{is_excluded, ProjectRoot, EXCLUDED_COMPONENTS};
 pub use gdextension::GdExtension;
 pub use index::{normalize as normalize_path, Index, IndexInvariant, IndexMut, Resolution};

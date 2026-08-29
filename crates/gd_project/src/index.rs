@@ -16,7 +16,7 @@
 //! is keyed on the per-file [`Index::epoch_of`] (WP-RD8), not the dirty set.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use gd_syntax::ParseTree;
+use gd_syntax::{Dialect, ParseOptions, ParseTree};
 use gd_types::NativeDb;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
@@ -147,14 +147,25 @@ impl Index {
     /// a single subdir would otherwise quietly halve the project. Persistent breakage shows up on
     /// the operator's stderr at default log level.
     pub fn build(root: &Utf8Path) -> Self {
-        Self::build_with_progress(root, &mut |_, _| {})
+        Self::build_with_dialect(root, Dialect::DEFAULT)
+    }
+
+    /// [`Self::build`] under an explicit dialect. Interfaces come out of a parse tree, so the
+    /// eager index must parse under the same dialect the analyzer will later use — otherwise
+    /// signatures and `@warning_ignore` validation silently run against the wrong Godot version.
+    pub fn build_with_dialect(root: &Utf8Path, dialect: Dialect) -> Self {
+        Self::build_with_progress(root, dialect, &mut |_, _| {})
     }
 
     /// [`Self::build`] invoking `progress(files_done, files_total)` after each file of the
     /// parse walk, so the caller can surface cold-index progress (M7 #58 — the LSP layer
     /// adapts this to `$/progress`; `gd_project` stays free of protocol types). The total is
     /// known up front (the walk enumerates before parsing), so percentage rendering is exact.
-    pub fn build_with_progress(root: &Utf8Path, progress: &mut dyn FnMut(usize, usize)) -> Self {
+    pub fn build_with_progress(
+        root: &Utf8Path,
+        dialect: Dialect,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Self {
         let mut idx = Index::new(root.to_path_buf());
         let scan = gd_files(root);
         if scan.walk_errors > 0 || scan.skipped_non_utf8 > 0 {
@@ -170,7 +181,14 @@ impl Index {
         for (done, path) in scan.files.into_iter().enumerate() {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
-                    idx.set_interface_from_tree(&path, &gd_syntax::parse(&text).tree);
+                    let options = ParseOptions {
+                        dialect,
+                        ..Default::default()
+                    };
+                    idx.set_interface_from_tree(
+                        &path,
+                        &gd_syntax::parse_with_options(&text, &options).tree,
+                    );
                 }
                 Err(e) => {
                     skipped_unreadable += 1;

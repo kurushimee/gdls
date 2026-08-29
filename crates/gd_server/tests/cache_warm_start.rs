@@ -106,7 +106,10 @@ fn timed_load(root: &camino::Utf8Path) -> (Workspace, std::time::Duration) {
 /// sees a valid project root.
 fn generate_corpus() -> common::TempProject {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     for i in 0..CORPUS_SIZE {
         let subdir = i / 100; // group files 100 per subdirectory to avoid huge flat dirs
         let rel = format!("src/sub{subdir}/script_{i}.gd");
@@ -186,7 +189,10 @@ fn reconcile_reparsed_only_touched_file() {
     // Use a smaller corpus for speed — this test covers correctness, not timing.
     const SMALL_SIZE: usize = 50;
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     for i in 0..SMALL_SIZE {
         p.write(&format!("src/script_{i}.gd"), &gen_script(i));
     }
@@ -259,7 +265,10 @@ fn discover_only_finds_added_and_removed_without_stating_known_files() {
 
     const SMALL_SIZE: usize = 20;
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     for i in 0..SMALL_SIZE {
         p.write(&format!("src/script_{i}.gd"), &gen_script(i));
     }
@@ -302,7 +311,10 @@ fn discover_only_finds_added_and_removed_without_stating_known_files() {
 #[test]
 fn reconcile_detects_added_file() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("src/a.gd", "class_name ClassA\nextends Node\n");
 
     let options = InitializationOptions::parse(Some(&serde_json::json!({
@@ -332,7 +344,10 @@ fn reconcile_detects_added_file() {
 #[test]
 fn reconcile_detects_removed_file() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("src/a.gd", "class_name ClassA\nextends Node\n");
     p.write("src/b.gd", "class_name ClassB\nextends Node\n");
 
@@ -356,7 +371,10 @@ fn reconcile_detects_removed_file() {
 #[test]
 fn warm_load_produces_same_index_as_cold() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     // Write a few files with class names and extends so the interface is non-trivial.
     p.write(
         "src/base.gd",
@@ -456,7 +474,10 @@ fn warm_load_skips_reparse_when_stat_matches() {
     use std::time::SystemTime;
 
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
 
     // V1: class_name EditTarget (size S1, different from V2/V3).
     let v1_src = "class_name EditTarget\nextends Node\n";
@@ -569,7 +590,10 @@ fn warm_load_skips_reparse_when_stat_matches() {
 #[test]
 fn warm_load_after_unsaved_buffer_edit_serves_disk_interface() {
     let p = common::TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     // Disk has V1 content with class_name DiskClass.
     let disk_src = "class_name DiskClass\nextends Node\n";
     let buffer_src = "class_name BufferClass\nextends Node\nvar unsaved: int = 0\n";

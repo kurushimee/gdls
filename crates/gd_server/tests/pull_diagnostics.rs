@@ -350,7 +350,7 @@ fn body_only_dependency_edit_refreshes_the_dependent_on_both_channels() {
     let p = common::TempProject::new();
     p.write(
         "project.godot",
-        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\n",
+        "config_version=5\n\n[application]\n\nconfig/name=\"Test\"\nconfig/features=PackedStringArray(\"4.6\")\n",
     );
     p.write("extension_api.json", common::MINI_API);
     p.write(

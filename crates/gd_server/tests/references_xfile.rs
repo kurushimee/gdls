@@ -60,7 +60,10 @@ fn init_and_open(project: &TempProject, client: &Connection, files: &[&str]) {
 #[test]
 fn references_finds_cross_file_method_calls() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // lib.gd defines `class_name Lib` and `func helper()`.
@@ -158,7 +161,10 @@ fn references_finds_cross_file_method_calls() {
 #[test]
 fn references_on_class_name_finds_body_only_consumer() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     p.write("hero.gd", "class_name Hero\nextends Node\n");
     // Interface-level consumer: `extends Hero` is in the interface, so the old fast path saw it.
@@ -241,7 +247,10 @@ fn references_on_class_name_finds_body_only_consumer() {
 #[test]
 fn references_excludes_unrelated_same_named_method() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // lib.gd defines `class_name Lib` and `func helper()`.
@@ -324,7 +333,10 @@ fn references_excludes_unrelated_same_named_method() {
 #[test]
 fn references_include_declaration_returns_cross_file_decl() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // lib.gd: class_name Lib, func helper() at line 3, col 5..11.
@@ -394,7 +406,10 @@ fn references_include_declaration_returns_cross_file_decl() {
 #[test]
 fn references_finds_bare_same_file_call() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // lib.gd: `func a()` calls sibling `func helper()` with a bare (unqualified) call.
@@ -475,7 +490,10 @@ fn references_finds_bare_same_file_call() {
 #[test]
 fn references_on_property_at_attribute_site_finds_other_reads() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // One file: field `hp` declared, then read through `self.hp` in two methods.
@@ -544,7 +562,10 @@ fn references_on_property_at_attribute_site_finds_other_reads() {
 #[test]
 fn references_finds_signal_emit_and_connect_sites() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // Line 0: `extends Node`
@@ -622,7 +643,10 @@ fn references_finds_signal_emit_and_connect_sites() {
 #[test]
 fn references_on_native_subscript_call_finds_cross_file_uses() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // a.gd calls the native `_ready` through `self`. `_ready` identifier at line 3:
@@ -688,7 +712,10 @@ fn references_on_native_subscript_call_finds_cross_file_uses() {
 #[test]
 fn references_include_declaration_false_excludes_member_var_decl() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     // Line 1: `var hp: int = 0` — declaration `hp` at cols 4..6.
     // Lines 3/5: `\tself.hp = …` — reads at cols 6..8.
@@ -763,7 +790,10 @@ fn references_include_declaration_false_excludes_member_var_decl() {
 #[test]
 fn references_on_member_excludes_unrelated_same_named_member() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     // a.gd line 2: `var speed: float = 1.0` — decl `speed` at cols 4..9; line 4 read at cols 13..18.
     p.write(
@@ -844,7 +874,10 @@ fn references_on_member_excludes_unrelated_same_named_member() {
 #[test]
 fn references_on_local_variable_stays_in_function() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
     // line 1: member `var charge: int = 0`
     // lines 3-4 (`func fa`): local `charge` declared (3, cols 5..11) and read (4, cols 7..13).
@@ -912,7 +945,10 @@ fn references_on_local_variable_stays_in_function() {
 #[test]
 fn references_member_use_excludes_current_file_same_named_decl() {
     let p = TempProject::new();
-    p.write("project.godot", "config_version=5\n");
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
     p.write("extension_api.json", common::MINI_API);
 
     // a.gd: declares the member the cursor resolves to.

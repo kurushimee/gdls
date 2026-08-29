@@ -2699,7 +2699,7 @@ fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<L
         if text.get(indexed_span.start..indexed_span.end) == Some(name) {
             (indexed_span, text)
         } else {
-            let tree = gd_syntax::parse(&text).tree;
+            let tree = state.workspace.parse_source(&text).tree;
             (root_class_identifier_span(&tree)?, text)
         }
     };
@@ -5485,7 +5485,7 @@ fn find_method_overrides(
                     }
                 },
             };
-            let cand_parsed = gd_syntax::parse(&cand_text);
+            let cand_parsed = state.workspace.parse_source(&cand_text);
             let span = function_identifier_span_for_decl(&cand_parsed.tree, fn_name, fallback_span)
                 .unwrap_or(fallback_span);
             let rope = Rope::from_str(&cand_text);
@@ -5632,7 +5632,7 @@ pub fn implementation(
                 }
             },
         };
-        let cand_parsed = gd_syntax::parse(&cand_text);
+        let cand_parsed = state.workspace.parse_source(&cand_text);
         let cand_rope = Rope::from_str(&cand_text);
         let cand_mapper = PositionMapper::new(&cand_rope, enc);
         // Prefer the class-identifier span; fall back to the file start for files without a
