@@ -160,9 +160,30 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
                         ) =>
                     {
                         if let Some(base) = s.base {
-                            reduce_expression(ctx, base, false);
+                            // analyzer.cpp:3597-3603 — a base that literally names a builtin type
+                            // (`Color.html_is_valid()`, `int.MAX`) is NOT reduced at all: Godot
+                            // builds the builtin metatype straight from the name, which is what
+                            // keeps `Builtin type cannot be used as a name on its own.` off a
+                            // legitimate static call. `reduce_call` rebuilds the same metatype
+                            // from the same test a few lines down.
+                            let base_names_a_builtin = match &ctx.node(base).kind {
+                                NodeKind::Identifier(idn) => {
+                                    crate::resolver::builtin_type_from_name(&idn.name).is_some()
+                                }
+                                _ => false,
+                            };
+                            if !base_names_a_builtin {
+                                reduce_expression(ctx, base, false);
+                            }
                         }
                     }
+                    // analyzer.cpp:3279-3283 — a bare identifier naming a builtin type is a
+                    // CONSTRUCTOR (`Vector2()`, `Array()`), which `reduce_call` answers from the
+                    // name alone. Godot never reduces that callee as an identifier, and must not:
+                    // doing so would report `Builtin type cannot be used as a name on its own.`
+                    // on every builtin construction in the language.
+                    NodeKind::Identifier(idn)
+                        if crate::resolver::builtin_type_from_name(&idn.name).is_some() => {}
                     _ => {
                         // analyzer.cpp:3380+ — when an identifier is reduced as a *call target*,
                         // Godot resolves it via `reduce_identifier_from_base` (the
@@ -1615,18 +1636,26 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
-    // 6. Builtin type name (`int`/`String`/`Vector2`/…). Godot gates on `can_be_builtin`
-    //    (analyzer.cpp:4531-4539) and emits "Builtin type cannot be used as a name on its own."
-    //    when used standalone. The standalone-error gate needs the call/subscript context the
-    //    later E3 slices wire in; for E3c we just expose the metatype so e.g. `int` as a type
-    //    annotation operand still resolves.
+    // 6. Builtin type name (`int`/`String`/`Vector2`/…), analyzer.cpp:4555-4563. Only a subscript
+    //    base may spell one (`int.MAX`, `Vector3.AXIS_X`); standing alone it is an error, and
+    //    Godot deliberately does NOT return after pushing it — the name carries on down the chain
+    //    and picks up `Identifier "int" not declared in the current scope.` from the tail as well.
+    //    Type annotations never reach here: they resolve through `resolver::resolve_datatype`.
     if let Some(bt) = crate::resolver::builtin_type_from_name(&name) {
-        ctx.set_type(id, builtin_meta_type(bt));
-        return;
+        if can_be_builtin {
+            ctx.set_type(id, builtin_meta_type(bt));
+            return;
+        }
+        ctx.push_error(
+            "Builtin type cannot be used as a name on its own.".to_owned(),
+            id,
+        );
     }
 
-    // 7. Variant-as-name (analyzer.cpp:4639-4647). Same `can_be_builtin` gate; we always expose.
-    if name == "Variant" {
+    // 7. Variant-as-name (analyzer.cpp:4667-4676) — "Allow `Variant` here since it might be used
+    //    for nested enums" (`Variant.Type.TYPE_NIL`). The same subscript-base gate gets it there;
+    //    a bare `Variant` falls through to the not-declared tail, since the type stays unset.
+    if can_be_builtin && name == "Variant" {
         ctx.set_type(
             id,
             DataType {
@@ -1637,6 +1666,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
                 ..Default::default()
             },
         );
+        return;
     }
 
     // 7b. `@GlobalScope` enum value (e.g. `CLOCKWISE`). Resolves to the enum's instance
