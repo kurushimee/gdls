@@ -733,7 +733,17 @@ pub(crate) fn script_render_name(ctx: &AnalysisContext, sref: &ScriptRef) -> Str
     {
         return name;
     }
-    ctx.xfile.res_path(sref.file).unwrap_or_default()
+    // The `res://` spelling is Godot's own fqcn (gdscript_parser.cpp:702) and the only path form
+    // safe to show a user — `file_path` is absolute on whatever machine gdls is running on, which
+    // on Windows means a drive letter and a home directory name (#419). A file outside the project
+    // root has no `res://` form at all; name it by its base name rather than leaking the rest.
+    if let Some(res) = ctx.xfile.res_path(sref.file) {
+        return res;
+    }
+    ctx.xfile
+        .file_path(sref.file)
+        .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_owned())
+        .unwrap_or_default()
 }
 
 /// The `Script` meta type for a concrete [`ScriptRef`]: the head script when `inner` is empty, one
