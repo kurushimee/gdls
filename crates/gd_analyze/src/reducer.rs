@@ -987,14 +987,14 @@ fn validated_op_result(op: BinaryOp, a: VariantType, b: VariantType) -> Option<V
             }
         }
 
-        // --- Comparisons (variant_op.cpp:467-744). Godot's table is broad — nearly every
-        // typed pair registers `==` / `!=` (registered for many cross-type combos that yield
-        // false) plus the same-type ordering ops. We accept any pair as valid (returning Bool)
-        // — the corpus doesn't pin invalid-comparison errors and being lenient here matches
-        // Godot's permissive `==`/`!=` registry.
-        CompEqual | CompNotEqual | CompLess | CompLessEqual | CompGreater | CompGreaterEqual => {
-            Some(Bool)
-        }
+        // --- Comparisons. `Variant::evaluate` is a bare table lookup (variant_op.cpp:1041-1057):
+        // an unregistered triple is `r_valid = false`, never a fabricated answer. The three sets
+        // below are what `_register_variant_operators` actually registers; the equality pair set
+        // is broad, the ordering ones are not, and the difference between them is the whole
+        // issue (#463).
+        CompEqual | CompNotEqual => comp_equality(a, b),
+        CompLess | CompGreater => comp_less_greater(a, b),
+        CompLessEqual | CompGreaterEqual => comp_less_greater_equal(a, b),
 
         // --- Logic — caught earlier. Branch unreachable in practice.
         LogicAnd | LogicOr => Some(Bool),
@@ -1007,6 +1007,58 @@ fn validated_op_result(op: BinaryOp, a: VariantType, b: VariantType) -> Option<V
 
 // Per-operator validity tables. Each returns `Some(result_type)` for a registered pair, `None`
 // otherwise.
+
+/// `OP_EQUAL` (variant_op.cpp:487-607) and `OP_NOT_EQUAL` (:609-729) register identical pair
+/// sets, and the block reduces to four rules: same-type for EVERY `VariantType` (all of them
+/// appear, `NIL × NIL` at :487/:609 included); the two numeric crossings at :490-491; the two
+/// String/StringName crossings, which `register_string_op` (:196-203) expands from the single
+/// registration at :493/:615; and either side `NIL` — `OBJECT × NIL` / `NIL × OBJECT` at
+/// :515-516 and :637-638, plus an `AlwaysFalse`/`AlwaysTrue` row for every other type in both
+/// orders at :533-607 and :665-729.
+///
+/// Written as the predicate rather than as 39 same-type rows: `grep OP_EQUAL variant_op.cpp`
+/// regenerates it mechanically, which is what the derived-from-source rule asks for.
+fn comp_equality(a: VariantType, b: VariantType) -> Option<VariantType> {
+    use VariantType::*;
+    let registered = a == b
+        || a == Nil
+        || b == Nil
+        || matches!((a, b), (Int, Float) | (Float, Int))
+        || matches!((a, b), (String, StringName) | (StringName, String));
+    registered.then_some(Bool)
+}
+
+/// `OP_LESS` (variant_op.cpp:731-745) and `OP_GREATER` (:762-776) register identical pair sets,
+/// and they are narrow: no `Color`, no `NodePath`, no `Object`, no `Dictionary`, no
+/// String/StringName crossing, no `NIL`, and no `BOOL` against a number.
+fn comp_less_greater(a: VariantType, b: VariantType) -> Option<VariantType> {
+    use VariantType::*;
+    Some(match (a, b) {
+        // :731/:762 — `bool` orders under `<` and `>`, and NOT under `<=` / `>=`.
+        (Bool, Bool) => Bool,
+        (Int, Int) | (Int, Float) | (Float, Int) | (Float, Float) => Bool,
+        // Same-type only: `"a" < &"b"` is unregistered, while `"a" == &"b"` is not.
+        (String, String) | (StringName, StringName) => Bool,
+        (Vector2, Vector2)
+        | (Vector2i, Vector2i)
+        | (Vector3, Vector3)
+        | (Vector3i, Vector3i)
+        | (Vector4, Vector4)
+        | (Vector4i, Vector4i) => Bool,
+        (Rid, Rid) | (Array, Array) => Bool,
+        _ => return None,
+    })
+}
+
+/// `OP_LESS_EQUAL` (variant_op.cpp:747-760) and `OP_GREATER_EQUAL` (:778-791) register exactly
+/// [`comp_less_greater`]'s set MINUS `BOOL × BOOL`. The asymmetry is real: `true < false` is
+/// silent upstream and `true <= false` is `Invalid operands to operator <=, bool and bool.`
+fn comp_less_greater_equal(a: VariantType, b: VariantType) -> Option<VariantType> {
+    if a == VariantType::Bool && b == VariantType::Bool {
+        return None;
+    }
+    comp_less_greater(a, b)
+}
 
 fn arith_add(a: VariantType, b: VariantType) -> Option<VariantType> {
     use VariantType::*;
@@ -1187,10 +1239,10 @@ fn eval_binary(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedV
     if matches!(a, Opaque(..)) || matches!(b, Opaque(..)) {
         return None;
     }
-    // Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`) — Variant registers comparisons for many type
-    // pairs incl. Bool×Bool (variant_op.cpp:488/610/731/762). The mixed-numeric (Int↔Bool/Float)
-    // cases also have entries; `compare` mirrors them by widening through `to_float` for any pair
-    // where both operands are numeric-or-bool.
+    // Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`). Which pairs register is not obvious — `bool`
+    // orders under `<` and `>` but not under `<=` and `>=`, and a bool against a number registers
+    // nowhere — so `compare` opens by asking the same registry the type-only path asks, and folds
+    // only what it says exists.
     if matches!(
         op,
         BinaryOp::CompEqual
@@ -1281,14 +1333,24 @@ fn eval_binary(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedV
     }
 }
 
-/// Variant comparison over our `FoldedValue` subset — numeric is loose (Int↔Float mixed), every
-/// other pair compares by exact-type structural equality.
+/// Variant comparison over our `FoldedValue` subset.
+///
+/// `Variant::evaluate` is a bare table lookup (variant_op.cpp:1041-1057): an unregistered
+/// `(op, a, b)` triple sets `r_valid = false` and never fabricates an answer. So the same
+/// registry the type-only path consults gates this one, which is what keeps the two halves from
+/// disagreeing — `1 == "a"` used to fold to `false` here while `1 < "a"` already failed. Past the
+/// gate, the arms below compute the value every registered pair really has: the `None`-comparison
+/// arms are the `AlwaysFalse`/`AlwaysTrue` evaluators the `X × NIL` rows install, not a guess.
 fn compare(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedValue> {
     use std::cmp::Ordering;
     use FoldedValue::*;
 
-    // Numeric mixed-mode (Int+Bool, Int+Float, …) — compare as f64. Everything else needs an
-    // exact-kind match; mixing kinds yields false-equal / true-not-equal (Variant's behavior).
+    validated_op_result(op, folded_variant_type(a), folded_variant_type(b))?;
+
+    // Numeric mixed-mode — compare as f64. `bool` is in here because `OP_LESS`/`OP_GREATER`
+    // register `BOOL × BOOL` (variant_op.cpp:731/:762) and every comparison registers same-type;
+    // a bool against a number never gets this far, the gate above having refused it. Everything
+    // else needs an exact-kind match.
     let cmp_num = if let (Some(l), Some(r)) = (to_float(a), to_float(b)) {
         if matches!(a, Int(_) | Float(_) | Bool(_)) && matches!(b, Int(_) | Float(_) | Bool(_)) {
             Some(if l < r {
@@ -1317,6 +1379,8 @@ fn compare(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedValue
     }
 
     let cmp = cmp_num.or_else(|| match (a, b) {
+        // `NIL × NIL` registers for `==` / `!=` only (variant_op.cpp:487/:609), so an ordering
+        // over two nulls never reaches here — the gate refused it.
         (Nil, Nil) => Some(Ordering::Equal),
         // Same-type only. `NodePath` is registered for equality alone (`:511`/`:633`), and the
         // fabricated-Bool arms below cover that; giving it an `Ordering` here would fold
@@ -1330,7 +1394,9 @@ fn compare(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedValue
     Some(match (op, cmp) {
         (BinaryOp::CompEqual, Some(Ordering::Equal)) => Bool(true),
         (BinaryOp::CompEqual, Some(_)) => Bool(false),
-        (BinaryOp::CompEqual, None) => Bool(false), // mismatched kinds compare unequal
+        // The pair IS registered (the gate said so) and the values are not orderable, which is
+        // exactly the shape of the `AlwaysFalse` / `AlwaysTrue` rows every `X × NIL` pair carries.
+        (BinaryOp::CompEqual, None) => Bool(false),
         (BinaryOp::CompNotEqual, Some(Ordering::Equal)) => Bool(false),
         (BinaryOp::CompNotEqual, Some(_)) => Bool(true),
         (BinaryOp::CompNotEqual, None) => Bool(true),
@@ -1409,9 +1475,10 @@ fn binary_op_symbol(op: BinaryOp) -> &'static str {
     }
 }
 
-/// Lift a comparable [`FoldedValue`] to `f64` for the [`compare`] mixed-numeric path. `Bool` widens
-/// to `f64` because comparison (unlike arithmetic) IS registered for `BOOL × {BOOL,INT,FLOAT}` in
-/// the Variant op table (variant_op.cpp:731/762 + cross-type entries).
+/// Lift a comparable [`FoldedValue`] to `f64` for the [`compare`] mixed-numeric path. `Bool` is in
+/// here because `OP_LESS` / `OP_GREATER` register `BOOL × BOOL` (variant_op.cpp:731/:762) and
+/// every comparison registers same-type; a bool against a number is registered nowhere, and
+/// `compare`'s registry gate is what keeps this widening from reaching one.
 fn to_float(v: &FoldedValue) -> Option<f64> {
     match v {
         FoldedValue::Int(i) => Some(*i as f64),
