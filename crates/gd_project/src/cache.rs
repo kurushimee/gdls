@@ -105,7 +105,11 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// shape did not change, so a v13 cache still deserializes; it just holds the older, poorer
 /// answers, and a warm load would keep serving `Variant` for those members until the next cold
 /// index. v13 files are ignored and rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 14;
+/// v15 (#431): `MemberDecl` gained `init`, the initializer's shape for a member the interface
+/// could not type. `#[serde(default)]` would warm-load `None` for every member and the reader
+/// would keep answering `Variant` for all of them until the next cold index — the same
+/// serve-the-older-answer failure v14 fixed. v14 files are ignored and rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 15;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool

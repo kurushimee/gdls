@@ -91,6 +91,32 @@ impl CrossFileQuery for Project {
     }
 }
 
+const DEP_GD: &str = "\
+class_name Dep431
+extends RefCounted
+
+const KONST := 7
+
+enum E { A, B }
+
+static func dmake() -> Dep431:
+\treturn Dep431.new()
+";
+
+const CYC_A_GD: &str = "\
+class_name CycA431
+extends RefCounted
+
+var x := CycB431.y
+";
+
+const CYC_B_GD: &str = "\
+class_name CycB431
+extends RefCounted
+
+var y := CycA431.x
+";
+
 const HELPER_GD: &str = "\
 class_name Helper431
 extends RefCounted
@@ -117,6 +143,24 @@ var soft_cast = get_parent() as CanvasItem
 var soft_int = 3
 var opaque := whatever()
 var single: Glob431
+
+enum Mode { IDLE, RUN }
+
+const SOME := 3
+
+var dep_const := Dep431.KONST
+var own_mode := Mode.RUN
+var dep_enum := Dep431.E.A
+var own_const := SOME
+var auto_member := Glob431.level
+var static_call := Dep431.dmake()
+var own_call := make_color()
+var preloaded := preload(\"res://dep.gd\")
+var preload_new := preload(\"res://dep.gd\").new()
+var soft_call = make_color()
+
+func make_color() -> Color:
+\treturn Color.RED
 ";
 
 const AUTOLOAD_GD: &str = "\
@@ -135,6 +179,9 @@ fn diagnose(stmt: &str) -> (Vec<String>, Vec<String>) {
         ("res://holder.gd", HOLDER_GD),
         ("res://main.gd", &consumer),
         ("res://autoload.gd", AUTOLOAD_GD),
+        ("res://dep.gd", DEP_GD),
+        ("res://cyca.gd", CYC_A_GD),
+        ("res://cycb.gd", CYC_B_GD),
     ]);
     let tree = parse(&consumer).tree;
     let result = analyze(
@@ -225,6 +272,102 @@ fn an_autoload_named_as_a_type_resolves_to_its_script() {
     assert!(access.is_empty(), "{access:?}");
     let (_, access) = diagnose("print(h.single.nope())");
     assert_eq!(access, vec![missing_method("nope", "res://autoload.gd")]);
+}
+
+// ===================================================================================================
+// #431 slice 2: the shapes that need the declaring class looked at, not just the syntax read.
+// ===================================================================================================
+
+/// Force a member's type into a message: `var n: String = <expr>` names what the reader inferred.
+fn assigned_to_string(member: &str) -> Vec<String> {
+    let (errors, _) = diagnose(&format!("var n: String = h.{member}\n\tprint(n)"));
+    errors
+}
+
+fn cannot_assign(ty: &str) -> Vec<String> {
+    vec![format!(
+        "Cannot assign a value of type {ty} to variable \"n\" with specified type String."
+    )]
+}
+
+#[test]
+fn a_chain_read_off_another_class_resolves() {
+    assert_eq!(assigned_to_string("dep_const"), cannot_assign("int"));
+    assert_eq!(assigned_to_string("own_const"), cannot_assign("int"));
+    assert_eq!(assigned_to_string("auto_member"), cannot_assign("int"));
+}
+
+#[test]
+fn an_enum_value_keeps_the_enum_it_came_from() {
+    assert_eq!(
+        assigned_to_string("own_mode"),
+        cannot_assign("Holder431.Mode")
+    );
+    assert_eq!(assigned_to_string("dep_enum"), cannot_assign("Dep431.E"));
+    // And it behaves like an enum value downstream, not like a bare int.
+    let (errors, access) = diagnose("print(h.own_mode.nope)");
+    assert_eq!(
+        errors,
+        vec!["Cannot get property from enum value.".to_owned()]
+    );
+    assert_eq!(access, vec![missing_prop("nope", "Holder431.Mode")]);
+}
+
+#[test]
+fn a_call_takes_the_functions_declared_return() {
+    assert_eq!(assigned_to_string("own_call"), cannot_assign("Color"));
+    assert_eq!(assigned_to_string("static_call"), cannot_assign("Dep431"));
+}
+
+#[test]
+fn a_preload_is_the_script_and_constructing_it_is_an_instance() {
+    assert_eq!(assigned_to_string("preloaded"), cannot_assign("Dep431"));
+    assert_eq!(assigned_to_string("preload_new"), cannot_assign("Dep431"));
+}
+
+#[test]
+fn a_shape_read_through_a_plain_equals_member_stays_soft() {
+    // `var soft_call = make_color()` — Godot's `INFERRED`, so the reader may not complain about
+    // it however well the shape resolved.
+    let (errors, access) = diagnose("var n: String = h.soft_call\n\tprint(n)");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(access.is_empty(), "{access:?}");
+}
+
+#[test]
+fn a_mutual_shape_cycle_answers_nothing_and_says_nothing() {
+    // Godot reaches this by really recursing into the other file and reports
+    // `Could not resolve external class member "x".`; this walk is structural, so it stays quiet
+    // rather than risk claiming a cycle that is not one.
+    let consumer =
+        "extends Node\n\nfunc go(a: CycA431) -> void:\n\tvar n: String = a.x\n\tprint(n)\n";
+    let project = Project::new(&[
+        ("res://helper.gd", HELPER_GD),
+        ("res://holder.gd", HOLDER_GD),
+        ("res://main.gd", consumer),
+        ("res://autoload.gd", AUTOLOAD_GD),
+        ("res://dep.gd", DEP_GD),
+        ("res://cyca.gd", CYC_A_GD),
+        ("res://cycb.gd", CYC_B_GD),
+    ]);
+    let tree = parse(consumer).tree;
+    let result = analyze(
+        &tree,
+        Some(FileId::new(3)),
+        "res://main.gd",
+        &native_db(),
+        &project,
+        &policy(),
+    );
+    assert!(
+        result.diagnostics.is_empty(),
+        "{:?}",
+        result
+            .diagnostics
+            .iter()
+            .map(|d| d.message())
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]

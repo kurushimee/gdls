@@ -6855,6 +6855,298 @@ pub(crate) fn resolve_interface_type_expr(
     result
 }
 
+/// What resolving a captured initializer shape produced. Three answers, not two: a cycle has to
+/// stop the walk, and telling it apart from a plain miss is what a later slice would need to say
+/// anything about it. Both non-answers degrade to soft `Variant` at the caller today.
+enum ShapeAnswer {
+    /// A type, built in the READING file's context out of interface facts alone. Hard only when
+    /// every hop it walked was hard. Boxed: the two non-answers are the common outcome and a
+    /// `DataType` is large.
+    Type(Box<DataType>),
+    /// The walk came back to a member already being resolved.
+    Cyclic,
+    /// No answer: an unresolvable head, a member miss, an access-mode gate, the depth cap, or a
+    /// hop whose own type is `Variant`.
+    Unknown,
+}
+
+/// How deep an initializer-shape walk may go before it gives up. Godot has no such bound because
+/// its recursion is the real analysis; this walk is structural, so it needs one.
+const INIT_SHAPE_DEPTH_CAP: usize = 16;
+
+/// Resolve `shape` — the initializer of `member_name`, declared on `link` — into a type, using
+/// nothing but interfaces (#431). The shallow pass records what an untypeable initializer *names*
+/// and this reads it back in the declaring class's scope, so the answer can only agree with the
+/// declaring file's own analysis or fall short of it.
+///
+/// Never diagnoses, never records a [`Binding`], never returns `Unresolved`. Godot's counterpart
+/// is `resolve_class_member` really recursing into the other file's analyzer
+/// (analyzer.cpp:967-1027); this is the part of that reachable from interfaces.
+fn resolve_member_init_shape(
+    ctx: &mut AnalysisContext,
+    link: &crate::data_type::ScriptRef,
+    member_name: &str,
+    shape: &gd_project::InitShape,
+) -> ShapeAnswer {
+    if ctx.init_shape_stack.len() >= INIT_SHAPE_DEPTH_CAP {
+        return ShapeAnswer::Unknown;
+    }
+    // Seed from the in-file guard on the outermost entry, so a mutual pair closes even when the
+    // reader is itself one of the two members.
+    if ctx.init_shape_stack.is_empty() {
+        if let (Some(f), Some(cur)) = (ctx.file, ctx.current_resolving_member.clone()) {
+            ctx.init_shape_stack.push((f, Vec::new(), cur));
+        }
+    }
+    let frame = (link.file, link.inner.clone(), member_name.to_owned());
+    if ctx.init_shape_stack.contains(&frame) {
+        return ShapeAnswer::Cyclic;
+    }
+    ctx.init_shape_stack.push(frame);
+    let answer = match shape {
+        gd_project::InitShape::MemberChain(path) => resolve_value_path(ctx, link, path),
+        gd_project::InitShape::Call(path) => resolve_call_shape(ctx, link, path),
+        gd_project::InitShape::Preload { path, construct } => {
+            match ctx.xfile.resolve_path_from(link.file, path) {
+                Some(target) if *construct => {
+                    ShapeAnswer::Type(Box::new(script_instance_datatype(ctx, target, Vec::new())))
+                }
+                Some(target) => ShapeAnswer::Type(Box::new(script_meta_type(ctx, target))),
+                None => ShapeAnswer::Unknown,
+            }
+        }
+    };
+    ctx.init_shape_stack.pop();
+    answer
+}
+
+/// A dotted chain read as a VALUE (`SOME`, `E.A`, `Other.KONST`, `SomeAutoload.level`): resolve
+/// the head in the declaring class's scope, then walk one segment at a time. Mirrors the order
+/// `reduce_identifier` uses in-file — the class chain first, then project globals — so a name a
+/// member shadows resolves to the member.
+fn resolve_value_path(
+    ctx: &mut AnalysisContext,
+    link: &crate::data_type::ScriptRef,
+    path: &[String],
+) -> ShapeAnswer {
+    let Some((head, rest)) = path.split_first() else {
+        return ShapeAnswer::Unknown;
+    };
+    let mut cur = match resolve_value_head(ctx, link, head) {
+        ShapeAnswer::Type(dt) => *dt,
+        other => return other,
+    };
+    for seg in rest {
+        cur = match member_type_of(ctx, &cur, seg) {
+            ShapeAnswer::Type(dt) => *dt,
+            other => return other,
+        };
+    }
+    ShapeAnswer::Type(Box::new(cur))
+}
+
+/// The leading segment of a value chain, resolved in the declaring class's scope.
+fn resolve_value_head(
+    ctx: &mut AnalysisContext,
+    link: &crate::data_type::ScriptRef,
+    name: &str,
+) -> ShapeAnswer {
+    // A member of the declaring class or its bases shadows everything below.
+    if let Some((decl_link, member)) = iface_member_in_chain(ctx, link, name) {
+        return type_of_iface_member(ctx, &decl_link, &member);
+    }
+    if let Some(iface) = crate::script_chain::link_interface(ctx.xfile, link) {
+        // A bare value of an unnamed enum is an `int` (analyzer.cpp:4212-4218).
+        if iface.unnamed_enum_values.iter().any(|v| v == name) {
+            return ShapeAnswer::Type(Box::new(hard_builtin(VariantType::Int)));
+        }
+        // A named enum used as a value is its own dictionary — the META type, whose members are
+        // the values.
+        if iface.enums.iter().any(|e| e.name == name) {
+            return match cross_file_named_enum(ctx, link.file, name, true) {
+                Some(dt) => ShapeAnswer::Type(Box::new(dt)),
+                None => ShapeAnswer::Unknown,
+            };
+        }
+    }
+    if let Some(fid) = ctx.xfile.global_class_file(name) {
+        return ShapeAnswer::Type(Box::new(script_meta_type(ctx, fid)));
+    }
+    if let Some(fid) = ctx.xfile.autoload_file(name) {
+        return ShapeAnswer::Type(Box::new(script_instance_datatype(ctx, fid, Vec::new())));
+    }
+    if ctx.native.global_enum(name).is_some() {
+        return ShapeAnswer::Type(Box::new(crate::resolver::make_global_enum_type(
+            ctx, name, "", true,
+        )));
+    }
+    // A native class head is left alone: Godot renders its metatype `GDScriptNativeClass`, a
+    // shape gdls does not produce, so anything read off it would be a guess.
+    ShapeAnswer::Unknown
+}
+
+/// One segment read off an already-resolved type.
+fn member_type_of(ctx: &mut AnalysisContext, base: &DataType, name: &str) -> ShapeAnswer {
+    if base.kind == DtKind::Enum && base.is_meta_type {
+        if !base.enum_values.contains_key(name) {
+            return ShapeAnswer::Unknown;
+        }
+        let mut value = base.clone();
+        value.is_meta_type = false;
+        value.builtin_type = VariantType::Int;
+        return ShapeAnswer::Type(Box::new(value));
+    }
+    let Some(sref) = base.script_type.clone() else {
+        return ShapeAnswer::Unknown;
+    };
+    if let Some(iface) = crate::script_chain::link_interface(ctx.xfile, &sref) {
+        if iface.enums.iter().any(|e| e.name == name) {
+            // `Other.SomeEnum` as a value: the enum's dictionary, so a further segment can read
+            // a value off it.
+            return match cross_file_named_enum(ctx, sref.file, name, true) {
+                Some(dt) => ShapeAnswer::Type(Box::new(dt)),
+                None => ShapeAnswer::Unknown,
+            };
+        }
+        if iface.unnamed_enum_values.iter().any(|v| v == name) {
+            return ShapeAnswer::Type(Box::new(hard_builtin(VariantType::Int)));
+        }
+    }
+    let Some((decl_link, member)) = iface_member_in_chain(ctx, &sref, name) else {
+        return ShapeAnswer::Unknown;
+    };
+    // The same access conditions the member walk applies (analyzer.cpp:4188-4260): through a
+    // METAtype only a constant or a static member is reachable.
+    if base.is_meta_type
+        && !matches!(member.kind, gd_project::MemberKind::Const)
+        && !member.flags.is_static
+    {
+        return ShapeAnswer::Unknown;
+    }
+    type_of_iface_member(ctx, &decl_link, &member)
+}
+
+/// A call whose callee is a nameable chain (`make()`, `Other.make()`): find the function and take
+/// its DECLARED return type. A function with no return annotation answers nothing — propagating
+/// its `Variant` as a hard type would let a reader mint claims only the declaring file can make.
+fn resolve_call_shape(
+    ctx: &mut AnalysisContext,
+    link: &crate::data_type::ScriptRef,
+    path: &[String],
+) -> ShapeAnswer {
+    let Some((fname, base_path)) = path.split_last() else {
+        return ShapeAnswer::Unknown;
+    };
+    let (target, is_meta) = if base_path.is_empty() {
+        (link.clone(), false)
+    } else {
+        match resolve_value_path(ctx, link, base_path) {
+            ShapeAnswer::Type(dt) => match dt.script_type.clone() {
+                Some(sref) => (sref, dt.is_meta_type),
+                None => return ShapeAnswer::Unknown,
+            },
+            other => return other,
+        }
+    };
+    let Some((decl_link, member)) = iface_member_in_chain(ctx, &target, fname) else {
+        return ShapeAnswer::Unknown;
+    };
+    if member.kind != gd_project::MemberKind::Func {
+        return ShapeAnswer::Unknown;
+    }
+    if is_meta && !member.flags.is_static {
+        return ShapeAnswer::Unknown;
+    }
+    let dt = resolve_interface_type_expr(ctx, decl_link.file, &member.ty);
+    if dt.is_variant() {
+        return ShapeAnswer::Unknown;
+    }
+    ShapeAnswer::Type(Box::new(dt))
+}
+
+/// The first `name` on `start`'s extends chain, with the link that declares it. Read-only: no
+/// `Binding::Use`, no diagnostics, no types set — safe to ask from inside another file's answer.
+fn iface_member_in_chain(
+    ctx: &AnalysisContext,
+    start: &crate::data_type::ScriptRef,
+    name: &str,
+) -> Option<(crate::data_type::ScriptRef, gd_project::MemberDecl)> {
+    let chain = crate::script_chain::resolve_script_chain(ctx, start);
+    for link in chain.links.iter() {
+        let iface = crate::script_chain::link_interface(ctx.xfile, link)?;
+        if let Some(m) = iface.members.iter().find(|m| m.name == name) {
+            return Some((link.clone(), m.clone()));
+        }
+    }
+    None
+}
+
+/// The type of an interface member: its annotation when it has one, otherwise its recorded
+/// initializer shape. Softness rides through — one soft hop makes the whole answer soft, which is
+/// what keeps a `var x = e` member from hardening anything downstream of it (#438).
+fn type_of_iface_member(
+    ctx: &mut AnalysisContext,
+    decl_link: &crate::data_type::ScriptRef,
+    member: &gd_project::MemberDecl,
+) -> ShapeAnswer {
+    // A named enum is a member AND an entry in `Interface::enums`; as a value it is the enum's
+    // own dictionary, so a following segment can read a value off it.
+    if member.kind == gd_project::MemberKind::Enum {
+        return match cross_file_named_enum(ctx, decl_link.file, &member.name, true) {
+            Some(dt) => ShapeAnswer::Type(Box::new(dt)),
+            None => ShapeAnswer::Unknown,
+        };
+    }
+    let answer = if matches!(member.ty, gd_project::TypeExpr::None) {
+        match &member.init {
+            Some(shape) => resolve_member_init_shape(ctx, decl_link, &member.name, shape),
+            None => ShapeAnswer::Unknown,
+        }
+    } else {
+        let dt = resolve_interface_type_expr(ctx, decl_link.file, &member.ty);
+        if dt.is_variant() {
+            ShapeAnswer::Unknown
+        } else {
+            ShapeAnswer::Type(Box::new(dt))
+        }
+    };
+    match answer {
+        ShapeAnswer::Type(mut dt) if member.flags.ty_is_soft => {
+            dt.type_source = TypeSource::Inferred;
+            ShapeAnswer::Type(dt)
+        }
+        other => other,
+    }
+}
+
+/// Fill in `dt` from the member's recorded initializer shape, for a member the shallow interface
+/// could not type (#431). A miss and a cycle both leave `dt` exactly as it was — the permissive
+/// soft `Variant` an unreadable initializer has always produced.
+fn apply_init_shape(
+    ctx: &mut AnalysisContext,
+    link: &crate::data_type::ScriptRef,
+    member: &gd_project::MemberDecl,
+    dt: &mut DataType,
+) {
+    let Some(shape) = &member.init else { return };
+    if !matches!(member.ty, gd_project::TypeExpr::None) {
+        return;
+    }
+    if let ShapeAnswer::Type(resolved) = resolve_member_init_shape(ctx, link, &member.name, shape) {
+        *dt = *resolved;
+    }
+}
+
+/// A hard builtin value type, the shape a bare enum value and an `int` fold both land on.
+fn hard_builtin(t: VariantType) -> DataType {
+    DataType {
+        type_source: TypeSource::AnnotatedInferred,
+        kind: DtKind::Builtin,
+        builtin_type: t,
+        ..Default::default()
+    }
+}
+
 /// A Script-typed INSTANCE DataType for `file` (+ inner-class chain). The cross-file counterpart
 /// of `resolver::script_base_datatype` with `is_meta_type = false`.
 pub(crate) fn script_instance_datatype(
@@ -7044,6 +7336,7 @@ fn lookup_in_links(
                 // CONSTANT arm (analyzer.cpp:4193-4200): the member's declared type; untyped
                 // consts degrade to soft Variant — permissive, never an enum value.
                 let mut dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
+                apply_init_shape(ctx, link, member, &mut dt);
                 dt.is_constant = true;
                 record_member_use(ctx, link, BindingSymbolKind::Constant, name, bind_site);
                 // Constant with no value: a cross-file constant's value isn't materializable
@@ -7056,6 +7349,7 @@ fn lookup_in_links(
                     continue; // VARIABLE arm condition (analyzer.cpp:4219-4226)
                 }
                 let mut dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
+                apply_init_shape(ctx, link, member, &mut dt);
                 if member.flags.ty_is_soft {
                     // `var x = expr` — Godot's `INFERRED`, not `ANNOTATED_INFERRED`
                     // (`resolve_assignable`, the `!has_specified_type` arm). Interface types

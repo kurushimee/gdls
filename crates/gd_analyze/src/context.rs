@@ -206,6 +206,15 @@ pub struct AnalysisContext<'a> {
     /// before the assignable's initializer is reduced; restored on exit. Read by
     /// [`crate::reducer::reduce_identifier_from_base`]'s Script-meta branch.
     pub current_resolving_member: Option<String>,
+    /// Members whose captured initializer shape (`gd_project::InitShape`) is currently being
+    /// resolved, innermost last — the cross-file analog of Godot's per-member `RESOLVING`
+    /// sentinel (analyzer.cpp:984-991), for the shapes the shallow interface could not type
+    /// (#431). Revisiting an entry is a cycle, and the resolver answers with soft `Variant`
+    /// rather than a diagnostic: Godot reaches those cycles by really recursing into the other
+    /// file's analysis, and until this structural walk is proven to see the same set, claiming
+    /// one would be a false error. Seeded from [`Self::current_resolving_member`] on entry so a
+    /// mutual pair closes even when the reader is itself one of the two members.
+    pub init_shape_stack: Vec<(gd_project::FileId, Vec<String>, String)>,
     /// Whether resolution is in a `static` context (Godot's `static_context`); drives static-access
     /// checks in WP-E.
     pub static_context: bool,
@@ -422,6 +431,7 @@ impl<'a> AnalysisContext<'a> {
             current_class: None,
             current_function: None,
             current_resolving_member: None,
+            init_shape_stack: Vec::new(),
             static_context: false,
             reducing_callee: false,
             reducing_callee_node: None,

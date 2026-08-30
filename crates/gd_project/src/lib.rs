@@ -34,8 +34,8 @@ pub use exclude::{is_excluded, ProjectRoot, EXCLUDED_COMPONENTS};
 pub use gdextension::GdExtension;
 pub use index::{normalize as normalize_path, Index, IndexInvariant, IndexMut, Resolution};
 pub use interface::{
-    enum_decl, extract as extract_interface, EnumDecl, EnumValueDecl, Extends, Interface,
-    MemberDecl, MemberFlags, MemberKind, TypeExpr,
+    enum_decl, extract as extract_interface, EnumDecl, EnumValueDecl, Extends, InitShape,
+    Interface, MemberDecl, MemberFlags, MemberKind, TypeExpr,
 };
 pub use model::{AutoloadTyping, LoadOutcome, ProjectModel};
 pub use paths::{path_to_res, res_to_path};
