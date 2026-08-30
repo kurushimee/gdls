@@ -1,9 +1,10 @@
 //! `Assigned value for constant "X" isn't a constant expression.` (#344).
 //!
-//! Godot decides this from `ExpressionNode::is_constant`, a bit its reducer stamps wherever it
-//! folds a value (`gdscript_analyzer.cpp:2124-2133`). gdls does not track that bit, and reading its
-//! own fold table directly false-positives, so `const_init_nonconstant_ref` walks the initializer
-//! for a subexpression that can NEVER fold and reports only on a positive identification.
+//! Godot decides this from `ExpressionNode::is_constant`, but only after trying to force the value
+//! through `make_expression_reduced_value` (`gdscript_analyzer.cpp:2124-2133`), which folds arrays,
+//! dictionaries, and constant calls. gdls has no such family, so gating on the bit alone would
+//! reject every `const A = [1, 2]`. `const_init_nonconstant_ref` instead walks the initializer for
+//! a subexpression that can NEVER fold and reports only on a positive identification.
 //!
 //! The rule is narrower than "anything non-literal", and the boundary is the whole point: an inner
 //! class, a named enum, a preload, and an alias of a declared constant ARE constant expressions,
