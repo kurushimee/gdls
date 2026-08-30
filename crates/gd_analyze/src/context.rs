@@ -216,6 +216,18 @@ pub struct AnalysisContext<'a> {
     /// Mirrors Godot's choice to invoke `reduce_identifier_from_base` (no-access-check) from
     /// `reduce_call` rather than the standalone `reduce_identifier` (with-access-check).
     pub reducing_callee: bool,
+    /// The bare-Identifier callee currently being pre-reduced, if any (#429).
+    ///
+    /// gdls pre-reduces a bare callee that Godot never touches (`gdscript_analyzer.cpp:3556-3559`
+    /// sets up the base and goes straight to `get_function_signature`). Godot's miss branch is
+    /// therefore the first thing to type that identifier, and its `reduce_identifier_from_base`
+    /// opens with a don't-re-resolve guard (`analyzer.cpp:4025-4027`) that only passes on a
+    /// typeless node. `reduce_expression`'s tail-guard would hand the probe a `Variant` instead,
+    /// so the one node named here is exempt from that guard; `reduce_call`'s dispatcher arm
+    /// re-stamps it afterwards if nothing determined it. Held as a `NodeId` and not folded into
+    /// `reducing_callee`, because that flag stays raised across the whole callee SUBTREE and the
+    /// exemption must reach exactly one node.
+    pub reducing_callee_node: Option<NodeId>,
     /// Godot's `reduce_identifier(p_identifier, can_be_builtin)` flag (analyzer.cpp:4388), carried
     /// on the context rather than as a parameter so `reduce_expression`'s dispatcher signature
     /// stays identical to upstream's. `true` only while reducing the **base of a subscript**
@@ -412,6 +424,7 @@ impl<'a> AnalysisContext<'a> {
             current_resolving_member: None,
             static_context: false,
             reducing_callee: false,
+            reducing_callee_node: None,
             identifier_can_be_builtin: false,
             native_property_scope: FxHashMap::default(),
             current_enum: None,

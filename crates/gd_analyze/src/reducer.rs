@@ -159,6 +159,10 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
             // here resolved the name in the CURRENT scope, which for an override lands on the
             // overriding method itself — typing the callee `Callable` and recording a `Binding::Use`
             // pointing at the wrong class, the two halves of #333.
+            // #429: the one node `reduce_expression`'s tail-guard must leave typeless, so the
+            // miss branch's callee probe sees Godot's state. Set below alongside `reducing_callee`
+            // and cleared after `reduce_call`.
+            let mut exempt_callee: Option<NodeId> = None;
             if let Some(callee) = c.callee.filter(|_| !c.is_super) {
                 match &ctx.node(callee).kind {
                     NodeKind::Subscript(s)
@@ -202,14 +206,40 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
                         // the callee-reduction so `reduce_identifier` can skip the access-
                         // check; the call-version of the static-context check
                         // (reducer.rs:2322) is the one that fires for calls.
+                        //
+                        // #429: a BARE identifier callee is also exempted from the dispatcher's
+                        // tail-guard for the duration of this call. Godot never reduces such a
+                        // callee (analyzer.cpp:3556-3559), so its miss branch is the first thing
+                        // to type it, through `reduce_identifier_from_base` — whose
+                        // don't-re-resolve guard (analyzer.cpp:4025-4027) only passes on a
+                        // typeless node. Stamping `Variant` here made that probe a no-op, and a
+                        // bare `name()` or `hp()` naming a member of the chain drew nothing at
+                        // all: not the value-callable pair Godot answers with, and not not-found
+                        // either (the chain-shadow gate correctly refuses to claim absence).
                         let prev = ctx.reducing_callee;
+                        let prev_node = ctx.reducing_callee_node;
                         ctx.reducing_callee = true;
+                        if matches!(&ctx.node(callee).kind, NodeKind::Identifier(_)) {
+                            exempt_callee = Some(callee);
+                            ctx.reducing_callee_node = Some(callee);
+                        }
                         reduce_expression(ctx, callee, false);
+                        ctx.reducing_callee_node = prev_node;
                         ctx.reducing_callee = prev;
                     }
                 }
             }
             reduce_call(ctx, id, is_root);
+            // #429: restore the dispatcher's every-node-is-typed invariant. Godot leaves an
+            // unresolved callee typeless forever; gdls's nav consumers read node types, so a
+            // callee neither the pre-reduce nor the probe determined gets the tail-guard's
+            // `Variant` now. Only the node exempted above — never a builtin-constructor or
+            // super callee, which are typeless today and stay that way.
+            if let Some(cid) = exempt_callee {
+                if ctx.get_type(cid).kind == DtKind::Unresolved {
+                    ctx.set_type(cid, variant_dt());
+                }
+            }
         }
         NodeKind::Subscript(_) => reduce_subscript(ctx, id, false),
         NodeKind::TernaryOp(_) => reduce_ternary_op(ctx, id, is_root),
@@ -231,7 +261,11 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
 
     // Tail-guard (analyzer.cpp:2686-2691): prevent `is_type_compatible()` errors for incomplete
     // expressions by promoting an unset type to `Variant`.
-    if ctx.get_type(id).kind == DtKind::Unresolved {
+    //
+    // #429: one node is exempt — the bare identifier callee gdls pre-reduces and Godot does not.
+    // See `AnalysisContext::reducing_callee_node`; `reduce_call`'s dispatcher arm re-stamps it
+    // once the miss branch has had its look.
+    if ctx.get_type(id).kind == DtKind::Unresolved && ctx.reducing_callee_node != Some(id) {
         ctx.set_type(id, variant_dt());
     }
 }
@@ -244,6 +278,11 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
 /// `Cannot infer the type of "X" … because the value doesn't have a set type.` error on every
 /// `var x := <un-ported-reducer expression>` in the corpus. Once `reduce_identifier`/
 /// `reduce_call`/`reduce_subscript`/… all produce determined types this divergence is moot.
+///
+/// #429: one node never gets this from the tail-guard — the bare identifier callee named by
+/// [`AnalysisContext::reducing_callee_node`], which has to reach `reduce_call`'s miss branch in
+/// Godot's typeless state. `reduce_expression`'s `NodeKind::Call` arm stamps it here itself once
+/// the branch is done, so the invariant holds for everything downstream.
 fn variant_dt() -> DataType {
     DataType {
         kind: DtKind::Variant,
@@ -5236,8 +5275,14 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             }
         }
 
+        // #406/#429: when the name IS on the chain but the declaring link did not parse cleanly,
+        // the pair stays whole — the `Member "X" is not a function.` half is already suppressed
+        // above, so the value half is too. Godot never gets this far on such a file: it refuses
+        // the inheritance outright (`Could not resolve super class inheritance from "X".`), and
+        // half a pair gdls invented from a partial interface would be worse than the silence.
+        let chain_evidence_is_partial = name_exists_nonfunc && !name_exists_nonfunc_clean;
         let mut name_is_value = false;
-        if !enum_meta_base && !call.is_super {
+        if !enum_meta_base && !call.is_super && !chain_evidence_is_partial {
             if let Some(callee) = callee_id {
                 reduce_identifier_from_base(ctx, callee, Some(&base_type));
                 let cdt = ctx.get_type(callee).clone();
