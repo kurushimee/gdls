@@ -6238,6 +6238,15 @@ fn resolve_match_pattern(
             for kv in pattern.dictionary {
                 if let Some(k) = kv.key {
                     crate::reducer::reduce_expression(ctx, k, false);
+                    // analyzer.cpp:2509-2512 — a dictionary pattern's key is matched by value, so
+                    // it has to be known at analysis time. The test is Godot's `is_constant` bit,
+                    // not whether the fold table holds a value (#364).
+                    if !ctx.folds.is_constant(k) {
+                        ctx.push_error(
+                            "Expression in dictionary pattern key must be a constant.".to_owned(),
+                            k,
+                        );
+                    }
                 }
                 if let Some(v) = kv.value {
                     resolve_match_pattern(ctx, v, None);
