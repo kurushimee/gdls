@@ -799,6 +799,12 @@ impl Parser {
     }
 
     fn parse_self(&mut self, _prev: Option<NodeId>, _can_assign: bool) -> Option<NodeId> {
+        // gdscript_parser.cpp:2900-2902 — a static function has no instance to name.
+        if self.current_function.is_some_and(
+            |f| matches!(&self.tree.get(f).kind, NodeKind::Function(fc) if fc.is_static),
+        ) {
+            self.push_error(r#"Cannot use "self" inside a static function."#);
+        }
         let id = self.alloc(NodeKind::SelfExpr);
         self.complete_extents(id);
         Some(id)
@@ -2719,8 +2725,9 @@ impl Parser {
             ),
         );
 
-        // Names already seen in *this* enum, for the duplicate-key diagnostic.
-        let mut elements: HashMap<String, ()> = HashMap::new();
+        // Names already seen in *this* enum, mapped to the line each was first declared on —
+        // the duplicate-key diagnostic names that line (gdscript_parser.cpp:1629).
+        let mut elements: HashMap<String, u32> = HashMap::new();
 
         loop {
             if self.check(TokenKind::BraceClose) {
@@ -2730,8 +2737,10 @@ impl Parser {
                 let ident = self.parse_identifier_node();
                 let key = ident.map(|i| self.identifier_name(i)).unwrap_or_default();
 
-                if elements.contains_key(&key) {
-                    self.push_error(format!(r#"Name "{key}" was already in this enum."#));
+                if let Some(&first_line) = elements.get(&key) {
+                    self.push_error(format!(
+                        r#"Name "{key}" was already in this enum (at line {first_line})."#
+                    ));
                 } else if !named {
                     if let Some(class_id) = self.current_class {
                         if self.class_has_member(class_id, &key) {
@@ -2742,7 +2751,10 @@ impl Parser {
                         }
                     }
                 }
-                elements.insert(key, ());
+                let key_line = ident
+                    .map(|i| self.tree.get(i).loc.start.line)
+                    .unwrap_or_else(|| self.previous.loc.start.line);
+                elements.entry(key).or_insert(key_line);
 
                 let mut custom_value = None;
                 if self.match_token(TokenKind::Equal) {
@@ -5139,5 +5151,58 @@ mod tests {
                 "{src:?} produced {errs:?}"
             );
         }
+    }
+
+    /// #372 — `self` names an instance, so a static function has none to name
+    /// (gdscript_parser.cpp:2900-2902). Godot's own corpus never writes this shape, so nothing in
+    /// the conformance tree pins it.
+    #[test]
+    fn self_inside_a_static_function_is_an_error() {
+        let messages = |src: &str| -> Vec<String> {
+            crate::parse(src)
+                .diagnostics
+                .into_iter()
+                .map(|d| d.message)
+                .collect()
+        };
+        assert_eq!(
+            messages("extends Node\n\nstatic func h() -> void:\n\tprint(self)\n"),
+            vec![r#"Cannot use "self" inside a static function."#.to_owned()]
+        );
+        // A non-static function, and a static one that never says `self`, both stay silent.
+        assert!(messages("extends Node\n\nfunc h() -> void:\n\tprint(self)\n").is_empty());
+        assert!(messages("extends Node\n\nstatic func h() -> int:\n\treturn 1\n").is_empty());
+        // A lambda inherits its enclosing function's static-ness (cpp:3712), so it inherits the
+        // restriction too.
+        assert_eq!(
+            messages("extends Node\n\nstatic func h() -> void:\n\tvar f := func(): return self\n\tf.call()\n"),
+            vec![r#"Cannot use "self" inside a static function."#.to_owned()]
+        );
+    }
+
+    /// #373 — the duplicate-enum-name error names the line the first declaration is on
+    /// (gdscript_parser.cpp:1629). With several enums in a file, that suffix is what says which
+    /// declaration the duplicate collides with.
+    #[test]
+    fn a_duplicate_enum_name_names_the_line_it_collides_with() {
+        let messages = |src: &str| -> Vec<String> {
+            crate::parse(src)
+                .diagnostics
+                .into_iter()
+                .map(|d| d.message)
+                .collect()
+        };
+        assert_eq!(
+            messages("extends Node\nenum Kind { A, B, A }\n"),
+            vec![r#"Name "A" was already in this enum (at line 2)."#.to_owned()]
+        );
+        // Across lines, the suffix points at the FIRST one, not the previous one.
+        assert_eq!(
+            messages("extends Node\nenum Kind {\n\tA,\n\tB,\n\tA,\n\tA,\n}\n"),
+            vec![
+                r#"Name "A" was already in this enum (at line 3)."#.to_owned(),
+                r#"Name "A" was already in this enum (at line 3)."#.to_owned(),
+            ]
+        );
     }
 }
