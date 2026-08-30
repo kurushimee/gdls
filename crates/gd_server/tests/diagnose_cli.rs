@@ -113,7 +113,7 @@ fn diagnose_notes_stock_native_surface_without_dump() {
     assert_eq!(out.status.code(), Some(0));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("diagnose never generates the native API dump"),
+        stderr.contains("diagnose never generates the dump"),
         "stock-fallback run should carry the no-dump note; got: {stderr}"
     );
 

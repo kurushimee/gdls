@@ -818,41 +818,43 @@ fn build_underscore_prefix_edit(
             if workspace_edit_is_empty(&edit) {
                 return None;
             }
-            // SINGLE-DECLARATION-TOKEN GATE (sound, defense-in-depth). gdls fires
-            // UNUSED_VARIABLE/UNUSED_PARAMETER ONLY when the binding has ZERO non-declaration
-            // occurrences (any read/write/same-named attribute access suppresses the warning), and a
-            // GDScript declaration is a single token. So a correctly-resolved `_`-prefix rename of a
-            // genuinely-unused binding touches EXACTLY ONE token — the declaration. The local
-            // resolution is now binding-precise (it resolves each occurrence to its declaring binding,
-            // so a forward-reference to a member/global or a sibling-block's distinct same-named local
-            // is NOT in the set), so a correct rename is already one edit — but a 2nd edit here would
-            // mean a resolver drift slipped a DIFFERENT binding in, and renaming it could silently
-            // rebind a read to the wrong symbol when `_name` collides with a cross-file
-            // global/autoload/class_name — error-free (the ERROR backstop is blind). The scope-aware
-            // firewall refuses that case (a cross-file `_name` use resolves to no local ⇒ refuse), but
-            // keep this gate as a fail-closed backstop: accept ONLY a one-edit rename, position- and
-            // file-blind, so any future resolver drift past the firewall still can't multi-edit.
-            // PRECONDITION: count==1
-            // is correct ONLY because the `_`-prefix is offered solely for the two FUNCTION-SCOPED
-            // warnings (UNUSED_VARIABLE/UNUSED_PARAMETER; see the dispatch in `push_mutating_actions`).
-            // A future member-variable warning would drive a project-wide multi-file rename — many
-            // legitimate edits — and would break this invariant, needing its own re-derivation.
-            let ranges = workspace_edit_ranges(&edit);
-            if ranges.len() != 1 {
+            // DECLARATION-PLUS-WRITES GATE (sound, defense-in-depth). gdls fires
+            // UNUSED_VARIABLE/UNUSED_PARAMETER when the binding is never READ — since #464 a write
+            // is not a read, so the occurrence set is the declaration token plus zero or more bare
+            // assignment targets (`var x = 1` / `x = 2`), and nothing else. Every one of those has to
+            // be rewritten or the fix leaves a dangling write; every edit OUTSIDE that set would mean
+            // a resolver drift slipped a DIFFERENT binding in, and renaming it could silently rebind
+            // a read to the wrong symbol when `_name` collides with a cross-file
+            // global/autoload/class_name — error-free, so the ERROR backstop in `edit_is_safe` is
+            // blind to it. The scope-aware firewall already refuses that case (a cross-file `_name`
+            // use resolves to no local ⇒ refuse); this gate is the fail-closed backstop behind it.
+            //
+            // PRECONDITION: the edit stays inside ONE document, which holds only because the
+            // `_`-prefix is offered solely for the two FUNCTION-SCOPED warnings
+            // (UNUSED_VARIABLE/UNUSED_PARAMETER; see the dispatch in `push_mutating_actions`). A
+            // future member-variable warning would drive a project-wide multi-file rename and would
+            // need its own re-derivation.
+            if workspace_edit_doc_count(&edit) > 1 {
                 return None;
             }
-            // Belt-and-suspenders: the single edit must cover the declaration identifier anchor. By
-            // construction it always does (rename anchors on the declaration token, and a one-edit set
-            // IS that token), so this never false-refuses a legitimate single-edit rename — but a
-            // fail-closed check (refuse, never panic — CLAUDE.md "never crash") catches any future
-            // resolver drift that produced one edit somewhere OTHER than the declaration.
+            let ranges = workspace_edit_ranges(&edit);
             let anchor = data.anchor();
-            let r = ranges[0];
             let pos_le = |p: Position, q: Position| (p.line, p.character) <= (q.line, q.character);
             let pos_lt = |p: Position, q: Position| (p.line, p.character) < (q.line, q.character);
-            // Half-open [start, end); a zero-width range (start == end) covers no position, so require
-            // the anchor to fall within an actually-spanning edit (the declaration token is non-empty).
-            if !(pos_le(r.start, anchor) && pos_lt(anchor, r.end)) {
+            // Half-open [start, end); a zero-width range (start == end) covers no position, so the
+            // declaration edit has to be an actually-spanning one (a declaration token is non-empty).
+            let covers_anchor = |r: &Range| pos_le(r.start, anchor) && pos_lt(anchor, r.end);
+            // Exactly one edit is the declaration. By construction rename anchors there, so this
+            // never false-refuses a correct rename — it catches drift that edited somewhere else.
+            if ranges.iter().filter(|r| covers_anchor(r)).count() != 1 {
+                return None;
+            }
+            // Every other edit must sit on a bare assignment target of the same name in this file.
+            let writes = write_target_ranges(state, &data.uri.parse().ok()?, &old_name)?;
+            if !ranges
+                .iter()
+                .all(|r| covers_anchor(r) || writes.contains(r))
+            {
                 return None;
             }
             Some(edit)
@@ -874,6 +876,50 @@ fn identifier_name_at(state: &mut ServerState, uri: &Uri, pos: Position) -> Opti
         NodeKind::Identifier(i) => Some(i.name.clone()),
         _ => None,
     }
+}
+
+/// LSP ranges of every identifier named `name` sitting BARE on the left of an assignment in `uri`'s
+/// current buffer — the write sites a `_`-prefix rename of an unread-but-written local legitimately
+/// has to carry along. Name-matched, not binding-matched, on purpose: this is the outer bound of what
+/// the gate ADMITS, and the binding-correct set comes from `rename` itself. `None` (fail-closed) when
+/// the buffer is gone.
+fn write_target_ranges(state: &mut ServerState, uri: &Uri, name: &str) -> Option<Vec<Range>> {
+    let doc = state.vfs.get(uri.as_str())?;
+    let text = doc.text();
+    let mapper = PositionMapper::new(&doc.rope, state.encoding);
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
+    let tree = &parsed.tree;
+    let mut out = Vec::new();
+    for id in tree.iter_ids() {
+        let NodeKind::Assignment(a) = &tree.get(id).kind else {
+            continue;
+        };
+        let Some(assignee) = a.assignee else {
+            continue;
+        };
+        let node = tree.get(assignee);
+        if let NodeKind::Identifier(i) = &node.kind {
+            if i.name == name {
+                out.push(Range {
+                    start: mapper.byte_to_position(node.span.start),
+                    end: mapper.byte_to_position(node.span.end),
+                });
+            }
+        }
+    }
+    Some(out)
+}
+
+/// How many documents a workspace edit touches. The `_`-prefix gate admits only single-file edits.
+fn workspace_edit_doc_count(edit: &WorkspaceEdit) -> usize {
+    use lsp_types::DocumentChanges;
+    if let Some(DocumentChanges::Edits(tdes)) = &edit.document_changes {
+        let mut uris: Vec<&str> = tdes.iter().map(|t| t.text_document.uri.as_str()).collect();
+        uris.sort_unstable();
+        uris.dedup();
+        return uris.len();
+    }
+    edit.changes.as_ref().map_or(0, |c| c.len())
 }
 
 /// `true` iff the candidate `name` (the would-be `_`-prefixed new name) is VISIBLE in the scope of the

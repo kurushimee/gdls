@@ -99,18 +99,21 @@ fn diagnose(args: &[String]) -> Result<()> {
     eprintln!("loading workspace at {root}...");
     let mut workspace = Workspace::load(&root, &options);
     eprintln!("loaded {} script(s)", workspace.index.file_count());
-    // A stock-surface run would otherwise inherit the resolve ladder's advice ("set
-    // godotBinaryPath or GDLS_GODOT for an exact dump") unqualified — but diagnose never
-    // dumps; the background dump is the LSP session's job (api_dump::spawn_background_dump,
-    // issue #25). Say so, so an operator doesn't set the env var and re-run diagnose
-    // expecting a different native surface.
-    if workspace.native.provenance() == gd_types::ApiProvenance::Generic
-        && options.extension_api_path.is_none()
-    {
+    // Both non-exact rungs of the resolve ladder end their warning with "set godotBinaryPath or
+    // GDLS_GODOT for an exact dump" (api_dump.rs), which reads as advice this CLI will act on
+    // next run. It won't: diagnose never dumps, because the background dump is the LSP session's
+    // job (api_dump::spawn_background_dump, started by serve_inner only — issue #25). Say so, so
+    // an operator doesn't set the variable, re-run diagnose, and get the same surface with no
+    // explanation. `options` is the default set here, so a pinned extensionApiPath cannot be in
+    // play; anything short of Exact means the ladder fell through to a source diagnose can't
+    // improve on its own.
+    if workspace.native.provenance() != gd_types::ApiProvenance::Exact {
         eprintln!(
-            "note: diagnose never generates the native API dump (that is the LSP session's \
-             background job); this run used the embedded stock surface. Open the project in \
-             any LSP session once, or set godotBinaryPath / GDLS_GODOT, to produce an exact dump."
+            "note: this run's native API surface is not project-derived, and diagnose never \
+             generates the dump — that is the LSP session's background job. Open the project in \
+             an LSP session once to produce an exact dump; if the Godot binary is not on PATH as \
+             `godot4` or `godot`, point GDLS_GODOT at it (or set godotBinaryPath in the client's \
+             initializationOptions) so that session can find it."
         );
     }
 

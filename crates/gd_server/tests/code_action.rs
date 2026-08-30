@@ -1429,46 +1429,85 @@ fn underscore_prefix_clears_unused_variable() {
     shutdown(&client, t);
 }
 
-/// ADVERSARIAL (assigned-unused → the dangling-write corruption is STRUCTURALLY IMPOSSIBLE in gdls):
-/// `var x = 1; x = 2` (assigned, never read). The spec's worst case for a `_`-prefix fix is renaming
-/// ONLY the declaration and leaving `x = 2` dangling. gdls's UNUSED_VARIABLE sweep over-approximates
-/// "used" — ANY in-scope identifier occurrence (incl. the write LHS `x`) counts as a use — so an
-/// ASSIGNED var does NOT warn at all. Therefore the fix is never even offered for it, and the dangling
-/// write can't arise. This test pins that property: NO UNUSED_VARIABLE diagnostic, NO `_`-prefix
-/// action. (When the fix DOES fire, the binding has zero non-declaration occurrences, so the rename is
-/// a single-site edit — and the multi-occurrence rewrite path is still proven by the
-/// attribute-exclusion and shadowing tests below, whose locals have real `print(_x)` uses.)
+/// ADVERSARIAL (assigned-unused → the dangling write): `var x = 1; x = 2` (written, never read).
+/// Since #464 a write is not a use, so this DOES warn and the `_`-prefix fix IS offered — which puts
+/// the spec's worst case squarely in reach: renaming ONLY the declaration would leave `x = 2`
+/// dangling and turn a warning into a broken script. The binding-correct collection behind the fix
+/// (`push_identifier_locations_within`, handlers.rs) is what prevents it, and this test pins the
+/// property end to end: both occurrences are rewritten, and the patched source re-analyzes with no
+/// induced diagnostic — an undeclared-identifier error being exactly what a dangling write produces.
 #[test]
-fn underscore_prefix_assigned_unused_does_not_warn_so_no_corruption() {
+fn underscore_prefix_rewrites_the_write_too() {
     const SRC: &str = "extends Node\n\n\nfunc f() -> void:\n\tvar x = 1\n\tx = 2\n\tprint(0)\n";
     let p = base_project();
     let (server, client) = Connection::memory();
     let t = std::thread::spawn(move || gd_server::serve(server));
     let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
     let uri = file_uri(&p.root.join("a.gd"));
-    // gdls reality: an assigned var counts as used → no UNUSED_VARIABLE.
-    assert!(
-        !has_warning(&diags, "UNUSED_VARIABLE"),
-        "an ASSIGNED local counts as used in gdls — no UNUSED_VARIABLE should fire (so the \
-         dangling-write corruption can't arise); got {:?}",
-        diags.diagnostics
+    let before = diag_identities(&diags);
+    let diag = diag_with_warning(&diags, "UNUSED_VARIABLE");
+
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Prefix unused name");
+    let tes = all_text_edits(&edit);
+    assert_eq!(
+        tes.len(),
+        2,
+        "the declaration AND the write must both be rewritten; got {tes:?}"
     );
-    // And a codeAction over the declaration offers NO `_`-prefix fix (there's no diagnostic to fix).
-    let decl_range = Range {
-        start: Position {
-            line: 4,
-            character: 5,
-        },
-        end: Position {
-            line: 4,
-            character: 6,
-        },
-    };
-    let actions = request_code_action(&client, 10, &uri, decl_range, Vec::new(), None);
     assert!(
-        find_action(&actions, "Prefix unused name").is_none(),
-        "no `_`-prefix fix for a non-warning binding; got titles {:?}",
-        action_titles(&actions)
+        tes.iter().all(|te| te.new_text == "_x"),
+        "every edit replaces with the `_`-prefixed name; got {tes:?}"
+    );
+
+    let patched = apply_text_edits(SRC, tes);
+    assert!(
+        patched.contains("var _x = 1") && patched.contains("_x = 2"),
+        "no occurrence may be left dangling; got\n{patched}"
+    );
+    let after = reopen_and_diags(&p, &client, "b.gd", &patched, 100);
+    assert!(
+        !has_warning(&after, "UNUSED_VARIABLE"),
+        "UNUSED_VARIABLE must be cleared; got {:?}",
+        after.diagnostics
+    );
+    let after_ids = diag_identities(&after);
+    let induced: Vec<_> = after_ids.difference(&before).collect();
+    assert!(
+        induced.is_empty(),
+        "no NEW diagnostic may appear after the fix; induced {induced:?}\npatched:\n{patched}"
+    );
+    shutdown(&client, t);
+}
+
+/// ADVERSARIAL (write-only local with a same-named write in ANOTHER function): renaming `f`'s
+/// unused `x` must carry `f`'s write and leave `g`'s distinct `x` alone. The gate admits write
+/// sites by NAME (an outer bound), so what keeps `g` out is `rename`'s binding-correct resolution —
+/// this pins that the two layers compose instead of the looser one winning.
+#[test]
+fn underscore_prefix_write_does_not_reach_another_function() {
+    const SRC: &str = "extends Node\n\n\nfunc f() -> void:\n\tvar x = 1\n\tx = 2\n\n\nfunc g() -> void:\n\tvar x = 3\n\tx = 4\n\tprint(x)\n";
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_r, diags) = init_open(&p, &client, &[("a.gd", SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = diag_with_warning(&diags, "UNUSED_VARIABLE");
+    assert_eq!(diag.range.start.line, 4, "the warning is on f's `x`");
+
+    let edit = resolve_fix_edit(&client, 10, &uri, &diag, "Prefix unused name");
+    let tes = all_text_edits(&edit);
+    assert_eq!(tes.len(), 2, "only f's two occurrences; got {tes:?}");
+    assert!(
+        tes.iter().all(|te| te.range.start.line < 6),
+        "no edit may reach g; got {tes:?}"
+    );
+
+    let patched = apply_text_edits(SRC, tes);
+    assert!(
+        patched.contains("var _x = 1")
+            && patched.contains("\t_x = 2")
+            && patched.contains("var x = 3"),
+        "g's binding must be untouched; got\n{patched}"
     );
     shutdown(&client, t);
 }
