@@ -6677,11 +6677,19 @@ pub fn prepare_call_hierarchy(
                         let spans =
                             spans.get_or_insert_with(|| callee_name_token_spans(&parsed.tree));
                         let ident = spans.get(call_site).copied()?;
-                        (ident.start <= byte && byte < ident.end).then_some(f)
+                        // #360: the callee's OWNING class rides with the file, so the item this
+                        // prepares names one method rather than every same-named one in that file.
+                        let cp = match callee {
+                            gd_analyze::CalleeTarget::Script { class_path, .. } => {
+                                class_path.clone()
+                            }
+                            _ => Vec::new(),
+                        };
+                        (ident.start <= byte && byte < ident.end).then_some((f, cp))
                     }
                     _ => None,
                 });
-                if let Some(fid) = target {
+                if let Some((fid, callee_class_path)) = target {
                     if let Some((path, callee_uri)) = state
                         .workspace
                         .index
@@ -6689,12 +6697,15 @@ pub fn prepare_call_hierarchy(
                         .map(|p| p.to_path_buf())
                         .and_then(|p| path_to_file_uri(&p).map(|u| (p, u)))
                     {
-                        let (range, selection_range) =
-                            resolve_fn_item_ranges(state, &path, &callee_uri, &name);
-                        let data = serde_json::json!({
-                            "uri": callee_uri.as_str(),
-                            "name": name,
-                        });
+                        let (range, selection_range) = resolve_fn_item_ranges(
+                            state,
+                            &path,
+                            &callee_uri,
+                            &callee_class_path,
+                            &name,
+                        );
+                        let data =
+                            call_hierarchy_data(callee_uri.as_str(), &name, &callee_class_path);
                         #[allow(deprecated)]
                         let item = CallHierarchyItem {
                             name,
@@ -6745,7 +6756,8 @@ pub fn prepare_call_hierarchy(
     let fn_range = mapper.span_to_range(parsed.tree.get(fn_id).span);
     let ident_range = mapper.span_to_range(parsed.tree.get(ident_id).span);
 
-    let data = serde_json::json!({ "uri": uri.as_str(), "name": fn_name });
+    let class_path = class_path_at(&parsed.tree, byte);
+    let data = call_hierarchy_data(uri.as_str(), &fn_name, &class_path);
     let detail = uri_to_path(&uri).and_then(|p| script_detail(state, &p));
 
     #[allow(deprecated)]
@@ -6782,18 +6794,87 @@ fn script_detail(state: &ServerState, path: &camino::Utf8Path) -> Option<String>
 /// function of that name exists (e.g. the synthetic `<top>` caller for top-level code).
 fn function_decl_spans(
     tree: &ParseTree,
+    class_path: &[String],
     name: &str,
 ) -> Option<(gd_syntax::ByteSpan, gd_syntax::ByteSpan)> {
-    for id in tree.iter_ids() {
-        if let NodeKind::Function(f) = &tree.get(id).kind {
-            if let Some(ident) = f.identifier {
-                if ident_name(tree, ident) == name {
-                    return Some((tree.get(id).span, tree.get(ident).span));
-                }
+    // #360: descend to the OWNING class first. Scanning the whole arena for the first `func` of
+    // that name anchored an inner class's method at the root class's declaration whenever the two
+    // shared a name.
+    let class_id = descend_class_path(tree, tree.root_id()?, class_path)?;
+    let NodeKind::Class(class) = &tree.get(class_id).kind else {
+        return None;
+    };
+    for m in &class.members {
+        let gd_syntax::ast::Member::Function(fid) = m else {
+            continue;
+        };
+        let NodeKind::Function(f) = &tree.get(*fid).kind else {
+            continue;
+        };
+        if let Some(ident) = f.identifier {
+            if ident_name(tree, ident) == name {
+                return Some((tree.get(*fid).span, tree.get(ident).span));
             }
         }
     }
     None
+}
+
+/// The class node `class_path` names, starting from `class_id` (an empty path is `class_id`
+/// itself). `None` when any segment names no inner class — an honest miss, never a same-named
+/// class elsewhere in the file.
+fn descend_class_path(tree: &ParseTree, class_id: NodeId, class_path: &[String]) -> Option<NodeId> {
+    let mut cur = class_id;
+    for seg in class_path {
+        let NodeKind::Class(c) = &tree.get(cur).kind else {
+            return None;
+        };
+        cur = c.members.iter().find_map(|m| {
+            let gd_syntax::ast::Member::Class(inner) = m else {
+                return None;
+            };
+            let NodeKind::Class(ic) = &tree.get(*inner).kind else {
+                return None;
+            };
+            let named = ic
+                .identifier
+                .is_some_and(|iid| ident_name(tree, iid) == *seg);
+            named.then_some(*inner)
+        })?;
+    }
+    Some(cur)
+}
+
+/// The inner-class chain of the smallest class node containing `byte` (empty = the file's root
+/// class) — the caller-side twin of the `class_path` the analyzer records on a call binding.
+fn class_path_at(tree: &ParseTree, byte: usize) -> Vec<String> {
+    fn walk(tree: &ParseTree, class_id: NodeId, byte: usize, out: &mut Vec<String>) {
+        let NodeKind::Class(c) = &tree.get(class_id).kind else {
+            return;
+        };
+        for m in &c.members {
+            let gd_syntax::ast::Member::Class(inner) = m else {
+                continue;
+            };
+            let node = tree.get(*inner);
+            if node.span.start <= byte && byte < node.span.end {
+                let NodeKind::Class(ic) = &node.kind else {
+                    return;
+                };
+                let Some(name) = ic.identifier.map(|iid| ident_name(tree, iid)) else {
+                    return;
+                };
+                out.push(name.to_owned());
+                walk(tree, *inner, byte, out);
+                return;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(root) = tree.root_id() {
+        walk(tree, root, byte, &mut out);
+    }
+    out
 }
 
 /// A zero-width LSP range at file start. The documented degrade for a [`CallHierarchyItem`] whose
@@ -6823,6 +6904,7 @@ fn resolve_fn_item_ranges(
     state: &mut ServerState,
     path: &camino::Utf8Path,
     uri: &Uri,
+    class_path: &[String],
     name: &str,
 ) -> (Range, Range) {
     let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
@@ -6839,7 +6921,7 @@ fn resolve_fn_item_ranges(
         },
     };
     let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
-    let Some((decl_span, ident_span)) = function_decl_spans(&parsed.tree, name) else {
+    let Some((decl_span, ident_span)) = function_decl_spans(&parsed.tree, class_path, name) else {
         log::debug!(
             "callHierarchy: `{name}` not found as a function declaration in {path}; \
              using a zero-width range at file start"
@@ -6874,7 +6956,7 @@ pub fn outgoing_calls(
     state: &mut ServerState,
     params: CallHierarchyOutgoingCallsParams,
 ) -> Option<Vec<CallHierarchyOutgoingCall>> {
-    let (uri, fn_name) = resolve_call_hierarchy_item(state, &params.item)?;
+    let (uri, fn_name, fn_class_path) = resolve_call_hierarchy_item(state, &params.item)?;
     // Stub API pages have no project call graph: expanding a stub-anchored item (the
     // references-view hands native `to` items back verbatim) gets a clean empty list — never
     // an error, and never an attempt to analyze pseudo-GDScript. Mirrors publish_diagnostics'
@@ -6915,7 +6997,7 @@ pub fn outgoing_calls(
     type CalleeKey = (CalleeTarget, String);
     let callee_spans = callee_name_token_spans(&parsed.tree);
     let groups: Vec<(CalleeKey, Vec<lsp_types::Range>)> = group_call_ranges(
-        find_outgoing_calls(&result, fn_name.as_str()),
+        find_outgoing_calls(&result, &fn_class_path, fn_name.as_str()),
         &mapper,
         &callee_spans,
         |b| match b {
@@ -6931,6 +7013,11 @@ pub fn outgoing_calls(
     let stub_root = state.options.stub_cache_dir.clone();
     let mut out = Vec::with_capacity(groups.len());
     for ((callee, callee_name), ranges) in groups {
+        // Captured before the `match` consumes `callee`.
+        let to_class_path = match &callee {
+            CalleeTarget::Script { class_path, .. } => class_path.clone(),
+            _ => Vec::new(),
+        };
         let (to_uri, to_range, to_selection, to_detail) = match callee {
             CalleeTarget::Script { file: fid, .. } => {
                 match state.workspace.index.path(fid).map(|p| p.to_path_buf()) {
@@ -6939,8 +7026,13 @@ pub fn outgoing_calls(
                             // The `to` item locates the callee's DECLARATION (LSP 3.17), not the
                             // call site — load the callee's file and resolve `func callee_name`'s
                             // spans.
-                            let (range, selection) =
-                                resolve_fn_item_ranges(state, &path, &u, &callee_name);
+                            let (range, selection) = resolve_fn_item_ranges(
+                                state,
+                                &path,
+                                &u,
+                                &to_class_path,
+                                &callee_name,
+                            );
                             let detail = script_detail(state, &path);
                             (u, range, selection, detail)
                         }
@@ -7003,13 +7095,11 @@ pub fn outgoing_calls(
             // declared at the top of the calling script.
             CalleeTarget::Unresolved => continue,
         };
-        // `to` items carry the same {uri, name} blob prepare/incoming items do — the client
-        // hands them back verbatim on expansion ("show outgoing calls of this callee"), and a
-        // data-less item used to dead-end the whole outgoing tree at depth 2.
-        let data = serde_json::json!({
-            "uri": to_uri.as_str(),
-            "name": callee_name,
-        });
+        // `to` items carry the same blob prepare/incoming items do — the client hands them back
+        // verbatim on expansion ("show outgoing calls of this callee"), and a data-less item used
+        // to dead-end the whole outgoing tree at depth 2. The owning class rides along (#360) so
+        // the expansion targets the method this call actually reached.
+        let data = call_hierarchy_data(to_uri.as_str(), &callee_name, &to_class_path);
         #[allow(deprecated)]
         let to = CallHierarchyItem {
             name: callee_name.clone(),
@@ -7040,7 +7130,8 @@ pub fn incoming_calls(
     state: &mut ServerState,
     params: CallHierarchyIncomingCallsParams,
 ) -> Option<Vec<CallHierarchyIncomingCall>> {
-    let (target_uri, target_name) = resolve_call_hierarchy_item(state, &params.item)?;
+    let (target_uri, target_name, target_class_path) =
+        resolve_call_hierarchy_item(state, &params.item)?;
     // Same stub gate as outgoing_calls: a stub-anchored item resolves to an API page no
     // project code is indexed against — empty, not an error.
     if crate::stubs::is_stub_uri(&target_uri, state.options.stub_cache_dir.as_deref()) {
@@ -7080,33 +7171,36 @@ pub fn incoming_calls(
         // already filtered to Call bindings whose callee matches (target_fid, target_name).
         let callee_spans = callee_name_token_spans(&parsed.tree);
         let groups = group_call_ranges(
-            find_incoming_calls(&result, target_fid, &target_name),
+            find_incoming_calls(&result, target_fid, &target_class_path, &target_name),
             &mapper,
             &callee_spans,
             |b| match b {
                 Binding::Call {
-                    caller_function, ..
-                } => Some(
+                    caller_function,
+                    caller_class_path,
+                    ..
+                } => Some((
+                    caller_class_path.clone(),
                     caller_function
                         .clone()
                         .unwrap_or_else(|| "<top>".to_string()),
-                ),
+                )),
                 _ => None,
             },
         );
 
-        for (caller_name, ranges) in groups {
+        for ((caller_class_path, caller_name), ranges) in groups {
             // The `from` item locates the CALLER's declaration in this candidate file (LSP 3.17),
             // not the call site. `parsed.tree` + `mapper` for this file are already in scope. The
             // synthetic `<top>` caller (top-level code) has no declaration → zero-width at start.
-            let (from_range, from_selection) = match function_decl_spans(&parsed.tree, &caller_name)
-            {
-                Some((decl_span, ident_span)) => (
-                    mapper.span_to_range(decl_span),
-                    mapper.span_to_range(ident_span),
-                ),
-                None => (file_start_range(), file_start_range()),
-            };
+            let (from_range, from_selection) =
+                match function_decl_spans(&parsed.tree, &caller_class_path, &caller_name) {
+                    Some((decl_span, ident_span)) => (
+                        mapper.span_to_range(decl_span),
+                        mapper.span_to_range(ident_span),
+                    ),
+                    None => (file_start_range(), file_start_range()),
+                };
             #[allow(deprecated)]
             let from = CallHierarchyItem {
                 name: caller_name.clone(),
@@ -7116,10 +7210,11 @@ pub fn incoming_calls(
                 uri: cand_uri.clone(),
                 range: from_range,
                 selection_range: from_selection,
-                data: Some(serde_json::json!({
-                    "uri": cand_uri.as_str(),
-                    "name": caller_name,
-                })),
+                data: Some(call_hierarchy_data(
+                    cand_uri.as_str(),
+                    &caller_name,
+                    &caller_class_path,
+                )),
             };
             out.push(CallHierarchyIncomingCall {
                 from,
@@ -7599,7 +7694,7 @@ fn member_kind_to_lsp(k: gd_project::MemberKind) -> LspSymbolKind {
 fn resolve_call_hierarchy_item(
     state: &mut ServerState,
     item: &CallHierarchyItem,
-) -> Option<(Uri, String)> {
+) -> Option<(Uri, String, Vec<String>)> {
     if let Some(decoded) = decode_call_hierarchy_data(item) {
         return Some(decoded);
     }
@@ -7612,7 +7707,29 @@ fn resolve_call_hierarchy_item(
             );
             item.name.clone()
         });
-    Some((item.uri.clone(), name))
+    // A data-less item is located by its own `selectionRange`, so the owning class comes from the
+    // same position rather than from the blob.
+    let class_path = position_class_path(state, &item.uri, item.selection_range.start);
+    Some((item.uri.clone(), name, class_path))
+}
+
+/// The inner-class chain containing `pos` in `uri`'s current text, for a [`CallHierarchyItem`] that
+/// carries no `data` blob. Empty (the root class) when the file is unreadable.
+fn position_class_path(state: &mut ServerState, uri: &Uri, pos: Position) -> Vec<String> {
+    let Some(path) = crate::uri::uri_to_path(uri) else {
+        return Vec::new();
+    };
+    let text = match state.vfs.get(uri.as_str()).map(|d| d.text()) {
+        Some(t) => t,
+        None => match std::fs::read_to_string(path.as_std_path()) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        },
+    };
+    let parsed = state.workspace.parse(&CanonicalKey::for_uri(uri), &text);
+    let rope = Rope::from_str(&text);
+    let byte = PositionMapper::new(&rope, state.encoding).position_to_byte(pos);
+    class_path_at(&parsed.tree, byte)
 }
 
 /// The name of the function whose declaration IDENTIFIER contains `pos` in `uri`'s current
@@ -7645,10 +7762,33 @@ fn position_function_name(state: &mut ServerState, uri: &Uri, pos: Position) -> 
 
 /// Decode the `data` field a `prepareCallHierarchy` item carries: `{ "uri": ..., "name": ... }`.
 /// Returns `None` if the field is absent or malformed.
-fn decode_call_hierarchy_data(item: &CallHierarchyItem) -> Option<(Uri, String)> {
+/// The `data` blob a [`CallHierarchyItem`] round-trips through the client: the declaring file, the
+/// bare function name, and — since #360 — the owning inner-class chain. The chain is omitted when
+/// it is empty (the root class), which is both the common case and what an item issued before the
+/// field existed looks like, so [`decode_call_hierarchy_data`] reads absent as root.
+fn call_hierarchy_data(uri: &str, name: &str, class_path: &[String]) -> serde_json::Value {
+    let mut data = serde_json::json!({ "uri": uri, "name": name });
+    if !class_path.is_empty() {
+        data["class_path"] = serde_json::json!(class_path);
+    }
+    data
+}
+
+fn decode_call_hierarchy_data(item: &CallHierarchyItem) -> Option<(Uri, String, Vec<String>)> {
     let data = item.data.as_ref()?;
     let uri_str = data.get("uri")?.as_str()?;
     let name = data.get("name")?.as_str()?.to_string();
+    // #360: absent means the root class — both for an item this server issued before the field
+    // existed and for the ordinary root-class case, which omits it.
+    let class_path: Vec<String> = data
+        .get("class_path")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     let uri: Uri = match uri_str.parse() {
         Ok(u) => u,
         Err(e) => {
@@ -7662,7 +7802,7 @@ fn decode_call_hierarchy_data(item: &CallHierarchyItem) -> Option<(Uri, String)>
             return None;
         }
     };
-    Some((uri, name))
+    Some((uri, name, class_path))
 }
 
 // =================================================================================================

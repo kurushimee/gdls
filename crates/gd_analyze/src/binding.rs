@@ -149,10 +149,18 @@ pub enum Binding {
         /// The call expression's source span. LSP `Range` derives from this.
         call_site: ByteSpan,
         /// Bare identifier of the enclosing function (e.g. `attack`, **never** `Hero::attack`),
-        /// or `None` for top-level / outside-fn calls. Drives `outgoingCalls` grouping. NOT
-        /// class-qualified in v1: two same-named methods in different classes share a *caller* key
-        /// here (the *callee* side is dispatch-resolved — see [`CalleeTarget::Script`]).
+        /// or `None` for top-level / outside-fn calls. Drives `outgoingCalls` grouping. Bare by
+        /// construction — the owning class rides alongside in [`Self::Call::caller_class_path`],
+        /// which is what actually disambiguates two same-named methods.
         caller_function: Option<String>,
+        /// Inner-class chain WITHIN this file where the CALLER is declared (empty = the file's
+        /// root class) — [`crate::data_type::ScriptRef::inner`]'s vocabulary, the
+        /// [`CalleeTarget::Script::class_path`] pattern carried onto the caller side (#360).
+        ///
+        /// Without it a root `func tick()` and an inner class's `func tick()` are one
+        /// `outgoingCalls` key, and each answers with the union of both methods' calls — a
+        /// well-formed, plausible, wrong tree.
+        caller_class_path: Vec<String>,
     },
     /// An identifier or member-access that the analyzer resolved to a named declaration. Surfaced
     /// by `textDocument/references`, which in v1 matches by `target_name` across both Call and Use
@@ -183,6 +191,7 @@ impl Binding {
         callee_name: String,
         call_site: ByteSpan,
         caller_function: Option<String>,
+        caller_class_path: Vec<String>,
     ) -> Self {
         debug_assert!(
             caller_function.as_deref().is_none_or(|c| !c.contains("::")),
@@ -194,6 +203,7 @@ impl Binding {
             callee_name,
             call_site,
             caller_function,
+            caller_class_path,
         }
     }
 
@@ -215,16 +225,19 @@ impl Binding {
         }
     }
 
-    /// True when this binding is a [`Self::Call`] whose `caller_function` matches `bare_caller`.
-    /// Used by `outgoingCalls`. The argument is a **bare** function name (e.g. `attack`, never
-    /// `Hero::attack`), matching how `caller_function` is recorded (see the field doc above).
-    pub fn matches_caller(&self, bare_caller: &str) -> bool {
+    /// True when this binding is a [`Self::Call`] declared in `class_path` whose
+    /// `caller_function` matches `bare_caller`. Used by `outgoingCalls`. The name argument is a
+    /// **bare** function name (e.g. `attack`, never `Hero::attack`), matching how
+    /// `caller_function` is recorded; the owning class is the separate `class_path` argument
+    /// (empty = the file's root class).
+    pub fn matches_caller(&self, class_path: &[String], bare_caller: &str) -> bool {
         matches!(
             self,
             Binding::Call {
                 caller_function: Some(c),
+                caller_class_path,
                 ..
-            } if c == bare_caller
+            } if c == bare_caller && caller_class_path.as_slice() == class_path
         )
     }
 
@@ -238,16 +251,30 @@ impl Binding {
         }
     }
 
-    /// True when this binding is a [`Self::Call`] whose callee matches the given (file, name).
-    /// `file = None` matches every NON-project callee (`Native` and `Unresolved` alike) —
-    /// preserving the pre-`CalleeTarget` `callee_file: None` matching that `incomingCalls`'
-    /// degrade paths rely on.
-    pub fn matches_callee(&self, file: Option<FileId>, name: &str) -> bool {
-        matches!(
-            self,
-            Binding::Call { callee, callee_name, .. }
-            if callee.script_file() == file && callee_name == name
-        )
+    /// True when this binding is a [`Self::Call`] whose callee matches the given
+    /// (file, class path, name). `file = None` matches every NON-project callee (`Native` and
+    /// `Unresolved` alike) — preserving the pre-`CalleeTarget` `callee_file: None` matching that
+    /// `incomingCalls`' degrade paths rely on, and the class path is not compared there since a
+    /// non-project callee has none.
+    ///
+    /// #360: for a project callee the class path IS compared, so an inner class's `tick` and the
+    /// root class's `tick` no longer share one set of call sites.
+    pub fn matches_callee(&self, file: Option<FileId>, class_path: &[String], name: &str) -> bool {
+        let Binding::Call {
+            callee,
+            callee_name,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if callee.script_file() != file || callee_name != name {
+            return false;
+        }
+        match callee {
+            CalleeTarget::Script { class_path: cp, .. } => cp.as_slice() == class_path,
+            _ => true,
+        }
     }
 
     /// True when this binding is a [`Self::Use`] targeting `(kind, name)`.
@@ -283,32 +310,34 @@ pub fn find_use_bindings<'a>(
         .filter(move |b| b.matches_use(kind, name))
 }
 
-/// Filter `result.bindings` to call-bindings whose callee matches `(file, name)`. Used by
-/// `callHierarchy/incomingCalls`.
+/// Filter `result.bindings` to call-bindings whose callee matches `(file, class path, name)`.
+/// Used by `callHierarchy/incomingCalls`.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub fn find_incoming_calls<'a>(
     result: &'a AnalysisResult,
     callee_file: Option<FileId>,
+    callee_class_path: &'a [String],
     callee_name: &'a str,
 ) -> impl Iterator<Item = &'a Binding> + 'a {
     result
         .bindings()
         .iter()
-        .filter(move |b| b.matches_callee(callee_file, callee_name))
+        .filter(move |b| b.matches_callee(callee_file, callee_class_path, callee_name))
 }
 
-/// Filter `result.bindings` to call-bindings whose caller matches the bare caller name
-/// `bare_caller` (never class-qualified — see [`Binding::Call::caller_function`]). Used by
-/// `callHierarchy/outgoingCalls`.
+/// Filter `result.bindings` to call-bindings declared in `caller_class_path` whose caller matches
+/// the bare caller name `bare_caller` (never class-qualified — see
+/// [`Binding::Call::caller_function`]). Used by `callHierarchy/outgoingCalls`.
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub fn find_outgoing_calls<'a>(
     result: &'a AnalysisResult,
+    caller_class_path: &'a [String],
     bare_caller: &'a str,
 ) -> impl Iterator<Item = &'a Binding> + 'a {
     result
         .bindings()
         .iter()
-        .filter(move |b| b.matches_caller(bare_caller))
+        .filter(move |b| b.matches_caller(caller_class_path, bare_caller))
 }
 
 #[cfg(test)]
@@ -337,6 +366,7 @@ mod tests {
             "attack".into(),
             ByteSpan { start: 0, end: 6 },
             Some("Hero::combo".into()),
+            Vec::new(),
         );
     }
 
@@ -385,21 +415,24 @@ mod tests {
                 callee_name: "flee".into(),
                 call_site: ByteSpan { start: 0, end: 6 },
                 caller_function: Some("attack".into()),
+                caller_class_path: Vec::new(),
             },
             Binding::Call {
                 callee: CalleeTarget::Unresolved,
                 callee_name: "print".into(),
                 call_site: ByteSpan { start: 10, end: 15 },
                 caller_function: Some("attack".into()),
+                caller_class_path: Vec::new(),
             },
             Binding::Call {
                 callee: script(2),
                 callee_name: "flee".into(),
                 call_site: ByteSpan { start: 20, end: 26 },
                 caller_function: Some("other".into()),
+                caller_class_path: Vec::new(),
             },
         ]);
-        let attack_calls: Vec<&Binding> = find_outgoing_calls(&result, "attack").collect();
+        let attack_calls: Vec<&Binding> = find_outgoing_calls(&result, &[], "attack").collect();
         assert_eq!(attack_calls.len(), 2);
     }
 
@@ -411,12 +444,14 @@ mod tests {
                 callee_name: "flee".into(),
                 call_site: ByteSpan { start: 0, end: 6 },
                 caller_function: Some("attack".into()),
+                caller_class_path: Vec::new(),
             },
             Binding::Call {
                 callee: CalleeTarget::Unresolved,
                 callee_name: "print".into(),
                 call_site: ByteSpan { start: 10, end: 15 },
                 caller_function: Some("attack".into()),
+                caller_class_path: Vec::new(),
             },
             Binding::Call {
                 callee: CalleeTarget::Native {
@@ -425,17 +460,18 @@ mod tests {
                 callee_name: "queue_free".into(),
                 call_site: ByteSpan { start: 20, end: 30 },
                 caller_function: Some("attack".into()),
+                caller_class_path: Vec::new(),
             },
         ]);
         let into_flee: Vec<&Binding> =
-            find_incoming_calls(&result, Some(FileId::new(2)), "flee").collect();
+            find_incoming_calls(&result, Some(FileId::new(2)), &[], "flee").collect();
         assert_eq!(into_flee.len(), 1);
         // `None` matches every NON-project callee — Unresolved and Native alike (the
         // pre-CalleeTarget degrade semantics incomingCalls relies on).
-        let into_print: Vec<&Binding> = find_incoming_calls(&result, None, "print").collect();
+        let into_print: Vec<&Binding> = find_incoming_calls(&result, None, &[], "print").collect();
         assert_eq!(into_print.len(), 1);
         let into_queue_free: Vec<&Binding> =
-            find_incoming_calls(&result, None, "queue_free").collect();
+            find_incoming_calls(&result, None, &[], "queue_free").collect();
         assert_eq!(into_queue_free.len(), 1);
     }
 }
