@@ -4247,12 +4247,6 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // of the lookup: a Variant utility folds when it is in the `UTILITY_FUNC_TYPE_MATH` set
         // (analyzer.cpp:3509), a GDScript one when its registration's `is_constant` column says so
         // (analyzer.cpp:3458). The names are disjoint, so the lookup order does not matter.
-        //
-        // #440: a call that does NOT fold ends in `validate_call_arg(function_info, p_call)` at
-        // analyzer.cpp:3498 and :3549, so Godot checks arity, `UNSAFE_CALL_ARGUMENT` and
-        // `NARROWING_CONVERSION` on utility arguments. This arm runs none of that. The Variant
-        // half could — `gd_types` carries `UtilityFn::params` — but the GDScript half has no
-        // parameter model at all, so both wait for that issue.
         let utility_return = ctx
             .native
             .utility(&function_name)
@@ -4354,8 +4348,36 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             // constancy BIT ONLY. Stamping `Opaque(Nil)` would feed the binary-op Opaque
             // validation an operand type that is not the real one, and `const M = min(1, 2) + 1`
             // — which Godot accepts — would draw `Invalid operands to operator +, Nil and int.`.
+            let sig = utility_call_sig(ctx, &function_name);
             if folds_at_compile_time && call.arguments.iter().all(|&a| ctx.folds.is_constant(a)) {
-                if return_type.kind == DtKind::Builtin
+                // Godot EXECUTES the call here, and execution rejects a wrong argument count on a
+                // non-vararg utility before it can succeed: `Variant::call_utility_function`
+                // (variant_utility.cpp:1798-1808) returns TOO_FEW/TOO_MANY with
+                // `expected = argcount`, which analyzer.cpp:3540-3545 renders through the SAME two
+                // templates `validate_call_arg` uses — except that both anchor on the call, not on
+                // the first excess argument. `absi()` and `len()` are vacuously all-constant, so
+                // they take this path and still error. CALL_OK is never reached, so the call does
+                // not become a constant either.
+                let arity_bad = sig.as_ref().is_some_and(|s| {
+                    !s.is_vararg
+                        && (call.arguments.len() < s.min_params
+                            || call.arguments.len() > s.max_params)
+                });
+                if let Some(s) = sig.as_ref().filter(|_| arity_bad) {
+                    let argc = call.arguments.len();
+                    let msg = if argc < s.min_params {
+                        format!(
+                            r#"Too few arguments for "{function_name}()" call. Expected at least {} but received {argc}."#,
+                            s.min_params
+                        )
+                    } else {
+                        format!(
+                            r#"Too many arguments for "{function_name}()" call. Expected at most {} but received {argc}."#,
+                            s.max_params
+                        )
+                    };
+                    ctx.push_error(msg, id);
+                } else if return_type.kind == DtKind::Builtin
                     && return_type.builtin_type != VariantType::Nil
                 {
                     ctx.folds
@@ -4363,6 +4385,10 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 } else {
                     ctx.folds.mark_constant(id);
                 }
+            } else if let Some(sig) = &sig {
+                // analyzer.cpp:3498 and :3549 — the non-folding half of both utility branches
+                // ends in the same ladder every method call goes through.
+                validate_call_arg(ctx, id, &call.arguments, &function_name, sig, true);
             }
             ctx.set_type(id, return_type);
             return;
@@ -5574,7 +5600,6 @@ pub(crate) fn class_identifier_name_or_default(ctx: &AnalysisContext, dt: &DataT
 
 /// `return_dt` is the return type; the size pair is min/max arity for arg-count messages.
 #[derive(Default)]
-
 pub(crate) struct CallSig {
     pub(crate) return_dt: DataType,
     pub(crate) par_types: Vec<DataType>,
@@ -5607,6 +5632,37 @@ pub(crate) struct CallSig {
     /// which is safe because the `CallSig::default()` stubs (constructor, Variant-degrade) are
     /// already excluded from the arity check by `sig_resolved`.
     pub(crate) arity_known: bool,
+}
+
+/// The `MethodInfo` Godot hands `validate_call_arg` for a utility call, as a `CallSig`.
+///
+/// The Variant half comes from `info_from_utility_func` (analyzer.cpp:55-81), which builds the
+/// info from `Variant::get_utility_function_argument_type/count` and nothing else. Two
+/// consequences drive the shape here. A vararg utility is given `METHOD_FLAG_VARARG` and NO
+/// arguments at all (:66-67), so `max(1, 2, 3)` and `print(a, b, c)` must see an empty parameter
+/// list rather than the dump's nominal `arg1`/`arg2`. And `default_arguments` is never filled, so
+/// min and max are both the argument count.
+///
+/// Each parameter maps through `type_from_property(E, /*is_arg=*/true)` (:6066-6067), whose
+/// gdls twin is `dump_param_type` — a dump-declared `Variant` parameter is HARD, the one shape
+/// `validate_call_arg` stays silent for (analyzer.cpp:6097), which is why `floor(untyped)` warns
+/// in neither engine nor gdls.
+fn utility_call_sig(ctx: &AnalysisContext, name: &str) -> Option<CallSig> {
+    let u = ctx.native.utility(name)?;
+    let par_types: Vec<DataType> = if u.is_vararg {
+        Vec::new()
+    } else {
+        u.params.iter().map(|p| dump_param_type(ctx, p)).collect()
+    };
+    let n = par_types.len();
+    Some(CallSig {
+        par_types,
+        min_params: n,
+        max_params: n,
+        is_vararg: u.is_vararg,
+        arity_known: true,
+        ..CallSig::default()
+    })
 }
 
 /// analyzer.cpp:6073-6131 — the shared count-plus-per-argument validation ladder every call

@@ -159,9 +159,12 @@ fn the_row_lands_on_the_argument_not_the_call() {
 }
 
 #[test]
-fn a_utility_call_is_a_known_under_report() {
-    // #440: Godot routes a non-folding utility call through `validate_call_arg` too, so it warns
-    // here. gdls's utility arm runs no argument validation at all — no arity, neither UNSAFE arm,
-    // and no narrowing. Pinned so the day that arm gains the ladder, this test says so.
-    assert!(messages("var f: float = 1.5\nprint(absi(f))").is_empty());
+fn a_utility_call_narrows_too() {
+    // A non-folding utility call ends in the same ladder every method call goes through
+    // (analyzer.cpp:3498, :3549), so `absi`'s `int` parameter narrows a hard `float` argument
+    // exactly as `take_int` does.
+    assert_eq!(
+        messages("var f: float = 1.5\nprint(absi(f))"),
+        vec![NARROWING.to_owned()]
+    );
 }
