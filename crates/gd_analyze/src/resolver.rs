@@ -326,6 +326,19 @@ fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option
                 })
             });
             if let Some((file, new_inner)) = resolved {
+                // #366: `extends Outer.Inner` in another file. The owning chain is what the
+                // segment hangs off, so it is `new_inner` minus this segment — the same
+                // `(file, chain, name)` triple the inner class's own declaration answers to.
+                let mut owner = new_inner.clone();
+                owner.pop();
+                record_type_use(
+                    ctx,
+                    Some(file),
+                    owner,
+                    crate::binding::BindingTargetKind::Class,
+                    &seg,
+                    id,
+                );
                 let sref = ScriptRef {
                     file,
                     inner: new_inner,
@@ -368,6 +381,16 @@ fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option
             Some(inner_id) => {
                 if ctx.get_type(inner_id).has_no_type() {
                     resolve_class_inheritance(ctx, inner_id, Some(id))?;
+                }
+                if let Some(owner) = declaring_class_path(ctx, inner_id) {
+                    record_type_use(
+                        ctx,
+                        ctx.file,
+                        owner,
+                        crate::binding::BindingTargetKind::Class,
+                        &seg,
+                        id,
+                    );
                 }
                 base = ctx.get_type(inner_id).clone();
             }
@@ -416,6 +439,16 @@ fn resolve_extends_in_scope(
             if ctx.get_type(look).has_no_type() {
                 resolve_class_inheritance(ctx, look, Some(source))?;
             }
+            if let Some(owner) = declaring_class_path(ctx, look) {
+                record_type_use(
+                    ctx,
+                    ctx.file,
+                    owner,
+                    crate::binding::BindingTargetKind::Class,
+                    name,
+                    source,
+                );
+            }
             return Ok(Some(ctx.get_type(look).clone()));
         }
         match class_member(ctx, look, name) {
@@ -423,6 +456,15 @@ fn resolve_extends_in_scope(
                 if ctx.get_type(inner_id).has_no_type() {
                     resolve_class_inheritance(ctx, inner_id, Some(source))?;
                 }
+                let owner = crate::reducer::class_inner_path(ctx, look);
+                record_type_use(
+                    ctx,
+                    ctx.file,
+                    owner,
+                    crate::binding::BindingTargetKind::Class,
+                    name,
+                    source,
+                );
                 return Ok(Some(ctx.get_type(inner_id).clone()));
             }
             // analyzer.cpp:554-562 — non-class members in an `extends` are specific errors, not the
@@ -453,6 +495,18 @@ fn resolve_extends_in_scope(
                     }
                 }
                 if dt.kind == DtKind::Script || dt.kind == DtKind::Class {
+                    // #366: `class Sub extends Hero:` where `Hero` is a `const … = preload(…)`.
+                    // No other surface can see this shape — the server's own extends resolver
+                    // never looks at constants — so without this the const's rename abandoned it.
+                    let owner = crate::reducer::class_inner_path(ctx, look);
+                    record_type_use(
+                        ctx,
+                        ctx.file,
+                        owner,
+                        crate::binding::BindingTargetKind::Constant,
+                        name,
+                        source,
+                    );
                     return Ok(Some(dt));
                 }
                 ctx.push_error(
@@ -592,7 +646,11 @@ fn walks_back_to(ctx: &AnalysisContext, class_id: NodeId, result: &DataType) -> 
 /// enums first (they shadow native), then the native inherits chain (returning the DECLARING
 /// class so the enum renders `BT.Status`). Meta-typed — annotations lower via
 /// `type_from_metatype`.
-fn inherited_enum_annotation(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> {
+fn inherited_enum_annotation(
+    ctx: &mut AnalysisContext,
+    name: &str,
+    first_id: NodeId,
+) -> Option<DataType> {
     let class_id = ctx.current_class?;
     if let Some(sr) = crate::reducer::current_class_script_base(ctx) {
         let chain = crate::script_chain::resolve_script_chain(ctx, &sr);
@@ -600,7 +658,19 @@ fn inherited_enum_annotation(ctx: &mut AnalysisContext, name: &str) -> Option<Da
             let has = crate::script_chain::link_interface(ctx.xfile, &link)
                 .is_some_and(|i| i.enums.iter().any(|e| e.name == name));
             if has && link.inner.is_empty() {
-                return crate::reducer::cross_file_named_enum(ctx, link.file, name, true);
+                let dt = crate::reducer::cross_file_named_enum(ctx, link.file, name, true)?;
+                // #366: a bare `: Direction` inherited from a base resolves HERE and nowhere else.
+                // The identity is the DECLARING file's head class, so a same-named enum in the
+                // using file is a different target and stays untouched.
+                record_type_use(
+                    ctx,
+                    Some(link.file),
+                    Vec::new(),
+                    crate::binding::BindingTargetKind::Enum,
+                    name,
+                    first_id,
+                );
+                return Some(dt);
             }
         }
     }
@@ -901,7 +971,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         // (analyzer.cpp:4570-4609, mirrored by `reduce_identifier` step 9a) — the TYPE position is
         // degenerate: the annotated variable just stays untyped (VARIANT). Return bad_type to match.
         return bad_type;
-    } else if let Some(dt) = inherited_enum_annotation(ctx, &first) {
+    } else if let Some(dt) = inherited_enum_annotation(ctx, &first, first_id) {
         // A bare enum NAME from the class's INHERITED scope: a cross-file script base's enum
         // (`-> Status` with `enum Status` on the base) or a native base-chain enum (LimboAI's
         // `BT.Status` reachable bare inside `extends BTDecorator`). Godot's in-scope type
@@ -956,6 +1026,16 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
                 if ctx.get_type(inner_id).has_no_type() {
                     let _ = resolve_class_inheritance(ctx, inner_id, Some(id));
                 }
+                if let Some(owner) = declaring_class_path(ctx, inner_id) {
+                    record_type_use(
+                        ctx,
+                        ctx.file,
+                        owner,
+                        crate::binding::BindingTargetKind::Class,
+                        &seg,
+                        id,
+                    );
+                }
                 result = ctx.get_type(inner_id).clone();
                 continue;
             }
@@ -965,7 +1045,25 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
             // `interface()` walk below and never reach this arm.
             let base_name = crate::reducer::class_identifier_name_or_default(ctx, &result);
             match meta_member(ctx, parent_class_node, &seg, id) {
-                MetaMember::Type(dt) => result = *dt,
+                MetaMember::Type(dt) => {
+                    // #366: an in-file qualified suffix (`var x: Owner.Hero`) whose segment is a
+                    // constant or enum rather than an inner class. The kind comes from the member
+                    // table, since a `Member` target's collection is binding-only.
+                    if let Some(kind) = parent_class_node
+                        .and_then(|c| class_member(ctx, c, &seg))
+                        .map(|m| match m {
+                            Member::Class(_) => crate::binding::BindingTargetKind::Class,
+                            Member::Enum(_) => crate::binding::BindingTargetKind::Enum,
+                            _ => crate::binding::BindingTargetKind::Constant,
+                        })
+                    {
+                        let owner = parent_class_node
+                            .map(|c| crate::reducer::class_inner_path(ctx, c))
+                            .unwrap_or_default();
+                        record_type_use(ctx, ctx.file, owner, kind, &seg, id);
+                    }
+                    result = *dt;
+                }
                 MetaMember::NotAType => {
                     // analyzer.cpp:918.
                     ctx.push_error(
@@ -1328,6 +1426,42 @@ enum ScopeType {
     Absent,
 }
 
+/// Record a [`Binding::Use`] for a name that resolved in TYPE position — a type-annotation head,
+/// an `extends` head, or an `extends` chain segment (#366).
+///
+/// These positions resolve here and nowhere else. `references` (and `rename` through it) is
+/// identity-keyed on the DECLARING `(file, inner-class chain, name)` triple, so a resolved
+/// position that records nothing is a position a rename silently leaves behind — which is how a
+/// `const Hero = preload(…)` rename used to rewrite `Hero.new()` and abandon `var h: Hero` in the
+/// same file. Recording here inherits the faithful arm order above, so a name that binds something
+/// else records that something else, or nothing: a shadowing global `class_name` beats a
+/// class-scope member exactly as it does in Godot, and the position is left alone.
+fn record_type_use(
+    ctx: &mut AnalysisContext,
+    target_file: Option<gd_project::FileId>,
+    class_path: Vec<String>,
+    kind: crate::binding::BindingTargetKind,
+    name: &str,
+    site: NodeId,
+) {
+    let span = ctx.node(site).span;
+    ctx.record_binding(crate::binding::Binding::use_(
+        target_file,
+        class_path,
+        kind,
+        name.to_owned(),
+        span,
+    ));
+}
+
+/// The chain of the class DECLARING `class_id`, i.e. `class_inner_path` minus the class's own
+/// name. `None` for a file's root class, whose rename is a global-class rename with its own path.
+fn declaring_class_path(ctx: &AnalysisContext, class_id: NodeId) -> Option<Vec<String>> {
+    let mut path = crate::reducer::class_inner_path(ctx, class_id);
+    path.pop()?;
+    Some(path)
+}
+
 fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) -> ScopeType {
     let Some(current) = ctx.current_class else {
         return ScopeType::Absent;
@@ -1335,6 +1469,16 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
     let scope = scope_classes(ctx, current);
     for look in scope.iter().copied() {
         if class_identifier_name(ctx, look).as_deref() == Some(name) {
+            if let Some(owner) = declaring_class_path(ctx, look) {
+                record_type_use(
+                    ctx,
+                    ctx.file,
+                    owner,
+                    crate::binding::BindingTargetKind::Class,
+                    name,
+                    first_id,
+                );
+            }
             return ScopeType::Found(Box::new(ctx.get_type(look).clone()));
         }
         // analyzer.cpp:860-898 — match class members by name and dispatch on member kind. The
@@ -1346,6 +1490,15 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                 if ctx.get_type(inner_id).has_no_type() {
                     let _ = resolve_class_inheritance(ctx, inner_id, None);
                 }
+                let owner = crate::reducer::class_inner_path(ctx, look);
+                record_type_use(
+                    ctx,
+                    ctx.file,
+                    owner,
+                    crate::binding::BindingTargetKind::Class,
+                    name,
+                    first_id,
+                );
                 return ScopeType::Found(Box::new(ctx.get_type(inner_id).clone()));
             }
             Some(Member::Enum(enum_id)) => {
@@ -1371,6 +1524,15 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                         resolve_class_member(ctx, look, idx, None);
                     }
                 }
+                let owner = crate::reducer::class_inner_path(ctx, look);
+                record_type_use(
+                    ctx,
+                    ctx.file,
+                    owner,
+                    crate::binding::BindingTargetKind::Enum,
+                    name,
+                    first_id,
+                );
                 return ScopeType::Found(Box::new(ctx.get_type(enum_id).clone()));
             }
             Some(Member::Constant(const_id)) => {
@@ -1422,6 +1584,15 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                 // dynamic" rule exists for (`features/local_const_as_type.gd`'s `const O =
                 // preload(...)` style).
                 if const_dt.is_meta_type {
+                    let owner = crate::reducer::class_inner_path(ctx, look);
+                    record_type_use(
+                        ctx,
+                        ctx.file,
+                        owner,
+                        crate::binding::BindingTargetKind::Constant,
+                        name,
+                        first_id,
+                    );
                     return ScopeType::Found(Box::new(const_dt));
                 }
                 if const_dt.is_set() && !const_dt.is_variant() && !const_dt.has_no_type() {
@@ -1432,6 +1603,15 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                     return ScopeType::NotAType;
                 }
                 if const_dt.is_set() {
+                    let owner = crate::reducer::class_inner_path(ctx, look);
+                    record_type_use(
+                        ctx,
+                        ctx.file,
+                        owner,
+                        crate::binding::BindingTargetKind::Constant,
+                        name,
+                        first_id,
+                    );
                     return ScopeType::Found(Box::new(const_dt));
                 }
             }
@@ -1479,6 +1659,14 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                         // against the base script (#284).
                         let mut inner: Vec<String> = link.inner.clone();
                         inner.push(name.to_string());
+                        record_type_use(
+                            ctx,
+                            Some(link.file),
+                            link.inner.clone(),
+                            crate::binding::BindingTargetKind::Class,
+                            name,
+                            first_id,
+                        );
                         return ScopeType::Found(Box::new(script_ref_datatype(
                             ctx,
                             ScriptRef {

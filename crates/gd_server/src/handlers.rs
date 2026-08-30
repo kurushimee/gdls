@@ -2554,8 +2554,9 @@ fn member_decl_click_class_path(
     };
     for m in &class.members {
         match m {
-            // Class/Enum declaration clicks keep the union path (their references live in
-            // annotations/extends the reducer doesn't record) — never classified as a Member.
+            // Class/Enum declaration clicks keep the union path: their in-file bare-name uses
+            // still need the raw floor on top of the bindings #366 added, so they are never
+            // classified as a Member (whose collection is binding-only).
             Member::Enum(_) => continue,
             Member::Class(inner_id) => {
                 let seg = match &tree.get(*inner_id).kind {
@@ -3029,11 +3030,13 @@ fn in_file_type_decl_class_path(tree: &ParseTree, byte: usize, name: &str) -> Op
 /// Append a [`Location`] for every cross-file use of the in-file type `name` declared by
 /// `(class_file, class_path)` — occurrence-positive, by binding identity only.
 ///
-/// An `enum` or inner `class` has no cross-file BARE reference, which is why the raw name scan is
-/// wrong here, but it very much has qualified ones: `Owner.Thing`, `PreloadConst.Thing`,
-/// `: Owner.Thing`, `Owner.Thing.new()`. Each records a `Binding::Use` whose `target_file` /
+/// An `enum` or inner `class` HAS cross-file bare references — through inheritance, where
+/// `extends Owner` puts `Slot` and `Entry` in scope unqualified — which is exactly why the raw
+/// name scan is wrong here and identity is not. Qualified uses (`Owner.Thing`,
+/// `PreloadConst.Thing`, `: Owner.Thing`, `Owner.Thing.new()`), `extends` chain segments, and
+/// inherited bare annotation heads each record a `Binding::Use` whose `target_file` /
 /// `target_class_path` / `target_name` name the declaration exactly, so widening the candidate set
-/// cannot widen what is collected inside one. #298.
+/// cannot widen what is collected inside one. #298, #366.
 fn push_in_file_type_locations(
     out: &mut Vec<Location>,
     result: &AnalysisResult,
@@ -5415,8 +5418,10 @@ enum NonMethodTarget {
     },
     /// Couldn't resolve — the documented "over-approximate, never under-report" residue floor
     /// (raw identifier scan). Class/Enum/EnumValue targets classify here DELIBERATELY:
-    /// `extends Foo`, `class_name`, and type annotations are resolver-level references with no
-    /// bindings, so a binding-only scan would under-report them.
+    /// `class_name` and the bare-name residue are resolver-level references with no bindings, so
+    /// a binding-only scan would under-report them. Type-annotation heads and `extends`
+    /// segments no longer belong to that residue — the analyzer records a `Binding::Use` for each
+    /// one it resolves (#366) — but the floor stays, since it is what covers the rest.
     Unresolved,
 }
 

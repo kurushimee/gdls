@@ -6053,3 +6053,47 @@ fn a_local_shadowing_an_autoload_renames_as_a_local() {
 
     shutdown(&client, server);
 }
+
+/// #366's worst case, and it half-applied inside a single file: a `const` alias used as a type.
+///
+/// A `const` declaration click classifies as a `Member` target, whose collection is binding-only
+/// — no raw-identifier floor. Type-annotation heads and `extends` heads recorded no binding, so
+/// the rename rewrote the declaration and `Blade.new()` and abandoned `var h: Blade`,
+/// `-> Blade`, and `class Sub extends Blade:` in the same file, each left naming a type that no
+/// longer existed.
+#[test]
+fn renaming_a_const_preload_alias_edits_every_type_position() {
+    let project = common::sample_project();
+    project.write("src/plain.gd", "extends Node\nfunc hi() -> void:\n\tpass\n");
+    project.write(
+        "src/holder.gd",
+        "extends Node\nconst Blade = preload(\"res://src/plain.gd\")\nvar h: Blade\nfunc mk() -> Blade:\n\treturn Blade.new()\nclass Sub extends Blade:\n\tpass\nfunc other() -> void:\n\tvar Blade := 1\n\tprint(Blade)\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/plain.gd", "src/holder.gd"],
+        2,
+    );
+    let holder = file_uri(&project.root.join("src/holder.gd"));
+
+    // The declaration, the annotation, the return type, the constructor call, and the `extends`.
+    // The function-local `var Blade := 1` on line 8 shadows the const and must be left alone —
+    // which is the reason this collection stays binding-keyed instead of falling back to a
+    // name scan.
+    let expected = vec![(1, 6), (2, 7), (3, 13), (4, 8), (5, 18)];
+    assert_eq!(
+        rename_sites(&client, 60, &holder, 1, 7, "Edge"),
+        expected,
+        "a const alias rename must reach every position that names it"
+    );
+    assert_eq!(
+        rename_sites(&client, 61, &holder, 2, 8, "Edge"),
+        expected,
+        "renaming from a type-annotation use must match the declaration's set"
+    );
+
+    shutdown(&client, server);
+}

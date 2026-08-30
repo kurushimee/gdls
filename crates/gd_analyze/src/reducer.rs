@@ -51,7 +51,7 @@ fn caller_function_name(ctx: &AnalysisContext) -> Option<String> {
 /// recorded on [`crate::binding::CalleeTarget::Script`]. Walks the class-member tree from the
 /// root (the flat arena has no parent pointers): O(classes) per recorded call, noise next to
 /// the resolution that preceded it.
-fn class_inner_path(ctx: &AnalysisContext, class_id: NodeId) -> Vec<String> {
+pub(crate) fn class_inner_path(ctx: &AnalysisContext, class_id: NodeId) -> Vec<String> {
     fn walk(
         ctx: &AnalysisContext,
         current: NodeId,
