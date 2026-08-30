@@ -894,12 +894,12 @@ fn an_extends_head_binds_the_global_class_before_a_same_named_inner_one() {
     shutdown(&client, handle);
 }
 
-/// The `implementation` seed is where the confusion used to be worst: it looks the cursor's bare
+/// The `implementation` seed is where the confusion used to be worst: it looked the cursor's bare
 /// name up in the global registry, so an inner-class cursor seeded on the unrelated top-level
-/// `Inner` and reported ITS subclasses. Both inner-class cursors now answer with an empty array —
-/// the class is identified, and no subclass of it can be named by a set of top-level `class_name`s.
+/// `Inner` and reported ITS subclasses. Both inner-class cursors now answer with `Outer.Inner`'s
+/// own subclass, and neither borrows the top-level class's.
 #[test]
-fn implementation_on_an_inner_class_borrows_no_ones_subclasses() {
+fn implementation_on_an_inner_class_reports_its_own_subclasses() {
     let project = inner_class_project();
     let (client, handle, _) = boot(&project);
     let outer_uri = project.uri("outer.gd");
@@ -913,10 +913,104 @@ fn implementation_on_an_inner_class_borrows_no_ones_subclasses() {
     ] {
         assert_eq!(
             implementation_uris(&client, uri, pos),
-            Vec::<String>::new(),
-            "{label} must not report `sub_unrelated.gd`, which subclasses a different `Inner`"
+            vec![project.uri("child.gd").as_str().to_owned()],
+            "{label} must report `child.gd` and never `sub_unrelated.gd`, \
+             which subclasses a different `Inner`"
         );
     }
+
+    shutdown(&client, handle);
+}
+
+/// The other direction of the same identity: the top-level `Inner` keeps `sub_unrelated.gd` and
+/// does not pick up `Outer.Inner`'s child.
+#[test]
+fn implementation_on_the_top_level_class_keeps_its_own_subclasses() {
+    let project = inner_class_project();
+    let (client, handle, _) = boot(&project);
+    let unrelated_uri = project.uri("unrelated.gd");
+    did_open(&client, &unrelated_uri, UNRELATED);
+
+    // `class_name Inner` is line 1; the identifier starts at column 11.
+    assert_eq!(
+        implementation_uris(&client, &unrelated_uri, Position::new(1, 11)),
+        vec![project.uri("sub_unrelated.gd").as_str().to_owned()]
+    );
+
+    shutdown(&client, handle);
+}
+
+/// `typeHierarchy/subtypes` reads the same graph. It used to enumerate `iter_interfaces`, so only a
+/// file's HEAD class was ever a candidate child; an inner class extending the cursor's class was
+/// invisible no matter how it was reached (#368).
+#[test]
+fn subtypes_include_an_inner_class_child() {
+    const BASE_GD: &str = "class_name TBase
+extends Node
+";
+    const HOLDER: &str = "extends Node
+
+class TSub extends TBase:
+	pass
+";
+    let project = NativeProject::new(&[("tbase.gd", BASE_GD), ("holder.gd", HOLDER)]);
+    let (client, handle, _) = boot(&project);
+    let base_uri = project.uri("tbase.gd");
+    did_open(&client, &base_uri, BASE_GD);
+
+    // `class_name TBase` is line 0; the identifier starts at column 11.
+    let item = prepare_one(&client, &base_uri, Position::new(0, 11));
+    let subs = subtypes_of(&client, &item).expect("subtypes are an array, never null");
+    let names: Vec<(&str, &str)> = subs
+        .iter()
+        .map(|i| (i.name.as_str(), i.uri.as_str()))
+        .collect();
+    assert_eq!(names, vec![("TSub", project.uri("holder.gd").as_str())]);
+
+    shutdown(&client, handle);
+}
+
+/// A method declared on an inner class is a real override target on both ends: the cursor may sit
+/// on the inner class's own `func`, and the reported override may itself live in an inner class.
+#[test]
+fn method_overrides_cross_the_inner_class_boundary() {
+    const BASE_GD: &str = "class_name MBase
+extends Node
+
+class Job:
+	extends Node
+	func run() -> void:
+		pass
+";
+    const HOLDER: &str = "extends Node
+
+class Worker extends MBase.Job:
+	func run() -> void:
+		pass
+";
+    let project = NativeProject::new(&[("mbase.gd", BASE_GD), ("holder.gd", HOLDER)]);
+    let (client, handle, _) = boot(&project);
+    let base_uri = project.uri("mbase.gd");
+    did_open(&client, &base_uri, BASE_GD);
+
+    // `\tfunc run() -> void:` is line 5; `run` starts at column 6.
+    let resp = implementation_at(&client, &base_uri, Position::new(5, 6))
+        .expect("implementation returns an array, never null");
+    let GotoDefinitionResponse::Array(locs) = resp else {
+        panic!("implementation returns an array");
+    };
+    let hits: Vec<(String, Position)> = locs
+        .iter()
+        .map(|l| (l.uri.as_str().to_owned(), l.range.start))
+        .collect();
+    // `\tfunc run() -> void:` in holder.gd is line 3; `run` starts at column 6.
+    assert_eq!(
+        hits,
+        vec![(
+            project.uri("holder.gd").as_str().to_owned(),
+            Position::new(3, 6)
+        )]
+    );
 
     shutdown(&client, handle);
 }

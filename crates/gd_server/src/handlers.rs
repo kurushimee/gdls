@@ -6151,11 +6151,14 @@ fn function_identifier_span_for_decl(
 // WP-N3: textDocument/implementation.
 // =============================================================================================
 
-/// M6-G: if the cursor is on a root `Func` member of the file identified by `uri`, BFS the
+/// M6-G: if the cursor is on a `Func` member declaration in the file identified by `uri`, walk the
 /// inverse-extends graph to find subclasses and return `Location`s for each subclass that also
-/// declares a method named `fn_name`. Returns `None` to fall through to the existing class-identifier
-/// BFS when the cursor is NOT on that method declaration (e.g. on a class name, a variable, a local
-/// with the same name, or an inner-class method).
+/// declares a method named `fn_name`. Returns `None` to fall through to the class-identity walk
+/// when the cursor is NOT on a method declaration (a class name, a variable, or a local or call
+/// site whose text merely matches a method name).
+///
+/// The declaration may be an INNER class's (#368): the seed is whichever class encloses the
+/// cursor, so `class Sub extends Outer.Inner:` reports its override of an `Outer.Inner` method.
 fn find_method_overrides(
     state: &mut ServerState,
     fn_name: &str,
@@ -6167,79 +6170,39 @@ fn find_method_overrides(
     // Resolve the current file's FileId and interface.
     let current_path = crate::uri::uri_to_path(uri)?;
     let current_fid = state.workspace.index.file_id(&current_path)?;
-    let iface = state.workspace.index.interface(current_fid)?;
 
-    // The cursor must be on this file's root method declaration, not merely an identifier whose
-    // text matches a method name. This keeps locals/params/call sites named like a method on the
-    // class-level implementation path, and excludes inner-class methods that are not interface
-    // members of this script's root class.
+    // The cursor must be on a method declaration in this file, not merely an identifier whose text
+    // matches a method name — that keeps locals, params, and call sites on the class-level
+    // implementation path. The owner is the class the declaration sits in, so an inner class's
+    // method qualifies on its own interface rather than being rejected for missing from the root's.
     let cursor_fn_span = function_node_span_for_identifier(tree, node_id, fn_name)?;
-    let is_root_func = iface.members.iter().any(|m| {
+    let class_path = class_path_at(tree, cursor_fn_span.start);
+    let owner = iface_at_inner(&state.workspace.index, current_fid, &class_path)?;
+    let is_decl = owner.members.iter().any(|m| {
         m.name == fn_name && m.kind == gd_project::MemberKind::Func && m.span == cursor_fn_span
     });
-    if !is_root_func {
+    if !is_decl {
         return None;
     }
 
-    // Seed the BFS on the current file's own class_name. The cursor is confirmed to be on a
-    // method of THIS file, so an unnamed script simply has no named subclasses to find — return
-    // an empty result, not `None`. `None` would fall through to the class-identifier BFS in
-    // `implementation`, which would then look up the function name in the class_name registry; a
-    // class whose name happens to equal the function name would wrongly surface its subclasses.
-    let Some(seed_name) = iface.class_name.clone() else {
-        return Some(Vec::new());
-    };
+    // The seed is the declaring class, by identity. It used to be the file's `class_name`, which
+    // meant an unnamed script had no reachable subclasses at all even when other files extend it by
+    // path (#368). Every return below is `Some(...)`, never `None` — falling through to the
+    // class-identity walk would look the FUNCTION name up in the class_name registry and surface an
+    // unrelated class's subclasses.
+    let seed = TypeRef::Script(current_fid, class_path);
 
-    // BFS the inverse-extends graph — same algorithm as the class-identifier branch below.
-    let mut known_names: FxHashSet<String> = FxHashSet::default();
-    let mut known_files: FxHashSet<gd_project::FileId> = FxHashSet::default();
-    known_names.insert(seed_name);
-    loop {
-        let prev_names = known_names.len();
-        let prev_files = known_files.len();
-        for (fid, sub_iface) in state.workspace.index.iter_interfaces() {
-            if known_files.contains(&fid) {
-                continue;
-            }
-            // A single-segment name-extends parent matches the known class_name set; a dotted
-            // `extends Outer.Inner` names an inner class, which the name set cannot express, so it
-            // matches nothing rather than borrowing a same-named top-level class (#359). A
-            // path-extends parent (`extends "res://base.gd"`) resolves through the index and
-            // matches the declaring file or any already-known subclass file. `current_fid` is
-            // checked explicitly because `known_files` only ever holds discovered subclasses,
-            // never the BFS seed.
-            let parent_known = match &sub_iface.extends {
-                gd_project::Extends::Names(parts) => match parts.as_slice() {
-                    [only] => known_names.contains(only),
-                    _ => false,
-                },
-                gd_project::Extends::Path { path: res_path, .. } => state
-                    .workspace
-                    .index
-                    .resolve_res_path(res_path)
-                    .is_some_and(|f| f == current_fid || known_files.contains(&f)),
-                gd_project::Extends::None => false,
-            };
-            if parent_known {
-                known_files.insert(fid);
-                if let Some(cn) = &sub_iface.class_name {
-                    known_names.insert(cn.clone());
-                }
-            }
-        }
-        if known_names.len() == prev_names && known_files.len() == prev_files {
-            break;
-        }
-    }
+    let edges = subclass_edges(&state.workspace.index, &state.workspace.native);
+    let subtypes = subtype_closure(&edges, &seed);
 
-    // For each known subclass (excluding the cursor's own file), emit a Location for the
-    // override's MemberDecl span. If the subclass doesn't override `fn_name`, skip it —
-    // method override search only reports files that actually declare the method.
+    // For each subtype that actually declares `fn_name`, emit a Location at its identifier.
+    // A subtype that doesn't override it is skipped — method override search only reports
+    // declarations.
     let mut locations = Vec::new();
-    for fid in known_files {
-        if fid == current_fid {
+    for sub in subtypes {
+        let TypeRef::Script(fid, class_path) = sub else {
             continue;
-        }
+        };
         let Some(sub_path) = state.workspace.index.path(fid).map(|p| p.to_path_buf()) else {
             continue;
         };
@@ -6247,8 +6210,10 @@ fn find_method_overrides(
             continue;
         };
 
-        // Check the subclass interface for the override and capture its span in one pass.
-        let Some(sub_iface) = state.workspace.index.interface(fid) else {
+        // Check the declaring class's own interface for the override and capture its span in one
+        // pass. An INNER class's members live on its own `Interface`, so the walk to it is what
+        // lets `class Sub extends Hero:` report its override at all.
+        let Some(sub_iface) = iface_at_inner(&state.workspace.index, fid, &class_path) else {
             continue;
         };
         let Some(override_decl) = sub_iface
@@ -6300,19 +6265,16 @@ fn find_method_overrides(
 /// (direct + transitive). Per LSP 3.17 §textDocument/implementation, returns
 /// `Location | Location[] | LocationLink[] | null`; this impl returns `Location[]`.
 ///
-/// Algorithm (per docs/03 §7.2 — "linear walk over Index.interfaces"):
-///   1. Resolve cursor → class name. The `ClassNameRegistry` is consulted **once here** as the
-///      name-validity gate (only registered `class_name`s have project subclasses to list); it is
-///      not iterated as part of the walk.
-///   2. BFS the inverse-of-extends graph over `Index::iter_interfaces` alone:
-///      seed `known = {name}`; each pass adds any iface whose extends-chain ends with a known name.
-///   3. For each known subclass (excluding the cursor's own class), emit a Location at the file's
-///      root class identifier.
+/// Algorithm:
+///   1. Resolve the cursor to a class *identity* ([`TypeRef`]) — an inner-class declaration, an
+///      `extends` chain segment, or a bare name looked up in the `ClassNameRegistry`. The registry
+///      is consulted once, as the last of the three, and is never iterated as part of the walk.
+///   2. Build the inverse-of-extends graph over every class in the project ([`subclass_edges`]) and
+///      take the seed's transitive closure ([`subtype_closure`]).
+///   3. Emit a Location at each subclass's own declaration identifier.
 ///
-/// Limitation: when the cursor is on a class member (a `func` / `var`), this v1 still resolves
-/// against the enclosing class — finding implementations of the *class*, not overrides of the
-/// specific method. Method-level override search is a follow-on; the docs/03 §7.2 design has it
-/// scoped to a future WP.
+/// A cursor on a root `func` identifier is answered earlier, by [`find_method_overrides`], which
+/// walks the same graph and emits the overriding method rather than the class.
 pub fn implementation(
     state: &mut ServerState,
     params: GotoDefinitionParams,
@@ -6341,129 +6303,59 @@ pub fn implementation(
         return Some(GotoDefinitionResponse::Array(locs));
     }
 
-    // #359: the cursor names an INNER class — either at its own `class Inner:` declaration, or as
-    // a suffix segment of an `extends Outer.Inner`. The BFS below seeds itself by looking the bare
-    // name up in the global registry and tracks a set of top-level `class_name`s, an identity that
-    // cannot hold an inner class at all. Left to run, it would seed on whatever unrelated
-    // `class_name Inner` the project registers and report THAT class's subclasses. The class under
-    // the cursor is identified, so the honest answer is an empty list: no subclass of it can be
-    // named here. (Reporting them truthfully needs an identity-keyed fixpoint — its own change.)
-    if cursor_inner_class_decl_path(&parsed.tree, node_id, byte).is_some()
-        || cursor_extends_chain(&parsed.tree, node_id)
-            .is_some_and(|(_, idx, path)| idx > 0 || path.is_some())
-    {
-        return Some(GotoDefinitionResponse::Array(Vec::new()));
-    }
-
-    // Only project class_names participate; native classes have no project subclasses to list.
-    // Resolve the seed class's file up front: the BFS below matches path-extends subclasses
-    // against it (`known_files` only ever holds discovered subclasses, never the seed), and the
-    // emission loop excludes it from the results.
-    let cursor_fid = {
+    // #368: the cursor may name an INNER class — at its own `class Inner:` declaration, or as a
+    // segment of an `extends Outer.Inner`. Both resolve to an identity, which is what the closure
+    // below is keyed on. #359 made these two arms answer an empty list because the old fixpoint
+    // tracked a set of top-level `class_name`s and would have seeded on whatever unrelated
+    // `class_name Inner` the project registers; now they answer truthfully. A cursor gdls cannot
+    // resolve still returns the empty list rather than falling through to the bare-name seed.
+    let file = crate::uri::uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
+    let on_inner_decl = cursor_inner_class_decl_path(&parsed.tree, node_id, byte);
+    let on_extends_seg = cursor_extends_chain(&parsed.tree, node_id)
+        .is_some_and(|(_, idx, path)| idx > 0 || path.is_some());
+    let seed = if let Some(class_path) = on_inner_decl {
+        match file {
+            Some(f) => TypeRef::Script(f, class_path),
+            None => return Some(GotoDefinitionResponse::Array(Vec::new())),
+        }
+    } else if on_extends_seg {
+        match cursor_extends_chain_prefix(state, &parsed.tree, file, node_id) {
+            Some(t) => t,
+            None => return Some(GotoDefinitionResponse::Array(Vec::new())),
+        }
+    } else {
+        // Only project class_names participate; native classes have no project subclasses to list.
         let entry = state.workspace.index.registry().get(&name)?;
-        state.workspace.index.file_id(&entry.path)
+        TypeRef::Script(state.workspace.index.file_id(&entry.path)?, Vec::new())
     };
 
-    // BFS the inverse-extends closure over EVERY interface (not just registry entries — a file
-    // can extend `Hero` without declaring its own `class_name`). Track known-extender FileIds in
-    // a set; class-name keys are still useful for the transitive walk through registered subclasses.
+    // The closure over the inverse-extends graph, keyed by identity so an inner class is both a
+    // reachable parent and a reportable child (#368).
     //
-    // WP-RD11 (1) — bench witness, no-op landed. This BFS rescans `iter_interfaces` per fixpoint
-    // round (O(depth × files)); a precomputed inverse-of-extends (subclass) index on `Index`,
-    // invalidated on mutation, would make it O(subclasses). The Phase-C calibration against a
-    // large real-world project (8 GDExtensions) measured `implementation` p99 well under the
-    // per-request budget — references (p99 ≈ 310 ms) was the only hot nav handler — so the memoized
-    // subclass index is deferred to the first project that actually flags this path, per the plan's
-    // "lands OR documented bench witness" rule. `bench/budget.toml` backs the numbers.
-    let mut known_names: FxHashSet<String> = FxHashSet::default();
-    let mut known_files: FxHashSet<gd_project::FileId> = FxHashSet::default();
-    known_names.insert(name.clone());
-    loop {
-        let prev_names = known_names.len();
-        let prev_files = known_files.len();
-        for (fid, iface) in state.workspace.index.iter_interfaces() {
-            if known_files.contains(&fid) {
-                continue;
-            }
-            // `known_names` holds top-level `class_name`s, so only a SINGLE-segment `extends`
-            // can match one. A dotted `extends Outer.Inner` names an inner class — an identity
-            // this name set cannot express — so it matches nothing rather than borrowing an
-            // unrelated top-level class that shares its last segment (#359). A path-extends
-            // parent (`extends "res://hero.gd"`) resolves through the index and matches the seed
-            // class's file or any already-known subclass file.
-            let parent_known = match &iface.extends {
-                gd_project::Extends::Names(parts) => match parts.as_slice() {
-                    [only] => known_names.contains(only),
-                    _ => false,
-                },
-                gd_project::Extends::Path { path: res_path, .. } => state
-                    .workspace
-                    .index
-                    .resolve_res_path(res_path)
-                    .is_some_and(|f| Some(f) == cursor_fid || known_files.contains(&f)),
-                gd_project::Extends::None => false,
-            };
-            if parent_known {
-                known_files.insert(fid);
-                if let Some(cn) = &iface.class_name {
-                    known_names.insert(cn.clone());
-                }
-            }
-        }
-        if known_names.len() == prev_names && known_files.len() == prev_files {
-            break;
-        }
-    }
-
-    // Emit a Location per known subclass file (excluding the cursor's own class file).
+    // WP-RD11 (1) — bench witness, restated. This builds the graph once per request
+    // (O(classes) `class_parent` calls) and then walks O(edges), where the old fixpoint rescanned
+    // `iter_interfaces` per round at O(depth × files); for depth > 1 it is strictly less work, and
+    // `override_group` already runs this exact shape on every method rename. The 0.1 ms
+    // `implementation` witness in `bench/budget.toml` predates this shape and is stale — the file
+    // is reference-only and gates nothing, so it is re-measured at the next release calibration
+    // walk. A memoized subclass map on `Index` stays deferred to the first project that flags this
+    // path.
+    let edges = subclass_edges(&state.workspace.index, &state.workspace.native);
     let mut locations: Vec<Location> = Vec::new();
-    let subclass_paths: Vec<camino::Utf8PathBuf> = known_files
-        .iter()
-        .filter(|&&fid| Some(fid) != cursor_fid)
-        .filter_map(|&fid| state.workspace.index.path(fid).map(|p| p.to_path_buf()))
-        .collect();
-    for path in subclass_paths {
-        let Some(cand_uri) = path_to_file_uri(&path) else {
-            log::debug!(
-                "implementation: dropping subclass {path} — path_to_file_uri rejected the path; \
-                 implementation list under-reports"
-            );
+    for sub in subtype_closure(&edges, &seed) {
+        let TypeRef::Script(fid, class_path) = sub else {
             continue;
         };
-        let cand_text = match state.vfs.get(cand_uri.as_str()).map(|d| d.text()) {
-            Some(t) => t,
-            None => match std::fs::read_to_string(path.as_std_path()) {
-                Ok(t) => t,
-                Err(e) => {
-                    log::warn!(
-                        "implementation: skipping subclass {path}: {e}; \
-                         it will not surface in the result"
-                    );
-                    continue;
-                }
-            },
-        };
-        let cand_parsed = state.workspace.parse_source(&cand_text);
-        let cand_rope = Rope::from_str(&cand_text);
-        let cand_mapper = PositionMapper::new(&cand_rope, enc);
-        // Prefer the class-identifier span; fall back to the file start for files without a
-        // class_name (most projects don't decorate every script with one). The (0,0)..(0,0)
-        // fallback is the documented expected case, not a bug — but log at debug so an
-        // operator filing "implementation result clusters at top of file" can correlate.
-        let range = match root_class_identifier_span(&cand_parsed.tree) {
-            Some(s) => cand_mapper.span_to_range(s),
-            None => {
-                log::debug!(
-                    "implementation: subclass {path} has no root-class identifier; falling \
-                     back to range (0,0)..(0,0)"
-                );
-                file_start_range()
-            }
-        };
-        locations.push(Location {
-            uri: cand_uri,
-            range,
-        });
+        // The class's own declaration identifier — its `class Inner:` name for an inner class,
+        // the root `class_name` for a head class, and (0,0)..(0,0) for a head class that declares
+        // none, which is the documented expected case rather than a bug.
+        match script_decl_location(state, fid, &class_path) {
+            Some(loc) => locations.push(loc),
+            None => log::debug!(
+                "implementation: dropping subclass {fid:?}{class_path:?} — no location; \
+                 implementation list under-reports"
+            ),
+        }
     }
 
     Some(GotoDefinitionResponse::Array(locations))
@@ -6486,7 +6378,7 @@ pub fn implementation(
 /// survive past depth 2). Serialized compactly (anti-catalog W9 — only the minimal identity in
 /// `data`): a project class is `{"fid": <FileId as u32>}` plus `"inner": ["Outer", "Inner"]` when
 /// it is an inner class, a native engine class is `{"native": "<ClassName>"}`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum TypeRef {
     /// A project class: the `.gd` file's (1-based) [`FileId`](gd_project::FileId) plus the
     /// inner-class chain naming the class inside it. The chain is empty for the file's head class,
@@ -6649,23 +6541,6 @@ fn resolve_type_name(state: &ServerState, name: &str) -> Option<TypeRef> {
         return Some(TypeRef::Native(name.to_owned()));
     }
     None
-}
-
-/// `true` when project file `fid`'s head class directly extends the type `ty` (ONE hop, no
-/// transitive walk) — the per-candidate predicate [`type_hierarchy_subtypes`] applies to every
-/// interface for the direct-children-only walk.
-///
-/// Resolution is [`script_parent`]'s, so the candidate's parent is an *identity* — a file plus an
-/// inner-class chain — compared whole. A dotted `extends Outer.Inner` therefore never matches an
-/// unrelated top-level `class_name Inner`, and a project `class_name` never cross-matches a native
-/// class that happens to share its name (#359).
-///
-/// A script with no `extends` implicitly extends `RefCounted` (Godot's implied base), which
-/// `class_parent` already reports, so the supertypes/subtypes round trip stays symmetric: a bare
-/// `class_name` reached by walking up to `RefCounted` reappears when `RefCounted`'s subtypes are
-/// expanded.
-fn extends_matches(state: &ServerState, fid: gd_project::FileId, ty: &TypeRef) -> bool {
-    script_parent(state, fid, &[]).is_some_and(|parent| &parent == ty)
 }
 
 /// `textDocument/prepareTypeHierarchy`: resolve the class under the cursor and return ONE
@@ -6832,29 +6707,37 @@ pub fn type_hierarchy_supertypes(
 /// LSP 3.17, returns `TypeHierarchyItem[]` or `null`. Each item carries its own `data` blob for
 /// further expansion (the depth>2 guarantee).
 ///
-/// Walks the same `index.iter_interfaces()` enumeration as [`implementation`] and applies the same
-/// parent-matching rule (via [`extends_matches`]), but minus the transitive BFS AND the method-name
-/// filter: every project file whose `extends` resolves to this type, direct children only.
-/// (Symmetric with `supertypes`, which also walks one level. `implementation` keeps its own
-/// transitive fixpoint loop untouched — `extends_matches` is a parallel predicate, not a rewrite of
-/// it — so `implementation` stays byte-identical; the `implementation_overrides` suite proves it.)
+/// Walks EVERY class in the project — inner classes included (#368) — and keeps the ones whose
+/// parent is this type, direct children only, minus [`implementation`]'s transitive closure and
+/// method-name filter. (Symmetric with `supertypes`, which also walks one level.) The enumeration
+/// used to be `iter_interfaces` and so tested each file's HEAD class alone, which meant a
+/// `class Sub extends Hero:` was never a candidate child and never an emitted item.
+///
+/// The match is [`script_parent`]'s, so a candidate's parent is an *identity* — a file plus an
+/// inner-class chain — compared whole. A dotted `extends Outer.Inner` therefore never matches an
+/// unrelated top-level `class_name Inner`, and a project `class_name` never cross-matches a native
+/// class that happens to share its name (#359).
+///
+/// A class with no `extends` implicitly extends `RefCounted` (Godot's implied base), which
+/// `class_parent` already reports, so the supertypes/subtypes round trip stays symmetric: a bare
+/// `class_name` reached by walking up to `RefCounted` reappears when `RefCounted`'s subtypes are
+/// expanded.
 pub fn type_hierarchy_subtypes(
     state: &mut ServerState,
     params: TypeHierarchySubtypesParams,
 ) -> Option<Vec<TypeHierarchyItem>> {
     let ty = TypeRef::from_data(params.item.data.as_ref())?;
-    // Collect direct-child FileIds first (immutable borrow of the index), then build items (which
-    // needs `&mut state`) — so the borrow of `iter_interfaces` is dropped before `hierarchy_item`.
-    let children: Vec<gd_project::FileId> = state
-        .workspace
-        .index
-        .iter_interfaces()
-        .filter(|(fid, _)| extends_matches(state, *fid, &ty))
-        .map(|(fid, _)| fid)
-        .collect();
+    // Collect direct children first (immutable borrow of the index), then build items (which needs
+    // `&mut state`) — so the borrow is dropped before `script_hierarchy_item`.
+    let mut children: Vec<(gd_project::FileId, Vec<String>)> = Vec::new();
+    for_each_class(&state.workspace.index, |fid, path| {
+        if script_parent(state, fid, path).is_some_and(|parent| parent == ty) {
+            children.push((fid, path.to_vec()));
+        }
+    });
     let mut items = Vec::with_capacity(children.len());
-    for fid in children {
-        if let Some(item) = script_hierarchy_item(state, fid, &[]) {
+    for (fid, path) in children {
+        if let Some(item) = script_hierarchy_item(state, fid, &path) {
             items.push(item);
         }
     }
@@ -9056,6 +8939,59 @@ fn native_chain_has_method(native: &gd_types::NativeDb, cls: &str, name: &str) -
 }
 
 /// Visit every `(file, class_path)` in the project, outermost first.
+/// The inverse-of-extends graph over EVERY class in the project — inner classes included — keyed
+/// by the identity [`TypeRef`] carries, never by a bare name (#368).
+///
+/// One `for_each_class` pass, one `class_parent` per class. That replaces the old per-round rescan
+/// of `iter_interfaces`, so a deep hierarchy costs O(classes + edges) instead of O(depth × files),
+/// and it is the only shape that can express "a subclass of `Outer.Inner`" at all: the old
+/// fixpoint tracked a set of top-level `class_name`s, which no inner class has.
+fn subclass_edges(
+    index: &gd_project::Index,
+    native: &gd_types::NativeDb,
+) -> FxHashMap<TypeRef, Vec<TypeRef>> {
+    let mut edges: FxHashMap<TypeRef, Vec<TypeRef>> = FxHashMap::default();
+    for_each_class(index, |file, path| {
+        let child = TypeRef::Script(file, path.to_vec());
+        match class_parent(index, native, file, path) {
+            ClassParent::Script((f, p)) => {
+                edges.entry(TypeRef::Script(f, p)).or_default().push(child)
+            }
+            ClassParent::Native(n) => edges.entry(TypeRef::Native(n)).or_default().push(child),
+            // Degrade, don't guess: a parent gdls could not resolve contributes no edge, so the
+            // class is missing from the answer rather than attached to the wrong one.
+            ClassParent::Unknown => {}
+        }
+    });
+    edges
+}
+
+/// Every transitive subtype of `seed` over [`subclass_edges`], the seed itself excluded, in a
+/// stable order. The visited set is what terminates a cyclic `extends`, which is an analyzer error
+/// but must not hang navigation.
+fn subtype_closure(edges: &FxHashMap<TypeRef, Vec<TypeRef>>, seed: &TypeRef) -> Vec<TypeRef> {
+    let mut seen: FxHashSet<TypeRef> = FxHashSet::default();
+    seen.insert(seed.clone());
+    let mut queue: Vec<TypeRef> = edges.get(seed).cloned().unwrap_or_default();
+    let mut out: Vec<TypeRef> = Vec::new();
+    while let Some(next) = queue.pop() {
+        if !seen.insert(next.clone()) {
+            continue;
+        }
+        if let Some(kids) = edges.get(&next) {
+            queue.extend(kids.iter().cloned());
+        }
+        out.push(next);
+    }
+    out.sort_by(|a, b| match (a, b) {
+        (TypeRef::Script(fa, pa), TypeRef::Script(fb, pb)) => (fa.get(), pa).cmp(&(fb.get(), pb)),
+        (TypeRef::Script(..), TypeRef::Native(_)) => std::cmp::Ordering::Less,
+        (TypeRef::Native(_), TypeRef::Script(..)) => std::cmp::Ordering::Greater,
+        (TypeRef::Native(a), TypeRef::Native(b)) => a.cmp(b),
+    });
+    out
+}
+
 fn for_each_class(index: &gd_project::Index, mut f: impl FnMut(gd_project::FileId, &[String])) {
     fn walk(
         iface: &gd_project::Interface,
