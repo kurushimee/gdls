@@ -915,6 +915,231 @@ fn code_action_provider_advertised() {
 }
 
 // ===================================================================================================
+// #339: staleness — a recipe whose buffer moved between offer and accept
+// ===================================================================================================
+
+/// A file whose fixable warning sits ABOVE a multi-line call, so a stale-line splice lands inside
+/// the argument list and breaks the parse. Line 4 is `var unused_thing := 1`.
+const STALE_SRC: &str = "extends Node\nfunc g(a: int, b: int, c: int) -> int:\n\treturn a + b + c\nfunc f() -> void:\n\tvar unused_thing := 1\n\tprint(g(\n\t\t1,\n\t\t2,\n\t\t3))\n";
+
+/// The same program with `func g` moved BELOW `func f` — every line of `f` shifts up by two, so the
+/// offer-time line 4 now points at `\t\t1,` inside `print(g(`.
+const STALE_SRC_SHIFTED: &str = "extends Node\nfunc f() -> void:\n\tvar unused_thing := 1\n\tprint(g(\n\t\t1,\n\t\t2,\n\t\t3))\nfunc g(a: int, b: int, c: int) -> int:\n\treturn a + b + c\n";
+
+/// Push a whole-document `didChange` at `version`.
+fn change_doc(client: &Connection, uri: &Uri, text: &str, version: i32) {
+    client
+        .sender
+        .send(notification(
+            "textDocument/didChange",
+            lsp_types::DidChangeTextDocumentParams {
+                text_document: lsp_types::VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version,
+                },
+                content_changes: vec![lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.to_string(),
+                }],
+            },
+        ))
+        .unwrap();
+}
+
+/// The suppression action offered for the file's one fixable warning, with the diagnostic it came
+/// from. Drains the wire afterwards so the next receive is the caller's own.
+fn offer_suppression(client: &Connection, uri: &Uri, id: i32) -> (Diagnostic, CodeAction) {
+    let diags = recv_publish_for(client, uri);
+    let diag = unused_var_diag(&diags);
+    while try_recv(client, Duration::from_millis(200)).is_some() {}
+    let actions = request_code_action(client, id, uri, diag_range(&diag), vec![diag.clone()], None);
+    let action = find_action(&actions, "Ignore")
+        .unwrap_or_else(|| panic!("the suppression action must be offered; got {actions:?}"));
+    (diag, action)
+}
+
+/// CORRUPTION GUARD (#339): the suppression recipe carries the line it resolved, so a `didChange`
+/// between the offer and the resolve makes that line name something else. Resolving must REFUSE
+/// with `ContentModified` rather than splice at the drifted line — which here would land the
+/// annotation inside a multi-line argument list and stop the file parsing.
+#[test]
+fn resolve_refuses_a_suppression_whose_buffer_moved() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    init_open(&p, &client, &[("a.gd", STALE_SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    let actions = request_code_action(
+        &client,
+        10,
+        &uri,
+        Range {
+            start: Position {
+                line: 4,
+                character: 0,
+            },
+            end: Position {
+                line: 4,
+                character: 0,
+            },
+        },
+        Vec::new(),
+        None,
+    );
+    // No diagnostics in context ⇒ nothing offered; re-request with the real diagnostic.
+    assert!(
+        actions.is_empty(),
+        "sanity: an empty context offers nothing"
+    );
+    let (_diag, action) = {
+        // Re-publish by touching the file so a fresh diagnostic set arrives.
+        change_doc(&client, &uri, STALE_SRC, 2);
+        offer_suppression(&client, &uri, 11)
+    };
+
+    // The user edits: `func g` moves below `func f`.
+    change_doc(&client, &uri, STALE_SRC_SHIFTED, 3);
+    while try_recv(&client, Duration::from_millis(400)).is_some() {}
+
+    client
+        .sender
+        .send(request(12, "codeAction/resolve", action))
+        .unwrap();
+    let resp = recv_response_for(&client, &RequestId::from(12));
+    let err = resp
+        .error
+        .expect("a stale suppression must be REFUSED, never resolved to an edit at the old line");
+    assert_eq!(
+        err.code, -32801,
+        "the refusal must be ContentModified (the request's basis changed); got {err:?}"
+    );
+
+    // RECOVERY: re-requesting code actions on the current buffer yields a working action whose edit
+    // lands on the warning's CURRENT line (2), not the stale 4.
+    let (_diag2, action2) = {
+        change_doc(&client, &uri, STALE_SRC_SHIFTED, 4);
+        offer_suppression(&client, &uri, 13)
+    };
+    let resolved = resolve_action(&client, 14, action2);
+    let (_u, new_text, range) = single_text_edit(&resolved.edit.expect("resolve fills the edit"));
+    assert_eq!(new_text, "\t@warning_ignore(\"UNUSED_VARIABLE\")\n");
+    assert_eq!(
+        range.start.line, 2,
+        "the re-offered action is gated against the CURRENT buffer, so it targets the warning's \
+         current line"
+    );
+    shutdown(&client, t);
+}
+
+/// The mutating channel: a `Command` can sit in a client menu indefinitely, so its staleness window
+/// is the longest there is. `workspace/executeCommand` on a moved buffer must refuse AND send no
+/// `workspace/applyEdit` at all — an applyEdit is a write the user never gets to inspect first.
+#[test]
+fn execute_command_refuses_a_stale_suppression_and_sends_no_apply_edit() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    // literal = FALSE → the Command fallback.
+    let (_r, diags) = init_open(
+        &p,
+        &client,
+        &[("a.gd", STALE_SRC)],
+        caps(false, false, true),
+    );
+    let uri = file_uri(&p.root.join("a.gd"));
+    let diag = unused_var_diag(&diags);
+    let actions = request_code_action(&client, 10, &uri, diag_range(&diag), vec![diag], None);
+    let CodeActionOrCommand::Command(cmd) = actions
+        .into_iter()
+        .find(|a| matches!(a, CodeActionOrCommand::Command(c) if c.title.starts_with("Ignore")))
+        .expect("the suppression Command must be offered")
+    else {
+        unreachable!()
+    };
+
+    change_doc(&client, &uri, STALE_SRC_SHIFTED, 3);
+    while try_recv(&client, Duration::from_millis(400)).is_some() {}
+
+    client
+        .sender
+        .send(request(
+            20,
+            "workspace/executeCommand",
+            ExecuteCommandParams {
+                command: cmd.command.clone(),
+                arguments: cmd.arguments.clone().unwrap_or_default(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        ))
+        .unwrap();
+    // Drain to the response, failing loudly on any interleaved applyEdit — the whole point is that
+    // no write is attempted.
+    let resp = loop {
+        match recv(&client) {
+            Message::Request(r) if r.method == "workspace/applyEdit" => {
+                panic!("a stale command must send NO workspace/applyEdit; got {r:?}")
+            }
+            Message::Response(r) if r.id == RequestId::from(20) => break r,
+            _ => {}
+        }
+    };
+    let err = resp.error.expect("a stale command must be REFUSED");
+    assert_eq!(err.code, -32801, "ContentModified; got {err:?}");
+
+    // LIVENESS: the refusal did not wedge the worker.
+    let after = request_code_action(
+        &client,
+        30,
+        &uri,
+        Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 0,
+            },
+        },
+        Vec::new(),
+        None,
+    );
+    assert!(after.is_empty(), "an empty context still answers []");
+    shutdown(&client, t);
+}
+
+/// The gate is the LSP document VERSION, not a content hash: two edits that end at the original
+/// text still refuse. Deliberate — the version is the protocol's own edit-validity coordinate, the
+/// same one the outgoing `documentChanges` stamp carries, and a second notion of staleness would be
+/// one more thing to keep in agreement with it.
+#[test]
+fn resolve_refuses_after_an_edit_round_trip_back_to_identical_text() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    init_open(&p, &client, &[("a.gd", STALE_SRC)], caps(true, true, true));
+    let uri = file_uri(&p.root.join("a.gd"));
+    change_doc(&client, &uri, STALE_SRC, 2);
+    let (_diag, action) = offer_suppression(&client, &uri, 10);
+
+    change_doc(&client, &uri, STALE_SRC_SHIFTED, 3);
+    change_doc(&client, &uri, STALE_SRC, 4);
+    while try_recv(&client, Duration::from_millis(400)).is_some() {}
+
+    client
+        .sender
+        .send(request(11, "codeAction/resolve", action))
+        .unwrap();
+    let resp = recv_response_for(&client, &RequestId::from(11));
+    let err = resp
+        .error
+        .expect("the version moved, so the recipe is stale even though the text matches again");
+    assert_eq!(err.code, -32801, "ContentModified; got {err:?}");
+    shutdown(&client, t);
+}
+
+// ===================================================================================================
 // Helpers
 // ===================================================================================================
 
