@@ -4247,12 +4247,6 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // of the lookup: a Variant utility folds when it is in the `UTILITY_FUNC_TYPE_MATH` set
         // (analyzer.cpp:3509), a GDScript one when its registration's `is_constant` column says so
         // (analyzer.cpp:3458). The names are disjoint, so the lookup order does not matter.
-        //
-        // #440: a call that does NOT fold ends in `validate_call_arg(function_info, p_call)` at
-        // analyzer.cpp:3498 and :3549, so Godot checks arity, `UNSAFE_CALL_ARGUMENT` and
-        // `NARROWING_CONVERSION` on utility arguments. This arm runs none of that. The Variant
-        // half could — `gd_types` carries `UtilityFn::params` — but the GDScript half has no
-        // parameter model at all, so both wait for that issue.
         let utility_return = ctx
             .native
             .utility(&function_name)
@@ -4354,8 +4348,36 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             // constancy BIT ONLY. Stamping `Opaque(Nil)` would feed the binary-op Opaque
             // validation an operand type that is not the real one, and `const M = min(1, 2) + 1`
             // — which Godot accepts — would draw `Invalid operands to operator +, Nil and int.`.
+            let sig = utility_call_sig(ctx, &function_name);
             if folds_at_compile_time && call.arguments.iter().all(|&a| ctx.folds.is_constant(a)) {
-                if return_type.kind == DtKind::Builtin
+                // Godot EXECUTES the call here, and execution rejects a wrong argument count on a
+                // non-vararg utility before it can succeed: `Variant::call_utility_function`
+                // (variant_utility.cpp:1798-1808) returns TOO_FEW/TOO_MANY with
+                // `expected = argcount`, which analyzer.cpp:3540-3545 renders through the SAME two
+                // templates `validate_call_arg` uses — except that both anchor on the call, not on
+                // the first excess argument. `absi()` and `len()` are vacuously all-constant, so
+                // they take this path and still error. CALL_OK is never reached, so the call does
+                // not become a constant either.
+                let arity_bad = sig.as_ref().is_some_and(|s| {
+                    !s.is_vararg
+                        && (call.arguments.len() < s.min_params
+                            || call.arguments.len() > s.max_params)
+                });
+                if let Some(s) = sig.as_ref().filter(|_| arity_bad) {
+                    let argc = call.arguments.len();
+                    let msg = if argc < s.min_params {
+                        format!(
+                            r#"Too few arguments for "{function_name}()" call. Expected at least {} but received {argc}."#,
+                            s.min_params
+                        )
+                    } else {
+                        format!(
+                            r#"Too many arguments for "{function_name}()" call. Expected at most {} but received {argc}."#,
+                            s.max_params
+                        )
+                    };
+                    ctx.push_error(msg, id);
+                } else if return_type.kind == DtKind::Builtin
                     && return_type.builtin_type != VariantType::Nil
                 {
                     ctx.folds
@@ -4363,6 +4385,10 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 } else {
                     ctx.folds.mark_constant(id);
                 }
+            } else if let Some(sig) = &sig {
+                // analyzer.cpp:3498 and :3549 — the non-folding half of both utility branches
+                // ends in the same ladder every method call goes through.
+                validate_call_arg(ctx, id, &call.arguments, &function_name, sig, true);
             }
             ctx.set_type(id, return_type);
             return;
@@ -4613,7 +4639,6 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     // hierarchy looking for a method by name. E3f does a narrower lookup that covers the cases
     // the corpus exercises (in-file class function members; native methods via NativeDb).
     let function_name = call.function_name.clone();
-    let arg_count = call.arguments.len();
     let mut return_type: Option<DataType> = None;
     let mut found = false;
     let mut sig = CallSig::default();
@@ -5119,150 +5144,14 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             }
         }
 
-        // analyzer.cpp:6085 → validate_call_arg (analyzer.cpp:5944-5950). The count checks run
-        // for every REAL resolved signature — in-file functions and native/builtin methods alike —
-        // because all now carry an accurate (min_params, max_params) pair (in-file from declared
-        // parameters + default initializers; native/builtin from the dump's per-param default
-        // literals). `sig_resolved` is the gate, not bare `found`: the constructor arm and the two
-        // "Unknown stays dynamic" Variant-degrade fallbacks set `found = true` to suppress the
-        // value-callable error while leaving `sig` at its zero-arg default, and arity-checking
-        // those would manufacture a phantom "Expected at most 0" Godot never emits (it skips
-        // validate_call_arg whenever get_function_signature returns false — analyzer.cpp:3626).
-        // `sig.arity_known` additionally excludes name-only seeded native stubs (the `_get`/`_set`/
-        // `_notification` virtuals `ClassDB` resolves but the dump omits — seeded with zero params
-        // purely for the existence lookup): Godot arity-checks them against ClassDB's real params,
-        // which gdls lacks, so the faithful degrade is silence, not a phantom "Expected at most 0".
-        // Too-few anchors on the whole call; too-many anchors on the first excess argument
-        // (`p_call->arguments[par_types.size()]`).
-        if sig_resolved && sig.arity_known {
-            if arg_count < sig.min_params {
-                ctx.push_error(
-                    format!(
-                        r#"Too few arguments for "{function_name}()" call. Expected at least {} but received {arg_count}."#,
-                        sig.min_params
-                    ),
-                    id,
-                );
-            } else if !sig.is_vararg && arg_count > sig.max_params {
-                ctx.push_error(
-                    format!(
-                        r#"Too many arguments for "{function_name}()" call. Expected at most {} but received {arg_count}."#,
-                        sig.max_params
-                    ),
-                    call.arguments[sig.max_params],
-                );
-            }
-        }
-
-        // Per-arg compatibility (analyzer.cpp:6093-6131). Godot iterates `min(args, par_types)`
-        // — anything beyond is consumed by the vararg place. For each typed-hard parameter we
-        // run the bidirectional `is_type_compatible` check; one direction failing turns into the
-        // `Invalid argument` error. The whole DEBUG ladder is ported inline below: both
-        // `UNSAFE_CALL_ARGUMENT` arms and the closing `NARROWING_CONVERSION` arm.
-        let n = call.arguments.len().min(sig.par_types.len());
-        for i in 0..n {
-            let arg_id = call.arguments[i];
-            let par_type = sig.par_types[i].clone();
-            // Per-arg const-narrowing (analyzer.cpp:6101-6103) — emits
-            // `Cannot pass a value of type X as Y.` on a foldable constant whose type is
-            // incompatible with the parameter.
-            if par_type.is_hard_type() && ctx.folds.is_constant(arg_id) {
-                update_const_expression_builtin_type(ctx, arg_id, &par_type, "pass", false);
-            }
-            let arg_type = ctx.get_type(arg_id).clone();
-            // Godot uses `arg_type.to_string_strict()` (gdscript_parser.h:148) which prints
-            // `"Variant"` for any soft type — so `var untyped_int = 42` reads as "Variant" in the
-            // warning even though its inferred kind is Builtin Int. Mirror that here.
-            let arg_strict = if arg_type.is_hard_type() {
-                arg_type.to_string()
-            } else {
-                "Variant".to_owned()
-            };
-            if arg_type.is_variant() || !arg_type.is_hard_type() {
-                // analyzer.cpp:6096-6100 — Variant or soft argument passed to a parameter.
-                // Godot's gate is `!(par_type.is_hard_type() && par_type.is_variant())`: the ONE
-                // parameter shape that accepts anything silently is a hard `Variant`. A soft
-                // parameter of any kind warns, including an untyped one, where both halves of
-                // the message render `"Variant"` (#449). Symbol order:
-                //  [arg_idx, "function", function_name, par_type, arg_type_strict]
-                //
-                // gdls adds two exclusions Godot has no need of, both for the same reason: Godot
-                // always has a real DataType to name here and gdls sometimes does not. An
-                // parameter type left `Unresolved` — by an incomplete cross-file signature, or by
-                // a default the shallow pass could not decode
-                // (`gd_project::ParamTyping::Unknown`) — would render an internal placeholder as
-                // the required type, or name `"Variant"` where the declaring file has a real
-                // type: an outright wrong answer rather than a missing one. A genuinely untyped
-                // parameter is a different thing and does warn, naming `"Variant"` correctly.
-                if !(par_type.is_hard_type() && par_type.is_variant())
-                    && !matches!(par_type.kind, DtKind::Unresolved | DtKind::Resolving)
-                {
-                    ctx.push_warning(
-                        crate::warnings::WarningCode::UnsafeCallArgument,
-                        &[
-                            format!("{}", i + 1),
-                            "function".to_owned(),
-                            function_name.clone(),
-                            par_type.to_string(),
-                            arg_strict.clone(),
-                        ],
-                        arg_id,
-                    );
-                }
-                continue;
-            }
-            if par_type.is_hard_type()
-                && !is_type_compatible(ctx, &par_type, &arg_type, true)
-                && !is_type_compatible(ctx, &arg_type, &par_type, false)
-            {
-                ctx.push_error(
-                    format!(
-                        r#"Invalid argument for "{function_name}()" function: argument {} should be "{par_type}" but is "{arg_type}"."#,
-                        i + 1
-                    ),
-                    arg_id,
-                );
-            } else if par_type.is_hard_type()
-                && !is_type_compatible(ctx, &par_type, &arg_type, true)
-                && is_type_compatible(ctx, &arg_type, &par_type, false)
-            {
-                // analyzer.cpp:6120-6124 — supertype is acceptable for dynamic compliance but
-                // unsafe. Same UNSAFE_CALL_ARGUMENT shape as above.
-                ctx.push_warning(
-                    crate::warnings::WarningCode::UnsafeCallArgument,
-                    &[
-                        format!("{}", i + 1),
-                        "function".to_owned(),
-                        function_name.clone(),
-                        par_type.to_string(),
-                        arg_strict.clone(),
-                    ],
-                    arg_id,
-                );
-            } else if par_type.kind == DtKind::Builtin
-                && par_type.builtin_type == VariantType::Int
-                && arg_type.kind == DtKind::Builtin
-                && arg_type.builtin_type == VariantType::Float
-            {
-                // analyzer.cpp:6115-6117 (4.6.3:5986-5987, byte-identical) — a hard `float`
-                // argument into an `int` parameter. Godot gates neither side on hardness here
-                // because the soft and Variant arguments already left through the first arm, the
-                // same way the `continue` above takes them. It passes `p_call->function_name` as
-                // a symbol and the template consumes none, so the argument list is empty like
-                // every other narrowing site.
-                //
-                // A CONSTANT float argument reaches this arm too. Godot converts it first inside
-                // `update_const_expression_builtin_type` (analyzer.cpp:2754-2770) and warns
-                // there, on the same node, so its own third arm then sees an `int`; gdls's port
-                // of that function neither converts nor warns, so the still-`float` argument
-                // draws the row here. One row either way, same message, same anchor.
-                ctx.push_warning(
-                    crate::warnings::WarningCode::NarrowingConversion,
-                    &[],
-                    arg_id,
-                );
-            }
-        }
+        validate_call_arg(
+            ctx,
+            id,
+            &call.arguments,
+            &function_name,
+            &sig,
+            sig_resolved && sig.arity_known,
+        );
         call_type = return_type.unwrap_or_else(DataType::variant);
         // analyzer.cpp:6012 — `get_function_signature` stamps the resolved function's
         // `is_coroutine` flag onto the returned type so callers see it. Mirror that here so the
@@ -5743,6 +5632,294 @@ pub(crate) struct CallSig {
     /// which is safe because the `CallSig::default()` stubs (constructor, Variant-degrade) are
     /// already excluded from the arity check by `sig_resolved`.
     pub(crate) arity_known: bool,
+}
+
+/// The `MethodInfo` Godot hands `validate_call_arg` for a utility call, as a `CallSig`.
+///
+/// The Variant half comes from `info_from_utility_func` (analyzer.cpp:55-81), which builds the
+/// info from `Variant::get_utility_function_argument_type/count` and nothing else. Two
+/// consequences drive the shape here. A vararg utility is given `METHOD_FLAG_VARARG` and NO
+/// arguments at all (:66-67), so `max(1, 2, 3)` and `print(a, b, c)` must see an empty parameter
+/// list rather than the dump's nominal `arg1`/`arg2`. And `default_arguments` is never filled, so
+/// min and max are both the argument count.
+///
+/// Each parameter maps through `type_from_property(E, /*is_arg=*/true)` (:6066-6067), whose
+/// gdls twin is `dump_param_type` — a dump-declared `Variant` parameter is HARD, the one shape
+/// `validate_call_arg` stays silent for (analyzer.cpp:6097), which is why `floor(untyped)` warns
+/// in neither engine nor gdls.
+fn utility_call_sig(ctx: &AnalysisContext, name: &str) -> Option<CallSig> {
+    let Some(u) = ctx.native.utility(name) else {
+        return gd_utility_call_sig(ctx, name);
+    };
+    let par_types: Vec<DataType> = if u.is_vararg {
+        Vec::new()
+    } else {
+        u.params.iter().map(|p| dump_param_type(ctx, p)).collect()
+    };
+    let n = par_types.len();
+    Some(CallSig {
+        par_types,
+        min_params: n,
+        max_params: n,
+        is_vararg: u.is_vararg,
+        arity_known: true,
+        ..CallSig::default()
+    })
+}
+
+/// One declared parameter of a GDScript utility, as the `ARG` / `ARGVAR` / `ARGTYPE` macros at
+/// gdscript_utility_functions.cpp:560-567 spell it. `type_from_property` reads each back into a
+/// `DataType` (analyzer.cpp:5842-5888), and these four are every shape the table uses.
+#[derive(Clone, Copy)]
+enum GdUtilParam {
+    /// `ARGVAR` — `Variant::NIL` with `PROPERTY_USAGE_NIL_IS_VARIANT`, so a hard `Variant`.
+    Var,
+    /// `ARG` — a plain builtin.
+    B(VariantType),
+    /// `ARG(_, OBJECT)` with no class name, which :5862 reads back as native `Object`.
+    Obj,
+    /// `ARGTYPE` — `INT` flagged `PROPERTY_USAGE_CLASS_IS_ENUM` naming `Variant.Type`, which
+    /// :5874-5877 turns into the global enum with `is_constant` cleared.
+    TypeEnum,
+}
+
+/// The `MethodInfo` for the GDScript-only utilities, mirroring the `REGISTER_FUNC` table at
+/// gdscript_utility_functions.cpp:570-589. `extension_api.json` does not know these functions
+/// exist, so the table is written out here; it is identical at both supported tags, which only
+/// differ in `type_exists` moving behind `DISABLE_DEPRECATED` (`docs/02` §11d).
+///
+/// `Color8` is the one entry with a default argument (`varray(255)` at :585-586), so it is the one
+/// entry whose min and max differ. `range` and `print_debug` are the two varargs, both registered
+/// `NOARGS`; `print_stack` and `get_stack` are `NOARGS` and NOT vararg, which is why
+/// `print_stack(1)` draws "Expected at most 0".
+///
+/// The per-argument callbacks a type list cannot express — `len`'s length-family check, `char`'s
+/// 0..2³²−1 range, `range`'s per-count int checks, `convert`'s `Variant::construct` — run at fold
+/// or run time upstream, not in the analyzer, so leaving them out is faithful rather than an
+/// under-report. (`len`'s does have a static mirror above, which the corpus pins.)
+fn gd_utility_call_sig(ctx: &AnalysisContext, name: &str) -> Option<CallSig> {
+    use GdUtilParam::{Obj, TypeEnum, Var, B};
+    let (params, is_vararg, default_count): (&[GdUtilParam], bool, usize) = match name {
+        "convert" => (&[Var, TypeEnum], false, 0),
+        "type_exists" => (&[B(VariantType::StringName)], false, 0),
+        "char" | "_char" => (&[B(VariantType::Int)], false, 0),
+        "ord" => (&[B(VariantType::String)], false, 0),
+        "range" | "print_debug" => (&[], true, 0),
+        "load" => (&[B(VariantType::String)], false, 0),
+        "inst_to_dict" => (&[Obj], false, 0),
+        "dict_to_inst" => (&[B(VariantType::Dictionary)], false, 0),
+        "Color8" => (
+            &[
+                B(VariantType::Int),
+                B(VariantType::Int),
+                B(VariantType::Int),
+                B(VariantType::Int),
+            ],
+            false,
+            1,
+        ),
+        "print_stack" | "get_stack" => (&[], false, 0),
+        "len" => (&[Var], false, 0),
+        "is_instance_of" => (&[Var, Var], false, 0),
+        _ => return None,
+    };
+    let hard = |kind: DtKind, builtin_type: VariantType, native_type: &str| DataType {
+        type_source: TypeSource::AnnotatedExplicit,
+        kind,
+        builtin_type,
+        native_type: native_type.to_owned(),
+        ..Default::default()
+    };
+    let par_types: Vec<DataType> = params
+        .iter()
+        .map(|p| match p {
+            Var => {
+                let mut t = DataType::variant();
+                t.type_source = TypeSource::AnnotatedExplicit;
+                t
+            }
+            B(vt) => hard(DtKind::Builtin, *vt, ""),
+            Obj => hard(DtKind::Native, VariantType::Object, "Object"),
+            TypeEnum => {
+                let mut t = crate::resolver::make_global_enum_type(ctx, "Variant.Type", "", false);
+                t.is_constant = false;
+                t
+            }
+        })
+        .collect();
+    let n = par_types.len();
+    Some(CallSig {
+        par_types,
+        min_params: n - default_count,
+        max_params: n,
+        is_vararg,
+        arity_known: true,
+        ..CallSig::default()
+    })
+}
+
+/// analyzer.cpp:6073-6131 — the shared count-plus-per-argument validation ladder every call
+/// site funnels through once it has a real signature. Godot reaches it from `reduce_call`'s
+/// method path (:3641) and from both utility paths (:3498, :3549) with the same `MethodInfo` in
+/// hand, so the checks, the message templates, and the anchors are one body of code, not three.
+///
+/// `check_arity` is the method path's `sig_resolved && sig.arity_known` gate, which the utility
+/// paths pass as `true` — upstream only ever reaches here with a registry-backed signature. The
+/// per-argument loop stays unconditional, as upstream: where the gate is false, `par_types` is
+/// empty in every reachable case and the loop no-ops.
+fn validate_call_arg(
+    ctx: &mut AnalysisContext,
+    id: NodeId,
+    args: &[NodeId],
+    function_name: &str,
+    sig: &CallSig,
+    check_arity: bool,
+) {
+    let arg_count = args.len();
+    // analyzer.cpp:6085 → validate_call_arg (analyzer.cpp:5944-5950). The count checks run
+    // for every REAL resolved signature — in-file functions and native/builtin methods alike —
+    // because all now carry an accurate (min_params, max_params) pair (in-file from declared
+    // parameters + default initializers; native/builtin from the dump's per-param default
+    // literals). What the method path passes as `check_arity` is `sig_resolved`, not bare
+    // `found`: the constructor arm and the two "Unknown stays dynamic" Variant-degrade fallbacks
+    // set `found = true` to suppress the value-callable error while leaving `sig` at its zero-arg
+    // default, and arity-checking those would manufacture a phantom "Expected at most 0" Godot
+    // never emits (it skips validate_call_arg whenever get_function_signature returns false —
+    // analyzer.cpp:3626). `sig.arity_known` additionally excludes name-only seeded native stubs (the `_get`/`_set`/
+    // `_notification` virtuals `ClassDB` resolves but the dump omits — seeded with zero params
+    // purely for the existence lookup): Godot arity-checks them against ClassDB's real params,
+    // which gdls lacks, so the faithful degrade is silence, not a phantom "Expected at most 0".
+    // Too-few anchors on the whole call; too-many anchors on the first excess argument
+    // (`p_call->arguments[par_types.size()]`).
+    if check_arity {
+        if arg_count < sig.min_params {
+            ctx.push_error(
+                format!(
+                    r#"Too few arguments for "{function_name}()" call. Expected at least {} but received {arg_count}."#,
+                    sig.min_params
+                ),
+                id,
+            );
+        } else if !sig.is_vararg && arg_count > sig.max_params {
+            ctx.push_error(
+                format!(
+                    r#"Too many arguments for "{function_name}()" call. Expected at most {} but received {arg_count}."#,
+                    sig.max_params
+                ),
+                args[sig.max_params],
+            );
+        }
+    }
+
+    // Per-arg compatibility (analyzer.cpp:6093-6131). Godot iterates `min(args, par_types)`
+    // — anything beyond is consumed by the vararg place. For each typed-hard parameter we
+    // run the bidirectional `is_type_compatible` check; one direction failing turns into the
+    // `Invalid argument` error. The whole DEBUG ladder is ported inline below: both
+    // `UNSAFE_CALL_ARGUMENT` arms and the closing `NARROWING_CONVERSION` arm.
+    let n = args.len().min(sig.par_types.len());
+    for i in 0..n {
+        let arg_id = args[i];
+        let par_type = sig.par_types[i].clone();
+        // Per-arg const-narrowing (analyzer.cpp:6101-6103) — emits
+        // `Cannot pass a value of type X as Y.` on a foldable constant whose type is
+        // incompatible with the parameter.
+        if par_type.is_hard_type() && ctx.folds.is_constant(arg_id) {
+            update_const_expression_builtin_type(ctx, arg_id, &par_type, "pass", false);
+        }
+        let arg_type = ctx.get_type(arg_id).clone();
+        // Godot uses `arg_type.to_string_strict()` (gdscript_parser.h:148) which prints
+        // `"Variant"` for any soft type — so `var untyped_int = 42` reads as "Variant" in the
+        // warning even though its inferred kind is Builtin Int. Mirror that here.
+        let arg_strict = if arg_type.is_hard_type() {
+            arg_type.to_string()
+        } else {
+            "Variant".to_owned()
+        };
+        if arg_type.is_variant() || !arg_type.is_hard_type() {
+            // analyzer.cpp:6096-6100 — Variant or soft argument passed to a parameter.
+            // Godot's gate is `!(par_type.is_hard_type() && par_type.is_variant())`: the ONE
+            // parameter shape that accepts anything silently is a hard `Variant`. A soft
+            // parameter of any kind warns, including an untyped one, where both halves of
+            // the message render `"Variant"` (#449). Symbol order:
+            //  [arg_idx, "function", function_name, par_type, arg_type_strict]
+            //
+            // gdls adds two exclusions Godot has no need of, both for the same reason: Godot
+            // always has a real DataType to name here and gdls sometimes does not. An
+            // parameter type left `Unresolved` — by an incomplete cross-file signature, or by
+            // a default the shallow pass could not decode
+            // (`gd_project::ParamTyping::Unknown`) — would render an internal placeholder as
+            // the required type, or name `"Variant"` where the declaring file has a real
+            // type: an outright wrong answer rather than a missing one. A genuinely untyped
+            // parameter is a different thing and does warn, naming `"Variant"` correctly.
+            if !(par_type.is_hard_type() && par_type.is_variant())
+                && !matches!(par_type.kind, DtKind::Unresolved | DtKind::Resolving)
+            {
+                ctx.push_warning(
+                    crate::warnings::WarningCode::UnsafeCallArgument,
+                    &[
+                        format!("{}", i + 1),
+                        "function".to_owned(),
+                        function_name.to_owned(),
+                        par_type.to_string(),
+                        arg_strict.clone(),
+                    ],
+                    arg_id,
+                );
+            }
+            continue;
+        }
+        if par_type.is_hard_type()
+            && !is_type_compatible(ctx, &par_type, &arg_type, true)
+            && !is_type_compatible(ctx, &arg_type, &par_type, false)
+        {
+            ctx.push_error(
+                format!(
+                    r#"Invalid argument for "{function_name}()" function: argument {} should be "{par_type}" but is "{arg_type}"."#,
+                    i + 1
+                ),
+                arg_id,
+            );
+        } else if par_type.is_hard_type()
+            && !is_type_compatible(ctx, &par_type, &arg_type, true)
+            && is_type_compatible(ctx, &arg_type, &par_type, false)
+        {
+            // analyzer.cpp:6120-6124 — supertype is acceptable for dynamic compliance but
+            // unsafe. Same UNSAFE_CALL_ARGUMENT shape as above.
+            ctx.push_warning(
+                crate::warnings::WarningCode::UnsafeCallArgument,
+                &[
+                    format!("{}", i + 1),
+                    "function".to_owned(),
+                    function_name.to_owned(),
+                    par_type.to_string(),
+                    arg_strict.clone(),
+                ],
+                arg_id,
+            );
+        } else if par_type.kind == DtKind::Builtin
+            && par_type.builtin_type == VariantType::Int
+            && arg_type.kind == DtKind::Builtin
+            && arg_type.builtin_type == VariantType::Float
+        {
+            // analyzer.cpp:6115-6117 (4.6.3:5986-5987, byte-identical) — a hard `float`
+            // argument into an `int` parameter. Godot gates neither side on hardness here
+            // because the soft and Variant arguments already left through the first arm, the
+            // same way the `continue` above takes them. It passes `p_call->function_name` as
+            // a symbol and the template consumes none, so the argument list is empty like
+            // every other narrowing site.
+            //
+            // A CONSTANT float argument reaches this arm too. Godot converts it first inside
+            // `update_const_expression_builtin_type` (analyzer.cpp:2754-2770) and warns
+            // there, on the same node, so its own third arm then sees an `int`; gdls's port
+            // of that function neither converts nor warns, so the still-`float` argument
+            // draws the row here. One row either way, same message, same anchor.
+            ctx.push_warning(
+                crate::warnings::WarningCode::NarrowingConversion,
+                &[],
+                arg_id,
+            );
+        }
+    }
 }
 
 /// Read an in-file function's signature snapshot for the count + per-arg compat checks. Needs
