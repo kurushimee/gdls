@@ -1139,3 +1139,91 @@ fn declaration_suppression_stops_at_the_name() {
     // `COMPLETION_DECLARATION`. It must not be swept up here.
     assert_eq!(at("func _rea|").kind, CompletionKind::OverrideMethod);
 }
+
+// ===================================================================================================
+// A fresh statement, and a cursor sitting inside a word (#404).
+// ===================================================================================================
+
+#[test]
+fn a_blank_line_opens_an_identifier_position() {
+    // The anchor is whatever ended the previous line — a literal, a `)`, an identifier. None of
+    // them start an expression, but the line break between them and the cursor does.
+    for m in [
+        "func f():\n\tvar a := 5\n\t|",
+        "func f():\n\tvar a := 5\n\t|\n\tprint(a)",
+        "func f():\n\tprint(1)\n\t|",
+        "extends Node\n\nvar speed := 1\n|",
+        "extends Node\n\nvar speed := 1\n\nfunc f():\n\tpass\n|",
+    ] {
+        assert_eq!(at(m).kind, CompletionKind::Identifier, "fixture {m:?}");
+    }
+}
+
+#[test]
+fn a_statement_that_opens_with_an_identifier_completes_from_its_first_column() {
+    // `\t|speed = 1` and `\tspe|ed = 1`: neither position is glued to the end of a word, and both
+    // used to resolve to `None` because the anchor was the previous line's last token.
+    let before = "func f():\n\tvar a := 5\n\t|speed = 1";
+    assert_eq!(at(before).kind, CompletionKind::Identifier);
+    assert_eq!(prefix_text(before, &at(before)), None);
+
+    let inside = "func f():\n\tvar a := 5\n\tspe|ed = 1";
+    let ctx = at(inside);
+    assert_eq!(ctx.kind, CompletionKind::Identifier);
+    assert_eq!(
+        prefix_text(inside, &ctx).as_deref(),
+        Some("speed"),
+        "the whole word is the prefix, so the edit replaces it"
+    );
+}
+
+#[test]
+fn a_cursor_inside_a_word_takes_the_whole_word_as_the_prefix() {
+    for (m, want) in [
+        ("func f():\n\tvar v := Vec|tor2.ONE", "Vector2"),
+        ("func f():\n\tvar v := Vector2.O|NE", "ONE"),
+        ("func f():\n\tprint(v.len|gth())", "length"),
+        ("func f():\n\tsuper.re|ady()", "ready"),
+    ] {
+        assert_eq!(
+            prefix_text(m, &at(m)).as_deref(),
+            Some(want),
+            "fixture {m:?}"
+        );
+    }
+}
+
+#[test]
+fn a_cursor_inside_a_member_name_stays_a_member_completion() {
+    let m = "func f():\n\tvar local = 1\n\tlocal.na|me";
+    assert!(
+        matches!(at(m).kind, CompletionKind::Attribute { .. }),
+        "got {:?}",
+        at(m).kind
+    );
+}
+
+#[test]
+fn a_finished_expression_at_the_end_of_a_line_offers_nothing() {
+    // No line break between the `)` and the cursor, so nothing opens here.
+    for m in [
+        "func f():\n\tprint(1)|",
+        "func f():\n\tvar a := 5\n\ta.b()|",
+    ] {
+        assert_eq!(at(m).kind, CompletionKind::None, "fixture {m:?}");
+    }
+}
+
+#[test]
+fn a_half_typed_declaration_keyword_is_still_a_word_prefix() {
+    // `va|r` and `var|` are the user typing the keyword; `var |` is the name position.
+    for (m, want) in [
+        ("func f():\n\tva|r", Some("var")),
+        ("func f():\n\tvar|", Some("var")),
+    ] {
+        let ctx = at(m);
+        assert_eq!(ctx.kind, CompletionKind::Identifier, "fixture {m:?}");
+        assert_eq!(prefix_text(m, &ctx).as_deref(), want, "fixture {m:?}");
+    }
+    assert_eq!(at("func f():\n\tvar |").kind, CompletionKind::None);
+}

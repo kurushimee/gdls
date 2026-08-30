@@ -259,17 +259,28 @@ fn prev_meaningful(tokens: &[Token], i: usize) -> Option<usize> {
         .map(|(j, _)| j)
 }
 
-/// Whether the cursor is sitting in a partial identifier: the anchor token is an identifier-like
-/// token whose span actually reaches the cursor (`span.end == byte`, i.e. the cursor is glued to its
-/// end). Returns that token's span as the completion prefix.
+/// Whether the cursor is sitting in a partial identifier, and if so which word it is editing.
+///
+/// Two shapes count. The cursor is glued to the end of a word token (`speed<cursor>`), which is the
+/// anchor; or it is strictly inside one (`spe<cursor>ed`), which the anchor never is — `anchor_index`
+/// wants `span.end <= byte`, so a word the cursor sits inside is passed over and the token before it
+/// wins. Either way the returned span is the WHOLE word, so the completion edit replaces it instead
+/// of inserting into the middle of it.
 fn prefix_at(tokens: &[Token], anchor: Option<usize>, byte: usize) -> Option<ByteSpan> {
-    let i = anchor?;
-    let t = &tokens[i];
-    if t.span.end == byte && is_word_token(t.kind) {
-        Some(t.span)
-    } else {
-        None
+    if let Some(t) = anchor.map(|i| &tokens[i]) {
+        if t.span.end == byte && is_word_token(t.kind) {
+            return Some(t.span);
+        }
     }
+    word_containing(tokens, byte)
+}
+
+/// The word token the cursor sits strictly inside (`span.start < byte < span.end`), if any.
+fn word_containing(tokens: &[Token], byte: usize) -> Option<ByteSpan> {
+    tokens
+        .iter()
+        .find(|t| is_word_token(t.kind) && t.span.start < byte && byte < t.span.end)
+        .map(|t| t.span)
 }
 
 /// Whether a token kind is a "word" the user could be mid-typing as an identifier/keyword. Used to
@@ -872,8 +883,11 @@ fn classify_member(
     let base_idx = prev_meaningful(tokens, dot_idx)?;
     let base_kind = tokens[base_idx].kind;
 
+    // `base.par|tial` — the cursor is inside the member name, so the `.` is the anchor and the word
+    // it precedes is still the prefix. Without this the edit range collapses to the cursor and
+    // accepting an item splices the item into the middle of the name it was meant to replace.
     let prefix = if anchor_kind == Period {
-        None
+        word_containing(tokens, byte)
     } else {
         prefix_at(tokens, anchor, byte)
     };
@@ -1043,6 +1057,19 @@ fn classify_anchored(
                 _ => {}
             }
         }
+    }
+
+    // The same declaration-name position with nothing typed yet (`var <cursor>`), where the keyword
+    // itself is the anchor. Godot answers it the same way it answers the partial-name case above.
+    // The cursor must be off the end of the keyword: glued to it (`va<cursor>`) the user is still
+    // typing the keyword, which is an ordinary word prefix.
+    if tokens[i].span.end < byte
+        && matches!(anchor_kind, Var | Const | Signal | Enum | Class | ClassName)
+    {
+        return Some(CompletionContext::new(CompletionKind::None, None));
+    }
+
+    {
         // A partial word at the start of an inline property-accessor line (`var x: int:\n\tg|`) →
         // the bare `get`/`set` keyword completion. Gated on the word opening the line (its raw
         // predecessor is layout, so an in-body expression `get:\n\t\tprin|` is excluded) AND the AST
@@ -1282,7 +1309,7 @@ fn classify_call_or_identifier(
     if prefix.is_some() {
         return CompletionContext::new(CompletionKind::Identifier, prefix);
     }
-    if starts_expression(tokens, anchor) {
+    if starts_expression(tokens, anchor) || opens_a_line(tokens, anchor, byte) {
         return CompletionContext::bare(CompletionKind::Identifier);
     }
     CompletionContext::bare(CompletionKind::None)
@@ -1520,6 +1547,28 @@ fn recover_callee(
 /// Whether the cursor (with the given anchor) plausibly begins an expression, so a bare identifier
 /// completion is appropriate even without a typed prefix. True at the very start, right after a
 /// statement boundary, or after an operator/opening bracket/keyword that expects an expression.
+/// Whether a line boundary separates the anchor from the cursor — the cursor is on a later line
+/// than the last real token, so it opens a fresh statement and an identifier can always begin here.
+///
+/// [`anchor_index`] skips layout tokens, which is what makes this a separate question: on a blank
+/// line inside a function body the anchor is whatever ended the *previous* line, and asking
+/// [`starts_expression`] about it answers about that line, not this one. The layout tokens the
+/// anchor passed over are the evidence, so this looks at them directly.
+fn opens_a_line(tokens: &[Token], anchor: Option<usize>, byte: usize) -> bool {
+    use TokenKind::*;
+    let (start, anchor_end) = match anchor {
+        Some(i) => (i + 1, tokens[i].span.end),
+        None => (0, 0),
+    };
+    tokens[start.min(tokens.len())..].iter().any(|t| {
+        // `span.start >= anchor_end` is what separates a real line break from the synthetic one the
+        // lexer closes an unterminated file with — that one is emitted *over* the last token's span
+        // (`print(1)` ends with a `ParenthesisClose` and a `Newline` both spanning `)`), and taking
+        // it for a line break would read the end of every file as a fresh statement.
+        t.span.start >= anchor_end && t.span.end <= byte && matches!(t.kind, Newline | Indent)
+    })
+}
+
 fn starts_expression(tokens: &[Token], anchor: Option<usize>) -> bool {
     use TokenKind::*;
     match anchor {
