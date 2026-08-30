@@ -293,3 +293,53 @@ fn a_degraded_variant_stays_silent_through_a_declaration() {
         );
     }
 }
+
+/// #459: `in` between two string constants is a substring test, not an invalid operand pair.
+///
+/// `eval_binary` carried no `ContentTest` arm, so the constant path always came back "no
+/// registered evaluator" and drew the `r_valid = false` error. Only the both-constant form broke —
+/// with a variable on either side the reducer takes the type-only path, which had `in` right.
+#[test]
+fn a_constant_in_between_two_strings_is_not_an_invalid_operand() {
+    for d in TAGS {
+        for expr in [
+            r#""a" in "abc""#,
+            r#""z" in "abc""#,
+            r#"&"a" in "abc""#,
+            r#""a" in &"abc""#,
+            r#"&"a" in &"abc""#,
+            r#""" in "abc""#,
+            r#""a" not in "abc""#,
+            // One constant operand and one dynamic — the shape that always worked.
+            r#""a" in s"#,
+            r#"s in "abc""#,
+            // Neither of these folds: an Array or Dictionary literal is `is_shared()`.
+            r#"1 in [1, 2]"#,
+            r#""k" in {"k": 1}"#,
+        ] {
+            assert_eq!(
+                errors(
+                    &format!("extends Node\n\nfunc f(s: String) -> void:\n\tprint({expr})\n"),
+                    d
+                ),
+                Vec::<String>::new(),
+                "{expr} at {d:?}"
+            );
+        }
+    }
+}
+
+/// The folded bool stays a constant, so it still satisfies a `const` initializer.
+#[test]
+fn a_constant_in_stays_constant() {
+    for d in TAGS {
+        assert_eq!(
+            errors(
+                &script(r#"const HAS: bool = "a" in "abc""#, "\tprint(HAS)"),
+                d
+            ),
+            Vec::<String>::new(),
+            "{d:?}"
+        );
+    }
+}
