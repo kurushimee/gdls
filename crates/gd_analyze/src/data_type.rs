@@ -68,6 +68,62 @@ pub enum VariantType {
 // Anchors the enum to Godot's `VARIANT_MAX` (39): the last type's discriminant is 38.
 const _: () = assert!(VariantType::PackedVector4Array as u8 == 38);
 
+/// Every [`VariantType`] in Godot's declaration order — `for (int i = 0; i < Variant::VARIANT_MAX;
+/// i++)`, which the analyzer walks whenever it builds a message out of the conversion tables.
+pub const VARIANT_TYPES: [VariantType; 39] = {
+    use VariantType::*;
+    [
+        Nil,
+        Bool,
+        Int,
+        Float,
+        String,
+        Vector2,
+        Vector2i,
+        Rect2,
+        Rect2i,
+        Vector3,
+        Vector3i,
+        Transform2d,
+        Vector4,
+        Vector4i,
+        Plane,
+        Quaternion,
+        Aabb,
+        Basis,
+        Transform3d,
+        Projection,
+        Color,
+        StringName,
+        NodePath,
+        Rid,
+        Object,
+        Callable,
+        Signal,
+        Dictionary,
+        Array,
+        PackedByteArray,
+        PackedInt32Array,
+        PackedInt64Array,
+        PackedFloat32Array,
+        PackedFloat64Array,
+        PackedStringArray,
+        PackedVector2Array,
+        PackedVector3Array,
+        PackedColorArray,
+        PackedVector4Array,
+    ]
+};
+
+// The table stays in enum order: each entry's discriminant is its index.
+const _: () = {
+    let mut i = 0;
+    while i < VARIANT_TYPES.len() {
+        assert!(VARIANT_TYPES[i] as usize == i);
+        i += 1;
+    }
+};
+
 /// `Variant::can_convert(from, to)` (`core/variant/variant.cpp:192`): whether a value of `from`
 /// can be implicitly converted to `to`. Ported verbatim from Godot's per-target-type tables.
 /// Used by `reduce_cast` (analyzer.cpp:3807) and by `is_type_compatible` when
