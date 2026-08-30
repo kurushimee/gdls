@@ -2001,3 +2001,88 @@ fn builtin_type_symbols_carry_docs_and_jump_into_a_stub() {
 
     shutdown(&client, handle);
 }
+
+/// #405: an enum value hovers like its native counterpart — qualified by its enum, typed as that
+/// enum, carrying its integer — at the declaration and at every reference.
+#[test]
+fn hover_on_an_enum_value_renders_its_type_and_value() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/enum_value.gd".parse().unwrap();
+    let src = "extends Node\n\nenum Mode { IDLE, RUN = 5, JUMP }\n\nfunc f() -> void:\n\tprint(Mode.JUMP)\n";
+    did_open(&client, &uri, src);
+
+    // The declaration of an implicit value, of an explicit one, and of the value after it.
+    for (pos, want) in [
+        (Position::new(2, 13), "const Mode.IDLE: Mode = 0"),
+        (Position::new(2, 20), "const Mode.RUN: Mode = 5"),
+        (Position::new(2, 28), "const Mode.JUMP: Mode = 6"),
+        // The reference reads the same as the declaration.
+        (Position::new(5, 13), "const Mode.JUMP: Mode = 6"),
+    ] {
+        let hover = hover_at(&client, &uri, pos).unwrap_or_else(|| panic!("hover at {pos:?}"));
+        let md = hover_markdown(&hover);
+        assert!(md.contains(want), "wanted {want:?} at {pos:?}, got {md:?}");
+    }
+
+    shutdown(&client, handle);
+}
+
+/// #405: a value the index cannot read without evaluating keeps the shorter line. Guessing one
+/// would be worse than omitting it, and the poison spreads to every implicit value after it.
+#[test]
+fn an_enum_value_that_needs_evaluating_hovers_without_a_number() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/enum_poison.gd".parse().unwrap();
+    let src = "extends Node\n\nenum Flags { A = 1 << 0, B, C = -3 }\n";
+    did_open(&client, &uri, src);
+
+    for (pos, want) in [
+        (Position::new(2, 13), "const Flags.A: Flags"),
+        (Position::new(2, 25), "const Flags.B: Flags"),
+        (Position::new(2, 28), "const Flags.C: Flags = -3"),
+    ] {
+        let hover = hover_at(&client, &uri, pos).unwrap_or_else(|| panic!("hover at {pos:?}"));
+        let md = hover_markdown(&hover);
+        assert!(md.contains(want), "wanted {want:?} at {pos:?}, got {md:?}");
+    }
+    // `A` and `B` carry no `=` at all, rather than a guessed one.
+    let hover = hover_at(&client, &uri, Position::new(2, 13)).expect("hover on A");
+    assert!(
+        !hover_markdown(&hover).contains('='),
+        "an unreadable value must not render a number, got {:?}",
+        hover_markdown(&hover)
+    );
+
+    shutdown(&client, handle);
+}
+
+/// #405: a `const` carries its folded value, and one gdls cannot fold does not.
+#[test]
+fn hover_on_a_constant_renders_its_value_when_it_folds() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/const_value.gd".parse().unwrap();
+    let src = "extends Node\n\nconst K := 7\nconst S := \"hi\"\nconst F := 1.5\nconst B := true\nconst D = K * 2\nconst ARR = [1, 2]\n";
+    did_open(&client, &uri, src);
+
+    for (pos, want) in [
+        (Position::new(2, 6), "const K: int = 7"),
+        (Position::new(3, 6), "const S: String = \"hi\""),
+        (Position::new(4, 6), "const F: float = 1.5"),
+        (Position::new(5, 6), "const B: bool = true"),
+        (Position::new(6, 6), "const D: int = 14"),
+    ] {
+        let hover = hover_at(&client, &uri, pos).unwrap_or_else(|| panic!("hover at {pos:?}"));
+        let md = hover_markdown(&hover);
+        assert!(md.contains(want), "wanted {want:?} at {pos:?}, got {md:?}");
+    }
+
+    // An array literal has no `FoldedValue`, so the line stops at the type.
+    let hover = hover_at(&client, &uri, Position::new(7, 7)).expect("hover on ARR");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("const ARR") && !md.contains('='),
+        "an unfoldable initializer must not render a value, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+}

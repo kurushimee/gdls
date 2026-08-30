@@ -664,7 +664,10 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
 /// `EnumNode::values[i]` walk: implicit values are previous + 1 (`gdscript_analyzer.cpp:
 /// 1174-1177`); a custom value that is an int literal (optionally negated) is read directly;
 /// anything needing evaluation yields `None` and poisons every later implicit value in the chain.
-fn enum_decl(tree: &ParseTree, id: NodeId) -> Option<EnumDecl> {
+///
+/// Public because hover reads it straight off the tree of the file being edited, where the indexed
+/// interface may be a revision behind the buffer.
+pub fn enum_decl(tree: &ParseTree, id: NodeId) -> Option<EnumDecl> {
     let NodeKind::Enum(e) = &tree.get(id).kind else {
         return None;
     };
