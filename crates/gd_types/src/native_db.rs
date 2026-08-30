@@ -282,6 +282,7 @@ impl NativeDb {
             classes.insert(class.name, class);
         }
         seed_dump_omitted_methods(&mut classes, &mut it);
+        recover_property_types_from_getters(&mut classes);
         let mut builtins = FxHashMap::default();
         for b in api.builtin_classes {
             let bt = ingest_builtin(b, &mut it);
@@ -1144,12 +1145,11 @@ fn ingest_class(c: api::ClassDef, it: &mut Interner) -> NativeClass {
         .into_iter()
         .map(|m| ingest_method(m, it))
         .collect();
-    let mut properties: Vec<Property> = c
+    let properties: Vec<Property> = c
         .properties
         .into_iter()
         .map(|p| ingest_property(p, it))
         .collect();
-    recover_property_types_from_getters(&mut properties, &methods);
     NativeClass {
         name: it.intern(&c.name),
         inherits: c.inherits.as_deref().map(|s| it.intern(s)),
@@ -1205,34 +1205,58 @@ fn ingest_method(m: api::MethodDef, it: &mut Interner) -> Method {
     }
 }
 
-/// Take a property's real type from its getter where the property table cannot express it (#428).
+/// Give every native property the type its getter returns (#428, #432).
 ///
-/// `ClassDB`'s `PropertyInfo` — which is what Godot's analyzer reads — carries the enum class name
-/// and the container element types alongside the plain `Variant::Type`. The JSON dump's
-/// `classes[].properties[].type` field flattens all of that: `Node.process_mode` is written `int`,
-/// where Godot names it `Node.ProcessMode`, and a typed-array property is written `Array`. The
-/// getter's signature is where the dump keeps the structure — `get_process_mode` returns
-/// `enum::Node.ProcessMode` — and `ClassDB::add_property` validates the two agree, so reading it
-/// back reconstructs the `PropertyInfo` rather than inventing anything.
+/// Godot's analyzer never reads the property table's type. It looks the property up to learn that
+/// it EXISTS, then types it from the getter: `type_from_property(getter->get_return_info(), …)`
+/// (`gdscript_analyzer.cpp:4343-4350`). The two disagree on 676 of the 4135 properties in the
+/// 4.7.2 dump, because `classes[].properties[].type` is a flattened `Variant::Type` while the
+/// getter's signature is the whole `PropertyInfo`:
 ///
-/// Only the three structured forms are recovered, and only over a plain named property type. The
-/// dump also disagrees with its getters on some object properties, but that is the `PropertyInfo`
-/// hint string leaking into the `type` field (`"Texture2D,-AtlasTexture,…"`). Picking a class out
-/// of a hint string would be inventing a type, so those are left as the dump wrote them.
-fn recover_property_types_from_getters(properties: &mut [Property], methods: &[Method]) {
-    for prop in properties.iter_mut() {
-        if !matches!(prop.ty, TypeRef::Named(_)) {
-            continue;
+/// - 502 enums written `int` (`Node.process_mode` is really `Node.ProcessMode`),
+/// - 34 typed arrays written `Array` or `PackedStringArray`,
+/// - 28 bitfields written `int` (which Godot also renders `int`, so these are a no-op),
+/// - 111 plain names that simply differ. Some are the getter narrowing (`SceneTree.root` is
+///   `Node` in the table and `Window` from `get_root`) or widening (`Camera2D.custom_viewport`
+///   is `Viewport` in the table and `Node` from its getter), and most are the `PropertyInfo`
+///   HINT STRING leaking into the `type` field — `"Texture2D,-AtlasTexture,…"`, which is not a
+///   type name at all and which the getter spells `Texture2D`.
+///
+/// The getter wins in every one of those, so this takes it unconditionally rather than judging
+/// which disagreements look recoverable. `ClassDB::add_property` validates that a property and
+/// its getter agree, so this reconstructs the `PropertyInfo` rather than inventing anything.
+///
+/// The getter is resolved up the `inherits` chain, as `ClassDB::get_method` does — 63 properties
+/// name a getter their own class does not declare (`ArrayOccluder3D.vertices` is served by
+/// `Occluder3D::get_vertices`).
+///
+/// 27 properties name a getter the dump omits entirely, always a `_`-prefixed internal
+/// (`Control.layout_mode` → `_get_layout_mode`). `ClassDB` has those at runtime and Godot types
+/// them from there, so gdls keeps the table's flattened type: it is the wrong rendering for a few
+/// of them, and it is the only information the dump carries.
+fn recover_property_types_from_getters(classes: &mut FxHashMap<Sym, NativeClass>) {
+    // Resolve every (class, getter) pair against the chain BEFORE mutating, so a parent's own
+    // recovery can never feed a child's — the source is always the dump's own method signature.
+    let mut recovered: Vec<(Sym, usize, TypeRef)> = Vec::new();
+    for (&class_sym, nc) in classes.iter() {
+        for (i, prop) in nc.properties.iter().enumerate() {
+            let Some(getter) = prop.getter else { continue };
+            let mut cur = Some(class_sym);
+            while let Some(c) = cur {
+                let Some(decl) = classes.get(&c) else { break };
+                if let Some(m) = decl.methods.iter().find(|m| m.name == getter) {
+                    if m.return_type != prop.ty {
+                        recovered.push((class_sym, i, m.return_type.clone()));
+                    }
+                    break;
+                }
+                cur = decl.inherits;
+            }
         }
-        let Some(getter) = prop.getter else { continue };
-        let Some(method) = methods.iter().find(|m| m.name == getter) else {
-            continue;
-        };
-        if matches!(
-            method.return_type,
-            TypeRef::Enum { .. } | TypeRef::TypedArray(_) | TypeRef::TypedDict(..)
-        ) {
-            prop.ty = method.return_type.clone();
+    }
+    for (class_sym, i, ty) in recovered {
+        if let Some(nc) = classes.get_mut(&class_sym) {
+            nc.properties[i].ty = ty;
         }
     }
 }
