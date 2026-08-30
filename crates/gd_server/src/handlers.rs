@@ -598,6 +598,37 @@ pub fn definition(
                 if let Some(loc) = member_decl_location(state, sr.file, &sr.inner, &name) {
                     return Some(GotoDefinitionResponse::Scalar(loc));
                 }
+                // #356: the head interface does not declare it. Try the script link up the
+                // `extends` chain that does, then the chain's native root — `class_name X extends
+                // Node2D`, then `x.position`, lives in the `Node2D` stub and used to answer null.
+                let chain_link = {
+                    let xfile = crate::xfile::WorkspaceXFileQuery::new(
+                        &state.workspace.index,
+                        &state.workspace.native,
+                        &state.workspace.analysis_cache,
+                        crate::xfile::AutoloadEnv::default(),
+                        &state.workspace.scenes,
+                        &state.workspace.project.root,
+                    );
+                    gd_analyze::enumerate::script_chain_declaring_link(
+                        &xfile,
+                        &state.workspace.native,
+                        &sr,
+                        &name,
+                    )
+                };
+                if let Some(link) = chain_link {
+                    if let Some(loc) = member_decl_location(state, link.file, &link.inner, &name) {
+                        return Some(GotoDefinitionResponse::Scalar(loc));
+                    }
+                } else if let Some(owner) = script_base_native_owner(state, &sr, &name) {
+                    let stub_root = state.options.stub_cache_dir.clone();
+                    if let Some(loc) =
+                        native_member_stub_location(state, &owner, &name, stub_root.as_deref())
+                    {
+                        return Some(GotoDefinitionResponse::Scalar(loc));
+                    }
+                }
             }
         }
     }
@@ -1383,6 +1414,61 @@ fn render_hover(
     md
 }
 
+/// #356: the resolution facts a `Script`-kind base needs beyond its OWN interface. A project
+/// script is almost always `class_name X extends <NativeClass>`, so most of what a value of that
+/// type exposes is inherited — first through any script links above it, then from the native root
+/// the chain bottoms out in. Completion already walked that chain
+/// ([`gd_analyze::enumerate::script_chain_members`] plus the native tail); hover and definition
+/// read only the head interface, so every inherited member hovered as a bare type label and could
+/// not be jumped to.
+///
+/// Returns the native class to resolve `name` on, or `None` when a SCRIPT link up the chain
+/// declares `name` first (derived shadows base, so the script arm owns it) or when the chain has
+/// no resolvable native root.
+fn script_base_native_owner(
+    state: &ServerState,
+    sr: &gd_analyze::data_type::ScriptRef,
+    name: &str,
+) -> Option<String> {
+    let xfile = crate::xfile::WorkspaceXFileQuery::new(
+        &state.workspace.index,
+        &state.workspace.native,
+        &state.workspace.analysis_cache,
+        crate::xfile::AutoloadEnv::default(),
+        &state.workspace.scenes,
+        &state.workspace.project.root,
+    );
+    let native = &state.workspace.native;
+    if gd_analyze::enumerate::script_chain_declaring_link(&xfile, native, sr, name).is_some() {
+        return None;
+    }
+    gd_analyze::enumerate::script_chain_native_root(&xfile, native, sr)
+}
+
+/// #356: the interface that DECLARES `name` for a `Script`-kind base — the head interface when it
+/// declares the member itself, else the first link up the `extends` chain that does.
+fn script_base_declaring_iface<'a>(
+    state: &'a ServerState,
+    sr: &gd_analyze::data_type::ScriptRef,
+    name: &str,
+) -> Option<&'a gd_project::Interface> {
+    let xfile = crate::xfile::WorkspaceXFileQuery::new(
+        &state.workspace.index,
+        &state.workspace.native,
+        &state.workspace.analysis_cache,
+        crate::xfile::AutoloadEnv::default(),
+        &state.workspace.scenes,
+        &state.workspace.project.root,
+    );
+    let link = gd_analyze::enumerate::script_chain_declaring_link(
+        &xfile,
+        &state.workspace.native,
+        sr,
+        name,
+    )?;
+    iface_at_inner(&state.workspace.index, link.file, &link.inner)
+}
+
 /// #349: the type to route a member access by — the SCENE-PRECISE type when the base is a
 /// `$Path` / `%Name` / `get_node("…")` access the attaching scenes agree on, else the analyzer's
 /// own type for that node.
@@ -1480,9 +1566,25 @@ fn hover_member_signature(
         DtKind::Script => {
             let script_ref = base_dt.script_type.as_ref()?;
 
+            // #356: a method the script inherits from its native root (`class_name X extends
+            // Node2D`, then `x.get_parent()`) is declared by neither this interface nor any script
+            // link above it — read it off the NativeDb, exactly as a `Native` base would.
+            if let Some(owner) = script_base_native_owner(state, script_ref, fn_name) {
+                let (decl, member) = state.workspace.native.lookup_member(&owner, fn_name)?;
+                let declaring = state.workspace.native.name_of(decl.name).to_owned();
+                return Some(native_member_hover_md(
+                    &state.workspace.native,
+                    &declaring,
+                    &member,
+                ));
+            }
+
             // Look up the method name in the OWNING class's interface, descending the inner-class
-            // chain (#146) so an inner-class instance's method resolves on the inner class, not root.
-            let iface = iface_at_inner(&state.workspace.index, script_ref.file, &script_ref.inner)?;
+            // chain (#146) so an inner-class instance's method resolves on the inner class, not root
+            // — then, when the head does not declare it, the script link up the chain that does.
+            let iface = iface_at_inner(&state.workspace.index, script_ref.file, &script_ref.inner)
+                .filter(|i| i.members.iter().any(|m| m.name.as_str() == fn_name))
+                .or_else(|| script_base_declaring_iface(state, script_ref, fn_name))?;
             let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
 
             let sig = format_func_signature(fn_name, decl);
@@ -1829,7 +1931,22 @@ fn hover_attribute_member_signature(
     // v1.0.4 (#35): no project declaration — a Native (or Builtin) base reads the NativeDb:
     // `player.volume_db`, `Input.MOUSE_MODE_CAPTURED`, an uncalled `player.stop` reference,
     // `Vector2.ZERO`. These used to fall through to the bare expression-type label.
+    //
+    // #356: a `Script` base reads it too, on the native root its `extends` chain bottoms out in —
+    // `class_name ValueSlider extends TextureProgressBar`, then `slider.value`, is a `Range`
+    // property no project interface declares.
     match base_dt.kind {
+        DtKind::Script => {
+            let sr = base_dt.script_type.as_ref()?;
+            let owner = script_base_native_owner(state, sr, name)?;
+            let (decl, member) = state.workspace.native.lookup_member(&owner, name)?;
+            let declaring = state.workspace.native.name_of(decl.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
         DtKind::Native if !base_dt.native_type.is_empty() => {
             let (decl, member) = state
                 .workspace

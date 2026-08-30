@@ -1739,3 +1739,133 @@ fn definition_doubly_nested_inner_class_property_locks_producer_chain() {
     );
     shutdown(&client, handle);
 }
+
+/// #356: a member a project script INHERITS — from a script link up its `extends` chain, or from
+/// the native root the chain bottoms out in — reaches hover and definition. Completion already
+/// walked that chain, so before this the three surfaces disagreed about the same expression:
+/// `slider.value` completed fine, hovered as the bare `float`, and went nowhere.
+#[test]
+fn hover_and_definition_reach_a_scripts_inherited_members() {
+    let fixture = tempfile::tempdir().expect("create fixture dir");
+    let fixture_dir = fixture.path().to_path_buf();
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    let api_path = fixture_dir.join("extension_api.json");
+    std::fs::write(
+        &api_path,
+        r#"{
+        "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
+        "classes": [
+            {"name": "Object", "is_instantiable": true},
+            {"name": "Node", "inherits": "Object", "is_instantiable": true,
+             "methods": [{"name": "get_parent", "is_const": true, "is_static": false,
+                          "is_vararg": false, "is_virtual": false, "hash": 1, "arguments": [],
+                          "return_value": {"type": "Node"},
+                          "description": "Returns this node's parent node."}]},
+            {"name": "Range", "inherits": "Node", "is_instantiable": true,
+             "properties": [{"name": "value", "type": "float",
+                             "setter": "set_value", "getter": "get_value",
+                             "description": "The current value."}]}
+        ]
+    }"#,
+    )
+    .expect("write fixture JSON");
+
+    // `Slider extends Range` (native), and `FineSlider extends Slider` (a script link), so the
+    // walk has to cross a script hop before it reaches the native tail.
+    std::fs::write(
+        fixture_dir.join("slider.gd"),
+        "class_name Slider\nextends Range\n\n## How fine the steps are.\nvar precision := 1\n",
+    )
+    .expect("write slider.gd");
+    std::fs::write(
+        fixture_dir.join("fine_slider.gd"),
+        "class_name FineSlider\nextends Slider\n",
+    )
+    .expect("write fine_slider.gd");
+
+    let src = "extends Node\n\
+               func _ready() -> void:\n\
+               \tvar s: FineSlider = null\n\
+               \ts.value = 1.0\n\
+               \ts.get_parent()\n\
+               \tprint(s.precision)\n";
+    let script_path = fixture_dir.join("main.gd");
+    std::fs::write(&script_path, src).expect("write main.gd");
+
+    let stub_dir = fixture_dir.join("stubs");
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+        "extensionApiPath": api_path.to_string_lossy().as_ref(),
+        "autoDumpExtensionApi": false,
+        "stubCacheDir": stub_dir.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+    let uri: Uri = format!(
+        "file:///{}",
+        script_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &uri, src);
+
+    let md_at = |line: u32, character: u32, what: &str| -> String {
+        let hover = hover_at(&client, &uri, Position::new(line, character))
+            .unwrap_or_else(|| panic!("hover must answer on {what} at {line}:{character}"));
+        hover_markdown(&hover).to_string()
+    };
+
+    // A property inherited from the chain's NATIVE root, two hops up.
+    let md = md_at(3, 4, "s.value");
+    assert!(
+        md.contains("var Range.value: float"),
+        "an inherited native property hovers as its declaration, got {md:?}"
+    );
+    assert!(
+        md.contains("The current value."),
+        "the dump's description renders after the fence, got {md:?}"
+    );
+
+    // A method inherited from further up the same native chain.
+    let md = md_at(4, 4, "s.get_parent()");
+    assert!(
+        md.contains("func Node.get_parent() -> Node"),
+        "an inherited native method hovers as its signature, got {md:?}"
+    );
+
+    // A member declared by the SCRIPT link above — the head interface does not carry it.
+    let md = md_at(5, 10, "s.precision");
+    assert!(
+        md.contains("precision"),
+        "a member from the script base hovers as its declaration, got {md:?}"
+    );
+    assert!(
+        md.contains("How fine the steps are."),
+        "the base script's `##` doc renders, got {md:?}"
+    );
+
+    // Definition lands in the DECLARING class's stub, not nowhere.
+    let Some(GotoDefinitionResponse::Scalar(loc)) =
+        definition_at(&client, &uri, Position::new(3, 4))
+    else {
+        panic!("definition on an inherited native property must resolve");
+    };
+    assert!(
+        loc.uri.as_str().ends_with("Range.gd"),
+        "expected the Range stub, got {}",
+        loc.uri.as_str()
+    );
+
+    // And on the script link, in that script's own file.
+    let Some(GotoDefinitionResponse::Scalar(loc)) =
+        definition_at(&client, &uri, Position::new(5, 10))
+    else {
+        panic!("definition on a script-inherited member must resolve");
+    };
+    assert!(
+        loc.uri.as_str().ends_with("slider.gd"),
+        "expected slider.gd, got {}",
+        loc.uri.as_str()
+    );
+
+    shutdown(&client, handle);
+}
