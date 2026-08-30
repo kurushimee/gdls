@@ -3739,6 +3739,296 @@ pub(crate) fn update_dictionary_literal_element_type(
     ctx.set_type(dict_id, dt);
 }
 
+/// `reduce_call`'s builtin-constructor block (analyzer.cpp:3277-3431): the call's type, its
+/// argument checking, and the constant fold.
+///
+/// Godot forks on `all_is_constant && !Variant::is_type_shared(builtin_type)` (:3288). The constant
+/// fork runs the real `Variant::construct` and reads back a `Callable::CallError`; the general fork
+/// walks `Variant::get_constructor_list` against the arguments' STATIC types. gdls has no
+/// `Variant::construct`, so the constant fork is reproduced from the same static data the dispatch
+/// itself uses — exact-arity plus `can_convert_strict` per argument, over the dump's overload list
+/// (`variant_construct.cpp:264-289`).
+///
+/// Two of the four constant-fork messages are dead upstream and are not ported: the dispatch loop
+/// only ever sets `CALL_ERROR_INVALID_METHOD`, never `TOO_MANY_ARGUMENTS` or `TOO_FEW_ARGUMENTS`, so
+/// an arity mismatch reads as "no constructor matches" rather than a count. `CALL_ERROR_INVALID_
+/// ARGUMENT` survives only through `VariantConstructorFromString` (`variant_construct.h:225-244`,
+/// registered for `int` and `float`), where the dispatch admits a `NodePath` that the body then
+/// rejects; every other body's rejection is unreachable behind its own dispatch filter.
+///
+/// The two forks anchor differently and both are faithful: the constant fork's no-match lands on the
+/// CALLEE (:3317) and its invalid-argument on the ARGUMENT (:3304), while the general fork's
+/// no-match lands on the whole CALL (:3428).
+fn reduce_builtin_constructor(
+    ctx: &mut AnalysisContext,
+    id: NodeId,
+    call: &gd_syntax::ast::CallNode,
+    bt: VariantType,
+    function_name: &str,
+) {
+    let call_type = DataType {
+        type_source: TypeSource::AnnotatedExplicit,
+        kind: DtKind::Builtin,
+        builtin_type: bt,
+        ..Default::default()
+    };
+    let args = call.arguments.clone();
+    let all_is_constant = args.iter().all(|&a| ctx.folds.is_constant(a));
+
+    // Godot evaluates a constant constructor call into a real value; gdls can't materialize a
+    // non-scalar one, so an Opaque fold keeps the constancy — `match v:\n\tVector2(-1, -1):` stays
+    // a legal constant pattern and `const X = Color(1, 1, 1)` a constant initializer. The fold is
+    // kept on every non-error exit and dropped on every error one, because Godot leaves
+    // `is_constant` false after a failed construct and `const X = Vector2(1, 2, 3)` really does
+    // draw the companion "isn't a constant expression" error.
+    macro_rules! finish {
+        ($fold:expr) => {{
+            if $fold && all_is_constant {
+                ctx.folds.set(id, FoldedValue::Opaque(bt, None));
+            }
+            ctx.set_type(id, call_type);
+            return;
+        }};
+    }
+
+    // Two gdls-only degrade guards with no upstream equivalent, both fail-open. A trimmed or
+    // version-mismatched dump has no overload list to check against, and an argument gdls could not
+    // resolve already carries its own error — checking either would manufacture a "no constructor
+    // matches" Godot never prints, over a signature rendered from `<unresolved>`.
+    let Some(builtin) = ctx.native.builtin_named(function_name) else {
+        finish!(true)
+    };
+    let constructors = builtin.constructors.clone();
+    if args.iter().any(|&a| !ctx.get_type(a).is_set()) {
+        finish!(true)
+    }
+
+    if all_is_constant && !variant_is_type_shared(ctx.dialect, bt) {
+        // --- the constant fork (analyzer.cpp:3288-3335) -----------------------------------------
+        let mut values = Vec::with_capacity(args.len());
+        for &a in &args {
+            // The value's own type, which is what `Variant::construct`'s dispatch reads. When gdls
+            // marked the node constant without folding a value AND its static type names no
+            // Variant type, the dispatch is unknowable — stay silent rather than guess.
+            match constant_arg_value_type(ctx, a) {
+                Some(vt) => values.push(vt),
+                None => finish!(true),
+            }
+        }
+        let matched = constructors.iter().find(|c| {
+            c.params.len() == args.len()
+                && values.iter().zip(&c.params).all(|(vt, p)| {
+                    crate::data_type::variant_can_convert_strict(
+                        *vt,
+                        constructor_param_value_type(ctx, p),
+                    )
+                })
+        });
+        let Some(matched) = matched else {
+            let signature = constructor_signature(ctx, function_name, &args);
+            ctx.push_error(
+                format!(
+                    r#"No constructor of "{function_name}" matches the signature "{signature}"."#
+                ),
+                call.callee.unwrap_or(id),
+            );
+            finish!(false)
+        };
+        // `VariantConstructorFromString`, the one reachable in-body rejection: `int`/`float` built
+        // from the single-String overload, given a value that is not actually a String. Only
+        // `NodePath` reaches here — `can_convert_strict` admits nothing else that fails
+        // `Variant::is_string()`.
+        if matches!(bt, VariantType::Int | VariantType::Float)
+            && matched.params.len() == 1
+            && constructor_param_value_type(ctx, &matched.params[0]) == VariantType::String
+            && values[0] == VariantType::NodePath
+        {
+            let at = ctx.get_type(args[0]).clone();
+            ctx.push_error(
+                format!(
+                    r#"Invalid argument for "{function_name}()" constructor: argument 1 should be "String" but is "{at}"."#
+                ),
+                args[0],
+            );
+            finish!(false)
+        }
+        finish!(true)
+    }
+
+    // --- the general fork (analyzer.cpp:3336-3430) ----------------------------------------------
+    if args.len() == 1 {
+        let arg_type = ctx.get_type(args[0]).clone();
+        if arg_type.is_hard_type() && !arg_type.is_variant() {
+            // The implicit copy constructor (:3341-3345). Any OTHER hard type falls through to the
+            // overload walk below.
+            if arg_type.kind == DtKind::Builtin && arg_type.builtin_type == bt {
+                finish!(true)
+            }
+        } else {
+            // A Variant or soft single argument is never an error, only unsafe (:3346-3361). Godot
+            // builds the acceptable-subtype union by walking every Variant type in enum order and
+            // keeping the ones that convert strictly to the target, then joins them with its own
+            // quoting: one extra type reads `X" or "Y`, two or more read `X", "A", …", or "Z`.
+            let mut names: Vec<&str> = vec![function_name];
+            names.extend(
+                crate::data_type::VARIANT_TYPES
+                    .iter()
+                    .filter(|&&t| t != bt && crate::data_type::variant_can_convert_strict(t, bt))
+                    .map(|&t| crate::data_type::variant_type_name(t)),
+            );
+            let expected = match names.len() {
+                1 => names[0].to_owned(),
+                2 => format!(r#"{}" or "{}"#, names[0], names[1]),
+                n => format!(
+                    r#"{}", or "{}"#,
+                    names[..n - 1].join(r#"", ""#),
+                    names[n - 1]
+                ),
+            };
+            ctx.push_warning(
+                crate::warnings::WarningCode::UnsafeCallArgument,
+                &[
+                    "1".to_owned(),
+                    "constructor".to_owned(),
+                    function_name.to_owned(),
+                    expected,
+                    "Variant".to_owned(),
+                ],
+                args[0],
+            );
+            finish!(true)
+        }
+    }
+
+    for ctor in &constructors {
+        let required = ctor
+            .params
+            .iter()
+            .filter(|p| p.default_value.is_none())
+            .count();
+        if args.len() < required || args.len() > ctor.params.len() {
+            continue;
+        }
+        let mut types_match = true;
+        for (i, &arg) in args.iter().enumerate() {
+            let par_type = constructor_param_type(ctx, &ctor.params[i]);
+            let arg_type = ctx.get_type(arg).clone();
+            if !is_type_compatible(ctx, &par_type, &arg_type, true) {
+                types_match = false;
+                break;
+            }
+            // analyzer.cpp:3390-3394. Godot pushes this while still scanning, so a candidate that
+            // goes on to fail a later argument still leaves the warning behind, and the anchor is
+            // the whole call rather than the argument.
+            if par_type.builtin_type == VariantType::Int
+                && arg_type.builtin_type == VariantType::Float
+                && bt != VariantType::Int
+            {
+                ctx.push_warning(crate::warnings::WarningCode::NarrowingConversion, &[], id);
+            }
+        }
+        if !types_match {
+            continue;
+        }
+        for (i, &arg) in args.iter().enumerate() {
+            let par_type = constructor_param_type(ctx, &ctor.params[i]);
+            if ctx.folds.is_constant(arg) {
+                update_const_expression_builtin_type(ctx, arg, &par_type, "pass", false);
+            }
+            // analyzer.cpp:3401-3406 — a Variant or soft argument against a parameter that is not
+            // a hard Variant. `to_string_strict` prints "Variant" for any soft type.
+            if par_type.is_variant() && par_type.is_hard_type() {
+                continue;
+            }
+            let arg_type = ctx.get_type(arg).clone();
+            if arg_type.is_variant() || !arg_type.is_hard_type() {
+                let arg_strict = if arg_type.is_hard_type() {
+                    arg_type.to_string()
+                } else {
+                    "Variant".to_owned()
+                };
+                ctx.push_warning(
+                    crate::warnings::WarningCode::UnsafeCallArgument,
+                    &[
+                        format!("{}", i + 1),
+                        "constructor".to_owned(),
+                        function_name.to_owned(),
+                        par_type.to_string(),
+                        arg_strict,
+                    ],
+                    arg,
+                );
+            }
+        }
+        finish!(true)
+    }
+
+    let signature = constructor_signature(ctx, function_name, &args);
+    ctx.push_error(
+        format!(r#"No constructor of "{function_name}" matches the signature "{signature}"."#),
+        id,
+    );
+    finish!(false)
+}
+
+/// The VALUE type of a constant argument — what `reduced_value.get_type()` reads inside
+/// `Variant::construct`'s dispatch. `None` when gdls marked the node constant without folding a
+/// value and its static type names no Variant type, which is the one case the dispatch cannot be
+/// reproduced from.
+fn constant_arg_value_type(ctx: &AnalysisContext, arg: NodeId) -> Option<VariantType> {
+    if let Some(v) = ctx.folds.get(arg) {
+        return Some(folded_variant_type(v));
+    }
+    let t = ctx.get_type(arg);
+    match t.kind {
+        DtKind::Builtin => Some(t.builtin_type),
+        // An enum VALUE is an int; the enum itself is a dictionary of them.
+        DtKind::Enum if t.is_meta_type => Some(VariantType::Dictionary),
+        DtKind::Enum => Some(VariantType::Int),
+        DtKind::Native | DtKind::Script | DtKind::Class => Some(VariantType::Object),
+        DtKind::Variant | DtKind::Resolving | DtKind::Unresolved => None,
+    }
+}
+
+/// `type_from_property(info.arguments[i], /*p_is_arg=*/true)` (analyzer.cpp:5841-5849) for a
+/// constructor parameter: [`type_from_type_ref`], except that a `Variant` parameter comes back HARD.
+/// The soft `DataType::variant()` would un-suppress the walk's UNSAFE_CALL_ARGUMENT guard, which
+/// exists precisely to stay quiet when the parameter accepts everything on purpose.
+fn constructor_param_type(ctx: &AnalysisContext, p: &gd_types::Param) -> DataType {
+    let mut t = type_from_type_ref(ctx, &p.ty);
+    if t.kind == DtKind::Variant {
+        t.type_source = TypeSource::AnnotatedExplicit;
+    }
+    t
+}
+
+/// The parameter type as `Variant::construct`'s `get_argument_type` sees it — a Variant type, not a
+/// `DataType`. A `Variant` parameter reads back as `Nil`, which `can_convert_strict` accepts from
+/// anything, matching a constructor slot that takes any value.
+fn constructor_param_value_type(ctx: &AnalysisContext, p: &gd_types::Param) -> VariantType {
+    let t = type_from_type_ref(ctx, &p.ty);
+    match t.kind {
+        DtKind::Builtin => t.builtin_type,
+        DtKind::Native | DtKind::Script | DtKind::Class => VariantType::Object,
+        DtKind::Enum => VariantType::Int,
+        _ => VariantType::Nil,
+    }
+}
+
+/// `Vector2(int, int, int)` — the signature both no-match messages render, built from the
+/// arguments' STATIC types (analyzer.cpp:3307-3316 and :3419-3427 build it identically).
+fn constructor_signature(ctx: &AnalysisContext, name: &str, args: &[NodeId]) -> String {
+    let mut out = format!("{name}(");
+    for (i, &a) in args.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&ctx.get_type(a).to_string());
+    }
+    out.push(')');
+    out
+}
+
 // ===================================================================================================
 // reduce_call — analyzer.cpp:3231
 // ===================================================================================================
@@ -3824,57 +4114,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
 
         // analyzer.cpp:3258 — builtin constructor.
         if let Some(bt) = crate::resolver::builtin_type_from_name(&function_name) {
-            call_type = DataType {
-                type_source: TypeSource::AnnotatedExplicit,
-                kind: DtKind::Builtin,
-                builtin_type: bt,
-                ..Default::default()
-            };
-            // analyzer.cpp's builtin constructor UNSAFE_CALL_ARGUMENT: when a single argument
-            // is provided with a soft `Variant` type and the constructor's first-positional
-            // parameter set isn't `Variant`-typed, warn. Godot iterates the constructor's
-            // overloads and emits the union of acceptable subtypes in the message
-            // (`"Vector2" or "Vector2i"`, `"int", "bool", or "float"`, etc.). gdls has a
-            // narrow per-builtin table for the four corpus shapes
-            // (`warnings/unsafe_call_argument.gd`'s constructor calls).
-            if !call.arguments.is_empty() {
-                let arg_id = call.arguments[0];
-                let at = ctx.get_type(arg_id).clone();
-                // `arg.kind == Variant` covers both soft (gradual-typing fallback) and hard
-                // (`var x: Variant = ...`) Variant — both yield Godot's "Variant"
-                // supertype in the warning template.
-                if at.kind == DtKind::Variant {
-                    let subtypes: Option<(&str, &str)> = match bt {
-                        VariantType::Callable => Some(("Object", "Variant")),
-                        VariantType::Dictionary => Some(("Dictionary", "Variant")),
-                        VariantType::Vector2 => Some((r#"Vector2" or "Vector2i"#, "Variant")),
-                        VariantType::Int => Some((r#"int", "bool", or "float"#, "Variant")),
-                        _ => None,
-                    };
-                    if let Some((sub, sup)) = subtypes {
-                        let supertype = if at.is_hard_type() { "Variant" } else { sup };
-                        ctx.push_warning(
-                            crate::warnings::WarningCode::UnsafeCallArgument,
-                            &[
-                                "1".to_owned(),
-                                "constructor".to_owned(),
-                                function_name.clone(),
-                                sub.to_owned(),
-                                supertype.to_owned(),
-                            ],
-                            id,
-                        );
-                    }
-                }
-            }
-            // Godot evaluates constructor calls over constant args into a reduced value
-            // (analyzer.cpp:3327-3357); gdls can't materialize non-scalar values — an Opaque
-            // fold keeps the constancy, so `match v:\n\tVector2(-1, -1):` stays a legal
-            // constant pattern and `const X = Color(1, 1, 1)` stays a constant initializer.
-            if call.arguments.iter().all(|&a| ctx.folds.is_constant(a)) {
-                ctx.folds.set(id, FoldedValue::Opaque(bt, None));
-            }
-            ctx.set_type(id, call_type);
+            reduce_builtin_constructor(ctx, id, &call, bt, &function_name);
             return;
         }
 

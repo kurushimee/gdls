@@ -2308,6 +2308,149 @@
 	],
 	"builtin_classes": [
 		{
+			"name": "bool",
+			"brief_description": "A built-in boolean type.",
+			"is_keyed": false,
+			"constructors": [
+				{
+					"index": 0,
+					"description": "Constructs a [bool] set to [code]false[/code]."
+				},
+				{
+					"index": 1,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "bool"
+						}
+					],
+					"description": "Constructs a [bool] as a copy of the given [bool]."
+				},
+				{
+					"index": 2,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "int"
+						}
+					],
+					"description": "Casts an [int] value to a [bool]. Returns [code]false[/code] if [param from] is equal to [code]0[/code], and [code]true[/code] for all other values."
+				},
+				{
+					"index": 3,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "float"
+						}
+					],
+					"description": "Casts a [float] value to a [bool]. Returns [code]false[/code] if [param from] is equal to [code]0.0[/code] (including [code]-0.0[/code]), and [code]true[/code] for all other values (including [constant @GDScript.INF] and [constant @GDScript.NAN])."
+				}
+			]
+		},
+		{
+			"name": "int",
+			"brief_description": "A built-in type for integers.",
+			"is_keyed": false,
+			"constructors": [
+				{
+					"index": 0,
+					"description": "Constructs an [int] set to [code]0[/code]."
+				},
+				{
+					"index": 1,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "int"
+						}
+					],
+					"description": "Constructs an [int] as a copy of the given [int]."
+				},
+				{
+					"index": 2,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "float"
+						}
+					],
+					"description": "Constructs a new [int] from a [float]. This will truncate the [float], discarding anything after the floating point."
+				},
+				{
+					"index": 3,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "bool"
+						}
+					],
+					"description": "Constructs a new [int] from a [bool]. [code]true[/code] is converted to [code]1[/code] and [code]false[/code] is converted to [code]0[/code]."
+				},
+				{
+					"index": 4,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "String"
+						}
+					],
+					"description": "Constructs a new [int] from a [String], following the same rules as [method String.to_int]."
+				}
+			]
+		},
+		{
+			"name": "float",
+			"brief_description": "A built-in type for floating-point numbers.",
+			"is_keyed": false,
+			"constructors": [
+				{
+					"index": 0,
+					"description": "Constructs a default-initialized [float] set to [code]0.0[/code]."
+				},
+				{
+					"index": 1,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "float"
+						}
+					],
+					"description": "Constructs a [float] as a copy of the given [float]."
+				},
+				{
+					"index": 2,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "int"
+						}
+					],
+					"description": "Cast an [int] value to a floating-point value, [code]float(1)[/code] will be equal to [code]1.0[/code]."
+				},
+				{
+					"index": 3,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "bool"
+						}
+					],
+					"description": "Cast a [bool] value to a floating-point value, [code]float(true)[/code] will be equal to 1.0 and [code]float(false)[/code] will be equal to 0.0."
+				},
+				{
+					"index": 4,
+					"arguments": [
+						{
+							"name": "from",
+							"type": "String"
+						}
+					],
+					"description": "Converts a [String] to a [float], following the same rules as [method String.to_float]."
+				}
+			]
+		},
+		{
 			"name": "Vector2",
 			"indexing_return_type": "float",
 			"is_keyed": false,
@@ -3237,40 +3380,6 @@
 							"type": "float"
 						}
 					]
-				},
-				{
-					"index": 0
-				},
-				{
-					"index": 1,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "Vector2"
-						}
-					]
-				},
-				{
-					"index": 2,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "Vector2i"
-						}
-					]
-				},
-				{
-					"index": 3,
-					"arguments": [
-						{
-							"name": "x",
-							"type": "float"
-						},
-						{
-							"name": "y",
-							"type": "float"
-						}
-					]
 				}
 			],
 			"has_destructor": false,
@@ -4053,129 +4162,6 @@
 				}
 			],
 			"constructors": [
-				{
-					"index": 0
-				},
-				{
-					"index": 1,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "Array"
-						}
-					]
-				},
-				{
-					"index": 2,
-					"arguments": [
-						{
-							"name": "base",
-							"type": "Array"
-						},
-						{
-							"name": "type",
-							"type": "int"
-						},
-						{
-							"name": "class_name",
-							"type": "StringName"
-						},
-						{
-							"name": "script",
-							"type": "Variant"
-						}
-					]
-				},
-				{
-					"index": 3,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedByteArray"
-						}
-					]
-				},
-				{
-					"index": 4,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedInt32Array"
-						}
-					]
-				},
-				{
-					"index": 5,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedInt64Array"
-						}
-					]
-				},
-				{
-					"index": 6,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedFloat32Array"
-						}
-					]
-				},
-				{
-					"index": 7,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedFloat64Array"
-						}
-					]
-				},
-				{
-					"index": 8,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedStringArray"
-						}
-					]
-				},
-				{
-					"index": 9,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedVector2Array"
-						}
-					]
-				},
-				{
-					"index": 10,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedVector3Array"
-						}
-					]
-				},
-				{
-					"index": 11,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedColorArray"
-						}
-					]
-				},
-				{
-					"index": 12,
-					"arguments": [
-						{
-							"name": "from",
-							"type": "PackedVector4Array"
-						}
-					]
-				},
 				{
 					"index": 0
 				},
