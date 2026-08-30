@@ -1974,6 +1974,13 @@ fn load_native(
         // whole reason this check exists (`gdextension.rs`).
         if let Some(notice) = extension_class_notice(ext, &db, merged - before) {
             log::warn!("GDExtension {}: {notice}", ext.config);
+            // The analyzer declines "Could not find type" claims about these names: the dump
+            // cannot see them (that is why the notice fired) but Godot's ClassDB can, so the
+            // negative claim is unsound even under `Exact` provenance. Record the set here,
+            // where it is computed, for the resolver's gate.
+            for hint in &ext.class_hints {
+                db.note_extension_declared_missing(hint);
+            }
         }
     }
     if merged > 0 {

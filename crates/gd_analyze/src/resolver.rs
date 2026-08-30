@@ -1015,7 +1015,15 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         // `Absent` (no source at all) DB, a custom engine build's class is indistinguishable
         // from a typo — Godot itself can never be in this state, so fidelity doesn't bind here;
         // degrade to a silent Variant per the docs/00 "unknown stays dynamic" rule.
-        if ctx.native.provenance() != gd_types::ApiProvenance::Exact {
+        //
+        // The same soundness bar has a per-class carve-out: a dump generated without
+        // extension registration (a failed DLL load silently unregisters the rest; a
+        // never-imported project) is engine-`Exact` yet blind to classes Godot's own ClassDB
+        // carries. When the project itself declares the name via a GDExtension, "Could not
+        // find type" is exactly as unsound as the provenance cases above — degrade silently.
+        if ctx.native.provenance() != gd_types::ApiProvenance::Exact
+            || ctx.native.is_extension_declared_missing(&first)
+        {
             return bad_type;
         }
         ctx.push_error(
@@ -7206,6 +7214,30 @@ func go(bs: PackedByteArray, i32s: PackedInt32Array, i64s: PackedInt64Array,
                 "{label}: no Could not find type error without Exact provenance"
             );
         }
+    }
+
+    /// The per-class carve-out to the Exact bar: a dump generated without extension
+    /// registration (a failed DLL load silently unregisters the rest) is engine-`Exact` yet
+    /// blind to classes Godot's own ClassDB carries. When the project declares the name via a
+    /// GDExtension (recorded on the [`NativeDb`] by the server), "Could not find type" is
+    /// exactly as unsound as the provenance cases above — degrade silently.
+    #[test]
+    fn datatype_of_an_extension_declared_class_degrades_silently_under_exact_provenance() {
+        let mut native = mini_native();
+        native.note_extension_declared_missing("Ghost");
+        let tree = gd_syntax::parse("extends Node\nvar g: Ghost\n").tree;
+        let xfile = NoCrossFile;
+        let pol = policy();
+        let mut ctx = AnalysisContext::new(&tree, &native, &xfile, Some(FileId::new(1)), "", &pol);
+        let _ = resolve_inheritance(&mut ctx);
+        ctx.current_class = ctx.tree.root_id();
+        let type_id = first_var_type(&tree);
+        let dt = resolve_datatype(&mut ctx, Some(type_id));
+        assert!(dt.is_variant(), "extension-declared type must degrade");
+        assert!(
+            !ctx.has_errors(),
+            "no Could not find type error for an extension-declared class"
+        );
     }
 
     #[test]
