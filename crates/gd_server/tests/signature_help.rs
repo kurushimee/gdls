@@ -1202,3 +1202,114 @@ fn a_top_level_class_constructor_is_unchanged() {
     assert_eq!(only_label(&h), "void _init(name: String, level: int = 1)");
     shutdown(&client, server_thread);
 }
+
+// ===================================================================================================
+// #392: `super(` and `super.method(`.
+// ===================================================================================================
+
+/// A bare `super(` names the PARENT's same-named method, and the popup must show the PARENT's
+/// signature — never the override's own. `Hero.greet` defaults `loud` to `false`; the override
+/// below defaults it to `true` and renames the first parameter, so the two labels are impossible to
+/// confuse. Answering with the override's would be the wrong-signature failure docs/09 §3 pins
+/// this binding against.
+#[test]
+fn bare_super_shows_the_parent_signature_not_the_overrides() {
+    let p = sig_project();
+    let src = "extends Hero\n\nfunc greet(who: String, loud: bool = true) -> int:\n\
+               \treturn super(who, loud)\n";
+    let uri = file_uri(&p.root.join("src/child.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor just inside `super(` — tab(1) + `return super(`(13) = 14.
+    let h = sig(&client, 10, &uri, Position::new(3, 14));
+    assert_eq!(
+        only_label(&h),
+        "int greet(target: String, loud: bool = false)",
+        "bare `super(` must render Hero.greet, not the override"
+    );
+    assert_eq!(h.active_parameter, Some(0));
+
+    // Past the comma, the second parameter is active.
+    let h = sig(&client, 11, &uri, Position::new(3, 19));
+    assert_eq!(h.active_parameter, Some(1));
+
+    shutdown(&client, server_thread);
+}
+
+/// `super.method(` reaches the same binding. Its callee parses as a plain `Identifier`, so without
+/// the super arm the attribute dispatch resolves it on the CURRENT class and answers the override
+/// with itself.
+#[test]
+fn dotted_super_shows_the_parent_signature() {
+    let p = sig_project();
+    let src = "extends Hero\n\nfunc greet(who: String, loud: bool = true) -> int:\n\
+               \treturn super.greet(who, loud)\n";
+    let uri = file_uri(&p.root.join("src/child.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor just inside `super.greet(` — tab(1) + `return super.greet(`(19) = 20.
+    let h = sig(&client, 10, &uri, Position::new(3, 20));
+    assert_eq!(
+        only_label(&h),
+        "int greet(target: String, loud: bool = false)"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A super call whose parent method is a NATIVE one resolves through the dump, the same way a
+/// `base.method(` receiver does.
+#[test]
+fn super_reaching_a_native_parent_method_resolves_from_the_dump() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc move(distance: float, relative: bool = false) -> void:\n\
+               \tsuper.move(distance, relative)\n";
+    let uri = file_uri(&p.root.join("src/mover.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor just inside `super.move(` — tab(1) + `super.move(`(11) = 12.
+    let h = sig(&client, 10, &uri, Position::new(3, 12));
+    assert_eq!(
+        only_label(&h),
+        "void move(distance: float, relative: bool = true)",
+        "the native parent's own default, not the override's"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A call nested INSIDE a super call's argument list still resolves as itself — the super arm takes
+/// the innermost enclosing `is_super` call, and this `(` belongs to a different call entirely.
+#[test]
+fn a_call_nested_in_a_super_argument_list_resolves_as_itself() {
+    let p = sig_project();
+    let src = "extends Hero\n\nfunc greet(who: String, loud: bool = true) -> int:\n\
+               \treturn super(who, max(1, 2) > 0)\n";
+    let uri = file_uri(&p.root.join("src/child.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor just inside `max(` — tab(1) + `return super(who, max(`(22) = 23.
+    let h = sig(&client, 10, &uri, Position::new(3, 23));
+    assert_eq!(only_label(&h), "Variant max(a: Variant, b: Variant)");
+
+    shutdown(&client, server_thread);
+}
+
+/// A super call gdls cannot resolve answers `null` rather than falling through to the current
+/// class. `Node` declares no `greet`, so the parent chain has nothing to name.
+#[test]
+fn an_unresolvable_super_call_is_null_not_the_current_class() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc greet(who: String) -> int:\n\treturn super(who)\n";
+    let uri = file_uri(&p.root.join("src/orphan.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor just inside `super(` — tab(1) + `return super(`(13) = 14.
+    assert_eq!(
+        sig_raw(&client, 10, &uri, Position::new(3, 14)),
+        serde_json::Value::Null,
+        "no parent declares `greet`, so there is no signature to show"
+    );
+
+    shutdown(&client, server_thread);
+}
