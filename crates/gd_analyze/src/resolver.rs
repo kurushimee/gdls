@@ -836,6 +836,30 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         }
         result.kind = DtKind::Builtin;
         result.builtin_type = builtin;
+
+        // Container element types (analyzer.cpp:764-783). Godot resolves them HERE, inside the
+        // builtin arm, and only for `Array` and `Dictionary` — the arity gate at the tail of this
+        // function is a separate, later check. A slot whose resolved type is `Variant` is left
+        // unset, so `Array[Variant]` carries no element types at all and renders as plain
+        // `Array`, while `Dictionary[Variant, int]` pads slot 0 to reach slot 1.
+        let set_slot = |ctx: &mut AnalysisContext, result: &mut DataType, slot: usize| {
+            let inner = type_from_metatype(resolve_datatype(ctx, containers.get(slot).copied()));
+            if inner.kind == DtKind::Variant {
+                return;
+            }
+            while result.container_element_types.len() <= slot {
+                result.container_element_types.push(DataType::variant());
+            }
+            result.container_element_types[slot] = inner;
+        };
+        match builtin {
+            VariantType::Array => set_slot(ctx, &mut result, 0),
+            VariantType::Dictionary => {
+                set_slot(ctx, &mut result, 0);
+                set_slot(ctx, &mut result, 1);
+            }
+            _ => {}
+        }
     } else if ctx.native.class_named(&first).is_some() {
         // Native engine class (analyzer.cpp:784-788).
         result.kind = DtKind::Native;
@@ -1081,26 +1105,25 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         return bad_type;
     }
 
-    // Container element types — `Array[T]`, `Dictionary[K, V]` (analyzer.cpp:894-925). Godot
-    // walks each `container_types[i]` via `resolve_datatype`, strips the metatype, and stamps it
-    // onto `result.container_element_types`. Element typing only applies when the base is
-    // Builtin Array / Dictionary; other bases reject containers (caught by the parser).
-    if !containers.is_empty() && result.kind == DtKind::Builtin {
-        let expected = match result.builtin_type {
-            VariantType::Array => 1,
-            VariantType::Dictionary => 2,
-            _ => 0,
+    // Container element-type arity (analyzer.cpp:941-957). The element types themselves were
+    // stamped up in the builtin arm; this gate runs last, after the whole nested-type walk, and
+    // rejects the annotation outright rather than truncating it. `Array[int, String]` is a real
+    // typo for `Dictionary[int, String]`, and answering it as `Array[int]` would make every later
+    // hover, completion, and assignment check agree on a type the source never asked for.
+    if !containers.is_empty() {
+        let arity_error = match (result.kind, result.builtin_type) {
+            (DtKind::Builtin, VariantType::Array) if containers.len() != 1 => {
+                Some("Typed arrays require exactly one collection element type.")
+            }
+            (DtKind::Builtin, VariantType::Dictionary) if containers.len() != 2 => {
+                Some("Typed dictionaries require exactly two collection element types.")
+            }
+            (DtKind::Builtin, VariantType::Array | VariantType::Dictionary) => None,
+            _ => Some("Only arrays and dictionaries can specify collection element types."),
         };
-        if expected > 0 {
-            for &cid in containers.iter().take(expected) {
-                let inner = type_from_metatype(resolve_datatype(ctx, Some(cid)));
-                result.container_element_types.push(inner);
-            }
-            // Fill remaining slots with Variant when the parser provides fewer than expected
-            // (defensive — Godot's parser enforces this).
-            while result.container_element_types.len() < expected {
-                result.container_element_types.push(DataType::variant());
-            }
+        if let Some(msg) = arity_error {
+            ctx.push_error(msg.to_owned(), type_id);
+            return bad_type;
         }
     }
 
