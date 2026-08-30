@@ -134,9 +134,9 @@ pub enum InitShape {
     /// A call whose callee is such a chain: `make()`, `Other.make()`. The arguments are not
     /// captured — the type comes from the function's declared return.
     Call(Vec<String>),
-    /// `preload("res://x.gd")`, and `preload("res://x.gd").new()` when `construct` is set. Only a
-    /// `res://` literal is captured: a relative path carries no dependency edge, so its type could
-    /// go stale without anything invalidating the reader.
+    /// `preload("x.gd")`, and `preload("x.gd").new()` when `construct` is set. The path is the
+    /// literal as written — `res://` or relative to the declaring file, the same two forms
+    /// `CrossFileQuery::resolve_path_from` resolves and `preload_deps` carries an edge for.
     Preload { path: String, construct: bool },
 }
 
@@ -256,8 +256,9 @@ pub struct Interface {
     /// a regular `const` — typing a regular const as an enum value is exactly the
     /// `Cannot get property from enum value.` false-positive family.
     pub unnamed_enum_values: Vec<String>,
-    /// WP-RD12: `res://` paths this file `preload(...)`s / `load(...)`s. M2 deliberately excluded
-    /// these as "body-level" edges, but a cross-file member-initializer cycle (WP-R2) reaches its
+    /// WP-RD12: the literal paths this file `preload(...)`s / `load(...)`s — `res://` and
+    /// relative alike, resolved by `Index::recompute_edges` against the file that wrote them. M2
+    /// deliberately excluded these as "body-level" edges, but a cross-file member-initializer cycle (WP-R2) reaches its
     /// target THROUGH a `const X = preload("res://b.gd")` — a const has no type annotation, so it
     /// was never a `referenced_names` / path-`extends` edge, and editing the dependency never
     /// re-invalidated the consumer (the missing-diagnostic gap the WP-RD8 xfile freshness-gate
@@ -444,9 +445,10 @@ fn collect_preload_deps(tree: &ParseTree) -> Vec<String> {
         };
         if let NodeKind::Literal(lit) = &tree.get(pid).kind {
             if let Literal::String(s) | Literal::StringName(s) | Literal::NodePath(s) = &lit.value {
-                if s.starts_with("res://") {
-                    deps.push(s.clone());
-                }
+                // Both forms: `res://…` and a path relative to the referring file. The index
+                // resolves each against the file that wrote it, and a path that resolves to
+                // nothing simply carries no edge.
+                deps.push(s.clone());
             }
         }
     }
@@ -989,10 +991,8 @@ fn capture_init_shape(tree: &ParseTree, init: Option<NodeId>) -> Option<Box<Init
     }
 }
 
-/// The `res://` string literal a `preload` was given, when it is a plain literal. A relative path
-/// is refused on purpose: `collect_preload_deps` only records
-/// `res://` targets, so a relative one would carry no dependency edge and its type could go stale
-/// with nothing to invalidate the reader.
+/// The string literal a `preload` was given, when it is a plain literal. A non-literal path is
+/// refused — the shallow pass cannot fold it, and guessing is the one thing this must not do.
 fn preload_res_path(tree: &ParseTree, path: Option<NodeId>) -> Option<String> {
     let NodeKind::Literal(l) = &tree.get(path?).kind else {
         return None;
@@ -1000,7 +1000,7 @@ fn preload_res_path(tree: &ParseTree, path: Option<NodeId>) -> Option<String> {
     let gd_syntax::token::Literal::String(text) = &l.value else {
         return None;
     };
-    text.starts_with("res://").then(|| text.clone())
+    Some(text.clone())
 }
 
 /// The dotted identifier chain under an attribute expression: `A` → `[A]`, `A.B.C` → `[A, B, C]`.
@@ -1387,8 +1387,15 @@ var b := pick().new()
         );
         // An index has no single reading, so nothing is recorded.
         assert_eq!(init("indexed"), None);
-        // A relative preload carries no dependency edge, so its answer could go stale.
-        assert_eq!(init("relative"), None);
+        // A relative preload is recorded verbatim; the index joins it against the reading file's
+        // own directory when it walks the edges, so the dependency still exists.
+        assert_eq!(
+            init("relative"),
+            Some(InitShape::Preload {
+                path: "lib.gd".to_owned(),
+                construct: false
+            })
+        );
         // A member the interface can already type records no shape.
         assert_eq!(init("typed"), None);
     }

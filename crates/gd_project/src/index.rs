@@ -677,6 +677,32 @@ impl Index {
         self.interfaces.contains_key(&fid).then_some(fid)
     }
 
+    /// A path written relative to `from`'s own directory, the other form `preload` accepts.
+    /// Joined lexically (`.` and `..` folded) against the normalized index keys, and live-gated
+    /// like [`Self::resolve_path`]. An absolute-looking scheme is not a relative path and answers
+    /// `None` rather than being joined onto a directory.
+    fn resolve_path_relative(&self, from: FileId, raw: &str) -> Option<FileId> {
+        if raw.starts_with("res://") || raw.starts_with("user://") || raw.starts_with("uid://") {
+            return None;
+        }
+        let dir = self.path(from)?.parent()?;
+        let mut parts: Vec<&str> = dir.as_str().split('/').collect();
+        for seg in raw.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    parts.pop()?;
+                }
+                other => parts.push(other),
+            }
+        }
+        let fid = self
+            .ids
+            .get(&normalize(camino::Utf8Path::new(&parts.join("/"))))
+            .copied()?;
+        self.interfaces.contains_key(&fid).then_some(fid)
+    }
+
     /// Recompute one file's forward edges from its interface against the current registry, and refresh
     /// its name-reference bookkeeping.
     fn recompute_edges(&mut self, fid: FileId) {
@@ -711,7 +737,10 @@ impl Index {
         // member-cycle case the M2 design deliberately left out (`depgraph.rs` module doc). The
         // existing reverse-closure invalidation flow carries the rest.
         for res in &preloads {
-            if let Some(target) = self.resolve_path(res) {
+            if let Some(target) = self
+                .resolve_path(res)
+                .or_else(|| self.resolve_path_relative(fid, res))
+            {
                 deps.insert(target);
             }
         }
@@ -2090,6 +2119,40 @@ mod tests {
             epoch(&idx, "a.gd") > a_epoch0,
             "editing a preloaded script's interface must invalidate the file that preloads it \
              (the WP-RD12 preload-const DepGraph edge)"
+        );
+    }
+
+    #[test]
+    fn a_relative_preload_target_creates_the_same_edge() {
+        // `preload` takes a path relative to the reading file just as readily as a `res://` one,
+        // and Godot's own test corpus writes it that way. The edge is joined against the reader's
+        // directory, so a sibling and a `..` hop both land on the real file.
+        let mut idx = cold_index(&[
+            (
+                "sub/a.gd",
+                "extends Node\nconst B = preload(\"b.gd\")\nconst C = preload(\"../c.gd\")\n",
+            ),
+            ("sub/b.gd", "class_name RelB\nextends Node\nconst Y = 1\n"),
+            ("c.gd", "class_name RelC\nextends Node\nconst Y = 1\n"),
+        ]);
+        idx.clear_dirty();
+        let a_epoch0 = epoch(&idx, "sub/a.gd");
+
+        let new_b = interface::extract(
+            &gd_syntax::parse("class_name RelB\nextends Node\nconst Z = 2\n").tree,
+        );
+        idx.on_file_changed(&abs("sub/b.gd"), new_b);
+        assert!(epoch(&idx, "sub/a.gd") > a_epoch0, "sibling preload edge");
+
+        idx.clear_dirty();
+        let a_epoch1 = epoch(&idx, "sub/a.gd");
+        let new_c = interface::extract(
+            &gd_syntax::parse("class_name RelC\nextends Node\nconst Z = 2\n").tree,
+        );
+        idx.on_file_changed(&abs("c.gd"), new_c);
+        assert!(
+            epoch(&idx, "sub/a.gd") > a_epoch1,
+            "parent-hop preload edge"
         );
     }
 

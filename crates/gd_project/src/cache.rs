@@ -109,7 +109,13 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// could not type. `#[serde(default)]` would warm-load `None` for every member and the reader
 /// would keep answering `Variant` for all of them until the next cold index — the same
 /// serve-the-older-answer failure v14 fixed. v14 files are ignored and rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 15;
+/// v16 (#433): `preload_deps` and `InitShape::Preload` now record a path written relative to the
+/// reading file, not just a `res://` one, so a const preloaded that way finally carries an edge
+/// and a type. The shape did not change, so a v15 cache deserializes; it just holds a shorter
+/// `preload_deps` and a `None` where a shape belongs, which reads as a missing dependency edge —
+/// the consumer would go stale on an edit instead of re-analyzing. v15 files are ignored and
+/// rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 16;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
