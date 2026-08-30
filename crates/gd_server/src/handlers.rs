@@ -1032,8 +1032,13 @@ pub fn type_definition(
 ///     so the jump lands on the INNER class's identifier, not the file root (#151, mirroring the
 ///     value-node inner resolution #146 fixed for hover/definition).
 ///   - [`DtKind::Native`] → that engine class's stub header, via [`native_class_header_location`].
-///   - everything else (`Builtin`/`Variant`/`Enum`/`Resolving`/`Unresolved`) → `None`: these name no
-///     single declaring document to jump to, and guessing would violate "never lie" (W10).
+///   - [`DtKind::Builtin`] → the builtin type's own stub header, through the same helper (#393).
+///     Every builtin is a `builtin_classes` entry in the dump and #370 gave each one a rendered
+///     page, so `Vector2` and `Array` name a document as squarely as `Node` does. `Nil` alone stays
+///     `None`: it is the absence of a type, not a type.
+///   - [`DtKind::Enum`] → the enum's own declaration, via [`enum_decl_location`] (#393).
+///   - everything else (`Variant`/`Resolving`/`Unresolved`) → `None`: these name no single
+///     declaring document to jump to, and guessing would violate "never lie" (W10).
 ///
 /// [`DtKind::Class`] (an in-file inner class) is rewritten to `Script` before analysis results
 /// escape `analyze`, so it never reaches here — it lands in the catch-all `None` arm rather than
@@ -1047,8 +1052,70 @@ fn type_decl_location(state: &mut ServerState, dt: &DataType) -> Option<Location
         DtKind::Native if !dt.native_type.is_empty() => {
             native_class_header_location(state, &dt.native_type)
         }
+        DtKind::Builtin if dt.builtin_type != gd_analyze::data_type::VariantType::Nil => {
+            native_class_header_location(
+                state,
+                gd_analyze::data_type::variant_type_name(dt.builtin_type),
+            )
+        }
+        DtKind::Enum => enum_decl_location(state, dt),
         _ => None,
     }
+}
+
+/// The declaration site of an `Enum`-kind [`DataType`] — the `enum E {` token itself, in whichever
+/// document declares it (#393).
+///
+/// Three sources, tried in order, and every one of them is an exact identity rather than a name
+/// guess:
+///   - A cross-file script enum carries the declaring file (and inner-class chain) outright in its
+///     [`ScriptRef`](gd_analyze::ScriptRef), so the enum is looked up as a member of that class.
+///   - Otherwise the owner is the prefix of `native_type`, which `make_enum_type`
+///     (`gd_analyze::resolver`) builds as `<owner>.<enum>`. An owner that is a native class or a
+///     builtin (`Node.ProcessMode`, `Vector3.Axis`) anchors at that stub page's `enum` line, which
+///     [`crate::stubs`] already renders and keys by enum name.
+///   - Otherwise the owner is a project class's fqcn — the shape an enum declared in the file under
+///     the cursor takes, since its `DataType` records the fqcn rather than a `FileId`. The fqcn is
+///     the head class (a `class_name`, else the script's `res://` path) followed by `::` for each
+///     inner class, and a GDScript identifier can hold no `:`, so the split back into a file plus
+///     an inner-class chain is exact.
+///
+/// Everything else answers `None`: a `@GlobalScope` enum, whose `native_type` is the bare enum name
+/// with no owner and which the dump gives no class page to anchor in; an `<anonymous enum>`; and an
+/// owner that resolves to no document. The enum is then genuinely unlocated, and W10 forbids
+/// offering the nearest same-named thing instead.
+fn enum_decl_location(state: &mut ServerState, dt: &DataType) -> Option<Location> {
+    if dt.enum_type.is_empty() {
+        return None;
+    }
+    if let Some(sr) = dt.script_type.as_ref() {
+        return member_decl_location(state, sr.file, &sr.inner, &dt.enum_type);
+    }
+    let owner = dt
+        .native_type
+        .strip_suffix(dt.enum_type.as_str())
+        .and_then(|s| s.strip_suffix('.'))?;
+
+    let db = &state.workspace.native;
+    if db.class_named(owner).is_some() || db.builtin_named(owner).is_some() {
+        let (path, stub) = crate::stubs::ensure_class_stub(
+            &state.stub_cache,
+            db,
+            owner,
+            state.options.stub_cache_dir.as_deref(),
+        )?;
+        let anchor = *stub.member_lines.get(&dt.enum_type)?;
+        return stub_token_location(&path, anchor.line, anchor.name_col, anchor.name_len);
+    }
+
+    let mut segments = owner.split("::");
+    let head = segments.next()?;
+    let inner: Vec<String> = segments.map(str::to_owned).collect();
+    let fid = match state.workspace.index.registry().get(head) {
+        Some(entry) => state.workspace.index.file_id(&entry.path)?,
+        None => state.workspace.index.resolve_res_path(head)?,
+    };
+    member_decl_location(state, fid, &inner, &dt.enum_type)
 }
 
 /// The `class_name` declaration site of the external script `fid` — the `Script`-kind arm of

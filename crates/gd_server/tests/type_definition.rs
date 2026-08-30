@@ -6,8 +6,9 @@
 //!   at the same positions and assert equality (a local-style member use, a native class name, and
 //!   an unresolved identifier where both are `null`).
 //! - `typeDefinition` resolves the cursor symbol's *type* to that type's declaring site: a project
-//!   `class_name` script's identifier (Script kind), a native class's stub header (Native kind), or
-//!   `null` for Builtin/Variant/unresolved (never a guess — W10).
+//!   `class_name` script's identifier (Script kind), a native class's or builtin type's stub header
+//!   (Native and Builtin kinds), an enum's own `enum E {` token (Enum kind), or `null` for
+//!   Variant/unresolved and for an enum with no locatable owner (never a guess — W10).
 //!
 //! Native cases REQUIRE a populated `NativeDb`: the bare `boot()` rig used by hover/definition tests
 //! has an empty DB (every native name resolves Unresolved → typeDefinition would return `null` for
@@ -88,9 +89,20 @@ impl NativeProject {
                 "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
                 "classes": [
                     {"name": "Object"},
-                    {"name": "Node", "inherits": "Object"},
+                    {"name": "Node", "inherits": "Object",
+                     "enums": [{"name": "ProcessMode", "is_bitfield": false,
+                                "values": [{"name": "PROCESS_MODE_INHERIT", "value": 0},
+                                           {"name": "PROCESS_MODE_ALWAYS", "value": 3}]}]},
                     {"name": "CanvasItem", "inherits": "Node"},
                     {"name": "Node2D", "inherits": "CanvasItem"}
+                ],
+                "builtin_classes": [
+                    {"name": "int"},
+                    {"name": "Vector2",
+                     "members": [{"name": "x", "type": "float"}],
+                     "enums": [{"name": "Axis", "is_bitfield": false,
+                                "values": [{"name": "AXIS_X", "value": 0},
+                                           {"name": "AXIS_Y", "value": 1}]}]}
                 ]
             }"#,
         );
@@ -517,17 +529,16 @@ fn type_definition_on_native_typed_symbol_jumps_to_stub_header() {
 
 #[test]
 fn type_definition_on_variant_or_unresolved_returns_null() {
-    // A symbol with no resolvable static type — an untyped `var v = 1` is `Variant` here (no
-    // annotation, value is a plain literal) — has no single declaring document to jump to, so the
-    // handler returns `null` rather than guessing (W10). The unresolved name on the next line is
-    // also `null`.
+    // A symbol whose type names no single declaring document answers `null` rather than guessing
+    // (W10). `Variant` is the whole point of the rule — it stands for every type at once — and an
+    // unresolved identifier has no type to declare at all.
     let consumer = concat!(
-        "extends Node\n",       // line 0
-        "\n",                   // line 1
-        "func go() -> void:\n", // line 2
-        "\tvar v = 1\n",        // line 3 — untyped `v` (cols 5..6)
-        "\tprint(v)\n",         // line 4
-        "\tprint(mystery_q)\n", // line 5 — unresolved identifier (cols 8..17)
+        "extends Node\n",         // line 0
+        "\n",                     // line 1
+        "func go() -> void:\n",   // line 2
+        "\tvar v: Variant = 1\n", // line 3 — hard Variant (cols 5..6)
+        "\tprint(v)\n",           // line 4
+        "\tprint(mystery_q)\n",   // line 5 — unresolved identifier (cols 8..17)
     );
     let project = NativeProject::new(&[("consumer.gd", consumer)]);
     let (client, handle, _) = boot(&project);
@@ -536,15 +547,165 @@ fn type_definition_on_variant_or_unresolved_returns_null() {
 
     assert!(
         type_definition_at(&client, &uri, Position::new(3, 5)).is_none(),
-        "untyped/Variant local ⇒ typeDefinition null (no guess)"
+        "Variant local ⇒ typeDefinition null (no guess)"
     );
     assert!(
         type_definition_at(&client, &uri, Position::new(4, 8)).is_none(),
-        "use of an untyped/Variant local ⇒ typeDefinition null"
+        "use of a Variant local ⇒ typeDefinition null"
     );
     assert!(
         type_definition_at(&client, &uri, Position::new(5, 10)).is_none(),
         "unresolved identifier ⇒ typeDefinition null"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// #393: a builtin type is a document like any other since #370 renders one per `builtin_classes`
+/// entry, so `typeDefinition` anchors at that page's header the way the native arm does. An
+/// INFERRED builtin answers too — `var v = 1` is a soft `int`, and soft is still a type, so the
+/// jump is honest rather than a guess. The one builtin that stays `null` is `Nil`: the absence of
+/// a type is not a type.
+#[test]
+fn type_definition_on_a_builtin_typed_symbol_jumps_to_its_stub_header() {
+    let consumer = concat!(
+        "extends Node\n",       // line 0
+        "\n",                   // line 1
+        "var pos: Vector2\n",   // line 2 — annotated (cols 4..7)
+        "\n",                   // line 3
+        "func go() -> void:\n", // line 4
+        "\tvar v = 1\n",        // line 5 — inferred soft int (cols 5..6)
+        "\tprint(v)\n",         // line 6
+    );
+    let project = NativeProject::new(&[("consumer.gd", consumer)]);
+    let (client, handle, _) = boot(&project);
+    let uri = project.uri("consumer.gd");
+    did_open(&client, &uri, consumer);
+
+    let loc = scalar(
+        type_definition_at(&client, &uri, Position::new(2, 4))
+            .expect("typeDefinition resolves the builtin type of `pos`"),
+    );
+    assert!(
+        loc.uri.as_str().ends_with("/Vector2.gd"),
+        "expected the Vector2 stub, got {}",
+        loc.uri.as_str()
+    );
+    // A stub header opens `class_name <Name>` → the identifier starts at col 11 on line 0.
+    assert_eq!(loc.range.start, Position::new(0, 11));
+    assert_eq!(loc.range.end, Position::new(0, 18)); // "Vector2" is 7 chars
+
+    let inferred = scalar(
+        type_definition_at(&client, &uri, Position::new(5, 5))
+            .expect("an inferred soft builtin resolves too"),
+    );
+    assert!(
+        inferred.uri.as_str().ends_with("/int.gd"),
+        "expected the int stub, got {}",
+        inferred.uri.as_str()
+    );
+
+    shutdown(&client, handle);
+}
+
+/// #393: an enum resolves to its own `enum E {` token, in whichever document declares it. The four
+/// shapes below cover every way the owner is recovered — the declaring `FileId` a cross-file enum
+/// carries outright, and the `<owner>.<enum>` fqcn every other kind records.
+#[test]
+fn type_definition_on_an_enum_typed_symbol_jumps_to_the_enum_declaration() {
+    let host = concat!(
+        "class_name EnumHost\n", // line 0
+        "extends Node\n",        // line 1
+        "\n",                    // line 2
+        "enum Local { A, B }\n", // line 3 — `Local` at cols 5..10
+        "\n",                    // line 4
+        "class Nested:\n",       // line 5
+        "\tenum Deep { X }\n",   // line 6 — `Deep` at cols 6..10
+    );
+    let consumer = concat!(
+        "extends Node\n",                                    // line 0
+        "\n",                                                // line 1
+        "func go() -> void:\n",                              // line 2
+        "\tvar a := EnumHost.Local.A\n",                     // line 3 — `a` at cols 5..6
+        "\tvar b := EnumHost.Nested.Deep.X\n",               // line 4 — `b` at cols 5..6
+        "\tvar c := Node.ProcessMode.PROCESS_MODE_ALWAYS\n", // line 5 — `c` at cols 5..6
+        "\tvar d := Vector2.Axis.AXIS_X\n",                  // line 6 — `d` at cols 5..6
+        "\tprint(a, b, c, d)\n",                             // line 7
+    );
+    let project = NativeProject::new(&[("host.gd", host), ("consumer.gd", consumer)]);
+    let (client, handle, _) = boot(&project);
+    let uri = project.uri("consumer.gd");
+    did_open(&client, &uri, consumer);
+
+    let host_uri = project.uri("host.gd").as_str().to_owned();
+    for (label, line, want_uri, want_start, want_end) in [
+        (
+            "a cross-file head-class enum",
+            3u32,
+            host_uri.clone(),
+            Position::new(3, 5),
+            Position::new(3, 10),
+        ),
+        (
+            "a cross-file INNER-class enum",
+            4,
+            host_uri.clone(),
+            Position::new(6, 6),
+            Position::new(6, 10),
+        ),
+    ] {
+        let loc = scalar(
+            type_definition_at(&client, &uri, Position::new(line, 5))
+                .unwrap_or_else(|| panic!("{label} resolves")),
+        );
+        assert_eq!(loc.uri.as_str(), want_uri, "{label}");
+        assert_eq!(loc.range.start, want_start, "{label}");
+        assert_eq!(loc.range.end, want_end, "{label}");
+    }
+
+    // A native enum and a builtin enum both anchor at their stub page's `enum <Name>` line, which
+    // `stubs` renders and keys by the enum's own name.
+    for (label, line, stub, name_len) in [
+        ("a native-class enum", 5u32, "/Node.gd", 11u32),
+        ("a builtin-type enum", 6, "/Vector2.gd", 4),
+    ] {
+        let loc = scalar(
+            type_definition_at(&client, &uri, Position::new(line, 5))
+                .unwrap_or_else(|| panic!("{label} resolves")),
+        );
+        assert!(
+            loc.uri.as_str().ends_with(stub),
+            "{label}: expected {stub}, got {}",
+            loc.uri.as_str()
+        );
+        // Stub enum lines open `enum <Name> {`, so the identifier starts at col 5.
+        assert_eq!(loc.range.start.character, 5, "{label}");
+        assert_eq!(loc.range.end.character, 5 + name_len, "{label} name length");
+    }
+
+    shutdown(&client, handle);
+}
+
+/// The `null` half of #393's enum arm. A `@GlobalScope` enum records a bare enum name with no
+/// owner, and the dump publishes no `@GlobalScope` page to anchor in, so it stays `null` rather
+/// than borrowing some other document that happens to declare the name (W10).
+#[test]
+fn type_definition_on_a_global_scope_enum_stays_null() {
+    let consumer = concat!(
+        "extends Node\n",       // line 0
+        "\n",                   // line 1
+        "func go() -> void:\n", // line 2
+        "\tvar e := OK\n",      // line 3 — `e` at cols 5..6
+        "\tprint(e)\n",         // line 4
+    );
+    let project = NativeProject::new(&[("consumer.gd", consumer)]);
+    let (client, handle, _) = boot(&project);
+    let uri = project.uri("consumer.gd");
+    did_open(&client, &uri, consumer);
+
+    assert!(
+        type_definition_at(&client, &uri, Position::new(3, 5)).is_none(),
+        "a @GlobalScope enum has no page to anchor in"
     );
 
     shutdown(&client, handle);
