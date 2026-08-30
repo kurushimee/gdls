@@ -1602,3 +1602,68 @@ class Mine extends External.E:
         "base-declared TARGET (int) must shadow both outer-declared ones; got {errs:?}"
     );
 }
+
+/// A `class_name` head in a type annotation is upstream's `CLASS` arm reached through gdls's
+/// interface walk (#338). It owes the same two-message split the in-file inner-class arm makes:
+/// a constant resolves on the meta base and comes back a value (analyzer.cpp:918), while an
+/// instance variable or a signal is not on a meta base at all (:915). Enums and inner classes
+/// resolve, and an enum *value* under one draws :918 against the enum's own qualified name.
+/// Every row is pinned against `godot --headless --check-only` at 4.7.2.
+#[test]
+fn a_cross_file_type_annotation_chain_splits_its_rejections_by_member_kind() {
+    const LIB: &str = "\
+class_name Lib1
+extends Node
+
+var lib_var = 1
+signal lib_sig
+const LIB_C = 5
+enum LibE { A }
+class LibInner:
+\tpass
+";
+    let project = Project::new(&[("res://lib1.gd", LIB), ("res://use.gd", "")]);
+    let use_ = |annotation: &str| {
+        format!("extends Node\n\nfunc f() -> void:\n\tvar x: {annotation} = null\n\tprint(x)\n")
+    };
+
+    for name in ["lib_var", "lib_sig", "Nope"] {
+        assert_eq!(
+            error_messages(&analyze_file(
+                &project,
+                "res://use.gd",
+                &use_(&format!("Lib1.{name}"))
+            )),
+            vec![format!(
+                r#"Could not find type "{name}" under base "Lib1"."#
+            )],
+            "{name}"
+        );
+    }
+    assert_eq!(
+        error_messages(&analyze_file(&project, "res://use.gd", &use_("Lib1.LIB_C"))),
+        vec![r#"Member "LIB_C" under base "Lib1" is not a valid type."#.to_owned()],
+    );
+    assert_eq!(
+        error_messages(&analyze_file(
+            &project,
+            "res://use.gd",
+            &use_("Lib1.LibE.A")
+        )),
+        vec![r#"Member "A" under base "Lib1.LibE" is not a valid type."#.to_owned()],
+    );
+    for (annotation, value) in [
+        ("Lib1.LibE", "Lib1.LibE.A"),
+        ("Lib1.LibInner", "null"),
+        ("Lib1", "null"),
+    ] {
+        let src = format!(
+            "extends Node\n\nfunc f() -> void:\n\tvar x: {annotation} = {value}\n\tprint(x)\n"
+        );
+        assert_eq!(
+            error_messages(&analyze_file(&project, "res://use.gd", &src)),
+            Vec::<String>::new(),
+            "{annotation}"
+        );
+    }
+}
