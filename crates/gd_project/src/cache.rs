@@ -115,7 +115,12 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// `preload_deps` and a `None` where a shape belongs, which reads as a missing dependency edge —
 /// the consumer would go stale on an edit instead of re-analyzing. v15 files are ignored and
 /// rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 16;
+/// v17 (#451): `MemberDecl` gained `params_soft`, and `params` now carries what a parameter's
+/// default value says when the parameter has no annotation. A v16 cache holds the poorer parameter
+/// list and no softness at all; warm-loading it would keep serving `Variant` for every `f(a := "")`
+/// parameter — the same serve-the-older-answer failure v14 and v15 fixed. v16 files are ignored and
+/// rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 17;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool

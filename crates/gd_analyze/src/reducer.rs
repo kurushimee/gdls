@@ -1221,6 +1221,21 @@ fn eval_binary(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedV
         }
     }
 
+    // `in` between two strings — `register_string_op(OperatorEvaluatorInStringFind, OP_IN)` at
+    // variant_op.cpp:922 registers all four String/StringName pairs, and the evaluator is a find:
+    // `a in b` is `b.find(a) != -1` (variant_op.h:1113-1139). An empty needle is the one place
+    // `find` and Rust's `contains` disagree — `String::find` bails on `p_str.is_empty()` and
+    // returns -1 (ustring.cpp:3040), so `"" in "abc"` is false upstream.
+    //
+    // These four pairs are the only ones that can reach here: an Array or Dictionary literal is
+    // `is_shared()` and never folds to a value, so `1 in [1, 2]` keeps taking the type-only path.
+    if op == BinaryOp::ContentTest {
+        if let (String(l) | StringName(l), String(r) | StringName(r)) = (a, b) {
+            return Some(Bool(!l.is_empty() && r.contains(l.as_str())));
+        }
+        return None;
+    }
+
     // Arithmetic — Int×Int, Int×Float, Float×Int, Float×Float only. Bool/String/Nil mixed with
     // anything (or themselves, for arithmetic) is NOT registered ⇒ None.
     match (a, b) {
@@ -4003,7 +4018,7 @@ fn reduce_builtin_constructor(
         }
         let mut types_match = true;
         for (i, &arg) in args.iter().enumerate() {
-            let par_type = constructor_param_type(ctx, &ctor.params[i]);
+            let par_type = dump_param_type(ctx, &ctor.params[i]);
             let arg_type = ctx.get_type(arg).clone();
             if !is_type_compatible(ctx, &par_type, &arg_type, true) {
                 types_match = false;
@@ -4023,7 +4038,7 @@ fn reduce_builtin_constructor(
             continue;
         }
         for (i, &arg) in args.iter().enumerate() {
-            let par_type = constructor_param_type(ctx, &ctor.params[i]);
+            let par_type = dump_param_type(ctx, &ctor.params[i]);
             if ctx.folds.is_constant(arg) {
                 update_const_expression_builtin_type(ctx, arg, &par_type, "pass", false);
             }
@@ -4082,11 +4097,15 @@ fn constant_arg_value_type(ctx: &AnalysisContext, arg: NodeId) -> Option<Variant
     }
 }
 
-/// `type_from_property(info.arguments[i], /*p_is_arg=*/true)` (analyzer.cpp:5841-5849) for a
-/// constructor parameter: [`type_from_type_ref`], except that a `Variant` parameter comes back HARD.
-/// The soft `DataType::variant()` would un-suppress the walk's UNSAFE_CALL_ARGUMENT guard, which
-/// exists precisely to stay quiet when the parameter accepts everything on purpose.
-fn constructor_param_type(ctx: &AnalysisContext, p: &gd_types::Param) -> DataType {
+/// `type_from_property(info.arguments[i], /*p_is_arg=*/true)` (analyzer.cpp:5841-5849) for any
+/// dump-declared parameter — a constructor's, a native method's, a builtin method's:
+/// [`type_from_type_ref`], except that a `Variant` parameter comes back HARD. Godot's own
+/// `p_is_arg` arm returns `kind = VARIANT` with the `ANNOTATED_EXPLICIT` source the function set
+/// on entry, and that hardness is load-bearing — a hard `Variant` parameter is the ONE shape
+/// `validate_call_arg`'s first arm stays quiet for (analyzer.cpp:6097). The soft
+/// `DataType::variant()` would draw `requires the subtype "Variant"` on every `Array.append`,
+/// `Object.set`, and `Dictionary.has` in a project (#449).
+fn dump_param_type(ctx: &AnalysisContext, p: &gd_types::Param) -> DataType {
     let mut t = type_from_type_ref(ctx, &p.ty);
     if t.kind == DtKind::Variant {
         t.type_source = TypeSource::AnnotatedExplicit;
@@ -5153,11 +5172,24 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 "Variant".to_owned()
             };
             if arg_type.is_variant() || !arg_type.is_hard_type() {
-                // analyzer.cpp:6109-6113 — Variant or soft argument passed to a hard non-Variant
-                // parameter. Godot emits UNSAFE_CALL_ARGUMENT unless the parameter is a hard
-                // Variant (then anything is fine). Symbol order:
+                // analyzer.cpp:6096-6100 — Variant or soft argument passed to a parameter.
+                // Godot's gate is `!(par_type.is_hard_type() && par_type.is_variant())`: the ONE
+                // parameter shape that accepts anything silently is a hard `Variant`. A soft
+                // parameter of any kind warns, including an untyped one, where both halves of
+                // the message render `"Variant"` (#449). Symbol order:
                 //  [arg_idx, "function", function_name, par_type, arg_type_strict]
-                if par_type.is_hard_type() && !par_type.is_variant() {
+                //
+                // gdls adds two exclusions Godot has no need of, both for the same reason: Godot
+                // always has a real DataType to name here and gdls sometimes does not. An
+                // parameter type left `Unresolved` — by an incomplete cross-file signature, or by
+                // a default the shallow pass could not decode
+                // (`gd_project::ParamTyping::Unknown`) — would render an internal placeholder as
+                // the required type, or name `"Variant"` where the declaring file has a real
+                // type: an outright wrong answer rather than a missing one. A genuinely untyped
+                // parameter is a different thing and does warn, naming `"Variant"` correctly.
+                if !(par_type.is_hard_type() && par_type.is_variant())
+                    && !matches!(par_type.kind, DtKind::Unresolved | DtKind::Resolving)
+                {
                     ctx.push_warning(
                         crate::warnings::WarningCode::UnsafeCallArgument,
                         &[
@@ -5959,11 +5991,7 @@ fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> 
         .iter()
         .find(|m| ctx.native.name_of(m.name) == name)?;
     let return_dt = type_from_type_ref(ctx, &m.return_type);
-    let par_types: Vec<DataType> = m
-        .params
-        .iter()
-        .map(|p| type_from_type_ref(ctx, &p.ty))
-        .collect();
+    let par_types: Vec<DataType> = m.params.iter().map(|p| dump_param_type(ctx, p)).collect();
     // Per-param default literals give the optional-argument boundary, identical to the native
     // path: `min_params` is the required count, `max_params` the total — so the arity check at
     // analyzer.cpp:5944 treats `Array.slice(2, 3)` / `Array.duplicate()` as valid. The dump only
@@ -6012,11 +6040,8 @@ pub(crate) fn lookup_native_method(
             .find(|m| ctx.native.name_of(m.name) == name)
         {
             let return_dt = type_from_type_ref(ctx, &m.return_type);
-            let par_types: Vec<DataType> = m
-                .params
-                .iter()
-                .map(|p| type_from_type_ref(ctx, &p.ty))
-                .collect();
+            let par_types: Vec<DataType> =
+                m.params.iter().map(|p| dump_param_type(ctx, p)).collect();
             let max_params = m.params.len();
             let min_params = m
                 .params
@@ -6674,10 +6699,36 @@ fn script_chain_call(
     };
     let par_n = member.params.len();
     let return_dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
+    // A parameter typed from its own default is SOFT when a plain `=` wrote it and hard when `:=`
+    // did (#451, `gd_project::ParamTyping`) — the same `resolve_assignable` split the member path
+    // reads through `MemberFlags::ty_is_soft`. Hardness gates the `Invalid argument` error and
+    // `UNSAFE_CALL_ARGUMENT`'s second arm, so it has to survive the seam. `Unknown` — a default the
+    // shallow pass could not decode — carries the no-type dummy instead of a `Variant`, so the
+    // argument checks stay off it entirely rather than naming a type gdls never read.
+    use gd_project::ParamTyping;
     let par_types: Vec<DataType> = member
         .params
         .iter()
-        .map(|p| resolve_interface_type_expr(ctx, link.file, p))
+        .enumerate()
+        .map(|(i, p)| {
+            let typing = member
+                .params_typing
+                .get(i)
+                .copied()
+                .unwrap_or(ParamTyping::Untyped);
+            if typing == ParamTyping::Unknown {
+                return DataType {
+                    kind: DtKind::Unresolved,
+                    type_source: TypeSource::Undetected,
+                    ..Default::default()
+                };
+            }
+            let mut dt = resolve_interface_type_expr(ctx, link.file, p);
+            if typing == ParamTyping::InferredSoft {
+                dt.type_source = TypeSource::Inferred;
+            }
+            dt
+        })
         .collect();
     ChainCall::Sig(
         Box::new(CallSig {
@@ -8952,6 +9003,45 @@ mod tests {
     use gd_syntax::ast::{BinaryOpNode, LiteralNode, Node, NodeKind, ParseTree, UnaryOpNode};
     use gd_syntax::Dialect;
     use gd_types::NativeDb;
+
+    /// #459: `in` between two constant strings. `eval_binary` had no `ContentTest` arm at all, so
+    /// every constant `in` came back `None` and `reduce_binary_op` read that as Godot's
+    /// `r_valid = false` and drew `Invalid operands to operator in, String and String.`
+    ///
+    /// The value itself is not observable from a diagnostic, so the four registered pairs and the
+    /// empty-needle carve-out are pinned straight against `String::find` (ustring.cpp:3033-3042).
+    #[test]
+    fn a_constant_in_between_two_strings_is_a_substring_test() {
+        let s = |v: &str| FoldedValue::String(v.to_owned());
+        let sn = |v: &str| FoldedValue::StringName(v.to_owned());
+        let got = |a: FoldedValue, b: FoldedValue| eval_binary(BinaryOp::ContentTest, &a, &b);
+
+        // All four String/StringName pairs are registered (variant_op.cpp:922 through
+        // register_string_op), and all four return a bool.
+        for (a, b) in [
+            (s("a"), s("abc")),
+            (s("a"), sn("abc")),
+            (sn("a"), s("abc")),
+            (sn("a"), sn("abc")),
+        ] {
+            assert_eq!(got(a, b), Some(FoldedValue::Bool(true)));
+        }
+        assert_eq!(got(s("z"), s("abc")), Some(FoldedValue::Bool(false)));
+        assert_eq!(got(s("abc"), s("a")), Some(FoldedValue::Bool(false)));
+        assert_eq!(got(s("abc"), s("abc")), Some(FoldedValue::Bool(true)));
+
+        // `String::find` bails on an empty needle and returns -1, where Rust's `contains` says
+        // true. An empty haystack is false either way.
+        assert_eq!(got(s(""), s("abc")), Some(FoldedValue::Bool(false)));
+        assert_eq!(got(s(""), s("")), Some(FoldedValue::Bool(false)));
+        assert_eq!(got(s("a"), s("")), Some(FoldedValue::Bool(false)));
+
+        // Nothing else registers `in` on a foldable pair — an Array or Dictionary literal is
+        // `is_shared()` and never reaches here.
+        assert_eq!(got(FoldedValue::Int(1), s("abc")), None);
+        assert_eq!(got(s("a"), FoldedValue::Int(1)), None);
+        assert_eq!(got(FoldedValue::Int(1), FoldedValue::Int(1)), None);
+    }
 
     /// #396: the shared-type table, pinned at both tags against `Variant::is_type_shared`. The one
     /// caller cannot reach the difference from real source today — `is_read_only` is only stamped

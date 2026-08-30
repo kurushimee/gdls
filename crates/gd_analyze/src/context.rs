@@ -398,6 +398,9 @@ pub struct AnalysisContext<'a> {
     /// the immutable tree, built once on first use instead of once per name-set sweep call.
     /// `OnceCell` because the sweep helpers hold `&AnalysisContext`.
     decl_ident_ids: std::cell::OnceCell<FxHashSet<NodeId>>,
+    /// Memoized bare-assignee identifier set (see [`Self::assignee_ident_ids`]). A pure function
+    /// of the tree, so it is built once per analysis and shared by both local sweeps.
+    assignee_ident_ids: std::cell::OnceCell<FxHashSet<NodeId>>,
     /// M5 WP-O3 / O4: once tripped, every subsequent governor / cancellation checkpoint
     /// short-circuits (the synthetic error has already been pushed; we don't want to spam the
     /// same diagnostic for every remaining call). Toggle is one-way per analyze pass.
@@ -469,6 +472,7 @@ impl<'a> AnalysisContext<'a> {
             checkpoint_delay: None,
             script_chains: std::cell::RefCell::new(FxHashMap::default()),
             decl_ident_ids: std::cell::OnceCell::new(),
+            assignee_ident_ids: std::cell::OnceCell::new(),
             bailed: false,
             sink: DiagnosticSink::new(),
         }
@@ -500,6 +504,22 @@ impl<'a> AnalysisContext<'a> {
     pub fn decl_ident_ids(&self) -> &FxHashSet<NodeId> {
         self.decl_ident_ids
             .get_or_init(|| build_decl_ident_ids(self.tree))
+    }
+
+    /// Identifier NodeIds sitting *bare* on the left of an assignment. `parse_assignment`
+    /// decrements the declaration's `usages` the moment it sees one (gdscript_parser.cpp:3135-3157,
+    /// "Also remove one usage since assignment isn't usage"), cancelling the increment
+    /// `parse_identifier` just made, so writing to a name is not using it. gdls counts uses by
+    /// sweeping identifier nodes rather than by keeping a counter, and excluding this set is the
+    /// exact equivalent of that decrement.
+    ///
+    /// Only a bare identifier assignee qualifies. A subscript or attribute assignee keeps its
+    /// base's use (`arr[0] = 2`, `v.x = 1`), matching the `case Node::SUBSCRIPT: // Okay.` arm.
+    /// The decrement covers locals, local constants, parameters, iterators, and pattern binds —
+    /// never members — so this set feeds only the two local sweeps, never `referenced_names`.
+    pub fn assignee_ident_ids(&self) -> &FxHashSet<NodeId> {
+        self.assignee_ident_ids
+            .get_or_init(|| build_assignee_ident_ids(self.tree))
     }
 
     /// M5 WP-O3 / O4: per-node governor + cancellation checkpoint. Call once at the entry of
@@ -830,6 +850,25 @@ fn build_decl_ident_ids(tree: &ParseTree) -> FxHashSet<NodeId> {
         };
         if let Some(i) = name_slot {
             out.insert(i);
+        }
+    }
+    out
+}
+
+/// Builder for [`AnalysisContext::assignee_ident_ids`].
+fn build_assignee_ident_ids(tree: &ParseTree) -> FxHashSet<NodeId> {
+    use gd_syntax::ast::NodeKind;
+
+    let mut out = FxHashSet::default();
+    for id in tree.iter_ids() {
+        let NodeKind::Assignment(a) = &tree.get(id).kind else {
+            continue;
+        };
+        let Some(assignee) = a.assignee else {
+            continue;
+        };
+        if matches!(tree.get(assignee).kind, NodeKind::Identifier(_)) {
+            out.insert(assignee);
         }
     }
     out

@@ -140,6 +140,33 @@ pub enum InitShape {
     Preload { path: String, construct: bool },
 }
 
+/// How a `func` parameter got its type — what a [`TypeExpr`] alone cannot say. Godot routes a
+/// parameter through `resolve_assignable` (`gdscript_analyzer.cpp:2255-2258`), whose
+/// no-specified-type arm stamps `ANNOTATED_INFERRED` when the declaration used `:=` and plain
+/// `INFERRED` otherwise. Hardness gates the `Invalid argument` error and `UNSAFE_CALL_ARGUMENT`'s
+/// second arm, so it has to cross the seam; so does the difference between a parameter that is
+/// genuinely untyped and one whose default the shallow pass simply could not read.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum ParamTyping {
+    /// `a: String` — a written annotation. Hard.
+    Annotated,
+    /// `a := ""` — inferred from the default, `ANNOTATED_INFERRED`. Hard.
+    InferredHard,
+    /// `a = ""` — inferred from the default, plain `INFERRED`. Soft.
+    InferredSoft,
+    /// `a` — no annotation and no default. A soft `Variant`, and Godot says so: a call passing
+    /// anything into it draws `requires the subtype "Variant"`.
+    #[default]
+    Untyped,
+    /// A default the shallow pass could not decode (`a := TileSet.TILE_SHAPE_SQUARE`). Godot has
+    /// a real type here and gdls does not, so the reader must degrade to "no type" rather than to
+    /// `Variant` — claiming `Variant` would render the wrong name in a warning that is otherwise
+    /// correct to fire.
+    Unknown,
+}
+
 /// One exposed member of a class.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberDecl {
@@ -147,8 +174,14 @@ pub struct MemberDecl {
     pub kind: MemberKind,
     /// The declared type (a `var`/`const`'s annotation, or a `func`'s return type).
     pub ty: TypeExpr,
-    /// Parameter types for `func`/`signal` members; empty otherwise.
+    /// Parameter types for `func`/`signal` members; empty otherwise. A parameter with no
+    /// annotation but a default value carries what the shallow pass could read off that default
+    /// ([`initializer_type_expr`], the same decode `var_member` uses), so `f(a := "")` crosses as
+    /// `String` rather than as nothing.
     pub params: Vec<TypeExpr>,
+    /// Parallel to [`Self::params`]: how that parameter got its type, which a `TypeExpr` alone
+    /// cannot say. Empty for non-func/signal members.
+    pub params_typing: Vec<ParamTyping>,
     /// Parameter identifier names for `func`/`signal` members, parallel to `params`. Empty for
     /// non-func/signal members, and empty for parameters without identifiers (rare, defensive).
     /// Not included in `signature_hash` — param renames don't change call compatibility in
@@ -328,6 +361,7 @@ impl Interface {
             m.kind.hash(h);
             m.ty.hash(h);
             m.params.hash(h);
+            m.params_typing.hash(h);
             m.required_params.hash(h);
             m.flags.hash(h);
             m.init.hash(h);
@@ -579,6 +613,7 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         kind,
         ty,
         params: Vec::new(),
+        params_typing: Vec::new(),
         param_names: Vec::new(),
         required_params: 0,
         flags: MemberFlags {
@@ -615,6 +650,7 @@ fn const_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         kind: MemberKind::Const,
         ty,
         params: Vec::new(),
+        params_typing: Vec::new(),
         param_names: Vec::new(),
         required_params: 0,
         flags: MemberFlags::default(),
@@ -633,19 +669,48 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     };
     let ident_id = f.identifier?;
     let name = ident_name(tree, Some(ident_id))?;
-    let (params, param_names): (Vec<TypeExpr>, Vec<String>) = f
-        .parameters
-        .iter()
-        .map(|&p| match &tree.get(p).kind {
-            NodeKind::Parameter(pn) => (
-                type_expr(tree, pn.datatype_specifier),
-                ident_name(tree, pn.identifier)
-                    .map(|n| n.to_owned())
-                    .unwrap_or_default(),
-            ),
-            _ => (TypeExpr::None, String::new()),
-        })
-        .unzip();
+    // A parameter with no annotation still has a type when it has a default: Godot resolves it
+    // through `resolve_assignable`, exactly as it resolves an untyped `var`'s (#451). Read the
+    // default with the same shallow decode the member path uses, and record whether `:=` or a
+    // plain `=` wrote it — the first is `ANNOTATED_INFERRED` (hard), the second `INFERRED` (soft).
+    let mut params: Vec<TypeExpr> = Vec::with_capacity(f.parameters.len());
+    let mut param_names: Vec<String> = Vec::with_capacity(f.parameters.len());
+    let mut params_typing: Vec<ParamTyping> = Vec::with_capacity(f.parameters.len());
+    for &p in &f.parameters {
+        let (ty, name, typing) = match &tree.get(p).kind {
+            NodeKind::Parameter(pn) => {
+                let annotated = type_expr(tree, pn.datatype_specifier);
+                let (ty, typing) = if annotated != TypeExpr::None {
+                    (annotated, ParamTyping::Annotated)
+                } else if pn.initializer.is_some() {
+                    match initializer_type_expr(tree, pn.initializer) {
+                        // `f(a = null)` is not an unread type — Godot resolves `null` to a plain
+                        // soft `Variant`, the same answer a bare `f(a)` gets, and the argument
+                        // check names it that way.
+                        TypeExpr::None if is_null_literal(tree, pn.initializer) => {
+                            (TypeExpr::None, ParamTyping::Untyped)
+                        }
+                        TypeExpr::None => (TypeExpr::None, ParamTyping::Unknown),
+                        t if pn.infer_datatype => (t, ParamTyping::InferredHard),
+                        t => (t, ParamTyping::InferredSoft),
+                    }
+                } else {
+                    (TypeExpr::None, ParamTyping::Untyped)
+                };
+                (
+                    ty,
+                    ident_name(tree, pn.identifier)
+                        .map(|n| n.to_owned())
+                        .unwrap_or_default(),
+                    typing,
+                )
+            }
+            _ => (TypeExpr::None, String::new(), ParamTyping::Untyped),
+        };
+        params.push(ty);
+        param_names.push(name);
+        params_typing.push(typing);
+    }
     let defaulted = f
         .parameters
         .iter()
@@ -660,6 +725,7 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         kind: MemberKind::Func,
         ty: type_expr(tree, f.return_type),
         params,
+        params_typing,
         param_names,
         required_params,
         flags: MemberFlags {
@@ -702,6 +768,17 @@ fn signal_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         name,
         kind: MemberKind::Signal,
         ty: TypeExpr::None,
+        // A signal parameter cannot carry a default, so it is annotated or nothing.
+        params_typing: params
+            .iter()
+            .map(|t| {
+                if *t == TypeExpr::None {
+                    ParamTyping::Untyped
+                } else {
+                    ParamTyping::Annotated
+                }
+            })
+            .collect(),
         params,
         param_names,
         required_params,
@@ -728,6 +805,7 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         kind: MemberKind::Enum,
         ty: TypeExpr::None,
         params: Vec::new(),
+        params_typing: Vec::new(),
         param_names: Vec::new(),
         required_params: 0,
         flags: MemberFlags::default(),
@@ -813,6 +891,7 @@ fn enum_value_member(tree: &ParseTree, value: &EnumValue) -> Option<MemberDecl> 
         kind: MemberKind::Const,
         ty: TypeExpr::None,
         params: Vec::new(),
+        params_typing: Vec::new(),
         param_names: Vec::new(),
         required_params: 0,
         flags: MemberFlags::default(),
@@ -865,6 +944,16 @@ fn type_expr(tree: &ParseTree, opt: Option<NodeId>) -> TypeExpr {
 /// #431: this is the floor a cross-file member's type falls to. Every shape missing here reads as
 /// `Variant` from another file while Godot has a real type, which silences the member access on
 /// it and then everything downstream of that.
+/// Whether `init` is the literal `null`. [`initializer_type_expr`] answers `TypeExpr::None` for it
+/// the same way it does for anything it cannot read, but the two mean different things to a
+/// parameter: `null` really is a soft `Variant`, while an unread initializer is a type the
+/// declaring file has and gdls does not.
+fn is_null_literal(tree: &ParseTree, init: Option<NodeId>) -> bool {
+    init.is_some_and(|id| {
+        matches!(&tree.get(id).kind, NodeKind::Literal(l) if l.value == gd_syntax::token::Literal::Null)
+    })
+}
+
 fn initializer_type_expr(tree: &ParseTree, init: Option<NodeId>) -> TypeExpr {
     use gd_syntax::token::Literal;
     let named = |s: &str| TypeExpr::Named {
@@ -1318,6 +1407,57 @@ var b := pick().new()
             i.members.iter().find(|m| m.name == "b").unwrap().ty,
             TypeExpr::None
         );
+    }
+
+    #[test]
+    fn a_parameters_default_gives_it_a_type_and_a_hardness() {
+        let iface = iface(
+            "extends Node\n\
+             func f(bare, annotated: String, hard := \"\", soft = 1, unknown := TileSet.TILE_SHAPE_SQUARE) -> void:\n\
+             \tpass\n",
+        );
+        let m = iface
+            .members
+            .iter()
+            .find(|m| m.name == "f")
+            .expect("func member");
+        let named = |n: &str| TypeExpr::Named {
+            path: vec![n.to_owned()],
+            args: vec![],
+        };
+        assert_eq!(
+            m.params,
+            vec![
+                TypeExpr::None,
+                named("String"),
+                named("String"),
+                named("int"),
+                // A dotted native enum constant is not something the shallow pass can decode.
+                TypeExpr::None,
+            ]
+        );
+        assert_eq!(
+            m.params_typing,
+            vec![
+                ParamTyping::Untyped,
+                ParamTyping::Annotated,
+                ParamTyping::InferredHard,
+                ParamTyping::InferredSoft,
+                ParamTyping::Unknown,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_parameters_default_changes_the_hash() {
+        // Nothing else in the interface moves when `a := ""` becomes `a := 0`, so without the
+        // parameter type in the hash a caller would keep checking against the old one.
+        let a = iface("extends Node\nfunc f(a := \"\") -> void:\n\tpass\n");
+        let b = iface("extends Node\nfunc f(a := 0) -> void:\n\tpass\n");
+        assert_ne!(a.signature_hash(), b.signature_hash());
+        // And `:=` versus `=` is a hardness change the caller must see too.
+        let c = iface("extends Node\nfunc f(a = \"\") -> void:\n\tpass\n");
+        assert_ne!(a.signature_hash(), c.signature_hash());
     }
 
     #[test]

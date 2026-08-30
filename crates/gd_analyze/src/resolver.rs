@@ -5151,12 +5151,15 @@ fn emit_unused_parameter_warnings(
 
     // Collect identifier-name references inside the body's byte span. Skip declaration
     // identifiers (Godot's `usages` counter only counts true references, not the decl
-    // identifier itself), via the shared per-analysis cache on the context.
+    // identifier itself) and bare assignment targets (`parse_assignment` decrements the
+    // parameter's `usages` on sight, gdscript_parser.cpp:3148-3150), via the shared
+    // per-analysis caches on the context.
     let decl_ident_ids = ctx.decl_ident_ids();
+    let assignee_ident_ids = ctx.assignee_ident_ids();
     let mut used_names = rustc_hash::FxHashSet::<String>::default();
     for id in ctx.tree.iter_ids() {
         let node = ctx.node(id);
-        if decl_ident_ids.contains(&id) {
+        if decl_ident_ids.contains(&id) || assignee_ident_ids.contains(&id) {
             continue;
         }
         if node.span.start < body_span.start || node.span.end > body_span.end {
@@ -5466,17 +5469,21 @@ fn warn_unused_local(
     };
     let suite_end = ctx.node(suite_id).span.end;
     let decl_end = ctx.node(decl_id).span.end;
-    // Declaration identifiers never count as uses (Godot's `usages` counts references only).
-    // The set comes from the shared per-analysis cache on the context — one O(nodes) walk per
-    // analysis, not per declaration.
+    // Declaration identifiers never count as uses (Godot's `usages` counts references only),
+    // and neither does a bare assignment target — `parse_assignment` decrements the local's
+    // `usages` the moment it sees one (gdscript_parser.cpp:3141-3153). Both sets come from the
+    // shared per-analysis caches on the context — one O(nodes) walk per analysis, not per
+    // declaration.
     let decl_ident_ids = ctx.decl_ident_ids();
+    let assignee_ident_ids = ctx.assignee_ident_ids();
     for id in ctx.tree.iter_ids() {
         let node = ctx.node(id);
         if node.span.start < decl_end || node.span.end > suite_end {
             continue;
         }
         if let NodeKind::Identifier(i) = &node.kind {
-            if i.name == name && !decl_ident_ids.contains(&id) {
+            if i.name == name && !decl_ident_ids.contains(&id) && !assignee_ident_ids.contains(&id)
+            {
                 return; // used
             }
         }
