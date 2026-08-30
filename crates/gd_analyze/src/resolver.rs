@@ -1642,6 +1642,20 @@ fn resolve_class_member(
             ctx.current_resolving_member = Some(name.clone());
             resolve_assignable(ctx, id, spec, init, infer, true);
             ctx.current_resolving_member = prev_resolving;
+            // analyzer.cpp:2124-2133 — the same constant-expression check the local arm runs. A
+            // class-level `const` had none at all, so `const A = Node` was accepted silently and
+            // then flowed on as a type alias (#338's meta-constant arm reads such a constant back
+            // as a type).
+            if let Some(init_id) = init {
+                if const_init_nonconstant_ref(ctx, init_id).is_some() {
+                    ctx.push_error(
+                        format!(
+                            r#"Assigned value for constant "{name}" isn't a constant expression."#
+                        ),
+                        init_id,
+                    );
+                }
+            }
             // Const-only typed-array element narrowing: when the init is a homogeneous-typed
             // array literal (`const X := [0, 1, 2]`), Godot stamps Array[int] onto the
             // constant. Narrows on top of the resolve_assignable type so downstream subscripts
@@ -5001,16 +5015,13 @@ fn resolve_constant_local(ctx: &mut AnalysisContext, const_id: NodeId) {
         crate::warnings::WarningCode::UnusedLocalConstant,
     );
     warn_confusable_identifier(ctx, const_id);
-    // analyzer.cpp:2118-2123 — constant initializer must reduce to a constant expression.
-    // gdls's fold table is incomplete (preload / Color.RED / native enum values stamp
-    // placeholder folds that aren't fully tracked), so checking `is_reduced` directly
-    // false-positives. Instead, walk the init AST and look for any identifier that
-    // resolves to a local Variable / Parameter / ForVariable / PatternBind — these are
-    // unambiguously non-constant. Constants (LocalKind::Constant) are fine.
+    // analyzer.cpp:2124-2133 — the constant initializer must reduce to a constant expression. See
+    // `const_init_nonconstant_ref` for why this is a positive-identification walk over the AST
+    // rather than a read of a fold bit.
     if let Some(init_id) = init {
-        if let Some(bad_ref) = init_references_nonconstant_local(ctx, init_id) {
+        if const_init_nonconstant_ref(ctx, init_id).is_some() {
             let name = decl_identifier_name(ctx, const_id);
-            let _ = bad_ref; // anchor at the init expression, not the bad ref, for consistency
+            // Anchored at the init expression, matching Godot's `p_assignable->initializer`.
             ctx.push_error(
                 format!(r#"Assigned value for constant "{name}" isn't a constant expression."#),
                 init_id,
@@ -5079,21 +5090,52 @@ fn expression_references_nonconstant_member(
     false
 }
 
-/// Walk the expression tree of `expr_id` looking for any identifier that resolves to a
-/// non-constant local (Variable / Parameter / ForVariable / PatternBind). Returns the
-/// offending NodeId on hit, `None` if every identifier reaches a Constant local (or no
-/// local). Constants and unresolved-to-locals identifiers are fine.
-fn init_references_nonconstant_local(ctx: &AnalysisContext, expr_id: NodeId) -> Option<NodeId> {
-    use gd_syntax::ast::LocalKind;
+/// analyzer.cpp:2124-2133 — a constant initializer must reduce to a constant expression. Godot
+/// decides that from `ExpressionNode::is_constant`, a bit its reducer stamps everywhere it folds a
+/// value; gdls does not track that bit, and reading its own fold table directly false-positives
+/// (preload, `Color.RED`, and native enum values stamp placeholder folds that are not fully
+/// tracked). So this walks the initializer for a subexpression that can NEVER be constant,
+/// whatever the fold table did or did not manage.
+///
+/// **Positive identification only.** Anything the walk cannot place — an unresolved name, a shape
+/// outside the classification — is treated as constant and stays silent. A missed diagnostic is a
+/// gap; a false one on a `const` Godot accepts would be a lie.
+///
+/// Returns the offending node, `None` when nothing in the initializer disqualifies it.
+fn const_init_nonconstant_ref(ctx: &AnalysisContext, expr_id: NodeId) -> Option<NodeId> {
     let mut stack: Vec<NodeId> = vec![expr_id];
     while let Some(id) = stack.pop() {
         match &ctx.node(id).kind {
             NodeKind::Identifier(i) => {
-                let name = i.name.clone();
-                if let Some(local) = crate::reducer::lookup_local(ctx, &name) {
-                    if !matches!(local.kind, LocalKind::Constant) {
-                        return Some(id);
-                    }
+                if matches!(classify_const_identifier(ctx, &i.name), ConstRef::Never) {
+                    return Some(id);
+                }
+            }
+            // analyzer.cpp:4789 — `reduce_self` sets `is_constant = false` unconditionally.
+            NodeKind::SelfExpr => return Some(id),
+            NodeKind::Call(c) => {
+                // A call folds only through an IDENTIFIER callee: the builtin constructor
+                // (analyzer.cpp:3326) and the two utility-function arms (:3493, :3544) are the only
+                // sites that set `is_constant` on a call, and the `make_call_reduced_value` fallback
+                // (:5391) opens with `if (p_call->get_callee_type() == IDENTIFIER)`. So an ATTRIBUTE
+                // callee — `In.new()`, `Node.new()`, `Lib1.new()`, `obj.method()` — can never fold,
+                // whatever it resolves to.
+                //
+                // An identifier callee is skipped whole, arguments included: `Vector2(1, 2)` and
+                // `Color("red")` do fold, and gdls cannot tell those from a project `my_func()`
+                // without the fold table this walk exists to avoid.
+                let attribute_callee = c.callee.is_some_and(|callee| {
+                    matches!(
+                        &ctx.node(callee).kind,
+                        NodeKind::Subscript(sub)
+                            if matches!(
+                                sub.access,
+                                Some(gd_syntax::ast::SubscriptAccess::Attribute(_))
+                            )
+                    )
+                });
+                if attribute_callee {
+                    return Some(id);
                 }
             }
             NodeKind::BinaryOp(b) => {
@@ -5120,14 +5162,44 @@ fn init_references_nonconstant_local(ctx: &AnalysisContext, expr_id: NodeId) -> 
                     stack.push(e);
                 }
             }
-            NodeKind::Subscript(s) => {
-                if let Some(b) = s.base {
-                    stack.push(b);
+            // `Base.member` — the ATTRIBUTE lookup is what makes a meta base constant
+            // (analyzer.cpp:4817-4850), so `Node.PROCESS_MODE_INHERIT`, `Vector2.ZERO`, `Kind.ONE`,
+            // and `External.InnerClass` all fold even though the base NAME alone would not. An
+            // identifier base is therefore classified in SCOPE-ONLY mode: a local or member that is
+            // not a constant still disqualifies it (`some_var.x`), while a global class / builtin /
+            // global enum name does not. A non-identifier base (`self.x`, `[Node].foo`) carries no
+            // such exemption and walks normally; a nested `A.B.C` re-enters this arm at the inner
+            // subscript. The attribute identifier itself is never pushed.
+            NodeKind::Subscript(s) => match s.access {
+                Some(gd_syntax::ast::SubscriptAccess::Attribute(_)) => {
+                    if let Some(base) = s.base {
+                        match &ctx.node(base).kind {
+                            NodeKind::Identifier(i) => {
+                                if matches!(
+                                    classify_const_identifier_in_scope(ctx, &i.name),
+                                    ConstRef::Never
+                                ) {
+                                    return Some(base);
+                                }
+                            }
+                            _ => stack.push(base),
+                        }
+                    }
                 }
-                if let Some(gd_syntax::ast::SubscriptAccess::Index(Some(idx))) = s.access {
-                    stack.push(idx);
+                Some(gd_syntax::ast::SubscriptAccess::Index(idx)) => {
+                    if let Some(b) = s.base {
+                        stack.push(b);
+                    }
+                    if let Some(idx) = idx {
+                        stack.push(idx);
+                    }
                 }
-            }
+                None => {
+                    if let Some(b) = s.base {
+                        stack.push(b);
+                    }
+                }
+            },
             NodeKind::Array(a) => {
                 for &el in &a.elements {
                     stack.push(el);
@@ -5143,13 +5215,127 @@ fn init_references_nonconstant_local(ctx: &AnalysisContext, expr_id: NodeId) -> 
                     }
                 }
             }
-            // Call / Cast / TypeTest / etc. — we consider these constant-safe for now (the
-            // call dispatcher may have already emitted any "non-constant call" diagnostic). The
-            // narrow gate above is sufficient for the `const TEST = 13 + i` corpus shape.
+            // Preload, Cast, TypeTest, Lambda, GetNode, Await, Literal — left constant-safe. The
+            // first three genuinely fold in Godot; the rest never do, but they are outside what the
+            // issue pinned against the oracle, so they stay an under-report rather than a guess.
             _ => {}
         }
     }
     None
+}
+
+/// What a bare name in a constant initializer resolves to, as far as constant-ness goes.
+enum ConstRef {
+    /// The name resolves to something that can never be a constant expression.
+    Never,
+    /// The name resolves to something that folds — no diagnostic, and stop looking.
+    Fine,
+    /// Nothing in this layer carries the name; resolution continues outward.
+    Absent,
+}
+
+/// The SCOPE half of [`classify_const_identifier`]: locals, in-file class members, and the
+/// cross-file base chain — everything that can SHADOW a global name. Split out because an attribute
+/// base gets this half only (see the `Subscript` arm of [`const_init_nonconstant_ref`]).
+fn classify_const_identifier_in_scope(ctx: &AnalysisContext, name: &str) -> ConstRef {
+    use gd_syntax::ast::LocalKind;
+
+    // A local. Only `LocalKind::Constant` folds (analyzer.cpp:4614-4655 — `LOCAL_BIND` sets
+    // `is_constant` on the DataType, never on the node, so a pattern bind stays non-constant).
+    if let Some(local) = crate::reducer::lookup_local(ctx, name) {
+        return match local.kind {
+            LocalKind::Constant => ConstRef::Fine,
+            _ => ConstRef::Never,
+        };
+    }
+
+    // An in-file class member, searched base-before-outer exactly as name resolution does.
+    if let Some(class_id) = ctx.current_class {
+        for look in scope_classes(ctx, class_id) {
+            if class_identifier_name(ctx, look).as_deref() == Some(name) {
+                // An in-file class NAME folds (analyzer.cpp:4040-4047).
+                return ConstRef::Fine;
+            }
+            if let Some(member) = class_member(ctx, look, name) {
+                return match member {
+                    // analyzer.cpp:4205-4225 — CONSTANT / ENUM / ENUM_VALUE all fold, and
+                    // MEMBER_CLASS folds through the helper at :4040-4047.
+                    Member::Constant(_)
+                    | Member::Enum(_)
+                    | Member::EnumValue(_)
+                    | Member::Class(_)
+                    | Member::Group(_) => ConstRef::Fine,
+                    Member::Variable(_) | Member::Signal(_) | Member::Function(_) => {
+                        ConstRef::Never
+                    }
+                };
+            }
+        }
+    }
+
+    // The cross-file base chain. Without this step a base class's `const Node = 5` — or any
+    // constant named like a native class — would fall through to the global arms and be reported,
+    // which is exactly the false positive this walk must not produce.
+    if let Some(base) = crate::reducer::current_class_script_base(ctx) {
+        for link in crate::script_chain::scope_refs(ctx, &base) {
+            let Some(iface) = crate::script_chain::link_interface(ctx.xfile, &link) else {
+                continue;
+            };
+            if iface.enums.iter().any(|e| e.name.as_str() == name)
+                || iface
+                    .inner
+                    .iter()
+                    .any(|c| c.class_name.as_deref() == Some(name))
+            {
+                return ConstRef::Fine;
+            }
+            if let Some(m) = iface.members.iter().find(|m| m.name.as_str() == name) {
+                return match m.kind {
+                    gd_project::MemberKind::Const | gd_project::MemberKind::Enum => ConstRef::Fine,
+                    gd_project::MemberKind::Var
+                    | gd_project::MemberKind::Property
+                    | gd_project::MemberKind::Func
+                    | gd_project::MemberKind::Signal => ConstRef::Never,
+                };
+            }
+        }
+    }
+
+    ConstRef::Absent
+}
+
+/// Whether a bare name used as a VALUE inside a constant initializer disqualifies it. Mirrors
+/// `reduce_identifier`'s own precedence (analyzer.cpp:4387-4680): scope first, then the globals.
+fn classify_const_identifier(ctx: &AnalysisContext, name: &str) -> ConstRef {
+    match classify_const_identifier_in_scope(ctx, name) {
+        found @ (ConstRef::Never | ConstRef::Fine) => return found,
+        ConstRef::Absent => {}
+    }
+
+    // analyzer.cpp:4541-4545 — a native class name sets a meta DataType and no node `is_constant`.
+    if ctx.native.class_named(name).is_some() {
+        return ConstRef::Never;
+    }
+    // analyzer.cpp:4571-4574 — the `ScriptServer::is_global_class` arm, same story.
+    if ctx.xfile.global_class_file(name).is_some() {
+        return ConstRef::Never;
+    }
+    // analyzer.cpp:4556-4563 — a bare builtin type name. The "cannot be used as a name on its own"
+    // and "not declared" errors fire first in Godot too; this is the third line it adds.
+    if builtin_type_from_name(name).is_some() || name == "Variant" {
+        return ConstRef::Never;
+    }
+    // analyzer.cpp:4620-4631 — a global CONSTANT (an enum's value included) folds …
+    if ctx.native.global_enum_value(name).is_some() {
+        return ConstRef::Fine;
+    }
+    // … while the global ENUM's own name (analyzer.cpp:4646-4652) does not.
+    if ctx.native.global_enum(name).is_some() {
+        return ConstRef::Never;
+    }
+    // Utility functions (`abs`), `PI`/`TAU`/`INF`/`NAN`, autoloads, inherited native members, and
+    // anything unresolved: all fold in Godot, or already carry their own "not declared" error.
+    ConstRef::Fine
 }
 
 /// `is_shadowing(identifier, kind, true)` (analyzer.cpp:6165-6173, current-class branch).
