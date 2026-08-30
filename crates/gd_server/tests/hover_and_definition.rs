@@ -307,6 +307,99 @@ fn hover_on_inner_class_declaration_renders_class_line() {
     shutdown(&client, handle);
 }
 
+/// #411: a member named bare in value position renders the same declaration card the `self.`
+/// spelling has rendered since #258 — the doc a user wrote must be visible in the position their
+/// code actually uses.
+#[test]
+fn hover_on_a_bare_member_renders_its_declaration_and_doc() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/bare.gd".parse().unwrap();
+    //  0: extends Node
+    //  1:
+    //  2: ## The speed doc.
+    //  3: var speed: int = 3
+    //  4:
+    //  5: ## The cap doc.
+    //  6: const CAP := 9
+    //  7:
+    //  8: ## The sig doc.
+    //  9: signal pinged(x: int)
+    // 10:
+    // 11: ## The mode doc.
+    // 12: enum Mode { A, B }
+    // 13:
+    // 14: func _ready() -> void:
+    // 15: \tprint(speed)
+    // 16: \tprint(CAP)
+    // 17: \tprint(pinged)
+    // 18: \tprint(Mode)
+    did_open(
+        &client,
+        &uri,
+        concat!(
+            "extends Node\n\n",
+            "## The speed doc.\nvar speed: int = 3\n\n",
+            "## The cap doc.\nconst CAP := 9\n\n",
+            "## The sig doc.\nsignal pinged(x: int)\n\n",
+            "## The mode doc.\nenum Mode { A, B }\n\n",
+            "func _ready() -> void:\n",
+            "\tprint(speed)\n\tprint(CAP)\n\tprint(pinged)\n\tprint(Mode)\n",
+        ),
+    );
+
+    for (line, sig, doc) in [
+        (15, "var speed: int", "The speed doc."),
+        (16, "const CAP: int", "The cap doc."),
+        (17, "signal pinged(x: int)", "The sig doc."),
+        (18, "enum Mode", "The mode doc."),
+    ] {
+        let hover = hover_at(&client, &uri, Position::new(line, 8))
+            .unwrap_or_else(|| panic!("expected a hover at line {line}"));
+        let md = hover_markdown(&hover);
+        assert!(md.contains(sig), "line {line}: wanted {sig:?}, got {md:?}");
+        assert!(md.contains(doc), "line {line}: wanted {doc:?}, got {md:?}");
+    }
+
+    shutdown(&client, handle);
+}
+
+/// A local, a parameter, and a `for` variable have no declaration card and no doc, so they keep
+/// the plain type label — including when one shadows a member of the same name.
+#[test]
+fn hover_on_a_local_keeps_the_plain_type_label() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/bareloc.gd".parse().unwrap();
+    //  0: extends Node
+    //  1:
+    //  2: ## The speed doc.
+    //  3: var speed: int = 3
+    //  4:
+    //  5: func take(amount: int) -> void:
+    //  6: \tvar speed = "shadow"
+    //  7: \tprint(speed)
+    //  8: \tprint(amount)
+    did_open(
+        &client,
+        &uri,
+        concat!(
+            "extends Node\n\n",
+            "## The speed doc.\nvar speed: int = 3\n\n",
+            "func take(amount: int) -> void:\n",
+            "\tvar speed = \"shadow\"\n\tprint(speed)\n\tprint(amount)\n",
+        ),
+    );
+
+    let shadowed = hover_at(&client, &uri, Position::new(7, 8)).expect("hover on the shadow");
+    let md = hover_markdown(&shadowed);
+    assert!(md.contains("String"), "got {md:?}");
+    assert!(!md.contains("The speed doc."), "got {md:?}");
+
+    let param = hover_at(&client, &uri, Position::new(8, 8)).expect("hover on the parameter");
+    assert!(hover_markdown(&param).contains("int"));
+
+    shutdown(&client, handle);
+}
+
 /// #412: the type-label fallback answers "what type is the node around here". Around a tab, an
 /// operator, a delimiter, or a structural keyword that node is the enclosing statement, so hovering
 /// blank space used to pop a card naming the statement's type — most often `Nil`.
@@ -389,20 +482,17 @@ fn a_void_typed_expression_reads_as_null_not_nil() {
     // 2: const N = null
     // 3:
     // 4: func _ready() -> void:
-    // 5: \tprint(N)
+    // 5: \tpass
     did_open(
         &client,
         &uri,
-        "extends Node\n\nconst N = null\n\nfunc _ready() -> void:\n\tprint(N)\n",
+        "extends Node\n\nconst N = null\n\nfunc _ready() -> void:\n\tpass\n",
     );
 
-    for (line, character, what) in [(2, 6, "the declaration name"), (5, 7, "a use")] {
-        let hover = hover_at(&client, &uri, Position::new(line, character))
-            .unwrap_or_else(|| panic!("expected a hover on {what}"));
-        let md = hover_markdown(&hover);
-        assert!(md.contains("null"), "{what}: got {md:?}");
-        assert!(!md.contains("Nil"), "{what}: got {md:?}");
-    }
+    let hover = hover_at(&client, &uri, Position::new(2, 6)).expect("hover on the declaration");
+    let md = hover_markdown(&hover);
+    assert!(md.contains("const N: null"), "got {md:?}");
+    assert!(!md.contains("Nil"), "got {md:?}");
 
     shutdown(&client, handle);
 }
