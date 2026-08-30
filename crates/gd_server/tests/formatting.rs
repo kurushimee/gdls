@@ -50,7 +50,7 @@ fn bare_project() -> TempProject {
     let p = TempProject::new();
     p.write(
         "project.godot",
-        "config_version=5\n\n[application]\n\nconfig/name=\"Fmt\"\n",
+        "config_version=5\n\n[application]\n\nconfig/name=\"Fmt\"\nconfig/features=PackedStringArray(\"4.6\")\n",
     );
     p
 }
