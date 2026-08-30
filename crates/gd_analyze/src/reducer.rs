@@ -3981,6 +3981,14 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     let mut is_self = false;
 
     if call.is_super {
+        // analyzer.cpp:3564-3566 — a bare `super()` names the parent's method of the enclosing
+        // function, and a lambda is not that function, so it has nothing to name. The gate is the
+        // lambda cursor at the CALL site, not the enclosing function: a `super()` written directly
+        // in a method is fine even when that method also declares lambdas elsewhere. `super.foo()`
+        // carries a callee and stays legal.
+        if call.callee.is_none() && !ctx.current_lambda_stack.is_empty() {
+            ctx.push_error("Cannot use `super()` inside a lambda.", id);
+        }
         // Super-call: base = parent class. Look up the current class's base_type from ctx.bases.
         if let Some(cc) = ctx.current_class {
             let mut bt = ctx.bases.get(&cc).cloned().unwrap_or_default();
@@ -4165,6 +4173,15 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         );
         ctx.set_type(id, call_type);
         return;
+    }
+
+    // analyzer.cpp:5902-5910 — an enum TYPE can be treated as a dictionary and keeps its methods,
+    // but an enum VALUE has none, so a call on one is rejected before the walk. Godot returns
+    // false straight after, which leaves `found` clear and hands the callee to
+    // `reduce_identifier_from_base` below — that is where the companion
+    // `Cannot get property from enum value.` comes from, so both lines land in Godot's order.
+    if base_type.kind == DtKind::Enum && !base_type.is_meta_type {
+        ctx.push_error("Cannot call function on enum value.", id);
     }
 
     // analyzer.cpp:5939-5945 — before any method walk, Godot rejects a base whose `native_type`
