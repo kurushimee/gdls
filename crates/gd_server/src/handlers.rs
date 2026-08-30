@@ -2156,6 +2156,35 @@ fn hover_attribute_member_signature(
 /// the `EnumValueLocal` binding recorded at `site`. That binding's `target_name` is the QUALIFIED
 /// `"<Enum>.<value>"`, so the enum half also picks the right `EnumDecl` when one file declares two
 /// enums with a same-named value.
+/// A folded constant as GDScript source, for the ` = <value>` tail of a `const` hover. `None` for
+/// anything the fold table holds only as an opaque type (`Vector3.UP`, a preloaded resource): the
+/// value is genuinely unknown there, and a placeholder would read as fact.
+fn render_folded(value: Option<&gd_analyze::FoldedValue>) -> Option<String> {
+    use gd_analyze::FoldedValue;
+    Some(match value? {
+        FoldedValue::Nil => "null".to_owned(),
+        FoldedValue::Bool(b) => b.to_string(),
+        FoldedValue::Int(i) => i.to_string(),
+        // `{:?}` on an f64 keeps the decimal point GDScript needs (`1.0`, not `1`).
+        FoldedValue::Float(f) => format!("{f:?}"),
+        FoldedValue::String(s) => format!("{:?}", s),
+        FoldedValue::Opaque(..) => return None,
+    })
+}
+
+/// One enum value's hover line, in the shape the native side already renders
+/// (`const Input.MOUSE_MODE_CAPTURED: MouseMode = 2`, `native_render.rs:81`): the value qualified
+/// by its enum, typed as that enum, and carrying its integer.
+///
+/// The integer is dropped when the index could not read it without evaluating (`A = compute()`,
+/// and every implicit value after it). Guessing one would be worse than the shorter line.
+fn enum_value_signature(enum_name: &str, value_name: &str, value: Option<i64>) -> String {
+    match value {
+        Some(v) => format!("const {enum_name}.{value_name}: {enum_name} = {v}"),
+        None => format!("const {enum_name}.{value_name}: {enum_name}"),
+    }
+}
+
 fn hover_enum_value_use(
     state: &ServerState,
     analyzed: &AnalysisResult,
@@ -2184,7 +2213,10 @@ fn hover_enum_value_use(
         .values
         .iter()
         .find(|v| v.name.as_str() == value_name)?;
-    let mut md = format!("```gdscript\n{enum_name}.{value_name}\n```");
+    let mut md = format!(
+        "```gdscript\n{}\n```",
+        enum_value_signature(enum_name, value_name, value.value)
+    );
     if let Some(doc) = value.doc.as_deref() {
         crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
     }
@@ -2248,7 +2280,15 @@ fn hover_enum_value_declaration(tree: &ParseTree, leaf_id: NodeId, name: &str) -
         let Some(idx) = e.values.iter().position(|v| v.identifier == Some(leaf_id)) else {
             continue;
         };
-        let mut md = format!("```gdscript\n{enum_name}.{name}\n```");
+        // The integer comes from the same walk the index uses, run against the live tree so an
+        // unsaved edit to an earlier value is reflected here.
+        let value = gd_project::enum_decl(tree, enum_id)
+            .and_then(|d| d.values.into_iter().find(|v| v.name == name))
+            .and_then(|v| v.value);
+        let mut md = format!(
+            "```gdscript\n{}\n```",
+            enum_value_signature(&enum_name, name, value)
+        );
         if let Some(doc) = tree.docs.enum_value_docs.get(&(enum_id, idx)) {
             crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
         }
@@ -2409,6 +2449,21 @@ fn hover_declaration_signature(
             let dt = a.types.get(decl_id);
             if dt.is_set() && !dt.is_variant() {
                 sig = format!("{sig}: {}", human_type_label(state, tree, dt));
+            }
+        }
+    }
+
+    // A `const`'s own value, when the analyzer folded one — the same thing the native side shows
+    // (`const Node.PROCESS_MODE_ALWAYS: ProcessMode = 3`), and the reason anyone hovers a constant.
+    // Only this file's own constants get one: the cross-file index carries no values, and a
+    // constant whose initializer gdls cannot fold (`const A = Array([])`) keeps the shorter line.
+    if member_decl.kind == gd_project::MemberKind::Const {
+        if let (Some(a), NodeKind::Constant(c)) = (analyzed, &tree.get(decl_id).kind) {
+            if let Some(rendered) = c
+                .initializer
+                .and_then(|init| render_folded(a.folds.get(init)))
+            {
+                sig = format!("{sig} = {rendered}");
             }
         }
     }
