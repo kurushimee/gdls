@@ -146,7 +146,10 @@ fn an_anonymous_head_class_renders_as_its_res_path() {
     );
 }
 
-/// The same names inside the unquoted assignment message.
+/// The same names inside the unquoted assignment message. The `In` row draws two lines, not one:
+/// an inner-class identifier is a *constant* expression (`gdscript_analyzer.cpp:4046`), so the
+/// const-narrowing companion fires first. `Node` and `Lib1` are not marked constant, so they draw
+/// one line each — see the boundary rows in `is_constant_marking.rs`.
 #[test]
 fn assignment_messages_carry_the_same_names() {
     assert_eq!(
@@ -161,6 +164,7 @@ fn assignment_messages_carry_the_same_names() {
         )),
         vec![
             r#"Cannot assign a value of type GDScriptNativeClass to variable "e" with specified type int."#.to_owned(),
+            r#"Cannot assign a value of type "In" as "int"."#.to_owned(),
             r#"Cannot assign a value of type In to variable "g" with specified type int."#.to_owned(),
             r#"Cannot assign a value of type Lib1 to variable "h" with specified type int."#.to_owned(),
         ]

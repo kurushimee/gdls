@@ -3051,8 +3051,10 @@ fn resolve_assignable(
             // reducer.rs:1939). For typed Array/Dictionary the per-element updater above
             // already handles the constant narrowing per-element; we still call this for the
             // top-level container fold when present.
-            if ctx.folds.is_reduced(init) {
-                crate::reducer::update_const_expression_builtin_type(ctx, init, &ty, "assign");
+            if ctx.folds.is_constant(init) {
+                crate::reducer::update_const_expression_builtin_type(
+                    ctx, init, &ty, "assign", false,
+                );
             }
 
             // analyzer.cpp:2162-2168 — `Cannot assign a value of type X to <kind> "Y" with
@@ -5154,18 +5156,22 @@ fn expression_references_nonconstant_member(
 }
 
 /// analyzer.cpp:2124-2133 — a constant initializer must reduce to a constant expression. Godot
-/// decides that from `ExpressionNode::is_constant`, a bit its reducer stamps everywhere it folds a
-/// value; gdls does not track that bit, and reading its own fold table directly false-positives
-/// (preload, `Color.RED`, and native enum values stamp placeholder folds that are not fully
-/// tracked). So this walks the initializer for a subexpression that can NEVER be constant,
-/// whatever the fold table did or did not manage.
+/// decides that from `ExpressionNode::is_constant`, but only AFTER trying to force the value
+/// through `make_expression_reduced_value`, which folds arrays, dictionaries, and constant calls.
+/// gdls has no `make_*_reduced_value` family, so gating the error on the bit alone would reject
+/// every `const A = [1, 2]`. The walk instead looks for a subexpression that can NEVER be
+/// constant, whatever the fold table did or did not manage.
 ///
 /// **Positive identification only.** Anything the walk cannot place — an unresolved name, a shape
 /// outside the classification — is treated as constant and stays silent. A missed diagnostic is a
-/// gap; a false one on a `const` Godot accepts would be a lie.
+/// gap; a false one on a `const` Godot accepts would be a lie. A node the reducer already marked
+/// constant short-circuits for the same reason: it is constant by construction.
 ///
 /// Returns the offending node, `None` when nothing in the initializer disqualifies it.
 fn const_init_nonconstant_ref(ctx: &AnalysisContext, expr_id: NodeId) -> Option<NodeId> {
+    if ctx.folds.is_constant(expr_id) {
+        return None;
+    }
     let mut stack: Vec<NodeId> = vec![expr_id];
     while let Some(id) = stack.pop() {
         match &ctx.node(id).kind {
@@ -5928,8 +5934,14 @@ fn resolve_return(ctx: &mut AnalysisContext, ret_id: NodeId) {
     if !expected_type.is_set() {
         return;
     }
-    if expected_type.is_hard_type() && ctx.folds.is_reduced(v) {
-        crate::reducer::update_const_expression_builtin_type(ctx, v, &expected_type, "return");
+    if expected_type.is_hard_type() && ctx.folds.is_constant(v) {
+        crate::reducer::update_const_expression_builtin_type(
+            ctx,
+            v,
+            &expected_type,
+            "return",
+            false,
+        );
     }
     let result = ctx.get_type(v).clone();
 
@@ -6132,7 +6144,7 @@ fn resolve_match_pattern(
                 // mismatch on `match_with_subscript.gd` is documented in
                 // analyze_known_failures.txt; `match_with_variable_expression.gd` (BinaryOp at
                 // line 4) lifts cleanly.
-                if ctx.folds.get(e).is_none() {
+                if !ctx.folds.is_constant(e) {
                     let mut walker = Some(e);
                     let mut last_seen = e;
                     // Track whether the inner walk got nulled by an INDEX subscript

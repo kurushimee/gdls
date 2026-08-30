@@ -1698,9 +1698,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
                 name.clone(),
                 site,
             ));
-            if let Some(fv) = fold {
-                ctx.folds.set(id, fv);
-            }
+            stamp_member_const(ctx, id, fold);
             // No UNASSIGNED_VARIABLE here, deliberately: upstream's warning block sits in the
             // `p_identifier->source` switch (analyzer.cpp:4408-4441), and a member identifier's
             // `source` is classified AFTER that switch on first resolution — so the
@@ -1759,9 +1757,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             // The SCOPE walk, not the chain walk: a bare identifier also sees what each base's
             // enclosing class declares (analyzer.cpp:320-344). #314.
             if let Some((dt, fold, kind)) = lookup_script_scope_member(ctx, &sr, &name, false, id) {
-                if let Some(fv) = fold {
-                    ctx.folds.set(id, fv);
-                }
+                stamp_member_const(ctx, id, fold);
                 ctx.set_type(id, dt);
                 // Implicit-self access marks `use_self` only for INSTANCE members — variables,
                 // signals, instance functions (analyzer.cpp:4425/4428/4506). An inherited
@@ -2324,12 +2320,33 @@ fn function_param_named(ctx: &AnalysisContext, fn_id: NodeId, name: &str) -> Opt
 /// scope-walk lands it — the class itself, an inheritance-chain base, or an outer class), so a
 /// caller recording a `Binding::Use` can key the use on the DECLARING inner-class chain, not the
 /// accessed class (`B.field` where `B extends A` declares `field` resolves to `A`). #153.
+/// What a member lookup says about the constancy of the identifier that referenced it — Godot's
+/// `(is_constant, reduced_value)` pair on the referencing `ExpressionNode`. gdls cannot always fill
+/// both halves: a class object, an enum dictionary, and a cross-file constant read from an
+/// interface are all constant with no [`FoldedValue`] to hold them (#364).
+#[derive(Clone, Debug)]
+pub(crate) enum MemberConst {
+    /// Not a constant — a `var`, a property, a signal. Godot sets no bit for these.
+    No,
+    /// Constant, carrying the value when this table can hold it.
+    Yes(Option<FoldedValue>),
+}
+
+/// Apply what a lookup reported onto the referencing identifier.
+fn stamp_member_const(ctx: &mut AnalysisContext, id: NodeId, c: MemberConst) {
+    match c {
+        MemberConst::Yes(Some(fv)) => ctx.folds.set(id, fv),
+        MemberConst::Yes(None) => ctx.folds.mark_constant(id),
+        MemberConst::No => {}
+    }
+}
+
 fn lookup_class_member(
     ctx: &mut AnalysisContext,
     class_id: NodeId,
     name: &str,
     identifier_id: NodeId,
-) -> Option<(DataType, Option<FoldedValue>, NodeId)> {
+) -> Option<(DataType, MemberConst, NodeId)> {
     // analyzer.cpp:4450-4455 — Godot's `reduce_identifier` walks the *full* scope
     // (`get_class_node_current_scope_classes`): the class, its inheritance chain, and its outer
     // chain. gdls previously only walked the inheritance chain (`ctx.bases`), so an identifier
@@ -2355,7 +2372,9 @@ fn lookup_class_member(
             _ => false,
         };
         if class_ident_match {
-            return Some((ctx.get_type(class).clone(), None, class));
+            // analyzer.cpp:4187 → :4046 — the class names itself (or an enclosing
+            // class): a class object, constant with no value this table can hold.
+            return Some((ctx.get_type(class).clone(), MemberConst::Yes(None), class));
         }
         let member = match &ctx.node(class).kind {
             NodeKind::Class(c) => c
@@ -2387,10 +2406,15 @@ fn lookup_class_member(
             // The third element is the DECLARING class node (`class`) so the caller can record the
             // use against the declaring inner-class chain, not the accessed one. #153.
             return match m {
-                gd_syntax::ast::Member::Variable(vid)
-                | gd_syntax::ast::Member::Signal(vid)
-                | gd_syntax::ast::Member::Class(vid)
-                | gd_syntax::ast::Member::Enum(vid) => Some((ctx.get_type(vid).clone(), None)),
+                gd_syntax::ast::Member::Variable(vid) | gd_syntax::ast::Member::Signal(vid) => {
+                    Some((ctx.get_type(vid).clone(), MemberConst::No))
+                }
+                // analyzer.cpp:4259 → :4046 (inner class) and :4220-4223 (named enum, whose
+                // `reduced_value` is the enum dictionary). Both are constant; neither value has a
+                // `FoldedValue` representation, so they carry the bit alone.
+                gd_syntax::ast::Member::Class(vid) | gd_syntax::ast::Member::Enum(vid) => {
+                    Some((ctx.get_type(vid).clone(), MemberConst::Yes(None)))
+                }
                 // analyzer.cpp:4225 — referencing an in-file member function as a value
                 // yields a constant Callable (via `make_callable_type(member.function->info)`).
                 // The `is_constant` flag is what makes `function = 25` fire `Cannot assign a
@@ -2398,12 +2422,17 @@ fn lookup_class_member(
                 // `errors/function_used_as_property.gd`. The full MethodInfo wiring lives in
                 // the make_callable_type slice; the constant-Callable shape on its own
                 // suffices for the assignment-rejection arm.
-                gd_syntax::ast::Member::Function(_) => Some((make_callable_type(), None)),
+                gd_syntax::ast::Member::Function(_) => {
+                    Some((make_callable_type(), MemberConst::No))
+                }
                 gd_syntax::ast::Member::Constant(cid) => {
                     let dt = ctx.get_type(cid).clone();
+                    // analyzer.cpp:4203-4209 marks a MEMBER_CONSTANT unconditionally, so a
+                    // constant whose initializer did not fold (`const P = preload(...)`) still
+                    // carries the bit.
                     let fold = constant_initializer_of(ctx, cid)
                         .and_then(|init| ctx.folds.get(init).cloned());
-                    Some((dt, fold))
+                    Some((dt, MemberConst::Yes(fold)))
                 }
                 // analyzer.cpp:4212-4218 — an enum value read through the class is
                 // *unconditionally* constant, carrying `element.value`, which is still the 0
@@ -2416,7 +2445,7 @@ fn lookup_class_member(
                         .get(iid)
                         .cloned()
                         .unwrap_or(crate::foldtable::FoldedValue::Int(0));
-                    (ctx.get_type(iid).clone(), Some(fold))
+                    (ctx.get_type(iid).clone(), MemberConst::Yes(Some(fold)))
                 }),
                 gd_syntax::ast::Member::Group(_) => None,
             }
@@ -2518,6 +2547,22 @@ fn reduce_cast(ctx: &mut AnalysisContext, id: NodeId) {
     }
 
     ctx.set_type(id, cast_type.clone());
+
+    // analyzer.cpp:3800-3806 — a CONSTANT operand runs the const-narrowing companion in cast mode,
+    // which is what draws `Cannot cast a value of type "X" as "Y".` alongside the validity check
+    // below. The cast node then inherits the operand's constancy when the target is Variant or the
+    // operand already reads as that type.
+    if let Some(operand_id) = cast.operand {
+        if ctx.folds.is_constant(operand_id) {
+            update_const_expression_builtin_type(ctx, operand_id, &cast_type, "cast", true);
+            if cast_type.is_variant() || ctx.get_type(operand_id).equiv(&cast_type) {
+                match ctx.folds.get(operand_id).cloned() {
+                    Some(fv) => ctx.folds.set(id, fv),
+                    None => ctx.folds.mark_constant(id),
+                }
+            }
+        }
+    }
 
     // Validity check (analyzer.cpp:3792-3815). We skip when the cast target is itself Variant —
     // anything → Variant is always legal.
@@ -3291,12 +3336,12 @@ fn reduce_assignment(ctx: &mut AnalysisContext, id: NodeId) {
 
     // analyzer.cpp:2951-2953 — coerce const constant expression to the assignee's hard type so
     // the "Cannot assign a value of type X as Y" arm fires alongside the compatibility check.
-    let value_is_constant = ctx.folds.get(value_id).is_some();
+    let value_is_constant = ctx.folds.is_constant(value_id);
     if assign.operation == gd_syntax::ast::AssignOp::None
         && assignee_type.is_hard_type()
         && value_is_constant
     {
-        update_const_expression_builtin_type(ctx, value_id, &assignee_type, "assign");
+        update_const_expression_builtin_type(ctx, value_id, &assignee_type, "assign", false);
     }
 
     let assigned_value_type = ctx.get_type(value_id).clone();
@@ -3486,6 +3531,7 @@ pub(crate) fn update_const_expression_builtin_type(
     expr_id: NodeId,
     p_type: &DataType,
     p_usage: &str,
+    p_is_cast: bool,
 ) {
     let expression_type = ctx.get_type(expr_id).clone();
     // analyzer.cpp:2723 — types already equal: no-op.
@@ -3496,13 +3542,18 @@ pub(crate) fn update_const_expression_builtin_type(
     if p_type.kind != DtKind::Builtin && p_type.kind != DtKind::Enum {
         return;
     }
-    // analyzer.cpp:2731 — Int -> Enum cast is special-cased; the `p_is_cast` flag flips this on.
-    // Callers in this slice pass `is_cast=false` (the reduce_cast path uses its own check), so we
-    // don't need to wire it here; explicit casts go through `reduce_cast`'s validity matrix.
+    // analyzer.cpp:2750 — an explicit `int as SomeEnum` cast is exempt from the compatibility
+    // error. Only `reduce_cast` passes `p_is_cast`; every other caller is an implicit narrowing.
+    let is_enum_cast = p_is_cast
+        && p_type.kind == DtKind::Enum
+        && !p_type.is_meta_type
+        && expression_type.builtin_type == VariantType::Int;
 
     // Upstream's call passes `p_expression` (analyzer.cpp:2729), so an int constant flowing
     // into an enum-typed slot warns INT_AS_ENUM_WITHOUT_CAST through the wrapper.
-    if !is_type_compatible_with_source(ctx, p_type, &expression_type, true, expr_id) {
+    if !is_enum_cast
+        && !is_type_compatible_with_source(ctx, p_type, &expression_type, true, expr_id)
+    {
         ctx.push_error(
             format!(r#"Cannot {p_usage} a value of type "{expression_type}" as "{p_type}"."#),
             expr_id,
@@ -3566,11 +3617,11 @@ pub(crate) fn update_array_literal_element_type(
     };
 
     for elem_id in elements {
-        let is_const = ctx.folds.get(elem_id).is_some();
+        let is_const = ctx.folds.is_constant(elem_id);
         if is_const {
             // analyzer.cpp:2781-2783 — emit the `Cannot include a value of type X as Y` companion
             // for constants.
-            update_const_expression_builtin_type(ctx, elem_id, &expected, "include");
+            update_const_expression_builtin_type(ctx, elem_id, &expected, "include", false);
         }
         let actual = ctx.get_type(elem_id).clone();
         if actual.has_no_type() || actual.is_variant() || !actual.is_hard_type() {
@@ -3630,8 +3681,8 @@ pub(crate) fn update_dictionary_literal_element_type(
 
     for kv in entries {
         if let Some(k) = kv.key {
-            if ctx.folds.get(k).is_some() {
-                update_const_expression_builtin_type(ctx, k, &expected_key, "include");
+            if ctx.folds.is_constant(k) {
+                update_const_expression_builtin_type(ctx, k, &expected_key, "include", false);
             }
             let actual = ctx.get_type(k).clone();
             // analyzer.cpp:2818 — Godot's `has_no_type || is_variant || !is_hard_type` guard
@@ -3653,8 +3704,8 @@ pub(crate) fn update_dictionary_literal_element_type(
             }
         }
         if let Some(v) = kv.value {
-            if ctx.folds.get(v).is_some() {
-                update_const_expression_builtin_type(ctx, v, &expected_value, "include");
+            if ctx.folds.is_constant(v) {
+                update_const_expression_builtin_type(ctx, v, &expected_value, "include", false);
             }
             let actual = ctx.get_type(v).clone();
             // Upstream's forward check passes `p_dictionary` (analyzer.cpp:2833).
@@ -3817,7 +3868,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             // (analyzer.cpp:3327-3357); gdls can't materialize non-scalar values — an Opaque
             // fold keeps the constancy, so `match v:\n\tVector2(-1, -1):` stays a legal
             // constant pattern and `const X = Color(1, 1, 1)` stays a constant initializer.
-            if call.arguments.iter().all(|&a| ctx.folds.is_reduced(a)) {
+            if call.arguments.iter().all(|&a| ctx.folds.is_constant(a)) {
                 ctx.folds.set(id, FoldedValue::Opaque(bt, None));
             }
             ctx.set_type(id, call_type);
@@ -4670,8 +4721,8 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             // Per-arg const-narrowing (analyzer.cpp:6101-6103) — emits
             // `Cannot pass a value of type X as Y.` on a foldable constant whose type is
             // incompatible with the parameter.
-            if par_type.is_hard_type() && ctx.folds.get(arg_id).is_some() {
-                update_const_expression_builtin_type(ctx, arg_id, &par_type, "pass");
+            if par_type.is_hard_type() && ctx.folds.is_constant(arg_id) {
+                update_const_expression_builtin_type(ctx, arg_id, &par_type, "pass", false);
             }
             let arg_type = ctx.get_type(arg_id).clone();
             // Godot uses `arg_type.to_string_strict()` (gdscript_parser.h:148) which prints
@@ -5480,7 +5531,7 @@ fn reduce_type_test(ctx: &mut AnalysisContext, id: NodeId) {
     // table produced a value — the same gate as Godot's `is_constant` flag. Godot uses
     // the strict-collections compat check here so an untyped `Array` constant fails an
     // `is Array[int]` test even though the lax-collections check would pass.
-    let operand_is_constant = ctx.folds.get(operand).is_some();
+    let operand_is_constant = ctx.folds.is_constant(operand);
     if operand_is_constant {
         // DIALECT(4.7): gdscript_analyzer.cpp reduce_type_test() —
         // `is_type_compatible_strict_collections` did not exist at 4.6, which used the plain
@@ -5824,6 +5875,11 @@ fn reduce_subscript_attribute(
             // and its `Cannot {assign/include/pass} a value of type X as Y` companion errors.
             if let Some(folded) = ctx.folds.get(attr_id).cloned() {
                 ctx.folds.set(sub_id, folded);
+            } else if ctx.folds.is_constant(attr_id) {
+                // The attribute is constant but its value has no `FoldedValue` — an inner class
+                // reached as `Outer.Inner`, a cross-file constant. Godot's copy at :4861 moves the
+                // bit either way, and it is the bit the companion diagnostics gate on (#364).
+                ctx.folds.mark_constant(sub_id);
             }
             // #256: a SCRIPT base never reaches the `else` arm below — its member miss reduces to
             // a permissive Variant (an interface gap must never become `Cannot find member`), so
@@ -6227,7 +6283,7 @@ pub(crate) fn lookup_script_chain_member(
     name: &str,
     base_is_meta: bool,
     bind_site: NodeId,
-) -> Option<(DataType, Option<FoldedValue>, BindingSymbolKind)> {
+) -> Option<(DataType, MemberConst, BindingSymbolKind)> {
     let chain = crate::script_chain::resolve_script_chain(ctx, start);
     lookup_in_links(ctx, &chain.links, name, base_is_meta, bind_site)
 }
@@ -6242,7 +6298,7 @@ pub(crate) fn lookup_script_scope_member(
     name: &str,
     base_is_meta: bool,
     bind_site: NodeId,
-) -> Option<(DataType, Option<FoldedValue>, BindingSymbolKind)> {
+) -> Option<(DataType, MemberConst, BindingSymbolKind)> {
     let scope = crate::script_chain::scope_refs(ctx, start);
     lookup_in_links(ctx, &scope, name, base_is_meta, bind_site)
 }
@@ -6253,7 +6309,7 @@ fn lookup_in_links(
     name: &str,
     base_is_meta: bool,
     bind_site: NodeId,
-) -> Option<(DataType, Option<FoldedValue>, BindingSymbolKind)> {
+) -> Option<(DataType, MemberConst, BindingSymbolKind)> {
     let xf = ctx.xfile;
     for link in links.iter() {
         let Some(iface) = crate::script_chain::link_interface(xf, link) else {
@@ -6279,7 +6335,8 @@ fn lookup_in_links(
                 }
             }
             record_member_use(ctx, link, BindingSymbolKind::Enum, name, bind_site);
-            return Some((dt, None, BindingSymbolKind::Enum));
+            // analyzer.cpp:4220-4223 — a named enum read as a value is constant.
+            return Some((dt, MemberConst::Yes(None), BindingSymbolKind::Enum));
         }
         // #212: an INNER CLASS of this link (`Lib.Box`, where `Lib` is a preload-const / script
         // meta and `Box` is `class Box:` inside the dependency). Godot's `script_classes` walk
@@ -6315,7 +6372,8 @@ fn lookup_in_links(
                 ..Default::default()
             };
             record_member_use(ctx, link, BindingSymbolKind::Class, name, bind_site);
-            return Some((dt, None, BindingSymbolKind::Class));
+            // analyzer.cpp:4259 → :4046 — a class object.
+            return Some((dt, MemberConst::Yes(None), BindingSymbolKind::Class));
         }
         let Some(member) = iface.members.iter().find(|m| m.name == name) else {
             continue;
@@ -6332,17 +6390,21 @@ fn lookup_in_links(
                     dt.is_constant = true;
                     record_member_use(ctx, link, BindingSymbolKind::EnumValue, name, bind_site);
                     // Placeholder fold: `is_reduced` gates read only the type.
-                    return Some((dt, Some(FoldedValue::Int(0)), BindingSymbolKind::EnumValue));
+                    return Some((
+                        dt,
+                        MemberConst::Yes(Some(FoldedValue::Int(0))),
+                        BindingSymbolKind::EnumValue,
+                    ));
                 }
                 // CONSTANT arm (analyzer.cpp:4193-4200): the member's declared type; untyped
                 // consts degrade to soft Variant — permissive, never an enum value.
                 let mut dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
                 dt.is_constant = true;
                 record_member_use(ctx, link, BindingSymbolKind::Constant, name, bind_site);
-                // No fold: the value isn't materializable cross-file; every fold consumer is an
-                // `is_reduced` gate or type-only narrowing, so absence only skips
-                // const-companion diagnostics — it never adds one.
-                return Some((dt, None, BindingSymbolKind::Constant));
+                // Constant with no value: a cross-file constant's value isn't materializable
+                // here. The bit still rides, which is what keeps the const-companion diagnostics
+                // firing (#364) even though nothing can be narrowed.
+                return Some((dt, MemberConst::Yes(None), BindingSymbolKind::Constant));
             }
             MK::Var | MK::Property => {
                 if base_is_meta && !member.flags.is_static {
@@ -6356,7 +6418,7 @@ fn lookup_in_links(
                 dt.is_constant = false;
                 dt.is_read_only = false;
                 record_member_use(ctx, link, BindingSymbolKind::Variable, name, bind_site);
-                return Some((dt, None, BindingSymbolKind::Variable));
+                return Some((dt, MemberConst::No, BindingSymbolKind::Variable));
             }
             MK::Signal => {
                 if base_is_meta {
@@ -6380,7 +6442,7 @@ fn lookup_in_links(
                     return_type: Box::new(DataType::default()),
                 });
                 record_member_use(ctx, link, BindingSymbolKind::Signal, name, bind_site);
-                return Some((dt, None, BindingSymbolKind::Signal));
+                return Some((dt, MemberConst::No, BindingSymbolKind::Signal));
             }
             MK::Func => {
                 if base_is_meta && !member.flags.is_static {
@@ -6390,7 +6452,7 @@ fn lookup_in_links(
                 // lives with reduce_call's cross-file CallSig path.
                 let dt = make_callable_type();
                 record_member_use(ctx, link, BindingSymbolKind::Function, name, bind_site);
-                return Some((dt, None, BindingSymbolKind::Function));
+                return Some((dt, MemberConst::No, BindingSymbolKind::Function));
             }
             // Named enums are matched through `iface.enums` above; the member-list entry is
             // only the declaration marker.
@@ -6765,9 +6827,7 @@ fn reduce_identifier_from_base(
                     site,
                 ));
                 ctx.set_type(identifier_id, member_dt);
-                if let Some(fv) = fold {
-                    ctx.folds.set(identifier_id, fv);
-                }
+                stamp_member_const(ctx, identifier_id, fold);
                 return;
             }
             // The in-file walk missed; continue into the cross-file part of the chain (the
@@ -6777,9 +6837,7 @@ fn reduce_identifier_from_base(
                 if let Some((dt, fold, _kind)) =
                     lookup_script_chain_member(ctx, &sr, &name, base.is_meta_type, identifier_id)
                 {
-                    if let Some(fv) = fold {
-                        ctx.folds.set(identifier_id, fv);
-                    }
+                    stamp_member_const(ctx, identifier_id, fold);
                     ctx.set_type(identifier_id, dt);
                     return;
                 }
@@ -6850,9 +6908,7 @@ fn reduce_identifier_from_base(
             if let Some((dt, fold, _kind)) =
                 lookup_script_chain_member(ctx, &sr, &name, base.is_meta_type, identifier_id)
             {
-                if let Some(fv) = fold {
-                    ctx.folds.set(identifier_id, fv);
-                }
+                stamp_member_const(ctx, identifier_id, fold);
                 ctx.set_type(identifier_id, dt);
                 return;
             }
@@ -7596,6 +7652,15 @@ fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
     };
     if folded_path.is_none() {
         ctx.push_error("Preloaded path must be a constant string.", path_id);
+    }
+
+    // analyzer.cpp:4778 — a preload whose PATH is constant is itself constant, whatever it loaded.
+    // Godot's `reduced_value` is the Resource; gdls has no `FoldedValue` for one, so the node
+    // carries the bit alone. That bit is what makes `var x: int = preload(...)` draw its
+    // const-narrowing companion error (#364). The gate is the path's own constancy, so a path that
+    // folded to a non-string still marks, exactly as upstream's fall-through does.
+    if ctx.folds.is_constant(path_id) {
+        ctx.folds.mark_constant(id);
     }
 
     // WP-P1 cross-file: Godot's tail at analyzer.cpp:4749-4751 sets
