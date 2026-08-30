@@ -5215,10 +5215,18 @@ fn resolve_suite(ctx: &mut AnalysisContext, suite_id: NodeId, is_root: bool) {
     for stmt in stmts {
         // analyzer.cpp:2076-2080 — a statement's own annotations resolve before the statement.
         resolve_node_annotations(ctx, stmt);
-        // gdscript_parser.cpp:2132-2160 — expression-statement shape warnings. Queued at parse
+        // gdscript_parser.cpp:2144-2190 — expression-statement shape warnings. Queued at parse
         // time in Godot, so on a shared line they precede both UNREACHABLE_CODE (queued at the
         // statement's parse tail) and any analyzer warning from inside the statement.
-        emit_standalone_statement_warnings(ctx, stmt);
+        //
+        // `is_root` is what stands in for "this statement came out of `parse_statement`". The one
+        // suite Godot resolves with `p_is_root = false` is a match-branch guard, and its single
+        // statement is appended straight from `parse_expression(false)`
+        // (gdscript_parser.cpp:2537) — the statement parser never sees it, so none of this family
+        // can fire on a guard. (#460)
+        if is_root {
+            emit_standalone_statement_warnings(ctx, stmt);
+        }
         if has_return && !has_unreachable_code {
             // The latch is unconditional; the warning needs an enclosing function (Godot skips
             // property setters/getters via its `if (current_function)` — same TODO as upstream).
@@ -5392,7 +5400,11 @@ fn resolve_node(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         NodeKind::Match(_) => resolve_match(ctx, id),
         NodeKind::Return(_) => resolve_return(ctx, id),
         NodeKind::Assert(_) => resolve_assert(ctx, id),
-        NodeKind::Suite(_) => resolve_suite(ctx, id, false),
+        // analyzer.cpp:1609 takes `resolve_suite`'s default `true` here. gd_syntax's
+        // `parse_statement` cannot yield a bare `Suite` statement, so this arm is defensive
+        // either way — but `is_root` now carries the guard/not-guard distinction, so it has to
+        // read the same as upstream.
+        NodeKind::Suite(_) => resolve_suite(ctx, id, true),
         NodeKind::MatchBranch(_) => resolve_match_branch(ctx, id, None),
         NodeKind::Pattern(_) => resolve_match_pattern(ctx, id, None),
         NodeKind::Parameter(_) => resolve_parameter(ctx, id),
@@ -6653,8 +6665,8 @@ fn resolve_match_branch(ctx: &mut AnalysisContext, branch_id: NodeId, match_test
         resolve_match_pattern(ctx, p, match_test);
     }
     ctx.current_match_branch = outer_branch;
-    // analyzer.cpp:2429 — match-branch guard body uses explicit `false` (an expression context,
-    // not a statement-root one). The block at :2432 uses the default `true`.
+    // analyzer.cpp:2443 — match-branch guard body uses explicit `false` (an expression context,
+    // not a statement-root one). The block at :2446 uses the default `true`.
     if let Some(g) = guard {
         resolve_suite(ctx, g, false);
     }
