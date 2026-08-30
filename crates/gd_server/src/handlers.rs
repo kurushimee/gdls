@@ -1112,10 +1112,11 @@ fn script_decl_location(
 ///   3. a bare call callee (`queue_free()` under a Node-rooted script) → the same member anchor
 ///      through the file's chain native root — definition/hover symmetry (#35's bare-call path).
 ///
-/// Builtin members (`v.length`) stay hover-only: builtin types have no class-page shape to
-/// materialize, so `definition` keeps returning null there. And shape 3's project-shadowing
-/// check sees interface MEMBERS only — a local `Callable` shadowing an inherited native name
-/// still jumps to the native; the interface walk can't see function bodies (accepted gap).
+/// Variant types (`Vector2`, `Array`) get the same treatment as engine classes: shapes 1 and 2
+/// both fall through to a builtin page when the name is not an engine class (#370). Shape 3's
+/// project-shadowing check sees interface MEMBERS only — a local `Callable` shadowing an
+/// inherited native name still jumps to the native; the interface walk can't see function bodies
+/// (accepted gap).
 fn native_definition(
     state: &mut ServerState,
     tree: &ParseTree,
@@ -1131,7 +1132,9 @@ fn native_definition(
     //    preserving the original early-return even when stub materialization fails). The header
     //    anchoring itself is shared with `type_definition`'s Native arm (both point at a native
     //    class's `class_name` line) via `native_class_header_location`.
-    if state.workspace.native.class_named(name).is_some() {
+    if state.workspace.native.class_named(name).is_some()
+        || state.workspace.native.builtin_named(name).is_some()
+    {
         return native_class_header_location(state, name);
     }
 
@@ -1161,6 +1164,10 @@ fn native_definition(
                     name,
                     stub_root.as_deref(),
                 );
+            }
+            if base_dt.kind == gd_analyze::DtKind::Builtin {
+                let bt_name = gd_analyze::data_type::variant_type_name(base_dt.builtin_type);
+                return builtin_member_stub_location(state, bt_name, name, stub_root.as_deref());
             }
         }
         // Deliberate stop, not a fall-through miss: the cursor names an ATTRIBUTE site, so
@@ -1216,6 +1223,24 @@ fn native_member_stub_location(
     let db = &state.workspace.native;
     let (decl, _) = db.lookup_member(class, member)?;
     let declaring = db.name_of(decl.name).to_owned();
+    let (path, stub) =
+        crate::stubs::ensure_class_stub(&state.stub_cache, db, &declaring, stub_root)?;
+    let anchor = *stub.member_lines.get(member)?;
+    stub_token_location(&path, anchor.line, anchor.name_col, anchor.name_len)
+}
+
+/// [`native_member_stub_location`] for a Variant type. The declaring type is the one the lookup
+/// resolved against — builtins have no inheritance, so it is always the base itself — and the
+/// anchor comes from the same rendered page (#370).
+fn builtin_member_stub_location(
+    state: &ServerState,
+    builtin: &str,
+    member: &str,
+    stub_root: Option<&str>,
+) -> Option<Location> {
+    let db = &state.workspace.native;
+    let (bt, _) = db.lookup_builtin_member(builtin, member)?;
+    let declaring = db.name_of(bt.name).to_owned();
     let (path, stub) =
         crate::stubs::ensure_class_stub(&state.stub_cache, db, &declaring, stub_root)?;
     let anchor = *stub.member_lines.get(member)?;
@@ -1449,6 +1474,28 @@ fn render_hover(
     if let Some(name) = native_lookup {
         if let Some(class) = state.workspace.native.class_named(&name) {
             append_class_docs(&mut md, class);
+        }
+    }
+
+    // #370: the Variant types are what most GDScript touches most often and they carried no
+    // prose at all. The label above is already the type's own name, which is what a builtin IS —
+    // Godot has no `<Native> class …` form for one — so only the docs are missing. The lookup is
+    // by the leaf identifier, the same shape the native fallback above uses, so it fires on
+    // `var q: Vector2` and on a bare `Vector2` alike.
+    if let NodeKind::Identifier(ident) = &node.kind {
+        if let Some(bt) = state.workspace.native.builtin_named(&ident.name) {
+            crate::docs::append_doc(
+                &mut md,
+                crate::docs::ProseFormat::Markdown,
+                &bt.brief_description,
+            );
+            if bt.description != bt.brief_description {
+                crate::docs::append_doc(
+                    &mut md,
+                    crate::docs::ProseFormat::Markdown,
+                    &bt.description,
+                );
+            }
         }
     }
 
@@ -1693,6 +1740,9 @@ fn native_member_hover_md(
         gd_types::NativeMember::Method(m) => m.description.as_str(),
         gd_types::NativeMember::Property(p) => p.description.as_str(),
         gd_types::NativeMember::Signal(s) => s.description.as_str(),
+        // A builtin type's constants are documented in the dump (`Vector2.ZERO`, `Color.RED`);
+        // an engine class's are not, and carry an empty string (#370).
+        gd_types::NativeMember::Constant(k) => k.description.as_str(),
         _ => "",
     };
     // M7 (#62): dump descriptions are BBCode — converted to GFM here at the hover boundary

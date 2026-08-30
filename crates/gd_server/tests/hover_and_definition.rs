@@ -1869,3 +1869,135 @@ fn hover_and_definition_reach_a_scripts_inherited_members() {
 
     shutdown(&client, handle);
 }
+
+/// #370: a Variant type's symbols get the same docs and the same stub jump an engine class's do.
+/// `Array`, `Vector2`, `String` and the rest are what most GDScript touches most often, and their
+/// prose was dropped at ingestion while `definition` had no page to anchor on.
+#[test]
+fn builtin_type_symbols_carry_docs_and_jump_into_a_stub() {
+    let fixture = tempfile::tempdir().expect("create fixture dir");
+    let fixture_dir = fixture.path().to_path_buf();
+    std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
+    let stub_cache = fixture_dir.join("stub-cache");
+    let api_path = fixture_dir.join("extension_api.json");
+    std::fs::write(
+        &api_path,
+        r#"{
+        "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
+        "classes": [
+            {"name": "Object", "is_instantiable": true},
+            {"name": "Node", "inherits": "Object", "is_instantiable": true}
+        ],
+        "builtin_classes": [
+            {"name": "Vector2",
+             "brief_description": "A 2D vector using floating-point coordinates.",
+             "description": "A 2-element structure that can be used to represent 2D coordinates.",
+             "members": [{"name": "x", "type": "float",
+                          "description": "The vector's X component."}],
+             "constants": [{"name": "UP", "type": "Vector2", "value": "Vector2(0, -1)",
+                            "description": "Up unit vector."}],
+             "methods": [{"name": "length", "return_type": "float", "is_const": true,
+                          "is_static": false, "is_vararg": false, "hash": 1, "arguments": [],
+                          "description": "Returns the length (magnitude) of this vector."}]}
+        ]
+    }"#,
+    )
+    .expect("write fixture JSON");
+
+    let src = "extends Node\n\
+               func _ready() -> void:\n\
+               \tvar v: Vector2\n\
+               \tprint(v.length())\n\
+               \tprint(v.x)\n\
+               \tprint(Vector2.UP)\n";
+    let script_path = fixture_dir.join("main.gd");
+    std::fs::write(&script_path, src).expect("write main.gd");
+
+    let init_options = serde_json::json!({
+        "projectRoot": fixture_dir.to_string_lossy().as_ref(),
+        "extensionApiPath": api_path.to_string_lossy().as_ref(),
+        "autoDumpExtensionApi": false,
+        "stubCacheDir": stub_cache.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+    let uri: Uri = format!(
+        "file:///{}",
+        script_path.to_string_lossy().replace('\\', "/")
+    )
+    .parse()
+    .unwrap();
+    did_open(&client, &uri, src);
+
+    let hover_text = |line: u32, character: u32, what: &str| -> String {
+        let hover = hover_at(&client, &uri, Position::new(line, character))
+            .unwrap_or_else(|| panic!("hover must answer on {what}"));
+        match hover.contents {
+            HoverContents::Markup(m) => m.value,
+            other => panic!("{what}: expected markup, got {other:?}"),
+        }
+    };
+
+    // The type itself keeps its bare label — Godot has no `<Native> class …` form for a builtin —
+    // and gains the prose that used to be dropped.
+    let ty = hover_text(2, 8, "the Vector2 annotation");
+    assert!(
+        ty.contains("A 2D vector using floating-point coordinates."),
+        "the type's brief must render: {ty}"
+    );
+    for (line, ch, what, doc) in [
+        (
+            3,
+            10,
+            "a builtin method",
+            "Returns the length (magnitude) of this vector.",
+        ),
+        (4, 9, "a builtin member", "The vector's X component."),
+        (5, 16, "a builtin constant", "Up unit vector."),
+    ] {
+        let md = hover_text(line, ch, what);
+        assert!(md.contains(doc), "{what} must carry its doc: {md}");
+    }
+
+    let location_at = |line: u32, character: u32, what: &str| -> lsp_types::Location {
+        match definition_at(&client, &uri, Position::new(line, character))
+            .unwrap_or_else(|| panic!("definition must answer on {what} at {line}:{character}"))
+        {
+            GotoDefinitionResponse::Scalar(loc) => loc,
+            other => panic!("{what}: expected scalar Location, got {other:?}"),
+        }
+    };
+
+    // Every one of these used to answer null: a builtin had no page to anchor on.
+    for (line, ch, what) in [
+        (2, 8, "the Vector2 annotation"),
+        (3, 10, "a builtin method"),
+        (4, 9, "a builtin member"),
+        (5, 16, "a builtin constant"),
+    ] {
+        let loc = location_at(line, ch, what);
+        let path = gd_server::uri::uri_to_path(&loc.uri).expect("stub uri is a file path");
+        assert!(
+            path.as_std_path()
+                .starts_with(std::path::Path::new(&stub_cache)),
+            "{what} must land inside the stub cache, got {path}"
+        );
+        assert!(
+            path.as_str().ends_with("Vector2.gd"),
+            "{what} must land on the Vector2 page, got {path}"
+        );
+        let page = std::fs::read_to_string(path.as_std_path()).expect("read the stub page");
+        let hit = page
+            .lines()
+            .nth(loc.range.start.line as usize)
+            .unwrap_or("");
+        assert!(
+            hit.contains("Vector2")
+                || hit.contains("length")
+                || hit.contains("x")
+                || hit.contains("UP"),
+            "{what} anchored on {hit:?}"
+        );
+    }
+
+    shutdown(&client, handle);
+}

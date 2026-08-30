@@ -109,6 +109,9 @@ pub struct NamedConst {
     /// constant. Additive — does not change the existing integer-constant path. The source of
     /// truth stays `extension_api.json`; M10 `textDocument/documentColor` reads RGBA from here.
     pub color: Option<[f32; 4]>,
+    /// The constant's own documentation. Builtin-class constants carry one in the dump
+    /// (`Vector2.ZERO`, `Color.RED`); engine-class constants do not, and leave this empty.
+    pub description: String,
 }
 
 /// A native class and its members.
@@ -136,6 +139,11 @@ pub struct NativeClass {
 #[derive(Clone, Debug)]
 pub struct BuiltinType {
     pub name: Sym,
+    /// One-line summary from `--dump-extension-api-with-docs`, the [`NativeClass`] fields' twin.
+    /// Empty when the dump carried no docs.
+    pub brief_description: String,
+    /// Long-form type description (see [`Method::description`]).
+    pub description: String,
     pub is_keyed: bool,
     pub indexing_return: Option<TypeRef>,
     pub members: Vec<Property>,
@@ -1164,8 +1172,10 @@ fn ingest_class(c: api::ClassDef, it: &mut Interner) -> NativeClass {
                 name: it.intern(&k.name),
                 value: k.value,
                 ty: None,
-                // Engine-class constants are bare integers — never a Color literal.
+                // Engine-class constants are bare integers — never a Color literal, and the
+                // dump carries no per-constant docs for them.
                 color: None,
+                description: String::new(),
             })
             .collect(),
         brief_description: c.brief_description,
@@ -1206,6 +1216,8 @@ fn ingest_property(p: api::PropertyDef, it: &mut Interner) -> Property {
 fn ingest_builtin(b: api::BuiltinClass, it: &mut Interner) -> BuiltinType {
     BuiltinType {
         name: it.intern(&b.name),
+        brief_description: b.brief_description,
+        description: b.description,
         is_keyed: b.is_keyed,
         indexing_return: b.indexing_return_type.map(|s| type_ref::decode(&s, it)),
         members: b
@@ -1218,9 +1230,7 @@ fn ingest_builtin(b: api::BuiltinClass, it: &mut Interner) -> BuiltinType {
                     ty,
                     setter: None,
                     getter: None,
-                    // Builtin-class members (e.g. `Vector2.x`) aren't documented per-member in the
-                    // extension-API dump; descriptions are class-level only.
-                    description: String::new(),
+                    description: m.description,
                 }
             })
             .collect(),
@@ -1239,7 +1249,7 @@ fn ingest_builtin(b: api::BuiltinClass, it: &mut Interner) -> BuiltinType {
                     is_virtual: false,
                     return_type,
                     params: ingest_args(m.arguments, it),
-                    description: String::new(),
+                    description: m.description,
                     // Real dump entry — parameter list authoritative, arity-checkable.
                     arity_known: true,
                 }
@@ -1261,6 +1271,7 @@ fn ingest_builtin(b: api::BuiltinClass, it: &mut Interner) -> BuiltinType {
                     .then(|| parse_color_literal(&k.value))
                     .flatten(),
                 ty: non_empty(&k.ty, it),
+                description: k.description,
             })
             .collect(),
         constructors: b
