@@ -1139,22 +1139,25 @@ pub const DUMP_OMITTED_NATIVE_METHODS: &[(&str, &str, bool)] = &[
 ];
 
 fn ingest_class(c: api::ClassDef, it: &mut Interner) -> NativeClass {
+    let methods: Vec<Method> = c
+        .methods
+        .into_iter()
+        .map(|m| ingest_method(m, it))
+        .collect();
+    let mut properties: Vec<Property> = c
+        .properties
+        .into_iter()
+        .map(|p| ingest_property(p, it))
+        .collect();
+    recover_property_types_from_getters(&mut properties, &methods);
     NativeClass {
         name: it.intern(&c.name),
         inherits: c.inherits.as_deref().map(|s| it.intern(s)),
         is_refcounted: c.is_refcounted,
         is_instantiable: c.is_instantiable,
         api_type: ApiType::parse(&c.api_type),
-        methods: c
-            .methods
-            .into_iter()
-            .map(|m| ingest_method(m, it))
-            .collect(),
-        properties: c
-            .properties
-            .into_iter()
-            .map(|p| ingest_property(p, it))
-            .collect(),
+        methods,
+        properties,
         signals: c
             .signals
             .into_iter()
@@ -1199,6 +1202,38 @@ fn ingest_method(m: api::MethodDef, it: &mut Interner) -> Method {
         description: m.description,
         // Real dump entry — its parameter list is authoritative, so callers may arity-check it.
         arity_known: true,
+    }
+}
+
+/// Take a property's real type from its getter where the property table cannot express it (#428).
+///
+/// `ClassDB`'s `PropertyInfo` — which is what Godot's analyzer reads — carries the enum class name
+/// and the container element types alongside the plain `Variant::Type`. The JSON dump's
+/// `classes[].properties[].type` field flattens all of that: `Node.process_mode` is written `int`,
+/// where Godot names it `Node.ProcessMode`, and a typed-array property is written `Array`. The
+/// getter's signature is where the dump keeps the structure — `get_process_mode` returns
+/// `enum::Node.ProcessMode` — and `ClassDB::add_property` validates the two agree, so reading it
+/// back reconstructs the `PropertyInfo` rather than inventing anything.
+///
+/// Only the three structured forms are recovered, and only over a plain named property type. The
+/// dump also disagrees with its getters on some object properties, but that is the `PropertyInfo`
+/// hint string leaking into the `type` field (`"Texture2D,-AtlasTexture,…"`). Picking a class out
+/// of a hint string would be inventing a type, so those are left as the dump wrote them.
+fn recover_property_types_from_getters(properties: &mut [Property], methods: &[Method]) {
+    for prop in properties.iter_mut() {
+        if !matches!(prop.ty, TypeRef::Named(_)) {
+            continue;
+        }
+        let Some(getter) = prop.getter else { continue };
+        let Some(method) = methods.iter().find(|m| m.name == getter) else {
+            continue;
+        };
+        if matches!(
+            method.return_type,
+            TypeRef::Enum { .. } | TypeRef::TypedArray(_) | TypeRef::TypedDict(..)
+        ) {
+            prop.ty = method.return_type.clone();
+        }
     }
 }
 
