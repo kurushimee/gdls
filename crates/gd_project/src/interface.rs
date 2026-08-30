@@ -128,17 +128,36 @@ pub struct MemberFlags {
 /// cross-file type is worse than no cross-file type (#431).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InitShape {
-    /// A dotted identifier chain read as a value: `SOME_CONST`, `E.A`, `Other.KONST`,
-    /// `SomeAutoload.level`.
-    MemberChain(Vec<String>),
-    /// A call whose callee is such a chain: `make()`, `Other.make()`. The arguments are not
-    /// captured — the type comes from the function's declared return.
-    Call(Vec<String>),
+    /// Segments read as a value. With no `base` this is a dotted identifier chain —
+    /// `SOME_CONST`, `E.A`, `Other.KONST`, `SomeAutoload.level`. With a `base` the segments are
+    /// read off whatever that shape resolves to: `preload("x.gd").KONST`.
+    Read {
+        base: Option<Box<InitShape>>,
+        path: Vec<String>,
+    },
+    /// A call. The last segment of `path` is the method; earlier ones are reads leading to it.
+    /// With no `base` the chain starts at a name — `make()`, `Other.make()`. With a `base` the
+    /// call is addressed off another shape's result: `OS.get_data_dir().path_join(x)`. The
+    /// arguments are never captured — the type comes from the function's declared return.
+    Call {
+        base: Option<Box<InitShape>>,
+        path: Vec<String>,
+    },
     /// `preload("x.gd")`, and `preload("x.gd").new()` when `construct` is set. The path is the
     /// literal as written — `res://` or relative to the declaring file, the same two forms
     /// `CrossFileQuery::resolve_path_from` resolves and `preload_deps` carries an edge for.
     Preload { path: String, construct: bool },
 }
+
+/// How deep a nested shape may go before the whole capture is refused.
+///
+/// The bound has to sit at capture, not just at resolve: extraction runs eagerly at startup on
+/// every `.gd`, so a generated `a().b().c()…` chain would otherwise walk the tree unboundedly.
+/// Refusing the WHOLE shape rather than truncating it is the load-bearing half — a shape missing
+/// its root resolves off the wrong thing, which is the one outcome worse than no shape at all.
+/// The cap is also far under serde's own recursion limit, so a captured shape always round-trips
+/// through the cache.
+pub const INIT_SHAPE_MAX_DEPTH: usize = 16;
 
 /// How a `func` parameter got its type — what a [`TypeExpr`] alone cannot say. Godot routes a
 /// parameter through `resolve_assignable` (`gdscript_analyzer.cpp:2255-2258`), whose
@@ -1042,39 +1061,91 @@ fn initializer_type_expr(tree: &ParseTree, init: Option<NodeId>) -> TypeExpr {
 /// index, a call through a value, a call whose result depends on its arguments — because a wrong
 /// cross-file type is worse than none.
 fn capture_init_shape(tree: &ParseTree, init: Option<NodeId>) -> Option<Box<InitShape>> {
-    let id = init?;
+    Some(Box::new(capture_shape(tree, init?, INIT_SHAPE_MAX_DEPTH)?))
+}
+
+/// One level of [`capture_init_shape`]. `depth` bounds the nesting; hitting zero refuses the
+/// whole shape rather than truncating it.
+fn capture_shape(tree: &ParseTree, id: NodeId, depth: usize) -> Option<InitShape> {
+    if depth == 0 {
+        return None;
+    }
     match &tree.get(id).kind {
-        NodeKind::Identifier(_) | NodeKind::Subscript(_) => {
-            attribute_path(tree, id).map(|p| Box::new(InitShape::MemberChain(p)))
-        }
-        NodeKind::Preload(pl) => preload_res_path(tree, pl.path).map(|path| {
-            Box::new(InitShape::Preload {
-                path,
-                construct: false,
-            })
+        NodeKind::Identifier(i) => Some(InitShape::Read {
+            base: None,
+            path: vec![i.name.clone()],
         }),
-        NodeKind::Call(c) => {
-            let callee = c.callee?;
-            if c.function_name == "new" {
-                // `preload("res://x.gd").new()` — the callee is `<preload>.new`, so the base of
-                // the attribute is the preload rather than a nameable chain.
-                if let NodeKind::Subscript(sub) = &tree.get(callee).kind {
-                    if let Some(base) = sub.base {
-                        if let NodeKind::Preload(pl) = &tree.get(base).kind {
-                            return preload_res_path(tree, pl.path).map(|path| {
-                                Box::new(InitShape::Preload {
-                                    path,
-                                    construct: true,
-                                })
-                            });
-                        }
-                    }
+        NodeKind::Subscript(_) => {
+            let (base, path) = split_chain_base(tree, id, depth)?;
+            Some(InitShape::Read { base, path })
+        }
+        NodeKind::Preload(pl) => preload_res_path(tree, pl.path).map(|path| InitShape::Preload {
+            path,
+            construct: false,
+        }),
+        NodeKind::Call(_) => capture_call_shape(tree, id, depth),
+        // A literal, an operator, a ternary, a lambda, an `await`: either the shape has no single
+        // reading, or the reader has no arm for its root. Recording it would mistype the member.
+        _ => None,
+    }
+}
+
+/// A call, as either a `Preload { construct }` or a [`InitShape::Call`].
+fn capture_call_shape(tree: &ParseTree, id: NodeId, depth: usize) -> Option<InitShape> {
+    let NodeKind::Call(c) = &tree.get(id).kind else {
+        return None;
+    };
+    let callee = c.callee?;
+    if c.function_name == "new" {
+        // `preload("res://x.gd").new()` — the callee is `<preload>.new`, so the base of the
+        // attribute is the preload rather than a nameable chain.
+        if let NodeKind::Subscript(sub) = &tree.get(callee).kind {
+            if let Some(base) = sub.base {
+                if let NodeKind::Preload(pl) = &tree.get(base).kind {
+                    return preload_res_path(tree, pl.path).map(|path| InitShape::Preload {
+                        path,
+                        construct: true,
+                    });
                 }
-                // A nameable `A.new()` / `A.B.new()` is already a type, handled by
-                // `initializer_type_expr`; anything else naming `new` has no single reading.
-                return None;
             }
-            attribute_path(tree, callee).map(|p| Box::new(InitShape::Call(p)))
+        }
+        // A nameable `A.new()` / `A.B.new()` is already a type, handled by
+        // `initializer_type_expr`; anything else naming `new` has no single reading.
+        return None;
+    }
+    match &tree.get(callee).kind {
+        NodeKind::Identifier(i) => Some(InitShape::Call {
+            base: None,
+            path: vec![i.name.clone()],
+        }),
+        NodeKind::Subscript(_) => {
+            let (base, path) = split_chain_base(tree, callee, depth)?;
+            Some(InitShape::Call { base, path })
+        }
+        _ => None,
+    }
+}
+
+/// Peel an attribute chain and decide what it hangs off: `(base, path)`.
+///
+/// A plain identifier root stays the head of the chain itself, so `A.B.C` comes back as
+/// `(None, [A, B, C])` — the flat form every shape had before nesting existed. A call or a
+/// preload root becomes a nested shape and the peeled segments are read off its result. Any
+/// other root refuses the whole capture.
+#[allow(clippy::type_complexity)]
+fn split_chain_base(
+    tree: &ParseTree,
+    id: NodeId,
+    depth: usize,
+) -> Option<(Option<Box<InitShape>>, Vec<String>)> {
+    let (root, mut path) = split_attribute_chain(tree, id)?;
+    match &tree.get(root).kind {
+        NodeKind::Identifier(i) => {
+            path.insert(0, i.name.clone());
+            Some((None, path))
+        }
+        NodeKind::Call(_) | NodeKind::Preload(_) => {
+            Some((Some(Box::new(capture_shape(tree, root, depth - 1)?)), path))
         }
         _ => None,
     }
@@ -1092,25 +1163,41 @@ fn preload_res_path(tree: &ParseTree, path: Option<NodeId>) -> Option<String> {
     Some(text.clone())
 }
 
-/// The dotted identifier chain under an attribute expression: `A` → `[A]`, `A.B.C` → `[A, B, C]`.
-/// `None` if any link is something other than a plain attribute over an identifier — a subscript
-/// with `[]`, a call, a literal.
-fn attribute_path(tree: &ParseTree, id: NodeId) -> Option<Vec<String>> {
-    match &tree.get(id).kind {
-        NodeKind::Identifier(i) => Some(vec![i.name.clone()]),
-        NodeKind::Subscript(sub) => {
-            let Some(gd_syntax::ast::SubscriptAccess::Attribute(Some(a))) = sub.access else {
-                return None;
-            };
-            let NodeKind::Identifier(attr) = &tree.get(a).kind else {
-                return None;
-            };
-            let mut path = attribute_path(tree, sub.base?)?;
-            path.push(attr.name.clone());
-            Some(path)
-        }
-        _ => None,
+/// Peel attribute-over-identifier links off `id`, returning the innermost node that is not one
+/// and the segment names in source order: `A.B.C` → `(A, [B, C])`.
+///
+/// `None` if any link is something other than a plain attribute over an identifier — a `[]`
+/// subscript, an attribute whose name slot is missing. The whole chain is refused in that case,
+/// never truncated. Iterative rather than recursive: a generated ten-thousand-segment chain must
+/// not blow the extraction stack, and extraction runs on every `.gd` at startup.
+fn split_attribute_chain(tree: &ParseTree, id: NodeId) -> Option<(NodeId, Vec<String>)> {
+    let mut segments = Vec::new();
+    let mut cur = id;
+    loop {
+        let NodeKind::Subscript(sub) = &tree.get(cur).kind else {
+            segments.reverse();
+            return Some((cur, segments));
+        };
+        let Some(gd_syntax::ast::SubscriptAccess::Attribute(Some(a))) = sub.access else {
+            return None;
+        };
+        let NodeKind::Identifier(attr) = &tree.get(a).kind else {
+            return None;
+        };
+        segments.push(attr.name.clone());
+        cur = sub.base?;
     }
+}
+
+/// The dotted identifier chain under an attribute expression: `A` → `[A]`, `A.B.C` → `[A, B, C]`.
+/// `None` if the chain does not bottom out at a plain identifier.
+fn attribute_path(tree: &ParseTree, id: NodeId) -> Option<Vec<String>> {
+    let (root, mut path) = split_attribute_chain(tree, id)?;
+    let NodeKind::Identifier(i) = &tree.get(root).kind else {
+        return None;
+    };
+    path.insert(0, i.name.clone());
+    Some(path)
 }
 
 /// GDScript's builtin type-name set (`GDScriptParser::get_builtin_type`, minus `Nil`/`Object`).
@@ -1486,21 +1573,22 @@ var b := pick().new()
                 .map(|b| *b)
         };
         let chain = |v: &[&str]| {
-            Some(InitShape::MemberChain(
-                v.iter().map(|s| (*s).to_owned()).collect(),
-            ))
+            Some(InitShape::Read {
+                base: None,
+                path: v.iter().map(|s| (*s).to_owned()).collect(),
+            })
+        };
+        let call = |v: &[&str]| {
+            Some(InitShape::Call {
+                base: None,
+                path: v.iter().map(|s| (*s).to_owned()).collect(),
+            })
         };
         assert_eq!(init("K"), chain(&["OTHER"]));
         assert_eq!(init("chain"), chain(&["Other", "KONST"]));
         assert_eq!(init("enum_val"), chain(&["E", "A"]));
-        assert_eq!(
-            init("called"),
-            Some(InitShape::Call(vec!["make".to_owned()]))
-        );
-        assert_eq!(
-            init("dotted"),
-            Some(InitShape::Call(vec!["Other".to_owned(), "make".to_owned()]))
-        );
+        assert_eq!(init("called"), call(&["make"]));
+        assert_eq!(init("dotted"), call(&["Other", "make"]));
         assert_eq!(
             init("pre"),
             Some(InitShape::Preload {
@@ -1517,14 +1605,7 @@ var b := pick().new()
         );
         // A longer chain is still one reading — whether it resolves to anything is the reader's
         // problem, not extraction's.
-        assert_eq!(
-            init("through_value"),
-            Some(InitShape::Call(vec![
-                "holder".to_owned(),
-                "thing".to_owned(),
-                "compute".to_owned()
-            ]))
-        );
+        assert_eq!(init("through_value"), call(&["holder", "thing", "compute"]));
         // An index has no single reading, so nothing is recorded.
         assert_eq!(init("indexed"), None);
         // A relative preload is recorded verbatim; the index joins it against the reading file's
@@ -1538,6 +1619,95 @@ var b := pick().new()
         );
         // A member the interface can already type records no shape.
         assert_eq!(init("typed"), None);
+    }
+
+    #[test]
+    fn a_shape_over_a_call_or_a_preload_nests() {
+        let i = iface(
+            "extends Node\n\
+             var joined := OS.get_temp_dir().path_join(\"x\")\n\
+             var read_off_call := make().field\n\
+             var read_off_preload := preload(\"res://lib.gd\").KONST\n\
+             var call_off_new := preload(\"res://lib.gd\").new().make()\n\
+             var through_index := rows[0].compute()\n",
+        );
+        let init = |n: &str| {
+            i.members
+                .iter()
+                .find(|m| m.name == n)
+                .unwrap()
+                .init
+                .clone()
+                .map(|b| *b)
+        };
+        let path = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            init("joined"),
+            Some(InitShape::Call {
+                base: Some(Box::new(InitShape::Call {
+                    base: None,
+                    path: path(&["OS", "get_temp_dir"]),
+                })),
+                path: path(&["path_join"]),
+            })
+        );
+        assert_eq!(
+            init("read_off_call"),
+            Some(InitShape::Read {
+                base: Some(Box::new(InitShape::Call {
+                    base: None,
+                    path: path(&["make"]),
+                })),
+                path: path(&["field"]),
+            })
+        );
+        assert_eq!(
+            init("read_off_preload"),
+            Some(InitShape::Read {
+                base: Some(Box::new(InitShape::Preload {
+                    path: "res://lib.gd".to_owned(),
+                    construct: false,
+                })),
+                path: path(&["KONST"]),
+            })
+        );
+        assert_eq!(
+            init("call_off_new"),
+            Some(InitShape::Call {
+                base: Some(Box::new(InitShape::Preload {
+                    path: "res://lib.gd".to_owned(),
+                    construct: true,
+                })),
+                path: path(&["make"]),
+            })
+        );
+        // An index anywhere in the chain still has more than one reading, and nesting does not
+        // make it recordable.
+        assert_eq!(init("through_index"), None);
+    }
+
+    #[test]
+    fn a_shape_deeper_than_the_cap_is_refused_whole() {
+        let init = |src: &str| {
+            iface(src)
+                .members
+                .iter()
+                .find(|m| m.name == "x")
+                .unwrap()
+                .init
+                .clone()
+        };
+        // Each `.g()` link is one more nesting level, and the innermost `f()` is the first.
+        let chain = |n: usize| {
+            let mut src = String::from("extends Node\nvar x := f()");
+            for _ in 1..n {
+                src.push_str(".g()");
+            }
+            src.push('\n');
+            src
+        };
+        assert!(init(&chain(INIT_SHAPE_MAX_DEPTH)).is_some());
+        assert!(init(&chain(INIT_SHAPE_MAX_DEPTH + 1)).is_none());
     }
 
     #[test]

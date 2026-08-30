@@ -314,9 +314,12 @@ fn an_unresolved_argument_produces_no_constructor_error() {
 }
 
 /// A builtin the dump does not carry has no overload list to check against, so nothing is checked.
-/// `String` is absent from the trimmed fixture; against a real dump this call resolves and reports
-/// exactly as Godot does.
+/// `Transform2D` is absent from the trimmed fixture; against a real dump this call resolves and
+/// reports exactly as Godot does.
 #[test]
 fn a_builtin_missing_from_the_dump_is_never_checked() {
-    assert_eq!(errors("\tprint(String(1, 2, 3))\n"), Vec::<String>::new());
+    assert_eq!(
+        errors("\tprint(Transform2D(1, 2, 3))\n"),
+        Vec::<String>::new()
+    );
 }

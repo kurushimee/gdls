@@ -20,21 +20,23 @@ jq 'walk(if type=="object" then del(.description, .brief_description) else . end
       global_enums:      [.global_enums[]      | select(.name | IN("Variant.Operator","Variant.Type","ClockDirection","Error","Side","PropertyHint","PropertyUsageFlags"))],
       global_constants:  .global_constants,
       utility_functions: .utility_functions,
-      builtin_classes:   [.builtin_classes[]   | select(.name | IN("Vector2","Vector2i","Vector3","Array","Dictionary","Color","Callable"))],
-      classes:           [.classes[]           | select(.name | IN("Object","RefCounted","Node","CanvasItem","Node2D","Node3D","SpriteBase3D","Sprite3D","Resource","Script","GDScript","Time","TileSet","InstancePlaceholder","MainLoop","SceneTree","Viewport","Window","PhysicsDirectBodyState3D","PhysicsDirectBodyState3DExtension"))],
-      singletons:        [.singletons[]        | select(.name | IN("Engine","OS"))] }' \
+      builtin_classes:   [.builtin_classes[]   | select(.name | IN("bool","int","float","String","Vector2","Vector2i","Vector3","Array","Dictionary","Color","Callable","PackedVector2Array"))],
+      classes:           [.classes[]           | select(.name | IN("Object","RefCounted","Node","CanvasItem","Node2D","Line2D","Node3D","VisualInstance3D","GeometryInstance3D","SpriteBase3D","Sprite3D","Resource","Script","GDScript","Time","TileSet","InstancePlaceholder","MainLoop","SceneTree","Viewport","Window","PhysicsDirectBodyState3D","PhysicsDirectBodyState3DExtension","OS","DirAccess"))],
+      singletons:        [.singletons[]        | select(.name | IN("Engine","OS","Time"))] }' \
   api/extension_api.json > crates/gd_types/tests/fixtures/trimmed_api.json
 ```
 
 `PropertyHint` and `PropertyUsageFlags` are kept because `@export_custom`'s arguments name them, and since annotation arguments are reduced, an enum the fixture drops reads as an undeclared identifier in the corpus.
 
-`Line2D` and the `PackedVector2Array` builtin are kept for the 4.7
-`CONFUSABLE_TEMPORARY_MODIFICATION` fixture, which needs a native property whose type is a packed
-array plus that array's method list (to tell the mutating `clear()` from the `const` `size()`).
+`Line2D` and the `PackedVector2Array` builtin are kept for the 4.7 `CONFUSABLE_TEMPORARY_MODIFICATION` fixture, which needs a native property whose type is a packed array plus that array's method list (to tell the mutating `clear()` from the `const` `size()`).
+
+`VisualInstance3D` and `GeometryInstance3D` carry no test of their own; they sit between `Node3D` and `SpriteBase3D` in the real dump, and dropping them would break the `Sprite3D` to `Node` chain the corpus walks. Whenever a class is added, add whatever the dump names in its `inherits` chain as well, up to a class already kept. Never patch a kept class's `inherits` to skip a gap: that makes a fixture claiming `Exact` describe an engine that does not exist.
+
+`OS` and `DirAccess` back the cross-file call-chain tests, which need a native static call whose return type is another native class, and `String` backs the ones that then read a method off that return.
 
 A few methods are hand-added on top, and must be re-applied after a regeneration:
 
-- `Object.free` and `Node.free`, ClassDB-resolvable names the dump omits, which `NativeDb` also seeds at ingest. Without them the `free`-related tests fail.
+- `Object.free`, a ClassDB-resolvable name the dump omits, which `NativeDb` also seeds at ingest. Without it the `free`-related tests fail.
 - `Object._get_property_list`, returning `typedarray::Dictionary`. The dump omits `Object`'s script virtuals entirely, and `seed_dump_omitted_methods` deliberately synthesizes every seeded method as `Variant`-returning, since only the name takes part in the existence lookup. The real signature is what 4.7's `_get_property_list` return-type exception turns on, so this fixture carries it and `crates/gd_analyze/tests/inherited_return_type.rs` pins the behavior. A stock dump therefore leaves that exception inert in a real session; the code is still correct, and goes live the moment a DB carries the real return type.
 
 ## Generating the full dump (`api/extension_api.json`, git-ignored)
