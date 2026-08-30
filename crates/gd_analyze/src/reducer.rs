@@ -1221,6 +1221,21 @@ fn eval_binary(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedV
         }
     }
 
+    // `in` between two strings — `register_string_op(OperatorEvaluatorInStringFind, OP_IN)` at
+    // variant_op.cpp:922 registers all four String/StringName pairs, and the evaluator is a find:
+    // `a in b` is `b.find(a) != -1` (variant_op.h:1113-1139). An empty needle is the one place
+    // `find` and Rust's `contains` disagree — `String::find` bails on `p_str.is_empty()` and
+    // returns -1 (ustring.cpp:3040), so `"" in "abc"` is false upstream.
+    //
+    // These four pairs are the only ones that can reach here: an Array or Dictionary literal is
+    // `is_shared()` and never folds to a value, so `1 in [1, 2]` keeps taking the type-only path.
+    if op == BinaryOp::ContentTest {
+        if let (String(l) | StringName(l), String(r) | StringName(r)) = (a, b) {
+            return Some(Bool(!l.is_empty() && r.contains(l.as_str())));
+        }
+        return None;
+    }
+
     // Arithmetic — Int×Int, Int×Float, Float×Int, Float×Float only. Bool/String/Nil mixed with
     // anything (or themselves, for arithmetic) is NOT registered ⇒ None.
     match (a, b) {
@@ -8988,6 +9003,45 @@ mod tests {
     use gd_syntax::ast::{BinaryOpNode, LiteralNode, Node, NodeKind, ParseTree, UnaryOpNode};
     use gd_syntax::Dialect;
     use gd_types::NativeDb;
+
+    /// #459: `in` between two constant strings. `eval_binary` had no `ContentTest` arm at all, so
+    /// every constant `in` came back `None` and `reduce_binary_op` read that as Godot's
+    /// `r_valid = false` and drew `Invalid operands to operator in, String and String.`
+    ///
+    /// The value itself is not observable from a diagnostic, so the four registered pairs and the
+    /// empty-needle carve-out are pinned straight against `String::find` (ustring.cpp:3033-3042).
+    #[test]
+    fn a_constant_in_between_two_strings_is_a_substring_test() {
+        let s = |v: &str| FoldedValue::String(v.to_owned());
+        let sn = |v: &str| FoldedValue::StringName(v.to_owned());
+        let got = |a: FoldedValue, b: FoldedValue| eval_binary(BinaryOp::ContentTest, &a, &b);
+
+        // All four String/StringName pairs are registered (variant_op.cpp:922 through
+        // register_string_op), and all four return a bool.
+        for (a, b) in [
+            (s("a"), s("abc")),
+            (s("a"), sn("abc")),
+            (sn("a"), s("abc")),
+            (sn("a"), sn("abc")),
+        ] {
+            assert_eq!(got(a, b), Some(FoldedValue::Bool(true)));
+        }
+        assert_eq!(got(s("z"), s("abc")), Some(FoldedValue::Bool(false)));
+        assert_eq!(got(s("abc"), s("a")), Some(FoldedValue::Bool(false)));
+        assert_eq!(got(s("abc"), s("abc")), Some(FoldedValue::Bool(true)));
+
+        // `String::find` bails on an empty needle and returns -1, where Rust's `contains` says
+        // true. An empty haystack is false either way.
+        assert_eq!(got(s(""), s("abc")), Some(FoldedValue::Bool(false)));
+        assert_eq!(got(s(""), s("")), Some(FoldedValue::Bool(false)));
+        assert_eq!(got(s("a"), s("")), Some(FoldedValue::Bool(false)));
+
+        // Nothing else registers `in` on a foldable pair — an Array or Dictionary literal is
+        // `is_shared()` and never reaches here.
+        assert_eq!(got(FoldedValue::Int(1), s("abc")), None);
+        assert_eq!(got(s("a"), FoldedValue::Int(1)), None);
+        assert_eq!(got(FoldedValue::Int(1), FoldedValue::Int(1)), None);
+    }
 
     /// #396: the shared-type table, pinned at both tags against `Variant::is_type_shared`. The one
     /// caller cannot reach the difference from real source today — `is_read_only` is only stamped
