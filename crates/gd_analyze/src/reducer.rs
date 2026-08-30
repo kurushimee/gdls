@@ -3294,7 +3294,9 @@ fn reduce_assignment(ctx: &mut AnalysisContext, id: NodeId) {
             let Some(base) = s.base else { break };
             let base_type = ctx.get_type(base).clone();
             if base_type.is_hard_type() && base_type.is_read_only {
-                if base_type.kind == DtKind::Builtin && !builtin_is_shared(base_type.builtin_type) {
+                if base_type.kind == DtKind::Builtin
+                    && !variant_is_type_shared(ctx.dialect, base_type.builtin_type)
+                {
                     ctx.push_error(
                         "Cannot assign a new value to a read-only property.",
                         assignee_id,
@@ -3483,20 +3485,21 @@ fn assign_op_variant_name(op: gd_syntax::ast::AssignOp) -> &'static str {
     }
 }
 
-/// Whether a builtin type is "shared" (analyzer.cpp:2928 wraps `Variant::is_type_shared`). Shared
-/// types (Array, Dictionary, Object, ...) are pointer-like and don't trigger the
-/// nested-read-only-subscript error on `state.center_of_mass.x +=`; non-shared types (Vector3,
-/// Color, ...) do. Godot's table is at `core/variant/variant.cpp:230` (`Variant::is_type_shared`
-/// — Array/Dictionary/Object/Callable/Signal/RID and the Packed*Array family are shared).
-fn builtin_is_shared(t: VariantType) -> bool {
+/// `Variant::is_type_shared(p_type)` (`core/variant/variant.cpp:3437`). A shared type is
+/// pointer-like, so writing through it does not modify a temporary and the nested-read-only
+/// subscript walk leaves it alone; a non-shared type (`Vector3`, `Color`, …) draws the error on
+/// `state.center_of_mass.x +=`.
+pub(crate) fn variant_is_type_shared(dialect: Dialect, t: VariantType) -> bool {
+    // DIALECT(4.7): variant.cpp:3437 — the ten Packed*Array types became shared. At 4.6 the whole
+    // list is Object/Array/Dictionary (variant.cpp:3433 at that tag).
+    if dialect < Dialect::Godot4_7 && data_type::is_packed_array(t) {
+        return false;
+    }
     matches!(
         t,
-        VariantType::Array
+        VariantType::Object
+            | VariantType::Array
             | VariantType::Dictionary
-            | VariantType::Object
-            | VariantType::Callable
-            | VariantType::Signal
-            | VariantType::Rid
             | VariantType::PackedByteArray
             | VariantType::PackedInt32Array
             | VariantType::PackedInt64Array
@@ -8013,11 +8016,36 @@ fn enum_element_named(
 mod tests {
     use super::*;
     use crate::cross_file::NoCrossFile;
+    use crate::data_type::VARIANT_TYPES;
     use crate::warn_policy::{StrictSettings, WarnPolicy};
     use gd_project::{FileId, WarningConfig};
     use gd_syntax::ast::{BinaryOpNode, LiteralNode, Node, NodeKind, ParseTree, UnaryOpNode};
     use gd_syntax::Dialect;
     use gd_types::NativeDb;
+
+    /// #396: the shared-type table, pinned at both tags against `Variant::is_type_shared`. The one
+    /// caller cannot reach the difference from real source today — `is_read_only` is only stamped
+    /// from a setter-less native property, and the dump has none of an affected type that can be
+    /// subscripted — so the table is pinned here directly rather than through a `.gd` fixture.
+    #[test]
+    fn shared_types_follow_the_tag() {
+        let base = [
+            VariantType::Object,
+            VariantType::Array,
+            VariantType::Dictionary,
+        ];
+        for d in [Dialect::Godot4_6, Dialect::Godot4_7] {
+            for t in VARIANT_TYPES {
+                let want = base.contains(&t)
+                    || (d >= Dialect::Godot4_7 && crate::data_type::is_packed_array(t));
+                assert_eq!(variant_is_type_shared(d, t), want, "{t:?} at {d:?}");
+            }
+        }
+        // The three types gdls used to carry that Godot never has.
+        for t in [VariantType::Callable, VariantType::Signal, VariantType::Rid] {
+            assert!(!variant_is_type_shared(Dialect::Godot4_7, t), "{t:?}");
+        }
+    }
 
     fn mini_native() -> NativeDb {
         NativeDb::from_json(
