@@ -11,6 +11,13 @@
 //! while a native class name, a project `class_name`, a builtin type name, a global enum's name,
 //! `self`, and any attribute-callee call are not. Every row below is pinned against
 //! `Godot_v4.7.2-stable --headless --check-only` inside an imported project.
+//!
+//! #400 closed the largest hole in that walk. An identifier-callee call used to be skipped whole,
+//! so `const X = randi()` and `const X = my_func()` passed in silence. The walk now reads the fold
+//! table for the call itself and falls back to a three-way classification of the name: a builtin
+//! constructor and the math subset of the utility registry fold, `Array` and `Dictionary` are
+//! walked into instead of blamed because gdls cannot fold them but Godot can, and everything else
+//! is never constant.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -104,6 +111,41 @@ fn errors(src: &str) -> Vec<String> {
     .collect()
 }
 
+/// `errors`, at an explicit dialect.
+fn errors_at(dialect: Dialect, src: &str) -> Vec<String> {
+    let project = Project::new(&[("res://lib.gd", LIB_GD), ("res://main.gd", src)]);
+    let tree = gd_syntax::parse_with_options(
+        src,
+        &gd_syntax::ParseOptions {
+            dialect,
+            script_path: "",
+        },
+    )
+    .tree;
+    let policy = WarnPolicy::build(
+        &gd_project::WarningConfig::default(),
+        &StrictSettings::default(),
+        dialect,
+    );
+    gd_analyze::analyze_with_options(
+        &tree,
+        Some(FileId::new(2)),
+        "res://main.gd",
+        &native_db(),
+        &project,
+        &policy,
+        gd_analyze::AnalyzeOptions {
+            dialect,
+            ..Default::default()
+        },
+    )
+    .diagnostics
+    .iter()
+    .filter(|d| d.severity() == Severity::Error)
+    .map(|d| d.message().to_owned())
+    .collect()
+}
+
 /// A class-level `const X = <init>` under a preamble that declares the names the rows reference.
 const PREAMBLE: &str = "\
 extends Node
@@ -115,6 +157,9 @@ class In:
 
 var member_var := 1
 const ALIAS = 7
+
+func g() -> int:
+	return 1
 ";
 
 fn class_const(init: &str) -> Vec<String> {
@@ -249,12 +294,14 @@ fn literals_and_folded_operations_are_constant_expressions() {
     assert_silent("In if true else 1");
 }
 
-/// An identifier-callee call is skipped whole: a builtin constructor folds in Godot, and gdls
-/// cannot tell one from a project `my_func()` without the fold table this walk exists to avoid.
-/// A deliberate under-report, never a wrong report.
+/// A builtin constructor over constant arguments folds, so it is a constant expression. Since
+/// #400 the walk reads the fold line for an identifier callee instead of skipping every one of
+/// them, and this row is what the fold line has to keep silent.
 #[test]
-fn an_identifier_callee_call_is_left_alone() {
+fn a_folded_builtin_constructor_is_a_constant_expression() {
     assert_silent("Vector2(1, 2)");
+    assert_silent("Color(1, 0, 0)");
+    assert_silent("Vector2(1, 2) + Vector2(3, 4)");
 }
 
 /// A preload folds, and so does a preload nested in a literal.
@@ -271,6 +318,86 @@ fn utility_names_and_unresolved_names_are_left_alone() {
     assert_silent("sin");
     assert_silent("PI");
     assert_silent("who_knows");
+}
+
+// ===================================================================================================
+// #400 — the identifier-callee call, read off the fold line instead of skipped.
+// ===================================================================================================
+
+/// A project function, a non-math engine utility, and a GDScript utility that reaches the
+/// filesystem all fail to fold, and Godot reports each. Before #400 the walk stepped over every
+/// one of them.
+#[test]
+fn an_unfoldable_identifier_callee_call_is_reported() {
+    assert_reported("g()");
+    assert_reported("str(1)");
+    assert_reported("randi()");
+    assert_reported("range(3)");
+    assert_reported("load(\"res://lib.gd\")");
+}
+
+/// The math subset of the engine's utility registry folds, and so do the eight GDScript utilities
+/// Godot marks constant. All of them over constant arguments only.
+#[test]
+fn a_folded_utility_call_is_a_constant_expression() {
+    assert_silent("absi(-1)");
+    assert_silent("maxi(1, 2)");
+    assert_silent("lerp(1.0, 2.0, 0.5)");
+    assert_silent("len(\"ab\")");
+    assert_silent("char(65)");
+    assert_silent("ord(\"a\")");
+    assert_silent("convert(1, TYPE_FLOAT)");
+    assert_silent("type_exists(\"Node\")");
+    assert_silent("Color8(255, 0, 0)");
+    assert_silent("is_instance_of(1, TYPE_INT)");
+}
+
+/// A foldable utility over a non-constant argument is still not constant, and the blame lands on
+/// the argument, not on the call.
+#[test]
+fn a_foldable_utility_over_a_nonconstant_argument_is_reported() {
+    let errs = errors(&format!(
+        "{PREAMBLE}func f(x: int) -> void:\n\tconst X = absi(x)\n\tprint(X)\n"
+    ));
+    assert!(
+        errs.iter().any(|e| e == MSG),
+        "a non-constant argument disqualifies the fold; got {errs:?}"
+    );
+}
+
+/// A folded utility feeding a binary operation stays constant — the fold has to carry a usable
+/// value, not a `Nil` placeholder, or the operand check false-positives on the way out.
+#[test]
+fn a_folded_utility_composes_with_an_operator() {
+    assert_silent("min(1, 2) + 1");
+    assert_silent("absi(-10) + 1");
+}
+
+/// `Array` and `Dictionary` are the two shapes gdls cannot fold but Godot can, so the walk
+/// descends into their arguments instead of blaming the call. `Array([1], TYPE_INT, &"", null)` is
+/// the typed-array form, and every argument of it is constant.
+#[test]
+fn the_array_and_dictionary_constructors_are_walked_not_blamed() {
+    assert_silent("Array([])");
+    assert_silent("Array([1], TYPE_INT, &\"\", null)");
+    assert_silent("Dictionary({1: 1})");
+}
+
+/// The packed arrays and the reference types are shared, so Godot refuses to fold them even over
+/// no arguments at all. Pinned at both dialects: 4.6 hardcodes the same 13 types in a switch, and
+/// 4.7 reads `Variant::is_type_shared`, which lists exactly those 13.
+#[test]
+fn a_shared_type_constructor_never_folds() {
+    assert_reported("PackedByteArray()");
+    assert_reported("PackedInt32Array([1, 2])");
+    for dialect in [Dialect::Godot4_6, Dialect::Godot4_7] {
+        assert!(
+            errors_at(dialect, &format!("{PREAMBLE}const X = PackedByteArray()\n"))
+                .iter()
+                .any(|e| e == MSG),
+            "{dialect:?}: a packed array is shared at both tags"
+        );
+    }
 }
 
 /// The shadowing guard: a base class's constant named like a native class must resolve as that

@@ -132,6 +132,109 @@ pub const VARIANT_UTILITY_FUNCTIONS: &[&str] = &[
     "is_same",
 ];
 
+/// The `UTILITY_FUNC_TYPE_MATH` subset of [`VARIANT_UTILITY_FUNCTIONS`] — the utilities Godot is
+/// willing to evaluate at compile time (`gdscript_analyzer.cpp:3509`, gated on
+/// `Variant::get_utility_function_type(name) == Variant::UTILITY_FUNC_TYPE_MATH`). `absi(-1)` folds
+/// and so is a legal `const` initializer; `str(1)` and `randi()` do not and are not.
+///
+/// The dump carries no category for a utility, so this is transcribed from the engine's own
+/// registrations. Re-derive it at the tag with:
+///
+/// ```text
+/// grep -oP 'FUNCBIND\w*\(\s*(\w+)\s*,[^;]*Variant::UTILITY_FUNC_TYPE_MATH' core/variant/variant_utility.cpp \
+///   | grep -oP 'FUNCBIND\w*\(\s*\K\w+' | sort
+/// ```
+///
+/// Identical at 4.6.3-stable and 4.7.2-stable, so no dialect guard is owed. Names are in the
+/// engine's own sorted order.
+pub const VARIANT_UTILITY_MATH_FUNCTIONS: &[&str] = &[
+    "abs",
+    "absf",
+    "absi",
+    "acos",
+    "acosh",
+    "angle_difference",
+    "asin",
+    "asinh",
+    "atan",
+    "atan2",
+    "atanh",
+    "bezier_derivative",
+    "bezier_interpolate",
+    "ceil",
+    "ceilf",
+    "ceili",
+    "clamp",
+    "clampf",
+    "clampi",
+    "cos",
+    "cosh",
+    "cubic_interpolate",
+    "cubic_interpolate_angle",
+    "cubic_interpolate_angle_in_time",
+    "cubic_interpolate_in_time",
+    "db_to_linear",
+    "deg_to_rad",
+    "ease",
+    "exp",
+    "floor",
+    "floorf",
+    "floori",
+    "fmod",
+    "fposmod",
+    "inverse_lerp",
+    "is_equal_approx",
+    "is_finite",
+    "is_inf",
+    "is_nan",
+    "is_zero_approx",
+    "lerp",
+    "lerp_angle",
+    "lerpf",
+    "linear_to_db",
+    "log",
+    "max",
+    "maxf",
+    "maxi",
+    "min",
+    "minf",
+    "mini",
+    "move_toward",
+    "nearest_po2",
+    "pingpong",
+    "posmod",
+    "pow",
+    "rad_to_deg",
+    "remap",
+    "rotate_toward",
+    "round",
+    "roundf",
+    "roundi",
+    "sign",
+    "signf",
+    "signi",
+    "sin",
+    "sinh",
+    "smoothstep",
+    "snapped",
+    "snappedf",
+    "snappedi",
+    "sqrt",
+    "step_decimals",
+    "tan",
+    "tanh",
+    "wrap",
+    "wrapf",
+    "wrapi",
+];
+
+/// Whether `name` is one of the math utilities Godot folds at compile time. See
+/// [`VARIANT_UTILITY_MATH_FUNCTIONS`].
+#[must_use]
+pub fn is_variant_utility_math(name: &str) -> bool {
+    VARIANT_UTILITY_MATH_FUNCTIONS.contains(&name)
+}
+
 /// Whether `name` is a Variant utility function — the DB-independent mirror of
 /// `Variant::has_utility_function`. Used so a bare utility reference resolves to a constant
 /// `Callable` under any [`crate::ApiProvenance`], including `Absent`.
@@ -152,6 +255,22 @@ mod tests {
         // The 4.6.3-stable Variant utility registry size. A mismatch means the list drifted from
         // the engine's `register_utility_functions` table.
         assert_eq!(VARIANT_UTILITY_FUNCTIONS.len(), 114);
+    }
+
+    #[test]
+    fn math_subset_is_the_full_registry_and_lives_inside_the_whole() {
+        // The `UTILITY_FUNC_TYPE_MATH` registration count, identical at both supported tags.
+        assert_eq!(VARIANT_UTILITY_MATH_FUNCTIONS.len(), 78);
+        for name in VARIANT_UTILITY_MATH_FUNCTIONS {
+            assert!(is_variant_utility(name), "{name} must also be a utility");
+        }
+        for name in ["absi", "maxi", "lerp", "min", "snapped"] {
+            assert!(is_variant_utility_math(name), "{name} folds in Godot");
+        }
+        // Not math, so not folded: I/O, randomness, conversion, reflection.
+        for name in ["str", "randi", "print", "typeof", "weakref", "is_same"] {
+            assert!(!is_variant_utility_math(name), "{name} does not fold");
+        }
     }
 
     #[test]
