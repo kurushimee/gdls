@@ -1994,7 +1994,7 @@ fn resolve_class_member(
             // (analyzer.cpp:1206-1209) — this is what makes `@abstract`'s static-misuse and
             // duplicate-on-function errors interleave with Godot's class-level @abstract
             // emissions in the right order.
-            apply_function_abstract_annotation(ctx, id);
+            apply_function_annotations(ctx, id);
             resolve_function_signature(ctx, id);
         }
         Member::Class(inner_id) => {
@@ -4144,19 +4144,27 @@ fn apply_class_abstract_annotation(ctx: &mut AnalysisContext, class_id: NodeId) 
     }
 }
 
-/// Function-level half of `apply_abstract_annotations` — fires during the interface pass
+/// Apply a function's annotations, in source order, during the interface pass
 /// (gdscript_analyzer.cpp:1206-1209 applies each function's annotations before
-/// `resolve_function_signature`). Emits the static-misuse and duplicate-on-function errors at
-/// the right phase so they interleave with class-level errors in Godot's emission order.
-fn apply_function_abstract_annotation(ctx: &mut AnalysisContext, fn_id: NodeId) {
+/// `resolve_function_signature`). This is the function-level half of
+/// `apply_abstract_annotations` plus `rpc_annotation` (gdscript_parser.cpp:5238); running them
+/// at the right phase is what interleaves their errors with the class-level ones in Godot's
+/// emission order.
+fn apply_function_annotations(ctx: &mut AnalysisContext, fn_id: NodeId) {
     let fn_annotations: Vec<NodeId> = ctx.node(fn_id).annotations.clone();
     let mut fn_abstract_count = 0usize;
+    let mut abstract_settled = false;
+    let mut rpc_configured = false;
     for &ann_id in &fn_annotations {
-        let is_abstract = matches!(
-            &ctx.node(ann_id).kind,
-            NodeKind::Annotation(an) if an.name == "@abstract"
-        );
-        if !is_abstract {
+        let ann_name = match &ctx.node(ann_id).kind {
+            NodeKind::Annotation(an) => an.name.clone(),
+            _ => continue,
+        };
+        if ann_name == "@rpc" {
+            apply_rpc_annotation(ctx, ann_id, &mut rpc_configured);
+            continue;
+        }
+        if ann_name != "@abstract" || abstract_settled {
             continue;
         }
         fn_abstract_count += 1;
@@ -4169,19 +4177,89 @@ fn apply_function_abstract_annotation(ctx: &mut AnalysisContext, fn_id: NodeId) 
             // Reject the @abstract annotation — the function is NOT abstract. Resets the
             // count so the no-body check later emits Godot's "must have a body" error.
             fn_abstract_count = 0;
-            break;
+            abstract_settled = true;
+            continue;
         }
         if fn_abstract_count > 1 {
             ctx.push_error(
                 r#""@abstract" annotation can only be used once per function."#,
                 ann_id,
             );
-            break;
+            abstract_settled = true;
         }
     }
     if fn_abstract_count >= 1 {
         ctx.abstract_nodes.insert(fn_id);
     }
+}
+
+/// `rpc_annotation` (gdscript_parser.cpp:5238-5298) — one `@rpc` per function, and within it a
+/// vocabulary check on each argument plus a "no more than once" check per config axis.
+///
+/// Godot reads `resolved_arguments`, so it sees whatever each argument folded to. gdls has no
+/// general fold for annotation arguments, so this reads string literals and passes over anything
+/// else: a `const MODE = "any_peer"` argument is legal in Godot and stays silent here too, and an
+/// argument that is neither is left to `resolve_annotation`'s own typed-argument check.
+///
+/// `rpc_configured` is Godot's `function->rpc_config.get_type() != Variant::NIL`, which the apply
+/// sets on its way out even when an argument was rejected — only the duplicate returns early.
+fn apply_rpc_annotation(ctx: &mut AnalysisContext, ann_id: NodeId, rpc_configured: &mut bool) {
+    if *rpc_configured {
+        ctx.push_error(
+            "RPC annotations can only be used once per function.",
+            ann_id,
+        );
+        return;
+    }
+
+    let arg_ids: Vec<NodeId> = match &ctx.node(ann_id).kind {
+        NodeKind::Annotation(an) => an.arguments.clone(),
+        _ => Vec::new(),
+    };
+    let mut locality_args = 0u32;
+    let mut permission_args = 0u32;
+    let mut transfer_mode_args = 0u32;
+    for (i, &arg_id) in arg_ids.iter().enumerate() {
+        // cpp:5256 — the fourth argument is the transfer channel, never a mode keyword.
+        if i == 3 {
+            continue;
+        }
+        let NodeKind::Literal(lit) = &ctx.node(arg_id).kind else {
+            continue;
+        };
+        let gd_syntax::token::Literal::String(arg) = &lit.value else {
+            continue;
+        };
+        match arg.as_str() {
+            "call_local" | "call_remote" => locality_args += 1,
+            "any_peer" | "authority" => permission_args += 1,
+            "reliable" | "unreliable" | "unreliable_ordered" => transfer_mode_args += 1,
+            _ => ctx.push_error(
+                r#"Invalid RPC argument. Must be one of: "call_local"/"call_remote" (local calls), "any_peer"/"authority" (permission), "reliable"/"unreliable"/"unreliable_ordered" (transfer mode)."#,
+                ann_id,
+            ),
+        }
+    }
+
+    // cpp:5288-5294 — an else-if chain, so at most one of the three is reported.
+    if locality_args > 1 {
+        ctx.push_error(
+            r#"Invalid RPC config. The locality ("call_local"/"call_remote") must be specified no more than once."#,
+            ann_id,
+        );
+    } else if permission_args > 1 {
+        ctx.push_error(
+            r#"Invalid RPC config. The permission ("any_peer"/"authority") must be specified no more than once."#,
+            ann_id,
+        );
+    } else if transfer_mode_args > 1 {
+        ctx.push_error(
+            r#"Invalid RPC config. The transfer mode ("reliable"/"unreliable"/"unreliable_ordered") must be specified no more than once."#,
+            ann_id,
+        );
+    }
+
+    *rpc_configured = true;
 }
 
 /// `analyzer.cpp:1532-1568` — check that non-abstract classes don't contain or inherit
