@@ -304,6 +304,32 @@ fn script_chain_links(
     }
 }
 
+/// The chain link that DECLARES `name`: the first link in `start`'s `extends` chain (starting at
+/// `start` itself) whose interface carries a member, enum, or inner class of that name. `None` when
+/// no SCRIPT link declares it — the member is inherited from the chain's native tail (ask
+/// [`script_chain_native_root`] next) or does not exist at all.
+///
+/// Derived shadows base, exactly as [`script_chain_members`] enumerates. Side-effect-free.
+#[must_use]
+pub fn script_chain_declaring_link(
+    xfile: &dyn CrossFileQuery,
+    native: &NativeDb,
+    start: &ScriptRef,
+    name: &str,
+) -> Option<ScriptRef> {
+    script_chain_links(xfile, native, start)
+        .into_iter()
+        .find(|link| {
+            link_interface(xfile, link).is_some_and(|i| {
+                i.members.iter().any(|m| m.name.as_str() == name)
+                    || i.enums.iter().any(|e| e.name.as_str() == name)
+                    || i.inner
+                        .iter()
+                        .any(|c| c.class_name.as_deref() == Some(name))
+            })
+        })
+}
+
 /// The native class a script chain bottoms out in (`Some("RefCounted")` for an `extends`-less
 /// head; `None` when the root is unknown / a cycle), for completion to chain native-member
 /// enumeration onto the script members. A side-effect-free re-walk (see [`script_chain_links`]).
