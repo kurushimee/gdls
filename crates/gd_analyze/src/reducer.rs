@@ -5349,6 +5349,75 @@ fn reduce_type_test(ctx: &mut AnalysisContext, id: NodeId) {
 /// nested base of another subscript, analyzer.cpp:4772). The dispatcher always calls in with
 /// `false`, so a standalone `Node.ProcessMode` triggers the
 /// `Type "%s" in base "%s" cannot be used on its own.` error at analyzer.cpp:4879.
+/// Does `base` reject an index of type `index`? (`reduce_subscript`'s index-validity table,
+/// analyzer.cpp:4951-5040.) Both types are known-hard builtins by the time this is asked.
+fn invalid_index_type(base: &DataType, index: &DataType) -> bool {
+    use VariantType as V;
+    let idx = index.builtin_type;
+    let is_int_or_float = idx == V::Int || idx == V::Float;
+    let is_string = idx == V::String || idx == V::StringName;
+    match base.builtin_type {
+        // Expect int or real as index.
+        V::PackedByteArray
+        | V::PackedFloat32Array
+        | V::PackedFloat64Array
+        | V::PackedInt32Array
+        | V::PackedInt64Array
+        | V::PackedStringArray
+        | V::PackedVector2Array
+        | V::PackedVector3Array
+        | V::PackedColorArray
+        | V::PackedVector4Array
+        | V::Array
+        | V::String => !is_int_or_float,
+        // Expect String only.
+        V::Rect2 | V::Rect2i | V::Plane | V::Quaternion | V::Aabb | V::Object => !is_string,
+        // Expect String or number.
+        V::Basis
+        | V::Vector2
+        | V::Vector2i
+        | V::Vector3
+        | V::Vector3i
+        | V::Vector4
+        | V::Vector4i
+        | V::Transform2d
+        | V::Transform3d
+        | V::Projection => !is_int_or_float && !is_string,
+        // Expect String or int.
+        V::Color => idx != V::Int && !is_string,
+        // Support depends on whether the dictionary has a typed key; untyped accepts anything.
+        V::Dictionary => match base.container_element_types.first() {
+            Some(key) => match idx {
+                // A null value is treated as an empty object, so allow it against one.
+                V::Nil => key.builtin_type != V::Object,
+                // Objects are checked for reference-compatibility, like container types.
+                // gdls has no `DataType::can_reference` port yet, so an object key stays
+                // permissive rather than guessing — a narrowing, never a false positive.
+                V::Object => key.builtin_type != V::Object && key.builtin_type != V::Nil,
+                // String and StringName are interchangeable in this context.
+                V::String | V::StringName => {
+                    key.builtin_type != V::StringName && key.builtin_type != V::String
+                }
+                // An int is a valid index for a float key, but not the other way round.
+                V::Int => key.builtin_type != V::Int && key.builtin_type != V::Float,
+                // Everything else must match exactly.
+                other => key.builtin_type != other,
+            },
+            None => false,
+        },
+        // Don't support indexing, but that is checked by the result-type table instead.
+        V::Rid
+        | V::Bool
+        | V::Callable
+        | V::Float
+        | V::Int
+        | V::Nil
+        | V::NodePath
+        | V::Signal
+        | V::StringName => false,
+    }
+}
+
 fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: bool) {
     let sub = match ctx.node(id).kind.clone() {
         NodeKind::Subscript(s) => s,
@@ -5373,22 +5442,17 @@ fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: b
             if let Some(idx) = index {
                 reduce_expression(ctx, idx, false);
 
-                // analyzer.cpp:4916-4931 — Array / String / Packed*Array index must be int or
-                // float. Godot's check has a much larger per-builtin table; this slice
-                // ports the Array arm only (the targeted corpus case is `[0, 1][true]`). Other
-                // base types stay permissive — they fall through to the silent-Variant tail
-                // guard that the prior comment described, preserving the corpus-passing state
-                // for typed-Dictionary / Vector / String-key access until the full matrix
-                // lands.
+                // analyzer.cpp:4951-5040 — which index types a builtin base accepts. gdls used
+                // to port the `Array` row alone and stay permissive everywhere else; the whole
+                // table is here now, since the result-type table below reads the same base.
                 let base_type = ctx.get_type(base_id).clone();
                 let index_type = ctx.get_type(idx).clone();
                 if base_type.is_hard_type()
                     && base_type.kind == DtKind::Builtin
-                    && base_type.builtin_type == VariantType::Array
                     && index_type.is_hard_type()
+                    && !index_type.is_variant()
                     && index_type.kind == DtKind::Builtin
-                    && index_type.builtin_type != VariantType::Int
-                    && index_type.builtin_type != VariantType::Float
+                    && invalid_index_type(&base_type, &index_type)
                 {
                     ctx.push_error(
                         format!(
@@ -5398,21 +5462,108 @@ fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: b
                     );
                 }
 
-                // Typed-Array element type: when the base is `Array[T]`, the subscript result
-                // is `T` (analyzer.cpp:4933-4938 reads the container element type). This drives
-                // type-test (`is String`) compatibility checks downstream
-                // (`errors/constant_subscript_type.gd`'s `const base := [0]; if base[0] is
-                // String:`). Untyped Array stays at the default `Variant` tail-guard. Clear
-                // `is_constant` and `is_meta_type` from the element type — a subscript-load
-                // always yields an instance value, never a constant or meta.
-                if base_type.kind == DtKind::Builtin
-                    && base_type.builtin_type == VariantType::Array
-                    && !base_type.container_element_types.is_empty()
-                {
-                    let mut elem = base_type.container_element_types[0].clone();
-                    elem.is_constant = false;
-                    elem.is_meta_type = false;
-                    ctx.set_type(id, elem);
+                // analyzer.cpp:5047-5145 — the result-type table. Indexing a builtin has a
+                // KNOWN element type for most bases (`PackedByteArray[i]` is an int,
+                // `PackedVector2Array[i]` a Vector2, `String[i]` a String), and the result is
+                // exactly as hard as the base. gdls used to stamp only the `Array[T]` row and
+                // leave everything else to the silent-Variant tail guard, which under-hard-typed
+                // every packed-array element — invisible until a gate started reading hardness.
+                //
+                // A subscript-load always yields an instance value, so `is_constant` and
+                // `is_meta_type` never survive it.
+                if base_type.kind == DtKind::Builtin {
+                    let mut result = DataType {
+                        kind: DtKind::Builtin,
+                        builtin_type: VariantType::Nil,
+                        type_source: if base_type.is_hard_type() {
+                            TypeSource::AnnotatedInferred
+                        } else {
+                            TypeSource::Inferred
+                        },
+                        ..DataType::default()
+                    };
+                    let undetected_variant = |r: &mut DataType| {
+                        r.kind = DtKind::Variant;
+                        r.builtin_type = VariantType::Nil;
+                        r.type_source = TypeSource::Undetected;
+                    };
+                    let mut stamp = true;
+                    match base_type.builtin_type {
+                        // Can't index at all (analyzer.cpp:5058-5068). The error itself is a
+                        // separate slice; only the type is stamped here.
+                        VariantType::Rid
+                        | VariantType::Bool
+                        | VariantType::Callable
+                        | VariantType::Float
+                        | VariantType::Int
+                        | VariantType::Nil
+                        | VariantType::NodePath
+                        | VariantType::Signal
+                        | VariantType::StringName => stamp = false,
+                        // Return int.
+                        VariantType::PackedByteArray
+                        | VariantType::PackedInt32Array
+                        | VariantType::PackedInt64Array
+                        | VariantType::Vector2i
+                        | VariantType::Vector3i
+                        | VariantType::Vector4i => result.builtin_type = VariantType::Int,
+                        // Return float.
+                        VariantType::PackedFloat32Array
+                        | VariantType::PackedFloat64Array
+                        | VariantType::Vector2
+                        | VariantType::Vector3
+                        | VariantType::Vector4
+                        | VariantType::Quaternion => result.builtin_type = VariantType::Float,
+                        // Return String.
+                        VariantType::PackedStringArray | VariantType::String => {
+                            result.builtin_type = VariantType::String
+                        }
+                        // Return Vector2.
+                        VariantType::PackedVector2Array
+                        | VariantType::Transform2d
+                        | VariantType::Rect2 => result.builtin_type = VariantType::Vector2,
+                        // Return Vector2i.
+                        VariantType::Rect2i => result.builtin_type = VariantType::Vector2i,
+                        // Return Vector3.
+                        VariantType::PackedVector3Array
+                        | VariantType::Aabb
+                        | VariantType::Basis => result.builtin_type = VariantType::Vector3,
+                        // Return Color.
+                        VariantType::PackedColorArray => result.builtin_type = VariantType::Color,
+                        // Return Vector4.
+                        VariantType::PackedVector4Array => {
+                            result.builtin_type = VariantType::Vector4
+                        }
+                        // Depends on the index (analyzer.cpp:5116-5123).
+                        VariantType::Transform3d
+                        | VariantType::Projection
+                        | VariantType::Plane
+                        | VariantType::Color
+                        | VariantType::Object => undetected_variant(&mut result),
+                        // Can have an element type.
+                        // The element carries the BASE's own source verbatim (analyzer.cpp:5127),
+                        // not the hard/soft mapping the other rows use.
+                        VariantType::Array => match base_type.container_element_types.first() {
+                            Some(elem) => {
+                                result = elem.clone();
+                                result.type_source = base_type.type_source;
+                            }
+                            None => undetected_variant(&mut result),
+                        },
+                        // Can have two element types, but only the value matters here.
+                        VariantType::Dictionary => match base_type.container_element_types.get(1) {
+                            Some(val) => {
+                                result = val.clone();
+                                result.type_source = base_type.type_source;
+                            }
+                            None => undetected_variant(&mut result),
+                        },
+                    }
+                    if stamp {
+                        result.is_constant = false;
+                        result.is_meta_type = false;
+                        ctx.set_type(id, result);
+                    }
                 }
             }
         }
