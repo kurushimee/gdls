@@ -112,7 +112,8 @@ fn sig_project() -> TempProject {
          func _init(name: String, level: int = 1) -> void:\n\tpass\n\n\
          func greet(target: String, loud: bool = false) -> int:\n\treturn 0\n\n\
          ## Restore [param amount] hit points to the hero.\n\
-         func heal(amount: int) -> void:\n\tpass\n",
+         func heal(amount: int) -> void:\n\tpass\n\n\
+         func tag(annotated: String, hard := \"\", soft = 1, bare = null) -> void:\n\tpass\n",
     );
     p
 }
@@ -565,6 +566,28 @@ fn cross_file_script_method_param_names_from_declaring_tree() {
         only_label(&h),
         "int greet(target: String, loud: bool = false)",
         "cross-file script method: names + default from the DECLARING file's tree"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// #455: `_make_arguments_hint` prints a parameter's ANALYZED datatype when it is hard and
+/// `Variant` otherwise (gdscript_editor.cpp:819-824), so the three unannotated shapes are not one
+/// case: `a := ""` is `ANNOTATED_INFERRED` and hard, while `a = ""` and a bare `a` are soft. gdls
+/// read only the annotation node, so all three printed `Variant` — and `hover` on the same
+/// declaration disagreed with `signatureHelp` about it.
+#[test]
+fn an_inferred_parameter_is_labelled_with_its_defaults_type() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f(h: Hero) -> void:\n\th.tag(\"hi\")\n";
+    let uri = file_uri(&p.root.join("src/tag_consumer.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor inside `h.tag(` — tab(1) + `h.tag(`(6) = 7.
+    let h = sig(&client, 10, &uri, Position::new(3, 7));
+    assert_eq!(
+        only_label(&h),
+        "void tag(annotated: String, hard: String = \"\", soft: Variant = 1, bare: Variant = null)"
     );
 
     shutdown(&client, server_thread);

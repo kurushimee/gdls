@@ -799,6 +799,7 @@ fn script_method_sig(
         name,
         func,
         doc,
+        Some(decl),
     )])
 }
 
@@ -1058,9 +1059,10 @@ impl Sig {
         name: &str,
         func: &gd_syntax::ast::FunctionNode,
         doc: Option<String>,
+        decl: Option<&gd_project::MemberDecl>,
     ) -> Sig {
         let ret = return_type_label(tree, src, func.return_type);
-        Sig::from_function_node_returning(tree, src, &ret, name, func, doc)
+        Sig::from_function_node_returning(tree, src, &ret, name, func, doc, decl)
     }
 
     /// Build a lambda's signature under the callee name the call site used (`call` /
@@ -1078,7 +1080,7 @@ impl Sig {
             Some(_) => return_type_label(tree, src, func.return_type),
             None => "Variant".to_string(),
         };
-        Sig::from_function_node_returning(tree, src, &ret, method, func, None)
+        Sig::from_function_node_returning(tree, src, &ret, method, func, None, None)
     }
 
     /// The shared body of [`Sig::from_function_node`] / [`Sig::from_lambda`]: the `ret name(…)`
@@ -1090,6 +1092,7 @@ impl Sig {
         name: &str,
         func: &gd_syntax::ast::FunctionNode,
         doc: Option<String>,
+        decl: Option<&gd_project::MemberDecl>,
     ) -> Sig {
         let mut b = LabelBuilder::new(format!("{ret} {name}("));
         for (i, &pid) in func.parameters.iter().enumerate() {
@@ -1102,7 +1105,7 @@ impl Sig {
                 .identifier
                 .map(|id| ident_text(tree, id))
                 .unwrap_or_default();
-            let pty = type_label(tree, src, p.datatype_specifier);
+            let pty = param_type_label(tree, src, p, decl, i);
             let mut frag = format!("{pname}: {pty}");
             if let Some(init) = p.initializer {
                 frag.push_str(" = ");
@@ -1119,7 +1122,7 @@ impl Sig {
                     .identifier
                     .map(|id| ident_text(tree, id))
                     .unwrap_or_default();
-                let pty = type_label(tree, src, p.datatype_specifier);
+                let pty = annotation_label(tree, src, p.datatype_specifier);
                 b.sep_force();
                 b.param(&format!("...{pname}: {pty}"));
             }
@@ -1211,13 +1214,53 @@ fn return_type_label(
     }
 }
 
-/// A parameter type-annotation's label: the written type's name, or `Variant` when there is no
-/// annotation (Godot renders an un-hard-typed parameter as `Variant`).
-fn type_label(tree: &ParseTree, src: &str, ty: Option<gd_syntax::ast::NodeId>) -> String {
+/// A parameter's label type, as `_make_arguments_hint` renders it (gdscript_editor.cpp:819-824):
+/// the parameter's own datatype when it is HARD, and `Variant` otherwise. Three declaration
+/// shapes reach here with no written annotation and they are not one case:
+///
+/// * `a := ""` resolves through `resolve_assignable`'s no-specified-type arm to
+///   `ANNOTATED_INFERRED`, which is hard, so Godot prints the default's type;
+/// * `a = ""` resolves to plain `INFERRED`, which is soft, so Godot prints `Variant`;
+/// * a bare `a` is a soft `Variant` too.
+///
+/// gdls has no analysis of the declaring file here — the signature is built from a one-shot parse
+/// — so the `:=` type comes from the declaring class's own interface, where the shallow pass
+/// already decoded the default and recorded which of the three shapes wrote it
+/// (`gd_project::ParamTyping`). A written annotation still renders from source, so the label keeps
+/// the spelling the author used.
+fn annotation_label(tree: &ParseTree, src: &str, ty: Option<gd_syntax::ast::NodeId>) -> String {
     match ty.map(|id| clean_type_text(node_source(tree, src, id))) {
         Some(t) if !t.is_empty() => t,
         _ => "Variant".to_string(),
     }
+}
+
+fn param_type_label(
+    tree: &ParseTree,
+    src: &str,
+    p: &gd_syntax::ast::ParameterNode,
+    decl: Option<&gd_project::MemberDecl>,
+    index: usize,
+) -> String {
+    if let Some(t) = p
+        .datatype_specifier
+        .map(|id| clean_type_text(node_source(tree, src, id)))
+        .filter(|t| !t.is_empty())
+    {
+        return t;
+    }
+    let inferred_hard = decl
+        .and_then(|d| d.params_typing.get(index))
+        .is_some_and(|t| *t == gd_project::ParamTyping::InferredHard);
+    if inferred_hard {
+        if let Some(t) = decl
+            .and_then(|d| d.params.get(index))
+            .and_then(gd_project::TypeExpr::render)
+        {
+            return t;
+        }
+    }
+    "Variant".to_string()
 }
 
 /// Strip the leading annotation punctuation a `Type` node's source carries: the parser anchors a
