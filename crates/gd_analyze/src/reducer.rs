@@ -6740,13 +6740,16 @@ fn reduce_subscript_attribute(
             // fallback) has an incomplete surface — never warn there, under any provenance.
             let negative_is_sound = match base_type.kind {
                 DtKind::Native => ctx.native.provenance() == gd_types::ApiProvenance::Exact,
-                DtKind::Class => match base_type
-                    .class_node
-                    .and_then(|cid| crate::resolver::nearest_native_ancestor(ctx, cid))
-                {
-                    Some(_) => ctx.native.provenance() == gd_types::ApiProvenance::Exact,
-                    None => false,
-                },
+                // A Class base's chain is sound exactly when it was walkable end to end.
+                // `nearest_native_ancestor` only answers for a chain that stays in this file, so
+                // it used to read "unresolvable" for every class extending a cross-file one and
+                // never warn there (#448); `base_is_introspectable` walks the cross-file links
+                // too and still refuses a chain with a missing or unclean interface, a cycle, or
+                // a native root the dump does not know.
+                DtKind::Class => {
+                    base_is_introspectable(ctx, &base_type)
+                        && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+                }
                 _ => true,
             };
             if valid && negative_is_sound {
@@ -8215,15 +8218,28 @@ fn reduce_identifier_from_base(
             ctx.set_type(identifier_id, make_callable_type());
             return;
         }
-        // Not found anywhere. When the chain crossed a file boundary the interface view may be
-        // incomplete — degrade the non-meta/non-constant case to a SILENT Variant (the SCRIPT
-        // branch's never-lie rule below) instead of leaving the type unset, which would read as
-        // a trustworthy miss to the caller's UNSAFE_PROPERTY_ACCESS arm. The meta+constant case
-        // stays unset so `Cannot find member` (and its provenance gate) behaves exactly as
-        // before.
+        // Not found anywhere. A chain that crossed a file boundary used to degrade the
+        // non-meta/non-constant case to a SILENT Variant outright, on the grounds that the
+        // interface view might be incomplete — which read as "this base resolved fine" to the
+        // caller's UNSAFE_PROPERTY_ACCESS arm and suppressed it. That is the same blanket
+        // conservatism #433 replaced on the method side, and it is unbounded: it covers every
+        // project class that does not extend a native class directly, which in a real codebase
+        // is most of them (#448).
+        //
+        // The gate is now whether the chain gdls actually walked is PROVABLE, at the soundness
+        // bar #256 set: `Exact` provenance, so the chain's native tail really is the user's
+        // engine surface, and [`base_is_introspectable`], which per its own doc means every
+        // in-file link resolved, every cross-file link's interface is present and parse-clean,
+        // no cycle closed, and the native root is one the dump knows. Where the walk is complete
+        // the miss is as trustworthy as a same-file one, so leave the type unset and let the
+        // caller decide between the warning and the error; where it is not, the historical
+        // silent degrade stands. The meta+constant case has always stayed unset, so
+        // `Cannot find member` and its own provenance gate are untouched either way.
         if base.class_node.is_some_and(|cid| {
             script_base_of_class(ctx, cid).is_some() && (!base.is_meta_type || !base.is_constant)
-        }) {
+        }) && !(ctx.native.provenance() == gd_types::ApiProvenance::Exact
+            && base_is_introspectable(ctx, &base))
+        {
             ctx.set_type(identifier_id, DataType::variant());
             return;
         }
