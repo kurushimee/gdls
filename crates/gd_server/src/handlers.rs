@@ -3159,11 +3159,21 @@ fn find_res_path_definition(
     if !path.starts_with("res://") {
         return None;
     }
-    // Gate on index membership — only emit a Location for paths that resolve to an actually
-    // existing, indexed project file. `res_to_path` is a pure path-join with no existence
-    // check; `resolve_res_path` returns Some only for indexed (on-disk) files.
-    let fid = state.workspace.index.resolve_res_path(path)?;
-    let abs = state.workspace.index.path(fid).map(|p| p.to_path_buf())?;
+    // Resolve to a real file on disk, the same two ways `document_link` does (#348). The index
+    // holds only `.gd` (see `gd_files`), so gating purely on index membership answered
+    // `preload("res://a.gd")` and silently declined `preload("res://a.tscn")` — two lines that
+    // look identical to a reader, one of which did nothing on ctrl-click. Neither has a
+    // "definition" in the analyzer's sense; both answers are "open this file", and `documentLink`
+    // already gives that answer for both. The existence check is what stays non-negotiable: a
+    // path-join alone would emit a dangling `file://` for a target that was never written.
+    let abs = match state.workspace.index.resolve_res_path(path) {
+        Some(fid) => state.workspace.index.path(fid).map(|p| p.to_path_buf()),
+        None => state
+            .workspace
+            .index
+            .res_to_path(path)
+            .filter(|p| p.is_file()),
+    }?;
     let uri = path_to_file_uri(&abs)?;
     Some(Location {
         uri,

@@ -342,3 +342,71 @@ fn document_link_no_link_for_nonexistent_non_gd_resource() {
 
     shutdown(&client, handle);
 }
+
+/// `definition` on a `res://` literal resolves the same two ways `documentLink` does (#348).
+///
+/// It used to gate on index membership alone, so `preload("res://a.gd")` jumped and
+/// `preload("res://a.tscn")` silently did nothing — two lines that look identical to a reader, on
+/// a gesture that many clients route through `definition` rather than `documentLink`. Neither has
+/// a "definition" in the analyzer's sense; both answers are "open this file".
+#[test]
+fn definition_on_a_res_path_opens_a_scene_as_well_as_a_script() {
+    let p = TempProject::new();
+    p.write("project.godot", "");
+    p.write("scenes/main.tscn", "[gd_scene]\n");
+    p.write("lib.gd", "extends Node\n");
+    let src = "const S = preload(\"res://scenes/main.tscn\")\nconst L = preload(\"res://lib.gd\")\nconst M = preload(\"res://gone.tscn\")\n";
+    p.write("caller.gd", src);
+
+    let (client, handle) = boot(&p);
+    let caller_path = p.root.join("caller.gd");
+    did_open(&client, &caller_path, src);
+    let caller_uri = file_uri(&caller_path);
+
+    // Column 25 sits inside each path string.
+    let want = [
+        (0u32, Some("/scenes/main.tscn")),
+        (1, Some("/lib.gd")),
+        // Never written — the existence check still blocks a dangling target.
+        (2, None),
+    ];
+    for (i, (line, expected)) in want.iter().enumerate() {
+        client
+            .sender
+            .send(request(
+                20 + i as i32,
+                "textDocument/definition",
+                lsp_types::GotoDefinitionParams {
+                    text_document_position_params: lsp_types::TextDocumentPositionParams {
+                        text_document: TextDocumentIdentifier {
+                            uri: caller_uri.clone(),
+                        },
+                        position: lsp_types::Position {
+                            line: *line,
+                            character: 25,
+                        },
+                    },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                },
+            ))
+            .unwrap();
+        let resp = recv_response(&client);
+        assert!(resp.error.is_none(), "definition errored: {:?}", resp.error);
+        let got = resp.result.filter(|v| !v.is_null());
+        match expected {
+            None => assert!(got.is_none(), "line {line} must not resolve, got {got:?}"),
+            Some(suffix) => {
+                let loc: lsp_types::Location =
+                    serde_json::from_value(got.expect("a Location")).unwrap();
+                assert!(
+                    loc.uri.as_str().ends_with(suffix),
+                    "line {line} should open `{suffix}`, got {}",
+                    loc.uri.as_str()
+                );
+            }
+        }
+    }
+
+    shutdown(&client, handle);
+}

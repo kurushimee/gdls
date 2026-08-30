@@ -195,14 +195,36 @@ fn collect_type_hints(
 ) {
     for id in tree.iter_ids() {
         match &tree.get(id).kind {
-            // `var x := <expr>` — the walrus form. Skip a plain `var x = expr` (untyped, the user
-            // chose no type) and an explicit `var x: T = expr` (already annotated). The resolved
-            // type is pinned on the Variable node itself.
-            NodeKind::Variable(v) => {
-                if !v.infer_datatype || v.datatype_specifier.is_some() {
+            // `var x := <expr>` / `const X := <expr>` — the walrus form. Skip a plain
+            // `var x = expr` (untyped, the user chose no type) and an explicit `var x: T = expr`
+            // (already annotated). The resolved type is pinned on the declaration node itself.
+            //
+            // A `const` is the case with the least other signal — the type appears nowhere on the
+            // line — and it is where the accompanying rewrite edit is most useful, so it gets the
+            // same hint (#347). Both node kinds carry the same four fields.
+            NodeKind::Variable(_) | NodeKind::Constant(_) => {
+                let (infer_datatype, datatype_specifier, identifier, initializer) = match &tree
+                    .get(id)
+                    .kind
+                {
+                    NodeKind::Variable(v) => (
+                        v.infer_datatype,
+                        v.datatype_specifier,
+                        v.identifier,
+                        v.initializer,
+                    ),
+                    NodeKind::Constant(c) => (
+                        c.infer_datatype,
+                        c.datatype_specifier,
+                        c.identifier,
+                        c.initializer,
+                    ),
+                    _ => unreachable!("invariant: the match arm admits only Variable and Constant"),
+                };
+                if !infer_datatype || datatype_specifier.is_some() {
                     continue;
                 }
-                let (Some(ident_id), Some(init_id)) = (v.identifier, v.initializer) else {
+                let (Some(ident_id), Some(init_id)) = (identifier, initializer) else {
                     continue;
                 };
                 let dt = analysis.types.get(id);
