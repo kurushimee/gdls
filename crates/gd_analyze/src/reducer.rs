@@ -5526,26 +5526,16 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
 pub(crate) fn class_identifier_name_or_default(ctx: &AnalysisContext, dt: &DataType) -> String {
     // A cross-file SCRIPT base gets the same treatment for the same reason: `Display` renders it
     // as the internal placeholder `<Script #3>`, while Godot's `DataType::to_string()` for SCRIPT
-    // (gdscript_parser.cpp:5321-5329) returns the script's name, falling back to its path. Read
-    // the `class_name` off the depended interface — for an inner class, its own declared name —
-    // and fall back to the file path exactly as upstream does.
+    // (gdscript_parser.cpp:5321-5329) returns the script's name, falling back to its path. That
+    // is exactly [`crate::resolver::script_render_name`], whose path fallback reads the `res://`
+    // spelling — Godot's own fqcn (gdscript_parser.cpp:702), and the only one safe to show a
+    // user, since `file_path` is an absolute path on the machine gdls happens to be running on
+    // (#419).
     if dt.kind == DtKind::Script {
-        if let Some(sr) = dt.script_type.as_ref() {
-            if let Some(inner) = sr.inner.last() {
-                return inner.clone();
-            }
-            if let Some(name) = ctx
-                .xfile
-                .interface(sr.file)
-                .and_then(|i| i.class_name.as_deref())
-            {
-                return name.to_owned();
-            }
-            if let Some(path) = ctx.xfile.file_path(sr.file) {
-                return path.to_owned();
-            }
-        }
-        return dt.to_string();
+        return match dt.script_type.as_ref() {
+            Some(sr) => crate::resolver::script_render_name(ctx, sr),
+            None => dt.to_string(),
+        };
     }
     if dt.kind != DtKind::Class {
         return dt.to_string();
