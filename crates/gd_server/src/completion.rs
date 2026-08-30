@@ -873,7 +873,7 @@ fn self_chain_members(
 fn annotation_items(render: &RenderCtx) -> Vec<CompletionItem> {
     let mut names: Vec<(&str, bool)> = gd_syntax::parser::REGISTERED_ANNOTATIONS
         .iter()
-        .map(|&(name, args)| (name.trim_start_matches('@'), args))
+        .map(|a| (a.name.trim_start_matches('@'), a.takes_arguments()))
         .collect();
     names.sort_unstable_by(|a, b| a.0.cmp(b.0));
     names
