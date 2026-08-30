@@ -991,6 +991,8 @@ fn dollar_method_miss_fires_unsafe_method_access() {
 // emission): they pin fire/no-fire directly. The `_typo()` / per-class-precision cases (#149) prove the
 // seed is per-class, not a global `_`-prefix allowlist. The DtKind::Script (cross-file `.gd`) base
 // degrades silently (`found = true`) and never reaches this arm — NATIVE-only by construction.
+// Since #418 that last sentence no longer holds: a `Class` or `Script` base whose ancestry was
+// walked end to end reaches the arm too. See the rows in `metatype_call_miss.rs`.
 
 /// A native DB with an ancestor method on `Object` and an instance method on `Node`, so the
 /// inherited-chain lookup (a `$Node` base reaching an `Object` method) can be exercised — the real
