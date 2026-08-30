@@ -188,6 +188,9 @@ fn is_skippable(kind: TokenKind) -> bool {
 ///    project script), or — when the member name is `new` and `base` is a type — the class `_init`.
 /// 2. a bare `name(` → a `@GlobalScope` utility, else a builtin **constructor** (`Vector2(`), else a
 ///    method on the implicit-self class (own / inherited project method, else the native root).
+///
+/// Both super forms — `super(` and `super.method(` — are answered before either arm, by
+/// [`super_call_sigs`], since neither may be resolved in the current scope.
 #[allow(clippy::too_many_arguments)] // the resolved call-site (tokens + tree + analysis + file id)
 fn resolve_signatures(
     state: &ServerState,
@@ -200,6 +203,13 @@ fn resolve_signatures(
     arg_index: usize,
     fid: Option<gd_project::FileId>,
 ) -> Option<Vec<Sig>> {
+    // #392: a super call, before anything reads the callee token. A bare `super(` has no callee to
+    // read at all, and `super.method(`'s callee is a plain identifier the attribute arm would
+    // resolve against the CURRENT class — answering an override with itself.
+    if let Some(sigs) = super_call_sigs(state, tree, analyzed, text, tokens, open_idx) {
+        return Some(sigs);
+    }
+
     let callee_idx = prev_meaningful(tokens, open_idx)?;
     let callee = &tokens[callee_idx];
 
@@ -236,6 +246,80 @@ fn resolve_signatures(
         );
     }
     resolve_bare_call(state, text, fid, &name, arg_index)
+}
+
+/// #392: the signature of the PARENT method a `super(` or `super.method(` call names.
+///
+/// Neither form may be resolved in the current scope. `super.X()` parses as a plain
+/// `Identifier("X")` callee, so the attribute arm would look `X` up on the current class and answer
+/// an override with its own signature — the wrong-signature failure this module's header calls out.
+/// A bare `super()` has no callee node at all (`Call { is_super: true, callee: None }`,
+/// gdscript_parser.cpp:3487-3499), so there is nothing for the token dispatch to read.
+///
+/// The resolution is not redone here. The reducer's super branch already walked the parent chain
+/// and recorded exactly one thing at a super site — a `Binding::Call` whose callee target names the
+/// declaring script or native class — and docs/09 §3 pins that binding as the only legal record of
+/// a super callee. This projects it, the same shape `hover_call_binding_signature` and
+/// `bare_super_call_definition` use. An `Unresolved` callee, or a buffer with no analysis, answers
+/// `None` and lets the popup stay closed rather than guess.
+fn super_call_sigs(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    text: &str,
+    tokens: &[Token],
+    open_idx: usize,
+) -> Option<Vec<Sig>> {
+    // This `(` must open the SUPER call's own argument list, not a nested call inside it. The two
+    // forms are `super (` and `super . name (`; anything else is a different call that merely sits
+    // within a super call's parentheses.
+    let before = prev_meaningful(tokens, open_idx)?;
+    let is_super_paren = match tokens[before].kind {
+        TokenKind::Super => true,
+        k if k == TokenKind::Identifier || k.is_identifier() => prev_meaningful(tokens, before)
+            .filter(|&d| tokens[d].kind == TokenKind::Period)
+            .and_then(|d| prev_meaningful(tokens, d))
+            .is_some_and(|b| tokens[b].kind == TokenKind::Super),
+        _ => false,
+    };
+    if !is_super_paren {
+        return None;
+    }
+
+    // The innermost `is_super` Call whose span covers this `(` — innermost so a super call nested
+    // in another super call's arguments resolves to itself.
+    let open_byte = tokens[open_idx].span.start;
+    let (call_span, name) = tree
+        .iter_ids()
+        .filter_map(|nid| {
+            let node = tree.get(nid);
+            let NodeKind::Call(c) = &node.kind else {
+                return None;
+            };
+            (c.is_super
+                && !c.function_name.is_empty()
+                && node.span.start <= open_byte
+                && open_byte < node.span.end)
+                .then(|| (node.span, c.function_name.clone()))
+        })
+        .min_by_key(|(span, _)| span.end - span.start)?;
+
+    let callee = analyzed?.bindings().iter().find_map(|b| match b {
+        Binding::Call {
+            callee,
+            callee_name,
+            call_site,
+            ..
+        } if *call_site == call_span && callee_name == &name => Some(callee.clone()),
+        _ => None,
+    })?;
+    match callee {
+        CalleeTarget::Script { file, class_path } => {
+            script_method_sig(state, text, file, &class_path, &name)
+        }
+        CalleeTarget::Native { class } => native_method_sig(state, &class, &name),
+        _ => None,
+    }
 }
 
 /// The identifier text of the simple-name token immediately before the dot at `dot_idx` (the base
