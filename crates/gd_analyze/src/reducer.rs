@@ -4748,15 +4748,20 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                                     native_callee = root;
                                     sig_resolved = true;
                                     found = true;
-                                } else if introspectable && is_self {
+                                } else if introspectable {
                                     // #406: every link was present and parse-clean, the walk
                                     // reached a native root the DB knows, and the name is on none
                                     // of it. That is a fact, so leave `found = false` and let the
-                                    // call take the same not-found path an in-file miss takes.
+                                    // call take the miss branch — which is one branch in Godot
+                                    // too (analyzer.cpp:3722-3774), deciding per base kind
+                                    // whether the answer is the not-found error, the static-miss
+                                    // error, or the UNSAFE_METHOD_ACCESS warning. #418: this used
+                                    // to require `is_self`, so a non-self miss degraded here and
+                                    // the warning was never reachable for a Class base.
                                 } else {
-                                    // The evidence is incomplete, or the base is not `self`
-                                    // (Godot's gate is `is_self || hard builtin`; an instance-base
-                                    // miss is the warning below, never the error). Degrade.
+                                    // The evidence is incomplete — a link is missing or did not
+                                    // parse cleanly, or the chain never reached a native root the
+                                    // DB knows. Absence proves nothing; degrade.
                                     return_type = Some(DataType::variant());
                                     found = true;
                                 }
@@ -4835,34 +4840,25 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         native_callee = root;
                         sig_resolved = true;
                         found = true;
-                    } else if introspectable && is_self {
+                    } else if introspectable {
                         // #406: every link was present and parse-clean, the walk reached a native
                         // root the DB knows, and the name is on none of it. Leave `found = false`
-                        // so a `super.miss()` takes the same not-found path an in-file miss takes.
-                        // No warning here — this became the hard error.
+                        // and let the call take the miss branch, which is one branch in Godot too
+                        // (analyzer.cpp:3722-3774) and decides per base kind between the not-found
+                        // error, the static-miss error, and the UNSAFE_METHOD_ACCESS warning.
+                        //
+                        // #426: the warning used to be pushed here instead, ahead of the callee
+                        // probe that decides `name_is_value`. That is why calling a native
+                        // property or signal through a `class_name` metatype
+                        // (`Weapon.process_mode()`) drew a phantom method miss: the probe would
+                        // have resolved the name, but the warning had already gone out. The miss
+                        // branch runs after the probe, so the shadow guards there can see it.
                     } else {
-                        // #256: the ERROR stays off (an interface gap must never become
-                        // "Function not found"), but the WARNING belongs here — this is
-                        // analyzer.cpp:3740-3742's arm, whose gate is any non-`self`,
-                        // non-hard-BUILTIN base, and a `class_name` instance is exactly that.
-                        // #123 landed it NATIVE-only because a Script miss degrades before the
-                        // not-found branch; this is the same claim made at the site that
-                        // actually knows. Sound only when the chain was fully walkable
-                        // (`native_root` resolved) under an `Exact` dump — otherwise the miss
-                        // may be a gap in gdls's view, not in the user's code. `!is_self` is
-                        // upstream's own gate (analyzer.cpp:3741): a self/super miss is the
-                        // error's business, never the warning's.
-                        if !is_self
-                            && root.is_some()
-                            && ctx.native.provenance() == gd_types::ApiProvenance::Exact
-                        {
-                            let base_str = class_identifier_name_or_default(ctx, &base_type);
-                            ctx.push_warning(
-                                crate::warnings::WarningCode::UnsafeMethodAccess,
-                                &[function_name.clone(), base_str],
-                                id,
-                            );
-                        }
+                        // The evidence is incomplete — a link is missing or did not parse
+                        // cleanly, or the chain never reached a native root the DB knows. Absence
+                        // proves nothing; degrade. `root.is_some()` used to stand in for this,
+                        // which let a chain with an unparseable link testify (#406's lesson,
+                        // applied to the warning that had kept the older gate).
                         return_type = Some(DataType::variant());
                         found = true;
                     }
@@ -5318,7 +5314,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         if !name_is_value
             && !(name_exists_nonfunc && !call.is_super)
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
-            && ((is_self && !native_value_shadow && self_base_is_introspectable(ctx, &base_type))
+            && ((is_self && !native_value_shadow && base_is_introspectable(ctx, &base_type))
                 || builtin_base_is_introspectable)
         {
             // The native super-VIRTUAL case (`super._init()`, `super._notification()`, …) is
@@ -5335,7 +5331,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             // all; and `Exact` provenance is exactly the claim that the dump IS the engine surface.
             // What remains is the resolution question — a self-call only reaches `!found` when the
             // in-file walk missed AND the chain bottomed out at a native root that also missed, so
-            // [`self_base_is_introspectable`] re-checks that the chain was actually walkable before
+            // [`base_is_introspectable`] re-checks that the chain was actually walkable before
             // gdls asserts a name is absent from it.
             let base_name = if is_self && !call.is_super {
                 "self".to_string()
@@ -5356,18 +5352,29 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             && !is_self
             && base_type.is_hard_type()
             && base_type.is_meta_type
-            && matches!(
-                base_type.kind,
-                DtKind::Class | DtKind::Enum | DtKind::Variant
-            )
+            && (matches!(base_type.kind, DtKind::Enum | DtKind::Variant)
+                || (matches!(base_type.kind, DtKind::Class | DtKind::Script)
+                    && base_is_introspectable(ctx, &base_type)
+                    && !metatype_value_shadow(ctx, &base_type, &function_name)
+                    && ctx.native.provenance() == gd_types::ApiProvenance::Exact))
         {
-            // analyzer.cpp:3746-3747 — static-call fall-through on a meta base
-            // (e.g. `MyClass.not_existing_method()`). gdls only emits on in-file `Class` meta
-            // bases — Native/Builtin/Enum metas need full ClassDB / builtin-static-method
-            // introspection (Dictionary methods on enum metas, builtin static functions like
-            // `Color.html_is_valid`, …) the trimmed dump can't cover. Godot's full table
-            // makes those errors faithful; gdls stays permissive until the typed-collection
-            // slice wires the builtin method registry.
+            // analyzer.cpp:3771-3773 — static-call fall-through on a meta base
+            // (`MyClass.not_existing_method()`). Upstream's gate is kind-agnostic; gdls emits on
+            // the kinds whose surface it can walk end to end. `Native` metas stay out: Godot
+            // renders those as `"GDScriptNativeClass"` (gdscript_parser.cpp:5351-5354), a string
+            // gdls does not produce, so the row is an under-report rather than a wrong message.
+            //
+            // #417: `Script` joined `Class` here. A cross-file `class_name` metatype carries
+            // `DtKind::Script`, so `Weapon.nope_static()` used to fall straight past. The two
+            // kinds share one firewall, since both are negative claims about a chain: the
+            // ancestry has to be walked end to end ([`base_is_introspectable`]), the name must not
+            // be one the metatype resolves as a value ([`metatype_value_shadow`], #426), and the
+            // dump has to be `Exact` — the walk bottoms out in it. The `Class` half carried none
+            // of those before, so `extends Unresolvable` used to draw a phantom static miss on top
+            // of its own inheritance error.
+            //
+            // `Enum` and `Variant` keep their conditions untouched: neither is a chain, and both
+            // are pinned by `enum_call_surface.rs`.
             //
             // Godot's `DataType::to_string()` for CLASS (gdscript_parser.cpp:5339-5343)
             // returns `class_type->identifier->name` (the class's own identifier) when set,
@@ -5433,33 +5440,46 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 );
             }
         }
-        // analyzer.cpp:3740-3742 — UNSAFE_METHOD_ACCESS on a method miss. Godot warns on ANY
-        // unresolved non-`self`, non-hard-BUILTIN method whose base carries a static type. gdls
-        // emits on a hard NATIVE-instance base (`var t: Timer = …; t.bogus()`, `$Node.bogus()`):
-        // the method lookup above walked the native dump's `inherits` chain and missed. The dump
-        // used to be a strict subset of Godot's ClassDB (`free` + the `_`-prefixed virtuals Godot
-        // resolves but `extension_api.json` omits), so a miss on those was a DUMP GAP, not a real
-        // miss — over-emitting vs Godot. That gap is now closed: [`NativeDb`] seeds the
-        // ClassDB-resolvable-but-dump-omitted methods (`free` + the per-class `_`-virtuals) at
-        // ingest, so `lookup_native_method` resolves them silently and only a genuinely absent
-        // name (a fabricated `_typo()`, a real method miss) reaches here. The DtKind::Script
-        // (cross-file `.gd` instance) base never reaches this arm — its miss degrades to a silent
-        // `Variant` return with `found = true` (the "Unknown stays dynamic" rule), so this stays
-        // NATIVE-only by construction. Exact-gated (a non-Exact dump can't be trusted to prove a
-        // method's absence — a custom engine build may define it). Additive — no error path
-        // changes; the hard "Function not found in base" error stays reserved for
-        // `is_self || (hard && BUILTIN)`. `!is_self` mirrors analyzer.cpp:3741; `!is_meta_type`
-        // excludes the static-call-on-a-metatype shape handled by the in-file `Class` arm above.
+        // analyzer.cpp:3749-3753 — UNSAFE_METHOD_ACCESS on a method miss. Upstream's gate is
+        // `!is_self && !(hard && BUILTIN)`: kind-agnostic, meta-agnostic, and it interpolates
+        // `base_type.to_string()` raw, still a metatype, with no `type_from_metatype` conversion
+        // anywhere in the miss branch. So a CLASS base renders as its identifier, which is why
+        // upstream prints `"Weapon"`, `"MissProbe2"`, `"Inner"`.
+        //
+        // gdls narrows that gate to the shapes where the miss is PROVABLE, per base kind. Every
+        // arm is a negative claim — "this name exists nowhere on this base" — so each has to show
+        // its chain was actually walked before it may speak, and all of them need `Exact`: the
+        // walk bottoms out in the native dump, and under a `Generic`/`Absent` DB a custom engine
+        // build may define exactly the method the dump lacks (#24).
+        //
+        // #418 widened this past `DtKind::Native`. It was Native-only because a Script or Class
+        // miss used to degrade before reaching the branch; both now route here when their chain
+        // is introspectable, so the claim is made at the one site that can see `name_is_value`.
+        let warn_miss_is_provable = match base_type.kind {
+            // A native METAtype miss is Godot's `"GDScriptNativeClass"` shape, which gdls does
+            // not render; left out deliberately, as an under-report.
+            DtKind::Native => !base_type.is_meta_type,
+            DtKind::Class | DtKind::Script => true,
+            // Builtin is upstream's own exclusion. An ENUM metatype is excluded by the enum arm
+            // upstream is an `else if` of. A soft Variant keeps the narrow untyped-parameter arm
+            // above; a hard Variant is a documented under-report.
+            _ => false,
+        };
         if !name_is_value
             && !is_self
+            && !call.is_super
             && base_type.is_hard_type()
-            && base_type.kind == DtKind::Native
-            && !base_type.is_meta_type
+            && warn_miss_is_provable
+            && base_is_introspectable(ctx, &base_type)
+            && !metatype_value_shadow(ctx, &base_type, &function_name)
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
         {
             ctx.push_warning(
                 crate::warnings::WarningCode::UnsafeMethodAccess,
-                &[function_name.clone(), base_type.to_string()],
+                &[
+                    function_name.clone(),
+                    class_identifier_name_or_default(ctx, &base_type),
+                ],
                 id,
             );
         }
@@ -5758,7 +5778,35 @@ fn native_surface_has_nonmethod(ctx: &AnalysisContext, root: &str, name: &str) -
     false
 }
 
-fn self_base_is_introspectable(ctx: &AnalysisContext, base_type: &DataType) -> bool {
+/// Whether a name reached through a METATYPE base resolves to something other than a script
+/// method, so claiming the method is absent would be a lie (#426).
+///
+/// Two surfaces upstream consults that gdls's chain walk does not. The native tail of
+/// `reduce_identifier_from_base` (analyzer.cpp:4333-4386) has no metatype gate at all, so a native
+/// property, signal, constant, or enum resolves through a class's own name — `Weapon.process_mode`
+/// is `Node.ProcessMode`, not a missing method. And `get_function_signature` (analyzer.cpp:6013)
+/// also tries `ClassDB::get_method_info("GDScript", name)` for any SCRIPT or CLASS metatype, so
+/// `Weapon.reload()` and `Weapon.duplicate()` resolve and then draw
+/// `Cannot call non-static function "%s()" on the class "%s" directly.` — a different error gdls
+/// has not ported.
+///
+/// Suppressing both is a deliberate under-report: the code is erroneous either way in Godot, and
+/// the alternative is emitting a diagnostic upstream never prints.
+fn metatype_value_shadow(ctx: &AnalysisContext, base_type: &DataType, name: &str) -> bool {
+    if !base_type.is_meta_type {
+        return false;
+    }
+    if lookup_native_method(ctx, "GDScript", name).is_some() {
+        return true;
+    }
+    native_root_for_base(ctx, base_type)
+        .is_some_and(|root| native_surface_has_nonmethod(ctx, &root, name))
+}
+
+/// Whether the base's own ancestry was walked end to end — every in-file link resolved, every
+/// cross-file link's interface present and parse-clean, no cycle, and a native root the DB knows.
+/// The precondition for any arm that asserts a name is absent from the base.
+fn base_is_introspectable(ctx: &AnalysisContext, base_type: &DataType) -> bool {
     match base_type.kind {
         DtKind::Class => base_type
             .class_node

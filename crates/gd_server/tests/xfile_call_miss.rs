@@ -151,3 +151,39 @@ fn miss_against_a_base_that_failed_to_parse_stays_silent() {
     assert_eq!(open_errors(&client, &p, "child.gd"), Vec::<String>::new());
     shutdown(&client, handle);
 }
+
+// ===================================================================================================
+// #417 — the static-miss error through a real cross-file interface.
+// ===================================================================================================
+
+/// A static call on a `class_name` from another file, with the real index and the real interface
+/// extractor behind it. The unit tests mock the `CrossFileQuery`; this is the row that proves the
+/// `parse_clean` bit and the chain walk line up end to end.
+#[test]
+fn static_miss_on_a_cross_file_class_name_publishes_an_error() {
+    let p = project();
+    p.write(
+        "child.gd",
+        "extends Node\nfunc go() -> void:\n\tCallBase.nope_static()\n",
+    );
+    let (client, handle) = boot(&p);
+    assert_eq!(
+        open_errors(&client, &p, "child.gd"),
+        vec![r#"Static function "nope_static()" not found in base "CallBase"."#]
+    );
+    shutdown(&client, handle);
+}
+
+/// The same call against a base whose file does not parse cleanly says nothing. Error recovery may
+/// have dropped the declaration, so its absence from the interface proves nothing.
+#[test]
+fn static_miss_on_an_unparseable_cross_file_base_stays_silent() {
+    let p = project();
+    p.write(
+        "child.gd",
+        "extends Node\nfunc go() -> void:\n\tBrokenCallBase.nope_static()\n",
+    );
+    let (client, handle) = boot(&p);
+    assert_eq!(open_errors(&client, &p, "child.gd"), Vec::<String>::new());
+    shutdown(&client, handle);
+}
