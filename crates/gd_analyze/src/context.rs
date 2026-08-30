@@ -672,6 +672,15 @@ impl<'a> AnalysisContext<'a> {
         self.sink.diagnostic_count()
     }
 
+    /// Errors only — warnings don't count (a reduction that only warned still "resolved").
+    pub fn error_count(&self) -> usize {
+        self.sink
+            .diagnostics()
+            .iter()
+            .filter(|d| d.warning_code().is_none())
+            .count()
+    }
+
     // --- Completion -----------------------------------------------------------------------------
 
     // (helpers below `impl` block)
