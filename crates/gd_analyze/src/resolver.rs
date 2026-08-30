@@ -142,6 +142,15 @@ fn resolve_class_inheritance(
         kind: DtKind::Class,
         class_node: Some(class_id),
         builtin_type: VariantType::Object,
+        // #355: Godot's CLASS arm renders the identifier, else the fqcn — which for a head class
+        // with no `class_name` is the script's own `res://` path (`-self` reads as
+        // `res://src/probe6.gd`). `ctx.script_path` is the last resort: it is a basename in the
+        // server, so it is only reached for an un-indexed buffer that has no `res://` path at all.
+        display_name: class_identifier_name(ctx, class_id).unwrap_or_else(|| {
+            ctx.file
+                .and_then(|f| ctx.xfile.res_path(f))
+                .unwrap_or_else(|| ctx.script_path.clone())
+        }),
         ..Default::default()
     };
     ctx.set_type(class_id, class_type.clone());
@@ -328,6 +337,7 @@ fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option
                     builtin_type: VariantType::Object,
                     native_type: crate::script_chain::chain_native_root(ctx, &sref)
                         .unwrap_or_default(),
+                    display_name: script_render_name(ctx, &sref),
                     script_type: Some(sref),
                     ..Default::default()
                 };
@@ -494,8 +504,9 @@ fn member_kind_name(member: Member) -> &'static str {
 /// Of the visible ones, a constant is a type only when it holds one (`const Alias = Inner`), and a
 /// static function never is. Pinned against `godot --headless --check-only` for every kind.
 enum MetaMember {
-    /// Resolved to a meta type — the walk continues into it.
-    Type(DataType),
+    /// Resolved to a meta type — the walk continues into it. Boxed: a bare [`DataType`] dwarfs the
+    /// two unit variants.
+    Type(Box<DataType>),
     /// Resolved, but to a value (analyzer.cpp:918).
     NotAType,
     /// Not on a meta base at all (analyzer.cpp:915).
@@ -528,14 +539,14 @@ fn meta_member(
             typed(ctx, class_id, name, cid, at);
             let dt = ctx.get_type(cid).clone();
             if dt.is_meta_type {
-                MetaMember::Type(dt)
+                MetaMember::Type(Box::new(dt))
             } else {
                 MetaMember::NotAType
             }
         }
         Some(Member::Enum(eid)) => {
             typed(ctx, class_id, name, eid, at);
-            MetaMember::Type(ctx.get_type(eid).clone())
+            MetaMember::Type(Box::new(ctx.get_type(eid).clone()))
         }
         Some(Member::Function(fid)) => match &ctx.node(fid).kind {
             NodeKind::Function(f) if f.is_static => MetaMember::NotAType,
@@ -619,6 +630,28 @@ pub(crate) fn script_base_datatype(ctx: &AnalysisContext, fid: gd_project::FileI
     )
 }
 
+/// #355: the name [`DataType`]'s `Display` renders for a `Script` kind — Godot's CLASS arm
+/// (`gdscript_parser.cpp:5354-5358`): the class's own identifier, else the head class's `fqcn`,
+/// which for a GDScript is its `res://` path.
+///
+/// An inner class always has an identifier, so `inner.last()` wins outright; a head class's
+/// identifier is its `class_name`, read off the depended interface. Empty only when the file
+/// resolves to no path at all, where `Display` keeps its bracketed placeholder rather than
+/// inventing a name.
+pub(crate) fn script_render_name(ctx: &AnalysisContext, sref: &ScriptRef) -> String {
+    if let Some(seg) = sref.inner.last() {
+        return seg.clone();
+    }
+    if let Some(name) = ctx
+        .xfile
+        .interface(sref.file)
+        .and_then(|i| i.class_name.clone())
+    {
+        return name;
+    }
+    ctx.xfile.res_path(sref.file).unwrap_or_default()
+}
+
 /// The `Script` meta type for a concrete [`ScriptRef`]: the head script when `inner` is empty, one
 /// of its inner classes otherwise. Same shape the cross-file inner-class hop in
 /// [`resolve_datatype`] builds for `Outer.Inner` annotations.
@@ -629,6 +662,7 @@ pub(crate) fn script_ref_datatype(ctx: &AnalysisContext, sref: ScriptRef) -> Dat
         is_meta_type: true,
         builtin_type: VariantType::Object,
         native_type: crate::script_chain::chain_native_root(ctx, &sref).unwrap_or_default(),
+        display_name: script_render_name(ctx, &sref),
         script_type: Some(sref),
         ..Default::default()
     }
@@ -822,7 +856,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         ScopeType::NotAType => return bad_type,
         other => other,
     } {
-        result = base;
+        result = *base;
     } else if ctx.native.global_enum(&first).is_some() {
         // analyzer.cpp:806-815 — `@GlobalScope` enum (e.g. `Side`, `ClockDirection`). Resolves
         // to the enum's meta type.
@@ -907,7 +941,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
             // `interface()` walk below and never reach this arm.
             let base_name = crate::reducer::class_identifier_name_or_default(ctx, &result);
             match meta_member(ctx, parent_class_node, &seg, id) {
-                MetaMember::Type(dt) => result = dt,
+                MetaMember::Type(dt) => result = *dt,
                 MetaMember::NotAType => {
                     // analyzer.cpp:918.
                     ctx.push_error(
@@ -1263,8 +1297,8 @@ fn class_member(ctx: &AnalysisContext, class_id: NodeId, name: &str) -> Option<M
 /// member's kind has three outcomes, not two: a type, no member at all, and *a member that is not a
 /// type* — which is an error in its own right (analyzer.cpp:894), not a reason to keep looking.
 enum ScopeType {
-    /// A member (or class) named the type.
-    Found(DataType),
+    /// A member (or class) named the type. Boxed: a bare [`DataType`] dwarfs the two unit variants.
+    Found(Box<DataType>),
     /// A member with this name exists but cannot name a type; the error is already pushed.
     NotAType,
     /// Nothing in scope carries this name — resolution continues down the chain.
@@ -1278,7 +1312,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
     let scope = scope_classes(ctx, current);
     for look in scope.iter().copied() {
         if class_identifier_name(ctx, look).as_deref() == Some(name) {
-            return ScopeType::Found(ctx.get_type(look).clone());
+            return ScopeType::Found(Box::new(ctx.get_type(look).clone()));
         }
         // analyzer.cpp:860-898 — match class members by name and dispatch on member kind. The
         // Godot's switch covers CLASS / ENUM / CONSTANT (meta-typed or script-typed); other kinds
@@ -1289,7 +1323,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                 if ctx.get_type(inner_id).has_no_type() {
                     let _ = resolve_class_inheritance(ctx, inner_id, None);
                 }
-                return ScopeType::Found(ctx.get_type(inner_id).clone());
+                return ScopeType::Found(Box::new(ctx.get_type(inner_id).clone()));
             }
             Some(Member::Enum(enum_id)) => {
                 // analyzer.cpp:869-872. The enum's datatype is the meta type
@@ -1314,7 +1348,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                         resolve_class_member(ctx, look, idx, None);
                     }
                 }
-                return ScopeType::Found(ctx.get_type(enum_id).clone());
+                return ScopeType::Found(Box::new(ctx.get_type(enum_id).clone()));
             }
             Some(Member::Constant(const_id)) => {
                 // analyzer.cpp:874-882's CONSTANT arm — when a class-level constant exists,
@@ -1365,7 +1399,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                 // dynamic" rule exists for (`features/local_const_as_type.gd`'s `const O =
                 // preload(...)` style).
                 if const_dt.is_meta_type {
-                    return ScopeType::Found(const_dt);
+                    return ScopeType::Found(Box::new(const_dt));
                 }
                 if const_dt.is_set() && !const_dt.is_variant() && !const_dt.has_no_type() {
                     ctx.push_error(
@@ -1375,7 +1409,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                     return ScopeType::NotAType;
                 }
                 if const_dt.is_set() {
-                    return ScopeType::Found(const_dt);
+                    return ScopeType::Found(Box::new(const_dt));
                 }
             }
             // analyzer.cpp:894's `default:` — a variable / function / signal / enum value / group
@@ -1422,13 +1456,13 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) ->
                         // against the base script (#284).
                         let mut inner: Vec<String> = link.inner.clone();
                         inner.push(name.to_string());
-                        return ScopeType::Found(script_ref_datatype(
+                        return ScopeType::Found(Box::new(script_ref_datatype(
                             ctx,
                             ScriptRef {
                                 file: link.file,
                                 inner,
                             },
-                        ));
+                        )));
                     }
                 }
             }

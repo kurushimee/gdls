@@ -6,6 +6,11 @@
 //! arm, which has its own unit coverage in `server.rs`'s tests. What can only be exercised at
 //! the integration level is the LRU eviction order, the `pop_lru`-based bulk shed, and the
 //! interaction between the per-insert evict-on-overflow and the per-tick bulk evict-half.
+//!
+//! The seeding hooks these tests call are `#[cfg(any(test, debug_assertions))]` on `Workspace`,
+//! and a `test` cfg on an integration crate does not reach the library it links. So the file as a
+//! whole compiles only where those hooks exist. CI runs `--all-targets` in debug, where it does.
+#![cfg(debug_assertions)]
 
 mod common;
 

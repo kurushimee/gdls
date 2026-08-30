@@ -384,6 +384,20 @@ pub struct DataType {
     pub enum_values_inexact: bool,
     /// `Array[T]` → `[T]`; `Dictionary[K, V]` → `[K, V]`. Empty = unparameterized.
     pub container_element_types: Vec<DataType>,
+    /// #355: the name [`Display`] renders for a `Script`/`Class` kind — the payload Godot's
+    /// `DataType` carries directly (`class_type->identifier->name`, else `class_type->fqcn`;
+    /// `gdscript_parser.cpp:5354-5358`) and gdls's `FileId`/`NodeId` cannot reach.
+    ///
+    /// Godot's `to_string()` is total on the value because the value owns what it needs to render.
+    /// gdls substituted opaque ids for those pointers, and every message that names a project type
+    /// then had to route through a context-aware helper to get a real name back — a fail-open
+    /// arrangement that leaked `<Script #3>` into user-facing errors four separate times. Carrying
+    /// the name restores Godot's property.
+    ///
+    /// Empty for every other kind, and for a type built outside an analysis (`gd_server`'s
+    /// navigation-only types), where [`Display`] keeps its bracketed placeholder — a value with no
+    /// name shows its seams rather than inventing one.
+    pub display_name: String,
 }
 
 impl DataType {
@@ -538,12 +552,23 @@ impl std::fmt::Display for DataType {
                     _ => f.write_str(variant_type_name(self.builtin_type)),
                 }
             }
+            // gdscript_parser.cpp:5351-5353 — the class OBJECT, not an instance of it, renders as
+            // the engine's own wrapper class name. `var e: int = Node` reads "a value of type
+            // GDScriptNativeClass", never "of type Node" (which would describe an instance).
+            DtKind::Native if self.is_meta_type => f.write_str("GDScriptNativeClass"),
             DtKind::Native => f.write_str(&self.native_type),
+            // gdscript_parser.cpp:5354-5358, the CLASS arm — which is what gdls's `Script` kind is:
+            // `make_global_class_meta_type` hands back the depended parser's head CLASS type, and
+            // Godot's SCRIPT kind proper only arises for non-GDScript scripts, which gdls has none
+            // of. `display_name` carries the identifier (else the fqcn); the bracketed placeholders
+            // remain for a type built with no name to render.
+            DtKind::Script if !self.display_name.is_empty() => f.write_str(&self.display_name),
             DtKind::Script => match &self.script_type {
                 Some(s) if s.inner.is_empty() => write!(f, "<Script #{}>", s.file.get()),
                 Some(s) => write!(f, "<Script #{}>.{}", s.file.get(), s.inner.join(".")),
                 None => f.write_str("<Script>"),
             },
+            DtKind::Class if !self.display_name.is_empty() => f.write_str(&self.display_name),
             DtKind::Class => f.write_str("<Class>"),
             DtKind::Enum => {
                 // analyzer.cpp:5361 — `String(native_type).get_file()`. Godot's `String::get_file()`
@@ -675,5 +700,44 @@ mod tests {
             ..Default::default()
         };
         assert!(!bad_class.kind_consistent());
+    }
+
+    /// #355 — every `Display` arm that reads [`DataType::display_name`], plus the placeholder a
+    /// nameless value keeps.
+    #[test]
+    fn script_and_class_kinds_render_their_carried_name() {
+        let named = |kind, name: &str| DataType {
+            kind,
+            script_type: Some(ScriptRef {
+                file: FileId::new(7),
+                inner: Vec::new(),
+            }),
+            display_name: name.to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(named(DtKind::Script, "Lib1").to_string(), "Lib1");
+        assert_eq!(
+            named(DtKind::Script, "res://src/probe.gd").to_string(),
+            "res://src/probe.gd"
+        );
+        assert_eq!(named(DtKind::Class, "In").to_string(), "In");
+
+        // A value built outside an analysis carries no name, so it shows its seams rather than
+        // inventing one.
+        assert_eq!(named(DtKind::Script, "").to_string(), "<Script #7>");
+        assert_eq!(named(DtKind::Class, "").to_string(), "<Class>");
+    }
+
+    /// A native class as a *value* is `GDScriptNativeClass`; as a type it is its own name.
+    #[test]
+    fn a_native_metatype_renders_as_gdscriptnativeclass() {
+        let mut dt = DataType {
+            kind: DtKind::Native,
+            native_type: "Node".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(dt.to_string(), "Node");
+        dt.is_meta_type = true;
+        assert_eq!(dt.to_string(), "GDScriptNativeClass");
     }
 }

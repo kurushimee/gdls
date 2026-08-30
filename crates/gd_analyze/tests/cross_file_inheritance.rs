@@ -1179,9 +1179,10 @@ func go() -> void:
         if let gd_syntax::ast::NodeKind::Variable(_) = &tree.get(id).kind {
             let dt = result.types.get(id);
             if dt.is_set() {
-                assert!(
-                    format!("{dt}").ends_with(".Inner"),
-                    "`v` must type as the inner class, got `{dt}`"
+                assert_eq!(
+                    format!("{dt}"),
+                    "Inner",
+                    "`v` must type as the inner class, rendered the way Godot renders it"
                 );
                 found = true;
             }

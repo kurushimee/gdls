@@ -154,6 +154,19 @@ pub trait CrossFileQuery {
     /// at `fid`, so member access through the singleton (`Global.popup_error(...)`) resolves via
     /// the existing Script-member path. `None` = not an autoload (default; overridden only by
     /// `WorkspaceXFileQuery` in `gd_server`, which has access to the `ProjectModel`).
+    /// The file's `res://` path — Godot's head-class `fqcn` spelling (`gdscript_parser.cpp:702`),
+    /// used ONLY when rendering a class that has no name of its own (`-self` in a script with no
+    /// `class_name` reads as `res://src/probe6.gd`).
+    ///
+    /// Deliberately separate from [`Self::file_path`]: the server passes a bare BASENAME as
+    /// `AnalysisContext::script_path` and basenames the index path for enum fqcns, because the
+    /// self-side and cross-side enum spellings have to agree (#286). That machinery must not
+    /// change, so the `res://` spelling gets its own accessor. The default is `file_path`
+    /// verbatim, which is what every in-tree test query wants.
+    fn res_path(&self, file: FileId) -> Option<String> {
+        self.file_path(file).map(str::to_owned)
+    }
+
     fn autoload_file(&self, _name: &str) -> Option<FileId> {
         None
     }
