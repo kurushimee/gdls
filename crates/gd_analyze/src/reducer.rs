@@ -5250,15 +5250,18 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // `builtin_classes[].methods` — the same tables `signatureHelp` resolves `arr.append(` and
         // `Vector2.lerp(` from — so under `Exact` a miss is provable, provided the dump actually
         // carries an entry for this builtin (a trimmed one may not, and then absence proves
-        // nothing). `Dictionary` is excluded for the same reason as the member arm above: its keys
-        // are its members, so Godot answers any name with a Variant.
+        // nothing).
+        //
+        // #416: `Dictionary` belongs here, unlike in the member arm. The member arm's exemption is
+        // upstream's own (analyzer.cpp:4126-4128 hands back a bare Variant for any name, because a
+        // dictionary's keys are its members), and it was carried over to this arm where upstream
+        // has nothing of the kind — the call gate at analyzer.cpp:3757 is `is_self || (hard &&
+        // BUILTIN)` flat. Godot answers `d.nope_p` with a Variant and `d.nope_m()` with an error.
+        // `Nil` stays out at both arms: it has its own message and this is not the arm to emit it.
         let builtin_base_is_introspectable = base_type.is_hard_type()
             && base_type.kind == DtKind::Builtin
             && !base_type.is_meta_type
-            && !matches!(
-                base_type.builtin_type,
-                VariantType::Dictionary | VariantType::Nil
-            )
+            && base_type.builtin_type != VariantType::Nil
             && ctx
                 .native
                 .builtin_named(data_type::variant_type_name(base_type.builtin_type))

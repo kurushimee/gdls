@@ -142,7 +142,8 @@ fn real_builtin_members_and_methods_stay_silent() {
 }
 
 /// FP guard, Godot's own exclusion: a `Dictionary`'s keys ARE its members, so upstream answers
-/// any name with a Variant instead of erroring (analyzer.cpp:4124-4128).
+/// any name with a Variant instead of erroring (analyzer.cpp:4124-4128). The exclusion is the
+/// member arm's alone — see the #416 rows below for the call arm, which has no such thing.
 #[test]
 fn dictionary_member_access_stays_silent() {
     let src = "extends Node\n\nfunc go() -> void:\n\tvar d := {}\n\tprint(d.anything)\n";
@@ -154,5 +155,55 @@ fn dictionary_member_access_stays_silent() {
 #[test]
 fn soft_typed_base_stays_silent() {
     let src = "extends Node\n\nfunc go(anything) -> void:\n\tanything.bogus()\n\tprint(anything.bogus_prop)\n";
+    assert_eq!(errors(src), Vec::<String>::new());
+}
+
+// ===================================================================================================
+// #416 — a Dictionary base, where the member arm and the call arm disagree.
+// ===================================================================================================
+
+/// Oracle: `Function "nope_m()" not found in base Dictionary.`, once per call site, and nothing at
+/// all for the property.
+///
+/// The member arm exempts `Dictionary` because upstream does (analyzer.cpp:4126-4128 hands back a
+/// bare Variant for any name — a dictionary's keys are its members). The exemption had been carried
+/// into the call arm, where upstream's gate is `is_self || (hard && BUILTIN)` flat with nothing of
+/// the kind, so every dictionary method typo was silent.
+#[test]
+fn method_miss_on_a_dictionary_base_errors_and_the_property_miss_does_not() {
+    let src = "\
+extends Node
+
+func go() -> void:
+\tvar inferred := {\"a\": 1}
+\tvar annotated: Dictionary = {}
+\tinferred.nope_m()
+\tannotated.nope_m()
+\tprint(inferred.nope_p)
+";
+    assert_eq!(
+        errors(src),
+        vec![
+            r#"Function "nope_m()" not found in base Dictionary."#.to_string(),
+            r#"Function "nope_m()" not found in base Dictionary."#.to_string(),
+        ]
+    );
+}
+
+/// FP guard: the real `Dictionary` methods resolve out of the dump, and an UNTYPED dictionary base
+/// is not a hard type, so it stays outside the gate exactly as it does for every other builtin.
+#[test]
+fn real_dictionary_methods_and_an_untyped_base_stay_silent() {
+    let src = "\
+extends Node
+
+func go() -> void:
+\tvar d := {\"a\": 1}
+\tprint(d.size())
+\tprint(d.has(\"a\"))
+\td.clear()
+\tvar loose = {}
+\tloose.nope_m()
+";
     assert_eq!(errors(src), Vec::<String>::new());
 }
