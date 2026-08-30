@@ -99,6 +99,20 @@ fn diagnose(args: &[String]) -> Result<()> {
     eprintln!("loading workspace at {root}...");
     let mut workspace = Workspace::load(&root, &options);
     eprintln!("loaded {} script(s)", workspace.index.file_count());
+    // A stock-surface run would otherwise inherit the resolve ladder's advice ("set
+    // godotBinaryPath or GDLS_GODOT for an exact dump") unqualified — but diagnose never
+    // dumps; the background dump is the LSP session's job (api_dump::spawn_background_dump,
+    // issue #25). Say so, so an operator doesn't set the env var and re-run diagnose
+    // expecting a different native surface.
+    if workspace.native.provenance() == gd_types::ApiProvenance::Generic
+        && options.extension_api_path.is_none()
+    {
+        eprintln!(
+            "note: diagnose never generates the native API dump (that is the LSP session's \
+             background job); this run used the embedded stock surface. Open the project in \
+             any LSP session once, or set godotBinaryPath / GDLS_GODOT, to produce an exact dump."
+        );
+    }
 
     let mut failed = false;
 
