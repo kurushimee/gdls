@@ -100,7 +100,12 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// claim, and a v12 cache holds no value for it — `#[serde(default)]` would warm-load `false` and
 /// silently suppress that error for every file until the next cold index, which reads as "gdls
 /// stopped reporting typos". v12 files are ignored and rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 13;
+/// v14 (#431): `initializer_type_expr` reads more shapes — a dotted `A.B.new()`, a cast, a `$`/`%`
+/// node lookup — so a member that used to be recorded as untyped now carries a real type. The
+/// shape did not change, so a v13 cache still deserializes; it just holds the older, poorer
+/// answers, and a warm load would keep serving `Variant` for those members until the next cold
+/// index. v13 files are ignored and rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 14;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool

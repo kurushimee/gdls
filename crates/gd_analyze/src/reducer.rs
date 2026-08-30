@@ -6805,6 +6805,18 @@ pub(crate) fn resolve_interface_type_expr(
         return script_instance_datatype(ctx, declaring_file, path.clone());
     } else if ctx.native.global_enum(first).is_some() {
         result = crate::resolver::make_global_enum_type(ctx, first, "", false);
+    } else if let Some(fid) = ctx.xfile.autoload_file(first) {
+        // An autoload singleton named as a type (analyzer.cpp:830-845), the cross-file twin of
+        // `resolver::resolve_datatype`'s arm. A member holds the INSTANCE, so nested segments
+        // walk the autoload script's inner classes exactly as a global class's do.
+        if path.len() > 1 {
+            let chain: Vec<&str> = path[1..].iter().map(String::as_str).collect();
+            if ctx.xfile.resolve_inner_chain(fid, &chain).is_some() {
+                return script_instance_datatype(ctx, fid, path[1..].to_vec());
+            }
+            return DataType::variant();
+        }
+        return script_instance_datatype(ctx, fid, Vec::new());
     } else {
         return DataType::variant();
     }
@@ -7013,6 +7025,14 @@ fn lookup_in_links(
                     continue; // VARIABLE arm condition (analyzer.cpp:4219-4226)
                 }
                 let mut dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
+                if member.flags.ty_is_soft {
+                    // `var x = expr` — Godot's `INFERRED`, not `ANNOTATED_INFERRED`
+                    // (`resolve_assignable`, the `!has_specified_type` arm). Interface types
+                    // arrive hard because an annotation is what they normally are; an inferred
+                    // one has to be put back down, or every check a soft type is excused from
+                    // fires on it from across the project.
+                    dt.type_source = TypeSource::Inferred;
+                }
                 // A VAR member is never a constant, whatever its TYPE carries — enum-typed
                 // members (`var key: Key`) get instance types whose constructors mark
                 // is_constant, and leaving it set made `obj.key = x` error
