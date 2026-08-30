@@ -287,6 +287,16 @@ pub struct AnalysisContext<'a> {
     /// `FunctionNode::is_abstract` inline, the annotation-apply step inserts the NodeId here and
     /// the rest of the analyzer reads it via `ctx.is_abstract(id)`.
     pub abstract_nodes: FxHashSet<NodeId>,
+    /// Annotation nodes already passed through `crate::resolver::resolve_annotation` (Godot's
+    /// `AnnotationNode::is_resolved`, analyzer.cpp:1676-1679). Godot's dispatcher reaches the same
+    /// annotation from several phases, and only the first visit does the work.
+    pub resolved_annotations: FxHashSet<NodeId>,
+    /// What each resolved annotation's arguments folded to, in order (Godot's
+    /// `AnnotationNode::resolved_arguments`, analyzer.cpp:1725). An apply callback reads this
+    /// rather than the argument expressions, so a `const MODE = "any_peer"` argument reaches it as
+    /// the string it is. Shorter than the argument list when an argument failed to fold — the
+    /// resolve returns at the first failure, exactly as Godot does.
+    pub annotation_resolved_args: FxHashMap<NodeId, Vec<crate::FoldedValue>>,
     /// The active suite scope chain — pushed on entry to `resolve_suite`, popped on exit. The
     /// Godot's `IdentifierNode::suite` back-pointer (gdscript_parser.cpp:3097) gives the parser
     /// scope-tracked lookups; gdls's AST keeps `SuiteNode::locals` but not the back-pointer, so
@@ -415,6 +425,8 @@ impl<'a> AnalysisContext<'a> {
             resolved_bodies: FxHashSet::default(),
             resolved_functions: FxHashSet::default(),
             abstract_nodes: FxHashSet::default(),
+            resolved_annotations: FxHashSet::default(),
+            annotation_resolved_args: FxHashMap::default(),
             suite_stack: Vec::new(),
             assignments: FxHashMap::default(),
             warning_ignore_regions,

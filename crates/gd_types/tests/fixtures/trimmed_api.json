@@ -522,6 +522,326 @@
 					"value": 39
 				}
 			]
+		},
+		{
+			"name": "PropertyHint",
+			"is_bitfield": false,
+			"values": [
+				{
+					"name": "PROPERTY_HINT_NONE",
+					"value": 0
+				},
+				{
+					"name": "PROPERTY_HINT_RANGE",
+					"value": 1
+				},
+				{
+					"name": "PROPERTY_HINT_ENUM",
+					"value": 2
+				},
+				{
+					"name": "PROPERTY_HINT_ENUM_SUGGESTION",
+					"value": 3
+				},
+				{
+					"name": "PROPERTY_HINT_EXP_EASING",
+					"value": 4
+				},
+				{
+					"name": "PROPERTY_HINT_LINK",
+					"value": 5
+				},
+				{
+					"name": "PROPERTY_HINT_FLAGS",
+					"value": 6
+				},
+				{
+					"name": "PROPERTY_HINT_LAYERS_2D_RENDER",
+					"value": 7
+				},
+				{
+					"name": "PROPERTY_HINT_LAYERS_2D_PHYSICS",
+					"value": 8
+				},
+				{
+					"name": "PROPERTY_HINT_LAYERS_2D_NAVIGATION",
+					"value": 9
+				},
+				{
+					"name": "PROPERTY_HINT_LAYERS_3D_RENDER",
+					"value": 10
+				},
+				{
+					"name": "PROPERTY_HINT_LAYERS_3D_PHYSICS",
+					"value": 11
+				},
+				{
+					"name": "PROPERTY_HINT_LAYERS_3D_NAVIGATION",
+					"value": 12
+				},
+				{
+					"name": "PROPERTY_HINT_LAYERS_AVOIDANCE",
+					"value": 37
+				},
+				{
+					"name": "PROPERTY_HINT_FILE",
+					"value": 13
+				},
+				{
+					"name": "PROPERTY_HINT_DIR",
+					"value": 14
+				},
+				{
+					"name": "PROPERTY_HINT_GLOBAL_FILE",
+					"value": 15
+				},
+				{
+					"name": "PROPERTY_HINT_GLOBAL_DIR",
+					"value": 16
+				},
+				{
+					"name": "PROPERTY_HINT_RESOURCE_TYPE",
+					"value": 17
+				},
+				{
+					"name": "PROPERTY_HINT_MULTILINE_TEXT",
+					"value": 18
+				},
+				{
+					"name": "PROPERTY_HINT_EXPRESSION",
+					"value": 19
+				},
+				{
+					"name": "PROPERTY_HINT_PLACEHOLDER_TEXT",
+					"value": 20
+				},
+				{
+					"name": "PROPERTY_HINT_COLOR_NO_ALPHA",
+					"value": 21
+				},
+				{
+					"name": "PROPERTY_HINT_OBJECT_ID",
+					"value": 22
+				},
+				{
+					"name": "PROPERTY_HINT_TYPE_STRING",
+					"value": 23
+				},
+				{
+					"name": "PROPERTY_HINT_NODE_PATH_TO_EDITED_NODE",
+					"value": 24
+				},
+				{
+					"name": "PROPERTY_HINT_OBJECT_TOO_BIG",
+					"value": 25
+				},
+				{
+					"name": "PROPERTY_HINT_NODE_PATH_VALID_TYPES",
+					"value": 26
+				},
+				{
+					"name": "PROPERTY_HINT_SAVE_FILE",
+					"value": 27
+				},
+				{
+					"name": "PROPERTY_HINT_GLOBAL_SAVE_FILE",
+					"value": 28
+				},
+				{
+					"name": "PROPERTY_HINT_INT_IS_OBJECTID",
+					"value": 29
+				},
+				{
+					"name": "PROPERTY_HINT_INT_IS_POINTER",
+					"value": 30
+				},
+				{
+					"name": "PROPERTY_HINT_ARRAY_TYPE",
+					"value": 31
+				},
+				{
+					"name": "PROPERTY_HINT_DICTIONARY_TYPE",
+					"value": 38
+				},
+				{
+					"name": "PROPERTY_HINT_LOCALE_ID",
+					"value": 32
+				},
+				{
+					"name": "PROPERTY_HINT_LOCALIZABLE_STRING",
+					"value": 33
+				},
+				{
+					"name": "PROPERTY_HINT_NODE_TYPE",
+					"value": 34
+				},
+				{
+					"name": "PROPERTY_HINT_HIDE_QUATERNION_EDIT",
+					"value": 35
+				},
+				{
+					"name": "PROPERTY_HINT_PASSWORD",
+					"value": 36
+				},
+				{
+					"name": "PROPERTY_HINT_TOOL_BUTTON",
+					"value": 39
+				},
+				{
+					"name": "PROPERTY_HINT_ONESHOT",
+					"value": 40
+				},
+				{
+					"name": "PROPERTY_HINT_GROUP_ENABLE",
+					"value": 42
+				},
+				{
+					"name": "PROPERTY_HINT_INPUT_NAME",
+					"value": 43
+				},
+				{
+					"name": "PROPERTY_HINT_FILE_PATH",
+					"value": 44
+				},
+				{
+					"name": "PROPERTY_HINT_MAX",
+					"value": 45
+				}
+			]
+		},
+		{
+			"name": "PropertyUsageFlags",
+			"is_bitfield": true,
+			"values": [
+				{
+					"name": "PROPERTY_USAGE_NONE",
+					"value": 0
+				},
+				{
+					"name": "PROPERTY_USAGE_STORAGE",
+					"value": 2
+				},
+				{
+					"name": "PROPERTY_USAGE_EDITOR",
+					"value": 4
+				},
+				{
+					"name": "PROPERTY_USAGE_INTERNAL",
+					"value": 8
+				},
+				{
+					"name": "PROPERTY_USAGE_CHECKABLE",
+					"value": 16
+				},
+				{
+					"name": "PROPERTY_USAGE_CHECKED",
+					"value": 32
+				},
+				{
+					"name": "PROPERTY_USAGE_GROUP",
+					"value": 64
+				},
+				{
+					"name": "PROPERTY_USAGE_CATEGORY",
+					"value": 128
+				},
+				{
+					"name": "PROPERTY_USAGE_SUBGROUP",
+					"value": 256
+				},
+				{
+					"name": "PROPERTY_USAGE_CLASS_IS_BITFIELD",
+					"value": 512
+				},
+				{
+					"name": "PROPERTY_USAGE_NO_INSTANCE_STATE",
+					"value": 1024
+				},
+				{
+					"name": "PROPERTY_USAGE_RESTART_IF_CHANGED",
+					"value": 2048
+				},
+				{
+					"name": "PROPERTY_USAGE_SCRIPT_VARIABLE",
+					"value": 4096
+				},
+				{
+					"name": "PROPERTY_USAGE_STORE_IF_NULL",
+					"value": 8192
+				},
+				{
+					"name": "PROPERTY_USAGE_UPDATE_ALL_IF_MODIFIED",
+					"value": 16384
+				},
+				{
+					"name": "PROPERTY_USAGE_SCRIPT_DEFAULT_VALUE",
+					"value": 32768
+				},
+				{
+					"name": "PROPERTY_USAGE_CLASS_IS_ENUM",
+					"value": 65536
+				},
+				{
+					"name": "PROPERTY_USAGE_NIL_IS_VARIANT",
+					"value": 131072
+				},
+				{
+					"name": "PROPERTY_USAGE_ARRAY",
+					"value": 262144
+				},
+				{
+					"name": "PROPERTY_USAGE_ALWAYS_DUPLICATE",
+					"value": 524288
+				},
+				{
+					"name": "PROPERTY_USAGE_NEVER_DUPLICATE",
+					"value": 1048576
+				},
+				{
+					"name": "PROPERTY_USAGE_HIGH_END_GFX",
+					"value": 2097152
+				},
+				{
+					"name": "PROPERTY_USAGE_NODE_PATH_FROM_SCENE_ROOT",
+					"value": 4194304
+				},
+				{
+					"name": "PROPERTY_USAGE_RESOURCE_NOT_PERSISTENT",
+					"value": 8388608
+				},
+				{
+					"name": "PROPERTY_USAGE_KEYING_INCREMENTS",
+					"value": 16777216
+				},
+				{
+					"name": "PROPERTY_USAGE_DEFERRED_SET_RESOURCE",
+					"value": 33554432
+				},
+				{
+					"name": "PROPERTY_USAGE_EDITOR_INSTANTIATE_OBJECT",
+					"value": 67108864
+				},
+				{
+					"name": "PROPERTY_USAGE_EDITOR_BASIC_SETTING",
+					"value": 134217728
+				},
+				{
+					"name": "PROPERTY_USAGE_READ_ONLY",
+					"value": 268435456
+				},
+				{
+					"name": "PROPERTY_USAGE_SECRET",
+					"value": 536870912
+				},
+				{
+					"name": "PROPERTY_USAGE_DEFAULT",
+					"value": 6
+				},
+				{
+					"name": "PROPERTY_USAGE_NO_EDITOR",
+					"value": 2
+				}
+			]
 		}
 	],
 	"global_constants": [],

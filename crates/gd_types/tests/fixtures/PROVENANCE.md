@@ -17,7 +17,7 @@ Regenerate from the workspace root, with the full dump at `api/extension_api.jso
 ```bash
 jq 'walk(if type=="object" then del(.description, .brief_description) else . end)
   | { header,
-      global_enums:      [.global_enums[]      | select(.name | IN("Variant.Operator","Variant.Type","ClockDirection","Error","Side"))],
+      global_enums:      [.global_enums[]      | select(.name | IN("Variant.Operator","Variant.Type","ClockDirection","Error","Side","PropertyHint","PropertyUsageFlags"))],
       global_constants:  .global_constants,
       utility_functions: .utility_functions,
       builtin_classes:   [.builtin_classes[]   | select(.name | IN("Vector2","Vector2i","Vector3","Array","Dictionary","Color","Callable"))],
@@ -25,6 +25,8 @@ jq 'walk(if type=="object" then del(.description, .brief_description) else . end
       singletons:        [.singletons[]        | select(.name | IN("Engine","OS"))] }' \
   api/extension_api.json > crates/gd_types/tests/fixtures/trimmed_api.json
 ```
+
+`PropertyHint` and `PropertyUsageFlags` are kept because `@export_custom`'s arguments name them, and since annotation arguments are reduced, an enum the fixture drops reads as an undeclared identifier in the corpus.
 
 `Line2D` and the `PackedVector2Array` builtin are kept for the 4.7
 `CONFUSABLE_TEMPORARY_MODIFICATION` fixture, which needs a native property whose type is a packed

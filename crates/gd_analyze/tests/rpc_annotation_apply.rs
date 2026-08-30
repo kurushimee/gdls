@@ -37,7 +37,14 @@ fn errors(src: &str) -> Vec<String> {
 }
 
 fn rpc(args: &str) -> Vec<String> {
-    errors(&format!("extends Node\n@rpc{args}\nfunc f():\n\tpass\n"))
+    rpc_in("", args)
+}
+
+/// `rpc`, with `preamble` inserted between the `extends` and the annotation.
+fn rpc_in(preamble: &str, args: &str) -> Vec<String> {
+    errors(&format!(
+        "extends Node\n{preamble}@rpc{args}\nfunc f():\n\tpass\n"
+    ))
 }
 
 #[test]
@@ -100,11 +107,24 @@ fn only_the_first_offending_axis_is_reported() {
 #[test]
 fn the_fourth_argument_is_a_channel_not_a_keyword() {
     // "unreliable" in the channel slot is a typed-argument error, not a transfer-mode clash.
+    // `resolve_annotation` reports the type and stops, so the apply sees only the first three
+    // arguments and reports the permission clash among them — both halves, in this order.
     assert_eq!(
         rpc(r#"("any_peer", "any_peer", "reliable", "unreliable")"#),
         vec![
-            r#"Invalid RPC config. The permission ("any_peer"/"authority") must be specified no more than once."#
+            r#"Invalid argument for annotation "@rpc": argument 4 should be "int" but is "String"."#,
+            r#"Invalid RPC config. The permission ("any_peer"/"authority") must be specified no more than once."#,
         ]
+    );
+}
+
+/// #371 slice 4: the apply reads `resolved_arguments`, so a constant that folds to one of the
+/// keywords is the keyword. Godot accepts this file.
+#[test]
+fn a_folded_constant_argument_reads_as_its_keyword() {
+    assert_eq!(
+        rpc_in("const M = \"any_peer\"\n", r#"(M, "call_local")"#),
+        Vec::<String>::new()
     );
 }
 
