@@ -689,3 +689,192 @@ fn refcounted_supertype_subtype_roundtrip_is_symmetric() {
 
     shutdown(&client, handle);
 }
+
+// =============================================================================================
+// #359 — a dotted `extends Outer.Inner` names ONE class, and it is not whatever top-level
+// `class_name` shares the last segment.
+// =============================================================================================
+
+/// The #359 project: an `Outer` holding an inner `Inner`, a completely unrelated top-level
+/// `class_name Inner`, and a `child` that extends the inner one.
+const OUTER: &str = "class_name Outer\nextends Node\n\nclass Inner:\n\textends Node\n\tfunc tick() -> void:\n\t\tpass\n";
+const UNRELATED: &str = "class_name Inner\nextends Node\n";
+const CHILD: &str = "extends Outer.Inner\n";
+
+fn inner_class_project() -> NativeProject {
+    NativeProject::new(&[
+        ("outer.gd", OUTER),
+        ("unrelated.gd", UNRELATED),
+        ("child.gd", CHILD),
+    ])
+}
+
+/// `textDocument/definition` for the request the handler answers under test.
+fn definition_at(
+    client: &Connection,
+    uri: &Uri,
+    position: Position,
+) -> Option<GotoDefinitionResponse> {
+    let params = GotoDefinitionParams {
+        text_document_position_params: position_params(uri, position),
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    client
+        .sender
+        .send(request(
+            14,
+            "textDocument/definition",
+            serde_json::to_value(params).unwrap(),
+        ))
+        .unwrap();
+    let resp = recv_response(client);
+    serde_json::from_value(resp.result.expect("definition result is always present"))
+        .expect("valid Option<GotoDefinitionResponse>")
+}
+
+/// `definition` on the SUFFIX segment of `extends Outer.Inner` lands on `Outer`'s inner class, not
+/// on the unrelated top-level `class_name Inner` that shares the segment's text.
+#[test]
+fn definition_on_an_extends_suffix_segment_lands_on_the_inner_class() {
+    let project = inner_class_project();
+    let (client, handle, _) = boot(&project);
+    let child_uri = project.uri("child.gd");
+    did_open(&client, &child_uri, CHILD);
+
+    // `extends Outer.Inner` — the `Inner` segment starts at column 14.
+    let resp = definition_at(&client, &child_uri, Position::new(0, 14))
+        .expect("definition resolves the suffix segment");
+    let GotoDefinitionResponse::Scalar(loc) = resp else {
+        panic!("definition returns a single location, got {resp:?}");
+    };
+    assert_eq!(loc.uri, project.uri("outer.gd"));
+    // `class Inner:` is line 3; the identifier spans columns 6..11.
+    assert_eq!(loc.range.start, Position::new(3, 6));
+    assert_eq!(loc.range.end, Position::new(3, 11));
+
+    shutdown(&client, handle);
+}
+
+/// `prepareTypeHierarchy` on that same segment yields the inner class as an item, with a `data`
+/// blob that carries the inner-class path — the identity a bare name cannot express.
+#[test]
+fn prepare_on_an_extends_suffix_segment_yields_the_inner_class() {
+    let project = inner_class_project();
+    let (client, handle, _) = boot(&project);
+    let child_uri = project.uri("child.gd");
+    did_open(&client, &child_uri, CHILD);
+
+    let item = prepare_one(&client, &child_uri, Position::new(0, 14));
+    assert_eq!(item.name, "Inner");
+    assert_eq!(item.uri, project.uri("outer.gd"));
+    assert_eq!(item.selection_range.start, Position::new(3, 6));
+    let data = item.data.as_ref().expect("the item carries a data blob");
+    assert_eq!(
+        data.get("inner").and_then(serde_json::Value::as_array),
+        Some(&vec![serde_json::json!("Inner")]),
+        "the blob addresses the INNER class, not the file's head class: {data}"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// The other side of the same confusion: the unrelated top-level `Inner` must not claim `child.gd`
+/// as a subtype, on either the type-hierarchy or the `implementation` surface.
+#[test]
+fn an_unrelated_global_of_the_same_name_claims_no_subtypes() {
+    let project = inner_class_project();
+    let (client, handle, _) = boot(&project);
+    let unrelated_uri = project.uri("unrelated.gd");
+    did_open(&client, &unrelated_uri, UNRELATED);
+
+    // `class_name Inner` — the identifier starts at column 11.
+    let item = prepare_one(&client, &unrelated_uri, Position::new(0, 11));
+    assert_eq!(item.uri, unrelated_uri);
+    assert_eq!(
+        subtypes_of(&client, &item),
+        Some(Vec::new()),
+        "`child.gd` extends Outer.Inner, a different class entirely"
+    );
+
+    let impls = implementation_uris(&client, &unrelated_uri, Position::new(0, 11));
+    assert_eq!(impls, Vec::<String>::new());
+
+    shutdown(&client, handle);
+}
+
+/// From the declaring side: clicking the inner class's own `class Inner:` identifier addresses THAT
+/// class, so the round trip down to `child.gd` and up to the native root both work.
+#[test]
+fn prepare_on_an_inner_class_declaration_round_trips() {
+    let project = inner_class_project();
+    let (client, handle, _) = boot(&project);
+    let outer_uri = project.uri("outer.gd");
+    did_open(&client, &outer_uri, OUTER);
+
+    let item = prepare_one(&client, &outer_uri, Position::new(3, 6));
+    assert_eq!(item.name, "Inner");
+    assert_eq!(item.uri, outer_uri, "the inner class lives in `outer.gd`");
+
+    let subs = subtypes_of(&client, &item).expect("subtypes are an array, never null");
+    let sub_uris: Vec<&str> = subs.iter().map(|i| i.uri.as_str()).collect();
+    assert_eq!(sub_uris, vec![project.uri("child.gd").as_str()]);
+
+    let supers = supertypes_of(&client, &item).expect("supertypes are an array, never null");
+    let super_names: Vec<&str> = supers.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(
+        super_names,
+        vec!["Node"],
+        "the inner class's own `extends Node`, not `Outer`'s"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// A hand-forged `data` blob whose `inner` key is not an array of strings names a class the server
+/// cannot identify. It decodes to nothing, and the request answers `null` — never a guess at the
+/// file's head class.
+#[test]
+fn a_malformed_inner_path_in_the_blob_answers_null() {
+    let project = inner_class_project();
+    let (client, handle, _) = boot(&project);
+    let outer_uri = project.uri("outer.gd");
+    did_open(&client, &outer_uri, OUTER);
+
+    let mut item = prepare_one(&client, &outer_uri, Position::new(3, 6));
+    item.data = Some(serde_json::json!({ "fid": 1, "inner": "Inner" }));
+    assert_eq!(supertypes_of(&client, &item), None);
+    assert_eq!(subtypes_of(&client, &item), None);
+
+    shutdown(&client, handle);
+}
+
+/// The head segment of an `extends` chain follows Godot's own order in `resolve_class_inheritance`
+/// (`gdscript_analyzer.cpp:469-543`): the global `class_name` registry first, the script's own
+/// classes last. So `class B extends GA:` beside `class GA:` binds the GLOBAL `GA` while one is
+/// registered. Godot separately reports the inner `GA` as hiding it, so a legal project cannot hold
+/// this collision — but when one does, gdls resolves it the way Godot does rather than inventing a
+/// friendlier answer.
+#[test]
+fn an_extends_head_binds_the_global_class_before_a_same_named_inner_one() {
+    const GLOBAL: &str = "class_name GA\nextends Node\n";
+    const COLLIDE: &str =
+        "extends Node\n\nclass GA:\n\textends Node\n\nclass B extends GA:\n\tpass\n";
+    let project = NativeProject::new(&[("ga.gd", GLOBAL), ("collide.gd", COLLIDE)]);
+    let (client, handle, _) = boot(&project);
+    let collide_uri = project.uri("collide.gd");
+    did_open(&client, &collide_uri, COLLIDE);
+
+    // `class B extends GA:` is line 5; `B`'s identifier starts at column 6.
+    let item = prepare_one(&client, &collide_uri, Position::new(5, 6));
+    assert_eq!(item.name, "B");
+
+    let supers = supertypes_of(&client, &item).expect("supertypes are an array, never null");
+    let parents: Vec<(&str, &str)> = supers
+        .iter()
+        .map(|i| (i.name.as_str(), i.uri.as_str()))
+        .collect();
+    assert_eq!(parents, vec![("GA", project.uri("ga.gd").as_str())]);
+
+    shutdown(&client, handle);
+}
