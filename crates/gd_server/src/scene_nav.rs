@@ -1,4 +1,5 @@
-//! Precise `$`/`%` typing for the NAVIGATION surfaces (#125) — hover, definition, typeDefinition.
+//! Precise `$`/`%` typing for the NAVIGATION surfaces (#125) — hover, definition, typeDefinition,
+//! completion, and signatureHelp.
 //!
 //! # Why this lives here and not in the analyzer
 //!
@@ -12,8 +13,17 @@
 //! Navigation has no compatibility check to fail: "what is `$Health`?" is a read-only question, and
 //! answering `Node2D` (or the script attached to that node) is strictly more useful than `Node`.
 //! This module is that consumer, and the ONLY one — the type it builds is handed straight to the
-//! hover / definition renderers and never reaches an `AnalysisResult`, so the two paths stay
-//! separate by construction.
+//! hover / definition / completion renderers and never reaches an `AnalysisResult`, so the two
+//! paths stay separate by construction.
+//!
+//! # Past the dot (#349)
+//!
+//! The precise type answers the node expression AND anything read off it. `$HUD/Label` knowing it
+//! is a `Label` while `$HUD/Label.` one character later offers bare `Node`'s 314 members is the
+//! same answer contradicting itself, and `$`-addressed nodes are the most common shape in a scene
+//! script. [`scene_type_ending_at`] is the seam for that: a read surface asks it for the type of a
+//! member-access BASE before falling back to the analyzer's own. It stays navigation-only for the
+//! same reason the node hover does — nothing it returns is written back.
 //!
 //! # Conservative end to end
 //!
@@ -47,6 +57,33 @@ pub(crate) fn scene_node_type_at(
     let path = crate::uri::uri_to_path(uri)?;
     let facts = state.workspace.scene_node_facts(&path, &query)?;
     Some((node_id, facts_to_nav_type(&facts)))
+}
+
+/// The scene-precise type of the `$`/`%`/`get_node("…")` access that ENDS at `end`, for a member
+/// access whose base is that expression (`$HUD/Label.text`, `%Label.`). `None` when the expression
+/// ending there is not such an access, or when [`scene_node_type_at`] declines it.
+///
+/// The end-anchored match is what keeps this exact: a `$X` buried inside a larger base expression
+/// (`foo($X).bar`, `[$X][0].bar`) ends before that base does, so it never hijacks the base's own
+/// type. NAVIGATION ONLY, exactly as [`scene_node_type_at`].
+pub(crate) fn scene_type_ending_at(
+    state: &ServerState,
+    uri: &Uri,
+    tree: &ParseTree,
+    end: usize,
+) -> Option<DataType> {
+    let (access_id, dt) = scene_node_type_at(state, uri, tree, end.checked_sub(1)?)?;
+    (tree.get(access_id).span.end == end).then_some(dt)
+}
+
+/// [`scene_type_ending_at`] for a member access's base NODE — the common caller shape.
+pub(crate) fn scene_type_of_base(
+    state: &ServerState,
+    uri: &Uri,
+    tree: &ParseTree,
+    base_id: NodeId,
+) -> Option<DataType> {
+    scene_type_ending_at(state, uri, tree, tree.get(base_id).span.end)
 }
 
 /// The innermost `$`/`%` access (a `GetNode` node) or `get_node("literal")` call containing `byte`,

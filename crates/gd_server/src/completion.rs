@@ -134,6 +134,7 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
     let items = match &ctx.kind {
         CompletionKind::Attribute { base } => attribute_items(
             state,
+            &uri,
             &parsed.tree,
             analyzed.as_deref(),
             *base,
@@ -211,6 +212,7 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
             arg_index,
         } => call_argument_items(
             state,
+            &uri,
             &parsed.tree,
             analyzed.as_deref(),
             *callee,
@@ -356,8 +358,10 @@ fn mark_deprecated(
 /// at the dot), then dispatch through [`enumerate::members_of_type`]. An unresolved base ⇒ empty
 /// (offer nothing rather than a wrong set) — including the top-level `local.` case where
 /// `base: None` and no typed node is recoverable, an honest Phase-3 gap.
+#[allow(clippy::too_many_arguments)] // the resolved call-site (tree + tokens + analysis + render ctx)
 fn attribute_items(
     state: &ServerState,
+    uri: &lsp_types::Uri,
     tree: &ParseTree,
     analyzed: Option<&AnalysisResult>,
     base: Option<NodeId>,
@@ -368,9 +372,10 @@ fn attribute_items(
     let Some(analyzed) = analyzed else {
         return Vec::new();
     };
-    let Some(dt) = resolve_base_type(tree, analyzed, base, tokens, byte) else {
+    let Some(dt) = resolve_base_type(state, uri, tree, analyzed, base, tokens, byte) else {
         return Vec::new();
     };
+    let dt = &dt;
     // `Color.` / `Vector2.` — a builtin **meta-type** (the type itself, not an instance). Godot's
     // `COMPLETION_BUILT_IN_TYPE_CONSTANT_OR_STATIC_METHOD`: only that type's constants + STATIC
     // methods, never its instance methods (offering `Color.lerp` as a static would be a "never lie"
@@ -475,7 +480,35 @@ fn builtin_static_items(
 /// `base` node id; when the AST didn't preserve it (`None`), falls back to the smallest typed node
 /// whose span ends at the cursor's dot — covering `base.partial` shapes where the base survived as
 /// some other node. Returns a set type only (`is_set()`), never `Unresolved`/`Resolving`.
-fn resolve_base_type<'a>(
+fn resolve_base_type(
+    state: &ServerState,
+    uri: &lsp_types::Uri,
+    tree: &ParseTree,
+    analyzed: &AnalysisResult,
+    base: Option<NodeId>,
+    tokens: &[gd_syntax::token::Token],
+    byte: usize,
+) -> Option<DataType> {
+    // #349: a `$Path` / `%Name` / `get_node("…")` base has a PRECISE scene type that the analyzer
+    // deliberately does not carry — it types every such access as a hard bare `Node`, faithful to
+    // `gdscript_analyzer.cpp:3866-3886`, because a precise type in the diagnostic path would
+    // false-positive on the downcasts Godot tolerates. Hover, definition, and typeDefinition
+    // already project the precise type onto the access itself; completion did not, so `$HUD/Label`
+    // hovered as `Label` and `$HUD/Label.` one character later offered bare `Node`'s members.
+    // Navigation-only by construction — see `crate::scene_nav`.
+    let end = match base {
+        Some(id) => Some(tree.get(id).span.end),
+        None => nearest_dot_start(tokens, byte),
+    };
+    if let Some(dt) = end.and_then(|e| crate::scene_nav::scene_type_ending_at(state, uri, tree, e))
+    {
+        return Some(dt);
+    }
+    analyzed_base_type(tree, analyzed, base, tokens, byte).cloned()
+}
+
+/// The analyzer's own type for a `<base>.<cursor>` base expression, or `None` when it has none.
+fn analyzed_base_type<'a>(
     tree: &ParseTree,
     analyzed: &'a AnalysisResult,
     base: Option<NodeId>,
@@ -1171,7 +1204,7 @@ fn type_attribute_members(
 ) -> Vec<MemberItem> {
     // Path 1: a typed node ending at the dot (when the AST/analysis preserved the base type).
     if let Some(analyzed) = analyzed {
-        if let Some(dt) = resolve_base_type(tree, analyzed, base, tokens, byte) {
+        if let Some(dt) = analyzed_base_type(tree, analyzed, base, tokens, byte) {
             return enumerate_members(state, tree, dt);
         }
     }
@@ -1275,6 +1308,7 @@ fn is_meaningful(kind: gd_syntax::token::TokenKind) -> bool {
 #[allow(clippy::too_many_arguments)] // dispatch fan-out: the classified call-site payload + render ctx
 fn call_argument_items(
     state: &ServerState,
+    uri: &lsp_types::Uri,
     tree: &ParseTree,
     analyzed: Option<&AnalysisResult>,
     callee: Option<NodeId>,
@@ -1287,7 +1321,7 @@ fn call_argument_items(
     // isn't a resolvable enum/bitfield.
     if let Some(analyzed) = analyzed {
         if let Some(candidates) =
-            call_arg_enum_candidates(state, tree, analyzed, callee, callee_name, arg_index)
+            call_arg_enum_candidates(state, uri, tree, analyzed, callee, callee_name, arg_index)
         {
             return candidates
                 .into_iter()
@@ -1414,6 +1448,7 @@ fn constructor_arghint_item(
 /// [`gd_types::TypeRef`] is an enum/bitfield — enumerates that enum's values.
 fn call_arg_enum_candidates(
     state: &ServerState,
+    uri: &lsp_types::Uri,
     tree: &ParseTree,
     analyzed: &AnalysisResult,
     callee: Option<NodeId>,
@@ -1423,7 +1458,7 @@ fn call_arg_enum_candidates(
     let method_name = callee_name?;
     // The class the method is resolved on: the callee's base (for `base.method(`), else the
     // implicit-self class (for a bare `method(`).
-    let class = call_arg_receiver_class(state, tree, analyzed, callee)?;
+    let class = call_arg_receiver_class(state, uri, tree, analyzed, callee)?;
     let native = &state.workspace.native;
     let (_decl, member) = native.lookup_member(&class, method_name)?;
     let gd_types::NativeMember::Method(m) = member else {
@@ -1450,14 +1485,15 @@ fn call_arg_enum_candidates(
 /// when no native receiver can be determined.
 fn call_arg_receiver_class(
     state: &ServerState,
+    uri: &lsp_types::Uri,
     tree: &ParseTree,
     analyzed: &AnalysisResult,
     callee: Option<NodeId>,
 ) -> Option<String> {
     // `base.method(` — the callee identifier's enclosing attribute Subscript carries the base.
     if let Some(callee_id) = callee {
-        if let Some(base_dt) = attribute_callee_base_type(tree, analyzed, callee_id) {
-            return native_class_of(base_dt);
+        if let Some(base_dt) = attribute_callee_base_type(state, uri, tree, analyzed, callee_id) {
+            return native_class_of(&base_dt);
         }
     }
     // Bare `method(` — resolve against the implicit-self type (the file's root class), chasing its
@@ -1488,19 +1524,25 @@ fn native_class_of(dt: &DataType) -> Option<String> {
 /// The resolved type of the **base** of an attribute call: given the callee identifier node of
 /// `base.method(`, find its enclosing `Subscript{Attribute}` and return the base expression's type.
 /// `None` for a bare callee (no enclosing attribute access).
-fn attribute_callee_base_type<'a>(
+fn attribute_callee_base_type(
+    state: &ServerState,
+    uri: &lsp_types::Uri,
     tree: &ParseTree,
-    analyzed: &'a AnalysisResult,
+    analyzed: &AnalysisResult,
     callee_id: NodeId,
-) -> Option<&'a DataType> {
+) -> Option<DataType> {
     use gd_syntax::ast::{NodeKind, SubscriptAccess};
     // The callee identifier's enclosing parent is the attribute Subscript whose base we type.
     for id in tree.iter_ids() {
         if let NodeKind::Subscript(s) = &tree.get(id).kind {
             if matches!(s.access, Some(SubscriptAccess::Attribute(Some(a))) if a == callee_id) {
                 let base = s.base?;
+                // #349: the scene-precise type first — see `crate::scene_nav`.
+                if let Some(dt) = crate::scene_nav::scene_type_of_base(state, uri, tree, base) {
+                    return Some(dt);
+                }
                 let dt = analyzed.types.get(base);
-                return dt.is_set().then_some(dt);
+                return dt.is_set().then(|| dt.clone());
             }
         }
     }

@@ -425,11 +425,11 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     // uncalled `obj.method` reference.
     let member_sig = analyzed
         .as_deref()
-        .and_then(|a| hover_member_signature(state, &parsed.tree, byte, a))
+        .and_then(|a| hover_member_signature(state, &uri, &parsed.tree, byte, a))
         .or_else(|| {
             analyzed
                 .as_deref()
-                .and_then(|a| hover_attribute_member_signature(state, &parsed.tree, byte, a))
+                .and_then(|a| hover_attribute_member_signature(state, &uri, &parsed.tree, byte, a))
         })
         // #333/#334: a bare (`helper()`) or `super.` (`super.describe()`) callee. Neither has a
         // subscript base for `hover_member_signature` to read a type off, so both used to fall
@@ -589,7 +589,7 @@ pub fn definition(
         if let Some(base_id) = attr_base {
             let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
             let sr = analyzed.as_deref().and_then(|a| {
-                let dt = a.types.get(base_id);
+                let dt = projected_base_type(state, &uri, &parsed.tree, a, base_id);
                 (dt.kind == DtKind::Script)
                     .then(|| dt.script_type.clone())
                     .flatten()
@@ -1093,7 +1093,9 @@ fn native_definition(
     });
     if let Some(Some(base_id)) = attr_site {
         let analyzed = analyze_if_gd(state, uri, tree, text);
-        let base_dt = analyzed.as_deref().map(|a| a.types.get(base_id).clone());
+        let base_dt = analyzed
+            .as_deref()
+            .map(|a| projected_base_type(state, uri, tree, a, base_id));
         if let Some(base_dt) = base_dt {
             if base_dt.kind == gd_analyze::DtKind::Native && !base_dt.native_type.is_empty() {
                 return native_member_stub_location(
@@ -1381,6 +1383,25 @@ fn render_hover(
     md
 }
 
+/// #349: the type to route a member access by — the SCENE-PRECISE type when the base is a
+/// `$Path` / `%Name` / `get_node("…")` access the attaching scenes agree on, else the analyzer's
+/// own type for that node.
+///
+/// The analyzer types every such access as a hard bare `NATIVE Node`, faithful to Godot, so without
+/// this projection a read off `$HUD/Label` resolves against `Node` and misses everything `Label`
+/// declares. Navigation-only, by construction: the projected type is consumed by the hover /
+/// definition renderers and never written into an `AnalysisResult` — see [`crate::scene_nav`].
+fn projected_base_type(
+    state: &ServerState,
+    uri: &Uri,
+    tree: &ParseTree,
+    analyzed: &AnalysisResult,
+    base_id: NodeId,
+) -> DataType {
+    crate::scene_nav::scene_type_of_base(state, uri, tree, base_id)
+        .unwrap_or_else(|| analyzed.types.get(base_id).clone())
+}
+
 /// M6-F: when the cursor lands on a Call or Subscript node, resolve the callee's `MemberDecl`
 /// from the base expression's type and render its signature. Returns `None` on fall-through
 /// (e.g. the base type isn't a project script, or the method isn't in the interface).
@@ -1396,6 +1417,7 @@ fn render_hover(
 /// unavailable (empty string), the type alone is rendered.
 fn hover_member_signature(
     state: &ServerState,
+    uri: &Uri,
     tree: &ParseTree,
     cursor_byte: usize,
     analyzed: &AnalysisResult,
@@ -1453,7 +1475,7 @@ fn hover_member_signature(
     // The base expression's resolved type routes the lookup: a project Script kind reads the
     // declaring interface; a Native (or Builtin) kind reads the NativeDb (v1.0.4 #35 — these
     // used to fall through to the bare expression-type label, `stop()` → `Nil`).
-    let base_dt = analyzed.types.get(base_id);
+    let base_dt = &projected_base_type(state, uri, tree, analyzed, base_id);
     match base_dt.kind {
         DtKind::Script => {
             let script_ref = base_dt.script_type.as_ref()?;
@@ -1686,6 +1708,7 @@ fn format_func_signature(fn_name: &str, decl: &gd_project::MemberDecl) -> String
 /// expression-type label keeps reporting the analyzer's resolved enum meta type.
 fn hover_attribute_member_signature(
     state: &ServerState,
+    uri: &Uri,
     tree: &ParseTree,
     cursor_byte: usize,
     analyzed: &AnalysisResult,
@@ -1738,7 +1761,7 @@ fn hover_attribute_member_signature(
         return Some(md);
     }
 
-    let base_dt = analyzed.types.get(base_id);
+    let base_dt = &projected_base_type(state, uri, tree, analyzed, base_id);
     let direct_iface = if base_dt.kind == DtKind::Script {
         base_dt
             .script_type
