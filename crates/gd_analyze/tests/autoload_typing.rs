@@ -49,6 +49,7 @@ impl AutoloadQuery {
                 path: vec!["String".to_string()],
                 args: vec![],
             }],
+            params_typing: vec![gd_project::ParamTyping::Annotated],
             param_names: vec!["msg".to_string()],
             required_params: 1,
             flags: Default::default(),
