@@ -334,7 +334,7 @@ impl Index {
         };
         match &iface.extends {
             Extends::None => Resolution::Unknown,
-            Extends::Path(p) => self
+            Extends::Path { path: p, .. } => self
                 .resolve_path(p)
                 .map_or(Resolution::Unknown, Resolution::Script),
             Extends::Names(names) => match names.first() {
@@ -376,7 +376,7 @@ impl Index {
             };
             match &iface.extends {
                 Extends::None => return (files, Some("RefCounted".to_owned())),
-                Extends::Path(p) => match self.resolve_path(p) {
+                Extends::Path { path: p, .. } => match self.resolve_path(p) {
                     Some(next) => cur = next,
                     None => return (files, None),
                 },
@@ -852,7 +852,7 @@ fn collect_type_names(ty: &TypeExpr, out: &mut FxHashSet<String>) {
 
 fn path_extends_of(iface: &Interface) -> Option<String> {
     match &iface.extends {
-        Extends::Path(p) => Some(p.clone()),
+        Extends::Path { path, .. } => Some(path.clone()),
         _ => None,
     }
 }

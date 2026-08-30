@@ -136,7 +136,12 @@ pub fn document_symbol(
 fn extends_detail(extends: &gd_project::Extends) -> Option<String> {
     match extends {
         gd_project::Extends::None => None,
-        gd_project::Extends::Path(p) => Some(format!("extends \"{p}\"")),
+        gd_project::Extends::Path { path, segments } if segments.is_empty() => {
+            Some(format!("extends \"{path}\""))
+        }
+        gd_project::Extends::Path { path, segments } => {
+            Some(format!("extends \"{path}\".{}", segments.join(".")))
+        }
         gd_project::Extends::Names(names) => Some(format!("extends {}", names.join("."))),
     }
 }
@@ -718,7 +723,9 @@ pub fn definition(
     // its text, so the whole prefix is resolved as one identity. Falling through is what used to
     // land in an unrelated file: step (2) matches the bare name against the global registry.
     // Fail-closed by construction — an unresolvable prefix answers with nothing.
-    if cursor_extends_chain(&parsed.tree, node_id).is_some_and(|(_, idx)| idx > 0) {
+    if cursor_extends_chain(&parsed.tree, node_id)
+        .is_some_and(|(_, idx, path)| idx > 0 || path.is_some())
+    {
         let fid = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
         let TypeRef::Script(target, class_path) =
             cursor_extends_chain_prefix(state, &parsed.tree, fid, node_id)?
@@ -2890,8 +2897,17 @@ fn cursor_inner_class_decl_path(
 }
 
 /// The `extends` identifier chain `ident_id` belongs to, as segment names plus the cursor's index
-/// within it. `None` when the identifier is not an `extends` segment at all.
-fn cursor_extends_chain(tree: &ParseTree, ident_id: NodeId) -> Option<(Vec<String>, usize)> {
+/// within it, and the `res://` path when the chain hangs off one. `None` when the identifier is
+/// not an `extends` segment at all.
+///
+/// The path matters for the index: under `extends "res://x.gd".Inner` the parser stores `Inner`
+/// at position 0 of the chain, so reading the index alone would treat it as a chain HEAD and
+/// resolve it as a global bare name — the wrong class outright when a global `class_name Inner`
+/// exists elsewhere (#388).
+fn cursor_extends_chain(
+    tree: &ParseTree,
+    ident_id: NodeId,
+) -> Option<(Vec<String>, usize, Option<String>)> {
     tree.iter_ids().find_map(|nid| match &tree.get(nid).kind {
         NodeKind::Class(c) => {
             let idx = c.extends.iter().position(|e| *e == ident_id)?;
@@ -2900,7 +2916,7 @@ fn cursor_extends_chain(tree: &ParseTree, ident_id: NodeId) -> Option<(Vec<Strin
                 .iter()
                 .map(|id| ident_name(tree, *id).to_owned())
                 .collect();
-            Some((names, idx))
+            Some((names, idx, c.extends_path.clone()))
         }
         _ => None,
     })
@@ -2919,7 +2935,18 @@ fn cursor_extends_chain_prefix(
     file: Option<gd_project::FileId>,
     ident_id: NodeId,
 ) -> Option<TypeRef> {
-    let (names, idx) = cursor_extends_chain(tree, ident_id)?;
+    let (names, idx, path) = cursor_extends_chain(tree, ident_id)?;
+    // A path head owns the whole name list, so the prefix walks the loaded script's inner
+    // classes rather than going through the global registry (#388).
+    if let Some(path) = path {
+        let fid = state.workspace.index.resolve_res_path(&path)?;
+        let mut walked: Vec<String> = Vec::new();
+        for seg in &names[..=idx] {
+            walked.push(seg.clone());
+            iface_at_inner(&state.workspace.index, fid, &walked)?;
+        }
+        return Some(TypeRef::Script(fid, walked));
+    }
     match resolve_extends_names(
         &state.workspace.index,
         &state.workspace.native,
@@ -6186,7 +6213,7 @@ fn find_method_overrides(
                     [only] => known_names.contains(only),
                     _ => false,
                 },
-                gd_project::Extends::Path(res_path) => state
+                gd_project::Extends::Path { path: res_path, .. } => state
                     .workspace
                     .index
                     .resolve_res_path(res_path)
@@ -6322,7 +6349,8 @@ pub fn implementation(
     // the cursor is identified, so the honest answer is an empty list: no subclass of it can be
     // named here. (Reporting them truthfully needs an identity-keyed fixpoint — its own change.)
     if cursor_inner_class_decl_path(&parsed.tree, node_id, byte).is_some()
-        || cursor_extends_chain(&parsed.tree, node_id).is_some_and(|(_, idx)| idx > 0)
+        || cursor_extends_chain(&parsed.tree, node_id)
+            .is_some_and(|(_, idx, path)| idx > 0 || path.is_some())
     {
         return Some(GotoDefinitionResponse::Array(Vec::new()));
     }
@@ -6368,7 +6396,7 @@ pub fn implementation(
                     [only] => known_names.contains(only),
                     _ => false,
                 },
-                gd_project::Extends::Path(res_path) => state
+                gd_project::Extends::Path { path: res_path, .. } => state
                     .workspace
                     .index
                     .resolve_res_path(res_path)
@@ -8902,8 +8930,23 @@ fn class_parent(
     match &iface.extends {
         // Godot's scriptless default.
         gd_project::Extends::None => ClassParent::Native("RefCounted".to_owned()),
-        gd_project::Extends::Path(p) => match index.resolve_res_path(p) {
-            Some(fid) => ClassParent::Script((fid, Vec::new())),
+        // #388: `extends "res://x.gd".Inner` names the INNER class. Answering the file's head
+        // class here is a wrong answer, not a missing one, and `class_parent` feeds
+        // `override_group` and so `rename` — so a segment that names nothing is `Unknown`.
+        gd_project::Extends::Path {
+            path: p,
+            segments: segs,
+        } => match index.resolve_res_path(p) {
+            Some(fid) => {
+                let mut walked: Vec<String> = Vec::new();
+                for seg in segs {
+                    walked.push(seg.clone());
+                    if iface_at_inner(index, fid, &walked).is_none() {
+                        return ClassParent::Unknown;
+                    }
+                }
+                ClassParent::Script((fid, walked))
+            }
             None => ClassParent::Unknown,
         },
         gd_project::Extends::Names(names) => {

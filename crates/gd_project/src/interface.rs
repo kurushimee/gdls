@@ -22,8 +22,11 @@ pub enum Extends {
     /// No `extends` (Godot implies `RefCounted`; M2 leaves that to the analyzer).
     #[default]
     None,
-    /// `extends "res://path.gd"` — a path literal, verbatim.
-    Path(String),
+    /// `extends "res://path.gd"` — a path literal, verbatim, plus the name segments after it.
+    /// `extends "res://x.gd".Inner` is legal GDScript and names the inner class, not the file's
+    /// head class, so the segments have to ride along or every consumer resolves the wrong one
+    /// (#388). Empty for the common bare-path form.
+    Path { path: String, segments: Vec<String> },
     /// `extends Foo` / `extends A.B.C` — an identifier chain.
     Names(Vec<String>),
 }
@@ -456,14 +459,19 @@ fn extract_class(
 }
 
 fn extends_of(tree: &ParseTree, class: &ClassNode) -> Extends {
-    if let Some(path) = &class.extends_path {
-        return Extends::Path(path.clone());
-    }
     let names: Vec<String> = class
         .extends
         .iter()
         .filter_map(|&id| ident_name(tree, Some(id)))
         .collect();
+    if let Some(path) = &class.extends_path {
+        // The parser stores the whole chain in `extends` regardless of the head's shape, so with
+        // a path head every name in it is a segment hanging off the loaded script.
+        return Extends::Path {
+            path: path.clone(),
+            segments: names,
+        };
+    }
     if names.is_empty() {
         Extends::None
     } else {
@@ -970,8 +978,37 @@ mod tests {
     #[test]
     fn extends_path_literal() {
         let i = iface("extends \"res://base.gd\"\n");
-        assert_eq!(i.extends, Extends::Path("res://base.gd".into()));
+        assert_eq!(
+            i.extends,
+            Extends::Path {
+                path: "res://base.gd".into(),
+                segments: Vec::new()
+            }
+        );
         assert!(i.class_name.is_none());
+    }
+
+    /// #388: `extends "res://x.gd".Inner` names the inner class. The segments used to be dropped
+    /// here, which made every consumer answer the file's HEAD class — and `class_parent` feeds
+    /// `rename`'s override grouping, so the wrong answer reached a mutating surface.
+    #[test]
+    fn extends_path_literal_keeps_its_segments() {
+        let i = iface("extends \"res://base.gd\".Inner\n");
+        assert_eq!(
+            i.extends,
+            Extends::Path {
+                path: "res://base.gd".into(),
+                segments: vec!["Inner".to_owned()]
+            }
+        );
+        let deep = iface("extends \"res://base.gd\".Mid.Leaf\n");
+        assert_eq!(
+            deep.extends,
+            Extends::Path {
+                path: "res://base.gd".into(),
+                segments: vec!["Mid".to_owned(), "Leaf".to_owned()]
+            }
+        );
     }
 
     #[test]

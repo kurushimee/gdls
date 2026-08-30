@@ -1018,3 +1018,42 @@ fn an_unresolvable_extends_suffix_never_reaches_the_global_registry() {
 
     shutdown(&client, handle);
 }
+
+/// #388: under `extends "res://x.gd".Inner` the parser stores `Inner` at chain position 0, so a
+/// cursor on it used to read as a chain HEAD and resolve through the global registry — answering a
+/// same-named top-level `class_name Inner` outright rather than the inner class the clause names.
+#[test]
+fn a_path_extends_segment_names_the_inner_class_not_a_global_of_the_same_name() {
+    let project = NativeProject::new(&[
+        (
+            "pathbase.gd",
+            "extends Node\nclass Inner:\n\textends Node\n",
+        ),
+        ("pathchild.gd", "extends \"res://pathbase.gd\".Inner\n"),
+        ("unrelated.gd", "class_name Inner\nextends Node\n"),
+    ]);
+    let (client, handle, _) = boot(&project);
+    let child_uri = project.uri("pathchild.gd");
+    let child_src = "extends \"res://pathbase.gd\".Inner\n";
+    did_open(&client, &child_uri, child_src);
+
+    // `Inner` starts at column 28: `extends ` is 8, the quoted path runs 8..=26, then the dot.
+    let item = prepare_one(&client, &child_uri, Position::new(0, 29));
+    assert_eq!(item.name, "Inner");
+    assert_eq!(
+        item.uri,
+        project.uri("pathbase.gd"),
+        "the segment names pathbase.gd's inner class, never the unrelated global"
+    );
+    assert_eq!(
+        item.data
+            .as_ref()
+            .and_then(|d| d.get("inner").cloned())
+            .unwrap_or(serde_json::Value::Null),
+        serde_json::json!(["Inner"]),
+        "the identity is the inner class, not the file's head: {:?}",
+        item.data
+    );
+
+    shutdown(&client, handle);
+}
