@@ -97,6 +97,41 @@ fn diagnose_indexes_extension_api() {
 }
 
 #[test]
+fn diagnose_notes_stock_native_surface_without_dump() {
+    // Diagnose never runs the background dump (that is the session's job, issue #25), so a
+    // run that fell back to the embedded stock surface must say so — otherwise the resolve
+    // ladder's "set godotBinaryPath or GDLS_GODOT for an exact dump" advice implies this CLI
+    // will act on it. It won't; only a session dumps.
+    let project = sample_project();
+    // sample_project ships a project-root extension_api.json (Exact surface); remove it so
+    // the resolve ladder lands on the embedded stock fallback instead.
+    project.remove("extension_api.json");
+    let out = Command::new(gdls_bin())
+        .args(["diagnose", "--reconcile", "--root", project.root.as_str()])
+        .output()
+        .expect("spawn gdls binary");
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("diagnose never generates the dump"),
+        "stock-fallback run should carry the no-dump note; got: {stderr}"
+    );
+
+    // With the project-root extension_api.json back, the surface is project-derived (Exact
+    // provenance) and the note must stay silent.
+    project.write("extension_api.json", MINI_API);
+    let out = Command::new(gdls_bin())
+        .args(["diagnose", "--reconcile", "--root", project.root.as_str()])
+        .output()
+        .expect("spawn gdls binary");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("diagnose never generates"),
+        "exact-surface run must not carry the stock note; got: {stderr}"
+    );
+}
+
+#[test]
 fn diagnose_reconcile_nonzero_exit_on_unreadable_file() {
     // Reconcile contract: a reconcile that walked a `.gd` it then
     // couldn't read must exit nonzero so wrapper scripts distinguish "couldn't read the tree" from
