@@ -128,13 +128,15 @@ For the identifier at the request's `TextDocumentPositionParams`:
 
 `ReferenceParams.context.includeDeclaration` adds the declaration site when true.
 
-### 7.2 `implementation`: a linear walk over `Index.interfaces`
+### 7.2 `implementation`: a per-request inverse-extends graph
 
-For a class C resolved from the cursor, a linear scan of `Index.interfaces` (about 10k entries at scale, sub-millisecond) finds any interface whose `extends.target` resolves to C, directly or transitively, walking one level at a time and following `class_name` through `ClassNameRegistry`. Each subclass's declaration site becomes an LSP `Location`.
+The cursor resolves to a class *identity* — a file plus an inner-class chain, or a native class name — and never to a bare string, so a `class Inner:` and an unrelated top-level `class_name Inner` are different seeds.
 
-For a virtual or abstract method M on class C: the same scan, plus a per-candidate check that the subclass declares a member with the same name and a compatible signature. `MemberDecl.kind`, `MemberFlags`, and `params` carry what is needed.
+One pass over every class in the project (inner classes included, not just each file's head class) resolves each one's parent to the same identity vocabulary and builds the inverse-of-extends map. The seed's transitive closure over that map is the answer, and each subclass's own declaration identifier becomes an LSP `Location`. `typeHierarchy/subtypes` takes the direct children of the same map.
 
-There is no precomputed subclass index. At this scale the linear scan is faster than the maintenance cost of an incrementally-invalidated reverse-inheritance map.
+For a virtual or abstract method M on class C: the same closure, plus a per-candidate check that the subclass declares a member with the same name; the reported location is the override's identifier rather than the class's. The cursor may sit on an inner class's method, in which case that inner class is the seed.
+
+There is no precomputed subclass index. At this scale one graph build per request is faster than the maintenance cost of an incrementally-invalidated reverse-inheritance map, and it costs strictly less than the level-at-a-time rescan it replaced.
 
 ### 7.3 Call hierarchy: piggyback on analyzer bindings
 
