@@ -5503,6 +5503,64 @@ fn warn_unused_local(
     ctx.push_warning(code, std::slice::from_ref(&name), decl_id);
 }
 
+/// UNUSED_VARIABLE for a `match` pattern bind (analyzer.cpp:2494-2496). Same `usages == 0 &&
+/// !name.begins_with("_")` test as `warn_unused_local`, but over the bind's own scope rather than
+/// the enclosing suite: the parser registers the bind as a local in the branch's guard body and in
+/// its block, and nowhere else (gdscript_parser.cpp:2521-2527 and :2560-2566), so every identifier
+/// Godot's parser could resolve to it lies inside one of those two spans.
+///
+/// The sweep over-approximates "used" the same way its two siblings do — a same-named attribute
+/// access or a same-named bind of a `match` nested inside the block also counts — so it can
+/// under-warn but never false-positive. A bare assignment target is not a use
+/// (gdscript_parser.cpp:3152, the `LOCAL_BIND` arm of the decrement), which is what
+/// `assignee_ident_ids` carries.
+fn warn_unused_pattern_bind(ctx: &mut AnalysisContext, bind_id: NodeId) {
+    let name = decl_identifier_name(ctx, bind_id);
+    if name.is_empty() || name.starts_with('_') {
+        return;
+    }
+    let Some(branch_id) = ctx.current_match_branch else {
+        return;
+    };
+    let (block, guard) = match &ctx.node(branch_id).kind {
+        NodeKind::MatchBranch(n) => (n.block, n.guard_body),
+        _ => return,
+    };
+    let spans: Vec<(usize, usize)> = [guard, block]
+        .into_iter()
+        .flatten()
+        .map(|id| {
+            let s = ctx.node(id).span;
+            (s.start, s.end)
+        })
+        .collect();
+    if spans.is_empty() {
+        return;
+    }
+    let decl_ident_ids = ctx.decl_ident_ids();
+    let assignee_ident_ids = ctx.assignee_ident_ids();
+    for id in ctx.tree.iter_ids() {
+        let node = ctx.node(id);
+        if !spans
+            .iter()
+            .any(|&(start, end)| node.span.start >= start && node.span.end <= end)
+        {
+            continue;
+        }
+        if let NodeKind::Identifier(i) = &node.kind {
+            if i.name == name && !decl_ident_ids.contains(&id) && !assignee_ident_ids.contains(&id)
+            {
+                return; // used
+            }
+        }
+    }
+    ctx.push_warning(
+        crate::warnings::WarningCode::UnusedVariable,
+        std::slice::from_ref(&name),
+        bind_id,
+    );
+}
+
 /// SHADOWED_GLOBAL_IDENTIFIER for class-level variables (mirrors `warn_local_shadowing`'s
 /// global-identifier branch but anchored on class members instead of locals). Class members
 /// don't shadow same-class members (they ARE members), so only the global-collision check
@@ -6600,9 +6658,13 @@ fn resolve_match_branch(ctx: &mut AnalysisContext, branch_id: NodeId, match_test
     };
     // analyzer.cpp:2433-2437 — the branch's own annotations first.
     resolve_node_annotations(ctx, branch_id);
+    // A bind's scope is this branch's guard body and block, and nothing else. Saved and restored
+    // so a `match` nested inside a branch block gives the outer branch back on the way out.
+    let outer_branch = ctx.current_match_branch.replace(branch_id);
     for p in patterns {
         resolve_match_pattern(ctx, p, match_test);
     }
+    ctx.current_match_branch = outer_branch;
     // analyzer.cpp:2443 — match-branch guard body uses explicit `false` (an expression context,
     // not a statement-root one). The block at :2446 uses the default `true`.
     if let Some(g) = guard {
@@ -6707,6 +6769,10 @@ fn resolve_match_pattern(
                     .map(|t| ctx.get_type(t).clone())
                     .unwrap_or_else(DataType::variant);
                 ctx.set_type(b, bind_type);
+                // analyzer.cpp:2492-2496 — shadow first, then unused, so the two land in that
+                // order on a bind that is both.
+                warn_local_shadowing(ctx, b, "pattern bind");
+                warn_unused_pattern_bind(ctx, b);
             }
         }
         gd_syntax::ast::PatternKind::Array => {

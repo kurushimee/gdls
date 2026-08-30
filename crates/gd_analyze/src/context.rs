@@ -197,6 +197,13 @@ pub struct AnalysisContext<'a> {
     pub current_class: Option<NodeId>,
     /// The function currently being resolved (Godot's `parser->current_function`); set in WP-E.
     pub current_function: Option<NodeId>,
+    /// The `match` branch whose patterns are being resolved, saved and restored around
+    /// `resolve_match_branch`. A pattern bind is scoped to its branch's guard body and block
+    /// (gdscript_parser.cpp:2521-2527 and :2560-2566 register it as a local in both and nowhere
+    /// else), and `resolve_match_pattern` mirrors Godot's two-argument signature, so the branch
+    /// rides here rather than as a parameter — the same substitution `suite_stack` makes for
+    /// Godot's parse-time back-pointers.
+    pub current_match_branch: Option<NodeId>,
     /// Name of the class member whose initializer is currently being reduced. Godot tracks
     /// the same information in-band via `DataType::RESOLVING` on the member's node
     /// (analyzer.cpp:984-991); gdls also stamps `DtKind::Resolving` on the member's type, but
@@ -433,6 +440,7 @@ impl<'a> AnalysisContext<'a> {
             bases: FxHashMap::default(),
             current_class: None,
             current_function: None,
+            current_match_branch: None,
             current_resolving_member: None,
             init_shape_stack: Vec::new(),
             static_context: false,
