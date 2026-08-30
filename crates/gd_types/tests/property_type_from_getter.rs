@@ -1,9 +1,11 @@
-//! #428: a native property takes its structured type from its getter.
+//! #428, #432: a native property takes its type from its getter, always.
 //!
 //! Godot's analyzer types a native member off the getter's `PropertyInfo`
-//! (`gdscript_analyzer.cpp:4343-4350`), which keeps the enum class name and the container element
-//! types. The JSON dump's `properties[].type` flattens all of that to a bare `int` / `Array` /
-//! `Dictionary`, so `NativeDb` reads the getter back over a plain named property type.
+//! (`gdscript_analyzer.cpp:4343-4350`), and never reads the property table's own type. The JSON
+//! dump's `properties[].type` is a flattened `Variant::Type` — a bare `int` for an enum, `Array`
+//! for a typed array, and sometimes a `PropertyInfo` hint string that is not a type name at all —
+//! so `NativeDb` reads the getter back over it, resolving the getter up the `inherits` chain the
+//! way `ClassDB::get_method` does.
 
 use gd_types::{NativeDb, TypeRef};
 
@@ -41,7 +43,16 @@ const DUMP: &str = r#"{
         { "name": "get_count", "is_const": true, "is_static": false, "is_vararg": false, "is_virtual": false,
           "hash": 4, "return_value": { "type": "int" }, "arguments": [] },
         { "name": "get_texture", "is_const": true, "is_static": false, "is_vararg": false, "is_virtual": false,
-          "hash": 5, "return_value": { "type": "Texture2D" }, "arguments": [] }
+          "hash": 5, "return_value": { "type": "Texture2D" }, "arguments": [] },
+        { "name": "get_inherited", "is_const": true, "is_static": false, "is_vararg": false, "is_virtual": false,
+          "hash": 6, "return_value": { "type": "Window" }, "arguments": [] }
+      ]
+    },
+    {
+      "name": "Child", "inherits": "Probe", "is_refcounted": false, "is_instantiable": true, "api_type": "core",
+      "constants": [], "enums": [], "signals": [], "methods": [],
+      "properties": [
+        { "name": "inherited_prop", "type": "Node", "setter": "set_inherited", "getter": "get_inherited", "index": -1 }
       ]
     }
   ]
@@ -105,9 +116,8 @@ fn a_container_getter_restores_the_element_types() {
 }
 
 #[test]
-fn a_plain_getter_leaves_the_property_row_alone() {
+fn an_agreeing_plain_getter_changes_nothing() {
     let db = NativeDb::from_json(DUMP).expect("dump parses");
-    // Agreement: nothing to recover.
     assert_eq!(
         db.name_of(match prop(&db, "count").ty {
             TypeRef::Named(s) => s,
@@ -115,14 +125,39 @@ fn a_plain_getter_leaves_the_property_row_alone() {
         }),
         "int"
     );
-    // Disagreement between two plain names is the hint string leaking into `type`. Recovering it
-    // would be guessing a class, so the dump's spelling stands.
+}
+
+/// The disagreement the property table cannot win: its `type` field is carrying a `PropertyInfo`
+/// hint string, and the getter spells the real class.
+#[test]
+fn a_disagreeing_plain_getter_wins() {
+    let db = NativeDb::from_json(DUMP).expect("dump parses");
     assert_eq!(
         db.name_of(match prop(&db, "texture").ty {
             TypeRef::Named(s) => s,
             _ => panic!(),
         }),
-        "Texture2D,-AtlasTexture"
+        "Texture2D"
+    );
+}
+
+/// The getter lives on a parent class — 63 real properties are served this way, and
+/// `ClassDB::get_method` walks the chain for all of them.
+#[test]
+fn a_getter_declared_on_a_parent_class_is_found() {
+    let db = NativeDb::from_json(DUMP).expect("dump parses");
+    let child = db.class_named("Child").expect("Child");
+    let inherited = child
+        .properties
+        .iter()
+        .find(|p| db.name_of(p.name) == "inherited_prop")
+        .expect("inherited_prop");
+    assert_eq!(
+        db.name_of(match inherited.ty {
+            TypeRef::Named(s) => s,
+            _ => panic!(),
+        }),
+        "Window"
     );
 }
 
