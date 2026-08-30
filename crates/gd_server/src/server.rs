@@ -46,7 +46,7 @@ const ERR_INVALID_REQUEST: i32 = -32600;
 /// LSP 3.17 `ContentModified` (-32801). Used by the WP-H1 Hard-pressure gate as "the server is
 /// intentionally not answering"; per the spec it signals the client to retry — exactly the
 /// behavior we want once peak RSS drops back below Hard.
-const ERR_CONTENT_MODIFIED: i32 = -32801;
+pub(crate) const ERR_CONTENT_MODIFIED: i32 = -32801;
 /// LSP 3.17 `RequestFailed` (-32803): "A request failed but it was syntactically correct, e.g the
 /// method name was known and the parameters were valid. The error message should contain human
 /// readable information about why the request failed." Used by M9 #66 `rename`/`prepareRename` to
@@ -3097,10 +3097,12 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Option<Response> {
         // per `@warning_ignore`-able diagnostic in range; `Command` shape for a client without
         // `codeActionLiteralSupport`, `CodeAction` otherwise — edit eager or deferred per
         // `resolveSupport`); `codeAction/resolve` fills a deferred action's `edit`. Both are driven by
-        // `context.diagnostics` / the action's `data` (never a fresh analyze), so neither is in the
-        // Hard-pressure `analyze_using` shed set above — served like foldingRange / `inlayHint/resolve`.
+        // `context.diagnostics` / the action's `data`, but both re-run the ERROR backstop over the
+        // buffer, so both ARE in the Hard-pressure `analyze_using` shed set above. `resolve` is the
+        // fallible arm: besides that shed, it refuses a recipe whose buffer moved since the offer
+        // (#339) — a stale line would splice the annotation mid-statement.
         "textDocument/codeAction" => handle!(handlers::code_action),
-        "codeAction/resolve" => handle!(handlers::code_action_resolve),
+        "codeAction/resolve" => handle_fallible!(handlers::code_action_resolve),
         // M10 (#75): `workspace/executeCommand` — runs a server command (only `gdls.applyWarningIgnore`,
         // which sends the `workspace/applyEdit` fallback fire-and-forget). The fallible arm: an UNKNOWN
         // command returns a typed error (never a panic — anti-catalog W15). A handled command answers

@@ -476,6 +476,65 @@ fn member_kind_name(member: Member) -> &'static str {
     }
 }
 
+/// What `reduce_identifier_from_base` makes of `name` against a **meta** (class-as-type) base —
+/// the three-way switch analyzer.cpp:912-920 keys its two messages off.
+///
+/// Only a constant, an inner class, an enum, or a *static* function is visible on a meta base; an
+/// instance variable, a signal, or an instance function is not there at all and reads as absent.
+/// Of the visible ones, a constant is a type only when it holds one (`const Alias = Inner`), and a
+/// static function never is. Pinned against `godot --headless --check-only` for every kind.
+enum MetaMember {
+    /// Resolved to a meta type — the walk continues into it.
+    Type(DataType),
+    /// Resolved, but to a value (analyzer.cpp:918).
+    NotAType,
+    /// Not on a meta base at all (analyzer.cpp:915).
+    Absent,
+}
+
+fn meta_member(
+    ctx: &mut AnalysisContext,
+    class_id: Option<NodeId>,
+    name: &str,
+    at: NodeId,
+) -> MetaMember {
+    let Some(class_id) = class_id else {
+        return MetaMember::Absent;
+    };
+    /// Resolve the member in place so its declared type is available, then hand it back.
+    fn typed(ctx: &mut AnalysisContext, class_id: NodeId, name: &str, member: NodeId, at: NodeId) {
+        if !ctx.get_type(member).has_no_type() {
+            return;
+        }
+        if let Some(idx) = match &ctx.node(class_id).kind {
+            NodeKind::Class(c) => c.members_indices.get(name).copied(),
+            _ => None,
+        } {
+            resolve_class_member(ctx, class_id, idx, Some(at));
+        }
+    }
+    match class_member(ctx, class_id, name) {
+        Some(Member::Constant(cid)) => {
+            typed(ctx, class_id, name, cid, at);
+            let dt = ctx.get_type(cid).clone();
+            if dt.is_meta_type {
+                MetaMember::Type(dt)
+            } else {
+                MetaMember::NotAType
+            }
+        }
+        Some(Member::Enum(eid)) => {
+            typed(ctx, class_id, name, eid, at);
+            MetaMember::Type(ctx.get_type(eid).clone())
+        }
+        Some(Member::Function(fid)) => match &ctx.node(fid).kind {
+            NodeKind::Function(f) if f.is_static => MetaMember::NotAType,
+            _ => MetaMember::Absent,
+        },
+        _ => MetaMember::Absent,
+    }
+}
+
 /// `get_class_node_current_scope_classes` (analyzer.cpp:320): the class itself, its (in-file) base
 /// chain, and its outer-class chain — deduplicated, in Godot's order.
 pub(crate) fn scope_classes(ctx: &AnalysisContext, class_id: NodeId) -> Vec<NodeId> {
@@ -687,11 +746,50 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
                 ctx.set_type(type_id, make_global_enum_type(ctx, &dotted, "", true));
                 return ctx.get_type(type_id).clone();
             }
+            // analyzer.cpp:735. Provenance-gated: the enum set comes from the dump, so under a
+            // `Generic` or `Absent` surface a name gdls cannot see is not proof of a typo.
+            if ctx.native.provenance() == gd_types::ApiProvenance::Exact {
+                ctx.push_error(
+                    format!(r#"Name "{seg}" is not a nested type of "Variant"."#),
+                    chain[1],
+                );
+            }
+            return bad_type;
+        } else if chain.len() > 2 {
+            // analyzer.cpp:740 — structural, so no provenance gate: nothing about the engine
+            // surface can make a three-segment `Variant.A.B` legal.
+            ctx.push_error(
+                "Variant only contains enum types, which do not have nested types.".to_owned(),
+                chain[2],
+            );
+            return bad_type;
         }
         result.kind = DtKind::Variant;
     } else if let Some(builtin) = builtin_type_from_name(&first) {
-        // Builtin scalar/container. Element typing for Array/Dictionary and nested builtin enums are
-        // WP-D; the unparameterized builtin is correct on its own.
+        // Builtin scalar/container, and its nested enums (`Vector3.Axis`).
+        if chain.len() == 2 {
+            let seg = ident_name(ctx, chain[1]).unwrap_or_default();
+            if builtin_has_enum(ctx, builtin, &seg) {
+                ctx.set_type(type_id, make_builtin_enum_type(ctx, &seg, builtin, true));
+                return ctx.get_type(type_id).clone();
+            }
+            // analyzer.cpp:754 — same dump-derived negative, same gate as the `Variant` arm.
+            if ctx.native.provenance() == gd_types::ApiProvenance::Exact {
+                ctx.push_error(
+                    format!(r#"Name "{seg}" is not a nested type of "{first}"."#),
+                    chain[1],
+                );
+            }
+            return bad_type;
+        } else if chain.len() > 2 {
+            // analyzer.cpp:758 — structural.
+            ctx.push_error(
+                "Built-in types only contain enum types, which do not have nested types."
+                    .to_owned(),
+                chain[2],
+            );
+            return bad_type;
+        }
         result.kind = DtKind::Builtin;
         result.builtin_type = builtin;
     } else if ctx.native.class_named(&first).is_some() {
@@ -706,8 +804,14 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         } else {
             script_base_datatype(ctx, fid)
         };
-    } else if let Some(base) = datatype_in_scope(ctx, &first) {
-        // In-file class in the current scope (analyzer.cpp:847-900, class-name case).
+    } else if let ScopeType::Found(base) = match datatype_in_scope(ctx, &first, first_id) {
+        // In-file class in the current scope (analyzer.cpp:847-900, class-name case). A member that
+        // exists but names no type has already reported itself and stops the walk — falling through
+        // would re-report it as `Could not find type "X" in the current scope.`, which is both a
+        // different message and a worse one.
+        ScopeType::NotAType => return bad_type,
+        other => other,
+    } {
         result = base;
     } else if ctx.native.global_enum(&first).is_some() {
         // analyzer.cpp:806-815 — `@GlobalScope` enum (e.g. `Side`, `ClockDirection`). Resolves
@@ -759,65 +863,56 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         return bad_type;
     }
 
-    // Nested `A.B` segments under an in-file `Class` base (analyzer.cpp:908-939); native-enum nesting
-    // and the deeper reducer-driven cases are WP-D.
+    // Nested `A.B` segments under an in-file `Class` base (analyzer.cpp:908-939). Godot runs
+    // `reduce_identifier_from_base` per segment and then sorts the outcome three ways: unset is
+    // :915, set-but-not-meta is :918, meta continues the walk. `meta_member` is that switch.
     if chain.len() > 1 && result.kind == DtKind::Class {
-        for (i, &id) in chain[1..].iter().enumerate() {
+        for &id in &chain[1..] {
             let seg = ident_name(ctx, id).unwrap_or_default();
-            // analyzer.cpp:910-939 — match inner Class first, then inner Enum (matches the
-            // Godot's `is_class` arm + the `Member::ENUM` arm).
+            if result.kind == DtKind::Enum {
+                // The walk stepped onto an enum. Godot keeps calling
+                // `reduce_identifier_from_base`, which on an enum base resolves the enum's own
+                // values (non-meta, so :918) and nothing else (:915).
+                let base_name = result.to_string();
+                let msg = if result.enum_values.contains_key(&seg) {
+                    format!(r#"Member "{seg}" under base "{base_name}" is not a valid type."#)
+                } else {
+                    format!(r#"Could not find type "{seg}" under base "{base_name}"."#)
+                };
+                ctx.push_error(msg, id);
+                return bad_type;
+            }
             let parent_class_node = result.class_node;
-            let inner_class = parent_class_node.and_then(|c| inner_class_named(ctx, c, &seg));
-            match inner_class {
-                Some(inner_id) => {
-                    if ctx.get_type(inner_id).has_no_type() {
-                        let _ = resolve_class_inheritance(ctx, inner_id, Some(id));
-                    }
-                    result = ctx.get_type(inner_id).clone();
+            if let Some(inner_id) = parent_class_node.and_then(|c| inner_class_named(ctx, c, &seg))
+            {
+                if ctx.get_type(inner_id).has_no_type() {
+                    let _ = resolve_class_inheritance(ctx, inner_id, Some(id));
                 }
-                None => {
-                    // Inner enum lookup — analyzer.cpp:921's `Member::ENUM` arm. Godot
-                    // resolves the parent class's members up to this point so `MyEnum` on
-                    // `OuterClass.InnerClass.MyEnum` lands as the enum's meta type. Only valid
-                    // as the *last* segment in the chain (matches Godot's enum-as-leaf rule).
-                    let is_last_segment = i + 1 == chain.len() - 1;
-                    let parent_class_id = parent_class_node;
-                    let inner_enum =
-                        parent_class_id.and_then(|c| match class_member(ctx, c, &seg) {
-                            Some(Member::Enum(eid)) => Some(eid),
-                            _ => None,
-                        });
-                    if let (Some(eid), true) = (inner_enum, is_last_segment) {
-                        if let Some(parent_id) = parent_class_id {
-                            if ctx.get_type(eid).has_no_type() {
-                                // Trigger the parent's member resolution so the enum is typed.
-                                if let Some(idx) = match &ctx.node(parent_id).kind {
-                                    NodeKind::Class(c) => c.members_indices.get(&seg).copied(),
-                                    _ => None,
-                                } {
-                                    resolve_class_member(ctx, parent_id, idx, Some(id));
-                                }
-                            }
-                            result = ctx.get_type(eid).clone();
-                        } else {
-                            return bad_type;
-                        }
-                    } else {
-                        // analyzer.cpp:933 — `Could not find type "X" under base "Y".` The base
-                        // is an in-file `Class` (we walked here from one), so we have a concrete
-                        // identifier to render via `class_identifier_name_or_default`. Safe to
-                        // emit here because: (a) inner Class lookup didn't match (above),
-                        // (b) inner Enum lookup didn't match either, (c) the parent is in-file
-                        // so the corpus has full visibility into its members. Cross-file Script
-                        // parents go through the `interface()` walk and don't reach this code path.
-                        let base_name =
-                            crate::reducer::class_identifier_name_or_default(ctx, &result);
-                        ctx.push_error(
-                            format!(r#"Could not find type "{seg}" under base "{base_name}"."#),
-                            id,
-                        );
-                        return bad_type;
-                    }
+                result = ctx.get_type(inner_id).clone();
+                continue;
+            }
+            // The base is an in-file `Class` (we walked here from one), so the identifier is
+            // concrete and `class_identifier_name_or_default` renders it the way Godot's
+            // `DataType::to_string()` does. Cross-file Script parents go through the
+            // `interface()` walk below and never reach this arm.
+            let base_name = crate::reducer::class_identifier_name_or_default(ctx, &result);
+            match meta_member(ctx, parent_class_node, &seg, id) {
+                MetaMember::Type(dt) => result = dt,
+                MetaMember::NotAType => {
+                    // analyzer.cpp:918.
+                    ctx.push_error(
+                        format!(r#"Member "{seg}" under base "{base_name}" is not a valid type."#),
+                        id,
+                    );
+                    return bad_type;
+                }
+                MetaMember::Absent => {
+                    // analyzer.cpp:915.
+                    ctx.push_error(
+                        format!(r#"Could not find type "{seg}" under base "{base_name}"."#),
+                        id,
+                    );
+                    return bad_type;
                 }
             }
         }
@@ -833,30 +928,60 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         // named link itself), an enum leaf under an inner class resolves (the old enum probe was
         // gated on `sr.inner.is_empty()`), and the walk records a `Binding::Use` so `definition` /
         // `references` can address a nested type named in type position.
-        for (i, &id) in chain[1..].iter().enumerate() {
+        for &id in &chain[1..] {
             let seg = ident_name(ctx, id).unwrap_or_default();
-            let is_last = i + 1 == chain.len() - 1;
+            if result.kind == DtKind::Enum {
+                // Same enum-base step as the in-file `Class` arm above: an enum's own value
+                // resolves but is not a type (analyzer.cpp:918), and nothing else resolves
+                // at all (:915).
+                let base_name = result.to_string();
+                let msg = if result.enum_values.contains_key(&seg) {
+                    format!(r#"Member "{seg}" under base "{base_name}" is not a valid type."#)
+                } else {
+                    format!(r#"Could not find type "{seg}" under base "{base_name}"."#)
+                };
+                ctx.push_error(msg, id);
+                return bad_type;
+            }
             let Some(sr) = result.script_type.clone() else {
                 return bad_type;
             };
             if let Some((dt, _fold, kind)) =
                 crate::reducer::lookup_script_chain_member(ctx, &sr, &seg, true, id)
             {
-                // Only a TYPE may appear in a type-annotation chain. A value member that happens
-                // to share the name is `Member "X" under base "Y" is not a valid type.` upstream
-                // (analyzer.cpp:918); gdls does not emit that message yet, so a non-type match
-                // degrades silently rather than mis-reporting it as absent.
+                // Only a TYPE may appear in a type-annotation chain.
                 match kind {
                     crate::binding::BindingTargetKind::Class => {
                         result = dt;
                         continue;
                     }
-                    // Enums cannot contain nested types, so one may only appear as the leaf.
-                    crate::binding::BindingTargetKind::Enum if is_last => {
+                    // An enum may step into the walk; the enum-base arm at the loop head is
+                    // what rejects a segment under it.
+                    crate::binding::BindingTargetKind::Enum => {
                         result = dt;
                         continue;
                     }
-                    _ => return bad_type,
+                    _ => {
+                        // analyzer.cpp:918 — a member that exists under the base but is not a
+                        // type. `is_meta_type` is upstream's own test, so a constant that does
+                        // hold a type is excluded here exactly as it is there. Same soundness bar
+                        // as the miss below: only an `Exact` dump over a fully walked chain makes
+                        // the claim provable.
+                        if !dt.is_meta_type
+                            && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+                            && crate::script_chain::chain_native_root(ctx, &sr).is_some()
+                        {
+                            let base_name =
+                                crate::reducer::class_identifier_name_or_default(ctx, &result);
+                            ctx.push_error(
+                                format!(
+                                    r#"Member "{seg}" under base "{base_name}" is not a valid type."#
+                                ),
+                                id,
+                            );
+                        }
+                        return bad_type;
+                    }
                 }
             }
             // analyzer.cpp:915 — `Could not find type "X" under base "Y".` Same soundness bar as
@@ -877,19 +1002,39 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
             }
             return bad_type;
         }
-    } else if chain.len() == 2 && result.kind == DtKind::Native {
+    } else if chain.len() > 1 && result.kind == DtKind::Native {
         // analyzer.cpp:922-934 — `TileSet.TileShape` style: a native class followed by exactly one
-        // segment that names an enum on that class (or one of its bases). Anything longer
-        // (`TileSet.TileShape.X`) is rejected by Godot as "Enums cannot contain nested types.";
-        // gdls degrades silently for the over-deep case per the "unknown stays dynamic" rule until
-        // the full nested-enum-value resolution lands alongside the cross-file slice. Missing-enum
-        // names also degrade silently for fidelity-fixture-trimmed dumps.
+        // segment that names an enum on that class (or one of its bases).
         let seg = ident_name(ctx, chain[1]).unwrap_or_default();
-        if crate::reducer::native_has_enum(ctx, &result.native_type, &seg) {
-            result = make_native_enum_type(ctx, &seg, &result.native_type, true);
-        } else {
+        if !crate::reducer::native_has_enum(ctx, &result.native_type, &seg) {
+            // analyzer.cpp:931. Provenance-gated, exactly like the script-chain arm above: the
+            // enum set is what the dump carries, so under `Generic`/`Absent` a name gdls cannot
+            // see is indistinguishable from a custom build's.
+            if ctx.native.provenance() == gd_types::ApiProvenance::Exact {
+                ctx.push_error(
+                    format!(r#"Could not find type "{seg}" in "{first}"."#),
+                    chain[1],
+                );
+            }
             return bad_type;
         }
+        if chain.len() > 2 {
+            // analyzer.cpp:926 — structural: an enum has no nested types, whatever the surface.
+            ctx.push_error("Enums cannot contain nested types.".to_owned(), chain[2]);
+            return bad_type;
+        }
+        result = make_native_enum_type(ctx, &seg, &result.native_type, true);
+    } else if chain.len() > 1 {
+        // analyzer.cpp:935's `else` — the head resolved to something that is neither a class, a
+        // script, nor a native: an enum (`MyEnum.A` in type position), a builtin instance type,
+        // a Variant. None of those carry nested types. Structural, so ungated.
+        let seg = ident_name(ctx, chain[1]).unwrap_or_default();
+        let base_name = result.to_string();
+        ctx.push_error(
+            format!(r#"Could not find nested type "{seg}" under base "{base_name}"."#),
+            chain[1],
+        );
+        return bad_type;
     }
 
     // Container element types — `Array[T]`, `Dictionary[K, V]` (analyzer.cpp:894-925). Godot
@@ -1085,11 +1230,26 @@ fn class_member(ctx: &AnalysisContext, class_id: NodeId, name: &str) -> Option<M
 
 /// Resolve a bare name to an in-scope in-file class's meta type (the class-name arm of
 /// `resolve_datatype`'s scope search). Wired in WP-D and consumed since.
-fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> {
-    let scope = scope_classes(ctx, ctx.current_class?);
+/// The outcome of the in-scope type lookup ([`datatype_in_scope`]). Godot's switch over the matched
+/// member's kind has three outcomes, not two: a type, no member at all, and *a member that is not a
+/// type* — which is an error in its own right (analyzer.cpp:894), not a reason to keep looking.
+enum ScopeType {
+    /// A member (or class) named the type.
+    Found(DataType),
+    /// A member with this name exists but cannot name a type; the error is already pushed.
+    NotAType,
+    /// Nothing in scope carries this name — resolution continues down the chain.
+    Absent,
+}
+
+fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str, first_id: NodeId) -> ScopeType {
+    let Some(current) = ctx.current_class else {
+        return ScopeType::Absent;
+    };
+    let scope = scope_classes(ctx, current);
     for look in scope.iter().copied() {
         if class_identifier_name(ctx, look).as_deref() == Some(name) {
-            return Some(ctx.get_type(look).clone());
+            return ScopeType::Found(ctx.get_type(look).clone());
         }
         // analyzer.cpp:860-898 — match class members by name and dispatch on member kind. The
         // Godot's switch covers CLASS / ENUM / CONSTANT (meta-typed or script-typed); other kinds
@@ -1100,7 +1260,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
                 if ctx.get_type(inner_id).has_no_type() {
                     let _ = resolve_class_inheritance(ctx, inner_id, None);
                 }
-                return Some(ctx.get_type(inner_id).clone());
+                return ScopeType::Found(ctx.get_type(inner_id).clone());
             }
             Some(Member::Enum(enum_id)) => {
                 // analyzer.cpp:869-872. The enum's datatype is the meta type
@@ -1125,7 +1285,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
                         resolve_class_member(ctx, look, idx, None);
                     }
                 }
-                return Some(ctx.get_type(enum_id).clone());
+                return ScopeType::Found(ctx.get_type(enum_id).clone());
             }
             Some(Member::Constant(const_id)) => {
                 // analyzer.cpp:874-882's CONSTANT arm — when a class-level constant exists,
@@ -1165,11 +1325,42 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
                         }
                     }
                 }
+                // analyzer.cpp:874-894 — a CONSTANT names a type only when its datatype is a
+                // meta type, or its reduced value is a Script. Anything else falls through to the
+                // `default:` arm's `"X" is a <kind> but does not contain a type.`
+                //
+                // gdls reports that only when it POSITIVELY knows the constant holds a non-type
+                // value: a hard, set, non-meta type. A `Variant` or unresolved constant is the
+                // shape a preload chain gdls could not follow lands in, and claiming *that* is not
+                // a type would false-positive on exactly the cross-file cases the "unknown stays
+                // dynamic" rule exists for (`features/local_const_as_type.gd`'s `const O =
+                // preload(...)` style).
+                if const_dt.is_meta_type {
+                    return ScopeType::Found(const_dt);
+                }
+                if const_dt.is_set() && !const_dt.is_variant() && !const_dt.has_no_type() {
+                    ctx.push_error(
+                        format!(r#""{name}" is a constant but does not contain a type."#),
+                        first_id,
+                    );
+                    return ScopeType::NotAType;
+                }
                 if const_dt.is_set() {
-                    return Some(const_dt);
+                    return ScopeType::Found(const_dt);
                 }
             }
-            Some(_) => {}
+            // analyzer.cpp:894's `default:` — a variable / function / signal / enum value / group
+            // named the type. The member exists, so this is not "could not find it": it is the
+            // wrong KIND of member, and Godot says so. Purely in-file evidence, so no provenance
+            // gate applies.
+            Some(other) => {
+                let kind = member_kind_name(other);
+                ctx.push_error(
+                    format!(r#""{name}" is a {kind} but does not contain a type."#),
+                    first_id,
+                );
+                return ScopeType::NotAType;
+            }
             None => {}
         }
     }
@@ -1202,7 +1393,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
                         // against the base script (#284).
                         let mut inner: Vec<String> = link.inner.clone();
                         inner.push(name.to_string());
-                        return Some(script_ref_datatype(
+                        return ScopeType::Found(script_ref_datatype(
                             ctx,
                             ScriptRef {
                                 file: link.file,
@@ -1214,7 +1405,7 @@ fn datatype_in_scope(ctx: &mut AnalysisContext, name: &str) -> Option<DataType> 
             }
         }
     }
-    None
+    ScopeType::Absent
 }
 
 fn type_node_parts(ctx: &AnalysisContext, type_id: NodeId) -> (Vec<NodeId>, Vec<NodeId>) {
@@ -3139,6 +3330,14 @@ pub(crate) fn make_native_enum_type(
         }
     }
     t
+}
+
+/// Does builtin type `builtin` carry an enum named `name`? (analyzer.cpp:749's `has_enum`.)
+pub(crate) fn builtin_has_enum(ctx: &AnalysisContext, builtin: VariantType, name: &str) -> bool {
+    let base = crate::data_type::variant_type_name(builtin);
+    ctx.native
+        .builtin_named(base)
+        .is_some_and(|bt| bt.enums.iter().any(|e| ctx.native.name_of(e.name) == name))
 }
 
 /// `make_builtin_enum_type` (analyzer.cpp:189): an enum on a builtin metatype (e.g. `Vector3.Axis`).

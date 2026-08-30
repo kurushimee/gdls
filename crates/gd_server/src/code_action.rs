@@ -104,18 +104,26 @@ pub(crate) struct WarningIgnoreData {
     /// continuation line of a multi-line statement; see [`enclosing_statement_line`]). The annotation
     /// is inserted at column 0 of this line, copying its leading indentation.
     line: u32,
+    /// The `vfs` document version [`line`](Self::line) was resolved against (#339). A line number is
+    /// a coordinate valid in exactly one buffer snapshot, so the version is the other half of this
+    /// recipe's identity — without it the splice lands wherever that line happens to be now, which
+    /// for an intervening edit is somewhere else entirely (the bug: mid-statement, inside a
+    /// multi-line call). Required by serde, so a version-less blob from an older session fails
+    /// [`WarningIgnoreData::parse`] and is refused rather than applied.
+    version: i32,
 }
 
 impl WarningIgnoreData {
     /// The `action` discriminant value for this family.
     const ACTION: &'static str = "warning_ignore";
 
-    fn new(uri: &Uri, code: &str, line: u32) -> Self {
+    fn new(uri: &Uri, code: &str, line: u32, version: i32) -> Self {
         WarningIgnoreData {
             action: Self::ACTION.to_string(),
             uri: uri.as_str().to_string(),
             code: code.to_string(),
             line,
+            version,
         }
     }
 
@@ -133,8 +141,10 @@ impl WarningIgnoreData {
 // Mutating warning quickfixes (#75): the resolve-data recipes. Each is self-contained (resolve /
 // executeCommand carry no `textDocument`) and discriminated by `action` so one family's blob can
 // never be mis-decoded as another's. The EDIT is rebuilt at resolve from the recipe + the CURRENT
-// buffer (never a frozen edit), so a buffer that changed between offer and resolve re-runs the same
-// refuse-gate rather than applying a stale edit.
+// buffer (never a frozen edit), and the recipe is VERSION-PINNED (#339): a buffer that changed
+// between offer and resolve is refused, because the recipe's coordinates name nothing in the new
+// snapshot. Re-deriving the target inside resolve is the pattern this module already rejected for
+// the `_`-prefix fix — it can land on a different, valid target the offer-time gate never saw.
 // =================================================================================================
 
 /// Recipe for the `_`-prefix fix (UNUSED_VARIABLE / UNUSED_PARAMETER): rename the unused local/param
@@ -371,7 +381,11 @@ fn push_warning_ignore_action(
     let Some(line) = enclosing_statement_line(state, uri, diag) else {
         return;
     };
-    let data = WarningIgnoreData::new(uri, &code, line);
+    // The snapshot `line` is a coordinate in (#339). Fail-closed: no open buffer ⇒ no action.
+    let Some(version) = state.vfs.get(uri.as_str()).map(|d| d.version) else {
+        return;
+    };
+    let data = WarningIgnoreData::new(uri, &code, line, version);
     let title = format!("Ignore \"{code}\" warning on this line");
 
     if !state.caps.code_action.literal_support {
@@ -410,17 +424,46 @@ fn push_warning_ignore_action(
 /// on a different valid target the offer-time gate never saw). So this only reconstructs the
 /// suppression edit from its self-contained `data`; any other action (a mutating fix with an eager
 /// edit and no `data`, or a foreign action) is returned unchanged.
-#[must_use]
-pub fn code_action_resolve(state: &mut ServerState, mut action: CodeAction) -> CodeAction {
+///
+/// #339: a suppression whose buffer moved between offer and resolve is REFUSED with
+/// `ContentModified`, not answered with an edit at the stale line and not answered with a silent
+/// editless action (a dead lightbulb the user cannot tell from a working one). The client's remedy
+/// is the right one: re-request `codeAction`, which re-runs the full offer gate — including
+/// [`enclosing_statement_line`] — against the current buffer and the current diagnostics.
+pub fn code_action_resolve(
+    state: &mut ServerState,
+    mut action: CodeAction,
+) -> Result<CodeAction, crate::handlers::RequestRefusal> {
     let Some(data) = action.data.clone() else {
-        return action;
+        return Ok(action);
     };
     if let Some(parsed) = WarningIgnoreData::parse(data) {
+        stale_recipe_refusal(state, &parsed)?;
         if let Some(edit) = build_warning_ignore_edit(state, &parsed) {
             action.edit = Some(edit);
         }
     }
-    action
+    Ok(action)
+}
+
+/// `Err(ContentModified)` when `data`'s buffer has moved past the version its line was resolved
+/// against (#339). Shared by both mutating channels so they refuse identically.
+fn stale_recipe_refusal(
+    state: &ServerState,
+    data: &WarningIgnoreData,
+) -> Result<(), crate::handlers::RequestRefusal> {
+    let current = state.vfs.get(&data.uri).map(|d| d.version);
+    if current == Some(data.version) {
+        return Ok(());
+    }
+    Err(crate::handlers::RequestRefusal::stale(format!(
+        "the buffer changed since this action was offered ({} version {} -> {}); re-request code          actions to get one gated against the current text",
+        data.uri,
+        data.version,
+        current
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "closed".to_string()),
+    )))
 }
 
 /// `workspace/executeCommand`: run a server command. The ONE command is
@@ -431,7 +474,9 @@ pub fn code_action_resolve(state: &mut ServerState, mut action: CodeAction) -> C
 /// Returns `Ok(Value::Null)` (the LSP result for a command that produced no direct value) on every
 /// command that ran — INCLUDING when the applyEdit could not be sent or the edit was empty (those are
 /// logged, never surfaced as a request error). An UNKNOWN command returns `Err(RequestRefusal)` →
-/// `Response::new_err`, never a panic (anti-catalog W15).
+/// `Response::new_err`, never a panic (anti-catalog W15). So does a STALE recipe (#339): a `Command`
+/// can sit in a client menu indefinitely, which is the longest staleness window there is, and this
+/// channel MUTATES — the user must see the refusal rather than an `applyEdit` at a drifted line.
 ///
 /// The applyEdit is FIRE-AND-FORGET: it is sent here, but its response arrives later on the worker's
 /// own channel and is correlated by `handle_outbound_response` — blocking on it here would deadlock
@@ -457,6 +502,8 @@ pub fn execute_command(
                 );
                 return Ok(Value::Null);
             };
+            // #339 — refuse (and send NO applyEdit) rather than mutate against a moved buffer.
+            stale_recipe_refusal(state, &data)?;
             match build_warning_ignore_edit(state, &data) {
                 Some(edit) => send_apply_edit(state, &data.code, edit),
                 None => log::warn!(
@@ -1878,6 +1925,12 @@ fn build_warning_ignore_edit(
 ) -> Option<WorkspaceEdit> {
     let uri: Uri = data.uri.parse().ok()?;
     let doc = state.vfs.get(uri.as_str())?;
+    // #339 — the authoritative staleness gate, here rather than at each caller so no future caller
+    // can bypass it. `data.line` was resolved against `data.version`; against any other snapshot it
+    // is just a number, and splicing at it lands the annotation wherever that line drifted to.
+    if doc.version != data.version {
+        return None;
+    }
     // The enclosing-statement line's text, to copy its leading indentation. ropey's `get_line` is
     // None for an out-of-range index (defensive — the line was resolved over this buffer's tree).
     let line_slice = doc.rope.get_line(data.line as usize)?;
@@ -1981,6 +2034,37 @@ mod tests {
     }
     fn wants_fix_all(only: Option<&[CodeActionKind]>) -> bool {
         request_wants(only, &CodeActionKind::SOURCE_FIX_ALL)
+    }
+
+    /// #339: the version is REQUIRED, so a blob written before the pin existed — a `Command` that
+    /// survived a server upgrade in a client menu — is refused at parse rather than applied at a
+    /// line no snapshot vouches for.
+    #[test]
+    fn a_version_less_recipe_is_rejected_at_parse() {
+        let blob = serde_json::json!({
+            "action": "warning_ignore",
+            "uri": "file:///x/a.gd",
+            "code": "UNUSED_VARIABLE",
+            "line": 4,
+        });
+        assert!(
+            WarningIgnoreData::parse(blob).is_none(),
+            "a recipe with no version pin cannot be trusted to name a line"
+        );
+    }
+
+    /// The round trip still works, so the pin is additive rather than a wholesale rejection.
+    #[test]
+    fn a_versioned_recipe_round_trips() {
+        let blob = serde_json::json!({
+            "action": "warning_ignore",
+            "uri": "file:///x/a.gd",
+            "code": "UNUSED_VARIABLE",
+            "line": 4,
+            "version": 7,
+        });
+        let parsed = WarningIgnoreData::parse(blob).expect("a versioned recipe parses");
+        assert_eq!((parsed.line, parsed.version), (4, 7));
     }
 
     #[test]
