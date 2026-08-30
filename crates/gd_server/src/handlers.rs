@@ -449,7 +449,14 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         // v1.0.4 (#35): bare calls — an inherited native method / signal through the implicit
         // self (`stop()` under `extends AudioStreamPlayer`), or a `@GlobalScope` utility
         // (`print(...)`). Runs last so any project-script resolution above keeps shadowing.
-        .or_else(|| hover_bare_native_signature(state, &parsed.tree, byte, &uri));
+        .or_else(|| hover_bare_native_signature(state, &parsed.tree, byte, &uri))
+        // #411: a member named bare in VALUE position (`speed`, `CAP`, `mode`). Runs last so every
+        // call and attribute path above keeps shadowing it.
+        .or_else(|| {
+            analyzed
+                .as_deref()
+                .and_then(|a| hover_bare_member_signature(state, &uri, &parsed.tree, byte, a))
+        });
 
     let markdown = if let Some(sig) = member_sig {
         sig
@@ -2185,6 +2192,159 @@ fn hover_attribute_member_signature(
         }
         _ => None,
     }
+}
+
+/// #411: hover for a class member named BARE, in value position — `speed`, not `self.speed`. The
+/// attribute spelling has rendered the declaration and its `##` doc since #258, and a bare CALL has
+/// since #333/#334, but a bare read fell through to the type label, so the doc a user wrote was
+/// invisible in the position their code actually uses.
+///
+/// Resolution is the analyzer's, not a re-derivation: `record_member_use` stamps a `Binding::Use`
+/// at this exact span naming the declaring file and inner-class chain whenever the member walk
+/// resolved the name. A local, a parameter, or a for-variable shadowing a member never gets that
+/// binding, so a shadowed name falls through on its own.
+///
+/// The native arm has no such binding to lean on (`target_file` is `None` for engine members), so
+/// it resolves by name against the chain's native root and refuses outright when the file declares
+/// any local of that name — an under-report where a shadow is possible, never a wrong card.
+fn hover_bare_member_signature(
+    state: &ServerState,
+    uri: &Uri,
+    tree: &ParseTree,
+    cursor_byte: usize,
+    analyzed: &AnalysisResult,
+) -> Option<String> {
+    let ident_id = bare_identifier_at(tree, cursor_byte)?;
+    let span = tree.get(ident_id).span;
+    let name = ident_name(tree, ident_id);
+    if name.is_empty() {
+        return None;
+    }
+
+    let target = analyzed.bindings().iter().find_map(|b| match b {
+        Binding::Use {
+            site,
+            target_file: Some(f),
+            target_class_path,
+            target_name,
+            ..
+        } if *site == span && target_name.as_str() == name => Some((*f, target_class_path.clone())),
+        _ => None,
+    });
+    if let Some((file, class_path)) = target {
+        if let Some(iface) = iface_at_inner(&state.workspace.index, file, &class_path) {
+            if let Some(md) = member_declaration_hover_md(iface, name) {
+                return Some(md);
+            }
+        }
+    }
+
+    // The native root of this file's `extends` chain. Project members shadow engine ones, and a
+    // project member would have produced a binding above, so reaching here means the name is not
+    // one — but a LOCAL is invisible to both, hence the refusal below.
+    if tree_declares_a_local_named(tree, name) {
+        return None;
+    }
+    let fid = crate::uri::uri_to_path(uri).and_then(|p| state.workspace.index.file_id(&p))?;
+    let (_, root) = state
+        .workspace
+        .index
+        .extends_chain_files(fid, &state.workspace.native);
+    let (decl, member) = state.workspace.native.lookup_member(&root?, name)?;
+    // Only value shapes — a bare method name in value position is a `Callable` reference, which
+    // the call paths above own.
+    if matches!(member, gd_types::NativeMember::Method(_)) {
+        return None;
+    }
+    let declaring = state.workspace.native.name_of(decl.name).to_owned();
+    Some(native_member_hover_md(
+        &state.workspace.native,
+        &declaring,
+        &member,
+    ))
+}
+
+/// The identifier token at `cursor_byte`, when it is written bare: not the attribute half of
+/// `base.attr` and not a call's callee. Both of those have their own hover paths, which run first
+/// and resolve against a base the bare form does not have.
+fn bare_identifier_at(tree: &ParseTree, cursor_byte: usize) -> Option<NodeId> {
+    let mut excluded: Vec<NodeId> = Vec::new();
+    for id in tree.iter_ids() {
+        match &tree.get(id).kind {
+            NodeKind::Subscript(sub) => {
+                if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
+                    excluded.push(attr_id);
+                }
+            }
+            NodeKind::Call(call) => {
+                if let Some(callee) = call.callee {
+                    excluded.push(callee);
+                }
+            }
+            _ => {}
+        }
+    }
+    tree.iter_ids().find(|&id| {
+        let node = tree.get(id);
+        matches!(node.kind, NodeKind::Identifier(_))
+            && node.span.start <= cursor_byte
+            && cursor_byte < node.span.end
+            && !excluded.contains(&id)
+    })
+}
+
+/// Render an interface member's declaration card — the signature line plus its `##` doc. Shared
+/// with [`hover_attribute_member_signature`]'s member arm, whose three shapes (inner class, named
+/// enum, ordinary member) this reproduces because a bare name can reach all three.
+fn member_declaration_hover_md(iface: &gd_project::Interface, name: &str) -> Option<String> {
+    if let Some(inner) = iface
+        .inner
+        .iter()
+        .find(|c| c.class_name.as_deref() == Some(name))
+    {
+        let mut md = format!("```gdscript\nclass {name}\n```");
+        if let Some(doc) = inner.doc.as_deref() {
+            crate::docs::append_class_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
+        }
+        return Some(md);
+    }
+    let decl = iface.members.iter().find(|m| m.name.as_str() == name)?;
+    let sig = if decl.kind == gd_project::MemberKind::Enum {
+        format!("enum {name}")
+    } else {
+        format_member_signature(name, decl)?
+    };
+    let mut md = format!("```gdscript\n{sig}\n```");
+    if let Some(doc) = &decl.doc {
+        crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
+    }
+    Some(md)
+}
+
+/// Whether the file declares a local binding of this name anywhere: a `var`/`const` inside a
+/// function body, a parameter, a `for` variable, or a match-pattern bind. Deliberately file-wide
+/// rather than scope-precise — the only consumer is a refusal, so over-matching costs a hover and
+/// under-matching would cost a wrong one.
+fn tree_declares_a_local_named(tree: &ParseTree, name: &str) -> bool {
+    let members: Vec<NodeId> = tree
+        .root_id()
+        .and_then(|rid| match &tree.get(rid).kind {
+            NodeKind::Class(c) => Some(c.members.iter().filter_map(member_decl_id).collect()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    tree.iter_ids().any(|id| {
+        if members.contains(&id) {
+            return false;
+        }
+        matches!(
+            &tree.get(id).kind,
+            NodeKind::Variable(_)
+                | NodeKind::Constant(_)
+                | NodeKind::Parameter(_)
+                | NodeKind::For(_)
+        ) && declaration_identifier(tree, id).is_some_and(|iid| ident_name(tree, iid) == name)
+    })
 }
 
 /// #258: the use-site enum-value hover — `EnumName.VALUE` plus the value's `##` doc, resolved from
