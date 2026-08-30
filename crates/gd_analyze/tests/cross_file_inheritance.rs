@@ -1668,3 +1668,96 @@ class LibInner:
         );
     }
 }
+
+/// #366: a name that resolves in TYPE position records a `Binding::Use` against the class that
+/// DECLARES it. Without these, `rename` rewrote a symbol's expression uses and silently abandoned
+/// every annotation and `extends` clause naming it.
+const OUTER_GD: &str = "\
+class_name Outer
+extends Node
+enum Direction { NORTH, SOUTH }
+class Inner:
+\textends Node
+";
+
+/// The three shapes that resolve through a cross-file base: an `extends` chain segment, a bare
+/// inherited enum head, and a bare inherited inner-class head.
+#[test]
+fn type_positions_record_use_bindings_against_the_declaring_file() {
+    let project = Project::new(&[("res://outer.gd", OUTER_GD), ("res://child.gd", "")]);
+    let outer_fid = project.fid("res://outer.gd");
+
+    let uses = |src: &str| -> Vec<(String, Vec<String>, BindingTargetKind)> {
+        let result = analyze_file(&project, "res://child.gd", src);
+        result
+            .bindings()
+            .iter()
+            .filter_map(|b| match b {
+                Binding::Use {
+                    target_file: Some(f),
+                    target_class_path,
+                    target_kind,
+                    target_name,
+                    ..
+                } if *f == outer_fid => {
+                    Some((target_name.clone(), target_class_path.clone(), *target_kind))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    let chain = uses("extends Outer.Inner\n");
+    assert!(
+        chain.contains(&("Inner".to_owned(), Vec::new(), BindingTargetKind::Class)),
+        "an `extends` chain segment must bind to the inner class it names: {chain:?}"
+    );
+
+    let bare = uses("extends Outer\nvar d: Direction\nvar q: Inner\n");
+    assert!(
+        bare.contains(&("Direction".to_owned(), Vec::new(), BindingTargetKind::Enum)),
+        "an inherited bare enum annotation must bind: {bare:?}"
+    );
+    assert!(
+        bare.contains(&("Inner".to_owned(), Vec::new(), BindingTargetKind::Class)),
+        "an inherited bare inner-class annotation must bind: {bare:?}"
+    );
+}
+
+/// The in-file half: a `const` alias used as a type, and the `extends` head that names it. A
+/// `Member` target's collection is binding-only, so these two are the whole difference between a
+/// complete rename and one that leaves the file naming a type that no longer exists.
+#[test]
+fn a_const_alias_used_as_a_type_records_use_bindings() {
+    let src = "\
+extends Node
+const Blade = preload(\"res://outer.gd\")
+var h: Blade
+func mk() -> Blade:
+\treturn Blade.new()
+class Sub extends Blade:
+\tpass
+";
+    let project = Project::new(&[("res://outer.gd", OUTER_GD), ("res://holder.gd", "")]);
+    let holder_fid = project.fid("res://holder.gd");
+    let result = analyze_file(&project, "res://holder.gd", src);
+    let blade_uses = result
+        .bindings()
+        .iter()
+        .filter(|b| {
+            matches!(
+                b,
+                Binding::Use {
+                    target_file: Some(f),
+                    target_kind: BindingTargetKind::Constant,
+                    target_name,
+                    ..
+                } if *f == holder_fid && target_name == "Blade"
+            )
+        })
+        .count();
+    assert_eq!(
+        blade_uses, 3,
+        "`var h: Blade`, `-> Blade`, and `class Sub extends Blade:` must each bind to the const"
+    );
+}
