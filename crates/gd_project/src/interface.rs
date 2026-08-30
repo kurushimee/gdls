@@ -252,6 +252,19 @@ pub struct Interface {
     /// fast-path, and filling it with every local's name would turn a cursor on an unresolvable
     /// identifier into a project-wide analysis.
     pub body_refs: Vec<String>,
+    /// `true` when the parse this interface was extracted from reported no syntax errors, so the
+    /// member list is the complete set of declarations the source has.
+    ///
+    /// A broken parse extracts a **truncated** interface — the declarations after the error are
+    /// simply gone — which is fine for every consumer that reads what IS here, and fatal for one
+    /// that reads absence as proof. `gd_analyze`'s chain walk carries this into its
+    /// "the name exists nowhere on this chain" claim; nothing else reads it.
+    ///
+    /// Defaults to `false`, the safe answer for a negative claim, so a defensively-constructed
+    /// interface never grants evidence it does not have. Set on the head **and** on every `inner`
+    /// interface: one file, one parse. Hashed — a base flipping broken↔clean changes what its
+    /// dependents may report, so they must re-analyze.
+    pub parse_clean: bool,
 }
 
 impl Interface {
@@ -298,6 +311,7 @@ impl Interface {
             }
         }
         self.unnamed_enum_values.hash(h);
+        self.parse_clean.hash(h);
     }
 }
 
@@ -321,7 +335,17 @@ pub fn extract(tree: &ParseTree) -> Interface {
     // #255: the body-level reference scan, likewise on the head interface only (the `DepGraph` is
     // per-file, so an inner class's references roll up).
     head.body_refs = collect_body_refs(tree);
+    // One file, one parse: the head and every inner class share the same completeness.
+    stamp_parse_clean(&mut head, !tree.had_parse_errors);
     head
+}
+
+/// Set [`Interface::parse_clean`] on `iface` and, recursively, on its inner classes.
+fn stamp_parse_clean(iface: &mut Interface, clean: bool) {
+    iface.parse_clean = clean;
+    for inner in &mut iface.inner {
+        stamp_parse_clean(inner, clean);
+    }
 }
 
 /// #255: every identifier name the file references, minus the two positions that only *look* like
@@ -455,6 +479,8 @@ fn extract_class(
         preload_deps: Vec::new(),
         // #255: likewise head-interface-only, populated by `extract`.
         body_refs: Vec::new(),
+        // Stamped for the whole file by `extract`, head and inner alike.
+        parse_clean: false,
     }
 }
 
@@ -1165,6 +1191,30 @@ mod tests {
     fn signature_change_changes_hash() {
         let a = iface("extends Node\nfunc move(x: int) -> void:\n\tpass\n");
         let b = iface("extends Node\nfunc move(x: float) -> void:\n\tpass\n"); // param type changed
+        assert_ne!(a.signature_hash(), b.signature_hash());
+    }
+
+    /// #406: `parse_clean` rides on the interface so a cross-file consumer can tell a real
+    /// absence from a recovery hole. One file means one parse, so the head and every inner class
+    /// carry the same answer.
+    #[test]
+    fn parse_clean_is_stamped_on_the_head_and_every_inner_class() {
+        let clean = iface("extends Node\nclass Inner:\n\tvar x: int\n");
+        assert!(clean.parse_clean);
+        assert!(clean.inner[0].parse_clean);
+
+        let broken = iface("extends Node\nclass Inner:\n\tvar x: int\nfunc (( -> :\n");
+        assert!(!broken.parse_clean);
+        assert!(!broken.inner[0].parse_clean);
+    }
+
+    /// The flag is part of what the file exposes: a file that starts parsing cleanly newly proves
+    /// its own absences, so dependents must re-analyze.
+    #[test]
+    fn parse_cleanliness_change_changes_hash() {
+        let a = iface("extends Node\nfunc move() -> void:\n\tpass\n");
+        let b = iface("extends Node\nfunc move() -> void:\n\tpass\nfunc (( -> :\n");
+        assert!(a.parse_clean && !b.parse_clean);
         assert_ne!(a.signature_hash(), b.signature_hash());
     }
 

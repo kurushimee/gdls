@@ -1802,3 +1802,309 @@ fn a_path_extends_walks_the_segments_after_it() {
     });
     assert!(seg, "the `In` segment must bind, or a rename abandons it");
 }
+
+// ============================================================================
+// #406 — a proven miss on a cross-file self base
+// ============================================================================
+
+const UBASE_GD: &str = "\
+class_name UBase
+extends Node
+signal sig1(a: int)
+const KON := 3
+var bvar: int = 1
+enum BEnum { X }
+class Inner:
+\tvar y: int = 0
+func bfn() -> void:
+\tpass
+";
+
+/// A base whose body does not parse. The extractor still publishes whatever it recovered, so a
+/// name missing from that interface proves nothing about the real class.
+const BROKEN_BASE_GD: &str = "\
+class_name BrokenBase
+extends Node
+func late() -> void:
+\tpass
+func (( -> :
+";
+
+fn ubase_project() -> Project {
+    Project::new(&[("res://ubase.gd", UBASE_GD), ("res://c.gd", "")])
+}
+
+/// The #406 headline: a bare call to a name that is in neither the file nor its cross-file
+/// ancestry is a proven miss, so it errors exactly as it does on a native base.
+#[test]
+fn cross_file_self_call_miss_errors() {
+    let consumer = "\
+extends UBase
+func go() -> void:
+\tnofunc()
+";
+    let result = analyze_file(&ubase_project(), "res://c.gd", consumer);
+    assert_eq!(
+        error_messages(&result),
+        vec![r#"Function "nofunc()" not found in base self."#]
+    );
+}
+
+/// `self.` spells the same base and gets the same error.
+#[test]
+fn cross_file_self_dot_call_miss_errors() {
+    let consumer = "\
+extends UBase
+func go() -> void:
+\tself.nofunc()
+";
+    let result = analyze_file(&ubase_project(), "res://c.gd", consumer);
+    assert_eq!(
+        error_messages(&result),
+        vec![r#"Function "nofunc()" not found in base self."#]
+    );
+}
+
+/// A `super.` miss names the parent, not `self` — and must not also fire UNSAFE_METHOD_ACCESS,
+/// which is the warning for an UNPROVEN miss.
+#[test]
+fn cross_file_super_call_miss_errors_without_the_unsafe_warning() {
+    let consumer = "\
+extends UBase
+func go() -> void:
+\tsuper.nofunc()
+";
+    let project = ubase_project();
+    let policy = policy_enabling(&["UNSAFE_PROPERTY_ACCESS", "UNSAFE_METHOD_ACCESS"]);
+    let result = analyze_file_with(&project, "res://c.gd", consumer, &policy);
+    assert_eq!(
+        error_messages(&result),
+        vec![r#"Function "nofunc()" not found in base UBase."#]
+    );
+    assert_eq!(warning_messages(&result), Vec::<String>::new());
+}
+
+/// Two hops up still counts as walked: the miss is proven against the whole chain.
+#[test]
+fn two_hop_chain_self_call_miss_errors() {
+    let mid = "class_name UMid\nextends UBase\nfunc midfn() -> void:\n\tpass\n";
+    let consumer = "\
+extends UMid
+func go() -> void:
+\tbfn()
+\tmidfn()
+\tnofunc()
+";
+    let project = Project::new(&[
+        ("res://ubase.gd", UBASE_GD),
+        ("res://umid.gd", mid),
+        ("res://c.gd", ""),
+    ]);
+    let result = analyze_file(&project, "res://c.gd", consumer);
+    assert_eq!(
+        error_messages(&result),
+        vec![r#"Function "nofunc()" not found in base self."#]
+    );
+}
+
+/// Silence S1: the chain never reaches a native root, so it was never fully walked.
+#[test]
+fn unresolvable_base_keeps_the_self_call_miss_silent() {
+    let orphan = "class_name UOrphan\nextends NobodyDeclaresThis\n";
+    let consumer = "\
+extends UOrphan
+func go() -> void:
+\tnofunc()
+";
+    let project = Project::new(&[("res://orphan.gd", orphan), ("res://c.gd", "")]);
+    let result = analyze_file(&project, "res://c.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}
+
+/// Silence S2: an `extends` the workspace cannot resolve reports itself and stops there. The call
+/// below is against a chain that was never walked, so it must add nothing.
+#[test]
+fn unindexed_base_keeps_the_self_call_miss_silent() {
+    let consumer = "\
+extends UnindexedThing
+func go() -> void:
+\tnofunc()
+";
+    let project = Project::new(&[("res://c.gd", "")]);
+    let result = analyze_file(&project, "res://c.gd", consumer);
+    assert_eq!(
+        error_messages(&result),
+        vec![r#"Could not find base class "UnindexedThing"."#]
+    );
+}
+
+/// Silence S3, the reason `parse_clean` exists: the base failed to parse, so the method it really
+/// declares may simply have been dropped by error recovery. Claiming it is absent would be a lie.
+#[test]
+fn broken_parse_base_keeps_the_self_call_miss_silent() {
+    let consumer = "\
+extends BrokenBase
+func go() -> void:
+\tlate()
+\tnofunc()
+";
+    let project = Project::new(&[("res://broken.gd", BROKEN_BASE_GD), ("res://c.gd", "")]);
+    let result = analyze_file(&project, "res://c.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}
+
+/// Silence S4: an `extends` cycle bottoms out with no native root.
+#[test]
+fn extends_cycle_keeps_the_self_call_miss_silent() {
+    let a = "class_name CycA\nextends CycB\n";
+    let b = "class_name CycB\nextends CycA\n";
+    let consumer = "\
+extends CycA
+func go() -> void:
+\tnofunc()
+";
+    let project = Project::new(&[("res://a.gd", a), ("res://b.gd", b), ("res://c.gd", "")]);
+    let result = analyze_file(&project, "res://c.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}
+
+/// The `Other` family: a name that IS in the chain but is not a function answers with the
+/// value-callable pair, never with not-found. One row per member shape.
+#[test]
+fn cross_file_non_function_members_report_not_a_function() {
+    for name in ["sig1", "KON", "bvar", "BEnum", "Inner"] {
+        let consumer = format!("extends UBase\nfunc go() -> void:\n\t{name}()\n");
+        let result = analyze_file(&ubase_project(), "res://c.gd", &consumer);
+        let msgs = error_messages(&result);
+        assert!(
+            msgs.contains(&format!(r#"Member "{name}" is not a function."#)),
+            "{name}: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.contains(r#"not found in base"#)),
+            "{name} must never read as not-found: {msgs:?}"
+        );
+    }
+}
+
+/// The same names through `super.` get BOTH halves, which is what Godot emits: the parent lookup
+/// runs on its own and reports the miss, then the member check reports the shape
+/// (analyzer.cpp:3748-3760 reached after the `Member "X" is not a function.` push). This is the
+/// one place a non-function member legitimately reads as not-found.
+#[test]
+fn cross_file_non_function_members_via_super_report_both_halves() {
+    for name in ["sig1", "KON", "bvar"] {
+        let consumer = format!("extends UBase\nfunc go() -> void:\n\tsuper.{name}()\n");
+        let result = analyze_file(&ubase_project(), "res://c.gd", &consumer);
+        assert_eq!(
+            error_messages(&result),
+            vec![
+                format!(r#"Member "{name}" is not a function."#),
+                format!(r#"Function "{name}()" not found in base UBase."#),
+            ],
+            "{name}"
+        );
+    }
+}
+
+/// A non-function member reached through an INSTANCE of the base, not through `self`.
+#[test]
+fn cross_file_non_function_member_on_an_instance_reports_not_a_function() {
+    let consumer = "\
+extends Node
+func go(d: UBase) -> void:
+\td.KON()
+";
+    let result = analyze_file(&ubase_project(), "res://c.gd", consumer);
+    let msgs = error_messages(&result);
+    assert!(
+        msgs.contains(&r#"Member "KON" is not a function."#.to_string()),
+        "{msgs:?}"
+    );
+}
+
+/// A non-function member of a base that did not parse cleanly stays silent — the same
+/// `parse_clean` gate, on the other emission arm.
+#[test]
+fn broken_parse_base_keeps_not_a_function_silent() {
+    let broken = "\
+class_name BrokenHolder
+extends Node
+var held: int = 0
+func (( -> :
+";
+    let consumer = "\
+extends BrokenHolder
+func go() -> void:
+\theld()
+";
+    let project = Project::new(&[("res://bh.gd", broken), ("res://c.gd", "")]);
+    let result = analyze_file(&project, "res://c.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}
+
+/// A name that the NATIVE root carries as a value (property, constant, signal, enum value) is not
+/// a proven method miss: Godot answers it with the value-callable pair, so gdls must not claim
+/// not-found. gdls under-reports the pair here rather than lying.
+#[test]
+fn native_value_shadows_suppress_the_self_call_miss() {
+    for name in [
+        "owner",
+        "NOTIFICATION_READY",
+        "ready",
+        "PROCESS_MODE_ALWAYS",
+    ] {
+        let consumer = format!("extends UBase\nfunc go() -> void:\n\t{name}()\n");
+        let result = analyze_file(&ubase_project(), "res://c.gd", &consumer);
+        let msgs = error_messages(&result);
+        assert!(
+            !msgs.iter().any(|m| m.contains("not found in base")),
+            "{name} must not read as not-found: {msgs:?}"
+        );
+    }
+}
+
+/// A proven miss inside a STATIC function is still a miss. It used to read as
+/// `Cannot call non-static function "X()" from a static function.`, which named a function that
+/// does not exist.
+#[test]
+fn static_context_self_call_miss_reads_as_not_found() {
+    let consumer = "\
+extends UBase
+static func go() -> void:
+\tnofunc()
+";
+    let result = analyze_file(&ubase_project(), "res://c.gd", consumer);
+    assert_eq!(
+        error_messages(&result),
+        vec![r#"Function "nofunc()" not found in base self."#]
+    );
+}
+
+/// A real inherited method resolves, so nothing fires — the guard against the new error family
+/// swallowing the whole chain.
+#[test]
+fn cross_file_inherited_method_call_stays_silent() {
+    let consumer = "\
+extends UBase
+func go() -> void:
+\tbfn()
+\tself.bfn()
+\tsuper.bfn()
+";
+    let result = analyze_file(&ubase_project(), "res://c.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}
+
+/// Methods inherited from the NATIVE root through a cross-file chain still resolve.
+#[test]
+fn native_root_method_through_a_cross_file_chain_stays_silent() {
+    let consumer = "\
+extends UBase
+func go() -> void:
+\tqueue_free()
+\tprint(get_name())
+";
+    let result = analyze_file(&ubase_project(), "res://c.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+}

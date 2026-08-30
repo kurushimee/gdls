@@ -95,7 +95,12 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// silently segment-less warm load is exactly the wrong answer this fixes — `class_parent` would
 /// hand `rename` the head class and it would group the wrong overrides. v11 files are ignored and
 /// rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 12;
+/// v13 (#406): `Interface` gained `parse_clean`, the bit that says the member list is the complete
+/// set of declarations the source has. It gates the cross-file `Function "X()" not found in base`
+/// claim, and a v12 cache holds no value for it — `#[serde(default)]` would warm-load `false` and
+/// silently suppress that error for every file until the next cold index, which reads as "gdls
+/// stopped reporting typos". v12 files are ignored and rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 13;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool

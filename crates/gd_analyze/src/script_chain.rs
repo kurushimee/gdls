@@ -31,6 +31,14 @@ pub(crate) struct ResolvedChain {
     /// The native class the chain bottoms out in. `Some("RefCounted")` for `Extends::None`
     /// (the implicit base, analyzer.cpp:423-427). `None` = unknown ⇒ permissive.
     pub native_root: Option<String>,
+    /// Whether this walk is good enough to prove a name is **absent** from the chain (#406).
+    ///
+    /// `native_root.is_some()` is only typing-grade: it says where the chain probably bottoms out,
+    /// and every consumer that reads it degrades permissively on `None`. A negative claim needs
+    /// more — every link's interface present *and* parse-clean, no cycle, and a terminus the
+    /// native DB actually knows. Anything less and the name gdls cannot find may simply be in a
+    /// part of the chain it never read.
+    pub introspectable: bool,
 }
 
 /// Walk `start`'s extends chain. Memoized in `AnalysisContext::script_chains` — interfaces are
@@ -128,6 +136,10 @@ fn walk(ctx: &AnalysisContext, start: &ScriptRef) -> ResolvedChain {
     let mut links: Vec<ScriptRef> = Vec::new();
     let mut visited: FxHashSet<ScriptRef> = FxHashSet::default();
     let mut cur = start.clone();
+    // #406: every link has to be present and parse-clean for the walk to prove an absence. A
+    // truncated interface (the parser stopped at a syntax error) still lists real members, so it
+    // keeps working for lookups; it just cannot testify that a name is missing.
+    let mut clean = true;
     loop {
         if !visited.insert(cur.clone()) {
             // Inheritance cycle — stop with "unknown"; the cycle error belongs to the cyclic
@@ -135,13 +147,22 @@ fn walk(ctx: &AnalysisContext, start: &ScriptRef) -> ResolvedChain {
             return ResolvedChain {
                 links,
                 native_root: None,
+                introspectable: false,
             };
         }
+        clean &= link_interface(ctx.xfile, &cur).is_some_and(|i| i.parse_clean);
         let next = step(ctx, &cur);
         links.push(cur);
         match next {
             Step::Next(n) => cur = n,
-            Step::Root(native_root) => return ResolvedChain { links, native_root },
+            Step::Root(native_root) => {
+                let introspectable = clean && native_root.is_some();
+                return ResolvedChain {
+                    links,
+                    native_root,
+                    introspectable,
+                };
+            }
         }
     }
 }

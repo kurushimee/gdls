@@ -602,6 +602,14 @@ pub struct ParseTree {
     /// (gdscript_parser.cpp:482-489); the warning itself is emitted by `gd_analyze`, which owns
     /// the warning set — this crate stays engine-free and only records the signal.
     pub starts_at_eof: bool,
+    /// `true` when the parse that produced this tree reported at least one syntax error, so the
+    /// tree — and every projection of it, the interface extraction included — may be missing
+    /// declarations the source actually has. Consumers that make *negative* claims ("this name
+    /// exists nowhere on the chain") must refuse to make them against a tree carrying this flag;
+    /// consumers that only read what IS here are unaffected. Stamped by [`crate::parse_with_options`],
+    /// the one chokepoint every production parse goes through, and so `false` on a
+    /// defensively-constructed tree, which is the safe default for a negative claim.
+    pub had_parse_errors: bool,
     /// M7 (#62): `##` doc-comment associations, populated by [`crate::parse`] after the parse
     /// completes (`doc_comments::associate`). Riding on the tree means every existing
     /// interface-extraction call site gets docs with zero signature churn, and the parse cache

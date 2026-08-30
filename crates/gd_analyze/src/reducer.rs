@@ -4468,6 +4468,12 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     // (analyzer.cpp:5944) must gate on this narrower predicate, never on bare `found`, or it would
     // emit a phantom "Expected at most 0" on a parameterized `_init` or an unresolved cross-file call.
     let mut sig_resolved = false;
+    // #406: the name was found on a cross-file chain link, but not as a function (a signal, a
+    // const, a var, a named enum, an inner class). Godot answers that with the value-callable
+    // pair, not with "not found", so this suppresses the not-found claim; `clean` says whether the
+    // declaring link's interface was complete enough to also emit `Member "X" is not a function.`
+    let mut name_exists_nonfunc = false;
+    let mut name_exists_nonfunc_clean = false;
     let mut in_file_function_id: Option<NodeId> = None;
     // The class node DECLARING an in-file-resolved callee (the chain link
     // `lookup_class_function_or_member` found it on) — the owning class recorded on
@@ -4576,14 +4582,16 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         sig.arity_known = true;
                         sig_resolved = true;
                     }
-                    ChainCall::Other => {
+                    ChainCall::Other { .. } => {
                         // `_init` exists as a non-Func member — degenerate; leave the count check
                         // off rather than risk a wrong bound.
                     }
-                    ChainCall::Missing => {
+                    ChainCall::Missing { introspectable } => {
                         // No `_init` anywhere in the chain. Reproduce Godot's empty-par_types
-                        // fallback (min == max == 0, not vararg) ONLY for a fully-resolved chain.
-                        if crate::script_chain::chain_native_root(ctx, script_ref).is_some() {
+                        // fallback (min == max == 0, not vararg) ONLY for a chain complete enough
+                        // to prove there is no `_init`: a truncated interface (#406) may be hiding
+                        // an `_init(a, b)`, and `Expected at most 0 arguments` would be a lie.
+                        if introspectable {
                             sig.par_types.clear();
                             sig.min_params = 0;
                             sig.max_params = 0;
@@ -4639,14 +4647,15 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                                 sig_resolved = true;
                                 cross_file_callee = Some(link);
                             }
-                            ChainCall::Other => {}
-                            ChainCall::Missing => {
+                            ChainCall::Other { clean } => {
+                                name_exists_nonfunc = true;
+                                name_exists_nonfunc_clean = clean;
+                            }
+                            ChainCall::Missing { introspectable } => {
                                 // Interface miss: probe the chain's native root first —
                                 // upstream's get_function_signature continues into ClassDB, so
                                 // an inherited native method through a cross-file chain binds
-                                // its real signature. Only a genuine native miss keeps the
-                                // silent-Variant degrade (the interface view may be incomplete;
-                                // never risk a phantom not-found).
+                                // its real signature.
                                 let root = crate::script_chain::chain_native_root(ctx, &sr);
                                 let native_sig = root.as_ref().and_then(|root| {
                                     lookup_native_method(ctx, root, &function_name)
@@ -4656,10 +4665,19 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                                     sig = s;
                                     native_callee = root;
                                     sig_resolved = true;
+                                    found = true;
+                                } else if introspectable && is_self {
+                                    // #406: every link was present and parse-clean, the walk
+                                    // reached a native root the DB knows, and the name is on none
+                                    // of it. That is a fact, so leave `found = false` and let the
+                                    // call take the same not-found path an in-file miss takes.
                                 } else {
+                                    // The evidence is incomplete, or the base is not `self`
+                                    // (Godot's gate is `is_self || hard builtin`; an instance-base
+                                    // miss is the warning below, never the error). Degrade.
                                     return_type = Some(DataType::variant());
+                                    found = true;
                                 }
-                                found = true;
                             }
                         }
                     } else if let Some(root) =
@@ -4714,10 +4732,12 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     // filtering).
                     cross_file_callee = Some(link);
                 }
-                ChainCall::Other => {
+                ChainCall::Other { clean } => {
                     // Exists as a non-Func — fall through; the value-callable path fires.
+                    name_exists_nonfunc = true;
+                    name_exists_nonfunc_clean = clean;
                 }
-                ChainCall::Missing => {
+                ChainCall::Missing { introspectable } => {
                     // Not in any chain interface — probe the chain's native root first
                     // (upstream's get_function_signature continues into ClassDB), then the
                     // silent degrade ("Unknown stays dynamic"): shallow interfaces may miss
@@ -4732,6 +4752,12 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         sig = s;
                         native_callee = root;
                         sig_resolved = true;
+                        found = true;
+                    } else if introspectable && is_self {
+                        // #406: every link was present and parse-clean, the walk reached a native
+                        // root the DB knows, and the name is on none of it. Leave `found = false`
+                        // so a `super.miss()` takes the same not-found path an in-file miss takes.
+                        // No warning here — this became the hard error.
                     } else {
                         // #256: the ERROR stays off (an interface gap must never become
                         // "Function not found"), but the WARNING belongs here — this is
@@ -4741,8 +4767,11 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         // not-found branch; this is the same claim made at the site that
                         // actually knows. Sound only when the chain was fully walkable
                         // (`native_root` resolved) under an `Exact` dump — otherwise the miss
-                        // may be a gap in gdls's view, not in the user's code.
-                        if root.is_some()
+                        // may be a gap in gdls's view, not in the user's code. `!is_self` is
+                        // upstream's own gate (analyzer.cpp:3741): a self/super miss is the
+                        // error's business, never the warning's.
+                        if !is_self
+                            && root.is_some()
                             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
                         {
                             let base_str = class_identifier_name_or_default(ctx, &base_type);
@@ -4753,8 +4782,8 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                             );
                         }
                         return_type = Some(DataType::variant());
+                        found = true;
                     }
-                    found = true;
                 }
             }
         }
@@ -4836,7 +4865,11 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // function via [`AnalysisContext::current_function`]; when it's `None` we're at the
         // class-body / variable-initializer level, which is Godot's `parent_function ==
         // nullptr` branch.
-        if is_self && ctx.static_context && !sig.is_static && !is_constructor {
+        // #406: `sig_resolved` is required, not bare `found`. The Variant-degrade fallbacks set
+        // `found = true` with `sig` at its zero-arg default, whose `is_static` is `false` — so
+        // without this gate an unresolved call in a static function reported "cannot call
+        // non-static", a claim about a signature gdls never read.
+        if is_self && sig_resolved && ctx.static_context && !sig.is_static && !is_constructor {
             // analyzer.cpp:3645-3654 — name the enclosing concrete function (walking through any
             // lambda chain) so a `static_func ... var f = func (): non_static_func()` reports
             // "from the static function 'static_func()'" rather than the lambda's empty name.
@@ -5178,9 +5211,29 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 .native
                 .builtin_named(data_type::variant_type_name(base_type.builtin_type))
                 .is_some();
+        // #406: the name IS on the chain, just not as a function. For a bare / `self.` call Godot
+        // answers with the value-callable pair (`Member "X" is not a function.` plus
+        // `Name "X" called as a function but is a "…"`), never with not-found. For a `super.` call
+        // it emits BOTH, so the suppression is non-super only. The companion error is emitted here
+        // when the declaring link's interface was complete — the cross-file mirror of the in-file
+        // `ClassCallLookup::NotAFunction` arm.
+        if name_exists_nonfunc && name_exists_nonfunc_clean {
+            ctx.push_error(
+                format!(r#"Member "{function_name}" is not a function."#),
+                call.callee.unwrap_or(id),
+            );
+        }
+        // #406: the name shadows a NON-METHOD member of the chain's native root (a property, a
+        // signal, a constant, an enum). Godot resolves the identifier to that value and answers
+        // `Name "X" called as a function but is a "…"`, so not-found would be a lie. A `super.`
+        // call skips the value resolution entirely and does get not-found, hence the exemption.
+        let native_value_shadow = !call.is_super
+            && native_root_for_base(ctx, &base_type)
+                .is_some_and(|root| native_surface_has_nonmethod(ctx, &root, &function_name));
         if !name_is_value
+            && !(name_exists_nonfunc && !call.is_super)
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
-            && ((is_self && (call.is_super || self_base_is_introspectable(ctx, &base_type)))
+            && ((is_self && !native_value_shadow && self_base_is_introspectable(ctx, &base_type))
                 || builtin_base_is_introspectable)
         {
             // The native super-VIRTUAL case (`super._init()`, `super._notification()`, …) is
@@ -5576,22 +5629,72 @@ fn lookup_class_function_or_member(
 }
 
 /// Hard-coded GDScript utility function return-type table, mirroring
-/// #256: whether a `self` base was resolved well enough for gdls to claim a name is absent from it.
+/// #256/#406: whether a `self` or `super` base was resolved well enough for gdls to claim a name is
+/// absent from it. One rule for all three base kinds a self-call can carry.
 ///
-/// A non-super self-call reaches the not-found branch only after the in-file class walk missed and
-/// the chain-continuation missed too — but "the chain-continuation missed" has two very different
-/// causes. Either the chain WAS walkable and the name genuinely is not on it (a real typo), or the
-/// chain could not be followed at all (`extends SomeUnresolvableName`, an orphan buffer, a base
-/// whose type never resolved), in which case absence proves nothing. Only the first may error.
+/// A self-call reaches the not-found branch only after the in-file class walk missed and the
+/// chain-continuation missed too — but "the chain-continuation missed" has two very different
+/// causes. Either the chain WAS walked end to end and the name genuinely is not on it (a real
+/// typo), or the walk stopped short (`extends SomeUnresolvableName`, an orphan buffer, a link whose
+/// interface is not indexed, a link that failed to parse and so extracted a truncated member list,
+/// an inheritance cycle), in which case absence proves nothing. Only the first may error.
 ///
-/// A cross-file `Script` base never reaches here — its miss degrades to a silent `Variant` with
-/// `found = true` ("Unknown stays dynamic"), because a shallow interface view can be incomplete.
-/// So the check reduces to: the base is an in-file class whose ancestry reaches a native root.
-fn self_base_is_introspectable(ctx: &AnalysisContext, base_type: &DataType) -> bool {
-    base_type.kind == DtKind::Class
-        && base_type
+/// This is claim-grade evidence, distinct from the typing-grade `native_root` that
+/// [`crate::resolver::nearest_native_ancestor`] answers with. Those consumers — the `$`/`@onready`
+/// node-ness gates, shadow warnings, type compatibility — must stay permissive on an unknown chain,
+/// so they keep reading the looser question.
+/// The native class a self/super base's chain bottoms out in, whatever kind the base carries.
+fn native_root_for_base(ctx: &AnalysisContext, base_type: &DataType) -> Option<String> {
+    match base_type.kind {
+        DtKind::Class => base_type
             .class_node
-            .is_some_and(|cid| crate::resolver::nearest_native_ancestor(ctx, cid).is_some())
+            .and_then(|cid| crate::resolver::nearest_native_ancestor(ctx, cid)),
+        DtKind::Script => base_type
+            .script_type
+            .as_ref()
+            .and_then(|sr| crate::script_chain::chain_native_root(ctx, sr)),
+        DtKind::Native if !base_type.native_type.is_empty() => Some(base_type.native_type.clone()),
+        _ => None,
+    }
+}
+
+/// Whether `name` is a NON-METHOD member of `root`'s native surface — a property, a signal, a
+/// constant, an enum, or an enum value — anywhere up its `inherits` chain. The method tables are
+/// deliberately not consulted: a method that resolved would never have reached the not-found
+/// branch, and one that did not is exactly what the branch is about.
+fn native_surface_has_nonmethod(ctx: &AnalysisContext, root: &str, name: &str) -> bool {
+    let db = ctx.native;
+    let mut cur = Some(root.to_owned());
+    while let Some(class_name) = cur {
+        let Some(class) = db.class_named(&class_name) else {
+            return false;
+        };
+        if class.properties.iter().any(|p| db.name_of(p.name) == name)
+            || class.signals.iter().any(|sg| db.name_of(sg.name) == name)
+            || class.constants.iter().any(|k| db.name_of(k.name) == name)
+            || class.enums.iter().any(|e| {
+                db.name_of(e.name) == name || e.values.iter().any(|(vn, _)| db.name_of(*vn) == name)
+            })
+        {
+            return true;
+        }
+        cur = class.inherits.map(|i| db.name_of(i).to_owned());
+    }
+    false
+}
+
+fn self_base_is_introspectable(ctx: &AnalysisContext, base_type: &DataType) -> bool {
+    match base_type.kind {
+        DtKind::Class => base_type
+            .class_node
+            .is_some_and(|cid| crate::resolver::class_ancestry_introspectable(ctx, cid)),
+        DtKind::Script => base_type
+            .script_type
+            .as_ref()
+            .is_some_and(|sr| crate::script_chain::resolve_script_chain(ctx, sr).introspectable),
+        DtKind::Native => ctx.native.class_named(&base_type.native_type).is_some(),
+        _ => false,
+    }
 }
 
 /// `modules/gdscript/gdscript_utility_functions.cpp:570-592`. These functions are NOT in the
@@ -6305,10 +6408,15 @@ enum ChainCall {
     /// inner-class path — what `CalleeTarget::Script` records). Boxed — the signature dwarfs
     /// the unit variants and this enum moves through match arms by value.
     Sig(Box<CallSig>, crate::data_type::ScriptRef),
-    /// The name exists as a non-Func member — the value-callable path owns it.
-    Other,
-    /// Not in any chain interface.
-    Missing,
+    /// The name exists on a chain link as a non-Func member, a named enum, or an inner class —
+    /// the value-callable path owns it. `clean` is the declaring link's
+    /// [`gd_project::Interface::parse_clean`], which gates the `Member "X" is not a function.`
+    /// companion error (#406).
+    Other { clean: bool },
+    /// Not in any chain interface. `introspectable` is
+    /// [`crate::script_chain::ResolvedChain::introspectable`] — whether the walk was complete
+    /// enough for the absence to be a fact rather than a gap (#406).
+    Missing { introspectable: bool },
 }
 
 /// Look up `function_name` as a Func through `start`'s full extends chain, synthesizing a
@@ -6339,14 +6447,29 @@ fn script_chain_call(
         };
         if let Some(m) = iface.members.iter().find(|m| m.name == function_name) {
             if m.kind != gd_project::MemberKind::Func {
-                return ChainCall::Other;
+                return ChainCall::Other {
+                    clean: iface.parse_clean,
+                };
             }
             hit = Some((link.clone(), m));
             break;
         }
+        // #406: an inner class is reachable by name but is not in `members`, so without this a
+        // `BInner()` call would read as "absent from the chain" once the absence becomes an error.
+        if iface
+            .inner
+            .iter()
+            .any(|i| i.class_name.as_deref() == Some(function_name))
+        {
+            return ChainCall::Other {
+                clean: iface.parse_clean,
+            };
+        }
     }
     let Some((link, member)) = hit else {
-        return ChainCall::Missing;
+        return ChainCall::Missing {
+            introspectable: chain.introspectable,
+        };
     };
     let par_n = member.params.len();
     let return_dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
