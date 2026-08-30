@@ -6097,3 +6097,75 @@ fn renaming_a_const_preload_alias_edits_every_type_position() {
 
     shutdown(&client, server);
 }
+
+/// #388: `extends "res://x.gd".Inner` names the inner class. `Extends::Path` used to drop the
+/// segments, so `class_parent` answered the file's HEAD class — and that wrong answer reaches
+/// `rename` through `override_group`, which then grouped the wrong overrides. Measured on `main`,
+/// renaming the inner class's `act` edited its own declaration and abandoned the child's override.
+#[test]
+fn a_path_extends_segment_groups_the_right_method_overrides() {
+    let project = common::sample_project();
+    project.write(
+        "src/pathbase.gd",
+        "extends Node\nclass In:\n\textends Node\n\tfunc act() -> void:\n\t\tpass\n",
+    );
+    project.write(
+        "src/pathchild.gd",
+        "extends \"res://src/pathbase.gd\".In\nfunc act() -> void:\n\tpass\n",
+    );
+    // A same-named global whose own `act` must stay out of both directions.
+    project.write(
+        "src/decoyglobal.gd",
+        "class_name In\nextends Node\nfunc act() -> void:\n\tpass\n",
+    );
+    let (client, server) = boot();
+    init_open(
+        &project,
+        &client,
+        caps_full(),
+        &["src/pathbase.gd", "src/pathchild.gd", "src/decoyglobal.gd"],
+        2,
+    );
+    let base = file_uri(&project.root.join("src/pathbase.gd"));
+    let decoy = file_uri(&project.root.join("src/decoyglobal.gd"));
+
+    // `func act` of the inner class `In`, line 3 col 6.
+    let view = flatten_edit(
+        &serde_json::from_value::<WorkspaceEdit>({
+            client
+                .sender
+                .send(request(
+                    70,
+                    "textDocument/rename",
+                    rename_params(&base, 3, 6, "perform"),
+                ))
+                .unwrap();
+            let resp = recv_response(&client);
+            assert!(resp.error.is_none(), "rename refused: {:?}", resp.error);
+            resp.result.expect("rename result")
+        })
+        .unwrap(),
+    );
+    let mut files: Vec<String> = view
+        .set
+        .iter()
+        .map(|(u, _)| u.rsplit('/').next().unwrap_or("").to_owned())
+        .collect();
+    files.sort();
+    files.dedup();
+    assert_eq!(
+        files,
+        vec!["pathbase.gd".to_owned(), "pathchild.gd".to_owned()],
+        "the child extending the INNER class must be in the group, and the global must not"
+    );
+
+    // The other direction: the global's own rename never reaches the path-extends pair.
+    let sites = rename_sites(&client, 71, &decoy, 2, 5, "perform");
+    assert_eq!(
+        sites,
+        vec![(2, 5)],
+        "a same-named global's method group stops at itself"
+    );
+
+    shutdown(&client, server);
+}

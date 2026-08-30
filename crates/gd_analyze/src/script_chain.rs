@@ -84,7 +84,8 @@ fn step(ctx: &AnalysisContext, cur: &ScriptRef) -> Step {
     };
     match &iface.extends {
         gd_project::Extends::None => Step::Root(Some("RefCounted".to_owned())),
-        gd_project::Extends::Path(p) => match ctx.xfile.resolve_path_from(cur.file, p) {
+        gd_project::Extends::Path { path: p, .. } => match ctx.xfile.resolve_path_from(cur.file, p)
+        {
             Some(f) => Step::Next(ScriptRef {
                 file: f,
                 inner: Vec::new(),

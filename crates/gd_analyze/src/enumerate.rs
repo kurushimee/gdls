@@ -262,7 +262,8 @@ fn script_chain_links(
                 links.push(cur);
                 return links;
             }
-            gd_project::Extends::Path(p) => match xfile.resolve_path_from(cur.file, p) {
+            gd_project::Extends::Path { path: p, .. } => match xfile.resolve_path_from(cur.file, p)
+            {
                 Some(f) => ScriptRef {
                     file: f,
                     inner: Vec::new(),
@@ -348,7 +349,7 @@ pub fn script_chain_native_root(
         let iface = link_interface(xfile, &cur)?;
         match &iface.extends {
             gd_project::Extends::None => return Some("RefCounted".to_owned()),
-            gd_project::Extends::Path(p) => {
+            gd_project::Extends::Path { path: p, .. } => {
                 cur = ScriptRef {
                     file: xfile.resolve_path_from(cur.file, p)?,
                     inner: Vec::new(),

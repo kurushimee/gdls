@@ -31,7 +31,7 @@ impl BaseRef {
     fn from_extends(extends: &Extends) -> Self {
         match extends {
             Extends::None => BaseRef::None,
-            Extends::Path(p) => BaseRef::Path(p.clone()),
+            Extends::Path { path, .. } => BaseRef::Path(path.clone()),
             Extends::Names(names) => BaseRef::Name(names.join(".")),
         }
     }
@@ -208,7 +208,10 @@ mod tests {
         r.insert(
             "B".into(),
             &p("/b.gd"),
-            &Extends::Path("res://x.gd".into()),
+            &Extends::Path {
+                path: "res://x.gd".into(),
+                segments: Vec::new(),
+            },
             false,
             None,
         );

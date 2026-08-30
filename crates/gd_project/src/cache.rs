@@ -89,7 +89,13 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// would deserialize-fail; not `#[serde(default)]` for the same reason as v4's `name_span` — a
 /// defaulted zero-width span warm-loaded from an old cache silently degrades every anchor it feeds.
 /// One cold re-index per project on upgrade, self-healing.
-pub const CACHE_FORMAT_VERSION: u32 = 11;
+/// v12 (#388): `Extends::Path` became a struct variant carrying the name segments after the path,
+/// so `extends "res://x.gd".Inner` names the inner class rather than the file's head class. A v11
+/// cache holds the old tuple shape and would deserialize-fail; not `#[serde(default)]`-able, and a
+/// silently segment-less warm load is exactly the wrong answer this fixes — `class_parent` would
+/// hand `rename` the head class and it would group the wrong overrides. v11 files are ignored and
+/// rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 12;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
