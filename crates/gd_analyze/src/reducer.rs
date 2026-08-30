@@ -2479,6 +2479,7 @@ fn script_meta_type(ctx: &AnalysisContext, file: gd_project::FileId) -> DataType
         is_meta_type: true,
         is_constant: true,
         native_type: crate::script_chain::chain_native_root(ctx, &sref).unwrap_or_default(),
+        display_name: crate::resolver::script_render_name(ctx, &sref),
         script_type: Some(sref),
         ..Default::default()
     }
@@ -6160,6 +6161,7 @@ pub(crate) fn script_instance_datatype(
         is_meta_type: false,
         builtin_type: VariantType::Object,
         native_type: crate::script_chain::chain_native_root(ctx, &sref).unwrap_or_default(),
+        display_name: crate::resolver::script_render_name(ctx, &sref),
         script_type: Some(sref),
         ..Default::default()
     }
@@ -6301,6 +6303,7 @@ fn lookup_in_links(
                 is_meta_type: true,
                 is_constant: true,
                 native_type: crate::script_chain::chain_native_root(ctx, &sref).unwrap_or_default(),
+                display_name: crate::resolver::script_render_name(ctx, &sref),
                 script_type: Some(sref),
                 ..Default::default()
             };
@@ -7606,16 +7609,18 @@ fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
         };
         path_for_resource_typing = Some(path_str);
         if let Some(file) = resolved {
+            let sref = crate::data_type::ScriptRef {
+                file,
+                inner: Vec::new(),
+            };
             let preload_type = DataType {
                 type_source: TypeSource::AnnotatedInferred,
                 kind: DtKind::Script,
                 builtin_type: VariantType::Object,
                 is_meta_type: true,
                 is_constant: true,
-                script_type: Some(crate::data_type::ScriptRef {
-                    file,
-                    inner: Vec::new(),
-                }),
+                display_name: crate::resolver::script_render_name(ctx, &sref),
+                script_type: Some(sref),
                 ..Default::default()
             };
             ctx.set_type(id, preload_type);

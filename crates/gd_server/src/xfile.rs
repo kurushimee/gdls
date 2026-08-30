@@ -172,6 +172,10 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
         self.inner.global_class_file(name)
     }
 
+    fn res_path(&self, file: FileId) -> Option<String> {
+        gd_project::path_to_res(&self.project_root, self.inner.index.path(file)?)
+    }
+
     fn interface(&self, file: FileId) -> Option<&Interface> {
         self.inner.interface(file)
     }
