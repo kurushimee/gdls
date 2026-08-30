@@ -2800,10 +2800,10 @@ fn resolve_assignable(
         // would false-positive INFERENCE_ON_VARIANT on every cyclic-pair member. Snapshotting
         // pre-reduction and skipping the warning if any new diagnostic landed mirrors Godot's
         // intent without re-architecting the cycle handling.
-        let pre_diag_count = ctx.diagnostic_count();
+        let pre_diag_count = ctx.error_count();
         crate::reducer::reduce_expression(ctx, init, false);
         let initializer_type = ctx.get_type(init).clone();
-        let init_emitted_errors = ctx.diagnostic_count() > pre_diag_count;
+        let init_emitted_errors = ctx.error_count() > pre_diag_count;
 
         // analyzer.cpp:2126-2141 — error reporting when inference fails. `infer_datatype` (`:=`)
         // and the typed-fallback (no `:=`, no specifier) take different message templates.
@@ -2824,12 +2824,20 @@ fn resolve_assignable(
                 NodeKind::Identifier(i) => i.name.starts_with(|c: char| c.is_ascii_uppercase()),
                 _ => false,
             };
+            // An operator-node initializer (binary/unary/ternary) with a soft NON-Variant
+            // result is trustworthy: the operator reducers compute hardness faithfully from
+            // their operands, and gdls's under-hard-typing degrades always come out as
+            // Variant-kinded (which the variant arms keep silent).
+            let init_is_operator = matches!(
+                ctx.node(init).kind,
+                NodeKind::BinaryOp(_) | NodeKind::UnaryOp(_) | NodeKind::TernaryOp(_)
+            );
             let weak_type_safe = !init_emitted_errors
                 && !initializer_type.is_hard_type()
                 && initializer_type.is_set()
                 && !initializer_type.has_no_type()
-                && init_is_plain_identifier
-                && !init_name_starts_upper;
+                && ((init_is_plain_identifier && !init_name_starts_upper)
+                    || (init_is_operator && initializer_type.kind != DtKind::Variant));
             if !initializer_type.is_set() || initializer_type.has_no_type() || weak_type_safe {
                 ctx.push_error(
                     format!(
@@ -2904,7 +2912,28 @@ fn resolve_assignable(
             if drops_to_variant {
                 ty.kind = DtKind::Variant;
             }
-            ty.type_source = if infer_datatype || is_constant {
+            // Upstream promotes unconditionally (analyzer.cpp:2150-2154), but it only reaches
+            // this line on the `:=` path after erroring on ANY non-hard initializer
+            // (analyzer.cpp:2141's `!is_hard_type()` clause), so upstream a hard
+            // `AnnotatedInferred` local is always backed by a hard initializer. gdls holds that
+            // clause back (`weak_type_safe` above) because the reducer degrades an unresolvable
+            // cross-file chain to a SOFT `Inferred` Variant — and promoting THAT would launder
+            // the degrade into a hard Variant, which the operator reducers' trust guards read as
+            // a genuine dynamic and stamp `Undetected` on, firing a false `Cannot infer …` one
+            // use later. So a soft Variant stays soft: "unknown stays dynamic" (docs/00) has to
+            // survive the declaration. The state this defines is one upstream never reaches
+            // without an error already emitted, so no upstream behavior is overridden.
+            //
+            // A PARAMETER is excluded, and that exclusion is load-bearing: a `:=` parameter
+            // default that degrades (the cyclic override default in `errors/cyclic_reference.gd`)
+            // must still harden, because `is_param_contravariant`'s hard-Variant-parent arm
+            // (analyzer.cpp:1915-1918) is what makes the child signature mismatch and routes into
+            // the `Cyclic reference.` emission. Without it the analyze ratchet drops to 195/196.
+            let is_parameter = matches!(ctx.node(node_id).kind, NodeKind::Parameter(_));
+            let soft_variant_stays_soft = !is_parameter
+                && ty.kind == DtKind::Variant
+                && ty.type_source == TypeSource::Inferred;
+            ty.type_source = if (infer_datatype || is_constant) && !soft_variant_stays_soft {
                 TypeSource::AnnotatedInferred
             } else {
                 TypeSource::Inferred

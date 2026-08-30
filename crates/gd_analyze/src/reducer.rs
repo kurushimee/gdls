@@ -212,63 +212,7 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
             reduce_call(ctx, id, is_root);
         }
         NodeKind::Subscript(_) => reduce_subscript(ctx, id, false),
-        NodeKind::TernaryOp(t) => {
-            if let Some(c) = t.condition {
-                reduce_expression(ctx, c, false);
-            }
-            if let Some(e) = t.true_expr {
-                reduce_expression(ctx, e, false);
-            }
-            if let Some(e) = t.false_expr {
-                reduce_expression(ctx, e, false);
-            }
-            // analyzer.cpp:5172-5186 ternary result typing for same-shaped branches. Both
-            // branches HARD ⇒ the common type at ANNOTATED_INFERRED (Godot's
-            // `true_type.is_hard_type() && false_type.is_hard_type() ? ANNOTATED_INFERRED :
-            // INFERRED` tail) — `x := a if c else Color.WHITE` with two hard Colors must infer
-            // Color, not degrade. Mixed hard/soft keeps the Undetected result the corpus's
-            // `ternary_weak_infer.gd` pins (gdls's resolve_assignable "Cannot infer" contract).
-            // Differing shapes fall to the dispatcher tail-guard's soft Variant.
-            if let (Some(te), Some(fe)) = (t.true_expr, t.false_expr) {
-                let tt = ctx.get_type(te).clone();
-                let ft = ctx.get_type(fe).clone();
-                // INCOMPATIBLE_TERNARY (analyzer.cpp:5172-5184): neither branch type accepts
-                // the other — the values have no common type and the expression degrades to
-                // Variant. Variant-typed (or unset, tail-guard-pending) branches are exempt,
-                // exactly as upstream's `is_variant()` early arm.
-                if tt.is_set()
-                    && ft.is_set()
-                    && tt.kind != DtKind::Variant
-                    && ft.kind != DtKind::Variant
-                    && !is_type_compatible(ctx, &tt, &ft, false)
-                    && !is_type_compatible(ctx, &ft, &tt, false)
-                {
-                    ctx.push_warning(crate::warnings::WarningCode::IncompatibleTernary, &[], id);
-                }
-                if tt.is_set()
-                    && ft.is_set()
-                    && tt.kind == ft.kind
-                    && tt.builtin_type == ft.builtin_type
-                {
-                    if tt.is_hard_type() && ft.is_hard_type() {
-                        let mut result = tt.clone();
-                        result.type_source = TypeSource::AnnotatedInferred;
-                        result.is_constant = false;
-                        ctx.set_type(id, result);
-                    } else if tt.type_source != ft.type_source {
-                        ctx.set_type(
-                            id,
-                            DataType {
-                                type_source: TypeSource::Undetected,
-                                kind: tt.kind,
-                                builtin_type: tt.builtin_type,
-                                ..Default::default()
-                            },
-                        );
-                    }
-                }
-            }
-        }
+        NodeKind::TernaryOp(_) => reduce_ternary_op(ctx, id, is_root),
         NodeKind::Cast(_) => reduce_cast(ctx, id),
         NodeKind::Assignment(_) => reduce_assignment(ctx, id),
         NodeKind::Await(_) => reduce_await(ctx, id),
@@ -368,35 +312,214 @@ pub fn type_from_variant(value: &FoldedValue) -> DataType {
 }
 
 // ===================================================================================================
+// reduce_ternary_op — analyzer.cpp:5160
+// ===================================================================================================
+
+/// `GDScriptAnalyzer::reduce_ternary_op` (analyzer.cpp:5160).
+fn reduce_ternary_op(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
+    let NodeKind::TernaryOp(t) = ctx.node(id).kind.clone() else {
+        return;
+    };
+    if let Some(c) = t.condition {
+        reduce_expression(ctx, c, false);
+    }
+    if let Some(e) = t.true_expr {
+        reduce_expression(ctx, e, is_root);
+    }
+    if let Some(e) = t.false_expr {
+        reduce_expression(ctx, e, is_root);
+    }
+
+    // analyzer.cpp:5167-5174 — constant fold: booleanize the condition, take that branch's value.
+    if let (Some(c), Some(te), Some(fe)) = (t.condition, t.true_expr, t.false_expr) {
+        if ctx.folds.is_reduced(c) && ctx.folds.is_reduced(te) && ctx.folds.is_reduced(fe) {
+            let cond = ctx.folds.get(c).cloned();
+            if let Some(b) = cond.as_ref().and_then(folded_booleanize) {
+                let picked = ctx.folds.get(if b { te } else { fe }).cloned();
+                if let Some(v) = picked {
+                    ctx.folds.set(id, v);
+                }
+            }
+        }
+    }
+
+    // analyzer.cpp:5176-5188 — a missing branch reads as Variant.
+    let variant_branch = || DataType {
+        kind: DtKind::Variant,
+        ..Default::default()
+    };
+    let true_type = t
+        .true_expr
+        .map(|e| ctx.get_type(e).clone())
+        .unwrap_or_else(variant_branch);
+    let false_type = t
+        .false_expr
+        .map(|e| ctx.get_type(e).clone())
+        .unwrap_or_else(variant_branch);
+
+    // analyzer.cpp:5190-5203.
+    let mut result;
+    if true_type.is_variant() || false_type.is_variant() {
+        result = variant_branch();
+    } else {
+        result = true_type.clone();
+        if !is_type_compatible(ctx, &true_type, &false_type, false) {
+            result = false_type.clone();
+            if !is_type_compatible(ctx, &false_type, &true_type, false) {
+                result = variant_branch();
+                ctx.push_warning(crate::warnings::WarningCode::IncompatibleTernary, &[], id);
+            }
+        }
+    }
+    // analyzer.cpp:5205 — the source is stamped unconditionally from branch hardness, so a
+    // degraded soft-Variant branch keeps the result soft (never UNDETECTED) and stays silent.
+    result.type_source = if true_type.is_hard_type() && false_type.is_hard_type() {
+        TypeSource::AnnotatedInferred
+    } else {
+        TypeSource::Inferred
+    };
+    ctx.set_type(id, result);
+}
+
+/// `Variant::booleanize` over the folded subset. `None` for `Opaque` (value unknown).
+fn folded_booleanize(v: &FoldedValue) -> Option<bool> {
+    Some(match v {
+        FoldedValue::Nil => false,
+        FoldedValue::Bool(b) => *b,
+        FoldedValue::Int(i) => *i != 0,
+        FoldedValue::Float(f) => *f != 0.0,
+        FoldedValue::String(s) => !s.is_empty(),
+        FoldedValue::Opaque(..) => return None,
+    })
+}
+
+// ===================================================================================================
 // reduce_unary_op — analyzer.cpp:5217
 // ===================================================================================================
 
-/// `GDScriptAnalyzer::reduce_unary_op` (analyzer.cpp:5217). E1 reproduces the constant-fold path
-/// (analyzer.cpp:5230-5234) for the operators that act on our `Int|Float|Bool` folded values;
-/// `get_operation_type` (analyzer.cpp:5241) — the type-only path for non-constant operands — lands
-/// in E2 with the operator type matrix. Until then, a non-constant operand types as `Variant`
-/// (Godot's variant-operand arm at analyzer.cpp:5236-5238 made unconditional — safe, the operator-
-/// validity error returns in E2/E3).
+/// `GDScriptAnalyzer::reduce_unary_op` (analyzer.cpp:5250).
 fn reduce_unary_op(ctx: &mut AnalysisContext, id: NodeId) {
     let NodeKind::UnaryOp(op_node) = ctx.node(id).kind.clone() else {
         return;
     };
+    // analyzer.cpp:5255-5258 — missing operand: the default UNDETECTED Variant.
     let Some(operand_id) = op_node.operand else {
-        ctx.set_type(id, variant_dt());
+        ctx.set_type(
+            id,
+            DataType {
+                kind: DtKind::Variant,
+                ..Default::default()
+            },
+        );
         return;
     };
     reduce_expression(ctx, operand_id, false);
+    let operand_type = ctx.get_type(operand_id).clone();
 
+    // analyzer.cpp:5262-5266 — constant fold. Invalid evaluate keeps the node constant with a Nil
+    // reduced value (the static Variant::evaluate returns Variant() on invalid).
+    let mut opaque_operand = false;
     if ctx.folds.is_reduced(operand_id) {
-        let operand = ctx.folds.get(operand_id).cloned();
-        if let Some(folded) = operand.and_then(|v| eval_unary(op_node.operation, &v)) {
-            let dt = type_from_variant(&folded);
-            ctx.folds.set(id, folded);
-            ctx.set_type(id, dt);
-            return;
+        if let Some(v) = ctx.folds.get(operand_id).cloned() {
+            if matches!(v, FoldedValue::Opaque(..)) {
+                opaque_operand = true;
+            } else if let Some(folded) = eval_unary(op_node.operation, &v) {
+                ctx.folds.set(id, folded);
+            } else {
+                ctx.folds.set(id, FoldedValue::Nil);
+            }
         }
     }
-    ctx.set_type(id, variant_dt());
+
+    let result = if operand_type.is_variant() {
+        // analyzer.cpp:5268-5270 — upstream stamps the default UNDETECTED Variant. gdls keeps
+        // Inferred for the ambiguous soft-Variant operand (a possible reducer degrade).
+        let source = if operand_type.kind == DtKind::Variant
+            && (operand_type.has_no_type() || operand_type.is_hard_type())
+        {
+            TypeSource::Undetected
+        } else {
+            TypeSource::Inferred
+        };
+        DataType {
+            kind: DtKind::Variant,
+            type_source: source,
+            ..Default::default()
+        }
+    } else {
+        // analyzer.cpp:5271-5279 — validate against the unary operator table.
+        let (res, valid) = get_operation_type_unary(op_node.operation, &operand_type);
+        if !valid {
+            ctx.push_error(
+                format!(
+                    r#"Invalid operand of type "{operand_type}" for unary operator "{op}"."#,
+                    op = unary_op_symbol(op_node.operation),
+                ),
+                id,
+            );
+        }
+        if opaque_operand && res.kind == DtKind::Builtin {
+            ctx.folds
+                .set(id, FoldedValue::Opaque(res.builtin_type, None));
+        }
+        res
+    };
+    ctx.set_type(id, result);
+}
+
+/// Unary `GDScriptAnalyzer::get_operation_type` (analyzer.cpp:6260-6266): the binary form with a
+/// hard ANNOTATED_INFERRED Nil as `b`, so `hard_operation` reduces to `a.is_hard_type()`.
+fn get_operation_type_unary(op: UnaryOp, a: &DataType) -> (DataType, bool) {
+    let a_t = coerce_enum_to_builtin_for_op(a);
+    let hard_operation = a.is_hard_type();
+    match validated_unary_op_result(op, a_t) {
+        Some(res_bt) => (
+            DataType {
+                type_source: if hard_operation {
+                    TypeSource::AnnotatedInferred
+                } else {
+                    TypeSource::Inferred
+                },
+                kind: DtKind::Builtin,
+                builtin_type: res_bt,
+                ..Default::default()
+            },
+            true,
+        ),
+        None => (
+            DataType {
+                kind: DtKind::Variant,
+                type_source: TypeSource::Undetected,
+                ..Default::default()
+            },
+            !hard_operation,
+        ),
+    }
+}
+
+/// Unary rows of `core/variant/variant_op.cpp`: OP_NEGATE / OP_POSITIVE (:456-478),
+/// OP_BIT_NEGATE (:485), OP_NOT (:882-920 — registered for every type, returns Bool).
+fn validated_unary_op_result(op: UnaryOp, a: VariantType) -> Option<VariantType> {
+    use VariantType::*;
+    match op {
+        UnaryOp::Negative | UnaryOp::Positive => match a {
+            Int | Float | Vector2 | Vector2i | Vector3 | Vector3i | Vector4 | Vector4i
+            | Quaternion | Plane | Color => Some(a),
+            _ => None,
+        },
+        UnaryOp::Complement => (a == Int).then_some(Int),
+        UnaryOp::LogicNot => Some(Bool),
+    }
+}
+
+/// `Variant::get_operator_name` for the unary operators (variant_op.cpp:1092-1104).
+fn unary_op_symbol(op: UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Negative => "unary-",
+        UnaryOp::Positive => "unary+",
+        UnaryOp::Complement => "~",
+        UnaryOp::LogicNot => "not",
+    }
 }
 
 /// Constant-fold a unary operation over our `FoldedValue` subset, mirroring `Variant::evaluate` for
@@ -518,6 +641,29 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
                     ctx.set_type(id, dt);
                     return;
                 } else {
+                    // Godot's `r_valid = false` STRING arm (analyzer.cpp:3149-3151): an int
+                    // division/modulo by zero writes an error string into the reduced value
+                    // (`variant_op.h:141/248`), which becomes both the message and the node's
+                    // constant String value.
+                    let zero_msg = match (op_node.operation, &lv, &rv) {
+                        (BinaryOp::Division, FoldedValue::Int(_), FoldedValue::Int(0)) => {
+                            Some("Division by zero error")
+                        }
+                        (BinaryOp::Modulo, FoldedValue::Int(_), FoldedValue::Int(0)) => {
+                            Some("Modulo by zero error")
+                        }
+                        _ => None,
+                    };
+                    if let Some(msg) = zero_msg {
+                        ctx.push_error(
+                            format!("{msg} in operator {}.", binary_op_symbol(op_node.operation)),
+                            id,
+                        );
+                        let folded = FoldedValue::String(msg.to_owned());
+                        ctx.set_type(id, type_from_variant(&folded));
+                        ctx.folds.set(id, folded);
+                        return;
+                    }
                     // Fold attempted and failed — Godot's `r_valid = false` arm at
                     // analyzer.cpp:3126-3135. Emit the exact `Invalid operands to operator OP, A and B.`
                     // diagnostic the corpus pins (`errors/invalid_concatenation_bool.gd`,
@@ -535,7 +681,12 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
                         ),
                         id,
                     );
-                    ctx.set_type(id, variant_dt());
+                    // analyzer.cpp:3140-3163 — the node stays constant with the invalid
+                    // evaluate's default Nil, and its type is `type_from_variant(Nil)` (a hard
+                    // Nil), which is what draws resolve_assignable's `value is "null"` error on
+                    // a `:=` declaration.
+                    ctx.folds.set(id, FoldedValue::Nil);
+                    ctx.set_type(id, type_from_variant(&FoldedValue::Nil));
                     return;
                 }
             }
@@ -568,8 +719,21 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
             ..Default::default()
         }
     } else if left_dt.is_variant() || right_dt.is_variant() {
-        // analyzer.cpp:3158-3161: a variant operand keeps the result variant.
-        variant_dt()
+        // analyzer.cpp:3181-3184: a variant operand keeps the result variant — upstream stamps the
+        // default UNDETECTED Variant. gdls keeps Inferred unless a Variant operand is trustworthy
+        // (Undetected or hard), so a reducer-degraded soft Variant stays silent.
+        let trustworthy =
+            |d: &DataType| d.kind == DtKind::Variant && (d.has_no_type() || d.is_hard_type());
+        let source = if trustworthy(&left_dt) || trustworthy(&right_dt) {
+            TypeSource::Undetected
+        } else {
+            TypeSource::Inferred
+        };
+        DataType {
+            kind: DtKind::Variant,
+            type_source: source,
+            ..Default::default()
+        }
     } else {
         // analyzer.cpp:3162-3169 — hard-typed binary op. `get_operation_type` consults the
         // Variant operator-validity table; an unregistered (op, a_type, b_type) triple emits the
@@ -597,6 +761,13 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
                     ),
                     id,
                 );
+            }
+            if opaque_operand_types.is_some() {
+                // Constant operands: upstream took the both-constant path (analyzer.cpp:3140),
+                // whose invalid evaluate leaves a constant Nil — see the fold-fail arm above.
+                ctx.folds.set(id, FoldedValue::Nil);
+                ctx.set_type(id, type_from_variant(&FoldedValue::Nil));
+                return;
             }
         }
         res_dt
@@ -678,9 +849,17 @@ fn get_operation_type(op: BinaryOp, a: &DataType, b: &DataType) -> (DataType, bo
             (result, true)
         }
         None => {
-            // analyzer.cpp:6273-6276 — invalid is gated on `hard_operation`. Soft operands return
-            // Variant with `valid=true` (the result is unsafe but not an error).
-            (DataType::variant(), !hard_operation)
+            // analyzer.cpp:6320-6322 — invalid is gated on `hard_operation`. Soft operands return
+            // an UNDETECTED Variant with `valid=true` (the result is unsafe but not an error);
+            // hard operands additionally draw the caller's error.
+            (
+                DataType {
+                    kind: DtKind::Variant,
+                    type_source: TypeSource::Undetected,
+                    ..Default::default()
+                },
+                !hard_operation,
+            )
         }
     }
 }
@@ -8050,10 +8229,8 @@ mod tests {
             dt.is_variant(),
             "unary-negate of bool must NOT widen to Int"
         );
-        assert!(
-            fold.is_none(),
-            "unary-negate of bool must NOT record a folded value"
-        );
+        // analyzer.cpp:5262-5264: the node stays constant with the invalid evaluate's Nil.
+        assert_eq!(fold, Some(FoldedValue::Nil));
     }
 
     #[test]
@@ -8071,10 +8248,12 @@ mod tests {
             })))
         });
         let (dt, fold) = reduce_one(&tree, id);
-        assert!(dt.is_variant(), "division by zero degrades to Variant");
-        assert!(
-            fold.is_none(),
-            "division by zero must not record a folded value"
+        // analyzer.cpp:3149-3163 — the evaluator's error string is the reduced value, so the
+        // node is a constant hard String.
+        assert_eq!(dt.builtin_type, VariantType::String);
+        assert_eq!(
+            fold,
+            Some(FoldedValue::String("Division by zero error".to_owned()))
         );
     }
 

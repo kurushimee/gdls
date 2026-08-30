@@ -324,7 +324,10 @@ fn utility_callable_operator_error_names_callable() {
     let src = "extends Node\n\n\nfunc test() -> void:\n\tvar x := print + 1\n";
     assert_eq!(
         errors(src),
-        vec!["Invalid operands to operator +, Callable and int.".to_owned()]
+        vec![
+            "Invalid operands to operator +, Callable and int.".to_owned(),
+            r#"Cannot infer the type of "x" variable because the value is "null"."#.to_owned(),
+        ]
     );
 }
 
