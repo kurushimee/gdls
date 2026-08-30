@@ -269,17 +269,19 @@ fn reduce_literal(ctx: &mut AnalysisContext, id: NodeId) {
 }
 
 /// Map a `gd_syntax::token::Literal` (the parser-emitted constant value) to our `FoldedValue` —
-/// gdls's `Nil|Bool|Int|Float|String` subset of `Variant`. `StringName`/`NodePath` are stored as
-/// `String` for folding purposes (their builtin `VariantType` is still recorded on the literal's
-/// type via [`type_from_variant`] below — except for these two, where the AST conflates them with
-/// strings; E3 distinguishes them when the proper reducer for them lands).
+/// gdls's `Nil|Bool|Int|Float|String|StringName|NodePath` subset of `Variant`.
+///
+/// The three string-like literals used to coalesce into `String`, on the grounds that Godot treats
+/// `&"k"` and `"k"` as the same dictionary key. It does — and only those two: `NodePath` is
+/// key-equal to nothing but another `NodePath`, so coalescing it reported a phantom duplicate
+/// (#424). Each now folds as itself and [`crate::foldtable::string_like_eq`] owns the relation.
 fn folded_from_literal(lit: &Literal) -> FoldedValue {
     match lit {
         Literal::Int(v) => FoldedValue::Int(*v),
         Literal::Float(v) => FoldedValue::Float(*v),
         Literal::String(s) => FoldedValue::String(s.clone()),
-        Literal::StringName(s) => FoldedValue::String(s.clone()),
-        Literal::NodePath(s) => FoldedValue::String(s.clone()),
+        Literal::StringName(s) => FoldedValue::StringName(s.clone()),
+        Literal::NodePath(s) => FoldedValue::NodePath(s.clone()),
         Literal::Bool(b) => FoldedValue::Bool(*b),
         Literal::Null => FoldedValue::Nil,
     }
@@ -305,6 +307,8 @@ pub fn type_from_variant(value: &FoldedValue) -> DataType {
             FoldedValue::Int(_) => VariantType::Int,
             FoldedValue::Float(_) => VariantType::Float,
             FoldedValue::String(_) => VariantType::String,
+            FoldedValue::StringName(_) => VariantType::StringName,
+            FoldedValue::NodePath(_) => VariantType::NodePath,
             FoldedValue::Opaque(vt, _) => *vt,
         },
         ..Default::default()
@@ -388,7 +392,9 @@ fn folded_booleanize(v: &FoldedValue) -> Option<bool> {
         FoldedValue::Bool(b) => *b,
         FoldedValue::Int(i) => *i != 0,
         FoldedValue::Float(f) => *f != 0.0,
-        FoldedValue::String(s) => !s.is_empty(),
+        FoldedValue::String(s) | FoldedValue::StringName(s) | FoldedValue::NodePath(s) => {
+            !s.is_empty()
+        }
         FoldedValue::Opaque(..) => return None,
     })
 }
@@ -631,7 +637,10 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
                     // it; gdls has no formatter), so route through the type tail's str_format
                     // arm and keep constancy via the Opaque result stamp.
                     || (op_node.operation == BinaryOp::Modulo
-                        && matches!(lv, FoldedValue::String(_)));
+                        && matches!(
+                            lv,
+                            FoldedValue::String(_) | FoldedValue::StringName(_)
+                        ));
                 if has_opaque {
                     opaque_operand_types =
                         Some((folded_variant_type(&lv), folded_variant_type(&rv)));
@@ -1163,9 +1172,12 @@ fn eval_binary(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedV
         _ => (),
     }
 
-    // String concatenation (`+` on String) — `register_string_op(OP_ADD)` at variant_op.cpp:222.
+    // String concatenation — `register_string_op(OperatorEvaluatorStringConcat, OP_ADD)` at
+    // variant_op.cpp:222 registers all four String/StringName pairs, and every one of them returns
+    // a `String` (`ReturnType = String`, variant_op.h:717). `NodePath` has no concat registration
+    // at all, so `^"a" + "b"` correctly falls through to `Invalid operands`.
     if op == BinaryOp::Addition {
-        if let (String(l), String(r)) = (a, b) {
+        if let (String(l) | StringName(l), String(r) | StringName(r)) = (a, b) {
             return Some(String(format!("{l}{r}")));
         }
     }
@@ -1239,9 +1251,25 @@ fn compare(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedValue
         None
     };
 
+    // `register_string_op` covers all four String/StringName pairs for `OP_EQUAL` and
+    // `OP_NOT_EQUAL` (variant_op.cpp:493/615), so `"a" == &"a"` is true — but the ORDERED
+    // comparisons are registered same-type only (`:737-783`), so `"a" < &"b"` has no evaluator and
+    // is `Invalid operands to operator <, String and StringName.`. Answering the cross pair here,
+    // ahead of the ordering table, keeps those two apart.
+    if matches!(op, BinaryOp::CompEqual | BinaryOp::CompNotEqual) {
+        if let (String(l), StringName(r)) | (StringName(l), String(r)) = (a, b) {
+            return Some(Bool((l == r) == (op == BinaryOp::CompEqual)));
+        }
+    }
+
     let cmp = cmp_num.or_else(|| match (a, b) {
         (Nil, Nil) => Some(Ordering::Equal),
-        (String(l), String(r)) => Some(l.cmp(r)),
+        // Same-type only. `NodePath` is registered for equality alone (`:511`/`:633`), and the
+        // fabricated-Bool arms below cover that; giving it an `Ordering` here would fold
+        // `^"a" < ^"b"` that Godot refuses.
+        (String(l), String(r)) | (StringName(l), StringName(r)) | (NodePath(l), NodePath(r)) => {
+            Some(l.cmp(r))
+        }
         _ => None,
     });
 
@@ -1276,7 +1304,7 @@ pub(crate) fn booleanize(v: &FoldedValue) -> bool {
         Bool(b) => *b,
         Int(i) => *i != 0,
         Float(f) => *f != 0.0,
-        String(s) => !s.is_empty(),
+        String(s) | StringName(s) | NodePath(s) => !s.is_empty(),
         // Unreachable in practice: `eval_binary` rejects Opaque operands before its
         // booleanize-driven logic arms run. Total for safety; never trust an unknown value.
         Opaque(..) => false,
@@ -1293,6 +1321,8 @@ pub(crate) fn folded_variant_type(v: &FoldedValue) -> VariantType {
         FoldedValue::Int(_) => VariantType::Int,
         FoldedValue::Float(_) => VariantType::Float,
         FoldedValue::String(_) => VariantType::String,
+        FoldedValue::StringName(_) => VariantType::StringName,
+        FoldedValue::NodePath(_) => VariantType::NodePath,
         FoldedValue::Opaque(vt, _) => *vt,
     }
 }
@@ -1384,9 +1414,10 @@ fn reduce_array(ctx: &mut AnalysisContext, id: NodeId) {
 ///   its name, a `String`/`StringName`/`NodePath` literal folds to its value, anything else stays
 ///   un-folded.
 ///
-/// `StringName ↔ String` equivalence is automatic: [`folded_from_literal`] coalesces both into
-/// `FoldedValue::String`, so the corpus case `errors/dictionary_string_stringname_equivalent.gd`
-/// (`&"key"` ≡ `"key"`) is caught.
+/// `StringName ↔ String` equivalence is Godot's one cross-type key exemption
+/// (`StringLikeVariantComparator`, `core/variant/variant.cpp:3400-3411`), and it is the whole of
+/// it — [`folded_value_eq`] carries the relation, so `errors/dictionary_string_stringname_equivalent.gd`
+/// (`&"key"` ≡ `"key"`) is caught while `{"k": 1, ^"k": 2}` is two distinct keys.
 fn reduce_dictionary(ctx: &mut AnalysisContext, id: NodeId) {
     let dict = match &ctx.node(id).kind {
         NodeKind::Dictionary(d) => d.clone(),
@@ -1449,11 +1480,15 @@ fn reduce_dictionary(ctx: &mut AnalysisContext, id: NodeId) {
 /// analysis time instead of parse time (gdls's parser is engine-free). Sets the key's folded
 /// value, builtin type, and marks the node visited so a later `reduce_expression` no-ops.
 fn fold_lua_dict_key(ctx: &mut AnalysisContext, key_id: NodeId) {
+    // Both branches of gdscript_parser.cpp:3331-3336 write a `StringName`: an identifier key
+    // through `IdentifierNode::name`, a literal key through an explicit `StringName(...)`
+    // conversion. The parser also rejects any literal key that is not a String, so no other
+    // literal shape can legitimately arrive here.
     let folded = match &ctx.node(key_id).kind {
-        NodeKind::Identifier(i) => FoldedValue::String(i.name.clone()),
+        NodeKind::Identifier(i) => FoldedValue::StringName(i.name.clone()),
         NodeKind::Literal(l) => match &l.value {
             Literal::String(s) | Literal::StringName(s) | Literal::NodePath(s) => {
-                FoldedValue::String(s.clone())
+                FoldedValue::StringName(s.clone())
             }
             other => folded_from_literal(other),
         },
@@ -1466,25 +1501,18 @@ fn fold_lua_dict_key(ctx: &mut AnalysisContext, key_id: NodeId) {
     ctx.reduced.insert(key_id);
 }
 
-/// `FoldedValue` equality for dup-key detection. `PartialEq` on `FoldedValue` already exists, but
-/// it would reject `Float` equality on NaN — for dictionary keys that's the right behavior
-/// (NaN != NaN), and Godot's Variant `==` on numeric keys mirrors it. Plus
-/// `StringName/String/NodePath` are coalesced into `FoldedValue::String` so they compare equal,
-/// matching `errors/dictionary_string_stringname_equivalent.gd`.
+/// `FoldedValue` equality for dup-key detection — [`crate::foldtable::string_like_eq`], which is
+/// the port of Godot's own dictionary-key relation (`StringLikeVariantComparator` over
+/// `Variant::hash_compare`).
+///
+/// Two things that relation gets right and a derived `PartialEq` would not: `String` and
+/// `StringName` are the one cross-type pair that matches, which is
+/// `errors/dictionary_string_stringname_equivalent.gd`, and `NodePath` matches neither of them,
+/// which is #424. It also decides no opaque value except a utility callable, since two references
+/// to the same utility fold to the same constant `Callable` and are a provable duplicate
+/// (`{print: 1, print: 2}`) while `{Vector3.UP: 1, Vector3.DOWN: 2}` is not.
 fn folded_value_eq(a: &FoldedValue, b: &FoldedValue) -> bool {
-    // Two references to the same utility function fold to the same constant Callable
-    // (`Callable(GDScriptUtilityCallable(name))`, compared by name in Godot), so same-utility keys
-    // ARE a provable duplicate — `{print: 1, print: 2}`.
-    if let (FoldedValue::Opaque(_, Some(ua)), FoldedValue::Opaque(_, Some(ub))) = (a, b) {
-        return ua == ub;
-    }
-    // Any other `Opaque` constant's value is unknown — it can never be *proven* a duplicate, so it
-    // never compares equal (`{Vector3.UP: 1, Vector3.DOWN: 2}` must not flag a phantom dup-key;
-    // Godot compares the real folded vectors).
-    if matches!(a, FoldedValue::Opaque(..)) || matches!(b, FoldedValue::Opaque(..)) {
-        return false;
-    }
-    a == b
+    crate::foldtable::string_like_eq(a, b)
 }
 
 /// Render a folded key for the `Key "%s"` substitution in the dup-key diagnostic
@@ -1496,7 +1524,9 @@ fn folded_key_display(v: &FoldedValue) -> String {
         FoldedValue::Bool(b) => b.to_string(),
         FoldedValue::Int(i) => i.to_string(),
         FoldedValue::Float(f) => f.to_string(),
-        FoldedValue::String(s) => s.clone(),
+        // `Variant::stringify` at the top level quote-wraps nothing, and renders all three
+        // string-likes as their bare text — `{^"y": 1, ^"y": 2}` reports `Key "y"`, oracle-pinned.
+        FoldedValue::String(s) | FoldedValue::StringName(s) | FoldedValue::NodePath(s) => s.clone(),
         // A utility callable stringifies as its scoped name (`@GlobalScope::print`,
         // `@GDScript::len`) — the one Opaque `folded_value_eq` can prove a duplicate, so the one
         // the dup-key error can actually name.
@@ -8121,12 +8151,16 @@ fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
 
     reduce_expression(ctx, path_id, false);
 
-    // analyzer.cpp:4701-4707 — must be a constant string. The path is a string when the folded
-    // value is a String/StringName/NodePath (the parser conflates these into FoldedValue::String;
-    // see folded_from_literal). A non-foldable expression isn't constant; a non-string fold isn't
-    // a path.
+    // analyzer.cpp:4701-4707 — must be a constant string. Godot's check is
+    // `reduced_value.get_type() == Variant::STRING`, but `can_convert_strict` has already coerced
+    // a `StringName`/`NodePath` argument by then, so all three read as a path. A non-foldable
+    // expression isn't constant; a non-string fold isn't a path.
     let folded_path: Option<String> = match ctx.folds.get(path_id) {
-        Some(crate::FoldedValue::String(s)) => Some(s.clone()),
+        Some(
+            crate::FoldedValue::String(s)
+            | crate::FoldedValue::StringName(s)
+            | crate::FoldedValue::NodePath(s),
+        ) => Some(s.clone()),
         _ => None,
     };
     if folded_path.is_none() {

@@ -2362,7 +2362,11 @@ fn render_folded(value: Option<&gd_analyze::FoldedValue>) -> Option<String> {
         FoldedValue::Int(i) => i.to_string(),
         // `{:?}` on an f64 keeps the decimal point GDScript needs (`1.0`, not `1`).
         FoldedValue::Float(f) => format!("{f:?}"),
-        FoldedValue::String(s) => format!("{:?}", s),
+        FoldedValue::String(s) => format!("{s:?}"),
+        // The GDScript source form of each, which is also how Godot stringifies them inside a
+        // collection.
+        FoldedValue::StringName(s) => format!("&{s:?}"),
+        FoldedValue::NodePath(s) => format!("^{s:?}"),
         FoldedValue::Opaque(..) => return None,
     })
 }

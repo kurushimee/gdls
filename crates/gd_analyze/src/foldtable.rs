@@ -25,6 +25,13 @@ pub enum FoldedValue {
     Int(i64),
     Float(f64),
     String(String),
+    /// `&"x"`. Held apart from [`FoldedValue::String`] because Godot holds them apart: the two are
+    /// key-equal to each other and to nothing else, and they stringify differently inside a
+    /// collection (`&"x"` versus `"x"`). See [`string_like_eq`].
+    StringName(String),
+    /// `^"x"`. Key-equal only to another `NodePath` — Godot's one cross-type key exemption is
+    /// `String`↔`StringName` and does not reach this (#424).
+    NodePath(String),
     /// A constant whose value the analyzer cannot materialize — builtin named constants like
     /// `Vector3.UP` (Godot folds the real `Variant` via `Variant::get_constant_value`,
     /// analyzer.cpp:4059-4067; this subset has no vector/color representations). Carries the
@@ -73,6 +80,36 @@ impl UtilityScope {
             UtilityScope::GlobalScope => "@GlobalScope",
             UtilityScope::GDScript => "@GDScript",
         }
+    }
+}
+
+/// Godot's dictionary-key relation over the folded subset: `StringLikeVariantComparator::compare`
+/// (`core/variant/variant.cpp:3400-3411`) sitting on `Variant::hash_compare` (`:3176`).
+///
+/// `hash_compare` requires both variants to be the same type, so a `NodePath` key never matches a
+/// `String` one. The comparator adds exactly one exemption on top — `String` against `StringName`,
+/// compared by text — and nothing else. `Float` follows `hash_compare_scalar`: equal by value,
+/// with two NaNs counting as equal.
+///
+/// Anything this cannot decide answers `false`, which is what keeps the dup-key error and the
+/// constant-subscript miss fail-closed.
+#[must_use]
+pub fn string_like_eq(a: &FoldedValue, b: &FoldedValue) -> bool {
+    use FoldedValue as V;
+    match (a, b) {
+        (V::String(x), V::StringName(y)) | (V::StringName(x), V::String(y)) => x == y,
+        (V::String(x), V::String(y))
+        | (V::StringName(x), V::StringName(y))
+        | (V::NodePath(x), V::NodePath(y)) => x == y,
+        (V::Nil, V::Nil) => true,
+        (V::Bool(x), V::Bool(y)) => x == y,
+        (V::Int(x), V::Int(y)) => x == y,
+        // `hash_compare_scalar` with `semantic_comparison = true`: two NaNs are the same key.
+        (V::Float(x), V::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
+        // Two references to the same utility fold to the same constant `Callable`, so they are a
+        // provable duplicate. Every other opaque value is genuinely unknown and never matches.
+        (V::Opaque(_, Some(x)), V::Opaque(_, Some(y))) => x == y,
+        _ => false,
     }
 }
 

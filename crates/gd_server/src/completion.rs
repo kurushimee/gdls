@@ -1665,7 +1665,10 @@ fn dict_key_string(
 ) -> Option<String> {
     use gd_syntax::ast::{DictStyle, NodeKind};
     // Fold-first: preserve the intact-parse path byte-for-byte.
-    if let Some(FoldedValue::String(s)) = analyzed.folds.get(key_id) {
+    // A Lua-style key folds as a `StringName` (gdscript_parser.cpp:3331-3336), a Python-style one
+    // as a `String`. Both are reachable through `d.key`, which is a `get_named` on the dictionary;
+    // a `NodePath` key is not, so it is deliberately not offered.
+    if let Some(FoldedValue::String(s) | FoldedValue::StringName(s)) = analyzed.folds.get(key_id) {
         return Some(s.clone());
     }
     // AST fallback (collapse): derive the key string syntactically, style-aware.
