@@ -684,6 +684,12 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
                     (annotated, ParamTyping::Annotated)
                 } else if pn.initializer.is_some() {
                     match initializer_type_expr(tree, pn.initializer) {
+                        // `f(a = null)` is not an unread type — Godot resolves `null` to a plain
+                        // soft `Variant`, the same answer a bare `f(a)` gets, and the argument
+                        // check names it that way.
+                        TypeExpr::None if is_null_literal(tree, pn.initializer) => {
+                            (TypeExpr::None, ParamTyping::Untyped)
+                        }
                         TypeExpr::None => (TypeExpr::None, ParamTyping::Unknown),
                         t if pn.infer_datatype => (t, ParamTyping::InferredHard),
                         t => (t, ParamTyping::InferredSoft),
@@ -938,6 +944,16 @@ fn type_expr(tree: &ParseTree, opt: Option<NodeId>) -> TypeExpr {
 /// #431: this is the floor a cross-file member's type falls to. Every shape missing here reads as
 /// `Variant` from another file while Godot has a real type, which silences the member access on
 /// it and then everything downstream of that.
+/// Whether `init` is the literal `null`. [`initializer_type_expr`] answers `TypeExpr::None` for it
+/// the same way it does for anything it cannot read, but the two mean different things to a
+/// parameter: `null` really is a soft `Variant`, while an unread initializer is a type the
+/// declaring file has and gdls does not.
+fn is_null_literal(tree: &ParseTree, init: Option<NodeId>) -> bool {
+    init.is_some_and(|id| {
+        matches!(&tree.get(id).kind, NodeKind::Literal(l) if l.value == gd_syntax::token::Literal::Null)
+    })
+}
+
 fn initializer_type_expr(tree: &ParseTree, init: Option<NodeId>) -> TypeExpr {
     use gd_syntax::token::Literal;
     let named = |s: &str| TypeExpr::Named {

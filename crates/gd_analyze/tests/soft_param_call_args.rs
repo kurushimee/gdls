@@ -104,6 +104,9 @@ func takes_unknown(a := TileSet.TILE_SHAPE_SQUARE) -> void:
 func takes_untyped(a) -> void:
 \tprint(a)
 
+func takes_null(a = null) -> void:
+\tprint(a)
+
 func takes_variant(a: Variant) -> void:
 \tprint(a)
 ";
@@ -209,6 +212,16 @@ fn a_cross_file_soft_default_parameter_names_its_real_type() {
     assert_eq!(
         warnings_of(&call("lib.takes_eq(v)")),
         vec![unsafe_arg(1, "takes_eq", "String")]
+    );
+}
+
+/// `= null` is not an unread type. Godot resolves it to a plain soft `Variant`, the same answer a
+/// bare `f(a)` gets, so the row fires and names `"Variant"`.
+#[test]
+fn a_null_default_is_a_plain_soft_variant() {
+    assert_eq!(
+        warnings_of(&call("lib.takes_null(v)")),
+        vec![unsafe_arg(1, "takes_null", "Variant")]
     );
 }
 
