@@ -1967,21 +1967,47 @@ fn load_native(
                 Err(e) => log::warn!("skipping GDExtension doc XML {xml}: {e}"),
             }
         }
-        // `[icons]` named classes but no usable doc XML was found ⇒ those types degrade to dynamic.
-        // Surfacing this is the whole reason `class_hints` is captured (`gdextension.rs`).
-        if merged == before && !ext.class_hints.is_empty() {
-            log::info!(
-                "GDExtension {} declares {} class hint(s) but shipped no usable doc XML; \
-                 its types degrade to dynamic",
-                ext.config,
-                ext.class_hints.len()
-            );
+        // `[icons]` named classes but no usable doc XML was found ⇒ those types degrade to
+        // dynamic — but only when the dump doesn't already carry them (a dump taken with the
+        // extension loaded has the classes; shipping no doc XML is then normal, not a
+        // degradation). `extension_class_notice` decides; capturing `class_hints` is the
+        // whole reason this check exists (`gdextension.rs`).
+        if let Some(notice) = extension_class_notice(ext, &db, merged - before) {
+            log::warn!("GDExtension {}: {notice}", ext.config);
         }
     }
     if merged > 0 {
         log::info!("merged {merged} GDExtension class(es) from doc XML");
     }
     (db, release_notice)
+}
+
+/// The degradation notice for one GDExtension whose classes this session cannot see.
+///
+/// `[icons]` hints exist, this pass merged no doc XML for the extension, and the dump
+/// doesn't carry the classes either — every hinted type degrades to dynamic. The causes all
+/// look identical from here: a stock surface, a never-imported project (no
+/// `.godot/extension_list.cfg`, the api_dump caveat), or a dump whose extension load failed
+/// (one extension's DLL failure silently unregisters the rest). Name the remediation, at
+/// `warn`: this is the difference between a typed extension API and `Variant`.
+///
+/// When the dump DOES carry a hinted class there is no degradation — an extension captured
+/// into the dump simply ships no doc XML, which is normal — so nothing is logged.
+fn extension_class_notice(
+    ext: &gd_project::gdextension::GdExtension,
+    db: &NativeDb,
+    merged_this_ext: usize,
+) -> Option<&'static str> {
+    if merged_this_ext > 0 || ext.class_hints.is_empty() {
+        return None;
+    }
+    let in_dump = ext.class_hints.iter().any(|h| db.class_named(h).is_some());
+    (!in_dump).then(|| {
+        "declares class hint(s) absent from both doc XML and the native dump — its types \
+         degrade to dynamic; a dump taken with the extension loaded fixes this (open the \
+         project in the Godot editor once — this generates .godot/extension_list.cfg — then \
+         restart gdls so it re-dumps)"
+    })
 }
 
 /// Act on a native surface whose release is not the one the project is read as (#329).
@@ -2095,6 +2121,50 @@ fn version_mismatch_notice(db: &NativeDb, dialect: Dialect) -> Option<String> {
          {dialect} build, or set the dialect explicitly.",
         header.version_major, header.version_minor,
     ))
+}
+
+#[cfg(test)]
+mod extension_notice_tests {
+    use super::*;
+
+    fn ext(hints: &[&str]) -> gd_project::gdextension::GdExtension {
+        gd_project::gdextension::GdExtension {
+            config: Utf8PathBuf::from("res://addons/x/x.gdextension"),
+            addon_dir: Utf8PathBuf::from("res://addons/x"),
+            class_hints: hints.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn db_with(class: &str) -> NativeDb {
+        let json = format!(
+            r#"{{"header":{{"version_major":4,"version_minor":6,"version_patch":0}},
+                "classes":[{{"name":"{class}"}}],"builtin_classes":[],"global_enums":[],
+                "global_constants":[],"utility_functions":[],"singletons":[]}}"#
+        );
+        NativeDb::from_json(&json).expect("fixture dump must ingest")
+    }
+
+    #[test]
+    fn hints_absent_everywhere_warn_with_the_remediation() {
+        let notice = extension_class_notice(&ext(&["BTPlayer"]), &db_with("Node"), 0)
+            .expect("hints the session cannot see must be called out");
+        assert!(notice.contains("degrade to dynamic"), "{notice}");
+        assert!(notice.contains("extension_list.cfg"), "{notice}");
+        assert!(notice.contains("restart gdls"), "{notice}");
+    }
+
+    #[test]
+    fn hints_already_in_the_dump_mean_no_degradation() {
+        // A dump captured with the extension loaded carries the class; shipping no doc XML
+        // is then normal, and a "types degrade to dynamic" line would be a lie.
+        assert!(extension_class_notice(&ext(&["BTPlayer"]), &db_with("BTPlayer"), 0).is_none());
+    }
+
+    #[test]
+    fn merged_doc_xml_or_no_hints_stay_silent() {
+        assert!(extension_class_notice(&ext(&["BTPlayer"]), &db_with("Node"), 1).is_none());
+        assert!(extension_class_notice(&ext(&[]), &db_with("Node"), 0).is_none());
+    }
 }
 
 #[cfg(test)]
