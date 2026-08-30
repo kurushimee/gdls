@@ -1169,3 +1169,58 @@ fn both_toggles_off_returns_empty() {
 
     shutdown(&client, server_thread);
 }
+
+/// A `const X := …` is a `:=` declaration and gets the same inferred-type hint and rewrite edit as
+/// a `var` (#347). It is the case with the least other signal — the type appears nowhere on the
+/// line — and it is where the rewrite edit is most useful, since a project tightening its typing is
+/// exactly what adds `const` annotations.
+#[test]
+fn type_hints_on_an_inferred_const_at_both_scopes() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let src = "extends Node\n\nconst CLASS_C := 2.0\nconst ANNOTATED: int = 4\n\nfunc run() -> void:\n\tconst LOCAL_C := 4.0\n\tconst PARENED := (1 + 2)\n\tprint(CLASS_C, ANNOTATED, LOCAL_C, PARENED)\n";
+    init_and_open_caps(&p, &client, &[("t.gd", src)], inlay_caps(false, false));
+    let uri = file_uri(&p.root.join("t.gd"));
+    let hints = request_hints(&client, 10, &uri, whole_doc());
+    let type_hints: Vec<&InlayHint> = hints
+        .iter()
+        .filter(|h| h.kind == Some(InlayHintKind::TYPE))
+        .collect();
+
+    for (line, label) in [(2, ": float"), (6, ": float"), (7, ": int")] {
+        assert!(
+            type_hints
+                .iter()
+                .any(|h| label_of(h) == label && h.position.line == line),
+            "expected a `{label}` TYPE hint on line {line}; got {type_hints:?}"
+        );
+    }
+    // An annotated `const` already says its type — no hint.
+    assert!(
+        !type_hints.iter().any(|h| h.position.line == 3),
+        "an annotated `const ANNOTATED: int` must get NO hint; got {type_hints:?}"
+    );
+
+    // The rewrite edit neutralizes `:=` and, for a PARENTHESIZED initializer, must stop at the
+    // `(` — replacing up to the initializer NODE's start would eat the paren and orphan its match.
+    let parened = type_hints
+        .iter()
+        .find(|h| h.position.line == 7)
+        .expect("the parenthesized const's hint");
+    let edits = parened
+        .text_edits
+        .as_ref()
+        .expect("a rewrite edit on a builtin-typed const");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].new_text, ": int = ");
+    // `\tconst PARENED := (1 + 2)`: tab(0) `const`(1-5) ` `(6) `PARENED`(7-13) ` := `(14-17) `(`(18).
+    assert_eq!(edits[0].range.start.character, 14);
+    assert_eq!(
+        edits[0].range.end.character, 18,
+        "the edit must end at the `(`, not inside it: {:?}",
+        edits[0].range
+    );
+
+    shutdown(&client, server_thread);
+}
