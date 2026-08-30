@@ -56,6 +56,7 @@ impl AutoloadQuery {
             name_span: Default::default(),
             line: 1,
             doc: None,
+            init: None,
         };
         let iface = Interface {
             class_name: None,

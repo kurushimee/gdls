@@ -118,6 +118,28 @@ pub struct MemberFlags {
     pub ty_is_soft: bool,
 }
 
+/// What an untyped member's initializer names, when [`initializer_type_expr`] could not decide a
+/// type from the syntax alone. The shallow pass has no analyzer under it, so it cannot evaluate
+/// `make()` or `E.A` — but it can record *what was written*, and the reading file's analyzer can
+/// resolve that against the declaring class the same lazy way it resolves an annotation.
+///
+/// Only shapes with a single reading are captured. Anything that could mean two things — an
+/// index, an argument-dependent call, a chain through a value — is left out, because a wrong
+/// cross-file type is worse than no cross-file type (#431).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InitShape {
+    /// A dotted identifier chain read as a value: `SOME_CONST`, `E.A`, `Other.KONST`,
+    /// `SomeAutoload.level`.
+    MemberChain(Vec<String>),
+    /// A call whose callee is such a chain: `make()`, `Other.make()`. The arguments are not
+    /// captured — the type comes from the function's declared return.
+    Call(Vec<String>),
+    /// `preload("res://x.gd")`, and `preload("res://x.gd").new()` when `construct` is set. Only a
+    /// `res://` literal is captured: a relative path carries no dependency edge, so its type could
+    /// go stale without anything invalidating the reader.
+    Preload { path: String, construct: bool },
+}
+
 /// One exposed member of a class.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberDecl {
@@ -157,6 +179,12 @@ pub struct MemberDecl {
     /// SHADOWED_VARIABLE_BASE_CLASS that include the member's line in the message
     /// (`"already-declared variable at line N"`).
     pub line: u32,
+    /// What the initializer named, for a `var`/`const` whose [`Self::ty`] came out
+    /// [`TypeExpr::None`] — the reader resolves it lazily (#431). `None` whenever `ty` already
+    /// has an answer, and boxed because almost every member has neither. **Hashed**: swapping
+    /// `make()` for `other()` changes what dependents compute, and nothing else in the interface
+    /// would show it.
+    pub init: Option<Box<InitShape>>,
 }
 
 /// A *named* enum and its value identifiers. Godot's `EnumNode::values[i].identifier->name`
@@ -301,6 +329,7 @@ impl Interface {
             m.params.hash(h);
             m.required_params.hash(h);
             m.flags.hash(h);
+            m.init.hash(h);
             // m.span / m.name_span are intentionally NOT hashed.
         }
         for inner in &self.inner {
@@ -540,6 +569,9 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     // `var x = expr` reads the initializer the same way `var x := expr` does, but the answer is
     // soft: Godot only hardens the inferred type when `:=` asked for it.
     let ty_is_soft = v.datatype_specifier.is_none() && !v.infer_datatype;
+    let init = matches!(ty, TypeExpr::None)
+        .then(|| capture_init_shape(tree, v.initializer))
+        .flatten();
     Some(MemberDecl {
         name,
         kind,
@@ -558,6 +590,7 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
         doc: member_doc(tree, id),
+        init,
     })
 }
 
@@ -572,6 +605,9 @@ fn const_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     if matches!(ty, TypeExpr::None) {
         ty = initializer_type_expr(tree, c.initializer);
     }
+    let init = matches!(ty, TypeExpr::None)
+        .then(|| capture_init_shape(tree, c.initializer))
+        .flatten();
     Some(MemberDecl {
         name,
         kind: MemberKind::Const,
@@ -584,6 +620,7 @@ fn const_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
         doc: member_doc(tree, id),
+        init,
     })
 }
 
@@ -634,6 +671,7 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
         doc: member_doc(tree, id),
+        init: None,
     })
 }
 
@@ -670,6 +708,7 @@ fn signal_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
         doc: member_doc(tree, id),
+        init: None,
     })
 }
 
@@ -694,6 +733,7 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         name_span: tree.get(ident_id).span,
         line: node.loc.start.line,
         doc: member_doc(tree, id),
+        init: None,
     })
 }
 
@@ -779,6 +819,7 @@ fn enum_value_member(tree: &ParseTree, value: &EnumValue) -> Option<MemberDecl> 
         name_span: node.span,
         line: node.loc.start.line,
         doc: member_doc(tree, id),
+        init: None,
     })
 }
 
@@ -902,6 +943,64 @@ fn initializer_type_expr(tree: &ParseTree, init: Option<NodeId>) -> TypeExpr {
         NodeKind::GetNode(_) => named("Node"),
         _ => TypeExpr::None,
     }
+}
+
+/// What an initializer NAMES, for the members [`initializer_type_expr`] could not type. The
+/// answers are deliberately few (#431): the shallow pass has no analyzer, so it records the shape
+/// and the reader resolves it. A shape with more than one reading is not recorded at all — an
+/// index, a call through a value, a call whose result depends on its arguments — because a wrong
+/// cross-file type is worse than none.
+fn capture_init_shape(tree: &ParseTree, init: Option<NodeId>) -> Option<Box<InitShape>> {
+    let id = init?;
+    match &tree.get(id).kind {
+        NodeKind::Identifier(_) | NodeKind::Subscript(_) => {
+            attribute_path(tree, id).map(|p| Box::new(InitShape::MemberChain(p)))
+        }
+        NodeKind::Preload(pl) => preload_res_path(tree, pl.path).map(|path| {
+            Box::new(InitShape::Preload {
+                path,
+                construct: false,
+            })
+        }),
+        NodeKind::Call(c) => {
+            let callee = c.callee?;
+            if c.function_name == "new" {
+                // `preload("res://x.gd").new()` — the callee is `<preload>.new`, so the base of
+                // the attribute is the preload rather than a nameable chain.
+                if let NodeKind::Subscript(sub) = &tree.get(callee).kind {
+                    if let Some(base) = sub.base {
+                        if let NodeKind::Preload(pl) = &tree.get(base).kind {
+                            return preload_res_path(tree, pl.path).map(|path| {
+                                Box::new(InitShape::Preload {
+                                    path,
+                                    construct: true,
+                                })
+                            });
+                        }
+                    }
+                }
+                // A nameable `A.new()` / `A.B.new()` is already a type, handled by
+                // `initializer_type_expr`; anything else naming `new` has no single reading.
+                return None;
+            }
+            attribute_path(tree, callee).map(|p| Box::new(InitShape::Call(p)))
+        }
+        _ => None,
+    }
+}
+
+/// The `res://` string literal a `preload` was given, when it is a plain literal. A relative path
+/// is refused on purpose: `collect_preload_deps` only records
+/// `res://` targets, so a relative one would carry no dependency edge and its type could go stale
+/// with nothing to invalidate the reader.
+fn preload_res_path(tree: &ParseTree, path: Option<NodeId>) -> Option<String> {
+    let NodeKind::Literal(l) = &tree.get(path?).kind else {
+        return None;
+    };
+    let gd_syntax::token::Literal::String(text) = &l.value else {
+        return None;
+    };
+    text.starts_with("res://").then(|| text.clone())
 }
 
 /// The dotted identifier chain under an attribute expression: `A` → `[A]`, `A.B.C` → `[A, B, C]`.
@@ -1219,6 +1318,92 @@ var b := pick().new()
             i.members.iter().find(|m| m.name == "b").unwrap().ty,
             TypeExpr::None
         );
+    }
+
+    #[test]
+    fn an_untypeable_initializer_records_what_it_names() {
+        let i = iface(
+            "extends Node\n\
+             const K := OTHER\n\
+             var chain := Other.KONST\n\
+             var enum_val := E.A\n\
+             var called := make()\n\
+             var dotted := Other.make()\n\
+             var pre := preload(\"res://lib.gd\")\n\
+             var pre_new := preload(\"res://lib.gd\").new()\n\
+             var indexed := rows[0]\n\
+             var through_value := holder.thing.compute()\n\
+             var relative := preload(\"lib.gd\")\n\
+             var typed := 3\n",
+        );
+        let init = |n: &str| {
+            i.members
+                .iter()
+                .find(|m| m.name == n)
+                .unwrap()
+                .init
+                .clone()
+                .map(|b| *b)
+        };
+        let chain = |v: &[&str]| {
+            Some(InitShape::MemberChain(
+                v.iter().map(|s| (*s).to_owned()).collect(),
+            ))
+        };
+        assert_eq!(init("K"), chain(&["OTHER"]));
+        assert_eq!(init("chain"), chain(&["Other", "KONST"]));
+        assert_eq!(init("enum_val"), chain(&["E", "A"]));
+        assert_eq!(
+            init("called"),
+            Some(InitShape::Call(vec!["make".to_owned()]))
+        );
+        assert_eq!(
+            init("dotted"),
+            Some(InitShape::Call(vec!["Other".to_owned(), "make".to_owned()]))
+        );
+        assert_eq!(
+            init("pre"),
+            Some(InitShape::Preload {
+                path: "res://lib.gd".to_owned(),
+                construct: false
+            })
+        );
+        assert_eq!(
+            init("pre_new"),
+            Some(InitShape::Preload {
+                path: "res://lib.gd".to_owned(),
+                construct: true
+            })
+        );
+        // A longer chain is still one reading — whether it resolves to anything is the reader's
+        // problem, not extraction's.
+        assert_eq!(
+            init("through_value"),
+            Some(InitShape::Call(vec![
+                "holder".to_owned(),
+                "thing".to_owned(),
+                "compute".to_owned()
+            ]))
+        );
+        // An index has no single reading, so nothing is recorded.
+        assert_eq!(init("indexed"), None);
+        // A relative preload carries no dependency edge, so its answer could go stale.
+        assert_eq!(init("relative"), None);
+        // A member the interface can already type records no shape.
+        assert_eq!(init("typed"), None);
+    }
+
+    #[test]
+    fn an_initializer_shape_change_changes_the_hash() {
+        // Nothing else in the interface moves when `make()` becomes `other()`, so without the
+        // shape in the hash a dependent would keep serving the old type.
+        let a = iface("extends Node\nvar x := make()\n");
+        let b = iface("extends Node\nvar x := other()\n");
+        assert_ne!(a.signature_hash(), b.signature_hash());
+        // And a body-only edit around it still does not.
+        let c = iface("extends Node\nvar x := make()\nfunc f() -> void:\n\tpass\n");
+        let d = iface("extends Node\nvar x := make()\nfunc f() -> void:\n\tprint(1)\n");
+        assert_eq!(c.signature_hash(), d.signature_hash());
     }
 
     #[test]
