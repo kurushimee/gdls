@@ -139,6 +139,64 @@ fn round_trip_warm_equivalent_to_cold() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 1b: a nested initializer shape survives the round trip.
+// ---------------------------------------------------------------------------
+
+/// `InitShape` is what a dependent reads to type a member the shallow pass could not (#431), and
+/// since #445 it nests. The cache serializes it, so a shape that came back flattened — or came
+/// back at all after a format change that should have invalidated it — would hand every warm-started
+/// session a different type than a cold one. `CACHE_FORMAT_VERSION` is what keeps the two honest.
+#[test]
+fn a_nested_init_shape_round_trips() {
+    let tmp = tempdir().expect("tempdir");
+    let root = make_project(&tmp);
+    fs::write(
+        root.join("c.gd"),
+        "extends Node\nvar joined := OS.get_temp_dir().path_join(\"x\")\n",
+    )
+    .expect("write c.gd");
+
+    let cold = Index::build(&root);
+    let cold_shape = cold
+        .interface_of(&root.join("c.gd"))
+        .expect("c.gd is indexed")
+        .members
+        .iter()
+        .find(|m| m.name == "joined")
+        .expect("the member is captured")
+        .init
+        .clone()
+        .expect("an untypeable initializer records its shape");
+    assert!(
+        matches!(
+            &*cold_shape,
+            gd_project::InitShape::Call { base: Some(_), .. }
+        ),
+        "the cold shape nests, got {cold_shape:?}"
+    );
+
+    let key = make_key(&root);
+    let files = stat_gd_files(&root);
+    let scenes = gd_project::SceneIndex::build(&root);
+    let assets = gd_project::AssetIndex::build(&root);
+    cache::save(&root, &cold, &scenes, &assets, &files, key.clone());
+
+    let loaded = cache::load(&root, &key).expect("load must succeed");
+    let warm_shape = loaded
+        .index
+        .interface_of(&root.join("c.gd"))
+        .expect("c.gd survives the round trip")
+        .members
+        .iter()
+        .find(|m| m.name == "joined")
+        .expect("the member survives the round trip")
+        .init
+        .clone()
+        .expect("the shape survives the round trip");
+    assert_eq!(warm_shape, cold_shape);
+}
+
+// ---------------------------------------------------------------------------
 // Test 2: corruption → cold fallback + quarantine (no panic).
 // ---------------------------------------------------------------------------
 

@@ -6971,9 +6971,31 @@ fn resolve_member_init_shape(
         return ShapeAnswer::Cyclic;
     }
     ctx.init_shape_stack.push(frame);
-    let answer = match shape {
-        gd_project::InitShape::MemberChain(path) => resolve_value_path(ctx, link, path),
-        gd_project::InitShape::Call(path) => resolve_call_shape(ctx, link, path),
+    let answer = resolve_shape(ctx, link, shape, gd_project::INIT_SHAPE_MAX_DEPTH);
+    ctx.init_shape_stack.pop();
+    answer
+}
+
+/// One structural level of an [`InitShape`]. `sdepth` bounds the nesting independently of the
+/// member-hop cap above: capture already refuses anything deeper than
+/// [`gd_project::INIT_SHAPE_MAX_DEPTH`], so this only ever fires on a hand-tampered cache — but it
+/// fires rather than recursing.
+fn resolve_shape(
+    ctx: &mut AnalysisContext,
+    link: &crate::data_type::ScriptRef,
+    shape: &gd_project::InitShape,
+    sdepth: usize,
+) -> ShapeAnswer {
+    if sdepth == 0 {
+        return ShapeAnswer::Unknown;
+    }
+    match shape {
+        gd_project::InitShape::Read { base, path } => {
+            resolve_value_path(ctx, link, base.as_deref(), path, sdepth)
+        }
+        gd_project::InitShape::Call { base, path } => {
+            resolve_call_shape(ctx, link, base.as_deref(), path, sdepth)
+        }
         gd_project::InitShape::Preload { path, construct } => {
             match ctx.xfile.resolve_path_from(link.file, path) {
                 Some(target) if *construct => {
@@ -6983,9 +7005,7 @@ fn resolve_member_init_shape(
                 None => ShapeAnswer::Unknown,
             }
         }
-    };
-    ctx.init_shape_stack.pop();
-    answer
+    }
 }
 
 /// A dotted chain read as a VALUE (`SOME`, `E.A`, `Other.KONST`, `SomeAutoload.level`): resolve
@@ -6995,14 +7015,26 @@ fn resolve_member_init_shape(
 fn resolve_value_path(
     ctx: &mut AnalysisContext,
     link: &crate::data_type::ScriptRef,
+    base: Option<&gd_project::InitShape>,
     path: &[String],
+    sdepth: usize,
 ) -> ShapeAnswer {
-    let Some((head, rest)) = path.split_first() else {
-        return ShapeAnswer::Unknown;
-    };
-    let mut cur = match resolve_value_head(ctx, link, head) {
-        ShapeAnswer::Type(dt) => *dt,
-        other => return other,
+    // With a nested base the whole `path` is read off its result; without one the first segment
+    // is the head and resolves in the declaring class's scope.
+    let (mut cur, rest) = match base {
+        Some(b) => match resolve_shape(ctx, link, b, sdepth - 1) {
+            ShapeAnswer::Type(dt) => (*dt, path),
+            other => return other,
+        },
+        None => {
+            let Some((head, rest)) = path.split_first() else {
+                return ShapeAnswer::Unknown;
+            };
+            match resolve_value_head(ctx, link, head, HeadMode::Value) {
+                ShapeAnswer::Type(dt) => (*dt, rest),
+                other => return other,
+            }
+        }
     };
     for seg in rest {
         cur = match member_type_of(ctx, &cur, seg) {
@@ -7013,11 +7045,24 @@ fn resolve_value_path(
     ShapeAnswer::Type(Box::new(cur))
 }
 
+/// Whether a chain head is being resolved as a value or as the base of a call.
+///
+/// A native class name is the one head that differs. As a VALUE it is refused: Godot renders its
+/// metatype `GDScriptNativeClass`, a shape gdls does not produce, so anything read off it would be
+/// a guess. As a CALL base it is exactly what `OS.get_data_dir()` needs, and `reduce_call`'s
+/// in-file path already types that expression from the same dump.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadMode {
+    Value,
+    CallBase,
+}
+
 /// The leading segment of a value chain, resolved in the declaring class's scope.
 fn resolve_value_head(
     ctx: &mut AnalysisContext,
     link: &crate::data_type::ScriptRef,
     name: &str,
+    mode: HeadMode,
 ) -> ShapeAnswer {
     // A member of the declaring class or its bases shadows everything below.
     if let Some((decl_link, member)) = iface_member_in_chain(ctx, link, name) {
@@ -7037,6 +7082,14 @@ fn resolve_value_head(
             };
         }
     }
+    // A native class sits HERE, between the class members above and the project globals below —
+    // `reduce_identifier`'s in-file order (analyzer.cpp step 4, before `class_name` and autoload
+    // lookup). Putting it any later would type `Time.get_ticks_msec()` off a project autoload
+    // named `Time` where the declaring file itself picks the native class, and the seam's whole
+    // contract is that it agrees with that file or falls short of it — never differs.
+    if mode == HeadMode::CallBase && ctx.native.class_named(name).is_some() {
+        return ShapeAnswer::Type(Box::new(native_meta_type(name.to_owned())));
+    }
     if let Some(fid) = ctx.xfile.global_class_file(name) {
         return ShapeAnswer::Type(Box::new(script_meta_type(ctx, fid)));
     }
@@ -7048,8 +7101,6 @@ fn resolve_value_head(
             ctx, name, "", true,
         )));
     }
-    // A native class head is left alone: Godot renders its metatype `GDScriptNativeClass`, a
-    // shape gdls does not produce, so anything read off it would be a guess.
     ShapeAnswer::Unknown
 }
 
@@ -7094,42 +7145,117 @@ fn member_type_of(ctx: &mut AnalysisContext, base: &DataType, name: &str) -> Sha
     type_of_iface_member(ctx, &decl_link, &member)
 }
 
-/// A call whose callee is a nameable chain (`make()`, `Other.make()`): find the function and take
-/// its DECLARED return type. A function with no return annotation answers nothing — propagating
-/// its `Variant` as a hard type would let a reader mint claims only the declaring file can make.
+/// A call: find the function and take its DECLARED return type. A function with no return
+/// annotation answers nothing — propagating its `Variant` as a hard type would let a reader mint
+/// claims only the declaring file can make.
+///
+/// The last segment of `path` is the method; anything before it is read first. Without a nested
+/// `base` the chain starts at a name in the declaring class's scope (`make()`, `Other.make()`);
+/// with one, the call is addressed off that shape's result (`OS.get_data_dir().path_join(x)`).
 fn resolve_call_shape(
     ctx: &mut AnalysisContext,
     link: &crate::data_type::ScriptRef,
+    base: Option<&gd_project::InitShape>,
     path: &[String],
+    sdepth: usize,
 ) -> ShapeAnswer {
     let Some((fname, base_path)) = path.split_last() else {
         return ShapeAnswer::Unknown;
     };
-    let (target, is_meta) = if base_path.is_empty() {
-        (link.clone(), false)
-    } else {
-        match resolve_value_path(ctx, link, base_path) {
-            ShapeAnswer::Type(dt) => match dt.script_type.clone() {
-                Some(sref) => (sref, dt.is_meta_type),
-                None => return ShapeAnswer::Unknown,
-            },
-            other => return other,
+    let base_dt = match base {
+        Some(b) => {
+            let mut cur = match resolve_shape(ctx, link, b, sdepth - 1) {
+                ShapeAnswer::Type(dt) => *dt,
+                other => return other,
+            };
+            for seg in base_path {
+                cur = match member_type_of(ctx, &cur, seg) {
+                    ShapeAnswer::Type(dt) => *dt,
+                    other => return other,
+                };
+            }
+            cur
+        }
+        None if base_path.is_empty() => {
+            script_instance_datatype(ctx, link.file, link.inner.clone())
+        }
+        None => {
+            let Some((head, rest)) = base_path.split_first() else {
+                return ShapeAnswer::Unknown;
+            };
+            let mut cur = match resolve_value_head(ctx, link, head, HeadMode::CallBase) {
+                ShapeAnswer::Type(dt) => *dt,
+                other => return other,
+            };
+            for seg in rest {
+                cur = match member_type_of(ctx, &cur, seg) {
+                    ShapeAnswer::Type(dt) => *dt,
+                    other => return other,
+                };
+            }
+            cur
         }
     };
-    let Some((decl_link, member)) = iface_member_in_chain(ctx, &target, fname) else {
-        return ShapeAnswer::Unknown;
+    shape_method_return(ctx, &base_dt, fname)
+}
+
+/// The declared return type of `fname` looked up on an already-resolved base — the one thing the
+/// seam needed that it did not have.
+///
+/// Three bases answer: a script (through its interface chain, as before), a native class, and a
+/// builtin. The last two go through the very functions `reduce_call` uses in-file
+/// ([`lookup_native_method`] / [`lookup_builtin_method`]), so the cross-file answer can only agree
+/// with the declaring file's own analysis. Everything else — a Variant, an enum meta, an
+/// unresolved type — answers `Unknown`, and so does a `void` or `Variant` return: a member typed
+/// off either would be a claim the reader minted rather than read.
+fn shape_method_return(ctx: &mut AnalysisContext, base: &DataType, fname: &str) -> ShapeAnswer {
+    if let Some(sref) = base.script_type.clone() {
+        let Some((decl_link, member)) = iface_member_in_chain(ctx, &sref, fname) else {
+            return ShapeAnswer::Unknown;
+        };
+        if member.kind != gd_project::MemberKind::Func {
+            return ShapeAnswer::Unknown;
+        }
+        if base.is_meta_type && !member.flags.is_static {
+            return ShapeAnswer::Unknown;
+        }
+        let dt = resolve_interface_type_expr(ctx, decl_link.file, &member.ty);
+        return if dt.is_variant() {
+            ShapeAnswer::Unknown
+        } else {
+            ShapeAnswer::Type(Box::new(dt))
+        };
+    }
+    let sig = match base.kind {
+        DtKind::Native => {
+            let Some(sig) = lookup_native_method(ctx, &base.native_type, fname) else {
+                return ShapeAnswer::Unknown;
+            };
+            // Through a class NAME rather than an instance, only a static method is callable —
+            // except on an engine singleton, whose every method `get_function_signature` flags
+            // static (analyzer.cpp:6036-6039). Anything else errors in the declaring file, so
+            // typing it here would be minting on top of broken code.
+            if base.is_meta_type
+                && !sig.is_static
+                && ctx.native.singleton_type(&base.native_type).is_none()
+            {
+                return ShapeAnswer::Unknown;
+            }
+            sig
+        }
+        DtKind::Builtin if !base.is_meta_type => {
+            match lookup_builtin_method(ctx, base.builtin_type, fname) {
+                Some(sig) => sig,
+                None => return ShapeAnswer::Unknown,
+            }
+        }
+        _ => return ShapeAnswer::Unknown,
     };
-    if member.kind != gd_project::MemberKind::Func {
+    // A `void` return arrives as a hard Nil; a member typed Nil would draw wrong rows everywhere.
+    if sig.return_dt.is_variant() || sig.return_dt.builtin_type == VariantType::Nil {
         return ShapeAnswer::Unknown;
     }
-    if is_meta && !member.flags.is_static {
-        return ShapeAnswer::Unknown;
-    }
-    let dt = resolve_interface_type_expr(ctx, decl_link.file, &member.ty);
-    if dt.is_variant() {
-        return ShapeAnswer::Unknown;
-    }
-    ShapeAnswer::Type(Box::new(dt))
+    ShapeAnswer::Type(Box::new(sig.return_dt))
 }
 
 /// The first `name` on `start`'s extends chain, with the link that declares it. Read-only: no

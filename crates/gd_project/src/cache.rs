@@ -120,7 +120,12 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// list and no softness at all; warm-loading it would keep serving `Variant` for every `f(a := "")`
 /// parameter — the same serve-the-older-answer failure v14 and v15 fixed. v16 files are ignored and
 /// rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 17;
+/// v18 (#445): `InitShape` became recursive — `Read` and `Call` carry an optional nested base, so
+/// an initializer rooted at another call (`OS.get_data_dir().path_join(x)`) is finally recordable.
+/// The serialized variant shapes changed, so a v17 cache does not deserialize at all; and a
+/// lenient decode would only hold the flat shapes, which read as `Variant` for every call-rooted
+/// initializer until the next cold index. v17 files are ignored and rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 18;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
