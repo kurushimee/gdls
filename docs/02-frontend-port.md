@@ -54,6 +54,8 @@ The full GDScript 2.0 type space:
 - Callables and signals, with signals as a first-class type carrying argument signatures.
 - A distinguished dynamic `Variant` type for untyped values.
 
+A native property's type comes from its getter, not from the property row. Godot's analyzer types a native member by reading the getter's `PropertyInfo` (`gdscript_analyzer.cpp:4343-4350`), and that struct carries the enum class name and the container element types beside the plain `Variant::Type`. The JSON dump's `classes[].properties[].type` flattens them — `Node.process_mode` is written `int` and a typed-array property is written `Array` — while the getter's signature keeps the structure (`enum::Node.ProcessMode`, `typedarray::T`). `NativeDb` therefore reads the getter back over a plain property type, which is what makes `node.process_mode` name `Node.ProcessMode`. Plain-versus-plain disagreements are left alone: there the `type` field is carrying a `PropertyInfo` hint string (`"Texture2D,-AtlasTexture,…"`), and picking a class out of it would be inventing a type.
+
 Gradual typing is modeled faithfully: the analyzer tracks when a value is statically known versus `Variant`, and downgrades to runtime-checked access exactly where Godot does, emitting `UNSAFE_*` warnings at those points. Getting "when is this `Variant`?" right is the central and most error-prone part of the port, which is why it is the main target of the conformance corpus (`06-testing-fidelity.md`).
 
 ## 6. Diagnostics sink
