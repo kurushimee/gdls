@@ -4010,8 +4010,9 @@ fn resolve_class_body(ctx: &mut AnalysisContext, class_id: NodeId) {
 
     emit_unused_member_warnings(ctx, class_id);
 
-    // WP-F: per-variable annotation-based warnings (analyzer.cpp:1066-1107, `DEBUG_ENABLED`):
-    // ONREADY_WITH_EXPORT (variable has both `@onready` and `@export`) and
+    // analyzer.cpp:1056-1061 then :1066-1107 — apply each member variable's annotations in
+    // source order, then emit the two warnings that read the flags those applies set:
+    // ONREADY_WITH_EXPORT (the variable ended up both `@onready` and `@export`ed) and
     // GET_NODE_DEFAULT_WITHOUT_ONREADY (non-static + non-onready variable initialized with
     // `$Node` / `%Unique` / `get_node(...)` — optionally wrapped in a cast).
     emit_variable_annotation_warnings(ctx, class_id);
@@ -4444,116 +4445,158 @@ fn emit_unused_member_warnings(ctx: &mut AnalysisContext, class_id: NodeId) {
     }
 }
 
-/// Emit `ONREADY_WITH_EXPORT` and `GET_NODE_DEFAULT_WITHOUT_ONREADY` warnings for class member
-/// variables, matching Godot's `DEBUG_ENABLED` block at gdscript_analyzer.cpp:1066-1107.
+/// Apply a class member variable's annotations in source order, then emit the two
+/// `DEBUG_ENABLED` warnings that read the flags those applies set.
+///
+/// This mirrors gdscript_analyzer.cpp:1056-1061, which resolves and then applies every
+/// annotation on a member in declaration order, followed by the warning block at :1066-1107.
+/// Each apply is a gate chain that stops at the first failure and only sets its flag
+/// (`onready`, `exported`) once it reaches the end, so a rejected annotation leaves the flag
+/// clear and the next annotation of the same family fails the same way. Godot therefore reports
+/// `@export @export_storage static var x` twice, once per apply.
+///
+/// The applies ported here are `onready_annotation` (gdscript_parser.cpp:4527) and the
+/// `@export*` family's shared prologue (gdscript_parser.cpp:4660, repeated verbatim in
+/// `export_storage_annotation` :4997, `export_custom_annotation` :5019 and
+/// `export_tool_button_annotation` :5047), plus the two type-shape checks gdls can answer:
+/// simple `@export` with nothing to infer from (:4792) and a Node-typed export outside a
+/// Node-derived class (:4861 / :4932).
 fn emit_variable_annotation_warnings(ctx: &mut AnalysisContext, class_id: NodeId) {
     use crate::warnings::WarningCode;
+
+    // gdscript_parser.cpp:4530 / :4861 / :4932 — the node-ness of the enclosing class, read once.
+    // `None` means the base chain is unknown, in which case gdls stays silent and lets the apply
+    // through rather than inventing a rejection.
+    let native_base = nearest_native_ancestor(ctx, class_id);
+    let is_node_derived = native_base
+        .as_ref()
+        .map(|base| ctx.native.is_subclass_of_named(base, "Node"));
+
     let total = member_count(ctx, class_id);
     for i in 0..total {
         let Some(Member::Variable(var_id)) = nth_member(ctx, class_id, i) else {
             continue;
         };
-        let (
-            has_onready,
-            onready_ann_id,
-            has_export,
-            export_ann_id,
-            export_ann_name,
-            is_static,
-            initializer,
-        ) = {
+        let (annotations, is_static, has_type_specifier, initializer) = {
             let var_node = ctx.node(var_id);
-            let mut has_onready = false;
-            let mut onready_ann_id: Option<NodeId> = None;
-            let mut has_export = false;
-            let mut export_ann_id: Option<NodeId> = None;
-            let mut export_ann_name = String::new();
-            for &ann_id in &var_node.annotations {
-                if let NodeKind::Annotation(a) = &ctx.node(ann_id).kind {
-                    match a.name.as_str() {
-                        "@onready" => {
-                            has_onready = true;
-                            if onready_ann_id.is_none() {
-                                onready_ann_id = Some(ann_id);
-                            }
-                        }
-                        // Godot's `member.variable->exported` includes every `@export*`
-                        // variant (@export, @export_range, @export_enum, etc.). Detect any
-                        // annotation whose name starts with "@export".
-                        n if n.starts_with("@export") => {
-                            has_export = true;
-                            if export_ann_id.is_none() {
-                                export_ann_id = Some(ann_id);
-                                export_ann_name = n.to_owned();
-                            }
-                        }
-                        _ => {}
-                    }
+            let annotations = var_node.annotations.clone();
+            let (is_static, has_type_specifier, initializer) = match &var_node.kind {
+                NodeKind::Variable(v) => {
+                    (v.is_static, v.datatype_specifier.is_some(), v.initializer)
                 }
-            }
-            let (is_static, initializer) = match &var_node.kind {
-                NodeKind::Variable(v) => (v.is_static, v.initializer),
-                _ => (false, None),
+                _ => (false, false, None),
             };
-            (
-                has_onready,
-                onready_ann_id,
-                has_export,
-                export_ann_id,
-                export_ann_name,
-                is_static,
-                initializer,
-            )
+            (annotations, is_static, has_type_specifier, initializer)
         };
 
-        // gdscript_parser.cpp:4648 — `@export` cannot be applied to a `static var`. Godot's
-        // annotation `apply()` checks this on the variable target; gdls's annotation-apply
-        // pass lands incrementally with WP-F, so this specific arm is handled inline against
-        // the variable's `is_static` flag. Error anchors at the `@export*` annotation, not
-        // the variable.
-        if is_static {
-            if let Some(ann_id) = export_ann_id {
-                ctx.push_error(
-                    format!(
-                        r#"Annotation "{export_ann_name}" cannot be applied to a static variable."#
-                    ),
-                    ann_id,
-                );
-            }
-        }
+        let mut onready = false;
+        let mut exported = false;
 
-        // gdscript_parser.cpp — annotation argument constancy validation. Each `@export*`
-        // annotation's argument must be a constant expression. Walk the args and emit
-        // `Argument N of annotation "@export*" isn't a constant expression.` when an arg
-        // identifier resolves to a non-constant local OR a non-constant class member
-        // (Variable / Signal / Function). gdls's fold table is too sparse to gate on
-        // `is_reduced` here; the identifier walk is a narrow but reliable check.
-        if let Some(ann_id) = export_ann_id {
-            let arg_ids: Vec<NodeId> = match &ctx.node(ann_id).kind {
-                NodeKind::Annotation(a) => a.arguments.clone(),
-                _ => Vec::new(),
+        for ann_id in annotations {
+            let name = match &ctx.node(ann_id).kind {
+                NodeKind::Annotation(a) => a.name.clone(),
+                _ => continue,
             };
-            for (arg_index, &arg_id) in arg_ids.iter().enumerate() {
-                if expression_references_nonconstant_member(ctx, arg_id, class_id) {
+            if name == "@onready" {
+                // gdscript_parser.cpp:4530-4544 — node-ness, then `static`, then the duplicate.
+                if is_node_derived == Some(false) {
+                    ctx.push_error(
+                        r#""@onready" can only be used in classes that inherit "Node"."#,
+                        ann_id,
+                    );
+                    continue;
+                }
+                if is_static {
+                    ctx.push_error(
+                        r#""@onready" annotation cannot be applied to a static variable."#,
+                        ann_id,
+                    );
+                    continue;
+                }
+                if onready {
+                    ctx.push_error(
+                        r#""@onready" annotation can only be used once per variable."#,
+                        ann_id,
+                    );
+                    continue;
+                }
+                onready = true;
+            } else if name.starts_with("@export") {
+                // gdscript_analyzer.cpp:1058 — `resolve_annotation` runs ahead of the apply, so a
+                // non-constant argument is reported even when the apply below rejects the
+                // annotation outright. gdls's fold table is too sparse to gate on `is_reduced`,
+                // so this walks the argument for an identifier that resolves to a non-constant
+                // local or a non-constant class member (Variable / Signal / Function).
+                let arg_ids: Vec<NodeId> = match &ctx.node(ann_id).kind {
+                    NodeKind::Annotation(a) => a.arguments.clone(),
+                    _ => Vec::new(),
+                };
+                for (arg_index, &arg_id) in arg_ids.iter().enumerate() {
+                    if expression_references_nonconstant_member(ctx, arg_id, class_id) {
+                        ctx.push_error(
+                            format!(
+                                r#"Argument {} of annotation "{name}" isn't a constant expression."#,
+                                arg_index + 1
+                            ),
+                            ann_id,
+                        );
+                        break;
+                    }
+                }
+
+                // gdscript_parser.cpp:4665-4674 — `static`, then a second `@export*` of any kind.
+                if is_static {
+                    ctx.push_error(
+                        format!(r#"Annotation "{name}" cannot be applied to a static variable."#),
+                        ann_id,
+                    );
+                    continue;
+                }
+                if exported {
                     ctx.push_error(
                         format!(
-                            r#"Argument {} of annotation "{export_ann_name}" isn't a constant expression."#,
-                            arg_index + 1
+                            r#"Annotation "{name}" cannot be used with another "@export" annotation."#
                         ),
                         ann_id,
                     );
-                    break;
+                    continue;
+                }
+                exported = true;
+
+                // gdscript_parser.cpp:4792 — simple `@export` needs something to infer from.
+                if name == "@export" && !has_type_specifier && initializer.is_none() {
+                    ctx.push_error(
+                        r#"Cannot use simple "@export" annotation with variable without type or initializer, since type can't be inferred."#,
+                        ann_id,
+                    );
+                    continue;
+                }
+
+                // gdscript_parser.cpp:4861 / :4932 — a Node-typed export needs a Node-derived
+                // class. The base's string in the template is `base_type.to_string()`, which for
+                // this chain walk is the bare native name (e.g. "Resource", "RefCounted").
+                if is_node_derived == Some(false) {
+                    let var_type = ctx.get_type(var_id).clone();
+                    if type_is_node_typed_for_export(ctx, &var_type) {
+                        let base = native_base.as_deref().unwrap_or_default();
+                        ctx.push_error(
+                            format!(
+                                r#"Node export is only supported in Node-derived classes, but the current class inherits "{base}"."#
+                            ),
+                            ann_id,
+                        );
+                    }
                 }
             }
         }
 
-        // analyzer.cpp:1067-1069 — both @onready and @export → ONREADY_WITH_EXPORT.
-        if has_onready && has_export {
+        // analyzer.cpp:1067-1069 — both flags set → ONREADY_WITH_EXPORT.
+        if onready && exported {
             ctx.push_warning(WarningCode::OnreadyWithExport, &[], var_id);
         }
 
         // analyzer.cpp:1070-1106 — non-static + non-onready + initializer is `$`/`%`/`get_node`.
-        if !is_static && !has_onready {
+        if !is_static && !onready {
             if let Some(init_id) = initializer {
                 if let Some(offending) = get_node_default_form(ctx.tree, init_id) {
                     ctx.push_warning(
@@ -4561,41 +4604,6 @@ fn emit_variable_annotation_warnings(ctx: &mut AnalysisContext, class_id: NodeId
                         &[offending],
                         var_id,
                     );
-                }
-            }
-        }
-
-        // gdscript_parser.cpp:4513-4515 — `@onready` requires a Node-derived class.
-        // Also gdscript_parser.cpp:4844-4847 / :4915-4918 — `@export` of a Node-derived type
-        // requires a Node-derived class. Both checks read the current class's nearest native
-        // ancestor and consult the DB's `is_subclass_of(native, "Node")`. The base's string for
-        // the error template is whatever `base_type.to_string()` produces, which for our chain
-        // walk is the bare native_type (e.g. "Resource", "RefCounted").
-        if has_onready || has_export {
-            let class_native_base = nearest_native_ancestor(ctx, class_id);
-            if let Some(native_base) = class_native_base.as_ref() {
-                let is_node_derived = ctx.native.is_subclass_of_named(native_base, "Node");
-                if has_onready && !is_node_derived {
-                    if let Some(ann_id) = onready_ann_id {
-                        ctx.push_error(
-                            r#""@onready" can only be used in classes that inherit "Node"."#,
-                            ann_id,
-                        );
-                    }
-                }
-                if has_export && !is_node_derived {
-                    let var_type = ctx.get_type(var_id).clone();
-                    let exports_node = type_is_node_typed_for_export(ctx, &var_type);
-                    if exports_node {
-                        if let Some(ann_id) = export_ann_id {
-                            ctx.push_error(
-                                format!(
-                                    r#"Node export is only supported in Node-derived classes, but the current class inherits "{native_base}"."#
-                                ),
-                                ann_id,
-                            );
-                        }
-                    }
                 }
             }
         }
