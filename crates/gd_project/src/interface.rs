@@ -108,6 +108,14 @@ pub struct MemberFlags {
     /// suppress the too-many arity check — the in-file path reads the same bit via
     /// `FunctionNode::rest_parameter`. Hashed: gaining/losing varargs changes call compatibility.
     pub is_vararg: bool,
+    /// `var` members whose [`MemberDecl::ty`] was read off a plain `=` initializer rather than an
+    /// annotation or a `:=`. Godot gives those a SOFT type — `INFERRED`, not `ANNOTATED_INFERRED`
+    /// (`gdscript_analyzer.cpp` `resolve_assignable`, the `!has_specified_type` arm) — and a soft
+    /// type is excused from the checks a hard one has to pass: no `Cannot assign a value of type
+    /// X`, no `UNSAFE_PROPERTY_ACCESS` on a member miss. Without this bit a cross-file reader
+    /// hardens every inferred member and reports things Godot does not. `const` never sets it:
+    /// a constant is `ANNOTATED_INFERRED` whether or not it was written with `:=`.
+    pub ty_is_soft: bool,
 }
 
 /// One exposed member of a class.
@@ -529,6 +537,9 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         // full analysis infers these; the shallow interface can read the simple shapes).
         ty = initializer_type_expr(tree, v.initializer);
     }
+    // `var x = expr` reads the initializer the same way `var x := expr` does, but the answer is
+    // soft: Godot only hardens the inferred type when `:=` asked for it.
+    let ty_is_soft = v.datatype_specifier.is_none() && !v.infer_datatype;
     Some(MemberDecl {
         name,
         kind,
@@ -540,6 +551,7 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
             is_static: v.is_static,
             exported: has_annotation(tree, &node.annotations, |n| n.starts_with("@export")),
             onready: has_annotation(tree, &node.annotations, |n| n == "@onready"),
+            ty_is_soft,
             ..MemberFlags::default()
         },
         span: node.span,
@@ -797,11 +809,19 @@ fn type_expr(tree: &ParseTree, opt: Option<NodeId>) -> TypeExpr {
 }
 
 /// The syntactically-obvious type of a `:=` initializer, for members with no annotation: a
-/// literal, an Array/Dictionary literal, a builtin constructor call (`Color(…)`), or a
+/// literal, an Array/Dictionary literal, a builtin constructor call (`Color(…)`), a
 /// builtin-class constant (`Color.PURPLE` — captured as the two-segment path so the analyzer can
-/// consult the dump for the constant's REAL declared type; `Vector3.AXIS_X` is `int`). Anything
-/// needing evaluation stays `TypeExpr::None` (soft Variant downstream). Godot's full analysis
-/// infers all of these; the shallow interface reads only the unambiguous shapes.
+/// consult the dump for the constant's REAL declared type; `Vector3.AXIS_X` is `int`), a
+/// constructor call (`A.new()`, `A.B.new()` — the whole attribute chain, so an inner class keeps
+/// its path), a cast (`x as T` — the cast's own type node, which is as declared as an
+/// annotation), or a node lookup (`$Path` / `%Unique` — a bare `Node`, per the `$`/`%` convention
+/// in `docs/02` §11). Anything needing evaluation stays `TypeExpr::None` (soft Variant
+/// downstream). Godot's full analysis infers all of these; the shallow interface reads only the
+/// unambiguous shapes.
+///
+/// #431: this is the floor a cross-file member's type falls to. Every shape missing here reads as
+/// `Variant` from another file while Godot has a real type, which silences the member access on
+/// it and then everything downstream of that.
 fn initializer_type_expr(tree: &ParseTree, init: Option<NodeId>) -> TypeExpr {
     use gd_syntax::token::Literal;
     let named = |s: &str| TypeExpr::Named {
@@ -828,16 +848,21 @@ fn initializer_type_expr(tree: &ParseTree, init: Option<NodeId>) -> TypeExpr {
                 named(&c.function_name)
             } else if c.function_name == "new" {
                 // `X.new()` constructs an X — the everyday `var map := SelectionMap.new()`
-                // member idiom. The callee is `X.new` (a Subscript over an identifier base).
-                let base_name = c.callee.and_then(|cid| match &tree.get(cid).kind {
-                    NodeKind::Subscript(sub) => sub.base.and_then(|b| match &tree.get(b).kind {
-                        NodeKind::Identifier(i) => Some(i.name.clone()),
+                // member idiom. The callee is `X.new` (a Subscript over the class), and the class
+                // itself may be a dotted chain (`Outer.Inner.new()`), which the analyzer resolves
+                // segment by segment the same way it resolves the annotation `Outer.Inner`.
+                let path = c
+                    .callee
+                    .and_then(|cid| match &tree.get(cid).kind {
+                        NodeKind::Subscript(sub) => sub.base,
                         _ => None,
-                    }),
-                    _ => None,
-                });
-                match base_name {
-                    Some(b) => named(&b),
+                    })
+                    .and_then(|b| attribute_path(tree, b));
+                match path {
+                    Some(path) => TypeExpr::Named {
+                        path,
+                        args: Vec::new(),
+                    },
                     None => TypeExpr::None,
                 }
             } else {
@@ -868,7 +893,35 @@ fn initializer_type_expr(tree: &ParseTree, init: Option<NodeId>) -> TypeExpr {
                 _ => TypeExpr::None,
             }
         }
+        // `x as T` — the cast names its type outright, so it is worth exactly what an annotation
+        // is worth. The operand never has to be understood.
+        NodeKind::Cast(c) => type_expr(tree, c.cast_type),
+        // `$Path` / `%Unique` type as a bare `Node`, the same hard floor the analyzer gives them
+        // (`docs/02` §11). The precise scene-derived type stays out of this on purpose: it is
+        // navigation-only, and an interface row feeds the diagnostic path.
+        NodeKind::GetNode(_) => named("Node"),
         _ => TypeExpr::None,
+    }
+}
+
+/// The dotted identifier chain under an attribute expression: `A` → `[A]`, `A.B.C` → `[A, B, C]`.
+/// `None` if any link is something other than a plain attribute over an identifier — a subscript
+/// with `[]`, a call, a literal.
+fn attribute_path(tree: &ParseTree, id: NodeId) -> Option<Vec<String>> {
+    match &tree.get(id).kind {
+        NodeKind::Identifier(i) => Some(vec![i.name.clone()]),
+        NodeKind::Subscript(sub) => {
+            let Some(gd_syntax::ast::SubscriptAccess::Attribute(Some(a))) = sub.access else {
+                return None;
+            };
+            let NodeKind::Identifier(attr) = &tree.get(a).kind else {
+                return None;
+            };
+            let mut path = attribute_path(tree, sub.base?)?;
+            path.push(attr.name.clone());
+            Some(path)
+        }
+        _ => None,
     }
 }
 
@@ -1080,6 +1133,92 @@ mod tests {
         assert_eq!(by("State").kind, MemberKind::Enum);
         // The named enum's values are reachable as `State.IDLE`, not as standalone members.
         assert!(i.members.iter().all(|m| m.name != "IDLE"));
+    }
+
+    #[test]
+    fn an_untyped_initializer_reads_every_unambiguous_shape() {
+        // #431: each of these is a member another file can read off. Anything that stays
+        // `TypeExpr::None` here reads as Variant from across the project, so the shapes gdls can
+        // decode without evaluating anything are pinned.
+        let src = "extends Node
+                   var count := 3
+                   var tint := Color(1, 0, 0)
+                   var purple := Color.PURPLE
+                   var map := SelectionMap.new()
+                   var cell := Outer.Inner.new()
+                   var canvas := get_parent() as CanvasItem
+                   @onready var timer := $Timer
+                   @onready var label := %Score
+                   var opaque := compute()
+";
+        let i = iface(src);
+        let ty = |n: &str| i.members.iter().find(|m| m.name == n).unwrap().ty.clone();
+
+        assert_eq!(ty("count").head(), Some("int"));
+        assert_eq!(ty("tint").head(), Some("Color"));
+        assert_eq!(
+            ty("purple"),
+            TypeExpr::Named {
+                path: vec!["Color".into(), "PURPLE".into()],
+                args: Vec::new()
+            }
+        );
+        assert_eq!(ty("map").head(), Some("SelectionMap"));
+        // A dotted constructor keeps every segment, so the analyzer walks to the inner class
+        // rather than stopping at the outer one.
+        assert_eq!(
+            ty("cell"),
+            TypeExpr::Named {
+                path: vec!["Outer".into(), "Inner".into()],
+                args: Vec::new()
+            }
+        );
+        // A cast names its type outright; the operand never has to be understood.
+        assert_eq!(ty("canvas").head(), Some("CanvasItem"));
+        // `$` and `%` are a bare `Node`, the analyzer's own hard floor for them.
+        assert_eq!(ty("timer").head(), Some("Node"));
+        assert_eq!(ty("label").head(), Some("Node"));
+        // A call that needs evaluating still has no answer, and says so.
+        assert_eq!(ty("opaque"), TypeExpr::None);
+    }
+
+    #[test]
+    fn a_typed_collection_cast_keeps_its_element_type() {
+        let i = iface(
+            "extends Node
+var rows := load_rows() as Array[Entry]
+",
+        );
+        assert_eq!(
+            i.members.iter().find(|m| m.name == "rows").unwrap().ty,
+            TypeExpr::Named {
+                path: vec!["Array".into()],
+                args: vec![TypeExpr::Named {
+                    path: vec!["Entry".into()],
+                    args: Vec::new()
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn a_constructor_over_something_that_is_not_a_name_stays_unknown() {
+        // `arr[0].new()` and `get_class().new()` name nothing decodable — an answer here would be
+        // a guess, and a wrong member type is worse than no member type.
+        let i = iface(
+            "extends Node
+var a := kinds[0].new()
+var b := pick().new()
+",
+        );
+        assert_eq!(
+            i.members.iter().find(|m| m.name == "a").unwrap().ty,
+            TypeExpr::None
+        );
+        assert_eq!(
+            i.members.iter().find(|m| m.name == "b").unwrap().ty,
+            TypeExpr::None
+        );
     }
 
     #[test]
