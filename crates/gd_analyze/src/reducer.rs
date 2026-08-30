@@ -5057,6 +5057,12 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     // Recording is additive (WP-N1b): it sets no type and emits no diagnostic.
     if callee_kind || is_subscript_callee || call.is_super {
         let caller = caller_function_name(ctx);
+        // #360: the OWNING class of the caller, so a root `tick` and an inner class's `tick` are
+        // distinct `outgoingCalls` keys rather than one key answering with both call sets.
+        let caller_class = ctx
+            .current_class
+            .map(|c| class_inner_path(ctx, c))
+            .unwrap_or_default();
         let call_span = ctx.node(id).span;
         let callee = if let Some(link) = cross_file_callee {
             CalleeTarget::Script {
@@ -5083,6 +5089,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             function_name.clone(),
             call_span,
             caller,
+            caller_class,
         ));
     }
 
