@@ -449,7 +449,15 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     let markdown = if let Some(sig) = member_sig {
         sig
     } else {
-        render_hover(state, &parsed.tree, node_id, typed_id, analyzed.as_deref())
+        let file = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
+        render_hover(
+            state,
+            &parsed.tree,
+            file,
+            node_id,
+            typed_id,
+            analyzed.as_deref(),
+        )
     };
     if markdown.trim().is_empty() {
         return None;
@@ -1312,6 +1320,7 @@ pub(crate) fn analyze_with_request_token(
 fn render_hover(
     state: &ServerState,
     tree: &ParseTree,
+    file: Option<gd_project::FileId>,
     leaf_id: NodeId,
     typed_id: NodeId,
     analyzed: Option<&AnalysisResult>,
@@ -1336,8 +1345,33 @@ fn render_hover(
     // names a known native class or a project `class_name`, render that NAME as the signature.
     // (Member-access / preload-path signatures are a richer hover feature tracked as a follow-up in
     // the M5 verification report; those still fall through to the typed-ancestor branch below.)
-    let leaf_type_label: Option<String> = match &leaf.kind {
-        NodeKind::Identifier(ident) => {
+    //
+    // #359 runs first: when the leaf is an `extends` segment, or an inner class's own declaration
+    // identifier, the class it names is an IDENTITY (a file plus an inner-class chain) that the
+    // bare-name arms below cannot express — they would render an unrelated top-level `class_name`
+    // of the same text, doc comment and all.
+    let identity = cursor_extends_chain_prefix(state, tree, file, leaf_id).or_else(|| {
+        let path = cursor_inner_class_decl_path(tree, leaf_id, leaf.span.start)?;
+        Some(TypeRef::Script(file?, path))
+    });
+    let leaf_type_label: Option<String> = match (&leaf.kind, identity) {
+        (NodeKind::Identifier(ident), Some(TypeRef::Script(fid, path))) => {
+            script_class_lookup = Some((fid, path));
+            Some(ident.name.clone())
+        }
+        (NodeKind::Identifier(_), Some(TypeRef::Native(class_name))) => {
+            let class = state
+                .workspace
+                .native
+                .class_named(&class_name)
+                .expect("invariant: `resolve_extends_names` only names a class the DB knows");
+            native_lookup = Some(class_name);
+            Some(crate::native_render::class_detail(
+                &state.workspace.native,
+                class,
+            ))
+        }
+        (NodeKind::Identifier(ident), None) => {
             if let Some(class) = state.workspace.native.class_named(&ident.name) {
                 // v1.0.4 (#35): the editor-LSP declaration line (`<Native> class X extends Y`)
                 // instead of the bare name — the docs append below as before.
@@ -6223,6 +6257,19 @@ pub fn implementation(
     // current file's class_name) and emits a Location for each subclass override.
     if let Some(locs) = find_method_overrides(state, &name, &uri, &parsed.tree, node_id, enc) {
         return Some(GotoDefinitionResponse::Array(locs));
+    }
+
+    // #359: the cursor names an INNER class — either at its own `class Inner:` declaration, or as
+    // a suffix segment of an `extends Outer.Inner`. The BFS below seeds itself by looking the bare
+    // name up in the global registry and tracks a set of top-level `class_name`s, an identity that
+    // cannot hold an inner class at all. Left to run, it would seed on whatever unrelated
+    // `class_name Inner` the project registers and report THAT class's subclasses. The class under
+    // the cursor is identified, so the honest answer is an empty list: no subclass of it can be
+    // named here. (Reporting them truthfully needs an identity-keyed fixpoint — its own change.)
+    if cursor_inner_class_decl_path(&parsed.tree, node_id, byte).is_some()
+        || cursor_extends_chain(&parsed.tree, node_id).is_some_and(|(_, idx)| idx > 0)
+    {
+        return Some(GotoDefinitionResponse::Array(Vec::new()));
     }
 
     // Only project class_names participate; native classes have no project subclasses to list.

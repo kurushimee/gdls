@@ -696,16 +696,20 @@ fn refcounted_supertype_subtype_roundtrip_is_symmetric() {
 // =============================================================================================
 
 /// The #359 project: an `Outer` holding an inner `Inner`, a completely unrelated top-level
-/// `class_name Inner`, and a `child` that extends the inner one.
-const OUTER: &str = "class_name Outer\nextends Node\n\nclass Inner:\n\textends Node\n\tfunc tick() -> void:\n\t\tpass\n";
-const UNRELATED: &str = "class_name Inner\nextends Node\n";
+/// `class_name Inner`, and one subclass of each. The two `Inner`s share nothing but their text, so
+/// every answer about one that mentions the other's file is wrong.
+const OUTER: &str = "class_name Outer\nextends Node\n\n## The nested worker Outer owns.\nclass Inner:\n\textends Node\n\tfunc tick() -> void:\n\t\tpass\n";
+const UNRELATED: &str =
+    "## A top-level class that has nothing to do with Outer.\nclass_name Inner\nextends Node\n";
 const CHILD: &str = "extends Outer.Inner\n";
+const SUB_UNRELATED: &str = "extends Inner\n";
 
 fn inner_class_project() -> NativeProject {
     NativeProject::new(&[
         ("outer.gd", OUTER),
         ("unrelated.gd", UNRELATED),
         ("child.gd", CHILD),
+        ("sub_unrelated.gd", SUB_UNRELATED),
     ])
 }
 
@@ -749,9 +753,9 @@ fn definition_on_an_extends_suffix_segment_lands_on_the_inner_class() {
         panic!("definition returns a single location, got {resp:?}");
     };
     assert_eq!(loc.uri, project.uri("outer.gd"));
-    // `class Inner:` is line 3; the identifier spans columns 6..11.
-    assert_eq!(loc.range.start, Position::new(3, 6));
-    assert_eq!(loc.range.end, Position::new(3, 11));
+    // `class Inner:` is line 4; the identifier spans columns 6..11.
+    assert_eq!(loc.range.start, Position::new(4, 6));
+    assert_eq!(loc.range.end, Position::new(4, 11));
 
     shutdown(&client, handle);
 }
@@ -768,7 +772,7 @@ fn prepare_on_an_extends_suffix_segment_yields_the_inner_class() {
     let item = prepare_one(&client, &child_uri, Position::new(0, 14));
     assert_eq!(item.name, "Inner");
     assert_eq!(item.uri, project.uri("outer.gd"));
-    assert_eq!(item.selection_range.start, Position::new(3, 6));
+    assert_eq!(item.selection_range.start, Position::new(4, 6));
     let data = item.data.as_ref().expect("the item carries a data blob");
     assert_eq!(
         data.get("inner").and_then(serde_json::Value::as_array),
@@ -788,17 +792,22 @@ fn an_unrelated_global_of_the_same_name_claims_no_subtypes() {
     let unrelated_uri = project.uri("unrelated.gd");
     did_open(&client, &unrelated_uri, UNRELATED);
 
-    // `class_name Inner` — the identifier starts at column 11.
-    let item = prepare_one(&client, &unrelated_uri, Position::new(0, 11));
+    // `class_name Inner` — line 1, the identifier starting at column 11.
+    let item = prepare_one(&client, &unrelated_uri, Position::new(1, 11));
     assert_eq!(item.uri, unrelated_uri);
+    let subs = subtypes_of(&client, &item).expect("subtypes are an array, never null");
+    let sub_uris: Vec<&str> = subs.iter().map(|i| i.uri.as_str()).collect();
     assert_eq!(
-        subtypes_of(&client, &item),
-        Some(Vec::new()),
+        sub_uris,
+        vec![project.uri("sub_unrelated.gd").as_str()],
         "`child.gd` extends Outer.Inner, a different class entirely"
     );
 
-    let impls = implementation_uris(&client, &unrelated_uri, Position::new(0, 11));
-    assert_eq!(impls, Vec::<String>::new());
+    let impls = implementation_uris(&client, &unrelated_uri, Position::new(1, 11));
+    assert_eq!(
+        impls,
+        vec![project.uri("sub_unrelated.gd").as_str().to_string()]
+    );
 
     shutdown(&client, handle);
 }
@@ -812,7 +821,7 @@ fn prepare_on_an_inner_class_declaration_round_trips() {
     let outer_uri = project.uri("outer.gd");
     did_open(&client, &outer_uri, OUTER);
 
-    let item = prepare_one(&client, &outer_uri, Position::new(3, 6));
+    let item = prepare_one(&client, &outer_uri, Position::new(4, 6));
     assert_eq!(item.name, "Inner");
     assert_eq!(item.uri, outer_uri, "the inner class lives in `outer.gd`");
 
@@ -841,10 +850,16 @@ fn a_malformed_inner_path_in_the_blob_answers_null() {
     let outer_uri = project.uri("outer.gd");
     did_open(&client, &outer_uri, OUTER);
 
-    let mut item = prepare_one(&client, &outer_uri, Position::new(3, 6));
-    item.data = Some(serde_json::json!({ "fid": 1, "inner": "Inner" }));
-    assert_eq!(supertypes_of(&client, &item), None);
-    assert_eq!(subtypes_of(&client, &item), None);
+    let mut item = prepare_one(&client, &outer_uri, Position::new(4, 6));
+    for bad in [
+        serde_json::json!({ "fid": 1, "inner": "Inner" }),
+        serde_json::json!({ "fid": 1, "inner": 42 }),
+        serde_json::json!({ "fid": 1, "inner": [1] }),
+    ] {
+        item.data = Some(bad.clone());
+        assert_eq!(supertypes_of(&client, &item), None, "blob {bad}");
+        assert_eq!(subtypes_of(&client, &item), None, "blob {bad}");
+    }
 
     shutdown(&client, handle);
 }
@@ -875,6 +890,131 @@ fn an_extends_head_binds_the_global_class_before_a_same_named_inner_one() {
         .map(|i| (i.name.as_str(), i.uri.as_str()))
         .collect();
     assert_eq!(parents, vec![("GA", project.uri("ga.gd").as_str())]);
+
+    shutdown(&client, handle);
+}
+
+/// The `implementation` seed is where the confusion used to be worst: it looks the cursor's bare
+/// name up in the global registry, so an inner-class cursor seeded on the unrelated top-level
+/// `Inner` and reported ITS subclasses. Both inner-class cursors now answer with an empty array —
+/// the class is identified, and no subclass of it can be named by a set of top-level `class_name`s.
+#[test]
+fn implementation_on_an_inner_class_borrows_no_ones_subclasses() {
+    let project = inner_class_project();
+    let (client, handle, _) = boot(&project);
+    let outer_uri = project.uri("outer.gd");
+    let child_uri = project.uri("child.gd");
+    did_open(&client, &outer_uri, OUTER);
+    did_open(&client, &child_uri, CHILD);
+
+    for (label, uri, pos) in [
+        ("the declaration", &outer_uri, Position::new(4, 6)),
+        ("the extends suffix", &child_uri, Position::new(0, 14)),
+    ] {
+        assert_eq!(
+            implementation_uris(&client, uri, pos),
+            Vec::<String>::new(),
+            "{label} must not report `sub_unrelated.gd`, which subclasses a different `Inner`"
+        );
+    }
+
+    shutdown(&client, handle);
+}
+
+/// `hover` reads the same identity. It used to render the unrelated top-level class's `##` doc for
+/// the suffix segment, which is the wrong answer wearing the right name.
+#[test]
+fn hover_on_an_extends_suffix_shows_the_inner_class_doc() {
+    let project = inner_class_project();
+    let (client, handle, _) = boot(&project);
+    let child_uri = project.uri("child.gd");
+    did_open(&client, &child_uri, CHILD);
+
+    let params = serde_json::json!({
+        "textDocument": { "uri": child_uri.as_str() },
+        "position": { "line": 0, "character": 14 },
+    });
+    client
+        .sender
+        .send(request(15, "textDocument/hover", params))
+        .unwrap();
+    let resp = recv_response(&client);
+    let hover: Option<lsp_types::Hover> =
+        serde_json::from_value(resp.result.expect("hover result is always present"))
+            .expect("valid Option<Hover>");
+    let lsp_types::HoverContents::Markup(markup) = hover.expect("hover resolves").contents else {
+        panic!("hover renders markup");
+    };
+    assert!(
+        markup.value.contains("The nested worker Outer owns."),
+        "hover must document `Outer.Inner`, got {:?}",
+        markup.value
+    );
+    assert!(
+        !markup.value.contains("nothing to do with Outer"),
+        "hover must not document the unrelated top-level class, got {:?}",
+        markup.value
+    );
+
+    shutdown(&client, handle);
+}
+
+/// Walking UP from a subclass reaches the inner class, and the blob that item carries expands
+/// again — the depth>2 guarantee, now with an inner-class identity riding through the round trip.
+#[test]
+fn supertypes_cross_the_file_boundary_into_an_inner_class() {
+    const GRANDCHILD: &str = "class_name GrandChild\nextends Outer.Inner\n";
+    let project = NativeProject::new(&[
+        ("outer.gd", OUTER),
+        ("unrelated.gd", UNRELATED),
+        ("grandchild.gd", GRANDCHILD),
+    ]);
+    let (client, handle, _) = boot(&project);
+    let uri = project.uri("grandchild.gd");
+    did_open(&client, &uri, GRANDCHILD);
+
+    // `class_name GrandChild` — the identifier starts at column 11.
+    let item = prepare_one(&client, &uri, Position::new(0, 11));
+    let parents = supertypes_of(&client, &item).expect("supertypes are an array");
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0].name, "Inner");
+    assert_eq!(parents[0].uri, project.uri("outer.gd"));
+
+    // Expand again from the returned item alone — no cursor involved.
+    let grandparents = supertypes_of(&client, &parents[0]).expect("supertypes are an array");
+    let names: Vec<&str> = grandparents.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, vec!["Node"]);
+
+    shutdown(&client, handle);
+}
+
+/// An `extends` suffix that names nothing must not fall back to the bare-name lookup — that is
+/// exactly what produced the wrong file. `definition` answers nothing at all; `prepare` keeps its
+/// unnamed-script fallback, which names THIS file rather than a base. The one thing neither may do
+/// is mention the same-named class in `unrelated.gd`.
+#[test]
+fn an_unresolvable_extends_suffix_never_reaches_the_global_registry() {
+    const BAD_CHILD: &str = "extends Outer.Inner.Missing\n";
+    let project = NativeProject::new(&[
+        ("outer.gd", OUTER),
+        ("unrelated.gd", UNRELATED),
+        ("bad_child.gd", BAD_CHILD),
+    ]);
+    let (client, handle, _) = boot(&project);
+    let uri = project.uri("bad_child.gd");
+    did_open(&client, &uri, BAD_CHILD);
+
+    // `extends Outer.Inner.Missing` — the `Missing` segment starts at column 20.
+    assert_eq!(definition_at(&client, &uri, Position::new(0, 20)), None);
+    let item = prepare_one(&client, &uri, Position::new(0, 20));
+    assert_eq!(
+        item.uri, uri,
+        "the unnamed-script fallback names this file, never `unrelated.gd`"
+    );
+
+    // The `Inner` segment before it still resolves — a broken tail does not poison the prefix.
+    let mid = prepare_one(&client, &uri, Position::new(0, 14));
+    assert_eq!(mid.uri, project.uri("outer.gd"));
 
     shutdown(&client, handle);
 }
