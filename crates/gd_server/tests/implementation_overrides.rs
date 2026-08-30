@@ -439,3 +439,82 @@ fn implementation_override_span_uses_matching_root_decl_not_inner_function() {
 
     shutdown(&client, server_thread);
 }
+
+/// #359: the subclass BFS is keyed on top-level `class_name`s, so a dotted `extends Foo.Base` must
+/// not be admitted by its last segment. Here `Foo.Base` is an inner class that happens to share its
+/// name with the global `class_name Base` the cursor sits on; `imposter.gd` extends the inner one
+/// and overrides `act`, and reporting it would send the reader into a class hierarchy that has no
+/// relationship to the one under the cursor.
+#[test]
+fn implementation_on_method_ignores_a_dotted_namesake_chain() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
+    p.write("extension_api.json", common::MINI_API);
+
+    p.write(
+        "real_base.gd",
+        "class_name Base\nextends Node\n\nfunc act():\n\tpass\n",
+    );
+    p.write(
+        "real_sub.gd",
+        "class_name RealSub\nextends Base\n\nfunc act():\n\tpass\n",
+    );
+    // `Foo.Base` — an inner class sharing the global's name, and nothing else.
+    p.write(
+        "mid.gd",
+        "class_name Foo\nextends Node\n\nclass Base:\n\textends Node\n\tfunc act():\n\t\tpass\n",
+    );
+    p.write("imposter.gd", "extends Foo.Base\n\nfunc act():\n\tpass\n");
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    init_and_open(
+        &p,
+        &client,
+        &["real_base.gd", "real_sub.gd", "mid.gd", "imposter.gd"],
+    );
+
+    let base_uri = file_uri(&p.root.join("real_base.gd"));
+    let params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: base_uri.clone(),
+            },
+            // `func act():` on line 3, the identifier at column 6.
+            position: Position {
+                line: 3,
+                character: 6,
+            },
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: Default::default(),
+    };
+    client
+        .sender
+        .send(request(10, "textDocument/implementation", params))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "implementation errored: {:?}",
+        resp.error
+    );
+    let response: GotoDefinitionResponse =
+        serde_json::from_value(resp.result.expect("implementation result"))
+            .expect("valid GotoDefinitionResponse");
+    let locs = match response {
+        GotoDefinitionResponse::Array(v) => v,
+        other => panic!("expected Array response, got {other:?}"),
+    };
+    let uris: Vec<&str> = locs.iter().map(|l| l.uri.as_str()).collect();
+    assert_eq!(
+        uris,
+        vec![file_uri(&p.root.join("real_sub.gd")).as_str()],
+        "only the real subclass overrides `Base.act`"
+    );
+
+    shutdown(&client, server_thread);
+}

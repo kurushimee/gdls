@@ -449,7 +449,15 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     let markdown = if let Some(sig) = member_sig {
         sig
     } else {
-        render_hover(state, &parsed.tree, node_id, typed_id, analyzed.as_deref())
+        let file = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
+        render_hover(
+            state,
+            &parsed.tree,
+            file,
+            node_id,
+            typed_id,
+            analyzed.as_deref(),
+        )
     };
     if markdown.trim().is_empty() {
         return None;
@@ -703,6 +711,24 @@ pub fn definition(
                 return Some(GotoDefinitionResponse::Scalar(loc));
             }
         }
+    }
+
+    // (0.75) #359: a SUFFIX segment of an `extends` chain (`Inner` in `extends Outer.Inner`). It
+    // names an inner class of the segment before it and NEVER a top-level `class_name` that shares
+    // its text, so the whole prefix is resolved as one identity. Falling through is what used to
+    // land in an unrelated file: step (2) matches the bare name against the global registry.
+    // Fail-closed by construction — an unresolvable prefix answers with nothing.
+    if cursor_extends_chain(&parsed.tree, node_id).is_some_and(|(_, idx)| idx > 0) {
+        let fid = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
+        let TypeRef::Script(target, class_path) =
+            cursor_extends_chain_prefix(state, &parsed.tree, fid, node_id)?
+        else {
+            // A native class cannot hold a nested GDScript type, so a suffix segment under one
+            // names nothing. (`resolve_extends_names` already declines this; belt and braces.)
+            return None;
+        };
+        return script_decl_location(state, target, &class_path)
+            .map(GotoDefinitionResponse::Scalar);
     }
 
     // (0.8) A `super.method()` callee (#333). `super.X` names the PARENT's `X` by language
@@ -1294,6 +1320,7 @@ pub(crate) fn analyze_with_request_token(
 fn render_hover(
     state: &ServerState,
     tree: &ParseTree,
+    file: Option<gd_project::FileId>,
     leaf_id: NodeId,
     typed_id: NodeId,
     analyzed: Option<&AnalysisResult>,
@@ -1318,8 +1345,33 @@ fn render_hover(
     // names a known native class or a project `class_name`, render that NAME as the signature.
     // (Member-access / preload-path signatures are a richer hover feature tracked as a follow-up in
     // the M5 verification report; those still fall through to the typed-ancestor branch below.)
-    let leaf_type_label: Option<String> = match &leaf.kind {
-        NodeKind::Identifier(ident) => {
+    //
+    // #359 runs first: when the leaf is an `extends` segment, or an inner class's own declaration
+    // identifier, the class it names is an IDENTITY (a file plus an inner-class chain) that the
+    // bare-name arms below cannot express — they would render an unrelated top-level `class_name`
+    // of the same text, doc comment and all.
+    let identity = cursor_extends_chain_prefix(state, tree, file, leaf_id).or_else(|| {
+        let path = cursor_inner_class_decl_path(tree, leaf_id, leaf.span.start)?;
+        Some(TypeRef::Script(file?, path))
+    });
+    let leaf_type_label: Option<String> = match (&leaf.kind, identity) {
+        (NodeKind::Identifier(ident), Some(TypeRef::Script(fid, path))) => {
+            script_class_lookup = Some((fid, path));
+            Some(ident.name.clone())
+        }
+        (NodeKind::Identifier(_), Some(TypeRef::Native(class_name))) => {
+            let class = state
+                .workspace
+                .native
+                .class_named(&class_name)
+                .expect("invariant: `resolve_extends_names` only names a class the DB knows");
+            native_lookup = Some(class_name);
+            Some(crate::native_render::class_detail(
+                &state.workspace.native,
+                class,
+            ))
+        }
+        (NodeKind::Identifier(ident), None) => {
             if let Some(class) = state.workspace.native.class_named(&ident.name) {
                 // v1.0.4 (#35): the editor-LSP declaration line (`<Native> class X extends Y`)
                 // instead of the bare name — the docs append below as before.
@@ -2765,6 +2817,68 @@ fn cursor_is_extends_base_segment(tree: &ParseTree, ident_id: NodeId) -> bool {
         NodeKind::Class(c) => c.extends.first() == Some(&ident_id),
         _ => false,
     })
+}
+
+/// The inner-class path of the class `ident_id` DECLARES, when it is an inner class's own
+/// `class Inner:` identifier. `None` for the file's head class (its path is empty and its
+/// `class_name` already addresses it) and for any identifier that declares no class.
+fn cursor_inner_class_decl_path(
+    tree: &ParseTree,
+    ident_id: NodeId,
+    byte: usize,
+) -> Option<Vec<String>> {
+    let declares = tree.iter_ids().any(|nid| match &tree.get(nid).kind {
+        NodeKind::Class(c) => c.identifier == Some(ident_id),
+        _ => false,
+    });
+    if !declares {
+        return None;
+    }
+    let path = class_path_at(tree, byte);
+    (!path.is_empty()).then_some(path)
+}
+
+/// The `extends` identifier chain `ident_id` belongs to, as segment names plus the cursor's index
+/// within it. `None` when the identifier is not an `extends` segment at all.
+fn cursor_extends_chain(tree: &ParseTree, ident_id: NodeId) -> Option<(Vec<String>, usize)> {
+    tree.iter_ids().find_map(|nid| match &tree.get(nid).kind {
+        NodeKind::Class(c) => {
+            let idx = c.extends.iter().position(|e| *e == ident_id)?;
+            let names = c
+                .extends
+                .iter()
+                .map(|id| ident_name(tree, *id).to_owned())
+                .collect();
+            Some((names, idx))
+        }
+        _ => None,
+    })
+}
+
+/// The class the cursor's `extends` segment names: the chain truncated *at* the cursor's own
+/// segment, then resolved through [`resolve_extends_names`]. `None` when the cursor is not on an
+/// `extends` segment, or when any segment of that prefix names nothing.
+///
+/// This is what keeps `extends Outer.Inner` from being answered with an unrelated top-level
+/// `class_name Inner`: the prefix is resolved as one identity, and a failure is an answer of
+/// nothing rather than a suffix match (#359).
+fn cursor_extends_chain_prefix(
+    state: &ServerState,
+    tree: &ParseTree,
+    file: Option<gd_project::FileId>,
+    ident_id: NodeId,
+) -> Option<TypeRef> {
+    let (names, idx) = cursor_extends_chain(tree, ident_id)?;
+    match resolve_extends_names(
+        &state.workspace.index,
+        &state.workspace.native,
+        file,
+        &names[..=idx],
+    ) {
+        ClassParent::Script((f, p)) => Some(TypeRef::Script(f, p)),
+        ClassParent::Native(n) => Some(TypeRef::Native(n)),
+        ClassParent::Unknown => None,
+    }
 }
 
 /// `true` iff `ident_id` is the BASE segment (index 0) of a type annotation's chain
@@ -6005,14 +6119,18 @@ fn find_method_overrides(
             if known_files.contains(&fid) {
                 continue;
             }
-            // A name-extends parent matches the known class_name set; a path-extends parent
-            // (`extends "res://base.gd"`) resolves through the index and matches the declaring
-            // file or any already-known subclass file. `current_fid` is checked explicitly
-            // because `known_files` only ever holds discovered subclasses, never the BFS seed.
+            // A single-segment name-extends parent matches the known class_name set; a dotted
+            // `extends Outer.Inner` names an inner class, which the name set cannot express, so it
+            // matches nothing rather than borrowing a same-named top-level class (#359). A
+            // path-extends parent (`extends "res://base.gd"`) resolves through the index and
+            // matches the declaring file or any already-known subclass file. `current_fid` is
+            // checked explicitly because `known_files` only ever holds discovered subclasses,
+            // never the BFS seed.
             let parent_known = match &sub_iface.extends {
-                gd_project::Extends::Names(parts) => {
-                    parts.last().is_some_and(|p| known_names.contains(p))
-                }
+                gd_project::Extends::Names(parts) => match parts.as_slice() {
+                    [only] => known_names.contains(only),
+                    _ => false,
+                },
                 gd_project::Extends::Path(res_path) => state
                     .workspace
                     .index
@@ -6141,6 +6259,19 @@ pub fn implementation(
         return Some(GotoDefinitionResponse::Array(locs));
     }
 
+    // #359: the cursor names an INNER class — either at its own `class Inner:` declaration, or as
+    // a suffix segment of an `extends Outer.Inner`. The BFS below seeds itself by looking the bare
+    // name up in the global registry and tracks a set of top-level `class_name`s, an identity that
+    // cannot hold an inner class at all. Left to run, it would seed on whatever unrelated
+    // `class_name Inner` the project registers and report THAT class's subclasses. The class under
+    // the cursor is identified, so the honest answer is an empty list: no subclass of it can be
+    // named here. (Reporting them truthfully needs an identity-keyed fixpoint — its own change.)
+    if cursor_inner_class_decl_path(&parsed.tree, node_id, byte).is_some()
+        || cursor_extends_chain(&parsed.tree, node_id).is_some_and(|(_, idx)| idx > 0)
+    {
+        return Some(GotoDefinitionResponse::Array(Vec::new()));
+    }
+
     // Only project class_names participate; native classes have no project subclasses to list.
     // Resolve the seed class's file up front: the BFS below matches path-extends subclasses
     // against it (`known_files` only ever holds discovered subclasses, never the seed), and the
@@ -6171,14 +6302,17 @@ pub fn implementation(
             if known_files.contains(&fid) {
                 continue;
             }
-            // The parent's name is the last identifier in the extends chain (e.g.
-            // `extends Outer.Inner` ⇒ parent name = "Inner"; `extends Hero` ⇒ "Hero"). A
-            // path-extends parent (`extends "res://hero.gd"`) resolves through the index and
-            // matches the seed class's file or any already-known subclass file.
+            // `known_names` holds top-level `class_name`s, so only a SINGLE-segment `extends`
+            // can match one. A dotted `extends Outer.Inner` names an inner class — an identity
+            // this name set cannot express — so it matches nothing rather than borrowing an
+            // unrelated top-level class that shares its last segment (#359). A path-extends
+            // parent (`extends "res://hero.gd"`) resolves through the index and matches the seed
+            // class's file or any already-known subclass file.
             let parent_known = match &iface.extends {
-                gd_project::Extends::Names(parts) => {
-                    parts.last().is_some_and(|p| known_names.contains(p))
-                }
+                gd_project::Extends::Names(parts) => match parts.as_slice() {
+                    [only] => known_names.contains(only),
+                    _ => false,
+                },
                 gd_project::Extends::Path(res_path) => state
                     .workspace
                     .index
@@ -6267,28 +6401,37 @@ pub fn implementation(
 /// The identity of a type, round-tripped through a [`TypeHierarchyItem::data`] blob so
 /// `supertypes`/`subtypes` re-resolve the type WITHOUT a cursor (the #50 lesson — expansion must
 /// survive past depth 2). Serialized compactly (anti-catalog W9 — only the minimal identity in
-/// `data`): a project script is `{"fid": <FileId as u32>}`, a native engine class is
-/// `{"native": "<ClassName>"}`.
-#[derive(Clone, Debug)]
+/// `data`): a project class is `{"fid": <FileId as u32>}` plus `"inner": ["Outer", "Inner"]` when
+/// it is an inner class, a native engine class is `{"native": "<ClassName>"}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum TypeRef {
-    /// A project `.gd` file, keyed on its (1-based) [`FileId`](gd_project::FileId).
-    Script(gd_project::FileId),
+    /// A project class: the `.gd` file's (1-based) [`FileId`](gd_project::FileId) plus the
+    /// inner-class chain naming the class inside it. The chain is empty for the file's head class,
+    /// so `Outer.Inner` and a same-named top-level `class_name Inner` are distinct identities and
+    /// can never cross-match (#359).
+    Script(gd_project::FileId, Vec<String>),
     /// A native engine class, keyed on its name in the [`NativeDb`](gd_types::native_db::NativeDb).
     Native(String),
 }
 
 impl TypeRef {
-    /// Encode into the compact `data` JSON blob.
+    /// Encode into the compact `data` JSON blob. The `inner` key is omitted for a head class, so
+    /// a blob written before #359 still decodes to the same identity.
     fn to_data(&self) -> serde_json::Value {
         match self {
-            TypeRef::Script(fid) => serde_json::json!({ "fid": fid.get() }),
+            TypeRef::Script(fid, inner) if inner.is_empty() => {
+                serde_json::json!({ "fid": fid.get() })
+            }
+            TypeRef::Script(fid, inner) => serde_json::json!({ "fid": fid.get(), "inner": inner }),
             TypeRef::Native(name) => serde_json::json!({ "native": name }),
         }
     }
 
     /// Decode a `data` blob produced by [`Self::to_data`]. A blob with neither key (or a
     /// malformed one) yields `None` — the handler then degrades to the LSP `null` response rather
-    /// than guessing (never crash, never lie).
+    /// than guessing (never crash, never lie). An `inner` key that is present but is not an array
+    /// of strings is malformed in exactly that sense: it names a class the server cannot identify,
+    /// so it fails the whole decode rather than silently dropping to the head class.
     fn from_data(data: Option<&serde_json::Value>) -> Option<Self> {
         let data = data?;
         if let Some(fid) = data.get("fid").and_then(serde_json::Value::as_u64) {
@@ -6298,7 +6441,15 @@ impl TypeRef {
             if raw == 0 {
                 return None;
             }
-            return Some(TypeRef::Script(gd_project::FileId::new(raw)));
+            let inner = match data.get("inner") {
+                None => Vec::new(),
+                Some(v) => v
+                    .as_array()?
+                    .iter()
+                    .map(|e| e.as_str().map(str::to_owned))
+                    .collect::<Option<Vec<String>>>()?,
+            };
+            return Some(TypeRef::Script(gd_project::FileId::new(raw), inner));
         }
         if let Some(name) = data.get("native").and_then(serde_json::Value::as_str) {
             return Some(TypeRef::Native(name.to_owned()));
@@ -6307,26 +6458,31 @@ impl TypeRef {
     }
 }
 
-/// Build the [`TypeHierarchyItem`] for a project script `fid`: name from its `class_name` (or the
-/// file stem for an unnamed script), `uri`/`range`/`selectionRange` anchored at the class-name
-/// identifier (the #48 name-token lesson — `selectionRange` is the identifier; `range` is set to
-/// the same span, which trivially satisfies the LSP `range ⊇ selectionRange` containment rule),
-/// and a `data` blob re-encoding the `fid` so the item re-resolves with no cursor.
+/// Build the [`TypeHierarchyItem`] for the project class `(fid, class_path)`: name from the inner
+/// class's own identifier, or — for the file's head class — its `class_name` (or the file stem for
+/// an unnamed script). `uri`/`range`/`selectionRange` are anchored at that identifier (the #48
+/// name-token lesson — `selectionRange` is the identifier; `range` is set to the same span, which
+/// trivially satisfies the LSP `range ⊇ selectionRange` containment rule), and the `data` blob
+/// re-encodes the whole identity so the item re-resolves with no cursor.
 fn script_hierarchy_item(
     state: &mut ServerState,
     fid: gd_project::FileId,
+    class_path: &[String],
 ) -> Option<TypeHierarchyItem> {
     let path = state.workspace.index.path(fid)?.to_path_buf();
     let uri = path_to_file_uri(&path)?;
-    let name = state
-        .workspace
-        .index
-        .interface(fid)
-        .and_then(|i| i.class_name.clone())
-        .unwrap_or_else(|| path.file_stem().unwrap_or("script").to_owned());
-    // Anchor on the class-name identifier when the script has one; else the file start (the
-    // file-target convention shared with `script_decl_location`).
-    let range = match script_decl_location(state, fid, &[]) {
+    let name = match class_path.last() {
+        Some(inner) => inner.clone(),
+        None => state
+            .workspace
+            .index
+            .interface(fid)
+            .and_then(|i| i.class_name.clone())
+            .unwrap_or_else(|| path.file_stem().unwrap_or("script").to_owned()),
+    };
+    // Anchor on the class's own identifier when it has one; else the file start (the file-target
+    // convention shared with `script_decl_location`).
+    let range = match script_decl_location(state, fid, class_path) {
         Some(loc) => loc.range,
         None => file_start_range(),
     };
@@ -6338,7 +6494,7 @@ fn script_hierarchy_item(
         uri,
         range,
         selection_range: range,
-        data: Some(TypeRef::Script(fid).to_data()),
+        data: Some(TypeRef::Script(fid, class_path.to_vec()).to_data()),
     })
 }
 
@@ -6368,34 +6524,32 @@ fn native_hierarchy_item(state: &ServerState, class: &str) -> Option<TypeHierarc
 /// `data` blob.
 fn hierarchy_item(state: &mut ServerState, ty: &TypeRef) -> Option<TypeHierarchyItem> {
     match ty {
-        TypeRef::Script(fid) => script_hierarchy_item(state, *fid),
+        TypeRef::Script(fid, inner) => script_hierarchy_item(state, *fid, inner),
         TypeRef::Native(name) => native_hierarchy_item(state, name),
     }
 }
 
-/// Resolve the parent named in a project script's `extends` clause to a [`TypeRef`], ONE level up.
-/// Mirrors the per-hop resolution `Index::extends_chain_files` performs internally, but yields the
-/// parent's identity (script `FileId` / native name) rather than walking the whole chain:
-///   - `extends Foo` / `extends A.B` → the LAST identifier (`Foo`/`B`) resolved against the
-///     `class_name` registry (→ `Script`) then the native DB (→ `Native`);
-///   - `extends "res://base.gd"` → the path resolved through the index (→ `Script`);
-///   - no `extends` → Godot implies `RefCounted`, a native base.
+/// Resolve the parent named in a project class's `extends` clause to a [`TypeRef`], ONE level up.
+/// Delegates to [`class_parent`], the same base resolution the rename override-group machinery
+/// walks, so a dotted `extends Outer.Inner` yields `Outer`'s inner class rather than whatever
+/// top-level `class_name` happens to share the last segment (#359).
 ///
-/// `None` when the parent can't be resolved (an unknown name / an unindexed path) — the walk then
-/// stops rather than inventing a parent.
-fn project_extends_parent(state: &ServerState, fid: gd_project::FileId) -> Option<TypeRef> {
-    let iface = state.workspace.index.interface(fid)?;
-    match &iface.extends {
-        gd_project::Extends::None => Some(TypeRef::Native("RefCounted".to_owned())),
-        gd_project::Extends::Path(res_path) => state
-            .workspace
-            .index
-            .resolve_res_path(res_path)
-            .map(TypeRef::Script),
-        gd_project::Extends::Names(parts) => {
-            let head = parts.last()?;
-            resolve_type_name(state, head)
-        }
+/// `None` when the parent can't be resolved (an unknown name, an unindexed path, a segment that
+/// names nothing) — the walk then stops rather than inventing a parent.
+fn script_parent(
+    state: &ServerState,
+    fid: gd_project::FileId,
+    class_path: &[String],
+) -> Option<TypeRef> {
+    match class_parent(
+        &state.workspace.index,
+        &state.workspace.native,
+        fid,
+        class_path,
+    ) {
+        ClassParent::Script((f, p)) => Some(TypeRef::Script(f, p)),
+        ClassParent::Native(n) => Some(TypeRef::Native(n)),
+        ClassParent::Unknown => None,
     }
 }
 
@@ -6405,7 +6559,7 @@ fn project_extends_parent(state: &ServerState, fid: gd_project::FileId) -> Optio
 fn resolve_type_name(state: &ServerState, name: &str) -> Option<TypeRef> {
     if let Some(entry) = state.workspace.index.registry().get(name) {
         if let Some(fid) = state.workspace.index.file_id(&entry.path) {
-            return Some(TypeRef::Script(fid));
+            return Some(TypeRef::Script(fid, Vec::new()));
         }
     }
     if state.workspace.native.class_named(name).is_some() {
@@ -6414,46 +6568,21 @@ fn resolve_type_name(state: &ServerState, name: &str) -> Option<TypeRef> {
     None
 }
 
-/// `true` when project file `iface` directly extends the type `ty` (ONE hop, no transitive walk) —
-/// the per-candidate predicate [`type_hierarchy_subtypes`] applies to every interface for the
-/// direct-children-only walk. It encodes the **same** parent-matching rule as [`implementation`]'s
-/// BFS body (last `extends` identifier → registry/native; or a `res://` path → the index), but is
-/// deliberately a separate predicate rather than a shared extraction: `implementation` matches each
-/// candidate against a *growing set* of known names/files (the transitive fixpoint), whereas this
-/// matches against a *single* resolved [`TypeRef`]. Sharing one helper would force `implementation`
-/// to restructure its set-membership test, so — exactly as `implementation` declines to share its
-/// cursor prologue with `references` — `implementation`'s loop is left untouched and stays
-/// byte-identical (the `implementation_overrides` regression suite proves it).
-///   - `extends Foo`/`extends A.Foo` matches a `Script` parent by the parent's `class_name`, or a
-///     `Native` parent by the engine class name (the last `extends` identifier);
-///   - `extends "res://x.gd"` matches a `Script` parent by resolving the path through the index.
-fn extends_matches(state: &ServerState, iface: &gd_project::Interface, ty: &TypeRef) -> bool {
-    match &iface.extends {
-        gd_project::Extends::Names(parts) => {
-            let Some(last) = parts.last() else {
-                return false;
-            };
-            // The parent name resolves the same way the cursor's type does; comparing resolved
-            // `TypeRef`s (rather than raw strings) means a project `class_name` and a native class
-            // that happen to share a name never cross-match.
-            resolve_type_name(state, last).is_some_and(|parent| match (&parent, ty) {
-                (TypeRef::Script(a), TypeRef::Script(b)) => a == b,
-                (TypeRef::Native(a), TypeRef::Native(b)) => a == b,
-                _ => false,
-            })
-        }
-        gd_project::Extends::Path(res_path) => match ty {
-            TypeRef::Script(target) => {
-                state.workspace.index.resolve_res_path(res_path) == Some(*target)
-            }
-            TypeRef::Native(_) => false,
-        },
-        // A script with no `extends` implicitly extends `RefCounted` (Godot's implied base — see
-        // `project_extends_parent`), so it IS a direct subtype of the native `RefCounted`. Matching
-        // it here makes the supertypes/subtypes round-trip symmetric: a bare `class_name` reached by
-        // walking up to `RefCounted` reappears when `RefCounted`'s subtypes are expanded.
-        gd_project::Extends::None => matches!(ty, TypeRef::Native(n) if n == "RefCounted"),
-    }
+/// `true` when project file `fid`'s head class directly extends the type `ty` (ONE hop, no
+/// transitive walk) — the per-candidate predicate [`type_hierarchy_subtypes`] applies to every
+/// interface for the direct-children-only walk.
+///
+/// Resolution is [`script_parent`]'s, so the candidate's parent is an *identity* — a file plus an
+/// inner-class chain — compared whole. A dotted `extends Outer.Inner` therefore never matches an
+/// unrelated top-level `class_name Inner`, and a project `class_name` never cross-matches a native
+/// class that happens to share its name (#359).
+///
+/// A script with no `extends` implicitly extends `RefCounted` (Godot's implied base), which
+/// `class_parent` already reports, so the supertypes/subtypes round trip stays symmetric: a bare
+/// `class_name` reached by walking up to `RefCounted` reappears when `RefCounted`'s subtypes are
+/// expanded.
+fn extends_matches(state: &ServerState, fid: gd_project::FileId, ty: &TypeRef) -> bool {
+    script_parent(state, fid, &[]).is_some_and(|parent| &parent == ty)
 }
 
 /// `textDocument/prepareTypeHierarchy`: resolve the class under the cursor and return ONE
@@ -6484,10 +6613,37 @@ pub fn prepare_type_hierarchy(
     let node_id = parsed.tree.innermost_node_at(byte)?;
     let name = cursor_identifier(&parsed.tree, node_id)?;
 
+    // (0) #359: the cursor is on an `extends` segment. The chain names ONE class — possibly an
+    // inner one, which no bare name can address — so it is resolved as a whole and answered as a
+    // whole. When it resolves to nothing, steps (1)/(2) are SKIPPED rather than consulted: looking
+    // the bare segment up in the global registry is what used to answer `extends Outer.Inner` with
+    // an unrelated top-level `class_name Inner`. Step (3) still applies, since it names the
+    // current file rather than a base.
+    let on_extends = cursor_extends_chain(&parsed.tree, node_id).is_some();
+    if on_extends {
+        let fid = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
+        if let Some(ty) = cursor_extends_chain_prefix(state, &parsed.tree, fid, node_id) {
+            return hierarchy_item(state, &ty).map(|item| vec![item]);
+        }
+    }
+
+    // (0.5) #359, from the declaring side: the cursor is on an INNER class's own `class Inner:`
+    // identifier. That class's identity is this file plus its path, which no bare-name lookup can
+    // express — step (1) would hand back whatever top-level `class_name Inner` the project happens
+    // to register, a different class in a different file.
+    if !on_extends {
+        if let Some(class_path) = cursor_inner_class_decl_path(&parsed.tree, node_id, byte) {
+            let fid = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p))?;
+            return script_hierarchy_item(state, fid, &class_path).map(|item| vec![item]);
+        }
+    }
+
     // (1)/(2): the cursor names a project class or a native class. `resolve_type_name` applies the
     // analyzer's class_name-before-native precedence.
-    if let Some(ty) = resolve_type_name(state, &name) {
-        return hierarchy_item(state, &ty).map(|item| vec![item]);
+    if !on_extends {
+        if let Some(ty) = resolve_type_name(state, &name) {
+            return hierarchy_item(state, &ty).map(|item| vec![item]);
+        }
     }
 
     // (3): unnamed-script fallback — the cursor is on the current file's root class header (its
@@ -6498,7 +6654,7 @@ pub fn prepare_type_hierarchy(
     // deeper in the file must NOT return the whole file (that would be a guess).
     if cursor_on_root_class_header(&parsed.tree, byte) {
         let fid = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p))?;
-        return script_hierarchy_item(state, fid).map(|item| vec![item]);
+        return script_hierarchy_item(state, fid, &[]).map(|item| vec![item]);
     }
 
     None
@@ -6558,7 +6714,7 @@ fn member_node_id(member: &Member) -> Option<NodeId> {
 /// the depth>2 guarantee.
 ///
 ///   - a project script → its `extends` parent (another project script, or a native base, or the
-///     implied `RefCounted` for a script with no `extends`), via [`project_extends_parent`];
+///     implied `RefCounted` for a script with no `extends`), via [`script_parent`];
 ///   - a native class → its `inherits` parent (one hop up `NativeDb`), anchored at that class's
 ///     stub header. `Object` (no `inherits`) yields an empty list — the top of the chain.
 ///
@@ -6569,7 +6725,7 @@ pub fn type_hierarchy_supertypes(
 ) -> Option<Vec<TypeHierarchyItem>> {
     let ty = TypeRef::from_data(params.item.data.as_ref())?;
     let parent = match ty {
-        TypeRef::Script(fid) => project_extends_parent(state, fid),
+        TypeRef::Script(fid, inner) => script_parent(state, fid, &inner),
         TypeRef::Native(name) => state
             .workspace
             .native
@@ -6610,12 +6766,12 @@ pub fn type_hierarchy_subtypes(
         .workspace
         .index
         .iter_interfaces()
-        .filter(|(_, iface)| extends_matches(state, iface, &ty))
+        .filter(|(fid, _)| extends_matches(state, *fid, &ty))
         .map(|(fid, _)| fid)
         .collect();
     let mut items = Vec::with_capacity(children.len());
     for fid in children {
-        if let Some(item) = script_hierarchy_item(state, fid) {
+        if let Some(item) = script_hierarchy_item(state, fid, &[]) {
             items.push(item);
         }
     }
@@ -8676,8 +8832,9 @@ enum ClassParent {
 /// (`gd_analyze::script_chain`) over interfaces rather than trees, and unlike
 /// [`gd_project::Index::extends_chain_files`] it addresses INNER classes: a dotted
 /// `extends Outer.Inner` walks into `Outer`'s inner class rather than stopping at its file root,
-/// and a bare `extends Sibling` inside a file resolves against that file's own inner classes
-/// first, the way Godot's class-scope lookup does before the global registry.
+/// and a bare `extends Sibling` inside a file resolves against that file's own inner classes once
+/// the global registry and the native table have both declined, the order Godot's
+/// `resolve_class_inheritance` uses.
 fn class_parent(
     index: &gd_project::Index,
     native: &gd_types::NativeDb,
@@ -8695,30 +8852,56 @@ fn class_parent(
             None => ClassParent::Unknown,
         },
         gd_project::Extends::Names(names) => {
-            let Some(head) = names.first() else {
-                return ClassParent::Unknown;
-            };
-            // Class scope before the global registry: `class B extends A:` next to `class A:`
-            // names the sibling, not a same-named global.
-            let (base_file, mut base_path) =
-                if iface_at_inner(index, file, std::slice::from_ref(head)).is_some() {
-                    (file, vec![head.clone()])
-                } else {
-                    match index.resolve_name(head, native) {
-                        gd_project::Resolution::Script(fid) => (fid, Vec::new()),
-                        gd_project::Resolution::Native => return ClassParent::Native(head.clone()),
-                        gd_project::Resolution::Unknown => return ClassParent::Unknown,
-                    }
-                };
-            for seg in &names[1..] {
-                base_path.push(seg.clone());
-                if iface_at_inner(index, base_file, &base_path).is_none() {
-                    return ClassParent::Unknown;
-                }
-            }
-            ClassParent::Script((base_file, base_path))
+            resolve_extends_names(index, native, Some(file), names)
         }
     }
+}
+
+/// Resolve an `extends` identifier chain (`extends Outer.Inner`) to the class it names, relative to
+/// `file` (the script the clause is written in, `None` when it is not indexed).
+///
+/// The head segment follows Godot's own order in `resolve_class_inheritance`
+/// (`gdscript_analyzer.cpp:469-543`): the global `class_name` registry, then the native class
+/// table, and only then the script's own classes. That order is observable — `class B extends A:`
+/// beside `class A:` binds the GLOBAL `A` when one is registered, and Godot separately reports the
+/// inner `A` as hiding it.
+///
+/// Every remaining segment must name an inner class of the one before it. A segment that names
+/// nothing, or a chain that continues past a native class, yields [`ClassParent::Unknown`] — the
+/// caller answers with nothing rather than a suffix match (#359).
+fn resolve_extends_names(
+    index: &gd_project::Index,
+    native: &gd_types::NativeDb,
+    file: Option<gd_project::FileId>,
+    names: &[String],
+) -> ClassParent {
+    let Some(head) = names.first() else {
+        return ClassParent::Unknown;
+    };
+    let (base_file, mut base_path) = match index.resolve_name(head, native) {
+        gd_project::Resolution::Script(fid) => (fid, Vec::new()),
+        gd_project::Resolution::Native => {
+            // A native class has no nested GDScript types to walk into.
+            return if names.len() == 1 {
+                ClassParent::Native(head.clone())
+            } else {
+                ClassParent::Unknown
+            };
+        }
+        gd_project::Resolution::Unknown => {
+            match file.filter(|f| iface_at_inner(index, *f, std::slice::from_ref(head)).is_some()) {
+                Some(f) => (f, vec![head.clone()]),
+                None => return ClassParent::Unknown,
+            }
+        }
+    };
+    for seg in &names[1..] {
+        base_path.push(seg.clone());
+        if iface_at_inner(index, base_file, &base_path).is_none() {
+            return ClassParent::Unknown;
+        }
+    }
+    ClassParent::Script((base_file, base_path))
 }
 
 /// Does `(file, class_path)` declare `name` as a `func`?
