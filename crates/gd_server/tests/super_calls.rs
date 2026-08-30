@@ -416,43 +416,168 @@ fn references_on_the_base_declaration_include_the_super_call_site() {
 }
 
 #[test]
-fn renaming_the_override_leaves_the_super_call_alone_and_renaming_the_base_takes_it() {
-    // THE CORRUPTION GUARD. `super.describe()` targets Actor's `describe`, so it must move with
-    // Actor's declaration and must NOT move with Player's. Before #333 both renames took it: one
-    // rewrote it to a name Actor does not have, the other left it dangling.
+fn renaming_either_end_of_an_override_chain_edits_the_whole_group() {
+    // THE CORRUPTION GUARD. GDScript overriding is purely name-based, so an override chain is ONE
+    // symbol and a single-link rename corrupts in both directions: renaming only `Player.describe`
+    // silently un-overrides it (`p.describe()` starts dispatching to `Actor.describe`, with no
+    // diagnostic anywhere), and renaming only `Actor.describe` orphans the override and dangles
+    // the `super.describe()` that targets it.
+    //
+    // So the edit set is the whole group, and it is the SAME set from every click site in it.
     let p = override_project();
     let (client, server) = boot(&p, &FILES);
     let actor = file_uri(&p.root.join("src/actor.gd"));
     let player = file_uri(&p.root.join("src/player.gd"));
     let game = file_uri(&p.root.join("src/game.gd"));
-    let super_site = format!("{}:7:21", player.as_str());
 
-    // player.gd line 6: `func `(0-4) `describe`(5) — the OVERRIDE's declaration.
-    let from_override = rename_sites(&client, 17, pos(&player, 6, 5), "label");
+    let want = {
+        let mut want = vec![
+            // Actor's declaration, and Player's override of it.
+            format!("{}:6:5", actor.as_str()),
+            format!("{}:6:5", player.as_str()),
+            // The `super.describe()` site, which targets Actor's.
+            format!("{}:7:21", player.as_str()),
+            // game.gd line 4/5: tab(0) `print(`(1-6) `p`/`a`(7) `.`(8) `describe`(9).
+            format!("{}:4:9", game.as_str()),
+            format!("{}:5:9", game.as_str()),
+        ];
+        want.sort();
+        want
+    };
+
     assert_eq!(
-        from_override,
-        {
-            let mut want = vec![
-                format!("{}:6:5", player.as_str()),
-                // game.gd line 4: tab(0) `print(`(1-6) `p`(7) `.`(8) `describe`(9) — `p` is a Player.
-                format!("{}:4:9", game.as_str()),
-            ];
-            want.sort();
-            want
-        },
-        "renaming the override takes its own declaration and its Player-typed call sites — never \
-         the `super.describe()` that targets the BASE"
+        rename_sites(&client, 17, pos(&player, 6, 5), "label"),
+        want,
+        "from the OVERRIDE's declaration"
     );
-    assert!(
-        !from_override.contains(&super_site),
-        "the super call site must never ride an override's rename: {from_override:?}"
+    assert_eq!(
+        rename_sites(&client, 18, pos(&actor, 6, 5), "label"),
+        want,
+        "from the BASE's declaration"
     );
+    assert_eq!(
+        rename_sites(&client, 19, pos(&game, 4, 9), "label"),
+        want,
+        "from a Player-typed call site"
+    );
+    assert_eq!(
+        rename_sites(&client, 20, pos(&game, 5, 9), "label"),
+        want,
+        "from an Actor-typed call site"
+    );
+    assert_eq!(
+        rename_sites(
+            &client,
+            21,
+            pos(&player, SUPER_DESCRIBE.0, SUPER_DESCRIBE.1),
+            "label"
+        ),
+        want,
+        "from the `super.describe()` site itself"
+    );
+    shutdown(&client, server);
+}
 
-    let from_base = rename_sites(&client, 18, pos(&actor, 6, 5), "label");
-    assert!(
-        from_base.contains(&super_site),
-        "the super call site MUST ride the base's rename — it is a call to the base: {from_base:?}"
+/// The invariant, restated as the thing that makes the group safe: a `super.X()` site is edited
+/// exactly when the declaration its call binding resolves to is edited. Because the edit set is
+/// always a whole group containing EVERY declaration in the dispatch chain, the super site and its
+/// target move together or not at all — there is no rename that separates them.
+#[test]
+fn a_super_site_never_moves_without_the_declaration_it_targets() {
+    let p = override_project();
+    let (client, server) = boot(&p, &FILES);
+    let actor = file_uri(&p.root.join("src/actor.gd"));
+    let player = file_uri(&p.root.join("src/player.gd"));
+    let super_site = format!("{}:7:21", player.as_str());
+    let base_decl = format!("{}:6:5", actor.as_str());
+
+    let edits = rename_sites(&client, 22, pos(&player, 6, 5), "label");
+    assert_eq!(
+        edits.contains(&super_site),
+        edits.contains(&base_decl),
+        "the super site and Actor's declaration must ride together: {edits:?}"
     );
+    shutdown(&client, server);
+}
+
+/// A method with no overrides anywhere is a group of one and renames as it always did — the group
+/// expansion must not widen an ordinary rename.
+#[test]
+fn a_method_no_one_overrides_still_renames_alone() {
+    let p = override_project();
+    p.write(
+        "src/actor.gd",
+        "class_name Actor\nextends Node2D\n\nfunc _ready() -> void:\n\tpass\n\nfunc describe() -> String:\n\treturn \"actor\"\n\nfunc only_here() -> int:\n\treturn 1\n",
+    );
+    let (client, server) = boot(&p, &FILES);
+    let actor = file_uri(&p.root.join("src/actor.gd"));
+    assert_eq!(
+        rename_sites(&client, 23, pos(&actor, 9, 5), "solo"),
+        vec![format!("{}:9:5", actor.as_str())],
+        "an unoverridden method renames only its own declaration"
+    );
+    shutdown(&client, server);
+}
+
+/// A chain whose ROOT is native is unrenamable: `_ready` overrides `Node._ready`, and the group
+/// reaches into engine code no edit can touch. Refuse at every cursor in the group rather than
+/// rewrite half of it — the rename-side twin of the `NATIVE_METHOD_OVERRIDE` warning.
+#[test]
+fn renaming_a_native_rooted_override_refuses_at_every_cursor() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\n\nconfig/name=\"T\"\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
+    // `Node` here declares `_ready`, so the chain's native root owns the name.
+    p.write(
+        "extension_api.json",
+        r#"{
+    "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
+    "classes": [
+        {"name": "Object", "is_instantiable": true},
+        {"name": "Node", "inherits": "Object", "is_instantiable": true,
+         "methods": [{"name": "_ready", "is_const": false, "is_static": false,
+                      "is_vararg": false, "is_virtual": true, "hash": 1, "arguments": []}]},
+        {"name": "CanvasItem", "inherits": "Node", "is_instantiable": true},
+        {"name": "Node2D", "inherits": "CanvasItem", "is_instantiable": true}
+    ]
+}"#,
+    );
+    p.write(
+        "src/actor.gd",
+        "class_name Actor\nextends Node2D\n\nfunc _ready() -> void:\n\tpass\n",
+    );
+    p.write(
+        "src/player.gd",
+        "class_name Player\nextends Actor\n\nfunc _ready() -> void:\n\tsuper()\n",
+    );
+    let (client, server) = boot(&p, &["src/actor.gd", "src/player.gd"]);
+    for (id, uri) in [
+        (24, file_uri(&p.root.join("src/actor.gd"))),
+        (25, file_uri(&p.root.join("src/player.gd"))),
+    ] {
+        client
+            .sender
+            .send(request(
+                id,
+                "textDocument/rename",
+                RenameParams {
+                    text_document_position: pos(&uri, 3, 5),
+                    new_name: "started".to_string(),
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                },
+            ))
+            .unwrap();
+        let resp = common::recv_response(&client);
+        let err = resp.error.expect("a refusal, not an edit");
+        assert_eq!(err.code, -32803, "RequestFailed: {err:?}");
+        assert!(
+            err.message.contains("_ready") && err.message.contains("Node"),
+            "the refusal names the native method it overrides: {}",
+            err.message
+        );
+    }
     shutdown(&client, server);
 }
 

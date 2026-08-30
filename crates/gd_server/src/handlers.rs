@@ -8232,9 +8232,347 @@ pub fn rename(
         work_done_progress_params: WorkDoneProgressParams::default(),
         partial_result_params: lsp_types::PartialResultParams::default(),
     };
-    let locations = references(state, ref_params).unwrap_or_default();
+    let locations = references(state, ref_params.clone()).unwrap_or_default();
+
+    // (7) #333 — a method override chain is ONE symbol. GDScript overriding is purely name-based,
+    // so editing a single link corrupts in both directions: renaming only the subclass silently
+    // un-overrides it (every call on a subclass-typed value starts dispatching to the base, with
+    // no diagnostic), and renaming only the base orphans the override and dangles its `super.X()`.
+    // Expand the anchor into its whole group and union each member's reference set — or refuse,
+    // when the group reaches a native root (unrenamable) or cannot be proven at all.
+    let locations = match rename_override_group_locations(state, &ref_params, &new_name)? {
+        Some(expanded) => expanded,
+        None => locations,
+    };
 
     Ok(Some(build_workspace_edit(state, locations, &new_name)))
+}
+
+/// Rename step (7): expand a method-declaration anchor into its override group and collect the
+/// union of every member's references, or refuse. `Ok(None)` means the anchor is not part of a
+/// multi-link group and the caller's own single-anchor set stands.
+///
+/// The group is what [`override_group`] computes — binding-correct, not name-only. Every member's
+/// declaration is a valid `references` anchor in its own right, so the union is exactly "every
+/// declaration in the dispatch chain, plus every resolved call site of every one of them". That is
+/// what makes the `super.X()` invariant hold by construction: a super site is edited exactly when
+/// the declaration its call binding resolves to is edited, and the group always contains every
+/// declaration in the chain.
+fn rename_override_group_locations(
+    state: &mut ServerState,
+    anchor: &ReferenceParams,
+    new_name: &str,
+) -> Result<Option<Vec<Location>>, RequestRefusal> {
+    let uri = anchor.text_document_position.text_document.uri.clone();
+    let Some(text) = state.vfs.get(uri.as_str()).map(|d| d.text()) else {
+        return Ok(None);
+    };
+    let key = CanonicalKey::for_uri(&uri);
+    let parsed = state.workspace.parse(&key, &text);
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    let byte = mapper.position_to_byte(anchor.text_document_position.position);
+    let Some(node_id) = parsed.tree.innermost_node_at(byte) else {
+        return Ok(None);
+    };
+    let Some(name) = cursor_identifier(&parsed.tree, node_id) else {
+        return Ok(None);
+    };
+    let Some(anchor_path) = uri_to_path(&uri) else {
+        return Ok(None);
+    };
+    let Some(file) = state.workspace.index.file_id(&anchor_path) else {
+        return Ok(None);
+    };
+    // The anchor is already canonicalized onto the DECLARATION (rename step 5), so the click sits
+    // on a member declaration and this yields the declaring class's inner path.
+    let Some(root_class) = parsed.tree.root_id() else {
+        return Ok(None);
+    };
+    let node_span = parsed.tree.get(node_id).span;
+    let Some(class_path) =
+        member_decl_click_class_path(&parsed.tree, root_class, &mut Vec::new(), &name, node_span)
+    else {
+        return Ok(None);
+    };
+
+    let group = override_group(
+        &state.workspace.index,
+        &state.workspace.native,
+        file,
+        &class_path,
+        &name,
+    );
+    let members = match group {
+        OverrideGroup::Single => return Ok(None),
+        OverrideGroup::NativeRooted(cls) => {
+            return Err(RequestRefusal::not_editable(format!(
+                "Cannot rename `{name}` to `{new_name}`: it overrides `{cls}.{name}`,                  a native engine method that cannot be renamed"
+            )))
+        }
+        OverrideGroup::Unprovable => {
+            return Err(RequestRefusal::not_editable(format!(
+                "Cannot rename `{name}`: its override chain could not be resolved, so the                  rename cannot be applied to every class that declares it"
+            )))
+        }
+        OverrideGroup::Group(members) => members,
+    };
+
+    let mut seen: FxHashSet<(String, u32, u32)> = FxHashSet::default();
+    let mut out: Vec<Location> = Vec::new();
+    for (mfile, mpath) in members {
+        let Some(decl) = member_decl_location(state, mfile, &mpath, &name) else {
+            // A member of the group whose declaration cannot be addressed means the edit set would
+            // be partial — refuse rather than half-apply.
+            return Err(RequestRefusal::not_editable(format!(
+                "Cannot rename `{name}`: one class in its override chain could not be located"
+            )));
+        };
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri: decl.uri },
+                position: decl.range.start,
+            },
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: lsp_types::PartialResultParams::default(),
+        };
+        for loc in references(state, params).unwrap_or_default() {
+            let k = (
+                loc.uri.as_str().to_string(),
+                loc.range.start.line,
+                loc.range.start.character,
+            );
+            if seen.insert(k) {
+                out.push(loc);
+            }
+        }
+    }
+    Ok(Some(out))
+}
+
+// ===================================================================================================
+// Method override groups (#333)
+// ===================================================================================================
+
+/// One class in a method override chain: the `(file, inner-class path)` that declares the method.
+type OverrideDecl = (gd_project::FileId, Vec<String>);
+
+/// What a click on a method declaration turns out to be part of.
+enum OverrideGroup {
+    /// Not a method, or a method no other class in the project overrides — rename from the anchor.
+    Single,
+    /// Every class in the dispatch chain that declares this name. Always length ≥ 2, base first.
+    Group(Vec<OverrideDecl>),
+    /// The chain's native root declares the name, so the group reaches into engine code that
+    /// cannot be renamed. Carries the native class for the refusal message.
+    NativeRooted(String),
+    /// The chain could not be walked to a definite root (an unresolvable `extends`, a cycle), so
+    /// the group's membership is unknowable. Fail closed.
+    Unprovable,
+}
+
+/// A class's immediate base, as an addressable identity.
+enum ClassParent {
+    Script(OverrideDecl),
+    Native(String),
+    /// Unresolvable base, or a cycle — the walk cannot continue.
+    Unknown,
+}
+
+/// Resolve `(file, class_path)`'s `extends` target. Mirrors the analyzer's own base resolution
+/// (`gd_analyze::script_chain`) over interfaces rather than trees, and unlike
+/// [`gd_project::Index::extends_chain_files`] it addresses INNER classes: a dotted
+/// `extends Outer.Inner` walks into `Outer`'s inner class rather than stopping at its file root,
+/// and a bare `extends Sibling` inside a file resolves against that file's own inner classes
+/// first, the way Godot's class-scope lookup does before the global registry.
+fn class_parent(
+    index: &gd_project::Index,
+    native: &gd_types::NativeDb,
+    file: gd_project::FileId,
+    class_path: &[String],
+) -> ClassParent {
+    let Some(iface) = iface_at_inner(index, file, class_path) else {
+        return ClassParent::Unknown;
+    };
+    match &iface.extends {
+        // Godot's scriptless default.
+        gd_project::Extends::None => ClassParent::Native("RefCounted".to_owned()),
+        gd_project::Extends::Path(p) => match index.resolve_res_path(p) {
+            Some(fid) => ClassParent::Script((fid, Vec::new())),
+            None => ClassParent::Unknown,
+        },
+        gd_project::Extends::Names(names) => {
+            let Some(head) = names.first() else {
+                return ClassParent::Unknown;
+            };
+            // Class scope before the global registry: `class B extends A:` next to `class A:`
+            // names the sibling, not a same-named global.
+            let (base_file, mut base_path) =
+                if iface_at_inner(index, file, std::slice::from_ref(head)).is_some() {
+                    (file, vec![head.clone()])
+                } else {
+                    match index.resolve_name(head, native) {
+                        gd_project::Resolution::Script(fid) => (fid, Vec::new()),
+                        gd_project::Resolution::Native => return ClassParent::Native(head.clone()),
+                        gd_project::Resolution::Unknown => return ClassParent::Unknown,
+                    }
+                };
+            for seg in &names[1..] {
+                base_path.push(seg.clone());
+                if iface_at_inner(index, base_file, &base_path).is_none() {
+                    return ClassParent::Unknown;
+                }
+            }
+            ClassParent::Script((base_file, base_path))
+        }
+    }
+}
+
+/// Does `(file, class_path)` declare `name` as a `func`?
+fn class_declares_func(
+    index: &gd_project::Index,
+    file: gd_project::FileId,
+    class_path: &[String],
+    name: &str,
+) -> bool {
+    iface_at_inner(index, file, class_path).is_some_and(|i| {
+        i.members
+            .iter()
+            .any(|m| m.name == name && m.kind == gd_project::MemberKind::Func)
+    })
+}
+
+/// Walk `(file, class_path)`'s base chain to its root. Returns the visited script classes (the
+/// start included, base-ward) and the native class the chain roots at — `None` when a link was
+/// unresolvable or the chain cycled, which callers must treat as fail-closed.
+fn class_base_chain(
+    index: &gd_project::Index,
+    native: &gd_types::NativeDb,
+    file: gd_project::FileId,
+    class_path: &[String],
+) -> (Vec<OverrideDecl>, Option<String>) {
+    let mut chain: Vec<OverrideDecl> = Vec::new();
+    let mut cur = (file, class_path.to_vec());
+    loop {
+        if chain.contains(&cur) {
+            return (chain, None); // cycle — root unknowable
+        }
+        chain.push(cur.clone());
+        match class_parent(index, native, cur.0, &cur.1) {
+            ClassParent::Script(next) => cur = next,
+            ClassParent::Native(cls) => return (chain, Some(cls)),
+            ClassParent::Unknown => return (chain, None),
+        }
+    }
+}
+
+/// Does native class `cls` (or one of its ancestors) declare a method `name`?
+fn native_chain_has_method(native: &gd_types::NativeDb, cls: &str, name: &str) -> bool {
+    let mut cur = Some(cls.to_owned());
+    while let Some(c) = cur {
+        let Some(nc) = native.class_named(&c) else {
+            return false;
+        };
+        if nc.methods.iter().any(|m| native.name_of(m.name) == name) {
+            return true;
+        }
+        cur = nc.inherits.map(|s| native.name_of(s).to_owned());
+    }
+    false
+}
+
+/// Visit every `(file, class_path)` in the project, outermost first.
+fn for_each_class(index: &gd_project::Index, mut f: impl FnMut(gd_project::FileId, &[String])) {
+    fn walk(
+        iface: &gd_project::Interface,
+        file: gd_project::FileId,
+        path: &mut Vec<String>,
+        f: &mut impl FnMut(gd_project::FileId, &[String]),
+    ) {
+        f(file, path);
+        for inner in &iface.inner {
+            let Some(name) = inner.class_name.clone() else {
+                continue;
+            };
+            path.push(name);
+            walk(inner, file, path, f);
+            path.pop();
+        }
+    }
+    for (file, iface) in index.iter_interfaces() {
+        walk(iface, file, &mut Vec::new(), &mut f);
+    }
+}
+
+/// Classify the method `name` declared on `(file, class_path)` against the project's override
+/// chains (#333).
+///
+/// GDScript overriding is purely name-based, so the name IS the binding and an override group is
+/// ONE symbol: renaming a single link is corruption in both directions. Renaming only the subclass
+/// un-overrides it silently, and every `p.describe()` on a subclass-typed value starts dispatching
+/// to the base with no diagnostic; renaming only the base orphans the override and dangles its
+/// `super.describe()`.
+///
+/// The group is collected binding-correctly, not by name: up-walk the base chain keeping every
+/// ancestor that declares the name (the last one is the root), then take every class in the
+/// project whose OWN base chain reaches that root and declares the name. The name-seeded sweep is
+/// the widened candidate set, which is safe; the per-candidate chain walk is what keeps the
+/// collection correct.
+fn override_group(
+    index: &gd_project::Index,
+    native: &gd_types::NativeDb,
+    file: gd_project::FileId,
+    class_path: &[String],
+    name: &str,
+) -> OverrideGroup {
+    if !class_declares_func(index, file, class_path, name) {
+        return OverrideGroup::Single;
+    }
+    let (up, native_root) = class_base_chain(index, native, file, class_path);
+    let Some(native_root) = native_root else {
+        return OverrideGroup::Unprovable;
+    };
+    // The rename-side twin of the NATIVE_METHOD_OVERRIDE warning: the group's root is engine code.
+    if native_chain_has_method(native, &native_root, name) {
+        return OverrideGroup::NativeRooted(native_root);
+    }
+    let Some(root) = up
+        .iter()
+        .rev()
+        .find(|(f, p)| class_declares_func(index, *f, p, name))
+        .cloned()
+    else {
+        return OverrideGroup::Single;
+    };
+    let mut group: Vec<OverrideDecl> = Vec::new();
+    let mut unprovable = false;
+    for_each_class(index, |f, p| {
+        if !class_declares_func(index, f, p, name) {
+            return;
+        }
+        let (chain, rooted) = class_base_chain(index, native, f, p);
+        if !chain.contains(&root) {
+            return;
+        }
+        // A candidate that reaches the root but whose own chain is unwalkable past it cannot be
+        // proven to share the dispatch chain; refuse rather than edit a partial group.
+        if rooted.is_none() {
+            unprovable = true;
+        }
+        group.push((f, p.to_vec()));
+    });
+    if unprovable {
+        return OverrideGroup::Unprovable;
+    }
+    if group.len() < 2 {
+        return OverrideGroup::Single;
+    }
+    // Base first, so the edit set is built in a stable order.
+    group.sort_by_key(|(f, p)| (f.get(), p.clone()));
+    OverrideGroup::Group(group)
 }
 
 /// Rename step (5)'s canonicalization decision: turn `definition()`'s answer for the cursor into
