@@ -613,10 +613,10 @@ fn unused_variable_and_local_constant_warn() {
 }
 
 #[test]
-fn used_underscored_or_written_locals_are_silent() {
-    // A read, an underscore prefix, or even a write-only assignment (Godot's parser counts
-    // assignee identifiers as usages) all suppress.
-    let src = "extends Node\n\n\nfunc test() -> void:\n\tvar used = 1\n\tprint(used)\n\tvar _ignored = 2\n\tconst _IGN = 3\n\tvar written = 4\n\twritten = 5\n";
+fn read_or_underscored_locals_are_silent() {
+    // A read or an underscore prefix suppresses. A write does NOT — `parse_assignment` takes the
+    // usage back off (gdscript_parser.cpp:3141-3153), which `assignment_is_not_usage.rs` pins.
+    let src = "extends Node\n\n\nfunc test() -> void:\n\tvar used = 1\n\tprint(used)\n\tvar _ignored = 2\n\tconst _IGN = 3\n";
     let got = codes(src, &godot_policy());
     assert!(
         !got.contains(&WarningCode::UnusedVariable)
