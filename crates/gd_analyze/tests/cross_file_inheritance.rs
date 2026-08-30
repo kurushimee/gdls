@@ -1761,3 +1761,44 @@ class Sub extends Blade:
         "`var h: Blade`, `-> Blade`, and `class Sub extends Blade:` must each bind to the const"
     );
 }
+
+/// #384: `extends "res://x.gd".Inner` used to stop at the path and ignore every segment after it,
+/// so the base was the file's HEAD class. Godot tracks how many names the head consumed
+/// (`extends_index`, `gdscript_analyzer.cpp:435`) — zero for a path base — and runs the same
+/// segment loop over the rest.
+const PATH_BASE_GD: &str = "\
+extends Node
+class In:
+\textends Node
+\tvar marker := 1
+";
+
+#[test]
+fn a_path_extends_walks_the_segments_after_it() {
+    let project = Project::new(&[
+        ("res://pathbase.gd", PATH_BASE_GD),
+        ("res://pathchild.gd", ""),
+    ]);
+    let child = "extends \"res://pathbase.gd\".In\nfunc use() -> void:\n\tprint(marker)\n";
+    let result = analyze_file(&project, "res://pathchild.gd", child);
+    assert_eq!(
+        error_messages(&result),
+        Vec::<String>::new(),
+        "`marker` is declared on `In`, which is what the chain names"
+    );
+
+    // Without the walk, the base was the head class and `marker` was undeclared.
+    let base_fid = project.fid("res://pathbase.gd");
+    let seg = result.bindings().iter().any(|b| {
+        matches!(
+            b,
+            Binding::Use {
+                target_file: Some(f),
+                target_kind: BindingTargetKind::Class,
+                target_name,
+                ..
+            } if *f == base_fid && target_name == "In"
+        )
+    });
+    assert!(seg, "the `In` segment must bind, or a rename abandons it");
+}
