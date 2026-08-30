@@ -236,6 +236,92 @@ pub(crate) fn render(db: &NativeDb, class: &NativeClass) -> RenderedStub {
     }
 }
 
+/// The [`render`] twin for a Variant type (`Vector2`, `Array`, `String`, …). Same page shape
+/// minus the `extends` line, which a builtin has no equivalent of. #370: builtin types are what
+/// most GDScript touches most often, and they had no page at all, so `definition` on
+/// `arr.append` answered null while `node.add_child` answered a stub location.
+pub(crate) fn render_builtin(db: &NativeDb, bt: &gd_types::BuiltinType) -> RenderedStub {
+    let mut text = String::new();
+    let mut member_lines = FxHashMap::default();
+    let mut line: u32 = 0;
+    let push = |text: &mut String, line: &mut u32, s: &str| {
+        text.push_str(s);
+        text.push('\n');
+        *line += 1;
+    };
+    let anchor = |line: u32, decl: &str, prefix: &str, name: &str| {
+        debug_assert_eq!(
+            decl.get(prefix.len()..prefix.len() + name.len()),
+            Some(name),
+            "stub anchor drift: {decl:?} does not open with {prefix:?} + {name:?}"
+        );
+        MemberAnchor {
+            line,
+            name_col: prefix.len() as u32,
+            name_len: name.len() as u32,
+        }
+    };
+
+    let type_name = db.name_of(bt.name).to_owned();
+    push_doc(&mut text, &mut line, &bt.brief_description);
+    if !bt.description.is_empty() && bt.description != bt.brief_description {
+        if !bt.brief_description.is_empty() {
+            push(&mut text, &mut line, "##");
+        }
+        push_doc(&mut text, &mut line, &bt.description);
+    }
+    let class_line = line;
+    push(&mut text, &mut line, &format!("class_name {type_name}"));
+
+    let section = |text: &mut String, line: &mut u32| push(text, line, "");
+
+    for k in &bt.constants {
+        section(&mut text, &mut line);
+        push_doc(&mut text, &mut line, &k.description);
+        let name = db.name_of(k.name).to_owned();
+        let decl = native_render::member_decl(db, &type_name, &NativeMember::Constant(k));
+        member_lines.insert(name.clone(), anchor(line, &decl, "const ", &name));
+        push(&mut text, &mut line, &decl);
+    }
+    for e in &bt.enums {
+        section(&mut text, &mut line);
+        let name = db.name_of(e.name).to_owned();
+        let decl = format!("enum {name} {{");
+        member_lines.insert(name.clone(), anchor(line, &decl, "enum ", &name));
+        push(&mut text, &mut line, &decl);
+        for (vname, value) in &e.values {
+            let vname = db.name_of(*vname).to_owned();
+            let decl = format!("\t{vname} = {value},");
+            member_lines.insert(vname.clone(), anchor(line, &decl, "\t", &vname));
+            push(&mut text, &mut line, &decl);
+        }
+        push(&mut text, &mut line, "}");
+    }
+    for p in &bt.members {
+        section(&mut text, &mut line);
+        push_doc(&mut text, &mut line, &p.description);
+        let name = db.name_of(p.name).to_owned();
+        let decl = native_render::member_decl(db, &type_name, &NativeMember::Property(p));
+        member_lines.insert(name.clone(), anchor(line, &decl, "var ", &name));
+        push(&mut text, &mut line, &decl);
+    }
+    for m in &bt.methods {
+        section(&mut text, &mut line);
+        push_doc(&mut text, &mut line, &m.description);
+        let name = db.name_of(m.name).to_owned();
+        let decl = native_render::member_decl(db, &type_name, &NativeMember::Method(m));
+        member_lines.insert(name.clone(), anchor(line, &decl, "func ", &name));
+        push(&mut text, &mut line, &decl);
+    }
+
+    RenderedStub {
+        text,
+        class_line,
+        class_name_col: "class_name ".len() as u32,
+        member_lines,
+    }
+}
+
 /// Append a (possibly multi-line) docstring as `## ` comment lines. No-op when empty.
 fn push_doc(text: &mut String, line: &mut u32, doc: &str) {
     if doc.is_empty() {
@@ -270,7 +356,11 @@ pub(crate) fn ensure_class_stub(
     if !is_identifier_shaped(class_name) {
         return None;
     }
-    let class = db.class_named(class_name)?;
+    // Engine classes and Variant types share one page namespace and one directory; Godot keeps
+    // the two name sets disjoint, so a name resolves to at most one of them (#370).
+    if db.class_named(class_name).is_none() && db.builtin_named(class_name).is_none() {
+        return None;
+    }
     let dir = stub_dir(db, override_root)?;
     std::fs::create_dir_all(dir.as_std_path()).ok()?;
     if let Some(base) = stubs_base_dir(override_root) {
@@ -285,7 +375,11 @@ pub(crate) fn ensure_class_stub(
                 // A mid-session dump adoption changes the hash: sweep the dead
                 // generation out instead of accumulating two dumps' pages.
                 map.retain(|_, (h, _)| *h == hash);
-                let stub = Rc::new(render(db, class));
+                let rendered = match db.class_named(class_name) {
+                    Some(class) => render(db, class),
+                    None => render_builtin(db, db.builtin_named(class_name)?),
+                };
+                let stub = Rc::new(rendered);
                 map.insert(class_name.to_owned(), (hash, Rc::clone(&stub)));
                 stub
             }

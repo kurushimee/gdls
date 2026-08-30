@@ -2314,48 +2314,57 @@
 			"members": [
 				{
 					"name": "x",
-					"type": "float"
+					"type": "float",
+					"description": "The vector's X component. Also accessible by using the index position [code][0][/code]."
 				},
 				{
 					"name": "y",
-					"type": "float"
+					"type": "float",
+					"description": "The vector's Y component. Also accessible by using the index position [code][1][/code]."
 				}
 			],
 			"constants": [
 				{
 					"name": "ZERO",
 					"type": "Vector2",
-					"value": "Vector2(0, 0)"
+					"value": "Vector2(0, 0)",
+					"description": "Zero vector, a vector with all components set to [code]0[/code]."
 				},
 				{
 					"name": "ONE",
 					"type": "Vector2",
-					"value": "Vector2(1, 1)"
+					"value": "Vector2(1, 1)",
+					"description": "One vector, a vector with all components set to [code]1[/code]."
 				},
 				{
 					"name": "INF",
 					"type": "Vector2",
-					"value": "Vector2(inf, inf)"
+					"value": "Vector2(inf, inf)",
+					"description": "Infinity vector, a vector with all components set to [constant @GDScript.INF]."
 				},
 				{
 					"name": "LEFT",
 					"type": "Vector2",
-					"value": "Vector2(-1, 0)"
+					"value": "Vector2(-1, 0)",
+					"description": "Left unit vector. Represents the direction of left."
 				},
 				{
 					"name": "RIGHT",
 					"type": "Vector2",
-					"value": "Vector2(1, 0)"
+					"value": "Vector2(1, 0)",
+					"description": "Right unit vector. Represents the direction of right."
 				},
 				{
 					"name": "UP",
 					"type": "Vector2",
-					"value": "Vector2(0, -1)"
+					"value": "Vector2(0, -1)",
+					"description": "Up unit vector. Y is down in 2D, so this vector points -Y."
 				},
 				{
 					"name": "DOWN",
 					"type": "Vector2",
-					"value": "Vector2(0, 1)"
+					"value": "Vector2(0, 1)",
+					"description": "Down unit vector. Y is down in 2D, so this vector points +Y."
 				}
 			],
 			"enums": [
@@ -2494,7 +2503,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 466405837
+					"hash": 466405837,
+					"description": "Returns this vector's angle with respect to the positive X axis, or [code](1, 0)[/code] vector, in radians.\nFor example, [code]Vector2.RIGHT.angle()[/code] will return zero, [code]Vector2.DOWN.angle()[/code] will return [code]PI / 2[/code] (a quarter turn, or 90 degrees), and [code]Vector2(1, -1).angle()[/code] will return [code]-PI / 4[/code] (a negative eighth turn, or -45 degrees).\nThis is equivalent to calling [method @GlobalScope.atan2] with [member y] and [member x].\n[url=https://raw.githubusercontent.com/godotengine/godot-docs/master/img/vector2_angle.png]Illustration of the returned angle.[/url]"
 				},
 				{
 					"name": "angle_to",
@@ -2508,7 +2518,8 @@
 							"name": "to",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the signed angle to the given vector, in radians. The result ranges from [code]-PI[/code] to [code]PI[/code] (inclusive).\n[url=https://raw.githubusercontent.com/godotengine/godot-docs/master/img/vector2_angle_to.png]Illustration of the returned angle.[/url]"
 				},
 				{
 					"name": "angle_to_point",
@@ -2522,7 +2533,8 @@
 							"name": "to",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the signed angle between the X axis and the line from this vector to point [param to], in radians. The result ranges from [code]-PI[/code] to [code]PI[/code] (inclusive).\n[code]a.angle_to_point(b)[/code] is equivalent to [code](b - a).angle()[/code]. See also [method angle].\n[url=https://raw.githubusercontent.com/godotengine/godot-docs/master/img/vector2_angle_to_point.png]Illustration of the returned angle.[/url]"
 				},
 				{
 					"name": "direction_to",
@@ -2536,7 +2548,8 @@
 							"name": "to",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the normalized vector pointing from this vector to [param to].\n[code]a.direction_to(b)[/code] is equivalent to [code](b - a).normalized()[/code]. See also [method normalized]."
 				},
 				{
 					"name": "distance_to",
@@ -2550,7 +2563,8 @@
 							"name": "to",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the [url=https://en.wikipedia.org/wiki/Euclidean_distance]Euclidean distance[/url] between this vector and [param to]."
 				},
 				{
 					"name": "distance_squared_to",
@@ -2564,7 +2578,8 @@
 							"name": "to",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the squared [url=https://en.wikipedia.org/wiki/Euclidean_distance]Euclidean distance[/url] between this vector and [param to].\nThis method runs faster than [method distance_to], so prefer it if you need to compare vectors or need the squared distance for some formula."
 				},
 				{
 					"name": "length",
@@ -2572,7 +2587,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 466405837
+					"hash": 466405837,
+					"description": "Returns the length (magnitude) of this vector."
 				},
 				{
 					"name": "length_squared",
@@ -2580,7 +2596,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 466405837
+					"hash": 466405837,
+					"description": "Returns the squared length (squared magnitude) of this vector.\nThis method runs faster than [method length], so prefer it if you need to compare vectors or need the squared distance for some formula."
 				},
 				{
 					"name": "limit_length",
@@ -2595,7 +2612,8 @@
 							"type": "float",
 							"default_value": "1.0"
 						}
-					]
+					],
+					"description": "Returns the vector with a maximum length by limiting its length to [param length]. If the vector is non-finite, the result is undefined."
 				},
 				{
 					"name": "normalized",
@@ -2603,7 +2621,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 2428350749
+					"hash": 2428350749,
+					"description": "Returns the result of scaling the vector to unit length. Equivalent to [code]v / v.length()[/code]. Returns [code](0, 0)[/code] if [code]v.length() == 0[/code]. See also [method is_normalized].\n[b]Note:[/b] This function may return incorrect values if the input vector length is near zero."
 				},
 				{
 					"name": "is_normalized",
@@ -2611,7 +2630,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the vector is normalized, i.e. its length is approximately equal to 1."
 				},
 				{
 					"name": "is_equal_approx",
@@ -2625,7 +2645,8 @@
 							"name": "to",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if this vector and [param to] are approximately equal, by running [method @GlobalScope.is_equal_approx] on each component."
 				},
 				{
 					"name": "is_zero_approx",
@@ -2633,7 +2654,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if this vector's values are approximately zero, by running [method @GlobalScope.is_zero_approx] on each component.\nThis method is faster than using [method is_equal_approx] with one value as a zero vector."
 				},
 				{
 					"name": "is_finite",
@@ -2641,7 +2663,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if this vector is finite, by calling [method @GlobalScope.is_finite] on each component."
 				},
 				{
 					"name": "posmod",
@@ -2655,7 +2678,8 @@
 							"name": "mod",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a vector composed of the [method @GlobalScope.fposmod] of this vector's components and [param mod]."
 				},
 				{
 					"name": "posmodv",
@@ -2669,7 +2693,8 @@
 							"name": "modv",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns a vector composed of the [method @GlobalScope.fposmod] of this vector's components and [param modv]'s components."
 				},
 				{
 					"name": "project",
@@ -2683,7 +2708,8 @@
 							"name": "b",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns a new vector resulting from projecting this vector onto the given vector [param b]. The resulting new vector is parallel to [param b]. See also [method slide].\n[b]Note:[/b] If the vector [param b] is a zero vector, the components of the resulting new vector will be [constant @GDScript.NAN]."
 				},
 				{
 					"name": "lerp",
@@ -2701,7 +2727,8 @@
 							"name": "weight",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the result of the linear interpolation between this vector and [param to] by amount [param weight]. [param weight] is on the range of [code]0.0[/code] to [code]1.0[/code], representing the amount of interpolation."
 				},
 				{
 					"name": "slerp",
@@ -2719,7 +2746,8 @@
 							"name": "weight",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the result of spherical linear interpolation between this vector and [param to], by amount [param weight]. [param weight] is on the range of 0.0 to 1.0, representing the amount of interpolation.\nThis method also handles interpolating the lengths if the input vectors have different lengths. For the special case of one or both input vectors having zero length, this method behaves like [method lerp]."
 				},
 				{
 					"name": "cubic_interpolate",
@@ -2745,7 +2773,8 @@
 							"name": "weight",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Performs a cubic interpolation between this vector and [param b] using [param pre_a] and [param post_b] as handles, and returns the result at position [param weight]. [param weight] is on the range of 0.0 to 1.0, representing the amount of interpolation."
 				},
 				{
 					"name": "cubic_interpolate_in_time",
@@ -2783,7 +2812,8 @@
 							"name": "post_b_t",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Performs a cubic interpolation between this vector and [param b] using [param pre_a] and [param post_b] as handles, and returns the result at position [param weight]. [param weight] is on the range of 0.0 to 1.0, representing the amount of interpolation.\nIt can perform smoother interpolation than [method cubic_interpolate] by the time values."
 				},
 				{
 					"name": "bezier_interpolate",
@@ -2809,7 +2839,8 @@
 							"name": "t",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the point at the given [param t] on the [url=https://en.wikipedia.org/wiki/B%C3%A9zier_curve]Bézier curve[/url] defined by this vector and the given [param control_1], [param control_2], and [param end] points."
 				},
 				{
 					"name": "bezier_derivative",
@@ -2835,7 +2866,8 @@
 							"name": "t",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the derivative at the given [param t] on the [url=https://en.wikipedia.org/wiki/B%C3%A9zier_curve]Bézier curve[/url] defined by this vector and the given [param control_1], [param control_2], and [param end] points."
 				},
 				{
 					"name": "max_axis_index",
@@ -2843,7 +2875,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the axis of the vector's highest value. See [code]AXIS_*[/code] constants. If all components are equal, this method returns [constant AXIS_X]."
 				},
 				{
 					"name": "min_axis_index",
@@ -2851,7 +2884,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the axis of the vector's lowest value. See [code]AXIS_*[/code] constants. If all components are equal, this method returns [constant AXIS_Y]."
 				},
 				{
 					"name": "move_toward",
@@ -2869,7 +2903,8 @@
 							"name": "delta",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a new vector moved toward [param to] by the fixed [param delta] amount. Will not go past the final value."
 				},
 				{
 					"name": "rotated",
@@ -2883,7 +2918,8 @@
 							"name": "angle",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the result of rotating this vector by [param angle] (in radians). See also [method @GlobalScope.deg_to_rad]."
 				},
 				{
 					"name": "orthogonal",
@@ -2891,7 +2927,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 2428350749
+					"hash": 2428350749,
+					"description": "Returns a perpendicular vector rotated 90 degrees counter-clockwise compared to the original, with the same length."
 				},
 				{
 					"name": "floor",
@@ -2899,7 +2936,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 2428350749
+					"hash": 2428350749,
+					"description": "Returns a new vector with all components rounded down (towards negative infinity)."
 				},
 				{
 					"name": "ceil",
@@ -2907,7 +2945,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 2428350749
+					"hash": 2428350749,
+					"description": "Returns a new vector with all components rounded up (towards positive infinity)."
 				},
 				{
 					"name": "round",
@@ -2915,7 +2954,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 2428350749
+					"hash": 2428350749,
+					"description": "Returns a new vector with all components rounded to the nearest integer, with halfway cases rounded away from zero."
 				},
 				{
 					"name": "aspect",
@@ -2923,7 +2963,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 466405837
+					"hash": 466405837,
+					"description": "Returns this vector's aspect ratio, which is [member x] divided by [member y]."
 				},
 				{
 					"name": "dot",
@@ -2937,7 +2978,8 @@
 							"name": "with",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the dot product of this vector and [param with]. This can be used to compare the angle between two vectors. For example, this can be used to determine whether an enemy is facing the player.\nThe dot product will be [code]0[/code] for a right angle (90 degrees), greater than 0 for angles narrower than 90 degrees and lower than 0 for angles wider than 90 degrees.\nWhen using unit (normalized) vectors, the result will always be between [code]-1.0[/code] (180 degree angle) when the vectors are facing opposite directions, and [code]1.0[/code] (0 degree angle) when the vectors are aligned.\n[b]Note:[/b] [code]a.dot(b)[/code] is equivalent to [code]b.dot(a)[/code]."
 				},
 				{
 					"name": "slide",
@@ -2951,7 +2993,8 @@
 							"name": "n",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns a new vector resulting from sliding this vector along a line with normal [param n]. The resulting new vector is perpendicular to [param n], and is equivalent to this vector minus its projection on [param n]. See also [method project].\n[b]Note:[/b] The vector [param n] must be normalized. See also [method normalized]."
 				},
 				{
 					"name": "bounce",
@@ -2965,7 +3008,8 @@
 							"name": "n",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the vector \"bounced off\" from a line defined by the given normal [param n] perpendicular to the line.\n[b]Note:[/b] [method bounce] performs the operation that most engines and frameworks call [code skip-lint]reflect()[/code]."
 				},
 				{
 					"name": "reflect",
@@ -2979,7 +3023,8 @@
 							"name": "line",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the result of reflecting the vector from a line defined by the given direction vector [param line].\n[b]Note:[/b] [method reflect] differs from what other engines and frameworks call [code skip-lint]reflect()[/code]. In other engines, [code skip-lint]reflect()[/code] takes a normal direction which is a direction perpendicular to the line. In Godot, you specify the direction of the line directly. See also [method bounce] which does what most engines call [code skip-lint]reflect()[/code]."
 				},
 				{
 					"name": "cross",
@@ -2993,7 +3038,8 @@
 							"name": "with",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the 2D analog of the cross product for this vector and [param with].\nThis is the signed area of the parallelogram formed by the two vectors. If the second vector is clockwise from the first vector, then the cross product is the positive area. If counter-clockwise, the cross product is the negative area. If the two vectors are parallel this returns zero, making it useful for testing if two vectors are parallel.\n[b]Note:[/b] Cross product is not defined in 2D mathematically. This method embeds the 2D vectors in the XY plane of 3D space and uses their cross product's Z component as the analog."
 				},
 				{
 					"name": "abs",
@@ -3001,7 +3047,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 2428350749
+					"hash": 2428350749,
+					"description": "Returns a new vector with all components in absolute values (i.e. positive)."
 				},
 				{
 					"name": "sign",
@@ -3009,7 +3056,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 2428350749
+					"hash": 2428350749,
+					"description": "Returns a new vector with each component set to [code]1.0[/code] if it's positive, [code]-1.0[/code] if it's negative, and [code]0.0[/code] if it's zero. The result is identical to calling [method @GlobalScope.sign] on each component."
 				},
 				{
 					"name": "clamp",
@@ -3027,7 +3075,8 @@
 							"name": "max",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns a new vector with all components clamped between the components of [param min] and [param max], by running [method @GlobalScope.clamp] on each component."
 				},
 				{
 					"name": "clampf",
@@ -3045,7 +3094,8 @@
 							"name": "max",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a new vector with all components clamped between [param min] and [param max], by running [method @GlobalScope.clamp] on each component."
 				},
 				{
 					"name": "snapped",
@@ -3059,7 +3109,8 @@
 							"name": "step",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns a new vector with each component snapped to the nearest multiple of the corresponding component in [param step]. This can also be used to round the components to an arbitrary number of decimals."
 				},
 				{
 					"name": "snappedf",
@@ -3073,7 +3124,8 @@
 							"name": "step",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a new vector with each component snapped to the nearest multiple of [param step]. This can also be used to round the components to an arbitrary number of decimals."
 				},
 				{
 					"name": "min",
@@ -3087,7 +3139,8 @@
 							"name": "with",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the component-wise minimum of this and [param with], equivalent to [code]Vector2(minf(x, with.x), minf(y, with.y))[/code]."
 				},
 				{
 					"name": "minf",
@@ -3101,7 +3154,8 @@
 							"name": "with",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the component-wise minimum of this and [param with], equivalent to [code]Vector2(minf(x, with), minf(y, with))[/code]."
 				},
 				{
 					"name": "max",
@@ -3115,7 +3169,8 @@
 							"name": "with",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the component-wise maximum of this and [param with], equivalent to [code]Vector2(maxf(x, with.x), maxf(y, with.y))[/code]."
 				},
 				{
 					"name": "maxf",
@@ -3129,7 +3184,8 @@
 							"name": "with",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the component-wise maximum of this and [param with], equivalent to [code]Vector2(maxf(x, with), maxf(y, with))[/code]."
 				},
 				{
 					"name": "from_angle",
@@ -3143,7 +3199,8 @@
 							"name": "angle",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Creates a [Vector2] rotated to the given [param angle] in radians. This is equivalent to doing [code]Vector2(cos(angle), sin(angle))[/code] or [code]Vector2.RIGHT.rotated(angle)[/code].\n[codeblock]\nprint(Vector2.from_angle(0)) # Prints (1.0, 0.0)\nprint(Vector2(1, 0).angle()) # Prints 0.0, which is the angle used above.\nprint(Vector2.from_angle(PI / 2)) # Prints (0.0, 1.0)\n[/codeblock]\n[b]Note:[/b] The length of the returned [Vector2] is [i]approximately[/i] [code]1.0[/code], but is is not guaranteed to be exactly [code]1.0[/code] due to floating-point precision issues. Call [method normalized] on the returned [Vector2] if you require a unit vector."
 				}
 			],
 			"constructors": [
@@ -3216,7 +3273,9 @@
 					]
 				}
 			],
-			"has_destructor": false
+			"has_destructor": false,
+			"brief_description": "A 2D vector using floating-point coordinates.",
+			"description": "A 2-element structure that can be used to represent 2D coordinates or any other pair of numeric values.\nIt uses floating-point coordinates. By default, these floating-point values use 32-bit precision, unlike [float] which is always 64-bit. If double precision is needed, compile the engine with the option [code]precision=double[/code].\nSee [Vector2i] for its integer counterpart.\n[b]Note:[/b] In a boolean context, a Vector2 will evaluate to [code]false[/code] if it's equal to [code]Vector2(0, 0)[/code]. Otherwise, a Vector2 will always evaluate to [code]true[/code]."
 		},
 		{
 			"name": "Array",
@@ -3290,7 +3349,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the number of elements in the array. Empty arrays ([code][][/code]) always return [code]0[/code]. See also [method is_empty]."
 				},
 				{
 					"name": "is_empty",
@@ -3298,14 +3358,16 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the array is empty ([code][][/code]). See also [method size]."
 				},
 				{
 					"name": "clear",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Removes all elements from the array. This is equivalent to using [method resize] with a size of [code]0[/code]."
 				},
 				{
 					"name": "hash",
@@ -3313,7 +3375,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns a hashed 32-bit integer value representing the array and its contents.\n[b]Note:[/b] Arrays with equal hash values are [i]not[/i] guaranteed to be the same, as a result of hash collisions. On the contrary, arrays with different hash values are guaranteed to be different."
 				},
 				{
 					"name": "assign",
@@ -3326,7 +3389,8 @@
 							"name": "array",
 							"type": "Array"
 						}
-					]
+					],
+					"description": "Assigns elements of another [param array] into the array. Resizes the array to match [param array]. Performs type conversions if the array is typed."
 				},
 				{
 					"name": "get",
@@ -3340,7 +3404,8 @@
 							"name": "index",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns the element at the given [param index] in the array. If [param index] is out-of-bounds or negative, this method fails and returns [code]null[/code].\nThis method is similar (but not identical) to the [code][][/code] operator. Most notably, when this method fails, it doesn't pause project execution if run from the editor."
 				},
 				{
 					"name": "set",
@@ -3357,7 +3422,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Sets the value of the element at the given [param index] to the given [param value]. This will not change the size of the array, it only changes the value at an index already in the array. This is the same as using the [code][][/code] operator ([code]array[index] = value[/code])."
 				},
 				{
 					"name": "push_back",
@@ -3370,7 +3436,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Appends an element at the end of the array. See also [method push_front]."
 				},
 				{
 					"name": "push_front",
@@ -3383,7 +3450,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Adds an element at the beginning of the array. See also [method push_back].\n[b]Note:[/b] This method shifts every other element's index forward, which may have a noticeable performance cost, especially on larger arrays."
 				},
 				{
 					"name": "append",
@@ -3396,7 +3464,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Appends [param value] at the end of the array (alias of [method push_back])."
 				},
 				{
 					"name": "append_array",
@@ -3409,7 +3478,8 @@
 							"name": "array",
 							"type": "Array"
 						}
-					]
+					],
+					"description": "Appends another [param array] at the end of this array.\n[codeblock]\nvar numbers = [1, 2, 3]\nvar extra = [4, 5, 6]\nnumbers.append_array(extra)\nprint(numbers) # Prints [1, 2, 3, 4, 5, 6]\n[/codeblock]"
 				},
 				{
 					"name": "append_unique",
@@ -3437,7 +3507,8 @@
 							"name": "size",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Sets the array's number of elements to [param size]. If [param size] is smaller than the array's current size, the elements at the end are removed. If [param size] is greater, new default elements (usually [code]null[/code]) are added, depending on the array's type.\nReturns [constant OK] on success, or one of the following [enum Error] constants if this method fails: [constant ERR_LOCKED] if the array is read-only, [constant ERR_INVALID_PARAMETER] if the size is negative, or [constant ERR_OUT_OF_MEMORY] if allocations fail. Use [method size] to find the actual size of the array after resize.\n[b]Note:[/b] Calling this method once and assigning the new values is faster than calling [method append] for every new element."
 				},
 				{
 					"name": "insert",
@@ -3455,7 +3526,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Inserts a new element ([param value]) at a given index ([param position]) in the array. [param position] should be between [code]0[/code] and the array's [method size]. If negative, [param position] is considered relative to the end of the array.\nReturns [constant OK] on success, or one of the other [enum Error] constants if this method fails.\n[b]Note:[/b] Every element's index after [param position] needs to be shifted forward, which may have a noticeable performance cost, especially on larger arrays."
 				},
 				{
 					"name": "remove_at",
@@ -3468,7 +3540,8 @@
 							"name": "position",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Removes the element from the array at the given index ([param position]). If the index is out of bounds, this method fails. If the index is negative, [param position] is considered relative to the end of the array.\nIf you need to return the removed element, use [method pop_at]. To remove an element by value, use [method erase] instead.\n[b]Note:[/b] This method shifts every element's index after [param position] back, which may have a noticeable performance cost, especially on larger arrays."
 				},
 				{
 					"name": "fill",
@@ -3481,7 +3554,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Assigns the given [param value] to all elements in the array.\nThis method can often be combined with [method resize] to create an array with a given size and initialized elements:\n[codeblocks]\n[gdscript]\nvar array = []\narray.resize(5)\narray.fill(2)\nprint(array) # Prints [2, 2, 2, 2, 2]\n[/gdscript]\n[csharp]\nGodot.Collections.Array array = [];\narray.Resize(5);\narray.Fill(2);\nGD.Print(array); // Prints [2, 2, 2, 2, 2]\n[/csharp]\n[/codeblocks]\n[b]Note:[/b] If [param value] is a [Variant] passed by reference ([Object]-derived, [Array], [Dictionary], etc.), the array will be filled with references to the same [param value], which are not duplicates."
 				},
 				{
 					"name": "erase",
@@ -3494,7 +3568,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Finds and removes the first occurrence of [param value] from the array. If [param value] does not exist in the array, nothing happens. To remove an element by index, use [method remove_at] instead.\n[b]Note:[/b] This method shifts every element's index after the removed [param value] back, which may have a noticeable performance cost, especially on larger arrays.\n[b]Note:[/b] Erasing elements while iterating over arrays is [b]not[/b] supported and will result in unpredictable behavior."
 				},
 				{
 					"name": "front",
@@ -3502,7 +3577,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1460142086
+					"hash": 1460142086,
+					"description": "Returns the first element of the array. If the array is empty, fails and returns [code]null[/code]. See also [method back].\n[b]Note:[/b] Unlike with the [code][][/code] operator ([code]array[0][/code]), an error is generated without stopping project execution."
 				},
 				{
 					"name": "back",
@@ -3510,7 +3586,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1460142086
+					"hash": 1460142086,
+					"description": "Returns the last element of the array. If the array is empty, fails and returns [code]null[/code]. See also [method front].\n[b]Note:[/b] Unlike with the [code][][/code] operator ([code]array[-1][/code]), an error is generated without stopping project execution."
 				},
 				{
 					"name": "pick_random",
@@ -3518,7 +3595,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1460142086
+					"hash": 1460142086,
+					"description": "Returns a random element from the array. Generates an error and returns [code]null[/code] if the array is empty.\n[codeblocks]\n[gdscript]\n# May print 1, 2, 3.25, or \"Hi\".\nprint([1, 2, 3.25, \"Hi\"].pick_random())\n[/gdscript]\n[csharp]\nGodot.Collections.Array array = [1, 2, 3.25f, \"Hi\"];\nGD.Print(array.PickRandom()); // May print 1, 2, 3.25, or \"Hi\".\n[/csharp]\n[/codeblocks]\n[b]Note:[/b] Like many similar functions in the engine (such as [method @GlobalScope.randi] or [method shuffle]), this method uses a common, global random seed. To get a predictable outcome from this method, see [method @GlobalScope.seed]."
 				},
 				{
 					"name": "find",
@@ -3537,7 +3615,8 @@
 							"type": "int",
 							"default_value": "0"
 						}
-					]
+					],
+					"description": "Returns the index of the [b]first[/b] occurrence of [param what] in this array, or [code]-1[/code] if there are none. The search's start can be specified with [param from], continuing to the end of the array.\n[b]Note:[/b] If you just want to know whether the array contains [param what], use [method has] ([code]Contains[/code] in C#). In GDScript, you may also use the [code]in[/code] operator.\n[b]Note:[/b] For performance reasons, the search is affected by [param what]'s [enum Variant.Type]. For example, [code]7[/code] ([int]) and [code]7.0[/code] ([float]) are not considered equal for this method."
 				},
 				{
 					"name": "find_custom",
@@ -3556,7 +3635,8 @@
 							"type": "int",
 							"default_value": "0"
 						}
-					]
+					],
+					"description": "Returns the index of the [b]first[/b] element in the array that causes [param method] to return [code]true[/code], or [code]-1[/code] if there are none. The search's start can be specified with [param from], continuing to the end of the array.\n[param method] is a callable that takes an element of the array, and returns a [bool].\n[b]Note:[/b] If you just want to know whether the array contains [i]anything[/i] that satisfies [param method], use [method any].\n[codeblocks]\n[gdscript]\nfunc is_even(number):\n\treturn number % 2 == 0\n\nfunc _ready():\n\tprint([1, 3, 4, 7].find_custom(is_even.bind())) # Prints 2\n\n# Another example using `bind()` to pass an additional parameter:\nfunc is_specific_number(number, expected):\n\treturn number == expected\n\nfunc _ready():\n\tprint([1, 3, 4, 7].find_custom(is_specific_number.bind(4))) # Prints 2\n[/gdscript]\n[/codeblocks]"
 				},
 				{
 					"name": "rfind",
@@ -3575,7 +3655,8 @@
 							"type": "int",
 							"default_value": "-1"
 						}
-					]
+					],
+					"description": "Returns the index of the [b]last[/b] occurrence of [param what] in this array, or [code]-1[/code] if there are none. The search's start can be specified with [param from], continuing to the beginning of the array. This method is the reverse of [method find]."
 				},
 				{
 					"name": "rfind_custom",
@@ -3594,7 +3675,8 @@
 							"type": "int",
 							"default_value": "-1"
 						}
-					]
+					],
+					"description": "Returns the index of the [b]last[/b] element of the array that causes [param method] to return [code]true[/code], or [code]-1[/code] if there are none. The search's start can be specified with [param from], continuing to the beginning of the array. This method is the reverse of [method find_custom]."
 				},
 				{
 					"name": "count",
@@ -3608,7 +3690,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Returns the number of times an element is in the array.\nTo count how many elements in an array satisfy a condition, see [method reduce]."
 				},
 				{
 					"name": "has",
@@ -3622,7 +3705,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if the array contains the given [param value].\n[codeblocks]\n[gdscript]\nprint([\"inside\", 7].has(\"inside\"))  # Prints true\nprint([\"inside\", 7].has(\"outside\")) # Prints false\nprint([\"inside\", 7].has(7))         # Prints true\nprint([\"inside\", 7].has(\"7\"))       # Prints false\n[/gdscript]\n[csharp]\nGodot.Collections.Array arr = [\"inside\", 7];\n// By C# convention, this method is renamed to `Contains`.\nGD.Print(arr.Contains(\"inside\"));  // Prints True\nGD.Print(arr.Contains(\"outside\")); // Prints False\nGD.Print(arr.Contains(7));         // Prints True\nGD.Print(arr.Contains(\"7\"));       // Prints False\n[/csharp]\n[/codeblocks]\nIn GDScript, this is equivalent to the [code]in[/code] operator:\n[codeblock]\nif 4 in [2, 4, 6, 8]:\n\tprint(\"4 is here!\") # Will be printed.\n[/codeblock]\n[b]Note:[/b] For performance reasons, the search is affected by the [param value]'s [enum Variant.Type]. For example, [code]7[/code] ([int]) and [code]7.0[/code] ([float]) are not considered equal for this method."
 				},
 				{
 					"name": "pop_back",
@@ -3630,7 +3714,8 @@
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 1321915136
+					"hash": 1321915136,
+					"description": "Removes and returns the last element of the array. Returns [code]null[/code] if the array is empty, without generating an error. See also [method pop_front]."
 				},
 				{
 					"name": "pop_front",
@@ -3638,7 +3723,8 @@
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 1321915136
+					"hash": 1321915136,
+					"description": "Removes and returns the first element of the array. Returns [code]null[/code] if the array is empty, without generating an error. See also [method pop_back].\n[b]Note:[/b] This method shifts every other element's index back, which may have a noticeable performance cost, especially on larger arrays."
 				},
 				{
 					"name": "pop_at",
@@ -3652,14 +3738,16 @@
 							"name": "position",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Removes and returns the element of the array at index [param position]. If negative, [param position] is considered relative to the end of the array. Returns [code]null[/code] if the array is empty. If [param position] is out of bounds, an error message is also generated.\n[b]Note:[/b] This method shifts every element's index after [param position] back, which may have a noticeable performance cost, especially on larger arrays."
 				},
 				{
 					"name": "sort",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Sorts the array in ascending order. The final order is dependent on the \"less than\" ([code]<[/code]) comparison between elements.\n[codeblocks]\n[gdscript]\nvar numbers = [10, 5, 2.5, 8]\nnumbers.sort()\nprint(numbers) # Prints [2.5, 5, 8, 10]\n[/gdscript]\n[csharp]\nGodot.Collections.Array numbers = [10, 5, 2.5, 8];\nnumbers.Sort();\nGD.Print(numbers); // Prints [2.5, 5, 8, 10]\n[/csharp]\n[/codeblocks]\n[b]Note:[/b] The sorting algorithm used is not [url=https://en.wikipedia.org/wiki/Sorting_algorithm#Stability]stable[/url]. This means that equivalent elements (such as [code]2[/code] and [code]2.0[/code]) may have their order changed when calling [method sort]."
 				},
 				{
 					"name": "sort_custom",
@@ -3672,14 +3760,16 @@
 							"name": "func",
 							"type": "Callable"
 						}
-					]
+					],
+					"description": "Sorts the array using a custom [Callable].\n[param func] is called as many times as necessary, receiving two array elements as arguments. The function should return [code]true[/code] if the first element should be moved [i]before[/i] the second one, otherwise it should return [code]false[/code].\n[codeblock]\nfunc sort_ascending(a, b):\n\tif a[1] < b[1]:\n\t\treturn true\n\treturn false\n\nfunc _ready():\n\tvar my_items = [[\"Tomato\", 5], [\"Apple\", 9], [\"Rice\", 4]]\n\tmy_items.sort_custom(sort_ascending)\n\tprint(my_items) # Prints [[\"Rice\", 4], [\"Tomato\", 5], [\"Apple\", 9]]\n\n\t# Sort descending, using a lambda function.\n\tmy_items.sort_custom(func(a, b): return a[1] > b[1])\n\tprint(my_items) # Prints [[\"Apple\", 9], [\"Tomato\", 5], [\"Rice\", 4]]\n[/codeblock]\nIt may also be necessary to use this method to sort strings by natural order, with [method String.naturalnocasecmp_to], as in the following example:\n[codeblock]\nvar files = [\"newfile1\", \"newfile2\", \"newfile10\", \"newfile11\"]\nfiles.sort_custom(func(a, b): return a.naturalnocasecmp_to(b) < 0)\nprint(files) # Prints [\"newfile1\", \"newfile2\", \"newfile10\", \"newfile11\"]\n[/codeblock]\n[b]Note:[/b] In C#, this method is not supported.\n[b]Note:[/b] The sorting algorithm used is not [url=https://en.wikipedia.org/wiki/Sorting_algorithm#Stability]stable[/url]. This means that values considered equal may have their order changed when calling this method.\n[b]Note:[/b] You should not randomize the return value of [param func], as the heapsort algorithm expects a consistent result. Randomizing the return value will result in unexpected behavior."
 				},
 				{
 					"name": "shuffle",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Shuffles all elements of the array in a random order.\n[b]Note:[/b] Like many similar functions in the engine (such as [method @GlobalScope.randi] or [method pick_random]), this method uses a common, global random seed. To get a predictable outcome from this method, see [method @GlobalScope.seed]."
 				},
 				{
 					"name": "bsearch",
@@ -3698,7 +3788,8 @@
 							"type": "bool",
 							"default_value": "true"
 						}
-					]
+					],
+					"description": "Returns the index of [param value] in the sorted array. If it cannot be found, returns where [param value] should be inserted to keep the array sorted. The algorithm used is [url=https://en.wikipedia.org/wiki/Binary_search_algorithm]binary search[/url].\nIf [param before] is [code]true[/code] (as by default), the returned index comes before all existing elements equal to [param value] in the array.\n[codeblock]\nvar numbers = [2, 4, 8, 10]\nvar idx = numbers.bsearch(7)\n\nnumbers.insert(idx, 7)\nprint(numbers) # Prints [2, 4, 7, 8, 10]\n\nvar fruits = [\"Apple\", \"Lemon\", \"Lemon\", \"Orange\"]\nprint(fruits.bsearch(\"Lemon\", true))  # Prints 1, points at the first \"Lemon\".\nprint(fruits.bsearch(\"Lemon\", false)) # Prints 3, points at \"Orange\".\n[/codeblock]\n[b]Note:[/b] Calling [method bsearch] on an [i]unsorted[/i] array will result in unexpected behavior. Use [method sort] before calling this method."
 				},
 				{
 					"name": "bsearch_custom",
@@ -3721,14 +3812,16 @@
 							"type": "bool",
 							"default_value": "true"
 						}
-					]
+					],
+					"description": "Returns the index of [param value] in the sorted array. If it cannot be found, returns where [param value] should be inserted to keep the array sorted (using [param func] for the comparisons). The algorithm used is [url=https://en.wikipedia.org/wiki/Binary_search_algorithm]binary search[/url].\nSimilar to [method sort_custom], [param func] is called as many times as necessary, receiving one array element and [param value] as arguments. The function should return [code]true[/code] if the array element should be [i]behind[/i] [param value], otherwise it should return [code]false[/code].\nIf [param before] is [code]true[/code] (as by default), the returned index comes before all existing elements equal to [param value] in the array.\n[codeblock]\nfunc sort_by_amount(a, b):\n\tif a[1] < b[1]:\n\t\treturn true\n\treturn false\n\nfunc _ready():\n\tvar my_items = [[\"Tomato\", 2], [\"Kiwi\", 5], [\"Rice\", 9]]\n\n\tvar apple = [\"Apple\", 5]\n\t# \"Apple\" is inserted before \"Kiwi\".\n\tmy_items.insert(my_items.bsearch_custom(apple, sort_by_amount, true), apple)\n\n\tvar banana = [\"Banana\", 5]\n\t# \"Banana\" is inserted after \"Kiwi\".\n\tmy_items.insert(my_items.bsearch_custom(banana, sort_by_amount, false), banana)\n\n\t# Prints [[\"Tomato\", 2], [\"Apple\", 5], [\"Kiwi\", 5], [\"Banana\", 5], [\"Rice\", 9]]\n\tprint(my_items)\n[/codeblock]\n[b]Note:[/b] Calling [method bsearch_custom] on an [i]unsorted[/i] array will result in unexpected behavior. Use [method sort_custom] with [param func] before calling this method."
 				},
 				{
 					"name": "reverse",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Reverses the order of all elements in the array."
 				},
 				{
 					"name": "duplicate",
@@ -3743,7 +3836,8 @@
 							"type": "bool",
 							"default_value": "false"
 						}
-					]
+					],
+					"description": "Returns a new copy of the array.\nBy default, a [b]shallow[/b] copy is returned: all nested [Array], [Dictionary], and [Resource] elements are shared with the original array. Modifying any of those in one array will also affect them in the other.\nIf [param deep] is [code]true[/code], a [b]deep[/b] copy is returned: all nested arrays and dictionaries are also duplicated (recursively). Any [Resource] is still shared with the original array, though."
 				},
 				{
 					"name": "duplicate_deep",
@@ -3758,7 +3852,8 @@
 							"type": "int",
 							"default_value": "1"
 						}
-					]
+					],
+					"description": "Duplicates this array, deeply, like [method duplicate] when passing [code]true[/code], with extra control over how subresources are handled.\n[param deep_subresources_mode] must be one of the values from [enum Resource.DeepDuplicateMode]. By default, only internal resources will be duplicated (recursively)."
 				},
 				{
 					"name": "slice",
@@ -3787,7 +3882,8 @@
 							"type": "bool",
 							"default_value": "false"
 						}
-					]
+					],
+					"description": "Returns a new [Array] containing this array's elements, from index [param begin] (inclusive) to [param end] (exclusive), every [param step] elements.\nIf either [param begin] or [param end] are negative, their value is relative to the end of the array.\nIf [param step] is negative, this method iterates through the array in reverse, returning a slice ordered backwards. For this to work, [param begin] must be greater than [param end].\nIf [param deep] is [code]true[/code], all nested [Array] and [Dictionary] elements in the slice are duplicated from the original, recursively. See also [method duplicate].\n[codeblock]\nvar letters = [\"A\", \"B\", \"C\", \"D\", \"E\", \"F\"]\n\nprint(letters.slice(0, 2))  # Prints [\"A\", \"B\"]\nprint(letters.slice(2, -2)) # Prints [\"C\", \"D\"]\nprint(letters.slice(-2, 6)) # Prints [\"E\", \"F\"]\n\nprint(letters.slice(0, 6, 2))  # Prints [\"A\", \"C\", \"E\"]\nprint(letters.slice(4, 1, -1)) # Prints [\"E\", \"D\", \"C\"]\n[/codeblock]"
 				},
 				{
 					"name": "filter",
@@ -3801,7 +3897,8 @@
 							"name": "method",
 							"type": "Callable"
 						}
-					]
+					],
+					"description": "Calls the given [Callable] on each element in the array and returns a new, filtered [Array].\nThe [param method] receives one of the array elements as an argument, and should return [code]true[/code] to add the element to the filtered array, or [code]false[/code] to exclude it.\n[codeblock]\nfunc is_even(number):\n\treturn number % 2 == 0\n\nfunc _ready():\n\tprint([1, 4, 5, 8].filter(is_even)) # Prints [4, 8]\n\n\t# Same as above, but using a lambda function.\n\tprint([1, 4, 5, 8].filter(func(number): return number % 2 == 0))\n[/codeblock]\nSee also [method any], [method all], [method map] and [method reduce]."
 				},
 				{
 					"name": "map",
@@ -3815,7 +3912,8 @@
 							"name": "method",
 							"type": "Callable"
 						}
-					]
+					],
+					"description": "Calls the given [Callable] for each element in the array and returns a new array filled with values returned by the [param method].\nThe [param method] should take one [Variant] parameter (the current array element) and can return any [Variant].\n[codeblock]\nfunc double(number):\n\treturn number * 2\n\nfunc _ready():\n\tprint([1, 2, 3].map(double)) # Prints [2, 4, 6]\n\n\t# Same as above, but using a lambda function.\n\tprint([1, 2, 3].map(func(element): return element * 2))\n[/codeblock]\nSee also [method filter], [method reduce], [method any] and [method all]."
 				},
 				{
 					"name": "reduce",
@@ -3834,7 +3932,8 @@
 							"type": "Variant",
 							"default_value": "null"
 						}
-					]
+					],
+					"description": "Calls the given [Callable] for each element in array, accumulates the result in [param accum], then returns it.\nThe [param method] takes two arguments: the current value of [param accum] and the current array element. If [param accum] is [code]null[/code] (as by default), the iteration will start from the second element, with the first one used as initial value of [param accum].\n[codeblock]\nfunc sum(accum, number):\n\treturn accum + number\n\nfunc _ready():\n\tprint([1, 2, 3].reduce(sum, 0))  # Prints 6\n\tprint([1, 2, 3].reduce(sum, 10)) # Prints 16\n\n\t# Same as above, but using a lambda function.\n\tprint([1, 2, 3].reduce(func(accum, number): return accum + number, 10))\n[/codeblock]\nIf [method max] is not desirable, this method may also be used to implement a custom comparator:\n[codeblock]\nfunc _ready():\n\tvar arr = [Vector2i(5, 0), Vector2i(3, 4), Vector2i(1, 2)]\n\n\tvar longest_vec = arr.reduce(func(max, vec): return vec if is_length_greater(vec, max) else max)\n\tprint(longest_vec) # Prints (3, 4)\n\nfunc is_length_greater(a, b):\n\treturn a.length() > b.length()\n[/codeblock]\nThis method can also be used to count how many elements in an array satisfy a certain condition, similar to [method count]:\n[codeblock]\nfunc is_even(number):\n\treturn number % 2 == 0\n\nfunc _ready():\n\tvar arr = [1, 2, 3, 4, 5]\n\t# If the current element is even, increment count, otherwise leave count the same.\n\tvar even_count = arr.reduce(func(count, next): return count + 1 if is_even(next) else count, 0)\n\tprint(even_count) # Prints 2\n[/codeblock]\nSee also [method map], [method filter], [method any], and [method all]."
 				},
 				{
 					"name": "any",
@@ -3848,7 +3947,8 @@
 							"name": "method",
 							"type": "Callable"
 						}
-					]
+					],
+					"description": "Calls the given [Callable] on each element in the array and returns [code]true[/code] if the [Callable] returns [code]true[/code] for [i]one or more[/i] elements in the array. If the [Callable] returns [code]false[/code] for all elements in the array, this method returns [code]false[/code].\nThe [param method] should take one [Variant] parameter (the current array element) and return a [bool].\n[codeblock]\nfunc greater_than_5(number):\n\treturn number > 5\n\nfunc _ready():\n\tprint([6, 10, 6].any(greater_than_5)) # Prints true (3 elements evaluate to true).\n\tprint([4, 10, 4].any(greater_than_5)) # Prints true (1 elements evaluate to true).\n\tprint([4, 4, 4].any(greater_than_5))  # Prints false (0 elements evaluate to true).\n\tprint([].any(greater_than_5))         # Prints false (0 elements evaluate to true).\n\n\t# Same as the first line above, but using a lambda function.\n\tprint([6, 10, 6].any(func(number): return number > 5)) # Prints true\n[/codeblock]\nSee also [method all], [method filter], [method map] and [method reduce].\n[b]Note:[/b] Unlike relying on the size of an array returned by [method filter], this method will return as early as possible to improve performance (especially with large arrays).\n[b]Note:[/b] For an empty array, this method always returns [code]false[/code]."
 				},
 				{
 					"name": "all",
@@ -3862,7 +3962,8 @@
 							"name": "method",
 							"type": "Callable"
 						}
-					]
+					],
+					"description": "Calls the given [Callable] on each element in the array and returns [code]true[/code] if the [Callable] returns [code]true[/code] for [i]all[/i] elements in the array. If the [Callable] returns [code]false[/code] for one array element or more, this method returns [code]false[/code].\nThe [param method] should take one [Variant] parameter (the current array element) and return a [bool].\n[codeblocks]\n[gdscript]\nfunc greater_than_5(number):\n\treturn number > 5\n\nfunc _ready():\n\tprint([6, 10, 6].all(greater_than_5)) # Prints true (3/3 elements evaluate to true).\n\tprint([4, 10, 4].all(greater_than_5)) # Prints false (1/3 elements evaluate to true).\n\tprint([4, 4, 4].all(greater_than_5))  # Prints false (0/3 elements evaluate to true).\n\tprint([].all(greater_than_5))         # Prints true (0/0 elements evaluate to true).\n\n\t# Same as the first line above, but using a lambda function.\n\tprint([6, 10, 6].all(func(element): return element > 5)) # Prints true\n[/gdscript]\n[csharp]\nprivate static bool GreaterThan5(int number)\n{\n\treturn number > 5;\n}\n\npublic override void _Ready()\n{\n\t// Prints True (3/3 elements evaluate to true).\n\tGD.Print(new Godot.Collections.Array<int> { 6, 10, 6 }.All(GreaterThan5));\n\t// Prints False (1/3 elements evaluate to true).\n\tGD.Print(new Godot.Collections.Array<int> { 4, 10, 4 }.All(GreaterThan5));\n\t// Prints False (0/3 elements evaluate to true).\n\tGD.Print(new Godot.Collections.Array<int> { 4, 4, 4 }.All(GreaterThan5));\n\t// Prints True (0/0 elements evaluate to true).\n\tGD.Print(new Godot.Collections.Array<int> { }.All(GreaterThan5));\n\n\t// Same as the first line above, but using a lambda function.\n\tGD.Print(new Godot.Collections.Array<int> { 6, 10, 6 }.All(element => element > 5)); // Prints True\n}\n[/csharp]\n[/codeblocks]\nSee also [method any], [method filter], [method map] and [method reduce].\n[b]Note:[/b] Unlike relying on the size of an array returned by [method filter], this method will return as early as possible to improve performance (especially with large arrays).\n[b]Note:[/b] For an empty array, this method [url=https://en.wikipedia.org/wiki/Vacuous_truth]always[/url] returns [code]true[/code]."
 				},
 				{
 					"name": "max",
@@ -3870,7 +3971,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1460142086
+					"hash": 1460142086,
+					"description": "Returns the maximum value contained in the array, if all elements can be compared. Otherwise, returns [code]null[/code]. See also [method min].\nTo find the maximum value using a custom comparator, you can use [method reduce]."
 				},
 				{
 					"name": "min",
@@ -3878,7 +3980,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1460142086
+					"hash": 1460142086,
+					"description": "Returns the minimum value contained in the array, if all elements can be compared. Otherwise, returns [code]null[/code]. See also [method max]."
 				},
 				{
 					"name": "is_typed",
@@ -3886,7 +3989,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the array is typed. Typed arrays can only contain elements of a specific type, as defined by the typed array constructor. The methods of a typed array are still expected to return a generic [Variant].\nIn GDScript, it is possible to define a typed array with static typing:\n[codeblock]\nvar numbers: Array[float] = [0.2, 4.2, -2.0]\nprint(numbers.is_typed()) # Prints true\n[/codeblock]"
 				},
 				{
 					"name": "is_same_typed",
@@ -3900,7 +4004,8 @@
 							"name": "array",
 							"type": "Array"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if this array is typed the same as the given [param array]. See also [method is_typed]."
 				},
 				{
 					"name": "get_typed_builtin",
@@ -3908,7 +4013,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the built-in [Variant] type of the typed array as a [enum Variant.Type] constant. If the array is not typed, returns [constant TYPE_NIL]. See also [method is_typed]."
 				},
 				{
 					"name": "get_typed_class_name",
@@ -3916,7 +4022,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1825232092
+					"hash": 1825232092,
+					"description": "Returns the [b]built-in[/b] class name of the typed array, if the built-in [Variant] type [constant TYPE_OBJECT]. Otherwise, returns an empty [StringName]. See also [method is_typed] and [method Object.get_class]."
 				},
 				{
 					"name": "get_typed_script",
@@ -3924,14 +4031,16 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1460142086
+					"hash": 1460142086,
+					"description": "Returns the [Script] instance associated with this typed array, or [code]null[/code] if it does not exist. See also [method is_typed]."
 				},
 				{
 					"name": "make_read_only",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Makes the array read-only. The array's elements cannot be overridden with different values, and their order cannot change. Does not apply to nested elements, such as dictionaries.\nIn GDScript, arrays are automatically read-only if declared with the [code]const[/code] keyword."
 				},
 				{
 					"name": "is_read_only",
@@ -3939,7 +4048,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the array is read-only. See [method make_read_only].\nIn GDScript, arrays are automatically read-only if declared with the [code]const[/code] keyword."
 				}
 			],
 			"constructors": [
@@ -4190,7 +4300,9 @@
 					]
 				}
 			],
-			"has_destructor": true
+			"has_destructor": true,
+			"brief_description": "A built-in data structure that holds a sequence of elements.",
+			"description": "An array data structure that can contain a sequence of elements of any [Variant] type by default. Values can optionally be constrained to a specific type by creating a [i]typed array[/i]. Elements are accessed by a numerical index starting at [code]0[/code]. Negative indices are used to count from the back ([code]-1[/code] is the last element, [code]-2[/code] is the second to last, etc.).\n[codeblocks]\n[gdscript]\nvar array = [\"First\", 2, 3, \"Last\"]\nprint(array[0])  # Prints \"First\"\nprint(array[2])  # Prints 3\nprint(array[-1]) # Prints \"Last\"\n\narray[1] = \"Second\"\nprint(array[1])  # Prints \"Second\"\nprint(array[-3]) # Prints \"Second\"\n\n# This typed array can only contain integers.\n# Attempting to add any other type will result in an error.\nvar typed_array: Array[int] = [1, 2, 3]\n[/gdscript]\n[csharp]\nGodot.Collections.Array array = [\"First\", 2, 3, \"Last\"];\nGD.Print(array[0]); // Prints \"First\"\nGD.Print(array[2]); // Prints 3\nGD.Print(array[^1]); // Prints \"Last\"\n\narray[1] = \"Second\";\nGD.Print(array[1]); // Prints \"Second\"\nGD.Print(array[^3]); // Prints \"Second\"\n\n// This typed array can only contain integers.\n// Attempting to add any other type will result in an error.\nGodot.Collections.Array<int> typedArray = [1, 2, 3];\n[/csharp]\n[/codeblocks]\n[b]Note:[/b] Arrays are always passed by [b]reference[/b]. To get a copy of an array that can be modified independently of the original array, use [method duplicate].\n[b]Note:[/b] Erasing elements while iterating over arrays is [b]not[/b] supported and will result in unpredictable behavior.\n[b]Note:[/b] In a boolean context, an array will evaluate to [code]false[/code] if it's empty ([code][][/code]). Otherwise, an array will always evaluate to [code]true[/code].\n[b]Differences between packed arrays, typed arrays, and untyped arrays:[/b] Packed arrays are generally faster to iterate on and modify compared to a typed array of the same type (e.g. [PackedInt64Array] versus [code]Array[int][/code]). Also, packed arrays consume less memory. As a downside, packed arrays are less flexible as they don't offer as many convenience methods such as [method Array.map]. Typed arrays are in turn faster to iterate on and modify than untyped arrays."
 		},
 		{
 			"name": "Dictionary",
@@ -4205,7 +4317,8 @@
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 1
+					"hash": 1,
+					"description": "Clears the dictionary, removing all entries from it."
 				},
 				{
 					"name": "size",
@@ -4213,7 +4326,8 @@
 					"is_const": true,
 					"is_static": false,
 					"hash": 2,
-					"return_type": "int"
+					"return_type": "int",
+					"description": "Returns the number of entries in the dictionary. Empty dictionaries ([code]{ }[/code]) always return [code]0[/code]. See also [method is_empty]."
 				},
 				{
 					"name": "has",
@@ -4227,7 +4341,8 @@
 							"name": "key",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if the dictionary contains an entry with the given [param key].\n[codeblocks]\n[gdscript]\nvar my_dict = {\n\t\"Godot\" : 4,\n\t210 : null,\n}\n\nprint(my_dict.has(\"Godot\")) # Prints true\nprint(my_dict.has(210))     # Prints true\nprint(my_dict.has(4))       # Prints false\n[/gdscript]\n[csharp]\nvar myDict = new Godot.Collections.Dictionary\n{\n\t{ \"Godot\", 4 },\n\t{ 210, default },\n};\n\nGD.Print(myDict.ContainsKey(\"Godot\")); // Prints True\nGD.Print(myDict.ContainsKey(210));     // Prints True\nGD.Print(myDict.ContainsKey(4));       // Prints False\n[/csharp]\n[/codeblocks]\nIn GDScript, this is equivalent to the [code]in[/code] operator:\n[codeblock]\nif \"Godot\" in { \"Godot\": 4 }:\n\tprint(\"The key is here!\") # Will be printed.\n[/codeblock]\n[b]Note:[/b] This method returns [code]true[/code] as long as the [param key] exists, even if its corresponding value is [code]null[/code]."
 				},
 				{
 					"name": "keys",
@@ -4235,7 +4350,8 @@
 					"is_const": true,
 					"is_static": false,
 					"hash": 4,
-					"return_type": "Array"
+					"return_type": "Array",
+					"description": "Returns the list of keys in the dictionary."
 				},
 				{
 					"name": "values",
@@ -4243,7 +4359,8 @@
 					"is_const": true,
 					"is_static": false,
 					"hash": 5,
-					"return_type": "Array"
+					"return_type": "Array",
+					"description": "Returns the list of values in this dictionary."
 				},
 				{
 					"name": "get",
@@ -4261,7 +4378,8 @@
 							"name": "default",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Returns the corresponding value for the given [param key] in the dictionary. If the [param key] does not exist, returns [param default], or [code]null[/code] if the parameter is omitted.\n[b]Note:[/b] If the [param default] argument is computationally expensive or has unwanted side effects, consider using the [method has] method instead:\n[codeblock]\n# Always calls `expensive_function()`.\ndict.get(\"key\", expensive_function())\n# Calls `expensive_function()` only if the key does not exist.\ndict.get(\"key\") if dict.has(\"key\") else expensive_function()\n[/codeblock]"
 				},
 				{
 					"name": "merge",
@@ -4278,7 +4396,8 @@
 							"name": "overwrite",
 							"type": "bool"
 						}
-					]
+					],
+					"description": "Adds entries from [param dictionary] to this dictionary. By default, duplicate keys are not copied over, unless [param overwrite] is [code]true[/code].\n[codeblocks]\n[gdscript]\nvar dict = { \"item\": \"sword\", \"quantity\": 2 }\nvar other_dict = { \"quantity\": 15, \"color\": \"silver\" }\n\n# Overwriting of existing keys is disabled by default.\ndict.merge(other_dict)\nprint(dict)  # { \"item\": \"sword\", \"quantity\": 2, \"color\": \"silver\" }\n\n# With overwriting of existing keys enabled.\ndict.merge(other_dict, true)\nprint(dict)  # { \"item\": \"sword\", \"quantity\": 15, \"color\": \"silver\" }\n[/gdscript]\n[csharp]\nvar dict = new Godot.Collections.Dictionary\n{\n\t[\"item\"] = \"sword\",\n\t[\"quantity\"] = 2,\n};\n\nvar otherDict = new Godot.Collections.Dictionary\n{\n\t[\"quantity\"] = 15,\n\t[\"color\"] = \"silver\",\n};\n\n// Overwriting of existing keys is disabled by default.\ndict.Merge(otherDict);\nGD.Print(dict); // { \"item\": \"sword\", \"quantity\": 2, \"color\": \"silver\" }\n\n// With overwriting of existing keys enabled.\ndict.Merge(otherDict, true);\nGD.Print(dict); // { \"item\": \"sword\", \"quantity\": 15, \"color\": \"silver\" }\n[/csharp]\n[/codeblocks]\n[b]Note:[/b] [method merge] is [i]not[/i] recursive. Nested dictionaries are considered as keys that can be overwritten or not depending on the value of [param overwrite], but they will never be merged together."
 				},
 				{
 					"name": "erase",
@@ -4292,7 +4411,8 @@
 							"name": "key",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Removes the dictionary entry by key, if it exists. Returns [code]true[/code] if the given [param key] existed in the dictionary, otherwise [code]false[/code].\n[b]Note:[/b] Do not erase entries while iterating over the dictionary. You can iterate over the [method keys] array instead."
 				},
 				{
 					"name": "is_empty",
@@ -4300,7 +4420,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the dictionary is empty (its size is [code]0[/code]). See also [method size]."
 				},
 				{
 					"name": "assign",
@@ -4313,14 +4434,16 @@
 							"name": "dictionary",
 							"type": "Dictionary"
 						}
-					]
+					],
+					"description": "Assigns elements of another [param dictionary] into the dictionary. Resizes the dictionary to match [param dictionary]. Performs type conversions if the dictionary is typed."
 				},
 				{
 					"name": "sort",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Sorts the dictionary in ascending order, by key. The final order is dependent on the \"less than\" ([code]<[/code]) comparison between keys.\n[codeblocks]\n[gdscript]\nvar numbers = { \"c\": 2, \"a\": 0, \"b\": 1 }\nnumbers.sort()\nprint(numbers) # Prints { \"a\": 0, \"b\": 1, \"c\": 2 }\n[/gdscript]\n[/codeblocks]\nThis method ensures that the dictionary's entries are ordered consistently when [method keys] or [method values] are called, or when the dictionary needs to be converted to a string through [method @GlobalScope.str] or [method JSON.stringify]."
 				},
 				{
 					"name": "merged",
@@ -4339,7 +4462,8 @@
 							"type": "bool",
 							"default_value": "false"
 						}
-					]
+					],
+					"description": "Returns a copy of this dictionary merged with the other [param dictionary]. By default, duplicate keys are not copied over, unless [param overwrite] is [code]true[/code]. See also [method merge].\nThis method is useful for quickly making dictionaries with default values:\n[codeblock]\nvar base = { \"fruit\": \"apple\", \"vegetable\": \"potato\" }\nvar extra = { \"fruit\": \"orange\", \"dressing\": \"vinegar\" }\n# Prints { \"fruit\": \"orange\", \"vegetable\": \"potato\", \"dressing\": \"vinegar\" }\nprint(extra.merged(base))\n# Prints { \"fruit\": \"apple\", \"vegetable\": \"potato\", \"dressing\": \"vinegar\" }\nprint(extra.merged(base, true))\n[/codeblock]"
 				},
 				{
 					"name": "has_all",
@@ -4353,7 +4477,8 @@
 							"name": "keys",
 							"type": "Array"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if the dictionary contains all keys in the given [param keys] array.\n[codeblock]\nvar data = { \"width\": 10, \"height\": 20 }\ndata.has_all([\"height\", \"width\"]) # Returns true\n[/codeblock]"
 				},
 				{
 					"name": "find_key",
@@ -4367,7 +4492,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Finds and returns the first key whose associated value is equal to [param value], or [code]null[/code] if it is not found.\n[b]Note:[/b] [code]null[/code] is also a valid key. If inside the dictionary, [method find_key] may give misleading results."
 				},
 				{
 					"name": "hash",
@@ -4375,7 +4501,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns a hashed 32-bit integer value representing the dictionary contents.\n[codeblocks]\n[gdscript]\nvar dict1 = { \"A\": 10, \"B\": 2 }\nvar dict2 = { \"A\": 10, \"B\": 2 }\n\nprint(dict1.hash() == dict2.hash()) # Prints true\n[/gdscript]\n[csharp]\nvar dict1 = new Godot.Collections.Dictionary { { \"A\", 10 }, { \"B\", 2 } };\nvar dict2 = new Godot.Collections.Dictionary { { \"A\", 10 }, { \"B\", 2 } };\n\n// Godot.Collections.Dictionary has no Hash() method. Use GD.Hash() instead.\nGD.Print(GD.Hash(dict1) == GD.Hash(dict2)); // Prints True\n[/csharp]\n[/codeblocks]\n[b]Note:[/b] Dictionaries with the same entries but in a different order will not have the same hash.\n[b]Note:[/b] Dictionaries with equal hash values are [i]not[/i] guaranteed to be the same, because of hash collisions. On the contrary, dictionaries with different hash values are guaranteed to be different."
 				},
 				{
 					"name": "duplicate",
@@ -4390,7 +4517,8 @@
 							"type": "bool",
 							"default_value": "false"
 						}
-					]
+					],
+					"description": "Returns a new copy of the dictionary.\nBy default, a [b]shallow[/b] copy is returned: all nested [Array], [Dictionary], and [Resource] keys and values are shared with the original dictionary. Modifying any of those in one dictionary will also affect them in the other.\nIf [param deep] is [code]true[/code], a [b]deep[/b] copy is returned: all nested arrays and dictionaries are also duplicated (recursively). Any [Resource] is still shared with the original dictionary, though."
 				},
 				{
 					"name": "duplicate_deep",
@@ -4405,7 +4533,8 @@
 							"type": "int",
 							"default_value": "1"
 						}
-					]
+					],
+					"description": "Duplicates this dictionary, deeply, like [method duplicate] when passing [code]true[/code], with extra control over how subresources are handled.\n[param deep_subresources_mode] must be one of the values from [enum Resource.DeepDuplicateMode]. By default, only internal resources will be duplicated (recursively)."
 				},
 				{
 					"name": "get_or_add",
@@ -4424,7 +4553,8 @@
 							"type": "Variant",
 							"default_value": "null"
 						}
-					]
+					],
+					"description": "Gets a value and ensures the key is set. If the [param key] exists in the dictionary, this behaves like [method get]. Otherwise, the [param default] value is inserted into the dictionary and returned."
 				},
 				{
 					"name": "set",
@@ -4442,7 +4572,8 @@
 							"name": "value",
 							"type": "Variant"
 						}
-					]
+					],
+					"description": "Sets the value of the element at the given [param key] to the given [param value]. Returns [code]true[/code] if the value is set successfully. Fails and returns [code]false[/code] if the dictionary is read-only, or if [param key] and [param value] don't match the dictionary's types. This is the same as using the [code][][/code] operator ([code]dict[key] = value[/code])."
 				},
 				{
 					"name": "is_typed",
@@ -4450,7 +4581,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the dictionary is typed. Typed dictionaries can only store keys/values of their associated type and provide type safety for the [code][][/code] operator. Methods of typed dictionary still return [Variant]."
 				},
 				{
 					"name": "is_typed_key",
@@ -4458,7 +4590,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the dictionary's keys are typed."
 				},
 				{
 					"name": "is_typed_value",
@@ -4466,7 +4599,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the dictionary's values are typed."
 				},
 				{
 					"name": "is_same_typed",
@@ -4480,7 +4614,8 @@
 							"name": "dictionary",
 							"type": "Dictionary"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if the dictionary is typed the same as [param dictionary]."
 				},
 				{
 					"name": "is_same_typed_key",
@@ -4494,7 +4629,8 @@
 							"name": "dictionary",
 							"type": "Dictionary"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if the dictionary's keys are typed the same as [param dictionary]'s keys."
 				},
 				{
 					"name": "is_same_typed_value",
@@ -4508,7 +4644,8 @@
 							"name": "dictionary",
 							"type": "Dictionary"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if the dictionary's values are typed the same as [param dictionary]'s values."
 				},
 				{
 					"name": "get_typed_key_builtin",
@@ -4516,7 +4653,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the built-in [Variant] type of the typed dictionary's keys as a [enum Variant.Type] constant. If the keys are not typed, returns [constant TYPE_NIL]. See also [method is_typed_key]."
 				},
 				{
 					"name": "get_typed_value_builtin",
@@ -4524,7 +4662,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the built-in [Variant] type of the typed dictionary's values as a [enum Variant.Type] constant. If the values are not typed, returns [constant TYPE_NIL]. See also [method is_typed_value]."
 				},
 				{
 					"name": "get_typed_key_class_name",
@@ -4532,7 +4671,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1825232092
+					"hash": 1825232092,
+					"description": "Returns the [b]built-in[/b] class name of the typed dictionary's keys, if the built-in [Variant] type is [constant TYPE_OBJECT]. Otherwise, returns an empty [StringName]. See also [method is_typed_key] and [method Object.get_class]."
 				},
 				{
 					"name": "get_typed_value_class_name",
@@ -4540,7 +4680,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1825232092
+					"hash": 1825232092,
+					"description": "Returns the [b]built-in[/b] class name of the typed dictionary's values, if the built-in [Variant] type is [constant TYPE_OBJECT]. Otherwise, returns an empty [StringName]. See also [method is_typed_value] and [method Object.get_class]."
 				},
 				{
 					"name": "get_typed_key_script",
@@ -4548,7 +4689,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1460142086
+					"hash": 1460142086,
+					"description": "Returns the [Script] instance associated with this typed dictionary's keys, or [code]null[/code] if it does not exist. See also [method is_typed_key]."
 				},
 				{
 					"name": "get_typed_value_script",
@@ -4556,14 +4698,16 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1460142086
+					"hash": 1460142086,
+					"description": "Returns the [Script] instance associated with this typed dictionary's values, or [code]null[/code] if it does not exist. See also [method is_typed_value]."
 				},
 				{
 					"name": "make_read_only",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Makes the dictionary read-only, i.e. disables modification of the dictionary's contents. Does not apply to nested content, e.g. content of nested dictionaries."
 				},
 				{
 					"name": "is_read_only",
@@ -4571,7 +4715,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the dictionary is read-only. See [method make_read_only]. Dictionaries are automatically read-only if declared with [code]const[/code] keyword."
 				},
 				{
 					"name": "recursive_equal",
@@ -4589,7 +4734,8 @@
 							"name": "recursion_count",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if the two dictionaries contain the same keys and values, inner [Dictionary] and [Array] keys and values are compared recursively."
 				}
 			],
 			"operators": [
@@ -4674,7 +4820,9 @@
 						}
 					]
 				}
-			]
+			],
+			"brief_description": "A built-in data structure that holds key-value pairs.",
+			"description": "Dictionaries are associative containers that contain values referenced by unique keys. Dictionaries will preserve the insertion order when adding new entries. In other programming languages, this data structure is often referred to as a hash map or an associative array.\nYou can define a dictionary by placing a comma-separated list of [code]key: value[/code] pairs inside curly braces [code]{}[/code].\nCreating a dictionary:\n[codeblocks]\n[gdscript]\nvar my_dict = {} # Creates an empty dictionary.\n\nvar dict_variable_key = \"Another key name\"\nvar dict_variable_value = \"value2\"\nvar another_dict = {\n\t\"Some key name\": \"value1\",\n\tdict_variable_key: dict_variable_value,\n}\n\nvar points_dict = { \"White\": 50, \"Yellow\": 75, \"Orange\": 100 }\n\n# Alternative Lua-style syntax.\n# Doesn't require quotes around keys, but only string constants can be used as key names.\n# Additionally, key names must start with a letter or an underscore.\n# Here, `some_key` is a string literal, not a variable!\nanother_dict = {\n\tsome_key = 42,\n}\n[/gdscript]\n[csharp]\nvar myDict = new Godot.Collections.Dictionary(); // Creates an empty dictionary.\nvar pointsDict = new Godot.Collections.Dictionary\n{\n\t{ \"White\", 50 },\n\t{ \"Yellow\", 75 },\n\t{ \"Orange\", 100 },\n};\n[/csharp]\n[/codeblocks]\nYou can access a dictionary's value by referencing its corresponding key. In the above example, [code]points_dict[\"White\"][/code] will return [code]50[/code]. You can also write [code]points_dict.White[/code], which is equivalent. However, you'll have to use the bracket syntax if the key you're accessing the dictionary with isn't a fixed string (such as a number or variable).\n[codeblocks]\n[gdscript]\n@export_enum(\"White\", \"Yellow\", \"Orange\") var my_color: String\nvar points_dict = { \"White\": 50, \"Yellow\": 75, \"Orange\": 100 }\nfunc _ready():\n\t# We can't use dot syntax here as `my_color` is a variable.\n\tvar points = points_dict[my_color]\n[/gdscript]\n[csharp]\n[Export(PropertyHint.Enum, \"White,Yellow,Orange\")]\npublic string MyColor { get; set; }\nprivate Godot.Collections.Dictionary _pointsDict = new Godot.Collections.Dictionary\n{\n\t{ \"White\", 50 },\n\t{ \"Yellow\", 75 },\n\t{ \"Orange\", 100 },\n};\n\npublic override void _Ready()\n{\n\tint points = (int)_pointsDict[MyColor];\n}\n[/csharp]\n[/codeblocks]\nIn the above code, [code]points[/code] will be assigned the value that is paired with the appropriate color selected in [code]my_color[/code].\nDictionaries can contain more complex data:\n[codeblocks]\n[gdscript]\nvar my_dict = {\n\t\"First Array\": [1, 2, 3, 4] # Assigns an Array to a String key.\n}\n[/gdscript]\n[csharp]\nvar myDict = new Godot.Collections.Dictionary\n{\n\t{ \"First Array\", new Godot.Collections.Array { 1, 2, 3, 4 } }\n};\n[/csharp]\n[/codeblocks]\nTo add a key to an existing dictionary, access it like an existing key and assign to it:\n[codeblocks]\n[gdscript]\nvar points_dict = { \"White\": 50, \"Yellow\": 75, \"Orange\": 100 }\npoints_dict[\"Blue\"] = 150 # Add \"Blue\" as a key and assign 150 as its value.\n[/gdscript]\n[csharp]\nvar pointsDict = new Godot.Collections.Dictionary\n{\n\t{ \"White\", 50 },\n\t{ \"Yellow\", 75 },\n\t{ \"Orange\", 100 },\n};\npointsDict[\"Blue\"] = 150; // Add \"Blue\" as a key and assign 150 as its value.\n[/csharp]\n[/codeblocks]\nFinally, untyped dictionaries can contain different types of keys and values in the same dictionary:\n[codeblocks]\n[gdscript]\n# This is a valid dictionary.\n# To access the string \"Nested value\" below, use `my_dict.sub_dict.sub_key` or `my_dict[\"sub_dict\"][\"sub_key\"]`.\n# Indexing styles can be mixed and matched depending on your needs.\nvar my_dict = {\n\t\"String Key\": 5,\n\t4: [1, 2, 3],\n\t7: \"Hello\",\n\t\"sub_dict\": { \"sub_key\": \"Nested value\" },\n}\n[/gdscript]\n[csharp]\n// This is a valid dictionary.\n// To access the string \"Nested value\" below, use `((Godot.Collections.Dictionary)myDict[\"sub_dict\"])[\"sub_key\"]`.\nvar myDict = new Godot.Collections.Dictionary {\n\t{ \"String Key\", 5 },\n\t{ 4, new Godot.Collections.Array { 1, 2, 3 } },\n\t{ 7, \"Hello\" },\n\t{ \"sub_dict\", new Godot.Collections.Dictionary { { \"sub_key\", \"Nested value\" } } },\n};\n[/csharp]\n[/codeblocks]\nThe keys of a dictionary can be iterated with the [code]for[/code] keyword:\n[codeblocks]\n[gdscript]\nvar groceries = { \"Orange\": 20, \"Apple\": 2, \"Banana\": 4 }\nfor fruit in groceries:\n\tvar amount = groceries[fruit]\n[/gdscript]\n[csharp]\nvar groceries = new Godot.Collections.Dictionary { { \"Orange\", 20 }, { \"Apple\", 2 }, { \"Banana\", 4 } };\nforeach (var (fruit, amount) in groceries)\n{\n\t// `fruit` is the key, `amount` is the value.\n}\n[/csharp]\n[/codeblocks]\nTo enforce a certain type for keys and values, you can create a [i]typed dictionary[/i]. Typed dictionaries can only contain keys and values of the given types, or that inherit from the given classes:\n[codeblocks]\n[gdscript]\n# Creates a typed dictionary with String keys and int values.\n# Attempting to use any other type for keys or values will result in an error.\nvar typed_dict: Dictionary[String, int] = {\n\t\"some_key\": 1,\n\t\"some_other_key\": 2,\n}\n\n# Creates a typed dictionary with String keys and values of any type.\n# Attempting to use any other type for keys will result in an error.\nvar typed_dict_key_only: Dictionary[String, Variant] = {\n\t\"some_key\": 12.34,\n\t\"some_other_key\": \"string\",\n}\n[/gdscript]\n[csharp]\n// Creates a typed dictionary with String keys and int values.\n// Attempting to use any other type for keys or values will result in an error.\nvar typedDict = new Godot.Collections.Dictionary<String, int> {\n\t{\"some_key\", 1},\n\t{\"some_other_key\", 2},\n};\n\n// Creates a typed dictionary with String keys and values of any type.\n// Attempting to use any other type for keys will result in an error.\nvar typedDictKeyOnly = new Godot.Collections.Dictionary<String, Variant> {\n\t{\"some_key\", 12.34},\n\t{\"some_other_key\", \"string\"},\n};\n[/csharp]\n[/codeblocks]\n[b]Note:[/b] Dictionaries are always passed by reference. To get a copy of a dictionary which can be modified independently of the original dictionary, use [method duplicate].\n[b]Note:[/b] Erasing elements while iterating over dictionaries is [b]not[/b] supported and will result in unpredictable behavior.\n[b]Note:[/b] In a boolean context, a dictionary will evaluate to [code]false[/code] if it's empty ([code]{}[/code]). Otherwise, a dictionary will always evaluate to [code]true[/code]."
 		},
 		{
 			"name": "Color",
@@ -4683,791 +4831,951 @@
 			"members": [
 				{
 					"name": "r",
-					"type": "float"
+					"type": "float",
+					"description": "The color's red component, typically on the range of 0 to 1."
 				},
 				{
 					"name": "g",
-					"type": "float"
+					"type": "float",
+					"description": "The color's green component, typically on the range of 0 to 1."
 				},
 				{
 					"name": "b",
-					"type": "float"
+					"type": "float",
+					"description": "The color's blue component, typically on the range of 0 to 1."
 				},
 				{
 					"name": "a",
-					"type": "float"
+					"type": "float",
+					"description": "The color's alpha component, typically on the range of 0 to 1. A value of 0 means that the color is fully transparent. A value of 1 means that the color is fully opaque.\n[b]Note:[/b] The alpha channel is always stored with linear encoding, regardless of the encoding of the other color channels. The [method linear_to_srgb] and [method srgb_to_linear] methods do not affect the alpha channel."
 				},
 				{
 					"name": "r8",
-					"type": "int"
+					"type": "int",
+					"description": "Wrapper for [member r] that uses the range 0 to 255, instead of 0 to 1."
 				},
 				{
 					"name": "g8",
-					"type": "int"
+					"type": "int",
+					"description": "Wrapper for [member g] that uses the range 0 to 255, instead of 0 to 1."
 				},
 				{
 					"name": "b8",
-					"type": "int"
+					"type": "int",
+					"description": "Wrapper for [member b] that uses the range 0 to 255, instead of 0 to 1."
 				},
 				{
 					"name": "a8",
-					"type": "int"
+					"type": "int",
+					"description": "Wrapper for [member a] that uses the range 0 to 255, instead of 0 to 1."
 				},
 				{
 					"name": "h",
-					"type": "float"
+					"type": "float",
+					"description": "The HSV hue of this color, on the range 0 to 1."
 				},
 				{
 					"name": "s",
-					"type": "float"
+					"type": "float",
+					"description": "The HSV saturation of this color, on the range 0 to 1."
 				},
 				{
 					"name": "v",
-					"type": "float"
+					"type": "float",
+					"description": "The HSV value (brightness) of this color, on the range 0 to 1."
 				},
 				{
 					"name": "ok_hsl_h",
-					"type": "float"
+					"type": "float",
+					"description": "The OKHSL hue of this color, on the range 0 to 1."
 				},
 				{
 					"name": "ok_hsl_s",
-					"type": "float"
+					"type": "float",
+					"description": "The OKHSL saturation of this color, on the range 0 to 1."
 				},
 				{
 					"name": "ok_hsl_l",
-					"type": "float"
+					"type": "float",
+					"description": "The OKHSL lightness of this color, on the range 0 to 1."
 				}
 			],
 			"constants": [
 				{
 					"name": "RED",
 					"type": "Color",
-					"value": "Color(1, 0, 0, 1)"
+					"value": "Color(1, 0, 0, 1)",
+					"description": "Red color."
 				},
 				{
 					"name": "GREEN",
 					"type": "Color",
-					"value": "Color(0, 1, 0, 1)"
+					"value": "Color(0, 1, 0, 1)",
+					"description": "Green color."
 				},
 				{
 					"name": "BLUE",
 					"type": "Color",
-					"value": "Color(0, 0, 1, 1)"
+					"value": "Color(0, 0, 1, 1)",
+					"description": "Blue color."
 				},
 				{
 					"name": "WHITE",
 					"type": "Color",
-					"value": "Color(1, 1, 1, 1)"
+					"value": "Color(1, 1, 1, 1)",
+					"description": "White color."
 				},
 				{
 					"name": "BLACK",
 					"type": "Color",
-					"value": "Color(0, 0, 0, 1)"
+					"value": "Color(0, 0, 0, 1)",
+					"description": "Black color. In GDScript, this is the default value of any color."
 				},
 				{
 					"name": "ALICE_BLUE",
 					"type": "Color",
-					"value": "Color(0.9411765, 0.972549, 1, 1)"
+					"value": "Color(0.9411765, 0.972549, 1, 1)",
+					"description": "Alice blue color."
 				},
 				{
 					"name": "ANTIQUE_WHITE",
 					"type": "Color",
-					"value": "Color(0.98039216, 0.92156863, 0.84313726, 1)"
+					"value": "Color(0.98039216, 0.92156863, 0.84313726, 1)",
+					"description": "Antique white color."
 				},
 				{
 					"name": "AQUA",
 					"type": "Color",
-					"value": "Color(0, 1, 1, 1)"
+					"value": "Color(0, 1, 1, 1)",
+					"description": "Aqua color."
 				},
 				{
 					"name": "AQUAMARINE",
 					"type": "Color",
-					"value": "Color(0.49803922, 1, 0.83137256, 1)"
+					"value": "Color(0.49803922, 1, 0.83137256, 1)",
+					"description": "Aquamarine color."
 				},
 				{
 					"name": "AZURE",
 					"type": "Color",
-					"value": "Color(0.9411765, 1, 1, 1)"
+					"value": "Color(0.9411765, 1, 1, 1)",
+					"description": "Azure color."
 				},
 				{
 					"name": "BEIGE",
 					"type": "Color",
-					"value": "Color(0.9607843, 0.9607843, 0.8627451, 1)"
+					"value": "Color(0.9607843, 0.9607843, 0.8627451, 1)",
+					"description": "Beige color."
 				},
 				{
 					"name": "BISQUE",
 					"type": "Color",
-					"value": "Color(1, 0.89411765, 0.76862746, 1)"
+					"value": "Color(1, 0.89411765, 0.76862746, 1)",
+					"description": "Bisque color."
 				},
 				{
 					"name": "BLANCHED_ALMOND",
 					"type": "Color",
-					"value": "Color(1, 0.92156863, 0.8039216, 1)"
+					"value": "Color(1, 0.92156863, 0.8039216, 1)",
+					"description": "Blanched almond color."
 				},
 				{
 					"name": "BLUE_VIOLET",
 					"type": "Color",
-					"value": "Color(0.5411765, 0.16862746, 0.8862745, 1)"
+					"value": "Color(0.5411765, 0.16862746, 0.8862745, 1)",
+					"description": "Blue violet color."
 				},
 				{
 					"name": "BROWN",
 					"type": "Color",
-					"value": "Color(0.64705884, 0.16470589, 0.16470589, 1)"
+					"value": "Color(0.64705884, 0.16470589, 0.16470589, 1)",
+					"description": "Brown color."
 				},
 				{
 					"name": "BURLYWOOD",
 					"type": "Color",
-					"value": "Color(0.87058824, 0.72156864, 0.5294118, 1)"
+					"value": "Color(0.87058824, 0.72156864, 0.5294118, 1)",
+					"description": "Burlywood color."
 				},
 				{
 					"name": "CADET_BLUE",
 					"type": "Color",
-					"value": "Color(0.37254903, 0.61960787, 0.627451, 1)"
+					"value": "Color(0.37254903, 0.61960787, 0.627451, 1)",
+					"description": "Cadet blue color."
 				},
 				{
 					"name": "CHARTREUSE",
 					"type": "Color",
-					"value": "Color(0.49803922, 1, 0, 1)"
+					"value": "Color(0.49803922, 1, 0, 1)",
+					"description": "Chartreuse color."
 				},
 				{
 					"name": "CHOCOLATE",
 					"type": "Color",
-					"value": "Color(0.8235294, 0.4117647, 0.11764706, 1)"
+					"value": "Color(0.8235294, 0.4117647, 0.11764706, 1)",
+					"description": "Chocolate color."
 				},
 				{
 					"name": "CORAL",
 					"type": "Color",
-					"value": "Color(1, 0.49803922, 0.3137255, 1)"
+					"value": "Color(1, 0.49803922, 0.3137255, 1)",
+					"description": "Coral color."
 				},
 				{
 					"name": "CORNFLOWER_BLUE",
 					"type": "Color",
-					"value": "Color(0.39215687, 0.58431375, 0.92941177, 1)"
+					"value": "Color(0.39215687, 0.58431375, 0.92941177, 1)",
+					"description": "Cornflower blue color."
 				},
 				{
 					"name": "CORNSILK",
 					"type": "Color",
-					"value": "Color(1, 0.972549, 0.8627451, 1)"
+					"value": "Color(1, 0.972549, 0.8627451, 1)",
+					"description": "Cornsilk color."
 				},
 				{
 					"name": "CRIMSON",
 					"type": "Color",
-					"value": "Color(0.8627451, 0.078431375, 0.23529412, 1)"
+					"value": "Color(0.8627451, 0.078431375, 0.23529412, 1)",
+					"description": "Crimson color."
 				},
 				{
 					"name": "CYAN",
 					"type": "Color",
-					"value": "Color(0, 1, 1, 1)"
+					"value": "Color(0, 1, 1, 1)",
+					"description": "Cyan color."
 				},
 				{
 					"name": "DARK_BLUE",
 					"type": "Color",
-					"value": "Color(0, 0, 0.54509807, 1)"
+					"value": "Color(0, 0, 0.54509807, 1)",
+					"description": "Dark blue color."
 				},
 				{
 					"name": "DARK_CYAN",
 					"type": "Color",
-					"value": "Color(0, 0.54509807, 0.54509807, 1)"
+					"value": "Color(0, 0.54509807, 0.54509807, 1)",
+					"description": "Dark cyan color."
 				},
 				{
 					"name": "DARK_GOLDENROD",
 					"type": "Color",
-					"value": "Color(0.72156864, 0.5254902, 0.043137256, 1)"
+					"value": "Color(0.72156864, 0.5254902, 0.043137256, 1)",
+					"description": "Dark goldenrod color."
 				},
 				{
 					"name": "DARK_GRAY",
 					"type": "Color",
-					"value": "Color(0.6627451, 0.6627451, 0.6627451, 1)"
+					"value": "Color(0.6627451, 0.6627451, 0.6627451, 1)",
+					"description": "Dark gray color."
 				},
 				{
 					"name": "DARK_GREEN",
 					"type": "Color",
-					"value": "Color(0, 0.39215687, 0, 1)"
+					"value": "Color(0, 0.39215687, 0, 1)",
+					"description": "Dark green color."
 				},
 				{
 					"name": "DARK_KHAKI",
 					"type": "Color",
-					"value": "Color(0.7411765, 0.7176471, 0.41960785, 1)"
+					"value": "Color(0.7411765, 0.7176471, 0.41960785, 1)",
+					"description": "Dark khaki color."
 				},
 				{
 					"name": "DARK_MAGENTA",
 					"type": "Color",
-					"value": "Color(0.54509807, 0, 0.54509807, 1)"
+					"value": "Color(0.54509807, 0, 0.54509807, 1)",
+					"description": "Dark magenta color."
 				},
 				{
 					"name": "DARK_OLIVE_GREEN",
 					"type": "Color",
-					"value": "Color(0.33333334, 0.41960785, 0.18431373, 1)"
+					"value": "Color(0.33333334, 0.41960785, 0.18431373, 1)",
+					"description": "Dark olive green color."
 				},
 				{
 					"name": "DARK_ORANGE",
 					"type": "Color",
-					"value": "Color(1, 0.54901963, 0, 1)"
+					"value": "Color(1, 0.54901963, 0, 1)",
+					"description": "Dark orange color."
 				},
 				{
 					"name": "DARK_ORCHID",
 					"type": "Color",
-					"value": "Color(0.6, 0.19607843, 0.8, 1)"
+					"value": "Color(0.6, 0.19607843, 0.8, 1)",
+					"description": "Dark orchid color."
 				},
 				{
 					"name": "DARK_RED",
 					"type": "Color",
-					"value": "Color(0.54509807, 0, 0, 1)"
+					"value": "Color(0.54509807, 0, 0, 1)",
+					"description": "Dark red color."
 				},
 				{
 					"name": "DARK_SALMON",
 					"type": "Color",
-					"value": "Color(0.9137255, 0.5882353, 0.47843137, 1)"
+					"value": "Color(0.9137255, 0.5882353, 0.47843137, 1)",
+					"description": "Dark salmon color."
 				},
 				{
 					"name": "DARK_SEA_GREEN",
 					"type": "Color",
-					"value": "Color(0.56078434, 0.7372549, 0.56078434, 1)"
+					"value": "Color(0.56078434, 0.7372549, 0.56078434, 1)",
+					"description": "Dark sea green color."
 				},
 				{
 					"name": "DARK_SLATE_BLUE",
 					"type": "Color",
-					"value": "Color(0.28235295, 0.23921569, 0.54509807, 1)"
+					"value": "Color(0.28235295, 0.23921569, 0.54509807, 1)",
+					"description": "Dark slate blue color."
 				},
 				{
 					"name": "DARK_SLATE_GRAY",
 					"type": "Color",
-					"value": "Color(0.18431373, 0.30980393, 0.30980393, 1)"
+					"value": "Color(0.18431373, 0.30980393, 0.30980393, 1)",
+					"description": "Dark slate gray color."
 				},
 				{
 					"name": "DARK_TURQUOISE",
 					"type": "Color",
-					"value": "Color(0, 0.80784315, 0.81960785, 1)"
+					"value": "Color(0, 0.80784315, 0.81960785, 1)",
+					"description": "Dark turquoise color."
 				},
 				{
 					"name": "DARK_VIOLET",
 					"type": "Color",
-					"value": "Color(0.5803922, 0, 0.827451, 1)"
+					"value": "Color(0.5803922, 0, 0.827451, 1)",
+					"description": "Dark violet color."
 				},
 				{
 					"name": "DEEP_PINK",
 					"type": "Color",
-					"value": "Color(1, 0.078431375, 0.5764706, 1)"
+					"value": "Color(1, 0.078431375, 0.5764706, 1)",
+					"description": "Deep pink color."
 				},
 				{
 					"name": "DEEP_SKY_BLUE",
 					"type": "Color",
-					"value": "Color(0, 0.7490196, 1, 1)"
+					"value": "Color(0, 0.7490196, 1, 1)",
+					"description": "Deep sky blue color."
 				},
 				{
 					"name": "DIM_GRAY",
 					"type": "Color",
-					"value": "Color(0.4117647, 0.4117647, 0.4117647, 1)"
+					"value": "Color(0.4117647, 0.4117647, 0.4117647, 1)",
+					"description": "Dim gray color."
 				},
 				{
 					"name": "DODGER_BLUE",
 					"type": "Color",
-					"value": "Color(0.11764706, 0.5647059, 1, 1)"
+					"value": "Color(0.11764706, 0.5647059, 1, 1)",
+					"description": "Dodger blue color."
 				},
 				{
 					"name": "FIREBRICK",
 					"type": "Color",
-					"value": "Color(0.69803923, 0.13333334, 0.13333334, 1)"
+					"value": "Color(0.69803923, 0.13333334, 0.13333334, 1)",
+					"description": "Firebrick color."
 				},
 				{
 					"name": "FLORAL_WHITE",
 					"type": "Color",
-					"value": "Color(1, 0.98039216, 0.9411765, 1)"
+					"value": "Color(1, 0.98039216, 0.9411765, 1)",
+					"description": "Floral white color."
 				},
 				{
 					"name": "FOREST_GREEN",
 					"type": "Color",
-					"value": "Color(0.13333334, 0.54509807, 0.13333334, 1)"
+					"value": "Color(0.13333334, 0.54509807, 0.13333334, 1)",
+					"description": "Forest green color."
 				},
 				{
 					"name": "FUCHSIA",
 					"type": "Color",
-					"value": "Color(1, 0, 1, 1)"
+					"value": "Color(1, 0, 1, 1)",
+					"description": "Fuchsia color."
 				},
 				{
 					"name": "GAINSBORO",
 					"type": "Color",
-					"value": "Color(0.8627451, 0.8627451, 0.8627451, 1)"
+					"value": "Color(0.8627451, 0.8627451, 0.8627451, 1)",
+					"description": "Gainsboro color."
 				},
 				{
 					"name": "GHOST_WHITE",
 					"type": "Color",
-					"value": "Color(0.972549, 0.972549, 1, 1)"
+					"value": "Color(0.972549, 0.972549, 1, 1)",
+					"description": "Ghost white color."
 				},
 				{
 					"name": "GOLD",
 					"type": "Color",
-					"value": "Color(1, 0.84313726, 0, 1)"
+					"value": "Color(1, 0.84313726, 0, 1)",
+					"description": "Gold color."
 				},
 				{
 					"name": "GOLDENROD",
 					"type": "Color",
-					"value": "Color(0.85490197, 0.64705884, 0.1254902, 1)"
+					"value": "Color(0.85490197, 0.64705884, 0.1254902, 1)",
+					"description": "Goldenrod color."
 				},
 				{
 					"name": "GRAY",
 					"type": "Color",
-					"value": "Color(0.74509805, 0.74509805, 0.74509805, 1)"
+					"value": "Color(0.74509805, 0.74509805, 0.74509805, 1)",
+					"description": "Gray color."
 				},
 				{
 					"name": "GREEN_YELLOW",
 					"type": "Color",
-					"value": "Color(0.6784314, 1, 0.18431373, 1)"
+					"value": "Color(0.6784314, 1, 0.18431373, 1)",
+					"description": "Green yellow color."
 				},
 				{
 					"name": "HONEYDEW",
 					"type": "Color",
-					"value": "Color(0.9411765, 1, 0.9411765, 1)"
+					"value": "Color(0.9411765, 1, 0.9411765, 1)",
+					"description": "Honeydew color."
 				},
 				{
 					"name": "HOT_PINK",
 					"type": "Color",
-					"value": "Color(1, 0.4117647, 0.7058824, 1)"
+					"value": "Color(1, 0.4117647, 0.7058824, 1)",
+					"description": "Hot pink color."
 				},
 				{
 					"name": "INDIAN_RED",
 					"type": "Color",
-					"value": "Color(0.8039216, 0.36078432, 0.36078432, 1)"
+					"value": "Color(0.8039216, 0.36078432, 0.36078432, 1)",
+					"description": "Indian red color."
 				},
 				{
 					"name": "INDIGO",
 					"type": "Color",
-					"value": "Color(0.29411766, 0, 0.50980395, 1)"
+					"value": "Color(0.29411766, 0, 0.50980395, 1)",
+					"description": "Indigo color."
 				},
 				{
 					"name": "IVORY",
 					"type": "Color",
-					"value": "Color(1, 1, 0.9411765, 1)"
+					"value": "Color(1, 1, 0.9411765, 1)",
+					"description": "Ivory color."
 				},
 				{
 					"name": "KHAKI",
 					"type": "Color",
-					"value": "Color(0.9411765, 0.9019608, 0.54901963, 1)"
+					"value": "Color(0.9411765, 0.9019608, 0.54901963, 1)",
+					"description": "Khaki color."
 				},
 				{
 					"name": "LAVENDER",
 					"type": "Color",
-					"value": "Color(0.9019608, 0.9019608, 0.98039216, 1)"
+					"value": "Color(0.9019608, 0.9019608, 0.98039216, 1)",
+					"description": "Lavender color."
 				},
 				{
 					"name": "LAVENDER_BLUSH",
 					"type": "Color",
-					"value": "Color(1, 0.9411765, 0.9607843, 1)"
+					"value": "Color(1, 0.9411765, 0.9607843, 1)",
+					"description": "Lavender blush color."
 				},
 				{
 					"name": "LAWN_GREEN",
 					"type": "Color",
-					"value": "Color(0.4862745, 0.9882353, 0, 1)"
+					"value": "Color(0.4862745, 0.9882353, 0, 1)",
+					"description": "Lawn green color."
 				},
 				{
 					"name": "LEMON_CHIFFON",
 					"type": "Color",
-					"value": "Color(1, 0.98039216, 0.8039216, 1)"
+					"value": "Color(1, 0.98039216, 0.8039216, 1)",
+					"description": "Lemon chiffon color."
 				},
 				{
 					"name": "LIGHT_BLUE",
 					"type": "Color",
-					"value": "Color(0.6784314, 0.84705883, 0.9019608, 1)"
+					"value": "Color(0.6784314, 0.84705883, 0.9019608, 1)",
+					"description": "Light blue color."
 				},
 				{
 					"name": "LIGHT_CORAL",
 					"type": "Color",
-					"value": "Color(0.9411765, 0.5019608, 0.5019608, 1)"
+					"value": "Color(0.9411765, 0.5019608, 0.5019608, 1)",
+					"description": "Light coral color."
 				},
 				{
 					"name": "LIGHT_CYAN",
 					"type": "Color",
-					"value": "Color(0.8784314, 1, 1, 1)"
+					"value": "Color(0.8784314, 1, 1, 1)",
+					"description": "Light cyan color."
 				},
 				{
 					"name": "LIGHT_GOLDENROD",
 					"type": "Color",
-					"value": "Color(0.98039216, 0.98039216, 0.8235294, 1)"
+					"value": "Color(0.98039216, 0.98039216, 0.8235294, 1)",
+					"description": "Light goldenrod color."
 				},
 				{
 					"name": "LIGHT_GRAY",
 					"type": "Color",
-					"value": "Color(0.827451, 0.827451, 0.827451, 1)"
+					"value": "Color(0.827451, 0.827451, 0.827451, 1)",
+					"description": "Light gray color."
 				},
 				{
 					"name": "LIGHT_GREEN",
 					"type": "Color",
-					"value": "Color(0.5647059, 0.93333334, 0.5647059, 1)"
+					"value": "Color(0.5647059, 0.93333334, 0.5647059, 1)",
+					"description": "Light green color."
 				},
 				{
 					"name": "LIGHT_PINK",
 					"type": "Color",
-					"value": "Color(1, 0.7137255, 0.75686276, 1)"
+					"value": "Color(1, 0.7137255, 0.75686276, 1)",
+					"description": "Light pink color."
 				},
 				{
 					"name": "LIGHT_SALMON",
 					"type": "Color",
-					"value": "Color(1, 0.627451, 0.47843137, 1)"
+					"value": "Color(1, 0.627451, 0.47843137, 1)",
+					"description": "Light salmon color."
 				},
 				{
 					"name": "LIGHT_SEA_GREEN",
 					"type": "Color",
-					"value": "Color(0.1254902, 0.69803923, 0.6666667, 1)"
+					"value": "Color(0.1254902, 0.69803923, 0.6666667, 1)",
+					"description": "Light sea green color."
 				},
 				{
 					"name": "LIGHT_SKY_BLUE",
 					"type": "Color",
-					"value": "Color(0.5294118, 0.80784315, 0.98039216, 1)"
+					"value": "Color(0.5294118, 0.80784315, 0.98039216, 1)",
+					"description": "Light sky blue color."
 				},
 				{
 					"name": "LIGHT_SLATE_GRAY",
 					"type": "Color",
-					"value": "Color(0.46666667, 0.53333336, 0.6, 1)"
+					"value": "Color(0.46666667, 0.53333336, 0.6, 1)",
+					"description": "Light slate gray color."
 				},
 				{
 					"name": "LIGHT_STEEL_BLUE",
 					"type": "Color",
-					"value": "Color(0.6901961, 0.76862746, 0.87058824, 1)"
+					"value": "Color(0.6901961, 0.76862746, 0.87058824, 1)",
+					"description": "Light steel blue color."
 				},
 				{
 					"name": "LIGHT_YELLOW",
 					"type": "Color",
-					"value": "Color(1, 1, 0.8784314, 1)"
+					"value": "Color(1, 1, 0.8784314, 1)",
+					"description": "Light yellow color."
 				},
 				{
 					"name": "LIME",
 					"type": "Color",
-					"value": "Color(0, 1, 0, 1)"
+					"value": "Color(0, 1, 0, 1)",
+					"description": "Lime color."
 				},
 				{
 					"name": "LIME_GREEN",
 					"type": "Color",
-					"value": "Color(0.19607843, 0.8039216, 0.19607843, 1)"
+					"value": "Color(0.19607843, 0.8039216, 0.19607843, 1)",
+					"description": "Lime green color."
 				},
 				{
 					"name": "LINEN",
 					"type": "Color",
-					"value": "Color(0.98039216, 0.9411765, 0.9019608, 1)"
+					"value": "Color(0.98039216, 0.9411765, 0.9019608, 1)",
+					"description": "Linen color."
 				},
 				{
 					"name": "MAGENTA",
 					"type": "Color",
-					"value": "Color(1, 0, 1, 1)"
+					"value": "Color(1, 0, 1, 1)",
+					"description": "Magenta color."
 				},
 				{
 					"name": "MAROON",
 					"type": "Color",
-					"value": "Color(0.6901961, 0.1882353, 0.3764706, 1)"
+					"value": "Color(0.6901961, 0.1882353, 0.3764706, 1)",
+					"description": "Maroon color."
 				},
 				{
 					"name": "MEDIUM_AQUAMARINE",
 					"type": "Color",
-					"value": "Color(0.4, 0.8039216, 0.6666667, 1)"
+					"value": "Color(0.4, 0.8039216, 0.6666667, 1)",
+					"description": "Medium aquamarine color."
 				},
 				{
 					"name": "MEDIUM_BLUE",
 					"type": "Color",
-					"value": "Color(0, 0, 0.8039216, 1)"
+					"value": "Color(0, 0, 0.8039216, 1)",
+					"description": "Medium blue color."
 				},
 				{
 					"name": "MEDIUM_ORCHID",
 					"type": "Color",
-					"value": "Color(0.7294118, 0.33333334, 0.827451, 1)"
+					"value": "Color(0.7294118, 0.33333334, 0.827451, 1)",
+					"description": "Medium orchid color."
 				},
 				{
 					"name": "MEDIUM_PURPLE",
 					"type": "Color",
-					"value": "Color(0.5764706, 0.4392157, 0.85882354, 1)"
+					"value": "Color(0.5764706, 0.4392157, 0.85882354, 1)",
+					"description": "Medium purple color."
 				},
 				{
 					"name": "MEDIUM_SEA_GREEN",
 					"type": "Color",
-					"value": "Color(0.23529412, 0.7019608, 0.44313726, 1)"
+					"value": "Color(0.23529412, 0.7019608, 0.44313726, 1)",
+					"description": "Medium sea green color."
 				},
 				{
 					"name": "MEDIUM_SLATE_BLUE",
 					"type": "Color",
-					"value": "Color(0.48235294, 0.40784314, 0.93333334, 1)"
+					"value": "Color(0.48235294, 0.40784314, 0.93333334, 1)",
+					"description": "Medium slate blue color."
 				},
 				{
 					"name": "MEDIUM_SPRING_GREEN",
 					"type": "Color",
-					"value": "Color(0, 0.98039216, 0.6039216, 1)"
+					"value": "Color(0, 0.98039216, 0.6039216, 1)",
+					"description": "Medium spring green color."
 				},
 				{
 					"name": "MEDIUM_TURQUOISE",
 					"type": "Color",
-					"value": "Color(0.28235295, 0.81960785, 0.8, 1)"
+					"value": "Color(0.28235295, 0.81960785, 0.8, 1)",
+					"description": "Medium turquoise color."
 				},
 				{
 					"name": "MEDIUM_VIOLET_RED",
 					"type": "Color",
-					"value": "Color(0.78039217, 0.08235294, 0.52156866, 1)"
+					"value": "Color(0.78039217, 0.08235294, 0.52156866, 1)",
+					"description": "Medium violet red color."
 				},
 				{
 					"name": "MIDNIGHT_BLUE",
 					"type": "Color",
-					"value": "Color(0.09803922, 0.09803922, 0.4392157, 1)"
+					"value": "Color(0.09803922, 0.09803922, 0.4392157, 1)",
+					"description": "Midnight blue color."
 				},
 				{
 					"name": "MINT_CREAM",
 					"type": "Color",
-					"value": "Color(0.9607843, 1, 0.98039216, 1)"
+					"value": "Color(0.9607843, 1, 0.98039216, 1)",
+					"description": "Mint cream color."
 				},
 				{
 					"name": "MISTY_ROSE",
 					"type": "Color",
-					"value": "Color(1, 0.89411765, 0.88235295, 1)"
+					"value": "Color(1, 0.89411765, 0.88235295, 1)",
+					"description": "Misty rose color."
 				},
 				{
 					"name": "MOCCASIN",
 					"type": "Color",
-					"value": "Color(1, 0.89411765, 0.70980394, 1)"
+					"value": "Color(1, 0.89411765, 0.70980394, 1)",
+					"description": "Moccasin color."
 				},
 				{
 					"name": "NAVAJO_WHITE",
 					"type": "Color",
-					"value": "Color(1, 0.87058824, 0.6784314, 1)"
+					"value": "Color(1, 0.87058824, 0.6784314, 1)",
+					"description": "Navajo white color."
 				},
 				{
 					"name": "NAVY_BLUE",
 					"type": "Color",
-					"value": "Color(0, 0, 0.5019608, 1)"
+					"value": "Color(0, 0, 0.5019608, 1)",
+					"description": "Navy blue color."
 				},
 				{
 					"name": "OLD_LACE",
 					"type": "Color",
-					"value": "Color(0.99215686, 0.9607843, 0.9019608, 1)"
+					"value": "Color(0.99215686, 0.9607843, 0.9019608, 1)",
+					"description": "Old lace color."
 				},
 				{
 					"name": "OLIVE",
 					"type": "Color",
-					"value": "Color(0.5019608, 0.5019608, 0, 1)"
+					"value": "Color(0.5019608, 0.5019608, 0, 1)",
+					"description": "Olive color."
 				},
 				{
 					"name": "OLIVE_DRAB",
 					"type": "Color",
-					"value": "Color(0.41960785, 0.5568628, 0.13725491, 1)"
+					"value": "Color(0.41960785, 0.5568628, 0.13725491, 1)",
+					"description": "Olive drab color."
 				},
 				{
 					"name": "ORANGE",
 					"type": "Color",
-					"value": "Color(1, 0.64705884, 0, 1)"
+					"value": "Color(1, 0.64705884, 0, 1)",
+					"description": "Orange color."
 				},
 				{
 					"name": "ORANGE_RED",
 					"type": "Color",
-					"value": "Color(1, 0.27058825, 0, 1)"
+					"value": "Color(1, 0.27058825, 0, 1)",
+					"description": "Orange red color."
 				},
 				{
 					"name": "ORCHID",
 					"type": "Color",
-					"value": "Color(0.85490197, 0.4392157, 0.8392157, 1)"
+					"value": "Color(0.85490197, 0.4392157, 0.8392157, 1)",
+					"description": "Orchid color."
 				},
 				{
 					"name": "PALE_GOLDENROD",
 					"type": "Color",
-					"value": "Color(0.93333334, 0.9098039, 0.6666667, 1)"
+					"value": "Color(0.93333334, 0.9098039, 0.6666667, 1)",
+					"description": "Pale goldenrod color."
 				},
 				{
 					"name": "PALE_GREEN",
 					"type": "Color",
-					"value": "Color(0.59607846, 0.9843137, 0.59607846, 1)"
+					"value": "Color(0.59607846, 0.9843137, 0.59607846, 1)",
+					"description": "Pale green color."
 				},
 				{
 					"name": "PALE_TURQUOISE",
 					"type": "Color",
-					"value": "Color(0.6862745, 0.93333334, 0.93333334, 1)"
+					"value": "Color(0.6862745, 0.93333334, 0.93333334, 1)",
+					"description": "Pale turquoise color."
 				},
 				{
 					"name": "PALE_VIOLET_RED",
 					"type": "Color",
-					"value": "Color(0.85882354, 0.4392157, 0.5764706, 1)"
+					"value": "Color(0.85882354, 0.4392157, 0.5764706, 1)",
+					"description": "Pale violet red color."
 				},
 				{
 					"name": "PAPAYA_WHIP",
 					"type": "Color",
-					"value": "Color(1, 0.9372549, 0.8352941, 1)"
+					"value": "Color(1, 0.9372549, 0.8352941, 1)",
+					"description": "Papaya whip color."
 				},
 				{
 					"name": "PEACH_PUFF",
 					"type": "Color",
-					"value": "Color(1, 0.85490197, 0.7254902, 1)"
+					"value": "Color(1, 0.85490197, 0.7254902, 1)",
+					"description": "Peach puff color."
 				},
 				{
 					"name": "PERU",
 					"type": "Color",
-					"value": "Color(0.8039216, 0.52156866, 0.24705882, 1)"
+					"value": "Color(0.8039216, 0.52156866, 0.24705882, 1)",
+					"description": "Peru color."
 				},
 				{
 					"name": "PINK",
 					"type": "Color",
-					"value": "Color(1, 0.7529412, 0.79607844, 1)"
+					"value": "Color(1, 0.7529412, 0.79607844, 1)",
+					"description": "Pink color."
 				},
 				{
 					"name": "PLUM",
 					"type": "Color",
-					"value": "Color(0.8666667, 0.627451, 0.8666667, 1)"
+					"value": "Color(0.8666667, 0.627451, 0.8666667, 1)",
+					"description": "Plum color."
 				},
 				{
 					"name": "POWDER_BLUE",
 					"type": "Color",
-					"value": "Color(0.6901961, 0.8784314, 0.9019608, 1)"
+					"value": "Color(0.6901961, 0.8784314, 0.9019608, 1)",
+					"description": "Powder blue color."
 				},
 				{
 					"name": "PURPLE",
 					"type": "Color",
-					"value": "Color(0.627451, 0.1254902, 0.9411765, 1)"
+					"value": "Color(0.627451, 0.1254902, 0.9411765, 1)",
+					"description": "Purple color."
 				},
 				{
 					"name": "REBECCA_PURPLE",
 					"type": "Color",
-					"value": "Color(0.4, 0.2, 0.6, 1)"
+					"value": "Color(0.4, 0.2, 0.6, 1)",
+					"description": "Rebecca purple color."
 				},
 				{
 					"name": "ROSY_BROWN",
 					"type": "Color",
-					"value": "Color(0.7372549, 0.56078434, 0.56078434, 1)"
+					"value": "Color(0.7372549, 0.56078434, 0.56078434, 1)",
+					"description": "Rosy brown color."
 				},
 				{
 					"name": "ROYAL_BLUE",
 					"type": "Color",
-					"value": "Color(0.25490198, 0.4117647, 0.88235295, 1)"
+					"value": "Color(0.25490198, 0.4117647, 0.88235295, 1)",
+					"description": "Royal blue color."
 				},
 				{
 					"name": "SADDLE_BROWN",
 					"type": "Color",
-					"value": "Color(0.54509807, 0.27058825, 0.07450981, 1)"
+					"value": "Color(0.54509807, 0.27058825, 0.07450981, 1)",
+					"description": "Saddle brown color."
 				},
 				{
 					"name": "SALMON",
 					"type": "Color",
-					"value": "Color(0.98039216, 0.5019608, 0.44705883, 1)"
+					"value": "Color(0.98039216, 0.5019608, 0.44705883, 1)",
+					"description": "Salmon color."
 				},
 				{
 					"name": "SANDY_BROWN",
 					"type": "Color",
-					"value": "Color(0.95686275, 0.6431373, 0.3764706, 1)"
+					"value": "Color(0.95686275, 0.6431373, 0.3764706, 1)",
+					"description": "Sandy brown color."
 				},
 				{
 					"name": "SEA_GREEN",
 					"type": "Color",
-					"value": "Color(0.18039216, 0.54509807, 0.34117648, 1)"
+					"value": "Color(0.18039216, 0.54509807, 0.34117648, 1)",
+					"description": "Sea green color."
 				},
 				{
 					"name": "SEASHELL",
 					"type": "Color",
-					"value": "Color(1, 0.9607843, 0.93333334, 1)"
+					"value": "Color(1, 0.9607843, 0.93333334, 1)",
+					"description": "Seashell color."
 				},
 				{
 					"name": "SIENNA",
 					"type": "Color",
-					"value": "Color(0.627451, 0.32156864, 0.1764706, 1)"
+					"value": "Color(0.627451, 0.32156864, 0.1764706, 1)",
+					"description": "Sienna color."
 				},
 				{
 					"name": "SILVER",
 					"type": "Color",
-					"value": "Color(0.7529412, 0.7529412, 0.7529412, 1)"
+					"value": "Color(0.7529412, 0.7529412, 0.7529412, 1)",
+					"description": "Silver color."
 				},
 				{
 					"name": "SKY_BLUE",
 					"type": "Color",
-					"value": "Color(0.5294118, 0.80784315, 0.92156863, 1)"
+					"value": "Color(0.5294118, 0.80784315, 0.92156863, 1)",
+					"description": "Sky blue color."
 				},
 				{
 					"name": "SLATE_BLUE",
 					"type": "Color",
-					"value": "Color(0.41568628, 0.3529412, 0.8039216, 1)"
+					"value": "Color(0.41568628, 0.3529412, 0.8039216, 1)",
+					"description": "Slate blue color."
 				},
 				{
 					"name": "SLATE_GRAY",
 					"type": "Color",
-					"value": "Color(0.4392157, 0.5019608, 0.5647059, 1)"
+					"value": "Color(0.4392157, 0.5019608, 0.5647059, 1)",
+					"description": "Slate gray color."
 				},
 				{
 					"name": "SNOW",
 					"type": "Color",
-					"value": "Color(1, 0.98039216, 0.98039216, 1)"
+					"value": "Color(1, 0.98039216, 0.98039216, 1)",
+					"description": "Snow color."
 				},
 				{
 					"name": "SPRING_GREEN",
 					"type": "Color",
-					"value": "Color(0, 1, 0.49803922, 1)"
+					"value": "Color(0, 1, 0.49803922, 1)",
+					"description": "Spring green color."
 				},
 				{
 					"name": "STEEL_BLUE",
 					"type": "Color",
-					"value": "Color(0.27450982, 0.50980395, 0.7058824, 1)"
+					"value": "Color(0.27450982, 0.50980395, 0.7058824, 1)",
+					"description": "Steel blue color."
 				},
 				{
 					"name": "TAN",
 					"type": "Color",
-					"value": "Color(0.8235294, 0.7058824, 0.54901963, 1)"
+					"value": "Color(0.8235294, 0.7058824, 0.54901963, 1)",
+					"description": "Tan color."
 				},
 				{
 					"name": "TEAL",
 					"type": "Color",
-					"value": "Color(0, 0.5019608, 0.5019608, 1)"
+					"value": "Color(0, 0.5019608, 0.5019608, 1)",
+					"description": "Teal color."
 				},
 				{
 					"name": "THISTLE",
 					"type": "Color",
-					"value": "Color(0.84705883, 0.7490196, 0.84705883, 1)"
+					"value": "Color(0.84705883, 0.7490196, 0.84705883, 1)",
+					"description": "Thistle color."
 				},
 				{
 					"name": "TOMATO",
 					"type": "Color",
-					"value": "Color(1, 0.3882353, 0.2784314, 1)"
+					"value": "Color(1, 0.3882353, 0.2784314, 1)",
+					"description": "Tomato color."
 				},
 				{
 					"name": "TRANSPARENT",
 					"type": "Color",
-					"value": "Color(1, 1, 1, 0)"
+					"value": "Color(1, 1, 1, 0)",
+					"description": "Transparent color (white with zero alpha)."
 				},
 				{
 					"name": "TURQUOISE",
 					"type": "Color",
-					"value": "Color(0.2509804, 0.8784314, 0.8156863, 1)"
+					"value": "Color(0.2509804, 0.8784314, 0.8156863, 1)",
+					"description": "Turquoise color."
 				},
 				{
 					"name": "VIOLET",
 					"type": "Color",
-					"value": "Color(0.93333334, 0.50980395, 0.93333334, 1)"
+					"value": "Color(0.93333334, 0.50980395, 0.93333334, 1)",
+					"description": "Violet color."
 				},
 				{
 					"name": "WEB_GRAY",
 					"type": "Color",
-					"value": "Color(0.5019608, 0.5019608, 0.5019608, 1)"
+					"value": "Color(0.5019608, 0.5019608, 0.5019608, 1)",
+					"description": "Web gray color."
 				},
 				{
 					"name": "WEB_GREEN",
 					"type": "Color",
-					"value": "Color(0, 0.5019608, 0, 1)"
+					"value": "Color(0, 0.5019608, 0, 1)",
+					"description": "Web green color."
 				},
 				{
 					"name": "WEB_MAROON",
 					"type": "Color",
-					"value": "Color(0.5019608, 0, 0, 1)"
+					"value": "Color(0.5019608, 0, 0, 1)",
+					"description": "Web maroon color."
 				},
 				{
 					"name": "WEB_PURPLE",
 					"type": "Color",
-					"value": "Color(0.5019608, 0, 0.5019608, 1)"
+					"value": "Color(0.5019608, 0, 0.5019608, 1)",
+					"description": "Web purple color."
 				},
 				{
 					"name": "WHEAT",
 					"type": "Color",
-					"value": "Color(0.9607843, 0.87058824, 0.7019608, 1)"
+					"value": "Color(0.9607843, 0.87058824, 0.7019608, 1)",
+					"description": "Wheat color."
 				},
 				{
 					"name": "WHITE_SMOKE",
 					"type": "Color",
-					"value": "Color(0.9607843, 0.9607843, 0.9607843, 1)"
+					"value": "Color(0.9607843, 0.9607843, 0.9607843, 1)",
+					"description": "White smoke color."
 				},
 				{
 					"name": "YELLOW",
 					"type": "Color",
-					"value": "Color(1, 1, 0, 1)"
+					"value": "Color(1, 1, 0, 1)",
+					"description": "Yellow color."
 				},
 				{
 					"name": "YELLOW_GREEN",
 					"type": "Color",
-					"value": "Color(0.6039216, 0.8039216, 0.19607843, 1)"
+					"value": "Color(0.6039216, 0.8039216, 0.19607843, 1)",
+					"description": "Yellow green color."
 				}
 			],
 			"enums": [],
@@ -5478,7 +5786,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the color converted to a 32-bit integer in ARGB format (each component is 8 bits). ARGB is more compatible with DirectX.\n[codeblocks]\n[gdscript]\nvar color = Color(1, 0.5, 0.2)\nprint(color.to_argb32()) # Prints 4294934323\n[/gdscript]\n[csharp]\nvar color = new Color(1.0f, 0.5f, 0.2f);\nGD.Print(color.ToArgb32()); // Prints 4294934323\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "to_abgr32",
@@ -5486,7 +5795,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the color converted to a 32-bit integer in ABGR format (each component is 8 bits). ABGR is the reversed version of the default RGBA format.\n[codeblocks]\n[gdscript]\nvar color = Color(1, 0.5, 0.2)\nprint(color.to_abgr32()) # Prints 4281565439\n[/gdscript]\n[csharp]\nvar color = new Color(1.0f, 0.5f, 0.2f);\nGD.Print(color.ToAbgr32()); // Prints 4281565439\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "to_rgba32",
@@ -5494,7 +5804,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the color converted to a 32-bit integer in RGBA format (each component is 8 bits). RGBA is Godot's default format. This method is the inverse of [method hex].\n[codeblocks]\n[gdscript]\nvar color = Color(1, 0.5, 0.2)\nprint(color.to_rgba32()) # Prints 4286526463\n[/gdscript]\n[csharp]\nvar color = new Color(1, 0.5f, 0.2f);\nGD.Print(color.ToRgba32()); // Prints 4286526463\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "to_argb64",
@@ -5502,7 +5813,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the color converted to a 64-bit integer in ARGB format (each component is 16 bits). ARGB is more compatible with DirectX.\n[codeblocks]\n[gdscript]\nvar color = Color(1, 0.5, 0.2)\nprint(color.to_argb64()) # Prints -2147470541\n[/gdscript]\n[csharp]\nvar color = new Color(1.0f, 0.5f, 0.2f);\nGD.Print(color.ToArgb64()); // Prints -2147470541\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "to_abgr64",
@@ -5510,7 +5822,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the color converted to a 64-bit integer in ABGR format (each component is 16 bits). ABGR is the reversed version of the default RGBA format.\n[codeblocks]\n[gdscript]\nvar color = Color(1, 0.5, 0.2)\nprint(color.to_abgr64()) # Prints -225178692812801\n[/gdscript]\n[csharp]\nvar color = new Color(1.0f, 0.5f, 0.2f);\nGD.Print(color.ToAbgr64()); // Prints -225178692812801\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "to_rgba64",
@@ -5518,7 +5831,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the color converted to a 64-bit integer in RGBA format (each component is 16 bits). RGBA is Godot's default format. This method is the inverse of [method hex64].\n[codeblocks]\n[gdscript]\nvar color = Color(1, 0.5, 0.2)\nprint(color.to_rgba64()) # Prints -140736629309441\n[/gdscript]\n[csharp]\nvar color = new Color(1, 0.5f, 0.2f);\nGD.Print(color.ToRgba64()); // Prints -140736629309441\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "to_html",
@@ -5533,7 +5847,8 @@
 							"type": "bool",
 							"default_value": "true"
 						}
-					]
+					],
+					"description": "Returns the color converted to an HTML hexadecimal color [String] in RGBA format, without the hash ([code]#[/code]) prefix.\nSetting [param with_alpha] to [code]false[/code], excludes alpha from the hexadecimal string, using RGB format instead of RGBA format.\n[codeblocks]\n[gdscript]\nvar white = Color(1, 1, 1, 0.5)\nvar with_alpha = white.to_html() # Returns \"ffffff7f\"\nvar without_alpha = white.to_html(false) # Returns \"ffffff\"\n[/gdscript]\n[csharp]\nvar white = new Color(1, 1, 1, 0.5f);\nstring withAlpha = white.ToHtml(); // Returns \"ffffff7f\"\nstring withoutAlpha = white.ToHtml(false); // Returns \"ffffff\"\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "clamp",
@@ -5553,7 +5868,8 @@
 							"type": "Color",
 							"default_value": "Color(1, 1, 1, 1)"
 						}
-					]
+					],
+					"description": "Returns a new color with all components clamped between the components of [param min] and [param max], by running [method @GlobalScope.clamp] on each component."
 				},
 				{
 					"name": "inverted",
@@ -5561,7 +5877,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3334027602
+					"hash": 3334027602,
+					"description": "Returns the color with its [member r], [member g], and [member b] components inverted ([code](1 - r, 1 - g, 1 - b, a)[/code]).\n[codeblocks]\n[gdscript]\nvar black = Color.WHITE.inverted()\nvar color = Color(0.3, 0.4, 0.9)\nvar inverted_color = color.inverted() # Equivalent to `Color(0.7, 0.6, 0.1)`\n[/gdscript]\n[csharp]\nvar black = Colors.White.Inverted();\nvar color = new Color(0.3f, 0.4f, 0.9f);\nColor invertedColor = color.Inverted(); // Equivalent to `new Color(0.7f, 0.6f, 0.1f)`\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "lerp",
@@ -5579,7 +5896,8 @@
 							"name": "weight",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the linear interpolation between this color's components and [param to]'s components. The interpolation factor [param weight] should be between 0.0 and 1.0 (inclusive). See also [method @GlobalScope.lerp].\n[codeblocks]\n[gdscript]\nvar red = Color(1.0, 0.0, 0.0)\nvar aqua = Color(0.0, 1.0, 0.8)\n\nred.lerp(aqua, 0.2) # Returns Color(0.8, 0.2, 0.16)\nred.lerp(aqua, 0.5) # Returns Color(0.5, 0.5, 0.4)\nred.lerp(aqua, 1.0) # Returns Color(0.0, 1.0, 0.8)\n[/gdscript]\n[csharp]\nvar red = new Color(1.0f, 0.0f, 0.0f);\nvar aqua = new Color(0.0f, 1.0f, 0.8f);\n\nred.Lerp(aqua, 0.2f); // Returns Color(0.8f, 0.2f, 0.16f)\nred.Lerp(aqua, 0.5f); // Returns Color(0.5f, 0.5f, 0.4f)\nred.Lerp(aqua, 1.0f); // Returns Color(0.0f, 1.0f, 0.8f)\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "lightened",
@@ -5593,7 +5911,8 @@
 							"name": "amount",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a new color resulting from making this color lighter by the specified [param amount], which should be a ratio from 0.0 to 1.0. See also [method darkened].\n[codeblocks]\n[gdscript]\nvar green = Color(0.0, 1.0, 0.0)\nvar light_green = green.lightened(0.2) # 20% lighter than regular green\n[/gdscript]\n[csharp]\nvar green = new Color(0.0f, 1.0f, 0.0f);\nColor lightGreen = green.Lightened(0.2f); // 20% lighter than regular green\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "darkened",
@@ -5607,7 +5926,8 @@
 							"name": "amount",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a new color resulting from making this color darker by the specified [param amount] (ratio from 0.0 to 1.0). See also [method lightened].\n[codeblocks]\n[gdscript]\nvar green = Color(0.0, 1.0, 0.0)\nvar darkgreen = green.darkened(0.2) # 20% darker than regular green\n[/gdscript]\n[csharp]\nvar green = new Color(0.0f, 1.0f, 0.0f);\nColor darkgreen = green.Darkened(0.2f); // 20% darker than regular green\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "blend",
@@ -5621,7 +5941,8 @@
 							"name": "over",
 							"type": "Color"
 						}
-					]
+					],
+					"description": "Returns a new color resulting from overlaying this color over the given color. In a painting program, you can imagine it as the [param over] color painted over this color (including alpha).\n[codeblocks]\n[gdscript]\nvar bg = Color(0.0, 1.0, 0.0, 0.5) # Green with alpha of 50%\nvar fg = Color(1.0, 0.0, 0.0, 0.5) # Red with alpha of 50%\nvar blended_color = bg.blend(fg) # Brown with alpha of 75%\n[/gdscript]\n[csharp]\nvar bg = new Color(0.0f, 1.0f, 0.0f, 0.5f); // Green with alpha of 50%\nvar fg = new Color(1.0f, 0.0f, 0.0f, 0.5f); // Red with alpha of 50%\nColor blendedColor = bg.Blend(fg); // Brown with alpha of 75%\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "get_luminance",
@@ -5629,7 +5950,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 466405837
+					"hash": 466405837,
+					"description": "Returns the light intensity of the color, as a value between 0.0 and 1.0 (inclusive). This is useful when determining light or dark color. Colors with a luminance smaller than 0.5 can be generally considered dark.\n[b]Note:[/b] [method get_luminance] relies on the color using linear encoding to return an accurate relative luminance value. If the color uses the default nonlinear sRGB encoding, use [method srgb_to_linear] to convert it to linear encoding first."
 				},
 				{
 					"name": "srgb_to_linear",
@@ -5637,7 +5959,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3334027602
+					"hash": 3334027602,
+					"description": "Returns a copy of the color that uses linear encoding. This method requires the original color to be encoded using the [url=https://en.wikipedia.org/wiki/SRGB]nonlinear sRGB transfer function[/url]. See also [method linear_to_srgb] which performs the opposite operation.\n[b]Note:[/b] The color's alpha channel ([member a]) is not affected. The alpha channel is always stored with linear encoding, regardless of the color space of the other color channels."
 				},
 				{
 					"name": "linear_to_srgb",
@@ -5645,7 +5968,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3334027602
+					"hash": 3334027602,
+					"description": "Returns a copy of the color that is encoded using the [url=https://en.wikipedia.org/wiki/SRGB]nonlinear sRGB transfer function[/url]. This method requires the original color to use linear encoding. See also [method srgb_to_linear] which performs the opposite operation.\n[b]Note:[/b] The color's alpha channel ([member a]) is not affected. The alpha channel is always stored with linear encoding, regardless of the color space of the other color channels."
 				},
 				{
 					"name": "is_equal_approx",
@@ -5659,7 +5983,8 @@
 							"name": "to",
 							"type": "Color"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if this color and [param to] are approximately equal, by running [method @GlobalScope.is_equal_approx] on each component."
 				},
 				{
 					"name": "hex",
@@ -5673,7 +5998,8 @@
 							"name": "hex",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns the [Color] associated with the provided [param hex] integer in 32-bit RGBA format (8 bits per channel). This method is the inverse of [method to_rgba32].\nIn GDScript and C#, the [int] is best visualized with hexadecimal notation ([code]\"0x\"[/code] prefix, making it [code]\"0xRRGGBBAA\"[/code]).\n[codeblocks]\n[gdscript]\nvar red = Color.hex(0xff0000ff)\nvar dark_cyan = Color.hex(0x008b8bff)\nvar my_color = Color.hex(0xbbefd2a4)\n[/gdscript]\n[csharp]\nvar red = new Color(0xff0000ff);\nvar dark_cyan = new Color(0x008b8bff);\nvar my_color = new Color(0xbbefd2a4);\n[/csharp]\n[/codeblocks]\nIf you want to use hex notation in a constant expression, use the equivalent constructor instead (i.e. [code]Color(0xRRGGBBAA)[/code])."
 				},
 				{
 					"name": "hex64",
@@ -5687,7 +6013,8 @@
 							"name": "hex",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns the [Color] associated with the provided [param hex] integer in 64-bit RGBA format (16 bits per channel). This method is the inverse of [method to_rgba64].\nIn GDScript and C#, the [int] is best visualized with hexadecimal notation ([code]\"0x\"[/code] prefix, making it [code]\"0xRRRRGGGGBBBBAAAA\"[/code])."
 				},
 				{
 					"name": "html",
@@ -5701,7 +6028,8 @@
 							"name": "rgba",
 							"type": "String"
 						}
-					]
+					],
+					"description": "Returns a new color from [param rgba], an HTML hexadecimal color string. [param rgba] is not case-sensitive, and may be prefixed by a hash sign ([code]#[/code]).\n[param rgba] must be a valid three-digit or six-digit hexadecimal color string, and may contain an alpha channel value. If [param rgba] does not contain an alpha channel value, an alpha channel value of 1.0 is applied. If [param rgba] is invalid, returns an empty color.\n[codeblocks]\n[gdscript]\nvar blue = Color.html(\"#0000ff\") # blue is Color(0.0, 0.0, 1.0, 1.0)\nvar green = Color.html(\"#0F0\")   # green is Color(0.0, 1.0, 0.0, 1.0)\nvar col = Color.html(\"663399cc\") # col is Color(0.4, 0.2, 0.6, 0.8)\n[/gdscript]\n[csharp]\nvar blue = Color.FromHtml(\"#0000ff\"); // blue is Color(0.0, 0.0, 1.0, 1.0)\nvar green = Color.FromHtml(\"#0F0\");   // green is Color(0.0, 1.0, 0.0, 1.0)\nvar col = Color.FromHtml(\"663399cc\"); // col is Color(0.4, 0.2, 0.6, 0.8)\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "html_is_valid",
@@ -5715,7 +6043,8 @@
 							"name": "color",
 							"type": "String"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if [param color] is a valid HTML hexadecimal color string. The string must be a hexadecimal value (case-insensitive) of either 3, 4, 6 or 8 digits, and may be prefixed by a hash sign ([code]#[/code]). This method is identical to [method String.is_valid_html_color].\n[codeblocks]\n[gdscript]\nColor.html_is_valid(\"#55aaFF\")   # Returns true\nColor.html_is_valid(\"#55AAFF20\") # Returns true\nColor.html_is_valid(\"55AAFF\")    # Returns true\nColor.html_is_valid(\"#F2C\")      # Returns true\n\nColor.html_is_valid(\"#AABBC\")    # Returns false\nColor.html_is_valid(\"#55aaFF5\")  # Returns false\n[/gdscript]\n[csharp]\nColor.HtmlIsValid(\"#55AAFF\");   // Returns true\nColor.HtmlIsValid(\"#55AAFF20\"); // Returns true\nColor.HtmlIsValid(\"55AAFF\");    // Returns true\nColor.HtmlIsValid(\"#F2C\");      // Returns true\n\nColor.HtmlIsValid(\"#AABBC\");    // Returns false\nColor.HtmlIsValid(\"#55aaFF5\");  // Returns false\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "from_string",
@@ -5733,7 +6062,8 @@
 							"name": "default",
 							"type": "Color"
 						}
-					]
+					],
+					"description": "Creates a [Color] from the given string, which can be either an HTML color code or a named color (case-insensitive). Returns [param default] if the color cannot be inferred from the string.\nIf you want to create a color from String in a constant expression, use the equivalent constructor instead (i.e. [code]Color(\"color string\")[/code])."
 				},
 				{
 					"name": "from_hsv",
@@ -5760,7 +6090,8 @@
 							"type": "float",
 							"default_value": "1.0"
 						}
-					]
+					],
+					"description": "Constructs a color from an [url=https://en.wikipedia.org/wiki/HSL_and_HSV]HSV profile[/url]. The hue ([param h]), saturation ([param s]), and value ([param v]) are typically between 0.0 and 1.0.\n[codeblocks]\n[gdscript]\nvar color = Color.from_hsv(0.58, 0.5, 0.79, 0.8)\n[/gdscript]\n[csharp]\nvar color = Color.FromHsv(0.58f, 0.5f, 0.79f, 0.8f);\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "from_ok_hsl",
@@ -5787,7 +6118,8 @@
 							"type": "float",
 							"default_value": "1.0"
 						}
-					]
+					],
+					"description": "Constructs a color from an [url=https://bottosson.github.io/posts/colorpicker/]OK HSL profile[/url]. The hue ([param h]), saturation ([param s]), and lightness ([param l]) are typically between 0.0 and 1.0.\n[codeblocks]\n[gdscript]\nvar color = Color.from_ok_hsl(0.58, 0.5, 0.79, 0.8)\n[/gdscript]\n[csharp]\nvar color = Color.FromOkHsl(0.58f, 0.5f, 0.79f, 0.8f);\n[/csharp]\n[/codeblocks]"
 				},
 				{
 					"name": "from_rgbe9995",
@@ -5801,7 +6133,8 @@
 							"name": "rgbe",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Decodes a [Color] from an RGBE9995 format integer. See [constant Image.FORMAT_RGBE9995]."
 				},
 				{
 					"name": "from_rgba8",
@@ -5828,7 +6161,8 @@
 							"type": "int",
 							"default_value": "255"
 						}
-					]
+					],
+					"description": "Returns a [Color] constructed from red ([param r8]), green ([param g8]), blue ([param b8]), and optionally alpha ([param a8]) integer channels, each divided by [code]255.0[/code] for their final value.\n[codeblock]\nvar red = Color.from_rgba8(255, 0, 0)             # Same as Color(1, 0, 0).\nvar dark_blue = Color.from_rgba8(0, 0, 51)        # Same as Color(0, 0, 0.2).\nvar my_color = Color.from_rgba8(306, 255, 0, 102) # Same as Color(1.2, 1, 0, 0.4).\n[/codeblock]\n[b]Note:[/b] Due to the lower precision of [method from_rgba8] compared to the standard [Color] constructor, a color created with [method from_rgba8] will generally not be equal to the same color created with the standard [Color] constructor. Use [method is_equal_approx] for comparisons to avoid issues with floating-point precision error."
 				}
 			],
 			"operators": [
@@ -6006,7 +6340,9 @@
 						}
 					]
 				}
-			]
+			],
+			"brief_description": "A color represented in RGBA format.",
+			"description": "A color represented in RGBA format by a red ([member r]), green ([member g]), blue ([member b]), and alpha ([member a]) component. Each component is a 32-bit floating-point value, usually ranging from [code]0.0[/code] to [code]1.0[/code]. Some properties (such as [member CanvasItem.modulate]) may support values greater than [code]1.0[/code], for overbright or HDR (High Dynamic Range) colors.\nColors can be created in a number of ways: By the various [Color] constructors, by static methods such as [method from_hsv], and by using a name from the set of standardized colors based on [url=https://en.wikipedia.org/wiki/X11_color_names]X11 color names[/url] with the addition of [constant TRANSPARENT].\n[url=https://raw.githubusercontent.com/godotengine/godot-docs/master/img/color_constants.png]Color constants cheatsheet[/url]\nAlthough [Color] may be used to store values of any encoding, the red ([member r]), green ([member g]), and blue ([member b]) properties of [Color] are expected by Godot to be encoded using the [url=https://en.wikipedia.org/wiki/SRGB#Transfer_function_(%22gamma%22)]nonlinear sRGB transfer function[/url] unless otherwise stated. This color encoding is used by many traditional art and web tools, making it easy to match colors between Godot and these tools. Godot uses [url=https://en.wikipedia.org/wiki/Rec._709]Rec. ITU-R BT.709[/url] color primaries, which are used by the sRGB standard.\nAll physical simulation, such as lighting calculations, and colorimetry transformations, such as [method get_luminance], must be performed on linearly encoded values to produce correct results. When performing these calculations, convert [Color] to and from linear encoding using [method srgb_to_linear] and [method linear_to_srgb].\n[b]Note:[/b] In a boolean context, a Color will evaluate to [code]false[/code] if it is equal to [code]Color(0, 0, 0, 1)[/code] (opaque black). Otherwise, a Color will always evaluate to [code]true[/code].\n[b]Note:[/b] In C#, color constants are defined in the [code]Colors[/code] static class instead of [code skip-lint]Color[/code]. Additionally, named colors use [code]PascalCase[/code] syntax instead of [code]UPPER_SNAKE_CASE[/code]. For example, [code skip-lint]Color.ALICE_BLUE[/code] in GDScript is [code skip-lint]Colors.AliceBlue[/code] in C#."
 		},
 		{
 			"name": "Callable",
@@ -6021,7 +6357,8 @@
 					"is_static": false,
 					"is_vararg": false,
 					"return_type": "StringName",
-					"arguments": []
+					"arguments": [],
+					"description": "Returns the name of the method represented by this [Callable]. If the callable is a GDScript lambda function, returns the function's name or [code]\"<anonymous lambda>\"[/code]."
 				},
 				{
 					"name": "call",
@@ -6029,7 +6366,8 @@
 					"is_static": false,
 					"is_vararg": true,
 					"return_type": "Variant",
-					"arguments": []
+					"arguments": [],
+					"description": "Calls the method represented by this [Callable]. Arguments can be passed and should match the method's signature."
 				},
 				{
 					"name": "is_valid",
@@ -6037,7 +6375,8 @@
 					"is_static": false,
 					"is_vararg": false,
 					"return_type": "bool",
-					"arguments": []
+					"arguments": [],
+					"description": "Returns [code]true[/code] if the callable's object exists and has a valid method name assigned, or is a custom callable."
 				},
 				{
 					"name": "create",
@@ -6055,7 +6394,8 @@
 							"name": "method",
 							"type": "StringName"
 						}
-					]
+					],
+					"description": "Creates a new [Callable] for the method named [param method] in the specified [param variant]. To represent a method of a built-in [Variant] type, a custom callable is used (see [method is_custom]). If [param variant] is [Object], then a standard callable will be created instead.\n[b]Note:[/b] This method is always necessary for the [Dictionary] type, as property syntax is used to access its entries. You may also use this method when [param variant]'s type is not known in advance (for polymorphism)."
 				},
 				{
 					"name": "callv",
@@ -6069,7 +6409,8 @@
 							"name": "arguments",
 							"type": "Array"
 						}
-					]
+					],
+					"description": "Calls the method represented by this [Callable]. Unlike [method call], this method expects all arguments to be contained inside the [param arguments] [Array]."
 				},
 				{
 					"name": "is_null",
@@ -6077,7 +6418,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if this [Callable] has no target to call the method on. Equivalent to [code]callable == Callable()[/code].\n[b]Note:[/b] This is [i]not[/i] the same as [code]not is_valid()[/code] and using [code]not is_null()[/code] will [i]not[/i] guarantee that this callable can be called. Use [method is_valid] instead."
 				},
 				{
 					"name": "is_custom",
@@ -6085,7 +6427,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if this [Callable] is a custom callable. Custom callables are used:\n- for binding/unbinding arguments (see [method bind] and [method unbind]);\n- for representing methods of built-in [Variant] types (see [method create]);\n- for representing global, lambda, and RPC functions in GDScript;\n- for other purposes in the core, GDExtension, and C#."
 				},
 				{
 					"name": "is_standard",
@@ -6093,7 +6436,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if this [Callable] is a standard callable. This method is the opposite of [method is_custom]. Returns [code]false[/code] if this callable is a lambda function."
 				},
 				{
 					"name": "get_object",
@@ -6101,7 +6445,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 4008621732
+					"hash": 4008621732,
+					"description": "Returns the object on which this [Callable] is called."
 				},
 				{
 					"name": "get_object_id",
@@ -6109,7 +6454,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the ID of this [Callable]'s object (see [method Object.get_instance_id])."
 				},
 				{
 					"name": "get_argument_count",
@@ -6117,7 +6463,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the total number of arguments this [Callable] should take, including optional arguments. This means that any arguments bound with [method bind] are [i]subtracted[/i] from the result, and any arguments unbound with [method unbind] are [i]added[/i] to the result."
 				},
 				{
 					"name": "get_bound_arguments_count",
@@ -6125,7 +6472,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the total amount of arguments bound via successive [method bind] or [method unbind] calls. This is the same as the size of the array returned by [method get_bound_arguments]. See [method get_bound_arguments] for details.\n[b]Note:[/b] The [method get_bound_arguments_count] and [method get_unbound_arguments_count] methods can both return positive values."
 				},
 				{
 					"name": "get_bound_arguments",
@@ -6133,7 +6481,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 4144163970
+					"hash": 4144163970,
+					"description": "Returns the array of arguments bound via successive [method bind] or [method unbind] calls. These arguments will be added [i]after[/i] the arguments passed to the call, from which [method get_unbound_arguments_count] arguments on the right have been previously excluded.\n[codeblock]\nfunc get_effective_arguments(callable, call_args):\n\tassert(call_args.size() - callable.get_unbound_arguments_count() >= 0)\n\tvar result = call_args.slice(0, call_args.size() - callable.get_unbound_arguments_count())\n\tresult.append_array(callable.get_bound_arguments())\n\treturn result\n[/codeblock]"
 				},
 				{
 					"name": "get_unbound_arguments_count",
@@ -6141,7 +6490,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the total amount of arguments unbound via successive [method bind] or [method unbind] calls. See [method get_bound_arguments] for details.\n[b]Note:[/b] The [method get_bound_arguments_count] and [method get_unbound_arguments_count] methods can both return positive values."
 				},
 				{
 					"name": "hash",
@@ -6149,7 +6499,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the 32-bit hash value of this [Callable]'s object.\n[b]Note:[/b] [Callable]s with equal content will always produce identical hash values. However, the reverse is not true. Returning identical hash values does [i]not[/i] imply the callables are equal, because different callables can have identical hash values due to hash collisions. The engine uses a 32-bit hash algorithm for [method hash]."
 				},
 				{
 					"name": "bindv",
@@ -6163,7 +6514,8 @@
 							"name": "arguments",
 							"type": "Array"
 						}
-					]
+					],
+					"description": "Returns a copy of this [Callable] with one or more arguments bound, reading them from an array. When called, the bound arguments are passed [i]after[/i] the arguments supplied by [method call]. See also [method unbind].\n[b]Note:[/b] When this method is chained with other similar methods, the order in which the argument list is modified is read from right to left."
 				},
 				{
 					"name": "unbind",
@@ -6177,21 +6529,24 @@
 							"name": "argcount",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns a copy of this [Callable] with a number of arguments unbound. In other words, when the new callable is called the last few arguments supplied by the user are ignored, according to [param argcount]. The remaining arguments are passed to the callable. This allows to use the original callable in a context that attempts to pass more arguments than this callable can handle, e.g. a signal with a fixed number of arguments. See also [method bind].\n[b]Note:[/b] When this method is chained with other similar methods, the order in which the argument list is modified is read from right to left.\n[codeblock]\nfunc _ready():\n\tfoo.unbind(1).call(1, 2) # Calls foo(1).\n\tfoo.bind(3, 4).unbind(1).call(1, 2) # Calls foo(1, 3, 4), note that it does not change the arguments from bind.\n[/codeblock]"
 				},
 				{
 					"name": "call_deferred",
 					"is_vararg": true,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3286317445
+					"hash": 3286317445,
+					"description": "Calls the method represented by this [Callable] in deferred mode, i.e. at the end of the current frame. Arguments can be passed and should match the method's signature.\n[codeblocks]\n[gdscript]\nfunc _ready():\n\tgrab_focus.call_deferred()\n[/gdscript]\n[csharp]\npublic override void _Ready()\n{\n\tCallable.From(GrabFocus).CallDeferred();\n}\n[/csharp]\n[/codeblocks]\n[b]Note:[/b] Deferred calls are processed at idle time. Idle time happens mainly at the end of process and physics frames. In it, deferred calls will be run until there are none left, which means you can defer calls from other deferred calls and they'll still be run in the current idle time cycle. This means you should not call a method deferred from itself (or from a method called by it), as this causes infinite recursion the same way as if you had called the method directly.\nSee also [method Object.call_deferred]."
 				},
 				{
 					"name": "rpc",
 					"is_vararg": true,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3286317445
+					"hash": 3286317445,
+					"description": "Perform an RPC (Remote Procedure Call) on all connected peers. This is used for multiplayer and is normally not available, unless the function being called has been marked as [i]RPC[/i] (using [annotation @GDScript.@rpc] or [method Node.rpc_config]). Calling this method on unsupported functions will result in an error. See [method Node.rpc]."
 				},
 				{
 					"name": "rpc_id",
@@ -6204,7 +6559,8 @@
 							"name": "peer_id",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Perform an RPC (Remote Procedure Call) on a specific peer ID (see multiplayer documentation for reference). This is used for multiplayer and is normally not available unless the function being called has been marked as [i]RPC[/i] (using [annotation @GDScript.@rpc] or [method Node.rpc_config]). Calling this method on unsupported functions will result in an error. See [method Node.rpc_id]."
 				},
 				{
 					"name": "bind",
@@ -6212,7 +6568,8 @@
 					"is_vararg": true,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3224143119
+					"hash": 3224143119,
+					"description": "Returns a copy of this [Callable] with one or more arguments bound. When called, the bound arguments are passed [i]after[/i] the arguments supplied by [method call]. See also [method unbind].\n[b]Note:[/b] When this method is chained with other similar methods, the order in which the argument list is modified is read from right to left."
 				}
 			],
 			"operators": [
@@ -6277,7 +6634,9 @@
 						}
 					]
 				}
-			]
+			],
+			"brief_description": "A built-in type representing a method or a standalone function.",
+			"description": "[Callable] is a built-in [Variant] type that represents a function. It can either be a method within an [Object] instance, or a custom callable used for different purposes (see [method is_custom]). Like all [Variant] types, it can be stored in variables and passed to other functions. It is most commonly used for signal callbacks.\n[codeblocks]\n[gdscript]\nfunc print_args(arg1, arg2, arg3 = \"\"):\n\tprints(arg1, arg2, arg3)\n\nfunc test():\n\tvar callable = Callable(self, \"print_args\")\n\tcallable.call(\"hello\", \"world\")  # Prints \"hello world \".\n\tcallable.call(Vector2.UP, 42, callable)  # Prints \"(0.0, -1.0) 42 Node(node.gd)::print_args\"\n\tcallable.call(\"invalid\")  # Invalid call, should have at least 2 arguments.\n[/gdscript]\n[csharp]\n// Default parameter values are not supported.\npublic void PrintArgs(Variant arg1, Variant arg2, Variant arg3 = default)\n{\n\tGD.PrintS(arg1, arg2, arg3);\n}\n\npublic void Test()\n{\n\t// Invalid calls fail silently.\n\tCallable callable = new Callable(this, MethodName.PrintArgs);\n\tcallable.Call(\"hello\", \"world\"); // Default parameter values are not supported, should have 3 arguments.\n\tcallable.Call(Vector2.Up, 42, callable); // Prints \"(0, -1) 42 Node(Node.cs)::PrintArgs\"\n\tcallable.Call(\"invalid\"); // Invalid call, should have 3 arguments.\n}\n[/csharp]\n[/codeblocks]\nIn GDScript, it's possible to create lambda functions within a method. Lambda functions are custom callables that are not associated with an [Object] instance. Optionally, lambda functions can also be named. The name will be displayed in the debugger, or when calling [method get_method].\n[codeblock]\nfunc _init():\n\tvar my_lambda = func (message):\n\t\tprint(message)\n\n\t# Prints \"Hello everyone!\"\n\tmy_lambda.call(\"Hello everyone!\")\n\n\t# Prints \"Attack!\", when the button_pressed signal is emitted.\n\tbutton_pressed.connect(func(): print(\"Attack!\"))\n[/codeblock]\nIn GDScript, you can access methods and global functions as [Callable]s:\n[codeblock]\ntween.tween_callback(node.queue_free)  # Object methods.\ntween.tween_callback(array.clear)  # Methods of built-in types.\ntween.tween_callback(print.bind(\"Test\"))  # Global functions.\n[/codeblock]\n[b]Note:[/b] [Dictionary] does not support the above due to ambiguity with keys.\n[codeblock]\nvar dictionary = { \"hello\": \"world\" }\n\n# This will not work, `clear` is treated as a key.\ntween.tween_callback(dictionary.clear)\n\n# This will work.\ntween.tween_callback(Callable.create(dictionary, \"clear\"))\n[/codeblock]\n[b]Note:[/b] In a boolean context, a callable will evaluate to [code]false[/code] if it's null (see [method is_null]). Otherwise, a callable will always evaluate to [code]true[/code]."
 		},
 		{
 			"name": "Vector3",
@@ -6286,42 +6645,50 @@
 			"members": [
 				{
 					"name": "x",
-					"type": "float"
+					"type": "float",
+					"description": "The vector's X component. Also accessible by using the index position [code][0][/code]."
 				},
 				{
 					"name": "y",
-					"type": "float"
+					"type": "float",
+					"description": "The vector's Y component. Also accessible by using the index position [code][1][/code]."
 				},
 				{
 					"name": "z",
-					"type": "float"
+					"type": "float",
+					"description": "The vector's Z component. Also accessible by using the index position [code][2][/code]."
 				}
 			],
 			"constants": [
 				{
 					"name": "ZERO",
 					"type": "Vector3",
-					"value": "Vector3(0, 0, 0)"
+					"value": "Vector3(0, 0, 0)",
+					"description": "Zero vector, a vector with all components set to [code]0[/code]."
 				},
 				{
 					"name": "ONE",
 					"type": "Vector3",
-					"value": "Vector3(1, 1, 1)"
+					"value": "Vector3(1, 1, 1)",
+					"description": "One vector, a vector with all components set to [code]1[/code]."
 				},
 				{
 					"name": "UP",
 					"type": "Vector3",
-					"value": "Vector3(0, 1, 0)"
+					"value": "Vector3(0, 1, 0)",
+					"description": "Up unit vector."
 				},
 				{
 					"name": "DOWN",
 					"type": "Vector3",
-					"value": "Vector3(0, -1, 0)"
+					"value": "Vector3(0, -1, 0)",
+					"description": "Down unit vector."
 				},
 				{
 					"name": "LEFT",
 					"type": "Vector3",
-					"value": "Vector3(-1, 0, 0)"
+					"value": "Vector3(-1, 0, 0)",
+					"description": "Left unit vector. Represents the local direction of left, and the global direction of west."
 				},
 				{
 					"name": "AXIS_X",
@@ -6331,52 +6698,62 @@
 				{
 					"name": "INF",
 					"type": "Vector3",
-					"value": "Vector3(inf, inf, inf)"
+					"value": "Vector3(inf, inf, inf)",
+					"description": "Infinity vector, a vector with all components set to [constant @GDScript.INF]."
 				},
 				{
 					"name": "RIGHT",
 					"type": "Vector3",
-					"value": "Vector3(1, 0, 0)"
+					"value": "Vector3(1, 0, 0)",
+					"description": "Right unit vector. Represents the local direction of right, and the global direction of east."
 				},
 				{
 					"name": "FORWARD",
 					"type": "Vector3",
-					"value": "Vector3(0, 0, -1)"
+					"value": "Vector3(0, 0, -1)",
+					"description": "Forward unit vector. Represents the local direction of forward, and the global direction of north. Keep in mind that the forward direction for lights, cameras, etc is different from 3D assets like characters, which face towards the camera by convention. Use [constant Vector3.MODEL_FRONT] and similar constants when working in 3D asset space."
 				},
 				{
 					"name": "BACK",
 					"type": "Vector3",
-					"value": "Vector3(0, 0, 1)"
+					"value": "Vector3(0, 0, 1)",
+					"description": "Back unit vector. Represents the local direction of back, and the global direction of south."
 				},
 				{
 					"name": "MODEL_LEFT",
 					"type": "Vector3",
-					"value": "Vector3(1, 0, 0)"
+					"value": "Vector3(1, 0, 0)",
+					"description": "Unit vector pointing towards the left side of imported 3D assets."
 				},
 				{
 					"name": "MODEL_RIGHT",
 					"type": "Vector3",
-					"value": "Vector3(-1, 0, 0)"
+					"value": "Vector3(-1, 0, 0)",
+					"description": "Unit vector pointing towards the right side of imported 3D assets."
 				},
 				{
 					"name": "MODEL_TOP",
 					"type": "Vector3",
-					"value": "Vector3(0, 1, 0)"
+					"value": "Vector3(0, 1, 0)",
+					"description": "Unit vector pointing towards the top side (up) of imported 3D assets."
 				},
 				{
 					"name": "MODEL_BOTTOM",
 					"type": "Vector3",
-					"value": "Vector3(0, -1, 0)"
+					"value": "Vector3(0, -1, 0)",
+					"description": "Unit vector pointing towards the bottom side (down) of imported 3D assets."
 				},
 				{
 					"name": "MODEL_FRONT",
 					"type": "Vector3",
-					"value": "Vector3(0, 0, 1)"
+					"value": "Vector3(0, 0, 1)",
+					"description": "Unit vector pointing towards the front side (facing forward) of imported 3D assets."
 				},
 				{
 					"name": "MODEL_REAR",
 					"type": "Vector3",
-					"value": "Vector3(0, 0, -1)"
+					"value": "Vector3(0, 0, -1)",
+					"description": "Unit vector pointing towards the rear side (back) of imported 3D assets."
 				}
 			],
 			"enums": [
@@ -6405,7 +6782,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the axis of the vector's lowest value. See [code]AXIS_*[/code] constants. If all components are equal, this method returns [constant AXIS_Z]."
 				},
 				{
 					"name": "max_axis_index",
@@ -6413,7 +6791,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the axis of the vector's highest value. See [code]AXIS_*[/code] constants. If all components are equal, this method returns [constant AXIS_X]."
 				},
 				{
 					"name": "angle_to",
@@ -6427,7 +6806,8 @@
 							"name": "to",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the unsigned minimum angle to the given vector, in radians."
 				},
 				{
 					"name": "signed_angle_to",
@@ -6445,7 +6825,8 @@
 							"name": "axis",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the signed angle to the given vector, in radians. The sign of the angle is positive in a counter-clockwise direction and negative in a clockwise direction when viewed from the side specified by the [param axis]."
 				},
 				{
 					"name": "direction_to",
@@ -6459,7 +6840,8 @@
 							"name": "to",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the normalized vector pointing from this vector to [param to]. This is equivalent to using [code](b - a).normalized()[/code]."
 				},
 				{
 					"name": "distance_to",
@@ -6473,7 +6855,8 @@
 							"name": "to",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the [url=https://en.wikipedia.org/wiki/Euclidean_distance]Euclidean distance[/url] between this vector and [param to]."
 				},
 				{
 					"name": "distance_squared_to",
@@ -6487,7 +6870,8 @@
 							"name": "to",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the squared [url=https://en.wikipedia.org/wiki/Euclidean_distance]Euclidean distance[/url] between this vector and [param to].\nThis method runs faster than [method distance_to], so prefer it if you need to compare vectors or need the squared distance for some formula."
 				},
 				{
 					"name": "length",
@@ -6495,7 +6879,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 466405837
+					"hash": 466405837,
+					"description": "Returns the length (magnitude) of this vector."
 				},
 				{
 					"name": "length_squared",
@@ -6503,7 +6888,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 466405837
+					"hash": 466405837,
+					"description": "Returns the squared length (squared magnitude) of this vector.\nThis method runs faster than [method length], so prefer it if you need to compare vectors or need the squared distance for some formula."
 				},
 				{
 					"name": "limit_length",
@@ -6518,7 +6904,8 @@
 							"type": "float",
 							"default_value": "1.0"
 						}
-					]
+					],
+					"description": "Returns the vector with a maximum length by limiting its length to [param length]. If the vector is non-finite, the result is undefined."
 				},
 				{
 					"name": "normalized",
@@ -6526,7 +6913,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1776574132
+					"hash": 1776574132,
+					"description": "Returns the result of scaling the vector to unit length. Equivalent to [code]v / v.length()[/code]. Returns [code](0, 0, 0)[/code] if [code]v.length() == 0[/code]. See also [method is_normalized].\n[b]Note:[/b] This function may return incorrect values if the input vector length is near zero."
 				},
 				{
 					"name": "is_normalized",
@@ -6534,7 +6922,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the vector is normalized, i.e. its length is approximately equal to 1."
 				},
 				{
 					"name": "is_equal_approx",
@@ -6548,7 +6937,8 @@
 							"name": "to",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if this vector and [param to] are approximately equal, by running [method @GlobalScope.is_equal_approx] on each component."
 				},
 				{
 					"name": "is_zero_approx",
@@ -6556,7 +6946,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if this vector's values are approximately zero, by running [method @GlobalScope.is_zero_approx] on each component.\nThis method is faster than using [method is_equal_approx] with one value as a zero vector."
 				},
 				{
 					"name": "is_finite",
@@ -6564,7 +6955,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if this vector is finite, by calling [method @GlobalScope.is_finite] on each component."
 				},
 				{
 					"name": "inverse",
@@ -6572,7 +6964,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1776574132
+					"hash": 1776574132,
+					"description": "Returns the inverse of the vector. This is the same as [code]Vector3(1.0 / v.x, 1.0 / v.y, 1.0 / v.z)[/code]."
 				},
 				{
 					"name": "clamp",
@@ -6590,7 +6983,8 @@
 							"name": "max",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns a new vector with all components clamped between the components of [param min] and [param max], by running [method @GlobalScope.clamp] on each component."
 				},
 				{
 					"name": "clampf",
@@ -6608,7 +7002,8 @@
 							"name": "max",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a new vector with all components clamped between [param min] and [param max], by running [method @GlobalScope.clamp] on each component."
 				},
 				{
 					"name": "snapped",
@@ -6622,7 +7017,8 @@
 							"name": "step",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns a new vector with each component snapped to the nearest multiple of the corresponding component in [param step]. This can also be used to round the components to an arbitrary number of decimals."
 				},
 				{
 					"name": "snappedf",
@@ -6636,7 +7032,8 @@
 							"name": "step",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a new vector with each component snapped to the nearest multiple of [param step]. This can also be used to round the components to an arbitrary number of decimals."
 				},
 				{
 					"name": "rotated",
@@ -6654,7 +7051,8 @@
 							"name": "angle",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the result of rotating this vector around a given axis by [param angle] (in radians). The axis must be a normalized vector. See also [method @GlobalScope.deg_to_rad]."
 				},
 				{
 					"name": "lerp",
@@ -6672,7 +7070,8 @@
 							"name": "weight",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the result of the linear interpolation between this vector and [param to] by amount [param weight]. [param weight] is on the range of [code]0.0[/code] to [code]1.0[/code], representing the amount of interpolation."
 				},
 				{
 					"name": "slerp",
@@ -6690,7 +7089,8 @@
 							"name": "weight",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the result of spherical linear interpolation between this vector and [param to], by amount [param weight]. [param weight] is on the range of 0.0 to 1.0, representing the amount of interpolation.\nThis method also handles interpolating the lengths if the input vectors have different lengths. For the special case of one or both input vectors having zero length, this method behaves like [method lerp]."
 				},
 				{
 					"name": "cubic_interpolate",
@@ -6716,7 +7116,8 @@
 							"name": "weight",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Performs a cubic interpolation between this vector and [param b] using [param pre_a] and [param post_b] as handles, and returns the result at position [param weight]. [param weight] is on the range of 0.0 to 1.0, representing the amount of interpolation."
 				},
 				{
 					"name": "cubic_interpolate_in_time",
@@ -6754,7 +7155,8 @@
 							"name": "post_b_t",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Performs a cubic interpolation between this vector and [param b] using [param pre_a] and [param post_b] as handles, and returns the result at position [param weight]. [param weight] is on the range of 0.0 to 1.0, representing the amount of interpolation.\nIt can perform smoother interpolation than [method cubic_interpolate] by the time values."
 				},
 				{
 					"name": "bezier_interpolate",
@@ -6780,7 +7182,8 @@
 							"name": "t",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the point at the given [param t] on the [url=https://en.wikipedia.org/wiki/B%C3%A9zier_curve]Bézier curve[/url] defined by this vector and the given [param control_1], [param control_2], and [param end] points."
 				},
 				{
 					"name": "bezier_derivative",
@@ -6806,7 +7209,8 @@
 							"name": "t",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the derivative at the given [param t] on the [url=https://en.wikipedia.org/wiki/B%C3%A9zier_curve]Bézier curve[/url] defined by this vector and the given [param control_1], [param control_2], and [param end] points."
 				},
 				{
 					"name": "move_toward",
@@ -6824,7 +7228,8 @@
 							"name": "delta",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a new vector moved toward [param to] by the fixed [param delta] amount. Will not go past the final value."
 				},
 				{
 					"name": "dot",
@@ -6838,7 +7243,8 @@
 							"name": "with",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the dot product of this vector and [param with]. This can be used to compare the angle between two vectors. For example, this can be used to determine whether an enemy is facing the player.\nThe dot product will be [code]0[/code] for a right angle (90 degrees), greater than 0 for angles narrower than 90 degrees and lower than 0 for angles wider than 90 degrees.\nWhen using unit (normalized) vectors, the result will always be between [code]-1.0[/code] (180 degree angle) when the vectors are facing opposite directions, and [code]1.0[/code] (0 degree angle) when the vectors are aligned.\n[b]Note:[/b] [code]a.dot(b)[/code] is equivalent to [code]b.dot(a)[/code]."
 				},
 				{
 					"name": "cross",
@@ -6852,7 +7258,8 @@
 							"name": "with",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the cross product of this vector and [param with].\nThis returns a vector perpendicular to both this and [param with], which would be the normal vector of the plane defined by the two vectors. As there are two such vectors, in opposite directions, this method returns the vector defined by a right-handed coordinate system. If the two vectors are parallel this returns an empty vector, making it useful for testing if two vectors are parallel."
 				},
 				{
 					"name": "outer",
@@ -6866,7 +7273,8 @@
 							"name": "with",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the outer product with [param with]."
 				},
 				{
 					"name": "abs",
@@ -6874,7 +7282,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1776574132
+					"hash": 1776574132,
+					"description": "Returns a new vector with all components in absolute values (i.e. positive)."
 				},
 				{
 					"name": "floor",
@@ -6882,7 +7291,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1776574132
+					"hash": 1776574132,
+					"description": "Returns a new vector with all components rounded down (towards negative infinity)."
 				},
 				{
 					"name": "ceil",
@@ -6890,7 +7300,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1776574132
+					"hash": 1776574132,
+					"description": "Returns a new vector with all components rounded up (towards positive infinity)."
 				},
 				{
 					"name": "round",
@@ -6898,7 +7309,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1776574132
+					"hash": 1776574132,
+					"description": "Returns a new vector with all components rounded to the nearest integer, with halfway cases rounded away from zero."
 				},
 				{
 					"name": "posmod",
@@ -6912,7 +7324,8 @@
 							"name": "mod",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns a vector composed of the [method @GlobalScope.fposmod] of this vector's components and [param mod]."
 				},
 				{
 					"name": "posmodv",
@@ -6926,7 +7339,8 @@
 							"name": "modv",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns a vector composed of the [method @GlobalScope.fposmod] of this vector's components and [param modv]'s components."
 				},
 				{
 					"name": "project",
@@ -6940,7 +7354,8 @@
 							"name": "b",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns a new vector resulting from projecting this vector onto the given vector [param b]. The resulting new vector is parallel to [param b]. See also [method slide].\n[b]Note:[/b] If the vector [param b] is a zero vector, the components of the resulting new vector will be [constant @GDScript.NAN]."
 				},
 				{
 					"name": "slide",
@@ -6954,7 +7369,8 @@
 							"name": "n",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns a new vector resulting from sliding this vector along a plane with normal [param n]. The resulting new vector is perpendicular to [param n], and is equivalent to this vector minus its projection on [param n]. See also [method project].\n[b]Note:[/b] The vector [param n] must be normalized. See also [method normalized]."
 				},
 				{
 					"name": "bounce",
@@ -6968,7 +7384,8 @@
 							"name": "n",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the vector \"bounced off\" from a plane defined by the given normal [param n].\n[b]Note:[/b] [method bounce] performs the operation that most engines and frameworks call [code skip-lint]reflect()[/code]."
 				},
 				{
 					"name": "reflect",
@@ -6982,7 +7399,8 @@
 							"name": "n",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the result of reflecting the vector through a plane defined by the given normal vector [param n].\n[b]Note:[/b] [method reflect] differs from what other engines and frameworks call [code skip-lint]reflect()[/code]. In other engines, [code skip-lint]reflect()[/code] returns the result of the vector reflected by the given plane. The reflection thus passes through the given normal. While in Godot the reflection passes through the plane and can be thought of as bouncing off the normal. See also [method bounce] which does what most engines call [code skip-lint]reflect()[/code]."
 				},
 				{
 					"name": "sign",
@@ -6990,7 +7408,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 1776574132
+					"hash": 1776574132,
+					"description": "Returns a new vector with each component set to [code]1.0[/code] if it's positive, [code]-1.0[/code] if it's negative, and [code]0.0[/code] if it's zero. The result is identical to calling [method @GlobalScope.sign] on each component."
 				},
 				{
 					"name": "octahedron_encode",
@@ -6998,7 +7417,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 2428350749
+					"hash": 2428350749,
+					"description": "Returns the octahedral-encoded (oct32) form of this [Vector3] as a [Vector2]. Since a [Vector2] occupies 1/3 less memory compared to [Vector3], this form of compression can be used to pass greater amounts of [method normalized] [Vector3]s without increasing storage or memory requirements. See also [method octahedron_decode].\n[b]Note:[/b] [method octahedron_encode] can only be used for [method normalized] vectors. [method octahedron_encode] does [i]not[/i] check whether this [Vector3] is normalized, and will return a value that does not decompress to the original value if the [Vector3] is not normalized.\n[b]Note:[/b] Octahedral compression is [i]lossy[/i], although visual differences are rarely perceptible in real world scenarios."
 				},
 				{
 					"name": "min",
@@ -7012,7 +7432,8 @@
 							"name": "with",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the component-wise minimum of this and [param with], equivalent to [code]Vector3(minf(x, with.x), minf(y, with.y), minf(z, with.z))[/code]."
 				},
 				{
 					"name": "minf",
@@ -7026,7 +7447,8 @@
 							"name": "with",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the component-wise minimum of this and [param with], equivalent to [code]Vector3(minf(x, with), minf(y, with), minf(z, with))[/code]."
 				},
 				{
 					"name": "max",
@@ -7040,7 +7462,8 @@
 							"name": "with",
 							"type": "Vector3"
 						}
-					]
+					],
+					"description": "Returns the component-wise maximum of this and [param with], equivalent to [code]Vector3(maxf(x, with.x), maxf(y, with.y), maxf(z, with.z))[/code]."
 				},
 				{
 					"name": "maxf",
@@ -7054,7 +7477,8 @@
 							"name": "with",
 							"type": "float"
 						}
-					]
+					],
+					"description": "Returns the component-wise maximum of this and [param with], equivalent to [code]Vector3(maxf(x, with), maxf(y, with), maxf(z, with))[/code]."
 				},
 				{
 					"name": "octahedron_decode",
@@ -7068,7 +7492,8 @@
 							"name": "uv",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the [Vector3] from an octahedral-compressed form created using [method octahedron_encode] (stored as a [Vector2])."
 				}
 			],
 			"operators": [
@@ -7234,60 +7659,72 @@
 						}
 					]
 				}
-			]
+			],
+			"brief_description": "A 3D vector using floating-point coordinates.",
+			"description": "A 3-element structure that can be used to represent 3D coordinates or any other triplet of numeric values.\nIt uses floating-point coordinates. By default, these floating-point values use 32-bit precision, unlike [float] which is always 64-bit. If double precision is needed, compile the engine with the option [code]precision=double[/code].\nSee [Vector3i] for its integer counterpart.\n[b]Note:[/b] In a boolean context, a Vector3 will evaluate to [code]false[/code] if it's equal to [code]Vector3(0, 0, 0)[/code]. Otherwise, a Vector3 will always evaluate to [code]true[/code]."
 		},
 		{
 			"name": "Vector2i",
 			"members": [
 				{
 					"name": "x",
-					"type": "int"
+					"type": "int",
+					"description": "The vector's X component. Also accessible by using the index position [code][0][/code]."
 				},
 				{
 					"name": "y",
-					"type": "int"
+					"type": "int",
+					"description": "The vector's Y component. Also accessible by using the index position [code][1][/code]."
 				}
 			],
 			"constants": [
 				{
 					"name": "ZERO",
 					"type": "Vector2i",
-					"value": "Vector2i(0, 0)"
+					"value": "Vector2i(0, 0)",
+					"description": "Zero vector, a vector with all components set to [code]0[/code]."
 				},
 				{
 					"name": "ONE",
 					"type": "Vector2i",
-					"value": "Vector2i(1, 1)"
+					"value": "Vector2i(1, 1)",
+					"description": "One vector, a vector with all components set to [code]1[/code]."
 				},
 				{
 					"name": "MIN",
 					"type": "Vector2i",
-					"value": "Vector2i(-2147483648, -2147483648)"
+					"value": "Vector2i(-2147483648, -2147483648)",
+					"description": "Min vector, a vector with all components equal to [code]INT32_MIN[/code]. Can be used as a negative integer equivalent of [constant Vector2.INF]."
 				},
 				{
 					"name": "MAX",
 					"type": "Vector2i",
-					"value": "Vector2i(2147483647, 2147483647)"
+					"value": "Vector2i(2147483647, 2147483647)",
+					"description": "Max vector, a vector with all components equal to [code]INT32_MAX[/code]. Can be used as an integer equivalent of [constant Vector2.INF]."
 				},
 				{
 					"name": "LEFT",
 					"type": "Vector2i",
-					"value": "Vector2i(-1, 0)"
+					"value": "Vector2i(-1, 0)",
+					"description": "Left unit vector. Represents the direction of left."
 				},
 				{
 					"name": "RIGHT",
 					"type": "Vector2i",
-					"value": "Vector2i(1, 0)"
+					"value": "Vector2i(1, 0)",
+					"description": "Right unit vector. Represents the direction of right."
 				},
 				{
 					"name": "UP",
 					"type": "Vector2i",
-					"value": "Vector2i(0, -1)"
+					"value": "Vector2i(0, -1)",
+					"description": "Up unit vector. Y is down in 2D, so this vector points -Y."
 				},
 				{
 					"name": "DOWN",
 					"type": "Vector2i",
-					"value": "Vector2i(0, 1)"
+					"value": "Vector2i(0, 1)",
+					"description": "Down unit vector. Y is down in 2D, so this vector points +Y."
 				}
 			],
 			"methods": [
@@ -7297,7 +7734,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 466405837
+					"hash": 466405837,
+					"description": "Returns the aspect ratio of this vector, the ratio of [member x] to [member y]."
 				},
 				{
 					"name": "max_axis_index",
@@ -7305,7 +7743,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the axis of the vector's highest value. See [code]AXIS_*[/code] constants. If all components are equal, this method returns [constant AXIS_X]."
 				},
 				{
 					"name": "min_axis_index",
@@ -7313,7 +7752,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the axis of the vector's lowest value. See [code]AXIS_*[/code] constants. If all components are equal, this method returns [constant AXIS_Y]."
 				},
 				{
 					"name": "distance_to",
@@ -7327,7 +7767,8 @@
 							"name": "to",
 							"type": "Vector2i"
 						}
-					]
+					],
+					"description": "Returns the [url=https://en.wikipedia.org/wiki/Euclidean_distance]Euclidean distance[/url] between this vector and [param to]."
 				},
 				{
 					"name": "distance_squared_to",
@@ -7341,7 +7782,8 @@
 							"name": "to",
 							"type": "Vector2i"
 						}
-					]
+					],
+					"description": "Returns the squared [url=https://en.wikipedia.org/wiki/Euclidean_distance]Euclidean distance[/url] between this vector and [param to].\nThis method runs faster than [method distance_to], so prefer it if you need to compare vectors or need the squared distance for some formula."
 				},
 				{
 					"name": "length",
@@ -7349,7 +7791,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 466405837
+					"hash": 466405837,
+					"description": "Returns the length (magnitude) of this vector."
 				},
 				{
 					"name": "length_squared",
@@ -7357,7 +7800,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the squared length (squared magnitude) of this vector.\nThis method runs faster than [method length], so prefer it if you need to compare vectors or need the squared distance for some formula."
 				},
 				{
 					"name": "sign",
@@ -7365,7 +7809,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3444277866
+					"hash": 3444277866,
+					"description": "Returns a new vector with each component set to [code]1[/code] if it's positive, [code]-1[/code] if it's negative, and [code]0[/code] if it's zero. The result is identical to calling [method @GlobalScope.sign] on each component."
 				},
 				{
 					"name": "abs",
@@ -7373,7 +7818,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3444277866
+					"hash": 3444277866,
+					"description": "Returns a new vector with all components in absolute values (i.e. positive)."
 				},
 				{
 					"name": "clamp",
@@ -7391,7 +7837,8 @@
 							"name": "max",
 							"type": "Vector2i"
 						}
-					]
+					],
+					"description": "Returns a new vector with all components clamped between the components of [param min] and [param max], by running [method @GlobalScope.clamp] on each component."
 				},
 				{
 					"name": "clampi",
@@ -7409,7 +7856,8 @@
 							"name": "max",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns a new vector with all components clamped between [param min] and [param max], by running [method @GlobalScope.clamp] on each component."
 				},
 				{
 					"name": "snapped",
@@ -7423,7 +7871,8 @@
 							"name": "step",
 							"type": "Vector2i"
 						}
-					]
+					],
+					"description": "Returns a new vector with each component snapped to the closest multiple of the corresponding component in [param step]."
 				},
 				{
 					"name": "snappedi",
@@ -7437,7 +7886,8 @@
 							"name": "step",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns a new vector with each component snapped to the closest multiple of [param step]."
 				},
 				{
 					"name": "min",
@@ -7451,7 +7901,8 @@
 							"name": "with",
 							"type": "Vector2i"
 						}
-					]
+					],
+					"description": "Returns the component-wise minimum of this and [param with], equivalent to [code]Vector2i(mini(x, with.x), mini(y, with.y))[/code]."
 				},
 				{
 					"name": "mini",
@@ -7465,7 +7916,8 @@
 							"name": "with",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns the component-wise minimum of this and [param with], equivalent to [code]Vector2i(mini(x, with), mini(y, with))[/code]."
 				},
 				{
 					"name": "max",
@@ -7479,7 +7931,8 @@
 							"name": "with",
 							"type": "Vector2i"
 						}
-					]
+					],
+					"description": "Returns the component-wise maximum of this and [param with], equivalent to [code]Vector2i(maxi(x, with.x), maxi(y, with.y))[/code]."
 				},
 				{
 					"name": "maxi",
@@ -7493,7 +7946,8 @@
 							"name": "with",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns the component-wise maximum of this and [param with], equivalent to [code]Vector2i(maxi(x, with), maxi(y, with))[/code]."
 				}
 			],
 			"enums": [
@@ -7660,7 +8114,9 @@
 					"right_type": "Array",
 					"return_type": "bool"
 				}
-			]
+			],
+			"brief_description": "A 2D vector using integer coordinates.",
+			"description": "A 2-element structure that can be used to represent 2D grid coordinates or any other pair of integers.\nIt uses integer coordinates and is therefore preferable to [Vector2] when exact precision is required. Note that the values are limited to 32 bits, and unlike [Vector2] this cannot be configured with an engine build option. Use [int] or [PackedInt64Array] if 64-bit values are needed.\n[b]Note:[/b] In a boolean context, a Vector2i will evaluate to [code]false[/code] if it's equal to [code]Vector2i(0, 0)[/code]. Otherwise, a Vector2i will always evaluate to [code]true[/code]."
 		},
 		{
 			"name": "PackedVector2Array",
@@ -7725,7 +8181,8 @@
 							"name": "index",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Returns the [Vector2] at the given [param index] in the array. If [param index] is out-of-bounds or negative, this method fails and returns [code]Vector2(0, 0)[/code].\nThis method is similar (but not identical) to the [code][][/code] operator. Most notably, when this method fails, it doesn't pause project execution if run from the editor."
 				},
 				{
 					"name": "set",
@@ -7742,7 +8199,8 @@
 							"name": "value",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Changes the [Vector2] at the given index."
 				},
 				{
 					"name": "size",
@@ -7750,7 +8208,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3173160232
+					"hash": 3173160232,
+					"description": "Returns the number of elements in the array."
 				},
 				{
 					"name": "is_empty",
@@ -7758,7 +8217,8 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 3918633141
+					"hash": 3918633141,
+					"description": "Returns [code]true[/code] if the array is empty."
 				},
 				{
 					"name": "push_back",
@@ -7772,7 +8232,8 @@
 							"name": "value",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Inserts a [Vector2] at the end."
 				},
 				{
 					"name": "append",
@@ -7786,7 +8247,8 @@
 							"name": "value",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Appends an element at the end of the array (alias of [method push_back])."
 				},
 				{
 					"name": "append_array",
@@ -7799,7 +8261,8 @@
 							"name": "array",
 							"type": "PackedVector2Array"
 						}
-					]
+					],
+					"description": "Appends a [PackedVector2Array] at the end of this array."
 				},
 				{
 					"name": "remove_at",
@@ -7812,7 +8275,8 @@
 							"name": "index",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Removes an element from the array by index."
 				},
 				{
 					"name": "insert",
@@ -7830,7 +8294,8 @@
 							"name": "value",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Inserts a new element at a given position in the array. The position must be valid, or at the end of the array ([code]idx == size()[/code])."
 				},
 				{
 					"name": "fill",
@@ -7843,7 +8308,8 @@
 							"name": "value",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Assigns the given value to all elements in the array. This can typically be used together with [method resize] to create an array with a given size and initialized elements."
 				},
 				{
 					"name": "resize",
@@ -7857,14 +8323,16 @@
 							"name": "new_size",
 							"type": "int"
 						}
-					]
+					],
+					"description": "Sets the size of the array. If the array is grown, reserves elements at the end of the array. If the array is shrunk, truncates the array to the new size. Calling [method resize] once and assigning the new values is faster than adding new elements one by one.\nReturns [constant OK] on success, or one of the following [enum Error] constants if this method fails: [constant ERR_INVALID_PARAMETER] if the size is negative, or [constant ERR_OUT_OF_MEMORY] if allocations fail. Use [method size] to find the actual size of the array after resize."
 				},
 				{
 					"name": "clear",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Clears the array. This is equivalent to using [method resize] with a size of [code]0[/code]."
 				},
 				{
 					"name": "has",
@@ -7878,14 +8346,16 @@
 							"name": "value",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns [code]true[/code] if the array contains [param value].\n[b]Note:[/b] Vectors with [constant @GDScript.NAN] elements don't behave the same as other vectors. Therefore, the results from this method may not be accurate if NaNs are included."
 				},
 				{
 					"name": "reverse",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Reverses the order of the elements in the array."
 				},
 				{
 					"name": "slice",
@@ -7904,7 +8374,8 @@
 							"type": "int",
 							"default_value": "2147483647"
 						}
-					]
+					],
+					"description": "Returns the slice of the [PackedVector2Array], from [param begin] (inclusive) to [param end] (exclusive), as a new [PackedVector2Array].\nThe absolute value of [param begin] and [param end] will be clamped to the array size, so the default value for [param end] makes it slice to the size of the array by default (i.e. [code]arr.slice(1)[/code] is a shorthand for [code]arr.slice(1, arr.size())[/code]).\nIf either [param begin] or [param end] are negative, they will be relative to the end of the array (i.e. [code]arr.slice(0, -2)[/code] is a shorthand for [code]arr.slice(0, arr.size() - 2)[/code])."
 				},
 				{
 					"name": "to_byte_array",
@@ -7912,14 +8383,16 @@
 					"is_vararg": false,
 					"is_const": true,
 					"is_static": false,
-					"hash": 247621236
+					"hash": 247621236,
+					"description": "Returns a [PackedByteArray] with each vector encoded as bytes."
 				},
 				{
 					"name": "sort",
 					"is_vararg": false,
 					"is_const": false,
 					"is_static": false,
-					"hash": 3218959716
+					"hash": 3218959716,
+					"description": "Sorts the elements of the array in ascending order.\n[b]Note:[/b] Vectors with [constant @GDScript.NAN] elements don't behave the same as other vectors. Therefore, the results from this method may not be accurate if NaNs are included."
 				},
 				{
 					"name": "bsearch",
@@ -7941,7 +8414,8 @@
 							"type": "bool",
 							"default_value": "true"
 						}
-					]
+					],
+					"description": "Finds the index of an existing value (or the insertion index that maintains sorting order, if the value is not yet present in the array) using binary search. Optionally, a [param before] specifier can be passed. If [code]false[/code], the returned index comes after all existing entries of the value in the array.\n[b]Note:[/b] Calling [method bsearch] on an unsorted array results in unexpected behavior.\n[b]Note:[/b] Vectors with [constant @GDScript.NAN] elements don't behave the same as other vectors. Therefore, the results from this method may not be accurate if NaNs are included."
 				},
 				{
 					"name": "duplicate",
@@ -7952,7 +8426,8 @@
 					"hash": 1660374357,
 					"hash_compatibility": [
 						3763646812
-					]
+					],
+					"description": "Creates a copy of the array, and returns it."
 				},
 				{
 					"name": "find",
@@ -7971,7 +8446,8 @@
 							"type": "int",
 							"default_value": "0"
 						}
-					]
+					],
+					"description": "Searches the array for a value and returns its index or [code]-1[/code] if not found. Optionally, the initial search index can be passed.\n[b]Note:[/b] Vectors with [constant @GDScript.NAN] elements don't behave the same as other vectors. Therefore, the results from this method may not be accurate if NaNs are included."
 				},
 				{
 					"name": "rfind",
@@ -7990,7 +8466,8 @@
 							"type": "int",
 							"default_value": "-1"
 						}
-					]
+					],
+					"description": "Searches the array in reverse order. Optionally, a start search index can be passed. If negative, the start index is considered relative to the end of the array.\n[b]Note:[/b] Vectors with [constant @GDScript.NAN] elements don't behave the same as other vectors. Therefore, the results from this method may not be accurate if NaNs are included."
 				},
 				{
 					"name": "count",
@@ -8004,7 +8481,8 @@
 							"name": "value",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Returns the number of times an element is in the array.\n[b]Note:[/b] Vectors with [constant @GDScript.NAN] elements don't behave the same as other vectors. Therefore, the results from this method may not be accurate if NaNs are included."
 				},
 				{
 					"name": "erase",
@@ -8018,7 +8496,8 @@
 							"name": "value",
 							"type": "Vector2"
 						}
-					]
+					],
+					"description": "Removes the first occurrence of a value from the array and returns [code]true[/code]. If the value does not exist in the array, nothing happens and [code]false[/code] is returned. To remove an element by index, use [method remove_at] instead.\n[b]Note:[/b] Vectors with [constant @GDScript.NAN] elements don't behave the same as other vectors. Therefore, the results from this method may not be accurate if NaNs are included."
 				}
 			],
 			"constructors": [
@@ -8044,7 +8523,9 @@
 					]
 				}
 			],
-			"has_destructor": true
+			"has_destructor": true,
+			"brief_description": "A packed array of [Vector2]s.",
+			"description": "An array specifically designed to hold [Vector2]. Packs data tightly, so it saves memory for large array sizes.\n[b]Differences between packed arrays, typed arrays, and untyped arrays:[/b] Packed arrays are generally faster to iterate on and modify compared to a typed array of the same type (e.g. [PackedVector2Array] versus [code]Array[Vector2][/code]). Also, packed arrays consume less memory. As a downside, packed arrays are less flexible as they don't offer as many convenience methods such as [method Array.map]. Typed arrays are in turn faster to iterate on and modify than untyped arrays.\n[b]Note:[/b] Packed arrays are always passed by reference. To get a copy of an array that can be modified independently of the original array, use [method duplicate]. This is [i]not[/i] the case for built-in properties and methods. In these cases the returned packed array is a copy, and changing it will [i]not[/i] affect the original value. To update a built-in property of this type, modify the returned array and then assign it to the property again.\n[b]Note:[/b] In a boolean context, a packed array will evaluate to [code]false[/code] if it's empty. Otherwise, a packed array will always evaluate to [code]true[/code]."
 		}
 	],
 	"classes": [

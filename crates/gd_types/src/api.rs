@@ -189,6 +189,12 @@ pub struct Singleton {
 #[derive(Clone, Debug, Deserialize)]
 pub struct BuiltinClass {
     pub name: String,
+    /// From `--dump-extension-api-with-docs`, exactly as `ClassDef` carries it. Empty when the
+    /// dump was taken without docs.
+    #[serde(default)]
+    pub brief_description: String,
+    #[serde(default)]
+    pub description: String,
     #[serde(default)]
     pub is_keyed: bool,
     #[serde(default)]
@@ -219,6 +225,8 @@ pub struct BuiltinMember {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -228,6 +236,8 @@ pub struct BuiltinConstant {
     pub ty: String,
     #[serde(default)]
     pub value: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -236,6 +246,8 @@ pub struct BuiltinMethod {
     /// Bare type string. Absent ⇒ `void`.
     #[serde(default)]
     pub return_type: Option<String>,
+    #[serde(default)]
+    pub description: String,
     #[serde(default)]
     pub is_const: bool,
     #[serde(default)]
