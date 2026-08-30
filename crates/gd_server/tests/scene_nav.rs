@@ -29,8 +29,15 @@ const API: &str = r#"{
         {"name": "Node", "inherits": "Object"},
         {"name": "CanvasItem", "inherits": "Node"},
         {"name": "Node2D", "inherits": "CanvasItem"},
-        {"name": "Sprite2D", "inherits": "Node2D"},
-        {"name": "Control", "inherits": "CanvasItem"}
+        {"name": "Sprite2D", "inherits": "Node2D",
+         "properties": [{"name": "flip_h", "type": "bool",
+                         "setter": "set_flip_h", "getter": "is_flip_h"}],
+         "methods": [{"name": "set_flip_h", "is_const": false, "is_static": false,
+                      "is_vararg": false, "is_virtual": false, "hash": 1,
+                      "arguments": [{"name": "enable", "type": "bool"}]}]},
+        {"name": "Control", "inherits": "CanvasItem",
+         "properties": [{"name": "tooltip_text", "type": "String",
+                         "setter": "set_tooltip_text", "getter": "get_tooltip_text"}]}
     ]
 }"#;
 
@@ -54,7 +61,10 @@ fn scene_project() -> TempProject {
         "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
     );
     p.write("extension_api.json", API);
-    p.write("health.gd", "class_name Health\nextends Node2D\n");
+    p.write(
+        "health.gd",
+        "class_name Health\nextends Node2D\nvar hp: int = 3\n",
+    );
     p.write("main.gd", MAIN_GD);
     p.write(
         "main.tscn",
@@ -396,6 +406,204 @@ fn definition_in_a_scene_less_script_is_null() {
 
     let raw = def_raw(&client, 19, &uri, Position::new(3, 4));
     assert!(raw.is_null(), "expected null, got {raw}");
+
+    shutdown(&client, server_thread);
+}
+
+// ===================================================================================================
+// #349 — the projection carries PAST the dot.
+// ===================================================================================================
+
+/// The completion labels at `pos`.
+fn completion_labels(client: &Connection, id: i32, uri: &Uri, pos: Position) -> Vec<String> {
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": pos.line, "character": pos.character },
+            }),
+        ))
+        .unwrap();
+    let resp = recv_response(client);
+    assert!(resp.error.is_none(), "completion errored: {:?}", resp.error);
+    let raw = resp.result.expect("completion result");
+    let items = raw
+        .get("items")
+        .cloned()
+        .unwrap_or(raw)
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|i| i.get("label")?.as_str().map(str::to_string))
+        .collect()
+}
+
+/// `$Sprite.` enumerates `Sprite2D`'s members. Before #349 the base fell back to the analyzer's
+/// hard bare `Node`, so the one class the user had just been told the node was is the one class
+/// whose members never showed up.
+#[test]
+fn completion_after_a_relative_access_offers_the_scene_classs_members() {
+    let p = scene_project();
+    let src = "extends Node2D\n\nfunc f():\n\t$Sprite.\n";
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, src);
+
+    let labels = completion_labels(&client, 20, &uri, Position::new(3, 9));
+    assert!(
+        labels.iter().any(|l| l == "flip_h"),
+        "expected Sprite2D's members, got {labels:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// `%Special.` resolves through the owner-scoped unique-name table, same as the node hover does.
+#[test]
+fn completion_after_a_unique_name_access_offers_the_scene_classs_members() {
+    let p = scene_project();
+    let src = "extends Node2D\n\nfunc f():\n\t%Special.\n";
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, src);
+
+    let labels = completion_labels(&client, 21, &uri, Position::new(3, 10));
+    assert!(
+        labels.iter().any(|l| l == "tooltip_text"),
+        "expected Control's members, got {labels:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// `get_node("Sprite").` is the same access spelled out, and gets the same answer.
+#[test]
+fn completion_after_a_get_node_call_offers_the_scene_classs_members() {
+    let p = scene_project();
+    let src = "extends Node2D\n\nfunc f():\n\tget_node(\"Sprite\").\n";
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, src);
+
+    let labels = completion_labels(&client, 22, &uri, Position::new(3, 20));
+    assert!(
+        labels.iter().any(|l| l == "flip_h"),
+        "expected Sprite2D's members, got {labels:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A node running a script answers with the SCRIPT's members — the projection hands back whatever
+/// `scene_nav` resolved, so the script arm of the member walk takes over from there.
+#[test]
+fn completion_after_a_scripted_node_offers_the_scripts_members() {
+    let p = scene_project();
+    let src = "extends Node2D\n\nfunc f():\n\t$Health.\n";
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, src);
+
+    let labels = completion_labels(&client, 23, &uri, Position::new(3, 9));
+    assert!(
+        labels.iter().any(|l| l == "hp"),
+        "expected health.gd's members, got {labels:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Hover on the MEMBER read off a scene access names the precise declaring class, not `Variant`.
+#[test]
+fn hover_on_a_member_read_off_a_scene_access_names_the_precise_class() {
+    let p = scene_project();
+    let src = "extends Node2D\n\nfunc f():\n\t$Sprite.flip_h = true\n";
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, src);
+
+    let md = hover_md(&client, 24, &uri, Position::new(3, 13));
+    assert!(
+        md.contains("Sprite2D") && md.contains("flip_h"),
+        "expected the Sprite2D property, got {md:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Hover on a METHOD called off a scene access resolves the same way.
+#[test]
+fn hover_on_a_method_called_off_a_scene_access_names_the_precise_class() {
+    let p = scene_project();
+    let src = "extends Node2D\n\nfunc f():\n\t$Sprite.set_flip_h(true)\n";
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, src);
+
+    let md = hover_md(&client, 25, &uri, Position::new(3, 13));
+    assert!(
+        md.contains("Sprite2D") && md.contains("set_flip_h"),
+        "expected the Sprite2D method, got {md:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// `definition` on the member jumps to the declaring class's stub, not nowhere.
+#[test]
+fn definition_on_a_member_read_off_a_scene_access_reaches_the_declaring_class() {
+    let p = scene_project();
+    let src = "extends Node2D\n\nfunc f():\n\t$Sprite.flip_h = true\n";
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, src);
+
+    let raw = def_raw(&client, 26, &uri, Position::new(3, 13));
+    assert!(!raw.is_null(), "expected a definition for `$Sprite.flip_h`");
+    let loc: GotoDefinitionResponse = serde_json::from_value(raw).expect("response deserializes");
+    let GotoDefinitionResponse::Scalar(loc) = loc else {
+        panic!("expected a single location");
+    };
+    assert!(
+        loc.uri.as_str().ends_with("Sprite2D.gd"),
+        "expected the Sprite2D stub, got {}",
+        loc.uri.as_str()
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The no-false-positives half: a script no scene attaches has no precise target, so the member
+/// surface stays on the analyzer's bare `Node` rather than guessing a class.
+#[test]
+fn completion_in_a_scene_less_script_stays_on_bare_node() {
+    let p = scene_project();
+    let src = "extends Node2D\n\nfunc f():\n\t$Sprite.\n";
+    p.write("orphan3.gd", src);
+    let uri = file_uri(&p.root.join("orphan3.gd"));
+    let (client, server_thread) = boot(&p, &uri, src);
+
+    let labels = completion_labels(&client, 27, &uri, Position::new(3, 9));
+    assert!(
+        !labels.iter().any(|l| l == "flip_h"),
+        "a scene-less script must not guess a class, got {labels:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A `$X` buried INSIDE a larger base expression is not the base — the end-anchored match must not
+/// let it hijack the enclosing expression's own type.
+#[test]
+fn a_nested_scene_access_does_not_hijack_the_enclosing_base() {
+    let p = scene_project();
+    let src = "extends Node2D\n\nfunc f():\n\tvar a := [$Sprite]\n\ta.\n";
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, src);
+
+    let labels = completion_labels(&client, 28, &uri, Position::new(4, 3));
+    assert!(
+        !labels.iter().any(|l| l == "flip_h"),
+        "an Array base must not answer with Sprite2D's members, got {labels:?}"
+    );
 
     shutdown(&client, server_thread);
 }

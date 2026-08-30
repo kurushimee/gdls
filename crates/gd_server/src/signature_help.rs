@@ -85,6 +85,7 @@ pub fn signature_help(
     // Resolve the callee to its signature(s).
     let sigs = resolve_signatures(
         state,
+        &uri,
         &parsed.tree,
         analyzed.as_deref(),
         &text,
@@ -190,6 +191,7 @@ fn is_skippable(kind: TokenKind) -> bool {
 #[allow(clippy::too_many_arguments)] // the resolved call-site (tokens + tree + analysis + file id)
 fn resolve_signatures(
     state: &ServerState,
+    uri: &lsp_types::Uri,
     tree: &ParseTree,
     analyzed: Option<&AnalysisResult>,
     text: &str,
@@ -230,7 +232,7 @@ fn resolve_signatures(
             }
         }
         return resolve_attribute_call(
-            state, tree, analyzed, text, tokens, dot_idx, open_idx, &name,
+            state, uri, tree, analyzed, text, tokens, dot_idx, open_idx, &name,
         );
     }
     resolve_bare_call(state, text, fid, &name, arg_index)
@@ -259,6 +261,7 @@ fn callee_token_name(callee: &Token) -> Option<String> {
 #[allow(clippy::too_many_arguments)] // the resolved call-site (tree + tokens + analysis + dot/open idx)
 fn resolve_attribute_call(
     state: &ServerState,
+    uri: &lsp_types::Uri,
     tree: &ParseTree,
     analyzed: Option<&AnalysisResult>,
     text: &str,
@@ -269,7 +272,15 @@ fn resolve_attribute_call(
 ) -> Option<Vec<Sig>> {
     let analyzed = analyzed?;
     let dot_start = tokens[dot_idx].span.start;
-    let base_dt = smallest_typed_ending_at(tree, analyzed, dot_start)?;
+    // #349: a `$Path` / `%Name` / `get_node("…")` base carries a scene-precise type the analyzer
+    // deliberately withholds (it types the access as a hard bare `Node`). Signature help is a read
+    // surface like hover, so it takes the precise type when the scenes agree — navigation-only, see
+    // `crate::scene_nav`.
+    let scene_dt = crate::scene_nav::scene_type_ending_at(state, uri, tree, dot_start);
+    let base_dt = match &scene_dt {
+        Some(dt) => dt,
+        None => smallest_typed_ending_at(tree, analyzed, dot_start)?,
+    };
 
     match base_dt.kind {
         DtKind::Native if !base_dt.native_type.is_empty() => {
