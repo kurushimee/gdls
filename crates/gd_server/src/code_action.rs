@@ -457,7 +457,7 @@ fn stale_recipe_refusal(
         return Ok(());
     }
     Err(crate::handlers::RequestRefusal::stale(format!(
-        "the buffer changed since this action was offered ({} version {} -> {}); re-request code          actions to get one gated against the current text",
+        "the buffer changed since this action was offered ({} version {} -> {}); re-request code actions to get one gated against the current text",
         data.uri,
         data.version,
         current
