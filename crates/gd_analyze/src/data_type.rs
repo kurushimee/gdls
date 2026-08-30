@@ -438,6 +438,18 @@ pub struct DataType {
     /// ENUM_VARIABLE_WITHOUT_DEFAULT) must skip when set — membership lookups stay valid.
     /// Analyzer-internal; never serialized.
     pub enum_values_inexact: bool,
+    /// `Variant` kind only: this soft `Variant` was copied off a positively-dynamic initializer by
+    /// a declaration. `resolve_assignable` (`gdscript_analyzer.cpp:2163-2167`) rewrites the source
+    /// to `INFERRED`, which is exactly where Godot-visible state stops telling `var un = v` (an
+    /// untyped parameter, genuinely dynamic) apart from `var lib = preload("res://gone.gd")` (a
+    /// gdls degrade). That one write is the whole laundering surface: of the five plain-`INFERRED`
+    /// stamps upstream (`:657`, `:1814`, `:1860`, `:2064`, `:2167`), it is the only one that takes
+    /// an existing type and softens it, and a local is never written back afterwards.
+    ///
+    /// Read in exactly one place, [`Self::is_positively_dynamic`]. Default `false`, so a
+    /// propagation site anyone forgets fails as an under-report rather than a false positive.
+    /// Analyzer-internal; never serialized.
+    pub dynamic_origin: bool,
     /// `Array[T]` → `[T]`; `Dictionary[K, V]` → `[K, V]`. Empty = unparameterized.
     pub container_element_types: Vec<DataType>,
     /// #355: the name [`Display`] renders for a `Script`/`Class` kind — the payload Godot's
@@ -487,6 +499,37 @@ impl DataType {
             self.kind,
             DtKind::Variant | DtKind::Resolving | DtKind::Unresolved
         )
+    }
+
+    /// Whether this type is dynamic because the CODE is dynamic, rather than because gdls could
+    /// not see something.
+    ///
+    /// Godot never needs the distinction: it always has a real type to hand, so `!is_hard_type()`
+    /// on a base means the base really is dynamic and a member read off it really does come back
+    /// `UNDETECTED`. gdls has a second source of soft Variants — its own degrades, which every
+    /// silent miss falls back to — and treating those as dynamic would report an inference
+    /// failure on a line with nothing wrong with it.
+    ///
+    /// The separation is the one `reduce_binary_op` already draws (`docs/02`, and
+    /// `invalid_operands.rs`'s header): every gdls degrade yields either a `Variant`-KINDED type
+    /// stamped `Inferred`, or an `Unresolved`/`Resolving` kind (the cross-file parameter degrades
+    /// at `reducer.rs`'s chain-call sites). So
+    ///
+    /// * a `Variant` kind is trustworthy when its source is `Undetected` (an untyped parameter, a
+    ///   `for` variable over an untyped container, a #323 dummy that already carries its own
+    ///   error), when it is hard (a written `: Variant`), or when [`Self::dynamic_origin`] says a
+    ///   declaration copied it off one of those;
+    /// * any other kind is trustworthy whatever its source, because no degrade produces one, and
+    ///   `is_set()` rejects the two sentinel kinds.
+    ///
+    /// Spelled on `kind == Variant` and not on [`Self::is_variant`]: the `Resolving` /
+    /// `Unresolved` cycle sentinels must stay excluded.
+    #[inline]
+    pub fn is_positively_dynamic(&self) -> bool {
+        if self.kind == DtKind::Variant {
+            return self.has_no_type() || self.is_hard_type() || self.dynamic_origin;
+        }
+        self.is_set()
     }
 
     /// Godot `is_hard_type()`: `source > Inferred`. Only hard types trigger compatibility errors;

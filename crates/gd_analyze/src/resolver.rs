@@ -3221,6 +3221,12 @@ fn resolve_assignable(
             // analyzer.cpp:2143-2154: inherit the initializer's type, with source promotion. A Nil
             // initializer for a non-constant declaration drops back to Variant — Variant doesn't
             // narrow on `null`.
+            // Read before the move: the bit records what the initializer was, and both the
+            // `drops_to_variant` rewrite below and the source stamp change the answer. A
+            // `Resolving` initializer dropped to Variant must read untrusted (its error is
+            // already out); a hard `Nil` one dropped to Variant must read trusted, since
+            // `var x = null` then `x.p` is an inference failure upstream too.
+            let init_is_dynamic = initializer_type.is_positively_dynamic();
             ty = initializer_type;
             let drops_to_variant = !ty.is_set()
                 || (ty.is_hard_type()
@@ -3256,6 +3262,11 @@ fn resolve_assignable(
             } else {
                 TypeSource::Inferred
             };
+            // The stamp above is upstream's (analyzer.cpp:2163-2167), and it is what erases the
+            // difference between `var un = v` and a gdls degrade. Carry the answer forward so a
+            // member read off `un` still knows the value really is dynamic (#468). This is the
+            // only site that softens an existing type, so it is the whole propagation surface.
+            ty.dynamic_origin = ty.kind == DtKind::Variant && init_is_dynamic;
         } else if ty.is_hard_type() {
             // analyzer.cpp:2095-2105 — when the specified type is a typed Array/Dictionary AND the
             // initializer is an array/dictionary literal, narrow the literal's element types so
@@ -6224,7 +6235,18 @@ fn resolve_for(ctx: &mut AnalysisContext, for_id: NodeId) {
         if is_range {
             // Already solved.
         } else if list_type.is_variant() {
+            // analyzer.cpp:2338 — the loop variable takes a Variant whose source stays at the
+            // default UNDETECTED, which is what makes `var x := elem.member` an inference failure
+            // one line later.
+            //
+            // This is the arm a gdls DEGRADE reaches: an unresolvable `preload` leaves the list a
+            // soft `Variant`, and stamping UNDETECTED here would launder it into a type the rest
+            // of the analyzer trusts, one loop body away from a false `Cannot infer …` (#468).
+            // The other arms are reached only by a list gdls really did type.
             variable_type.kind = DtKind::Variant;
+            if !list_type.is_positively_dynamic() {
+                variable_type.type_source = TypeSource::Inferred;
+            }
         } else if !list_type.container_element_types.is_empty() {
             // analyzer.cpp:2307-2309 — `has_container_element_type(0)`: the FIRST container
             // element type, which is `Array[T]`'s element AND `Dictionary[K, V]`'s KEY (iterating

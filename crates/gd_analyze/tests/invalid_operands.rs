@@ -270,6 +270,11 @@ fn well_typed_operations_stay_silent() {
 /// cross-file member the shallow interface cannot type) must stay silent, and it must stay silent
 /// through a `:=` declaration too.
 ///
+/// This once used `var dict = {}` then `dict.k`, on the belief that an untyped Dictionary literal
+/// made the read a degrade. The oracle says otherwise at both tags: a soft base is a genuinely
+/// dynamic one, Godot errors on the read, and gdls does too since #468. The role moved to a shape
+/// that really is gdls not seeing something.
+///
 /// That second part is the subtle one. Upstream hardens every `:=` local unconditionally
 /// (analyzer.cpp:2150-2154), but it only gets there after erroring on any non-hard initializer, so
 /// upstream a hard `AnnotatedInferred` local always has a hard initializer behind it. gdls holds
@@ -279,12 +284,14 @@ fn well_typed_operations_stay_silent() {
 #[test]
 fn a_degraded_variant_stays_silent_through_a_declaration() {
     for d in TAGS {
-        // `{}` is an untyped Dictionary, so `d.k` is a degrade, not a real dynamic.
+        // A `preload` of a script this harness cannot resolve (`NoCrossFile`) is gdls not seeing
+        // something, not the code being dynamic — so nothing is claimed about it, here or one use
+        // later. Godot resolves the same preload and is silent for the opposite reason.
         assert_eq!(
             errors(
                 &script(
                     "",
-                    "\tvar dict = {}\n\tvar x := dict.k\n\tvar y := x + 1\n\tprint(y)"
+                    "\tvar lib = preload(\"res://lib.gd\")\n\tvar x := lib.k\n\tvar y := x + 1\n\tprint(y)"
                 ),
                 d
             ),

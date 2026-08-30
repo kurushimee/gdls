@@ -479,8 +479,7 @@ fn reduce_unary_op(ctx: &mut AnalysisContext, id: NodeId) {
     let result = if operand_type.is_variant() {
         // analyzer.cpp:5268-5270 — upstream stamps the default UNDETECTED Variant. gdls keeps
         // Inferred for the ambiguous soft-Variant operand (a possible reducer degrade).
-        let source = if operand_type.kind == DtKind::Variant
-            && (operand_type.has_no_type() || operand_type.is_hard_type())
+        let source = if operand_type.kind == DtKind::Variant && operand_type.is_positively_dynamic()
         {
             TypeSource::Undetected
         } else {
@@ -770,8 +769,7 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
         // analyzer.cpp:3181-3184: a variant operand keeps the result variant — upstream stamps the
         // default UNDETECTED Variant. gdls keeps Inferred unless a Variant operand is trustworthy
         // (Undetected or hard), so a reducer-degraded soft Variant stays silent.
-        let trustworthy =
-            |d: &DataType| d.kind == DtKind::Variant && (d.has_no_type() || d.is_hard_type());
+        let trustworthy = |d: &DataType| d.kind == DtKind::Variant && d.is_positively_dynamic();
         let source = if trustworthy(&left_dt) || trustworthy(&right_dt) {
             TypeSource::Undetected
         } else {
@@ -5546,9 +5544,20 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // fails, `call_type` is never assigned, and the call reads as "no set type"
         // (analyzer.cpp:3745). gdls cannot leave it UNRESOLVED — the `reduce_expression` tail-guard
         // would promote that straight back to a soft `Variant` — so it carries the same dummy
-        // forward. Everything else keeps the permissive soft `Variant`: a method miss here is far
-        // more often a gdls lookup gap than a real one.
-        call_type = if base_type.has_no_type() {
+        // forward.
+        //
+        // A positively-dynamic `Variant` base joins it (#468). Upstream's `call_type` is
+        // default-constructed at analyzer.cpp:3267 and only ever has its KIND assigned
+        // (analyzer.cpp:3557), so every miss lands `VARIANT`/`UNDETECTED` and `var x := v.m()` is
+        // an inference failure. The gate is the base, NOT `warn_miss_gate` above: that gate is a
+        // deliberate warning-level over-claim on a degraded Variant base (#433), and promoting a
+        // tolerated warning into an error is the one direction this port does not take. The
+        // walked kinds stay out for the same reason they always were — a method miss on a
+        // `Native`, `Class`, `Script` or `Builtin` base is far more often a gdls lookup gap than
+        // a real one — so their soft `Variant` remains a documented under-report.
+        call_type = if base_type.has_no_type()
+            || (base_type.kind == DtKind::Variant && base_type.is_positively_dynamic())
+        {
             DataType {
                 kind: DtKind::Variant,
                 type_source: TypeSource::Undetected,
@@ -6678,6 +6687,29 @@ fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: b
                         result.is_meta_type = false;
                         ctx.set_type(id, result);
                     }
+                } else if base_type.kind == DtKind::Variant {
+                    // analyzer.cpp:4937-4939 — indexing a Variant. Godot's `result_type` is a
+                    // fresh default with only `kind = VARIANT` assigned, so its source stays
+                    // `UNDETECTED` and `var x := v[0]` cannot infer. gdls used to leave the node
+                    // untyped and let `reduce_expression`'s tail-guard stamp a soft Variant,
+                    // which is a SET type and silences that check (#468).
+                    //
+                    // The source is only carried when the base is positively dynamic. A base that
+                    // is Variant because gdls could not see it is a degrade, and an inference
+                    // failure on a line with nothing wrong with it is the one direction the port
+                    // does not take.
+                    ctx.set_type(
+                        id,
+                        DataType {
+                            kind: DtKind::Variant,
+                            type_source: if base_type.is_positively_dynamic() {
+                                TypeSource::Undetected
+                            } else {
+                                TypeSource::Inferred
+                            },
+                            ..DataType::default()
+                        },
+                    );
                 }
             }
         }
@@ -6709,6 +6741,17 @@ fn reduce_subscript_attribute(
     if base_type.is_variant() || !base_type.is_hard_type() {
         valid = !base_type.is_pseudo_type || can_be_pseudo_type;
         result_type = DataType::variant();
+        // analyzer.cpp:4854-4856 — Godot's `result_type` here is a fresh default with only
+        // `kind = VARIANT` assigned, so its source stays `UNDETECTED` and `var x := v.y` cannot
+        // infer. gdls stamped a SET soft Variant, which silences that check (#468).
+        //
+        // Carried only when the base is positively dynamic: a base that is Variant because gdls
+        // could not see it is a degrade, and an inference failure on a line with nothing wrong
+        // with it is the one direction the port does not take. A non-Variant soft base — `var n =
+        // Node2D.new()` then `n.position` — is always genuine, and Godot errors on it too.
+        if base_type.is_positively_dynamic() {
+            result_type.type_source = TypeSource::Undetected;
+        }
         if base_type.is_variant()
             && base_type.is_hard_type()
             && base_type.is_meta_type
@@ -6730,7 +6773,11 @@ fn reduce_subscript_attribute(
                 // valid stays true.
             } else {
                 // Unknown global enum (fixture-trimmed or genuinely absent). Stay permissive —
-                // result_type stays Variant, valid stays whatever the pseudo gate produced.
+                // result_type stays Variant, valid stays whatever the pseudo gate produced. And
+                // keep it SOFT rather than `Undetected`: this is an epistemic degrade, so it must
+                // not draw the inference failure the genuinely dynamic bases above do. The base
+                // is a hard Variant, which is why the stamp had to be undone rather than skipped.
+                result_type.type_source = TypeSource::Inferred;
                 result_type.is_pseudo_type = false;
             }
         }
@@ -6739,51 +6786,82 @@ fn reduce_subscript_attribute(
         reduce_identifier_from_base(ctx, attr_id, Some(&base_type));
         let attr_type = ctx.get_type(attr_id).clone();
         if attr_type.is_set() {
-            // Dictionary-with-typed-keys narrowing (analyzer.cpp:4847-4857) joins typed-collection
-            // slice; skip cleanly for now (treat as the general "attribute resolved" arm).
-            valid = !attr_type.is_pseudo_type || can_be_pseudo_type;
-            result_type = attr_type;
-            // analyzer.cpp:4861-4862 — propagate the attribute's constancy onto the subscript
-            // node itself so callers (`reduce_assignment::value_is_constant`,
-            // `reduce_call::validate_call_arg`'s const-arg arm) see the folded value through
-            // the subscript wrapper. Without this, `EnumName.VALUE` typed correctly but
-            // wasn't recognised as a constant, suppressing `update_const_expression_builtin_type`
-            // and its `Cannot {assign/include/pass} a value of type X as Y` companion errors.
-            if let Some(folded) = ctx.folds.get(attr_id).cloned() {
-                ctx.folds.set(sub_id, folded);
-            } else if ctx.folds.is_constant(attr_id) {
-                // The attribute is constant but its value has no `FoldedValue` — an inner class
-                // reached as `Outer.Inner`, a cross-file constant. Godot's copy at :4861 moves the
-                // bit either way, and it is the bit the companion diagnostics gate on (#364).
-                ctx.folds.mark_constant(sub_id);
-            }
-            // #256: a SCRIPT base never reaches the `else` arm below — its member miss reduces to
-            // a permissive Variant (an interface gap must never become `Cannot find member`), so
-            // `is_set()` is true either way and UNSAFE_PROPERTY_ACCESS was structurally
-            // unreachable for `class_name` instances while firing correctly for native ones.
-            // Finishing #123's stated acceptance: ask the chain read-only whether the name is
-            // actually there. Same soundness bar as everywhere else — an `Exact` dump and a chain
-            // that was fully walkable (`native_root` resolved); anything less and the miss might
-            // be gdls's view, not the user's code. The ERROR path stays untouched.
-            if base_type.kind == DtKind::Script
-                && (!base_type.is_meta_type || !base_type.is_constant)
-                && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+            // analyzer.cpp:4876-4886 — a TYPED dictionary refines the dummy the attribute walk
+            // just produced. The key type decides validity: only `Nil`, `String`, and
+            // `StringName` can be addressed by `.name` at all, so `Dictionary[int, int]` falls
+            // through to the `!valid` arm and its `Cannot find member` message. A declared value
+            // type becomes the result, carrying the BASE's source verbatim, so `td.k` on a
+            // `Dictionary[String, int]` infers `int`; without one the result is the same
+            // `UNDETECTED` Variant an untyped dictionary gives.
+            if base_type.builtin_type == VariantType::Dictionary
+                && !base_type.container_element_types.is_empty()
             {
-                if let Some(sr) = base_type.script_type.clone() {
-                    let attr_name = match &ctx.node(attr_id).kind {
-                        NodeKind::Identifier(i) => i.name.clone(),
-                        _ => String::new(),
-                    };
-                    if crate::script_chain::chain_native_root(ctx, &sr).is_some()
-                        && !attr_name.is_empty()
-                        && !script_chain_has_member(ctx, &sr, &attr_name)
-                    {
-                        let base_str = class_identifier_name_or_default(ctx, &base_type);
-                        ctx.push_warning(
-                            crate::warnings::WarningCode::UnsafePropertyAccess,
-                            &[attr_name, base_str],
-                            sub_id,
-                        );
+                let key_type = base_type
+                    .container_element_types
+                    .first()
+                    .map_or(VariantType::Nil, |k| k.builtin_type);
+                valid = matches!(
+                    key_type,
+                    VariantType::Nil | VariantType::String | VariantType::StringName
+                );
+                match base_type.container_element_types.get(1) {
+                    Some(val) => {
+                        result_type = val.clone();
+                        result_type.type_source = base_type.type_source;
+                    }
+                    None => {
+                        result_type = DataType {
+                            kind: DtKind::Variant,
+                            type_source: TypeSource::Undetected,
+                            ..DataType::default()
+                        };
+                    }
+                }
+            } else {
+                valid = !attr_type.is_pseudo_type || can_be_pseudo_type;
+                result_type = attr_type;
+                // analyzer.cpp:4861-4862 — propagate the attribute's constancy onto the subscript
+                // node itself so callers (`reduce_assignment::value_is_constant`,
+                // `reduce_call::validate_call_arg`'s const-arg arm) see the folded value through
+                // the subscript wrapper. Without this, `EnumName.VALUE` typed correctly but
+                // wasn't recognised as a constant, suppressing `update_const_expression_builtin_type`
+                // and its `Cannot {assign/include/pass} a value of type X as Y` companion errors.
+                if let Some(folded) = ctx.folds.get(attr_id).cloned() {
+                    ctx.folds.set(sub_id, folded);
+                } else if ctx.folds.is_constant(attr_id) {
+                    // The attribute is constant but its value has no `FoldedValue` — an inner class
+                    // reached as `Outer.Inner`, a cross-file constant. Godot's copy at :4861 moves the
+                    // bit either way, and it is the bit the companion diagnostics gate on (#364).
+                    ctx.folds.mark_constant(sub_id);
+                }
+                // #256: a SCRIPT base never reaches the `else` arm below — its member miss reduces to
+                // a permissive Variant (an interface gap must never become `Cannot find member`), so
+                // `is_set()` is true either way and UNSAFE_PROPERTY_ACCESS was structurally
+                // unreachable for `class_name` instances while firing correctly for native ones.
+                // Finishing #123's stated acceptance: ask the chain read-only whether the name is
+                // actually there. Same soundness bar as everywhere else — an `Exact` dump and a chain
+                // that was fully walkable (`native_root` resolved); anything less and the miss might
+                // be gdls's view, not the user's code. The ERROR path stays untouched.
+                if base_type.kind == DtKind::Script
+                    && (!base_type.is_meta_type || !base_type.is_constant)
+                    && ctx.native.provenance() == gd_types::ApiProvenance::Exact
+                {
+                    if let Some(sr) = base_type.script_type.clone() {
+                        let attr_name = match &ctx.node(attr_id).kind {
+                            NodeKind::Identifier(i) => i.name.clone(),
+                            _ => String::new(),
+                        };
+                        if crate::script_chain::chain_native_root(ctx, &sr).is_some()
+                            && !attr_name.is_empty()
+                            && !script_chain_has_member(ctx, &sr, &attr_name)
+                        {
+                            let base_str = class_identifier_name_or_default(ctx, &base_type);
+                            ctx.push_warning(
+                                crate::warnings::WarningCode::UnsafePropertyAccess,
+                                &[attr_name, base_str],
+                                sub_id,
+                            );
+                        }
                     }
                 }
             }
@@ -8161,6 +8239,25 @@ fn reduce_identifier_from_base(
         }
         // Non-meta builtin base (instance): members (`pos.x` → int, analyzer.cpp:4118-4124 via
         // Variant introspection) and methods (constant Callable).
+        //
+        // `Dictionary` comes FIRST, ahead of the dump, because Godot's switch puts it there
+        // (analyzer.cpp:4134-4139): a dictionary's keys are its members, so ANY name on one gets a
+        // default-constructed dummy — `kind = VARIANT` with the source left `UNDETECTED`. That
+        // covers `d.size` as well as `d.k`, which is why `var x := d.size` is an inference failure
+        // upstream rather than a `Callable` (#468). It reads no DB, so a trimmed dump cannot
+        // change the answer. The typed-dictionary narrowing that can refine this sits in the
+        // subscript caller, where upstream has it (:4876-4886).
+        if base.builtin_type == VariantType::Dictionary {
+            ctx.set_type(
+                identifier_id,
+                DataType {
+                    kind: DtKind::Variant,
+                    type_source: TypeSource::Undetected,
+                    ..DataType::default()
+                },
+            );
+            return;
+        }
         let builtin_name = data_type::variant_type_name(base.builtin_type);
         if let Some(bt) = ctx.native.builtin_named(builtin_name) {
             if let Some(member) = bt
@@ -8188,15 +8285,12 @@ fn reduce_identifier_from_base(
             // surface, and reaching here means the base's builtin entry was present and neither its
             // members nor its methods carry the name, so absence is provable.
             //
-            // Godot's own switch keeps two shapes out: `Dictionary` returns a bare Variant for ANY
-            // name (analyzer.cpp:4124-4128 — a dictionary's keys are its members), and `Nil` has
-            // its own `Cannot get property "%s" on a null object.` message, which is not this arm's
-            // to emit.
+            // Godot's own switch keeps `Nil` out — it has its own `Cannot get property "%s" on a
+            // null object.` message, which is not this arm's to emit. `Dictionary` is the other
+            // shape it keeps out, and it never reaches here at all now: the arm above answers
+            // every name on one.
             if base.is_hard_type()
-                && !matches!(
-                    base.builtin_type,
-                    VariantType::Dictionary | VariantType::Nil
-                )
+                && base.builtin_type != VariantType::Nil
                 && ctx.native.provenance() == gd_types::ApiProvenance::Exact
             {
                 ctx.push_error(
