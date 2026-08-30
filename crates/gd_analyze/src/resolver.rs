@@ -225,7 +225,13 @@ fn resolve_class_inheritance(
 /// The `extends` resolution (analyzer.cpp:430-601). Returns the resolved base, or `None` after pushing
 /// a specific error.
 fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option<DataType>, ()> {
-    // `extends "res://path.gd"` (analyzer.cpp:437-459).
+    let extends = class_extends_names(ctx, class_id);
+
+    // `extends "res://path.gd"` (analyzer.cpp:437-459). Godot tracks how many names the head
+    // consumed in `extends_index` — 0 here, because a path base leaves the WHOLE name list as
+    // chain segments hanging off the loaded script, and 1 below, where the head is a name. Both
+    // then share the segment loop, which is what makes `extends "res://x.gd".Inner` resolve to
+    // `Inner` rather than to the file's head class (#384).
     if let Some(path) = class_extends_path(ctx, class_id) {
         // Relative paths resolve against the script's own directory (analyzer.cpp:437); an
         // unresolved path is Godot's "Could not resolve super class path".
@@ -233,19 +239,17 @@ fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option
             Some(from) => ctx.xfile.resolve_path_from(from, &path),
             None => ctx.xfile.resolve_res_path(&path),
         };
-        return match resolved {
-            Some(fid) => Ok(Some(script_base_datatype(ctx, fid))),
-            None => {
-                ctx.push_error(
-                    format!(r#"Could not resolve super class path "{path}"."#),
-                    class_id,
-                );
-                Ok(None)
-            }
+        let Some(fid) = resolved else {
+            ctx.push_error(
+                format!(r#"Could not resolve super class path "{path}"."#),
+                class_id,
+            );
+            return Ok(None);
         };
+        let base = script_base_datatype(ctx, fid);
+        return resolve_extends_segments(ctx, base, &extends);
     }
 
-    let extends = class_extends_names(ctx, class_id);
     let Some(&first_id) = extends.first() else {
         ctx.push_error("Could not resolve an empty super class path.", class_id);
         return Ok(None);
@@ -253,7 +257,7 @@ fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option
     let name = ident_name(ctx, first_id).unwrap_or_default();
 
     // Resolve the head of the `extends` chain.
-    let mut base = if let Some(fid) = ctx.xfile.global_class_file(&name) {
+    let base = if let Some(fid) = ctx.xfile.global_class_file(&name) {
         // A project `class_name` (analyzer.cpp:469-494).
         if Some(fid) == ctx.file {
             ctx.get_type(root_or(ctx, class_id)).clone()
@@ -306,12 +310,22 @@ fn resolve_extends(ctx: &mut AnalysisContext, class_id: NodeId) -> Result<Option
         }
     };
 
-    // Nested `extends A.B.C` segments (analyzer.cpp:578-598). For an in-file `Class` base we walk inner
-    // classes syntactically; for a cross-file `Script` base (WP-P1) we walk the depended file's
-    // inner-class table via `CrossFileQuery::resolve_inner_chain`. Godot's
-    // `reduce_identifier_from_base` does both at analyzer.cpp:578-598 — gdls splits the in-file
-    // walk (this loop) from the cross-file walk because the Script base lives outside our parse tree.
-    for &id in &extends[1..] {
+    resolve_extends_segments(ctx, base, &extends[1..])
+}
+
+/// Nested `extends A.B.C` segments (analyzer.cpp:578-598). For an in-file `Class` base we walk
+/// inner classes syntactically; for a cross-file `Script` base (WP-P1) we walk the depended file's
+/// inner-class table via `CrossFileQuery::resolve_inner_chain`. Godot's
+/// `reduce_identifier_from_base` does both at analyzer.cpp:578-598 — gdls splits the in-file
+/// walk from the cross-file walk because the Script base lives outside our parse tree.
+///
+/// `segments` is whatever the head did not consume, so a path base passes the whole list.
+fn resolve_extends_segments(
+    ctx: &mut AnalysisContext,
+    mut base: DataType,
+    segments: &[NodeId],
+) -> Result<Option<DataType>, ()> {
+    for &id in segments {
         // WP-P1: cross-file Script base — walk via the depended file's Interface inner-class table.
         if base.kind == DtKind::Script {
             let seg = ident_name(ctx, id).unwrap_or_default();
