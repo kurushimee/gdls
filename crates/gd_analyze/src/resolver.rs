@@ -104,14 +104,24 @@ fn resolve_class_inheritance(
     let previous_class = ctx.current_class;
     ctx.current_class = Some(class_id);
 
-    // "Class X hides a …" checks on the class's own name. The builtin/native cases are ported; the
-    // global-script-class and autoload-singleton cases need self-exclusion + autoload data (WP-D).
+    // "Class X hides a …" checks on the class's own name (analyzer.cpp:396-407), all four arms, in
+    // Godot's order — the first that matches is the only one reported.
     if let Some(name) = class_identifier_name(ctx, class_id) {
         let id_node = class_identifier(ctx, class_id).unwrap_or(class_id);
         if builtin_type_from_name(&name).is_some() {
             ctx.push_error(format!(r#"Class "{name}" hides a built-in type."#), id_node);
         } else if ctx.native.class_named(&name).is_some() {
             ctx.push_error(format!(r#"Class "{name}" hides a native class."#), id_node);
+        } else if hides_global_script_class(ctx, class_id, &name) {
+            ctx.push_error(
+                format!(r#"Class "{name}" hides a global script class."#),
+                id_node,
+            );
+        } else if ctx.xfile.is_autoload(&name) {
+            ctx.push_error(
+                format!(r#"Class "{name}" hides an autoload singleton."#),
+                id_node,
+            );
         }
     }
 
@@ -1136,6 +1146,25 @@ fn class_extends_path(ctx: &AnalysisContext, class_id: NodeId) -> Option<String>
 
 fn class_extends_used(ctx: &AnalysisContext, class_id: NodeId) -> bool {
     matches!(&ctx.node(class_id).kind, NodeKind::Class(c) if c.extends_used)
+}
+
+/// analyzer.cpp:402 — whether `class_id`'s own name shadows a project `class_name` REGISTERED
+/// SOMEWHERE ELSE. The self-exclusion is the whole subtlety: the head class of `foo.gd` declaring
+/// `class_name Foo` is what put `Foo` in the registry, so it must not report itself, while an INNER
+/// class named `Foo` inside that same file still does. Godot spells that as "the registered path is
+/// not this script's path, OR this is not the head class"; gdls compares file IDS rather than path
+/// strings, which is the same identity and immune to the `res://` versus absolute-path spelling the
+/// two sides use.
+///
+/// An un-indexed buffer (`ctx.file` is `None`) has no identity to exclude by, so it reports only
+/// when the name is registered to some other file — never against itself, since it is in no
+/// registry.
+fn hides_global_script_class(ctx: &AnalysisContext, class_id: NodeId, name: &str) -> bool {
+    let Some(registered) = ctx.xfile.global_class_file(name) else {
+        return false;
+    };
+    let is_head = class_outer(ctx, class_id).is_none();
+    Some(registered) != ctx.file || !is_head
 }
 
 fn class_outer(ctx: &AnalysisContext, class_id: NodeId) -> Option<NodeId> {
