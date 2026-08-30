@@ -44,7 +44,7 @@ pub use context::{AnalysisContext, AnalysisResult};
 pub use cross_file::{CrossFileQuery, NoCrossFile, NodePathQuery, SceneNodeFacts, SyntacticQuery};
 pub use data_type::{DataType, DtKind, MethodSig, ScriptRef, TypeSource, VariantType};
 pub use diagnostic::{Diagnostic, DiagnosticSink, RelatedInfo, Severity};
-pub use foldtable::{FoldTable, FoldedValue, UtilityCallableId, UtilityScope};
+pub use foldtable::{string_like_eq, FoldTable, FoldedValue, UtilityCallableId, UtilityScope};
 pub use reducer::is_gdscript_utility;
 pub use typetable::TypeTable;
 pub use warn_policy::{StrictProfile, StrictSettings, WarnPolicy};
