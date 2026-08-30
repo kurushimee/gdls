@@ -3672,8 +3672,11 @@ pub(crate) fn update_const_expression_builtin_type(
     // through Variant::construct (it'd need a full port of the runtime type system); the
     // arithmetic-folding paths in `reduce_unary_op` / `reduce_binary_op` produce typed
     // FoldedValues directly, which covers the corpus's `features/constant_expressions.gd`
-    // cases. NARROWING_CONVERSION warning at analyzer.cpp:2764-2766 joins with the rest of
-    // WP-F's narrowing family.
+    // cases. The `NARROWING_CONVERSION` warning at analyzer.cpp:2764-2766 is deliberately not
+    // ported here: because the value is never re-typed, every caller reads the argument back as
+    // a `float` afterwards and its own narrowing arm emits the identical row on the identical
+    // node — the assignment arm, the initializer arm, and the call-argument arm. Porting the
+    // conversion later keeps that at one row, since a re-typed `int` no longer matches them.
 }
 
 // ===================================================================================================
@@ -4218,6 +4221,12 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // of the lookup: a Variant utility folds when it is in the `UTILITY_FUNC_TYPE_MATH` set
         // (analyzer.cpp:3509), a GDScript one when its registration's `is_constant` column says so
         // (analyzer.cpp:3458). The names are disjoint, so the lookup order does not matter.
+        //
+        // #440: a call that does NOT fold ends in `validate_call_arg(function_info, p_call)` at
+        // analyzer.cpp:3498 and :3549, so Godot checks arity, `UNSAFE_CALL_ARGUMENT` and
+        // `NARROWING_CONVERSION` on utility arguments. This arm runs none of that. The Variant
+        // half could — `gd_types` carries `UtilityFn::params` — but the GDScript half has no
+        // parameter model at all, so both wait for that issue.
         let utility_return = ctx
             .native
             .utility(&function_name)
@@ -5122,8 +5131,8 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // Per-arg compatibility (analyzer.cpp:6093-6131). Godot iterates `min(args, par_types)`
         // — anything beyond is consumed by the vararg place. For each typed-hard parameter we
         // run the bidirectional `is_type_compatible` check; one direction failing turns into the
-        // `Invalid argument` error. The DEBUG-only `UNSAFE_CALL_ARGUMENT` and
-        // `NARROWING_CONVERSION` warnings live in WP-F.
+        // `Invalid argument` error. The whole DEBUG ladder is ported inline below: both
+        // `UNSAFE_CALL_ARGUMENT` arms and the closing `NARROWING_CONVERSION` arm.
         let n = call.arguments.len().min(sig.par_types.len());
         for i in 0..n {
             let arg_id = call.arguments[i];
@@ -5189,6 +5198,28 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         par_type.to_string(),
                         arg_strict.clone(),
                     ],
+                    arg_id,
+                );
+            } else if par_type.kind == DtKind::Builtin
+                && par_type.builtin_type == VariantType::Int
+                && arg_type.kind == DtKind::Builtin
+                && arg_type.builtin_type == VariantType::Float
+            {
+                // analyzer.cpp:6115-6117 (4.6.3:5986-5987, byte-identical) — a hard `float`
+                // argument into an `int` parameter. Godot gates neither side on hardness here
+                // because the soft and Variant arguments already left through the first arm, the
+                // same way the `continue` above takes them. It passes `p_call->function_name` as
+                // a symbol and the template consumes none, so the argument list is empty like
+                // every other narrowing site.
+                //
+                // A CONSTANT float argument reaches this arm too. Godot converts it first inside
+                // `update_const_expression_builtin_type` (analyzer.cpp:2754-2770) and warns
+                // there, on the same node, so its own third arm then sees an `int`; gdls's port
+                // of that function neither converts nor warns, so the still-`float` argument
+                // draws the row here. One row either way, same message, same anchor.
+                ctx.push_warning(
+                    crate::warnings::WarningCode::NarrowingConversion,
+                    &[],
                     arg_id,
                 );
             }

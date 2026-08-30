@@ -107,6 +107,33 @@ fn analyze_use(project: &Project, src: &str) -> AnalysisResult {
     )
 }
 
+/// Every `NARROWING_CONVERSION` row the file draws. The warning is `Ignore` by default, so the
+/// helper builds its own policy rather than reusing [`policy`].
+fn warnings(project: &Project, src: &str) -> Vec<String> {
+    let tree = gd_syntax::parse(src).tree;
+    let pol = WarnPolicy::build(
+        &gd_project::WarningConfig::default(),
+        &StrictSettings {
+            enable_warnings: vec!["NARROWING_CONVERSION".to_owned()],
+            ..Default::default()
+        },
+        Dialect::DEFAULT,
+    );
+    analyze(
+        &tree,
+        Some(FileId::new(2)),
+        "res://use.gd",
+        &native_db(),
+        project,
+        &pol,
+    )
+    .diagnostics
+    .iter()
+    .filter(|d| d.code() == "NARROWING_CONVERSION")
+    .map(|d| d.message().to_owned())
+    .collect()
+}
+
 fn errors(project: &Project, src: &str) -> Vec<String> {
     analyze_use(project, src)
         .diagnostics
@@ -248,6 +275,31 @@ fn a_typed_container_parameter_narrows_the_argument_literal() {
             r#"Cannot have an element of type "String" in an array of type "Array[int]"."#
                 .to_owned(),
         ],
+    );
+}
+
+/// #434 — a hard `float` into a cross-file `int` parameter narrows, on the instance call and the
+/// static one alike. The row rides the same per-slot projection every check in this file uses, so
+/// it is here rather than in `call_arg_narrowing.rs`.
+#[test]
+fn a_hard_float_into_a_cross_file_int_parameter_narrows() {
+    let p = project();
+    let narrowing =
+        vec!["Narrowing conversion (float is converted to int and loses precision).".to_owned()];
+    for body in [
+        "\tvar l := ArgLib.new()\n\tvar f: float = 1.5\n\tl.take_int(f)",
+        "\tvar f: float = 1.5\n\tArgLib.s_take_int(f)",
+        "\tvar f: float = 1.5\n\tvar l := ArgLib.new(f)",
+    ] {
+        assert_eq!(warnings(&p, &use_body(body)), narrowing, "{body}");
+    }
+    // A slot with no evidence behind it still stays silent.
+    assert_eq!(
+        warnings(
+            &p,
+            &use_body("\tvar l := ArgLib.new()\n\tvar f: float = 1.5\n\tl.untyped(f)")
+        ),
+        Vec::<String>::new()
     );
 }
 

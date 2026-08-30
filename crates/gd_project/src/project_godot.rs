@@ -169,7 +169,7 @@ pub fn parse_with_confidence(text: &str) -> (ProjectGodot, f32) {
         } else if let Some(w) = full.strip_prefix("debug/gdscript/warnings/") {
             if w == "enable" {
                 pg.warnings.enable = val == "true";
-            } else if let Some(level) = val.parse::<u8>().ok().and_then(WarnLevel::from_u8) {
+            } else if let Some(level) = warn_level_value(w, val) {
                 pg.warnings.levels.insert(w.to_owned(), level);
             }
         }
@@ -274,6 +274,30 @@ fn parse_features_version(value: &str) -> Option<(u32, u32)> {
         .split(',')
         .filter_map(|entry| Dialect::parse_version(&unquote(entry)))
         .max()
+}
+
+/// The level of a `debug/gdscript/warnings/<name>` setting. Godot reads whatever Variant the file
+/// stored and casts it to an int (`gdscript_parser.cpp:101`), so the older boolean form still in
+/// the wild counts: `false` is `0` (ignore) and `true` is `1` (warn). #441 — dropping those left
+/// a warning the project had turned off sitting at its default level.
+///
+/// The prefix also carries settings that are NOT warning codes and are genuinely boolean —
+/// `exclude_addons`, `renamed_in_godot_4_hint` — so the boolean form is only read for a name the
+/// warning table knows. Godot has the same guard for free: its loop walks the codes and reads each
+/// one's own path, never the other way round.
+fn warn_level_value(name: &str, val: &str) -> Option<WarnLevel> {
+    match val {
+        "false" | "true" => {
+            gd_syntax::warning_names::warning_name_index(&name.to_ascii_uppercase()).map(|_| {
+                if val == "true" {
+                    WarnLevel::Warn
+                } else {
+                    WarnLevel::Ignore
+                }
+            })
+        }
+        _ => val.parse::<u8>().ok().and_then(WarnLevel::from_u8),
+    }
 }
 
 fn unquote(s: &str) -> String {
@@ -468,8 +492,32 @@ gdscript/warnings/exclude_addons=true
             pg.warnings.levels.get("untyped_declaration"),
             Some(&WarnLevel::Error)
         );
-        // `exclude_addons=true` is not an int level ⇒ not recorded as one.
+        // `exclude_addons=true` is not a warning code ⇒ not recorded as a level, even though the
+        // boolean form is otherwise read.
         assert!(!pg.warnings.levels.contains_key("exclude_addons"));
+    }
+
+    /// #441 — the older boolean form of a warning level. Godot casts whatever the file stored to
+    /// an int (`gdscript_parser.cpp:101`), so `false` turns the warning off and `true` puts it at
+    /// level 1. Dropping them left the warning at its default, which for `narrowing_conversion`
+    /// means a project that had switched it off still saw it.
+    #[test]
+    fn a_boolean_warning_level_is_read_as_zero_or_one() {
+        let pg = parse(
+            "[debug]\n\n             gdscript/warnings/narrowing_conversion=false\n             gdscript/warnings/integer_division=true\n             gdscript/warnings/untyped_declaration=2\n",
+        );
+        assert_eq!(
+            pg.warnings.levels.get("narrowing_conversion"),
+            Some(&WarnLevel::Ignore)
+        );
+        assert_eq!(
+            pg.warnings.levels.get("integer_division"),
+            Some(&WarnLevel::Warn)
+        );
+        assert_eq!(
+            pg.warnings.levels.get("untyped_declaration"),
+            Some(&WarnLevel::Error)
+        );
     }
 
     #[test]
