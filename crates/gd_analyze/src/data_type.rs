@@ -542,12 +542,17 @@ impl std::fmt::Display for DataType {
                     VariantType::Array if !self.container_element_types.is_empty() => {
                         write!(f, "Array[{}]", self.container_element_types[0])
                     }
-                    VariantType::Dictionary if self.container_element_types.len() >= 2 => {
-                        write!(
-                            f,
-                            "Dictionary[{}, {}]",
-                            self.container_element_types[0], self.container_element_types[1]
-                        )
+                    // A `Dictionary` renders parameterized as soon as EITHER slot is set, and
+                    // an unset slot reads back as `Variant`
+                    // (`get_container_element_type_or_variant`), so
+                    // `Dictionary[int, Variant]` — which only ever fills slot 0 — still prints
+                    // both halves.
+                    VariantType::Dictionary if !self.container_element_types.is_empty() => {
+                        let slot = |i: usize| match self.container_element_types.get(i) {
+                            Some(t) => t.to_string(),
+                            None => "Variant".to_owned(),
+                        };
+                        write!(f, "Dictionary[{}, {}]", slot(0), slot(1))
                     }
                     _ => f.write_str(variant_type_name(self.builtin_type)),
                 }
