@@ -454,6 +454,14 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     let markdown = if let Some(sig) = member_sig {
         sig
     } else {
+        // #412: everything above answers a question the cursor actually asked. This last arm
+        // answers "what type is the smallest node around here", and around a tab, an operator, or
+        // a closing paren that node is the enclosing statement — so hovering blank space used to
+        // pop a card naming the statement's type. Require the byte to sit on something a reader
+        // would point at before falling back.
+        if !cursor_is_on_a_symbol(&text, byte) {
+            return None;
+        }
         let file = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
         render_hover(
             state,
@@ -474,7 +482,34 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     })
 }
 
+/// Whether `byte` lands on a token a reader would point at to ask "what is this": a name, a
+/// literal, or one of the keywords that denotes a value. Whitespace, operators, delimiters, and
+/// the structural keywords (`func`, `var`, `if`, …) are not questions, so the type-label fallback
+/// in [`hover`] must not answer them.
+///
+/// Only that fallback consults this. Every path above it keys off a node the cursor is genuinely
+/// inside — a `preload` path, a `$` access, a declaration name, a member or callee — and those
+/// keep answering exactly as before.
+fn cursor_is_on_a_symbol(text: &str, byte: usize) -> bool {
+    use gd_syntax::token::TokenKind;
+    let (tokens, _) = gd_syntax::tokenize(text);
+    tokens.iter().any(|t| {
+        t.span.start <= byte
+            && byte < t.span.end
+            && (t.kind.is_identifier()
+                || matches!(
+                    t.kind,
+                    // `true`, `false`, and `null` are Literal tokens, as they are upstream.
+                    TokenKind::Literal
+                        | TokenKind::SelfKw
+                        | TokenKind::Super
+                        | TokenKind::Annotation
+                ))
+    })
+}
+
 /// The smallest-span containing node at `byte` whose [`TypeTable`](gd_analyze::TypeTable) entry is
+/// set./// The smallest-span containing node at `byte` whose [`TypeTable`](gd_analyze::TypeTable) entry is
 /// set. Linear over the arena, like `innermost_node_at` — adequate for per-keystroke hover (an LSP
 /// request, not a hot loop). Returns `None` if no containing node has a resolved type at all
 /// (e.g. the byte is inside an `extends` chain on an empty native DB, where every member is
@@ -2515,6 +2550,11 @@ pub(crate) fn human_type_label(
                 human_type_label(state, tree, &dt.container_element_types[1])
             )
         }
+        // #412: a `void` call's type is a builtin NIL, and Godot's `DataType::to_string()` renders
+        // that as `null` (gdscript_parser.cpp:5341), never as `Variant::get_type_name(NIL)`'s
+        // `Nil`. `Display` already gets this right; the label path did not, so a void-typed
+        // expression read as a type that is not spelled that way anywhere in GDScript.
+        DtKind::Builtin if dt.builtin_type == VariantType::Nil => "null".to_owned(),
         // A scalar builtin (or an untyped container) — `Display` renders its exact source name.
         DtKind::Builtin => variant_type_name(dt.builtin_type).to_string(),
         DtKind::Script => {
