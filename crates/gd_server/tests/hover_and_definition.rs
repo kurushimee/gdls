@@ -307,6 +307,106 @@ fn hover_on_inner_class_declaration_renders_class_line() {
     shutdown(&client, handle);
 }
 
+/// #412: the type-label fallback answers "what type is the node around here". Around a tab, an
+/// operator, a delimiter, or a structural keyword that node is the enclosing statement, so hovering
+/// blank space used to pop a card naming the statement's type — most often `Nil`.
+#[test]
+fn hover_returns_none_on_a_position_that_holds_no_symbol() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/nosym.gd".parse().unwrap();
+    // 0: extends Node
+    // 1:
+    // 2: func go() -> void:
+    // 3: \tpass
+    // 4:
+    // 5: func _ready() -> void:
+    // 6: \tvar a = 1 + 2
+    // 7: \tgo()
+    did_open(
+        &client,
+        &uri,
+        "extends Node\n\nfunc go() -> void:\n\tpass\n\nfunc _ready() -> void:\n\tvar a = 1 + 2\n\tgo()\n",
+    );
+
+    for (line, character, what) in [
+        (1, 0, "an empty line"),
+        (3, 0, "the indent before a statement"),
+        (6, 0, "the indent before a declaration"),
+        (6, 7, "the `=` of an assignment"),
+        (6, 11, "the `+` of a binary op"),
+        (7, 4, "the `)` of a void call"),
+        (2, 1, "the `func` keyword"),
+        (0, 2, "the `extends` keyword"),
+    ] {
+        assert!(
+            hover_at(&client, &uri, Position::new(line, character)).is_none(),
+            "hover on {what} must be null"
+        );
+    }
+
+    shutdown(&client, handle);
+}
+
+/// The other half of the same gate: every position that DOES hold a symbol still answers.
+#[test]
+fn hover_still_answers_on_names_and_literals() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/sym.gd".parse().unwrap();
+    did_open(
+        &client,
+        &uri,
+        "extends Node\n\nfunc _ready() -> void:\n\tvar a = 1 + 2\n\tvar s = \"hi\"\n\tvar b = true\n\tprint(a, s, b)\n",
+    );
+
+    for (line, character, want) in [
+        (0, 9, "Node"),
+        (3, 5, "int"),
+        (3, 9, "int"),
+        (4, 10, "String"),
+        (5, 10, "bool"),
+    ] {
+        let hover = hover_at(&client, &uri, Position::new(line, character))
+            .unwrap_or_else(|| panic!("expected a hover at {line}:{character}"));
+        assert!(
+            hover_markdown(&hover).contains(want),
+            "at {line}:{character} wanted {want}, got {:?}",
+            hover_markdown(&hover)
+        );
+    }
+
+    shutdown(&client, handle);
+}
+
+/// #412, second half: a builtin `NIL` is spelled `null` by `DataType::to_string()`
+/// (gdscript_parser.cpp:5341). `Nil` is `Variant::get_type_name`'s spelling, which is what error
+/// messages use — never what a type label should read.
+#[test]
+fn a_void_typed_expression_reads_as_null_not_nil() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/voidty.gd".parse().unwrap();
+    // 0: extends Node
+    // 1:
+    // 2: const N = null
+    // 3:
+    // 4: func _ready() -> void:
+    // 5: \tprint(N)
+    did_open(
+        &client,
+        &uri,
+        "extends Node\n\nconst N = null\n\nfunc _ready() -> void:\n\tprint(N)\n",
+    );
+
+    for (line, character, what) in [(2, 6, "the declaration name"), (5, 7, "a use")] {
+        let hover = hover_at(&client, &uri, Position::new(line, character))
+            .unwrap_or_else(|| panic!("expected a hover on {what}"));
+        let md = hover_markdown(&hover);
+        assert!(md.contains("null"), "{what}: got {md:?}");
+        assert!(!md.contains("Nil"), "{what}: got {md:?}");
+    }
+
+    shutdown(&client, handle);
+}
+
 #[test]
 fn hover_returns_none_outside_any_node() {
     // A hover request whose position lands past the source end (a whitespace-only file) must
