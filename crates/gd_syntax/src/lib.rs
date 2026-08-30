@@ -106,6 +106,9 @@ pub fn parse_with_options(source: &str, options: &ParseOptions<'_>) -> ParseResu
     parser.parse_program();
     let comments = parser.take_comments();
     let (mut tree, diagnostics) = parser.into_parts();
+    // Every parse diagnostic is an error (the type carries no severity), so a non-empty list is
+    // exactly "this tree may be missing declarations the source has".
+    tree.had_parse_errors = !diagnostics.is_empty();
     // M7 (#62): associate `##` doc comments post-parse — a read-only pass over the finished
     // tree + the lexer's comment side-channel, so the ported grammar (and both conformance
     // ratchets) never sees them.
@@ -160,6 +163,20 @@ mod tests {
                 ("move", SymbolKind::Function)
             ]
         );
+    }
+
+    /// #406: the tree carries whether its own parse was clean, so a consumer of the extracted
+    /// interface can tell "this class does not declare X" from "error recovery may have dropped X".
+    #[test]
+    fn parse_errors_are_stamped_on_the_tree() {
+        assert!(
+            !parse("extends Node\nfunc f() -> void:\n\tpass\n")
+                .tree
+                .had_parse_errors
+        );
+        let broken = parse("extends Node\nfunc f() -> void:\n\tpass\nfunc (( -> :\n");
+        assert!(!broken.diagnostics.is_empty(), "expected errors");
+        assert!(broken.tree.had_parse_errors);
     }
 
     /// Deeply nested input must hit the recursion-depth guard and return (with errors), never

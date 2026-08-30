@@ -4717,6 +4717,31 @@ pub(crate) fn nearest_native_ancestor(ctx: &AnalysisContext, class_id: NodeId) -
     None
 }
 
+/// #406: the claim-grade twin of [`nearest_native_ancestor`] — whether `class_id`'s whole ancestry
+/// was walked end to end, so a name missing from all of it is genuinely missing.
+///
+/// The looser question ("where does this probably bottom out?") is what typing and the node-ness
+/// gates read, and they must stay permissive when the answer is unknown. A negative claim cannot:
+/// a link whose interface is unindexed, or one whose parse stopped at a syntax error and so
+/// extracted a truncated member list, hides exactly the declaration the user wrote.
+pub(crate) fn class_ancestry_introspectable(ctx: &AnalysisContext, class_id: NodeId) -> bool {
+    let mut cur = Some(class_id);
+    while let Some(c) = cur {
+        let base = ctx.bases.get(&c).cloned().unwrap_or_default();
+        match base.kind {
+            DtKind::Native => return ctx.native.class_named(&base.native_type).is_some(),
+            DtKind::Class => cur = base.class_node,
+            DtKind::Script => {
+                return base.script_type.as_ref().is_some_and(|sr| {
+                    crate::script_chain::resolve_script_chain(ctx, sr).introspectable
+                })
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// `true` when the variable's declared type makes the `@export` annotation a "Node export" — the
 /// Godot's `PROPERTY_HINT_NODE_TYPE` path (gdscript_parser.cpp:4844 / :4915). Hits when:
 /// * the type is a native Object whose chain reaches Node, or
