@@ -78,7 +78,9 @@ fn member_line(db: &NativeDb, declaring: &str, qualify: bool, member: &NativeMem
             Some(ty) => format!("const {}: {}", q(db.name_of(k.name)), db.name_of(ty)),
             None => format!("const {} = {}", q(db.name_of(k.name)), k.value),
         },
-        NativeMember::EnumValue { owner, name, value } => {
+        NativeMember::EnumValue {
+            owner, name, value, ..
+        } => {
             format!(
                 "const {}: {} = {}",
                 q(db.name_of(*name)),

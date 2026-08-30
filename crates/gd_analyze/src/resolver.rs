@@ -3643,9 +3643,9 @@ pub(crate) fn make_native_enum_type(
             .iter()
             .find(|e| ctx.native.name_of(e.name) == enum_name)
         {
-            for (sym, val) in &ne.values {
+            for v in &ne.values {
                 t.enum_values
-                    .insert(ctx.native.name_of(*sym).to_owned(), *val);
+                    .insert(ctx.native.name_of(v.name).to_owned(), v.value);
             }
         }
     }
@@ -3680,9 +3680,9 @@ pub(crate) fn make_builtin_enum_type(
             .iter()
             .find(|e| ctx.native.name_of(e.name) == enum_name)
         {
-            for (sym, val) in &ne.values {
+            for v in &ne.values {
                 t.enum_values
-                    .insert(ctx.native.name_of(*sym).to_owned(), *val);
+                    .insert(ctx.native.name_of(v.name).to_owned(), v.value);
             }
         }
     }
@@ -3709,15 +3709,15 @@ pub(crate) fn make_global_enum_type(
         format!("{base}.{enum_name}")
     };
     if let Some(ne) = ctx.native.global_enum(&lookup_key) {
-        for (sym, val) in &ne.values {
+        for v in &ne.values {
             t.enum_values
-                .insert(ctx.native.name_of(*sym).to_owned(), *val);
+                .insert(ctx.native.name_of(v.name).to_owned(), v.value);
         }
     } else if let Some(ne) = ctx.native.global_enum(enum_name) {
         // Some dumps key by the bare enum name.
-        for (sym, val) in &ne.values {
+        for v in &ne.values {
             t.enum_values
-                .insert(ctx.native.name_of(*sym).to_owned(), *val);
+                .insert(ctx.native.name_of(v.name).to_owned(), v.value);
         }
     }
     t

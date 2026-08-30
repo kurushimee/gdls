@@ -136,6 +136,9 @@ pub struct EnumDef {
     pub name: String,
     #[serde(default)]
     pub is_bitfield: bool,
+    /// The enum's own description from the with-docs dump (see [`ClassDef::description`]).
+    #[serde(default)]
+    pub description: String,
     #[serde(default)]
     pub values: Vec<EnumValue>,
 }
@@ -143,7 +146,11 @@ pub struct EnumDef {
 #[derive(Clone, Debug, Deserialize)]
 pub struct EnumValue {
     pub name: String,
+    #[serde(default)]
     pub value: i64,
+    /// This value's description from the with-docs dump (see [`ClassDef::description`]).
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -151,6 +158,9 @@ pub struct ClassConstant {
     pub name: String,
     #[serde(default)]
     pub value: i64,
+    /// The constant's description from the with-docs dump (see [`ClassDef::description`]).
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -160,6 +170,9 @@ pub struct GlobalConstant {
     pub value: i64,
     #[serde(default)]
     pub is_bitfield: bool,
+    /// The constant's description from the with-docs dump (see [`ClassDef::description`]).
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

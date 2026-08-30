@@ -636,6 +636,72 @@ fn hover_includes_native_doc_text_when_dump_carries_it() {
 }
 
 #[test]
+fn hover_includes_native_constant_and_enum_value_docs() {
+    // #456: with-docs dumps carry per-constant / per-enum-value `description`s
+    // (`Node.NOTIFICATION_READY`, `Input.MOUSE_MODE_VISIBLE`). Hover on a class-qualified
+    // constant and enum value must render the declaration line *and* the doc text — the
+    // ingest layer used to drop both, leaving every native constant hover docless.
+    let fixture_dir = std::env::temp_dir().join("gdls_wph_const_docs");
+    std::fs::create_dir_all(&fixture_dir).expect("create temp fixture dir");
+    let api_path = fixture_dir.join("extension_api.json");
+    let api_json = r#"{
+        "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
+        "classes": [
+            {
+                "name": "Widget",
+                "constants": [
+                    {"name": "WIDGET_MODE_AUTO", "value": 2,
+                     "description": "Automatic mode runs the widget unattended."}
+                ],
+                "enums": [
+                    {"name": "Mode", "is_bitfield": false,
+                     "values": [{"name": "MODE_MANUAL", "value": 0,
+                                  "description": "Manual mode waits for a click."}]}
+                ]
+            }
+        ]
+    }"#;
+    std::fs::write(&api_path, api_json).expect("write fixture JSON");
+
+    let init_options = serde_json::json!({
+        "extensionApiPath": api_path.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+    let uri: Uri = "file:///test/const_docs.gd".parse().unwrap();
+    did_open(
+        &client,
+        &uri,
+        "extends Widget\nvar a := Widget.WIDGET_MODE_AUTO\nvar b := Widget.MODE_MANUAL\n",
+    );
+
+    // `WIDGET_MODE_AUTO` on line 1, columns 17..33. Click inside it.
+    let hover = hover_at(&client, &uri, Position::new(1, 20)).expect("hover on constant");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("const Widget.WIDGET_MODE_AUTO = 2"),
+        "hover renders the constant's declaration, got {md:?}"
+    );
+    assert!(
+        md.contains("Automatic mode runs the widget unattended."),
+        "hover includes the constant's dump description, got {md:?}"
+    );
+
+    // `MODE_MANUAL` on line 2, columns 17..28. Click inside it.
+    let hover = hover_at(&client, &uri, Position::new(2, 20)).expect("hover on enum value");
+    let md = hover_markdown(&hover);
+    assert!(
+        md.contains("const Widget.MODE_MANUAL: Mode = 0"),
+        "hover renders the enum value's declaration, got {md:?}"
+    );
+    assert!(
+        md.contains("Manual mode waits for a click."),
+        "hover includes the enum value's dump description, got {md:?}"
+    );
+
+    shutdown(&client, handle);
+}
+
+#[test]
 fn definition_on_a_literal_returns_null() {
     // The innermost node at a literal position is the literal itself, not an identifier. Per the
     // handler's contract (`NodeKind::Identifier` gate), non-identifier positions resolve to null.

@@ -91,7 +91,18 @@ pub struct Signal {
 pub struct NativeEnum {
     pub name: Sym,
     pub is_bitfield: bool,
-    pub values: Vec<(Sym, i64)>,
+    /// The enum's own documentation from the with-docs dump; empty when the dump carried none.
+    pub description: String,
+    pub values: Vec<NativeEnumValue>,
+}
+
+/// One value inside a [`NativeEnum`] (`Key.KEY_A`, `Node.PROCESS_MODE_ALWAYS`).
+#[derive(Clone, Debug)]
+pub struct NativeEnumValue {
+    pub name: Sym,
+    pub value: i64,
+    /// This value's documentation from the with-docs dump; empty when the dump carried none.
+    pub description: String,
 }
 
 #[derive(Clone, Debug)]
@@ -189,6 +200,8 @@ pub enum NativeMember<'a> {
         owner: &'a NativeEnum,
         name: Sym,
         value: i64,
+        /// This value's documentation from the with-docs dump; empty when it carried none.
+        doc: &'a str,
     },
 }
 
@@ -227,7 +240,7 @@ pub struct NativeDb {
     classes: FxHashMap<Sym, NativeClass>,
     builtins: FxHashMap<Sym, BuiltinType>,
     global_enums: FxHashMap<Sym, NativeEnum>,
-    global_constants: FxHashMap<Sym, i64>,
+    global_constants: FxHashMap<Sym, NamedConst>,
     utilities: FxHashMap<Sym, UtilityFn>,
     /// Singleton name → its class type.
     singletons: FxHashMap<Sym, Sym>,
@@ -295,7 +308,17 @@ impl NativeDb {
         }
         let mut global_constants = FxHashMap::default();
         for gc in api.global_constants {
-            global_constants.insert(it.intern(&gc.name), gc.value);
+            let name = it.intern(&gc.name);
+            global_constants.insert(
+                name,
+                NamedConst {
+                    name,
+                    value: gc.value,
+                    ty: None,
+                    color: None,
+                    description: gc.description,
+                },
+            );
         }
         let mut utilities = FxHashMap::default();
         for u in api.utility_functions {
@@ -371,7 +394,7 @@ impl NativeDb {
         let mut all: Vec<(&str, i64)> = self
             .global_constants
             .iter()
-            .map(|(s, v)| (self.name_of(*s), *v))
+            .map(|(s, c)| (self.name_of(*s), c.value))
             .collect();
         all.sort_by(|a, b| a.0.cmp(b.0));
         all.into_iter()
@@ -403,7 +426,7 @@ impl NativeDb {
                 let owner = self.name_of(ne.name);
                 ne.values
                     .iter()
-                    .map(move |(sym, val)| (self.name_of(*sym), owner, *val))
+                    .map(move |v| (self.name_of(v.name), owner, v.value))
             })
             .collect();
         all.sort_by(|a, b| a.0.cmp(b.0));
@@ -511,9 +534,9 @@ impl NativeDb {
     pub fn global_enum_value(&self, name: &str) -> Option<(String, i64)> {
         let target = self.interner.get(name)?;
         for ne in self.global_enums.values() {
-            for (sym, val) in &ne.values {
-                if *sym == target {
-                    return Some((self.name_of(ne.name).to_owned(), *val));
+            for v in &ne.values {
+                if v.name == target {
+                    return Some((self.name_of(ne.name).to_owned(), v.value));
                 }
             }
         }
@@ -532,7 +555,7 @@ impl NativeDb {
         match scope {
             None => {
                 if let Some(ne) = self.global_enum(enum_name) {
-                    out.extend(ne.values.iter().map(|(s, _)| self.name_of(*s)));
+                    out.extend(ne.values.iter().map(|v| self.name_of(v.name)));
                 }
             }
             Some(class) => {
@@ -541,7 +564,7 @@ impl NativeDb {
                 for _ in 0..64 {
                     let Some(nc) = cur else { break };
                     if let Some(ne) = target.and_then(|t| nc.enums.iter().find(|e| e.name == t)) {
-                        out.extend(ne.values.iter().map(|(s, _)| self.name_of(*s)));
+                        out.extend(ne.values.iter().map(|v| self.name_of(v.name)));
                         break;
                     }
                     cur = nc.inherits.and_then(|s| self.classes.get(&s));
@@ -557,7 +580,7 @@ impl NativeDb {
         self.interner
             .get(name)
             .and_then(|s| self.global_constants.get(&s))
-            .copied()
+            .map(|c| c.value)
     }
 
     /// A `@GlobalScope` utility function (`abs`, `print`, …).
@@ -1175,10 +1198,10 @@ fn ingest_class(c: api::ClassDef, it: &mut Interner) -> NativeClass {
                 name: it.intern(&k.name),
                 value: k.value,
                 ty: None,
-                // Engine-class constants are bare integers — never a Color literal, and the
-                // dump carries no per-constant docs for them.
+                // Engine-class constants are bare integers — never a Color literal.
                 color: None,
-                description: String::new(),
+                // Per-constant docs arrive with the with-docs dump (#456); empty otherwise.
+                description: k.description,
             })
             .collect(),
         brief_description: c.brief_description,
@@ -1385,10 +1408,15 @@ fn ingest_enum(e: api::EnumDef, it: &mut Interner) -> NativeEnum {
     NativeEnum {
         name: it.intern(&e.name),
         is_bitfield: e.is_bitfield,
+        description: e.description,
         values: e
             .values
             .into_iter()
-            .map(|v| (it.intern(&v.name), v.value))
+            .map(|v| NativeEnumValue {
+                name: it.intern(&v.name),
+                value: v.value,
+                description: v.description,
+            })
             .collect(),
     }
 }
@@ -1440,11 +1468,12 @@ fn member_of<'a>(
         return Some(NativeMember::Constant(k));
     }
     for e in enums {
-        if let Some((name, value)) = e.values.iter().find(|(n, _)| *n == target) {
+        if let Some(v) = e.values.iter().find(|v| v.name == target) {
             return Some(NativeMember::EnumValue {
                 owner: e,
-                name: *name,
-                value: *value,
+                name: v.name,
+                value: v.value,
+                doc: v.description.as_str(),
             });
         }
     }
@@ -1486,14 +1515,15 @@ fn collect_class_members<'a>(
         }
     }
     for e in &nc.enums {
-        for (name, value) in &e.values {
-            if seen.insert(*name) {
+        for v in &e.values {
+            if seen.insert(v.name) {
                 out.push((
                     nc,
                     NativeMember::EnumValue {
                         owner: e,
-                        name: *name,
-                        value: *value,
+                        name: v.name,
+                        value: v.value,
+                        doc: v.description.as_str(),
                     },
                 ));
             }
@@ -1529,14 +1559,15 @@ fn collect_builtin_members<'a>(
         }
     }
     for e in &bt.enums {
-        for (name, value) in &e.values {
-            if seen.insert(*name) {
+        for v in &e.values {
+            if seen.insert(v.name) {
                 out.push((
                     bt,
                     NativeMember::EnumValue {
                         owner: e,
-                        name: *name,
-                        value: *value,
+                        name: v.name,
+                        value: v.value,
+                        doc: v.description.as_str(),
                     },
                 ));
             }
@@ -1818,6 +1849,57 @@ mod tests {
             vec!["MODE_A", "MODE_B"],
             "a class-scoped enum is found up the inherits chain"
         );
+    }
+
+    #[test]
+    fn constant_and_enum_docs_ingest_from_the_dump() {
+        // #456: a with-docs dump carries per-constant and per-enum-value `description`s
+        // (`Node.NOTIFICATION_READY`, `Input.MOUSE_MODE_VISIBLE`, …). They must survive
+        // ingest so hover/completion can surface them; a stock dump leaves every one empty.
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [
+                    {"name": "Widget", "is_instantiable": true,
+                     "constants": [{"name": "WIDGET_MODE_AUTO", "value": 2,
+                                     "description": "Automatic mode runs the widget unattended."}],
+                     "enums": [{"name": "Mode", "is_bitfield": false,
+                                 "values": [{"name": "MODE_MANUAL", "value": 0,
+                                              "description": "Manual mode waits for a click."},
+                                            {"name": "MODE_IDLE", "value": 1}]}]}
+                ]
+            }"#,
+        )
+        .expect("documented constants dump");
+        let (_, member) = db
+            .lookup_member("Widget", "WIDGET_MODE_AUTO")
+            .expect("class constant resolves");
+        match member {
+            NativeMember::Constant(k) => assert_eq!(
+                k.description, "Automatic mode runs the widget unattended.",
+                "a class constant keeps its dump description"
+            ),
+            other => panic!("WIDGET_MODE_AUTO resolved to {other:?}, expected a constant"),
+        }
+        let (_, member) = db
+            .lookup_member("Widget", "MODE_MANUAL")
+            .expect("enum value resolves");
+        match member {
+            NativeMember::EnumValue { owner, doc, .. } => {
+                assert_eq!(db.name_of(owner.name), "Mode");
+                assert_eq!(
+                    doc, "Manual mode waits for a click.",
+                    "an enum value keeps its dump description"
+                );
+            }
+            other => panic!("MODE_MANUAL resolved to {other:?}, expected an enum value"),
+        }
+        // Untocumented members stay empty strings, never panics or None.
+        let (_, member) = db.lookup_member("Widget", "MODE_IDLE").unwrap();
+        match member {
+            NativeMember::EnumValue { doc, .. } => assert_eq!(doc, ""),
+            other => panic!("MODE_IDLE resolved to {other:?}, expected an enum value"),
+        }
     }
 
     #[test]
