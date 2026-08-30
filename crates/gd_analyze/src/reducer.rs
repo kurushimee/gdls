@@ -1286,7 +1286,7 @@ pub(crate) fn booleanize(v: &FoldedValue) -> bool {
 /// The [`VariantType`] of a folded value — the same mapping [`type_from_variant`] uses internally.
 /// Lives separately so the binary-op error path can name operand types without rebuilding the
 /// full `DataType`.
-fn folded_variant_type(v: &FoldedValue) -> VariantType {
+pub(crate) fn folded_variant_type(v: &FoldedValue) -> VariantType {
     match v {
         FoldedValue::Nil => VariantType::Nil,
         FoldedValue::Bool(_) => VariantType::Bool,

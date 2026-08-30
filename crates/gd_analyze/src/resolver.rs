@@ -1944,6 +1944,8 @@ fn resolve_class_member(
                     );
                 }
             }
+            // analyzer.cpp:1115-1119 — apply the constant's annotations after resolving it.
+            resolve_node_annotations(ctx, id);
             // Const-only typed-array element narrowing: when the init is a homogeneous-typed
             // array literal (`const X := [0, 1, 2]`), Godot stamps Array[int] onto the
             // constant. Narrows on top of the resolve_assignable type so downstream subscripts
@@ -1980,6 +1982,8 @@ fn resolve_class_member(
             ctx.set_type(id, resolving());
             let sig = resolve_signal_type(ctx, id, &name);
             ctx.set_type(id, sig);
+            // analyzer.cpp:1145-1149.
+            resolve_node_annotations(ctx, id);
         }
         Member::Enum(id) => {
             let name = decl_identifier_name(ctx, id);
@@ -1987,6 +1991,8 @@ fn resolve_class_member(
             ctx.set_type(id, resolving());
             let enum_type = resolve_enum_type(ctx, id, class_id, &name);
             ctx.set_type(id, enum_type);
+            // analyzer.cpp:1200-1204.
+            resolve_node_annotations(ctx, id);
         }
         Member::Function(id) => {
             // Functions are not conflict-checked (they may override a parent function).
@@ -4125,6 +4131,8 @@ fn apply_class_abstract_annotation(ctx: &mut AnalysisContext, class_id: NodeId) 
     let class_annotations: Vec<NodeId> = ctx.node(class_id).annotations.clone();
     let mut abstract_count = 0usize;
     for &ann_id in &class_annotations {
+        // analyzer.cpp:624-627 — the resolve runs immediately before the apply, per annotation.
+        resolve_annotation(ctx, ann_id);
         let is_abstract = matches!(
             &ctx.node(ann_id).kind,
             NodeKind::Annotation(an) if an.name == "@abstract"
@@ -4156,6 +4164,8 @@ fn apply_function_annotations(ctx: &mut AnalysisContext, fn_id: NodeId) {
     let mut abstract_settled = false;
     let mut rpc_configured = false;
     for &ann_id in &fn_annotations {
+        // analyzer.cpp:1206-1209 / :1412-1415 — resolve then apply, per annotation.
+        resolve_annotation(ctx, ann_id);
         let ann_name = match &ctx.node(ann_id).kind {
             NodeKind::Annotation(an) => an.name.clone(),
             _ => continue,
@@ -4193,13 +4203,142 @@ fn apply_function_annotations(ctx: &mut AnalysisContext, fn_id: NodeId) {
     }
 }
 
+/// `GDScriptAnalyzer::resolve_annotation` (analyzer.cpp:1673-1727) — reduce each of an
+/// annotation's arguments, fold it to a value, and check that value against the parameter the
+/// registration declares. Idempotent: Godot's dispatcher reaches the same annotation from several
+/// phases and only the first visit does the work (`AnnotationNode::is_resolved`).
+///
+/// The parameter index walks the registration but sticks on the last entry, which is what makes a
+/// vararg annotation (`@export_flags("A", "B", "C")`) check every argument against its final
+/// declared type (analyzer.cpp:1686-1689).
+///
+/// **Two departures, both under-reports.** Godot's `make_expression_reduced_value` materializes
+/// every `Variant`; [`crate::FoldedValue`] cannot represent an array, a dictionary, a vector, a
+/// math-utility result, or a preloaded resource. So the non-constant blame is gated on the
+/// never-constant walk rather than on the fold's absence, and an argument gdls could not
+/// materialize ends the walk without a message. A conversion gdls cannot perform (`StringName` to
+/// `String`, say) does the same. Both truncate `resolved_arguments` exactly as an error does, so an
+/// apply callback reading it can never see a value that was not checked.
+pub(crate) fn resolve_annotation(ctx: &mut AnalysisContext, ann_id: NodeId) {
+    use crate::data_type::{variant_can_convert_strict, variant_type_name, VariantType};
+    use crate::FoldedValue;
+
+    if !ctx.resolved_annotations.insert(ann_id) {
+        return;
+    }
+    let (name, arg_ids) = match &ctx.node(ann_id).kind {
+        NodeKind::Annotation(a) => (a.name.clone(), a.arguments.clone()),
+        _ => return,
+    };
+    let Some(reg) = gd_syntax::parser::registered_annotation(&name) else {
+        return; // An unregistered name — the parser already reported it.
+    };
+    // A zero-parameter annotation given arguments is the parser's arity error to report
+    // (`Parser::validate_annotation_arguments`); there is nothing here to type them against.
+    if reg.params.is_empty() {
+        ctx.annotation_resolved_args.insert(ann_id, Vec::new());
+        return;
+    }
+
+    let mut resolved: Vec<FoldedValue> = Vec::new();
+    let mut param_index = 0usize;
+    for (i, &arg_id) in arg_ids.iter().enumerate() {
+        let want = match reg.params[param_index].ty {
+            gd_syntax::parser::AnnotationParamType::Int => VariantType::Int,
+            gd_syntax::parser::AnnotationParamType::Float => VariantType::Float,
+            gd_syntax::parser::AnnotationParamType::String => VariantType::String,
+        };
+        if param_index + 1 < reg.params.len() {
+            param_index += 1;
+        }
+
+        crate::reducer::reduce_expression(ctx, arg_id, false);
+
+        let Some(value) = ctx.folds.get(arg_id).cloned() else {
+            // Godot gates this on `make_expression_reduced_value` having produced a value, which
+            // it can always do for anything constant. gdls's fold table is narrower — `absi(-10)`
+            // and `Vector3.UP` are both constant to Godot and unrepresentable here — so the blame
+            // needs positive identification instead: the same never-constant walk a `const`
+            // initializer uses. Anything the walk cannot place stays silent.
+            if const_init_nonconstant_ref(ctx, arg_id).is_some() {
+                ctx.push_error(
+                    format!(
+                        r#"Argument {} of annotation "{name}" isn't a constant expression."#,
+                        i + 1
+                    ),
+                    arg_id,
+                );
+            }
+            break;
+        };
+
+        let got = crate::reducer::folded_variant_type(&value);
+        let value = if got == want {
+            value
+        } else {
+            if want == VariantType::Int && got == VariantType::Float {
+                ctx.push_warning(
+                    crate::warnings::WarningCode::NarrowingConversion,
+                    &[],
+                    arg_id,
+                );
+            }
+            if !variant_can_convert_strict(got, want) {
+                let actual = ctx.get_type(arg_id).to_string();
+                ctx.push_error(
+                    format!(
+                        r#"Invalid argument for annotation "{name}": argument {} should be "{}" but is "{actual}"."#,
+                        i + 1,
+                        variant_type_name(want)
+                    ),
+                    arg_id,
+                );
+                break;
+            }
+            let Some(converted) = convert_folded_value(&value, want) else {
+                break;
+            };
+            converted
+        };
+        resolved.push(value);
+    }
+    ctx.annotation_resolved_args.insert(ann_id, resolved);
+}
+
+/// Resolve every annotation attached to `node_id`, in source order. Godot's member/statement loops
+/// pair `resolve_annotation(E)` with `E->apply(...)`; where gdls has no apply for a kind (a
+/// constant, a signal, an enum, a statement) this is the whole of that pairing.
+fn resolve_node_annotations(ctx: &mut AnalysisContext, node_id: NodeId) {
+    for ann_id in ctx.node(node_id).annotations.clone() {
+        resolve_annotation(ctx, ann_id);
+    }
+}
+
+/// `Variant::construct(p_type, …)` for the three parameter types an annotation registration can
+/// declare, over the source types [`crate::FoldedValue`] represents. `None` where the conversion is
+/// one Godot performs but gdls has no value for — the caller then truncates rather than inventing.
+fn convert_folded_value(
+    value: &crate::FoldedValue,
+    want: crate::data_type::VariantType,
+) -> Option<crate::FoldedValue> {
+    use crate::data_type::VariantType;
+    use crate::FoldedValue::{Bool, Float, Int};
+    Some(match (want, value) {
+        (VariantType::Int, Bool(b)) => Int(i64::from(*b)),
+        (VariantType::Int, Float(f)) => Int(*f as i64),
+        (VariantType::Float, Bool(b)) => Float(f64::from(*b)),
+        (VariantType::Float, Int(n)) => Float(*n as f64),
+        _ => return None,
+    })
+}
+
 /// `rpc_annotation` (gdscript_parser.cpp:5238-5298) — one `@rpc` per function, and within it a
 /// vocabulary check on each argument plus a "no more than once" check per config axis.
 ///
-/// Godot reads `resolved_arguments`, so it sees whatever each argument folded to. gdls has no
-/// general fold for annotation arguments, so this reads string literals and passes over anything
-/// else: a `const MODE = "any_peer"` argument is legal in Godot and stays silent here too, and an
-/// argument that is neither is left to `resolve_annotation`'s own typed-argument check.
+/// Reads `resolved_arguments` exactly as Godot does, so a `const MODE = "any_peer"` argument is
+/// seen as the string it folded to. That list is short of the written arguments when
+/// [`resolve_annotation`] stopped early, and the missing tail is simply not checked — a rejected
+/// argument has already been reported once and must not be reported again as a bad RPC keyword.
 ///
 /// `rpc_configured` is Godot's `function->rpc_config.get_type() != Variant::NIL`, which the apply
 /// sets on its way out even when an argument was rejected — only the duplicate returns early.
@@ -4212,22 +4351,20 @@ fn apply_rpc_annotation(ctx: &mut AnalysisContext, ann_id: NodeId, rpc_configure
         return;
     }
 
-    let arg_ids: Vec<NodeId> = match &ctx.node(ann_id).kind {
-        NodeKind::Annotation(an) => an.arguments.clone(),
-        _ => Vec::new(),
-    };
+    let args: Vec<crate::FoldedValue> = ctx
+        .annotation_resolved_args
+        .get(&ann_id)
+        .cloned()
+        .unwrap_or_default();
     let mut locality_args = 0u32;
     let mut permission_args = 0u32;
     let mut transfer_mode_args = 0u32;
-    for (i, &arg_id) in arg_ids.iter().enumerate() {
+    for (i, value) in args.iter().enumerate() {
         // cpp:5256 — the fourth argument is the transfer channel, never a mode keyword.
         if i == 3 {
             continue;
         }
-        let NodeKind::Literal(lit) = &ctx.node(arg_id).kind else {
-            continue;
-        };
-        let gd_syntax::token::Literal::String(arg) = &lit.value else {
+        let crate::FoldedValue::String(arg) = value else {
             continue;
         };
         match arg.as_str() {
@@ -4575,6 +4712,8 @@ fn emit_variable_annotation_warnings(ctx: &mut AnalysisContext, class_id: NodeId
                 NodeKind::Annotation(a) => a.name.clone(),
                 _ => continue,
             };
+            // analyzer.cpp:1057-1062 — resolve then apply, per annotation.
+            resolve_annotation(ctx, ann_id);
             if name == "@onready" {
                 // gdscript_parser.cpp:4530-4544 — node-ness, then `static`, then the duplicate.
                 if is_node_derived == Some(false) {
@@ -4600,28 +4739,6 @@ fn emit_variable_annotation_warnings(ctx: &mut AnalysisContext, class_id: NodeId
                 }
                 onready = true;
             } else if name.starts_with("@export") {
-                // gdscript_analyzer.cpp:1058 — `resolve_annotation` runs ahead of the apply, so a
-                // non-constant argument is reported even when the apply below rejects the
-                // annotation outright. gdls's fold table is too sparse to gate on `is_reduced`,
-                // so this walks the argument for an identifier that resolves to a non-constant
-                // local or a non-constant class member (Variable / Signal / Function).
-                let arg_ids: Vec<NodeId> = match &ctx.node(ann_id).kind {
-                    NodeKind::Annotation(a) => a.arguments.clone(),
-                    _ => Vec::new(),
-                };
-                for (arg_index, &arg_id) in arg_ids.iter().enumerate() {
-                    if expression_references_nonconstant_member(ctx, arg_id, class_id) {
-                        ctx.push_error(
-                            format!(
-                                r#"Argument {} of annotation "{name}" isn't a constant expression."#,
-                                arg_index + 1
-                            ),
-                            ann_id,
-                        );
-                        break;
-                    }
-                }
-
                 // gdscript_parser.cpp:4665-4674 — `static`, then a second `@export*` of any kind.
                 if is_static {
                     ctx.push_error(
@@ -5083,6 +5200,8 @@ fn resolve_suite(ctx: &mut AnalysisContext, suite_id: NodeId, is_root: bool) {
     let mut has_return = false;
     let mut has_unreachable_code = false;
     for stmt in stmts {
+        // analyzer.cpp:2076-2080 — a statement's own annotations resolve before the statement.
+        resolve_node_annotations(ctx, stmt);
         // gdscript_parser.cpp:2132-2160 — expression-statement shape warnings. Queued at parse
         // time in Godot, so on a shared line they precede both UNREACHABLE_CODE (queued at the
         // statement's parse tail) and any analyzer warning from inside the statement.
@@ -5269,6 +5388,7 @@ fn resolve_node(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         }
         NodeKind::Annotation(_) => {
             // analyzer.cpp:1617-1619 — annotation `apply()` lands with WP-F.
+            resolve_annotation(ctx, id);
         }
         NodeKind::Class(_) => {
             // analyzer.cpp:1592-1597 — never reached in practice (classes are resolved through
@@ -5430,65 +5550,6 @@ fn resolve_constant_local(ctx: &mut AnalysisContext, const_id: NodeId) {
         }
     }
     warn_local_shadowing(ctx, const_id, "constant");
-}
-
-/// Walk the expression tree of `expr_id` and check whether any identifier resolves to
-/// either a non-constant local (Variable / Parameter / ForVariable / PatternBind) OR a
-/// non-constant member of `class_id` (Variable / Signal / Function). Returns `true`
-/// if such an identifier is found — the expression isn't a compile-time constant.
-fn expression_references_nonconstant_member(
-    ctx: &AnalysisContext,
-    expr_id: NodeId,
-    class_id: NodeId,
-) -> bool {
-    use gd_syntax::ast::LocalKind;
-    let mut stack: Vec<NodeId> = vec![expr_id];
-    while let Some(id) = stack.pop() {
-        match &ctx.node(id).kind {
-            NodeKind::Identifier(i) => {
-                let name = i.name.clone();
-                if let Some(local) = crate::reducer::lookup_local(ctx, &name) {
-                    if !matches!(local.kind, LocalKind::Constant) {
-                        return true;
-                    }
-                    continue;
-                }
-                // Class member fallback — `num` in `@export_range(num, 10)` resolves to a
-                // class-level Variable / Signal / Function as a non-constant member.
-                if let Some(member) = class_member(ctx, class_id, &name) {
-                    if matches!(
-                        member,
-                        Member::Variable(_) | Member::Signal(_) | Member::Function(_)
-                    ) {
-                        return true;
-                    }
-                }
-            }
-            NodeKind::BinaryOp(b) => {
-                if let Some(l) = b.left_operand {
-                    stack.push(l);
-                }
-                if let Some(r) = b.right_operand {
-                    stack.push(r);
-                }
-            }
-            NodeKind::UnaryOp(u) => {
-                if let Some(o) = u.operand {
-                    stack.push(o);
-                }
-            }
-            NodeKind::Subscript(s) => {
-                if let Some(b) = s.base {
-                    stack.push(b);
-                }
-                if let Some(gd_syntax::ast::SubscriptAccess::Index(Some(idx))) = s.access {
-                    stack.push(idx);
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 /// analyzer.cpp:2124-2133 — a constant initializer must reduce to a constant expression. Godot
@@ -6436,6 +6497,8 @@ fn resolve_match_branch(ctx: &mut AnalysisContext, branch_id: NodeId, match_test
         NodeKind::MatchBranch(n) => (n.patterns, n.block, n.guard_body),
         _ => return,
     };
+    // analyzer.cpp:2433-2437 — the branch's own annotations first.
+    resolve_node_annotations(ctx, branch_id);
     for p in patterns {
         resolve_match_pattern(ctx, p, match_test);
     }
