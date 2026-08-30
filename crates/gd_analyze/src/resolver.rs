@@ -5417,7 +5417,10 @@ fn const_init_nonconstant_ref(ctx: &AnalysisContext, expr_id: NodeId) -> Option<
                 //
                 // An identifier callee is skipped whole, arguments included: `Vector2(1, 2)` and
                 // `Color("red")` do fold, and gdls cannot tell those from a project `my_func()`
-                // without the fold table this walk exists to avoid.
+                // without the fold table this walk exists to avoid. Blaming an unfolded builtin
+                // constructor is tempting now that #380 decides its fold by Godot's own overload
+                // dispatch, but a fold also needs every ARGUMENT folded, and gdls has no array or
+                // dictionary value — so `const A = Array([])`, which Godot accepts, would be blamed.
                 let attribute_callee = c.callee.is_some_and(|callee| {
                     matches!(
                         &ctx.node(callee).kind,
