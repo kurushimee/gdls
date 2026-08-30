@@ -5648,7 +5648,9 @@ pub(crate) struct CallSig {
 /// `validate_call_arg` stays silent for (analyzer.cpp:6097), which is why `floor(untyped)` warns
 /// in neither engine nor gdls.
 fn utility_call_sig(ctx: &AnalysisContext, name: &str) -> Option<CallSig> {
-    let u = ctx.native.utility(name)?;
+    let Some(u) = ctx.native.utility(name) else {
+        return gd_utility_call_sig(ctx, name);
+    };
     let par_types: Vec<DataType> = if u.is_vararg {
         Vec::new()
     } else {
@@ -5660,6 +5662,97 @@ fn utility_call_sig(ctx: &AnalysisContext, name: &str) -> Option<CallSig> {
         min_params: n,
         max_params: n,
         is_vararg: u.is_vararg,
+        arity_known: true,
+        ..CallSig::default()
+    })
+}
+
+/// One declared parameter of a GDScript utility, as the `ARG` / `ARGVAR` / `ARGTYPE` macros at
+/// gdscript_utility_functions.cpp:560-567 spell it. `type_from_property` reads each back into a
+/// `DataType` (analyzer.cpp:5842-5888), and these four are every shape the table uses.
+#[derive(Clone, Copy)]
+enum GdUtilParam {
+    /// `ARGVAR` — `Variant::NIL` with `PROPERTY_USAGE_NIL_IS_VARIANT`, so a hard `Variant`.
+    Var,
+    /// `ARG` — a plain builtin.
+    B(VariantType),
+    /// `ARG(_, OBJECT)` with no class name, which :5862 reads back as native `Object`.
+    Obj,
+    /// `ARGTYPE` — `INT` flagged `PROPERTY_USAGE_CLASS_IS_ENUM` naming `Variant.Type`, which
+    /// :5874-5877 turns into the global enum with `is_constant` cleared.
+    TypeEnum,
+}
+
+/// The `MethodInfo` for the GDScript-only utilities, mirroring the `REGISTER_FUNC` table at
+/// gdscript_utility_functions.cpp:570-589. `extension_api.json` does not know these functions
+/// exist, so the table is written out here; it is identical at both supported tags, which only
+/// differ in `type_exists` moving behind `DISABLE_DEPRECATED` (`docs/02` §11d).
+///
+/// `Color8` is the one entry with a default argument (`varray(255)` at :585-586), so it is the one
+/// entry whose min and max differ. `range` and `print_debug` are the two varargs, both registered
+/// `NOARGS`; `print_stack` and `get_stack` are `NOARGS` and NOT vararg, which is why
+/// `print_stack(1)` draws "Expected at most 0".
+///
+/// The per-argument callbacks a type list cannot express — `len`'s length-family check, `char`'s
+/// 0..2³²−1 range, `range`'s per-count int checks, `convert`'s `Variant::construct` — run at fold
+/// or run time upstream, not in the analyzer, so leaving them out is faithful rather than an
+/// under-report. (`len`'s does have a static mirror above, which the corpus pins.)
+fn gd_utility_call_sig(ctx: &AnalysisContext, name: &str) -> Option<CallSig> {
+    use GdUtilParam::{Obj, TypeEnum, Var, B};
+    let (params, is_vararg, default_count): (&[GdUtilParam], bool, usize) = match name {
+        "convert" => (&[Var, TypeEnum], false, 0),
+        "type_exists" => (&[B(VariantType::StringName)], false, 0),
+        "char" | "_char" => (&[B(VariantType::Int)], false, 0),
+        "ord" => (&[B(VariantType::String)], false, 0),
+        "range" | "print_debug" => (&[], true, 0),
+        "load" => (&[B(VariantType::String)], false, 0),
+        "inst_to_dict" => (&[Obj], false, 0),
+        "dict_to_inst" => (&[B(VariantType::Dictionary)], false, 0),
+        "Color8" => (
+            &[
+                B(VariantType::Int),
+                B(VariantType::Int),
+                B(VariantType::Int),
+                B(VariantType::Int),
+            ],
+            false,
+            1,
+        ),
+        "print_stack" | "get_stack" => (&[], false, 0),
+        "len" => (&[Var], false, 0),
+        "is_instance_of" => (&[Var, Var], false, 0),
+        _ => return None,
+    };
+    let hard = |kind: DtKind, builtin_type: VariantType, native_type: &str| DataType {
+        type_source: TypeSource::AnnotatedExplicit,
+        kind,
+        builtin_type,
+        native_type: native_type.to_owned(),
+        ..Default::default()
+    };
+    let par_types: Vec<DataType> = params
+        .iter()
+        .map(|p| match p {
+            Var => {
+                let mut t = DataType::variant();
+                t.type_source = TypeSource::AnnotatedExplicit;
+                t
+            }
+            B(vt) => hard(DtKind::Builtin, *vt, ""),
+            Obj => hard(DtKind::Native, VariantType::Object, "Object"),
+            TypeEnum => {
+                let mut t = crate::resolver::make_global_enum_type(ctx, "Variant.Type", "", false);
+                t.is_constant = false;
+                t
+            }
+        })
+        .collect();
+    let n = par_types.len();
+    Some(CallSig {
+        par_types,
+        min_params: n - default_count,
+        max_params: n,
+        is_vararg,
         arity_known: true,
         ..CallSig::default()
     })

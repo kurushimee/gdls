@@ -224,3 +224,131 @@ fn a_failed_count_on_a_folding_call_reports_the_count() {
     // under-report, and the safe direction: blaming the call outright would fire wherever gdls
     // fails to fold something Godot folds.
 }
+
+// ===================================================================================================
+// The GDScript-only half (gdscript_utility_functions.cpp:570-589).
+// ===================================================================================================
+
+#[test]
+fn the_one_default_argument_in_the_table_is_color8s() {
+    // `varray(255)` at :585-586 makes `Color8` 3..4. Missing it would put "Expected at least 4" on
+    // the three-argument form, which is the one everybody writes.
+    assert!(all("\tprint(Color8(1, 2, 3))\n").is_empty());
+    assert!(all("\tprint(Color8(1, 2, 3, 4))\n").is_empty());
+    assert_eq!(
+        errors("\tprint(Color8(1, 2))\n"),
+        vec![
+            "Too few arguments for \"Color8()\" call. Expected at least 3 but received 2."
+                .to_owned()
+        ]
+    );
+    assert_eq!(
+        errors("\tprint(Color8(1, 2, 3, 4, 5))\n"),
+        vec![
+            "Too many arguments for \"Color8()\" call. Expected at most 4 but received 5."
+                .to_owned()
+        ]
+    );
+    assert_eq!(
+        all("\tvar f: float = 1.5\n\tprint(Color8(f, 2, 3))\n"),
+        vec![NARROWING.to_owned()]
+    );
+}
+
+#[test]
+fn a_noargs_registration_that_is_not_vararg_bounds_at_zero() {
+    // `print_stack` and `get_stack` are `NOARGS` with the vararg column false, so an argument is
+    // one too many — unlike `range` and `print_debug`, which are `NOARGS` and vararg.
+    assert_eq!(
+        errors("\tprint_stack(1)\n"),
+        vec![
+            "Too many arguments for \"print_stack()\" call. Expected at most 0 but received 1."
+                .to_owned()
+        ]
+    );
+    assert!(all("\tprint_stack()\n\tprint(get_stack())\n").is_empty());
+    assert!(all("\tprint(range(1, 2, 3))\n\tprint_debug(1, 2, 3)\n").is_empty());
+}
+
+#[test]
+fn a_gdscript_utilitys_typed_parameter_is_unsafe_for_a_variant_argument() {
+    let rows = all(
+        "\tvar v = get_parent()\n\tprint(char(v))\n\tprint(ord(v))\n\tprint(load(v))\n\
+         \tprint(dict_to_inst(v))\n",
+    );
+    for (name, want) in [
+        ("char", "int"),
+        ("ord", "String"),
+        ("load", "String"),
+        ("dict_to_inst", "Dictionary"),
+    ] {
+        assert!(
+            rows.contains(&unsafe_arg(1, name, want, "Variant")),
+            "{rows:?}"
+        );
+    }
+}
+
+#[test]
+fn an_argvar_parameter_stays_silent_and_still_bounds_the_count() {
+    // `len` and `is_instance_of` take `ARGVAR`, a hard `Variant`, so no argument is ever unsafe —
+    // but the count still is.
+    assert!(
+        all("\tvar v = get_parent()\n\tprint(len(v))\n\tprint(is_instance_of(v, v))\n").is_empty()
+    );
+    assert_eq!(
+        errors("\tprint(len(\"ab\", \"cd\"))\n"),
+        vec![
+            "Too many arguments for \"len()\" call. Expected at most 1 but received 2.".to_owned()
+        ]
+    );
+}
+
+#[test]
+fn the_argtype_parameter_is_the_variant_type_enum() {
+    // `ARGTYPE` names the `Variant.Type` global enum, so an `int` constant passes and a `String`
+    // draws both the const-narrowing message and the argument error.
+    assert!(all("\tvar v = get_parent()\n\tprint(convert(v, TYPE_INT))\n").is_empty());
+    assert_eq!(
+        errors("\tvar v = get_parent()\n\tprint(convert(v, \"x\"))\n"),
+        vec![
+            "Cannot pass a value of type \"String\" as \"Variant.Type\".".to_owned(),
+            "Invalid argument for \"convert()\" function: argument 2 should be \"Variant.Type\" \
+             but is \"String\"."
+                .to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn the_signature_table_and_the_return_table_answer_for_the_same_names() {
+    // Three tables key off the same registration (`gd_utility_return_type`,
+    // `is_gd_utility_constant`, and the signature table). A name in one and not another is a
+    // silent gap, so pin the set.
+    for name in [
+        "convert",
+        "type_exists",
+        "char",
+        "ord",
+        "range",
+        "load",
+        "inst_to_dict",
+        "dict_to_inst",
+        "Color8",
+        "print_debug",
+        "print_stack",
+        "get_stack",
+        "len",
+        "is_instance_of",
+    ] {
+        // A call with no arguments reaches the arm for every one of these names; a name the
+        // signature table did not answer for would skip the count check and stay silent, and a
+        // name the return table did not answer for would fall through to method dispatch and
+        // report a missing function instead.
+        let rows = errors(&format!("\tvar _x = {name}()\n"));
+        assert!(
+            rows.iter().all(|m| !m.contains("not found in base")),
+            "{name} fell through to method dispatch: {rows:?}"
+        );
+    }
+}
