@@ -5552,7 +5552,51 @@ fn resolve_constant_local(ctx: &mut AnalysisContext, const_id: NodeId) {
     warn_local_shadowing(ctx, const_id, "constant");
 }
 
-/// analyzer.cpp:2124-2133 — a constant initializer must reduce to a constant expression. Godot
+/// What a bare-identifier call can do inside a constant expression.
+enum CallFold {
+    /// Never constant: blame the call itself.
+    Never,
+    /// Could have folded, so an argument is what stopped it — walk them instead.
+    Foldable,
+    /// Never folds, and Godot never blames it either: only its arguments can disqualify it.
+    ArgumentsOnly,
+}
+
+/// Classify a bare-identifier callee against Godot's own fold line, in `reduce_call`'s dispatch
+/// order (analyzer.cpp:3248-3533):
+///
+/// - a builtin constructor folds when every argument is constant and the type is not shared
+///   (:3288) — except `Array` and `Dictionary`, which `make_call_reduced_value` builds afterwards
+///   (:5407-5450);
+/// - a GDScript utility folds when its registration says it is constant (:3458);
+/// - a Variant utility folds when it is in the `UTILITY_FUNC_TYPE_MATH` set (:3509);
+/// - everything else — every project function, every engine method — never folds.
+fn const_call_fold(ctx: &AnalysisContext, name: &str) -> CallFold {
+    if matches!(name, "Array" | "Dictionary") {
+        return CallFold::ArgumentsOnly;
+    }
+    if builtin_type_from_name(name).is_some() {
+        // Reaching here means the constant fork did not fold it: a shared type it refuses outright
+        // (`PackedByteArray()`), a signature no overload matches, or a non-constant argument. Godot
+        // blames the constant in every one of those.
+        return CallFold::Never;
+    }
+    let is_utility = ctx.native.utility(name).is_some()
+        || gd_types::is_variant_utility(name)
+        || crate::reducer::is_gdscript_utility(name);
+    if is_utility {
+        return if gd_types::is_variant_utility_math(name)
+            || crate::reducer::is_gd_utility_constant(name)
+        {
+            CallFold::Foldable
+        } else {
+            CallFold::Never
+        };
+    }
+    CallFold::Never
+}
+
+/// analyzer.cpp:2124-2133 — a constant initializer must reduce to a constant expression./// analyzer.cpp:2124-2133 — a constant initializer must reduce to a constant expression. Godot
 /// decides that from `ExpressionNode::is_constant`, but only AFTER trying to force the value
 /// through `make_expression_reduced_value`, which folds arrays, dictionaries, and constant calls.
 /// gdls has no `make_*_reduced_value` family, so gating the error on the bit alone would reject
@@ -5587,12 +5631,8 @@ fn const_init_nonconstant_ref(ctx: &AnalysisContext, expr_id: NodeId) -> Option<
                 // callee — `In.new()`, `Node.new()`, `Lib1.new()`, `obj.method()` — can never fold,
                 // whatever it resolves to.
                 //
-                // An identifier callee is skipped whole, arguments included: `Vector2(1, 2)` and
-                // `Color("red")` do fold, and gdls cannot tell those from a project `my_func()`
-                // without the fold table this walk exists to avoid. Blaming an unfolded builtin
-                // constructor is tempting now that #380 decides its fold by Godot's own overload
-                // dispatch, but a fold also needs every ARGUMENT folded, and gdls has no array or
-                // dictionary value — so `const A = Array([])`, which Godot accepts, would be blamed.
+                // An identifier callee is decided by the same three-way line Godot draws, in
+                // `reduce_call`'s own dispatch order.
                 let attribute_callee = c.callee.is_some_and(|callee| {
                     matches!(
                         &ctx.node(callee).kind,
@@ -5605,6 +5645,38 @@ fn const_init_nonconstant_ref(ctx: &AnalysisContext, expr_id: NodeId) -> Option<
                 });
                 if attribute_callee {
                     return Some(id);
+                }
+                // The call folded, so it is constant by construction and its arguments cannot
+                // disqualify it.
+                if ctx.folds.is_constant(id) {
+                    continue;
+                }
+                let Some(name) = c
+                    .callee
+                    .and_then(|callee| match &ctx.node(callee).kind {
+                        NodeKind::Identifier(i) => Some(i.name.clone()),
+                        _ => None,
+                    })
+                    .filter(|_| !c.is_super)
+                else {
+                    // A bare `super()` and a callee-less call are neither foldable nor
+                    // classifiable; leave them alone rather than guess.
+                    continue;
+                };
+                match const_call_fold(ctx, &name) {
+                    // `Array(…)` / `Dictionary(…)` are the two names `make_call_reduced_value`
+                    // rescues (analyzer.cpp:5407-5450): the constructor fork refuses them because
+                    // they are shared types, and the fallback evaluator then builds them anyway.
+                    // gdls has no value for either, so the CALL is never blamed and only its
+                    // arguments are walked — `const A = Array([])` stays legal, as Godot has it.
+                    CallFold::ArgumentsOnly => stack.extend(c.arguments.iter().copied()),
+                    // A math or const-registered utility over constant arguments folds. It did
+                    // not, so an argument is to blame — walk them and let one own the error.
+                    CallFold::Foldable => stack.extend(c.arguments.iter().copied()),
+                    // Every builtin constructor that reached here failed its constant fork, and
+                    // every project function, engine method, and non-folding utility (`str`,
+                    // `randi`, `range`, `load`, `print`) never had one to fail.
+                    CallFold::Never => return Some(id),
                 }
             }
             NodeKind::BinaryOp(b) => {

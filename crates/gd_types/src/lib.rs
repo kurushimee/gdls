@@ -23,4 +23,7 @@ pub use native_db::{
     DUMP_OMITTED_NATIVE_METHODS,
 };
 pub use type_ref::{decode as decode_type, TypeRef};
-pub use utility_functions::{is_variant_utility, VARIANT_UTILITY_FUNCTIONS};
+pub use utility_functions::{
+    is_variant_utility, is_variant_utility_math, VARIANT_UTILITY_FUNCTIONS,
+    VARIANT_UTILITY_MATH_FUNCTIONS,
+};

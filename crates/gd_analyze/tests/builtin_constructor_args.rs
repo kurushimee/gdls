@@ -143,14 +143,11 @@ fn a_metatype_argument_renders_as_gdscriptnativeclass() {
 }
 
 /// A failed construct is not constant, so the fold is dropped and the constant it initializes is
-/// left unfoldable. Godot draws a second error there, `Assigned value for constant "X" isn't a
-/// constant expression.`; gdls does not, because `const_init_nonconstant_ref` skips every
-/// identifier-callee call whole and cannot be narrowed while the fold table has no array or
-/// dictionary value (`const A = Array([])` is legal and unfoldable here). That subtraction is
-/// tracked on its own; what this row pins is that the constructor error is not accompanied by a
-/// WRONG second error, and that the fold really is gone.
+/// left unfoldable. Godot draws a second error there, and since #400 so does gdls: the
+/// never-constant walk now reads the fold line for an identifier callee instead of skipping it.
+/// Both halves, in this order.
 #[test]
-fn a_failed_constant_constructor_reports_once() {
+fn a_failed_constant_constructor_reports_both_halves() {
     let msgs: Vec<String> = diagnose("extends Node\nconst X = Vector2(1, 2, 3)\n")
         .into_iter()
         .filter(|(is_err, _)| *is_err)
@@ -160,7 +157,8 @@ fn a_failed_constant_constructor_reports_once() {
         msgs,
         vec![
             r#"No constructor of "Vector2" matches the signature "Vector2(int, int, int)"."#
-                .to_owned()
+                .to_owned(),
+            r#"Assigned value for constant "X" isn't a constant expression."#.to_owned(),
         ]
     );
 }

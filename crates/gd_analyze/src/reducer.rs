@@ -3489,6 +3489,22 @@ fn assign_op_variant_name(op: gd_syntax::ast::AssignOp) -> &'static str {
 /// pointer-like, so writing through it does not modify a temporary and the nested-read-only
 /// subscript walk leaves it alone; a non-shared type (`Vector3`, `Color`, …) draws the error on
 /// `state.center_of_mass.x +=`.
+/// The types a builtin constructor refuses to fold at compile time: they are stored by reference,
+/// so one folded value would be shared by every construction of it. 4.7 spells this
+/// `!Variant::is_type_shared(builtin_type)` (analyzer.cpp:3288); 4.6 spelled it as a hardcoded
+/// `safe_to_fold` switch (analyzer.cpp:3260-3282 at that tag) listing exactly the same 13 types.
+///
+/// So the gate is TAG-INVARIANT and owes no dialect guard — unlike [`variant_is_type_shared`],
+/// whose list genuinely grew between the tags and whose guard belongs to its other caller, the
+/// nested read-only subscript walk. Reading the guarded version here made gdls fold a
+/// `PackedByteArray()` constructor under dialect 4.6 that Godot 4.6 refuses to fold.
+fn constructor_fold_blocked(t: VariantType) -> bool {
+    matches!(
+        t,
+        VariantType::Object | VariantType::Dictionary | VariantType::Array
+    ) || data_type::is_packed_array(t)
+}
+
 pub(crate) fn variant_is_type_shared(dialect: Dialect, t: VariantType) -> bool {
     // DIALECT(4.7): variant.cpp:3437 — the ten Packed*Array types became shared. At 4.6 the whole
     // list is Object/Array/Dictionary (variant.cpp:3433 at that tag).
@@ -3774,6 +3790,10 @@ fn reduce_builtin_constructor(
     };
     let args = call.arguments.clone();
     let all_is_constant = args.iter().all(|&a| ctx.folds.is_constant(a));
+    // Godot's own fold gate (analyzer.cpp:3288). A shared type is never folded at a constructor
+    // site, whatever its arguments did, so `const P = PackedByteArray()` is not a constant
+    // expression — at either tag (see [`constructor_fold_blocked`]).
+    let can_fold = all_is_constant && !constructor_fold_blocked(bt);
 
     // Godot evaluates a constant constructor call into a real value; gdls can't materialize a
     // non-scalar one, so an Opaque fold keeps the constancy — `match v:\n\tVector2(-1, -1):` stays
@@ -3783,7 +3803,7 @@ fn reduce_builtin_constructor(
     // draw the companion "isn't a constant expression" error.
     macro_rules! finish {
         ($fold:expr) => {{
-            if $fold && all_is_constant {
+            if $fold && can_fold {
                 ctx.folds.set(id, FoldedValue::Opaque(bt, None));
             }
             ctx.set_type(id, call_type);
@@ -3803,7 +3823,7 @@ fn reduce_builtin_constructor(
         finish!(true)
     }
 
-    if all_is_constant && !variant_is_type_shared(ctx.dialect, bt) {
+    if can_fold {
         // --- the constant fork (analyzer.cpp:3288-3335) -----------------------------------------
         let mut values = Vec::with_capacity(args.len());
         for &a in &args {
@@ -4124,12 +4144,25 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // `GDScriptUtilityFunctions::function_exists`; gdls checks the NativeDb first (Variant
         // utilities from extension_api.json) then a hard-coded GDScript utility table mirroring
         // `gdscript_utility_functions.cpp:570-592`.
+        //
+        // The two families carry different fold rules, so which one answered has to be carried out
+        // of the lookup: a Variant utility folds when it is in the `UTILITY_FUNC_TYPE_MATH` set
+        // (analyzer.cpp:3509), a GDScript one when its registration's `is_constant` column says so
+        // (analyzer.cpp:3458). The names are disjoint, so the lookup order does not matter.
         let utility_return = ctx
             .native
             .utility(&function_name)
-            .map(|u| type_from_type_ref(ctx, &u.return_type))
-            .or_else(|| gd_utility_return_type(&function_name));
-        if let Some(return_type) = utility_return {
+            .map(|u| {
+                (
+                    type_from_type_ref(ctx, &u.return_type),
+                    gd_types::is_variant_utility_math(&function_name),
+                )
+            })
+            .or_else(|| {
+                gd_utility_return_type(&function_name)
+                    .map(|t| (t, is_gd_utility_constant(&function_name)))
+            });
+        if let Some((return_type, folds_at_compile_time)) = utility_return {
             if !is_root
                 && return_type.kind == DtKind::Builtin
                 && return_type.builtin_type == VariantType::Nil
@@ -4206,6 +4239,25 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                             id,
                         );
                     }
+                }
+            }
+            // analyzer.cpp:3458 / :3509 — a foldable utility over constant arguments is called at
+            // compile time and its result becomes the call's `reduced_value`. gdls cannot call the
+            // engine, so it records the constancy and, where the registration names a concrete
+            // builtin return, an `Opaque` of that type.
+            //
+            // A Variant-returning one (`abs`, `min`, `clamp`, `lerp`, `convert`, …) gets the
+            // constancy BIT ONLY. Stamping `Opaque(Nil)` would feed the binary-op Opaque
+            // validation an operand type that is not the real one, and `const M = min(1, 2) + 1`
+            // — which Godot accepts — would draw `Invalid operands to operator +, Nil and int.`.
+            if folds_at_compile_time && call.arguments.iter().all(|&a| ctx.folds.is_constant(a)) {
+                if return_type.kind == DtKind::Builtin
+                    && return_type.builtin_type != VariantType::Nil
+                {
+                    ctx.folds
+                        .set(id, FoldedValue::Opaque(return_type.builtin_type, None));
+                } else {
+                    ctx.folds.mark_constant(id);
                 }
             }
             ctx.set_type(id, return_type);
@@ -5735,6 +5787,21 @@ pub(crate) fn gd_utility_return_type(name: &str) -> Option<DataType> {
         "is_instance_of" => builtin(VariantType::Bool),
         _ => return None,
     })
+}
+
+/// `GDScriptUtilityFunctions::is_function_constant` (gdscript_utility_functions.cpp:642), reading
+/// the `is_constant` column of the `REGISTER_FUNC` table at :570-589. These are the GDScript-only
+/// utilities Godot evaluates at compile time, so `const A = len("ab")` is legal while
+/// `const B = range(3)` is not.
+///
+/// The column is identical at both supported tags; 4.7 only moved `type_exists` behind
+/// `DISABLE_DEPRECATED`, which gdls mirrors as a default build (`docs/02` §11d). Names are the
+/// registered ones, so `_char` registers as `char`.
+pub(crate) fn is_gd_utility_constant(name: &str) -> bool {
+    matches!(
+        name,
+        "convert" | "type_exists" | "char" | "_char" | "ord" | "Color8" | "len" | "is_instance_of"
+    )
 }
 
 /// Whether `name` is a GDScript-only utility function (`len`, `range`, `load`, …) — the
