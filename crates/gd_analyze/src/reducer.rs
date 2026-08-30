@@ -5952,10 +5952,19 @@ enum ChainCall {
 }
 
 /// Look up `function_name` as a Func through `start`'s full extends chain, synthesizing a
-/// permissive [`CallSig`]: the return type projects through the declared annotation (what kills
-/// the `x := obj.method()` INFERENCE_ON_VARIANT false positives) while params stay Variant —
-/// arity is exact (`required_params` carries defaults), argument-type errors against a shallow
-/// interface are not worth the false-positive risk.
+/// [`CallSig`] from the declaring file's interface: the return type projects through the declared
+/// annotation (what kills the `x := obj.method()` INFERENCE_ON_VARIANT false positives), the arity
+/// is exact (`required_params` carries defaults), and each parameter projects through its own
+/// annotation the same way (#336).
+///
+/// Per-parameter degradation is what makes the argument check safe without a signature-wide gate.
+/// [`resolve_interface_type_expr`] never diagnoses and never returns Unresolved — an annotation it
+/// cannot see (an unannotated param, a preload-const type alias, a class not indexed yet) comes
+/// back SOFT Variant, and every check in the argument loop is gated on `par_type.is_hard_type()`.
+/// So a slot with no evidence is silent by construction, while the slots that do carry evidence
+/// get checked. That is upstream's granularity too: `type_from_property` degrades per property,
+/// never per method (analyzer.cpp:6127-6129). A real `f(x: Variant)` is a different thing — it
+/// comes back HARD Variant, which every gate accepts, so it stays silent as well.
 fn script_chain_call(
     ctx: &mut AnalysisContext,
     start: &crate::data_type::ScriptRef,
@@ -5981,10 +5990,15 @@ fn script_chain_call(
     };
     let par_n = member.params.len();
     let return_dt = resolve_interface_type_expr(ctx, link.file, &member.ty);
+    let par_types: Vec<DataType> = member
+        .params
+        .iter()
+        .map(|p| resolve_interface_type_expr(ctx, link.file, p))
+        .collect();
     ChainCall::Sig(
         Box::new(CallSig {
             return_dt,
-            par_types: vec![DataType::variant(); par_n],
+            par_types,
             min_params: member.required_params,
             max_params: par_n,
             // The interface carries the func's rest-parameter (`...args`) flag — a vararg method
