@@ -292,51 +292,174 @@ fn annotation_target_kind(name: &str) -> Option<u32> {
     })
 }
 
-/// Every registered annotation `(name_with_@, takes_arguments)`, transcribed from the
-/// `register_annotation(MethodInfo("@…", …), …)` calls in `GDScriptParser::GDScriptParser()`
-/// (`gdscript_parser.cpp:149-190`) — the **single source of truth** the M8 `ANNOTATION` completion
-/// renders from (Godot's `get_annotation_list` iterates the same `valid_annotations` registry).
-/// `takes_arguments` is `true` exactly when the registering `MethodInfo` carried one or more
-/// `PropertyInfo` parameters (so completion appends `(`, matching `gdscript_editor.cpp:3473`). The
-/// names are kept in Godot's registration order; the completion renderer sorts as needed.
-pub const REGISTERED_ANNOTATIONS: &[(&str, bool)] = &[
-    ("@tool", false),
-    ("@icon", true),
-    ("@static_unload", false),
-    ("@abstract", false),
-    ("@onready", false),
-    ("@export", false),
-    ("@export_enum", true),
-    ("@export_file", true),
-    ("@export_file_path", true),
-    ("@export_dir", false),
-    ("@export_global_file", true),
-    ("@export_global_dir", false),
-    ("@export_multiline", true),
-    ("@export_placeholder", true),
-    ("@export_range", true),
-    ("@export_exp_easing", true),
-    ("@export_color_no_alpha", false),
-    ("@export_node_path", true),
-    ("@export_flags", true),
-    ("@export_flags_2d_render", false),
-    ("@export_flags_2d_physics", false),
-    ("@export_flags_2d_navigation", false),
-    ("@export_flags_3d_render", false),
-    ("@export_flags_3d_physics", false),
-    ("@export_flags_3d_navigation", false),
-    ("@export_flags_avoidance", false),
-    ("@export_storage", false),
-    ("@export_custom", true),
-    ("@export_tool_button", true),
-    ("@export_category", true),
-    ("@export_group", true),
-    ("@export_subgroup", true),
-    ("@warning_ignore", true),
-    ("@warning_ignore_start", true),
-    ("@warning_ignore_restore", true),
-    ("@rpc", true),
-];
+/// The `Variant::Type` of a registered annotation parameter. Only the three types that appear in
+/// the registrations at `gdscript_parser.cpp:149-190` are represented — verified identical at both
+/// supported tags — and the names are `Variant::get_type_name`'s. This is GDScript-language data,
+/// not engine knowledge: nothing here reaches the native-class DB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnotationParamType {
+    Int,
+    Float,
+    String,
+}
+
+/// One `PropertyInfo(Variant::T, "name")` parameter of a registered annotation. The name is carried
+/// so the table reads as the mechanical transcription it is; nothing consumes it yet.
+#[derive(Clone, Copy, Debug)]
+pub struct AnnotationParam {
+    pub ty: AnnotationParamType,
+    pub name: &'static str,
+}
+
+/// One `register_annotation(MethodInfo("@…", …), …, p_default_arguments, p_is_vararg)` call.
+#[derive(Clone, Copy, Debug)]
+pub struct RegisteredAnnotation {
+    pub name: &'static str,
+    /// The `MethodInfo` parameter list, in declaration order.
+    pub params: &'static [AnnotationParam],
+    /// `p_default_arguments.size()` — how many trailing parameters the `varray(…)` supplies. The
+    /// default VALUES are not transcribed because no ported check reads them; each entry's comment
+    /// carries the literal `varray` so the count can be re-derived at the next audit.
+    pub default_arg_count: usize,
+    /// `p_is_vararg`, which sets `METHOD_FLAG_VARARG` (`gdscript_parser.cpp:1928`).
+    pub is_vararg: bool,
+}
+
+impl RegisteredAnnotation {
+    /// Whether completion should append `(` — true exactly when the registering `MethodInfo`
+    /// carried at least one parameter (`gdscript_editor.cpp:3473`).
+    #[must_use]
+    pub fn takes_arguments(&self) -> bool {
+        !self.params.is_empty()
+    }
+
+    /// The smallest legal argument count: `arguments.size() - default_arguments.size()`
+    /// (`gdscript_parser.cpp:4416`). Enforced for varargs too.
+    #[must_use]
+    pub fn min_arguments(&self) -> usize {
+        self.params.len() - self.default_arg_count
+    }
+}
+
+const fn p(ty: AnnotationParamType, name: &'static str) -> AnnotationParam {
+    AnnotationParam { ty, name }
+}
+
+const fn ann(
+    name: &'static str,
+    params: &'static [AnnotationParam],
+    default_arg_count: usize,
+    is_vararg: bool,
+) -> RegisteredAnnotation {
+    RegisteredAnnotation {
+        name,
+        params,
+        default_arg_count,
+        is_vararg,
+    }
+}
+
+/// Every registered annotation, transcribed from the `register_annotation(MethodInfo("@…", …), …)`
+/// calls in `GDScriptParser::GDScriptParser()` (`gdscript_parser.cpp:149-190`) — the **single source
+/// of truth** for both the M8 `ANNOTATION` completion (Godot's `get_annotation_list` iterates the
+/// same `valid_annotations` registry) and [`Parser::validate_annotation_arguments`]. The block is
+/// byte-identical at 4.6.3 and 4.7.2, so no dialect guard is owed. Names stay in Godot's
+/// registration order; the completion renderer sorts as needed.
+pub const REGISTERED_ANNOTATIONS: &[RegisteredAnnotation] = {
+    use AnnotationParamType::{Float, Int, String};
+    &[
+        // Script annotations.
+        ann("@tool", &[], 0, false),
+        ann("@icon", &[p(String, "icon_path")], 0, false),
+        ann("@static_unload", &[], 0, false),
+        ann("@abstract", &[], 0, false),
+        // Onready annotation.
+        ann("@onready", &[], 0, false),
+        // Export annotations.
+        ann("@export", &[], 0, false),
+        ann("@export_enum", &[p(String, "names")], 0, true), // varray()
+        ann("@export_file", &[p(String, "filter")], 1, true), // varray("")
+        ann("@export_file_path", &[p(String, "filter")], 1, true), // varray("")
+        ann("@export_dir", &[], 0, false),
+        ann("@export_global_file", &[p(String, "filter")], 1, true), // varray("")
+        ann("@export_global_dir", &[], 0, false),
+        ann("@export_multiline", &[p(String, "hint")], 1, true), // varray("")
+        ann("@export_placeholder", &[p(String, "placeholder")], 0, false),
+        ann(
+            "@export_range",
+            &[
+                p(Float, "min"),
+                p(Float, "max"),
+                p(Float, "step"),
+                p(String, "extra_hints"),
+            ],
+            2, // varray(1.0, "")
+            true,
+        ),
+        ann("@export_exp_easing", &[p(String, "hints")], 1, true), // varray("")
+        ann("@export_color_no_alpha", &[], 0, false),
+        ann("@export_node_path", &[p(String, "type")], 1, true), // varray("")
+        ann("@export_flags", &[p(String, "names")], 0, true),    // varray()
+        ann("@export_flags_2d_render", &[], 0, false),
+        ann("@export_flags_2d_physics", &[], 0, false),
+        ann("@export_flags_2d_navigation", &[], 0, false),
+        ann("@export_flags_3d_render", &[], 0, false),
+        ann("@export_flags_3d_physics", &[], 0, false),
+        ann("@export_flags_3d_navigation", &[], 0, false),
+        ann("@export_flags_avoidance", &[], 0, false),
+        ann("@export_storage", &[], 0, false),
+        // `hint` and `usage` also carry PROPERTY_USAGE_CLASS_IS_ENUM("PropertyHint") and
+        // CLASS_IS_BITFIELD("PropertyUsageFlags"); validation reads only `Variant::INT`.
+        ann(
+            "@export_custom",
+            &[p(Int, "hint"), p(String, "hint_string"), p(Int, "usage")],
+            1, // varray(PROPERTY_USAGE_DEFAULT)
+            false,
+        ),
+        ann(
+            "@export_tool_button",
+            &[p(String, "text"), p(String, "icon")],
+            1, // varray("")
+            false,
+        ),
+        // Export grouping annotations.
+        ann("@export_category", &[p(String, "name")], 0, false),
+        ann(
+            "@export_group",
+            &[p(String, "name"), p(String, "prefix")],
+            1, // varray("")
+            false,
+        ),
+        ann(
+            "@export_subgroup",
+            &[p(String, "name"), p(String, "prefix")],
+            1, // varray("")
+            false,
+        ),
+        // Warning annotations.
+        ann("@warning_ignore", &[p(String, "warning")], 0, true), // varray()
+        ann("@warning_ignore_start", &[p(String, "warning")], 0, true), // varray()
+        ann("@warning_ignore_restore", &[p(String, "warning")], 0, true), // varray()
+        // Networking. Keep in sync with `rpc_annotation()`.
+        ann(
+            "@rpc",
+            &[
+                p(String, "mode"),
+                p(String, "sync"),
+                p(String, "transfer_mode"),
+                p(Int, "transfer_channel"),
+            ],
+            4, // varray("authority", "call_remote", "reliable", 0)
+            false,
+        ),
+    ]
+};
+
+/// The registration for `name` (with its leading `@`), or `None` when the name is not registered.
+#[must_use]
+pub fn registered_annotation(name: &str) -> Option<&'static RegisteredAnnotation> {
+    REGISTERED_ANNOTATIONS.iter().find(|a| a.name == name)
+}
 
 /// The lowercase noun Godot uses for a class member of this kind (`Member::get_type_name`).
 fn member_type_name(member: &Member) -> &'static str {
@@ -2959,9 +3082,11 @@ impl Parser {
         Some(function)
     }
 
-    /// Parse `@annotation[(args)]` (`cpp:1817`). Annotation argument *validation* and *application*
-    /// are deferred to the analyzer; we keep the name/target/argument structure and the parser-level
-    /// diagnostics (unrecognized name, wrong level).
+    /// Parse `@annotation[(args)]` (`cpp:1817`) and check its name, its target level, and its
+    /// argument COUNT. The per-argument TYPE check is not here and is not an omission: Godot runs it
+    /// in `GDScriptAnalyzer::resolve_annotation` (`gdscript_analyzer.cpp:1673`), and its own comment
+    /// at `gdscript_parser.cpp:4442` says so. Annotation *application* — the per-annotation `apply`
+    /// callbacks — is likewise the analyzer's, however the C++ files are laid out.
     fn parse_annotation(&mut self, valid_targets: u32) -> Option<NodeId> {
         let annotation = self.alloc(NodeKind::Annotation(AnnotationNode::default()));
         let name = self.previous.literal.clone();
@@ -3041,11 +3166,82 @@ impl Parser {
 
         self.match_token(TokenKind::Newline); // Newline after annotation is optional.
 
+        // cpp:1907-1909 — only a name-and-level-valid annotation gets its arguments checked, so a
+        // misplaced one draws one error rather than two.
+        if valid {
+            valid = self.validate_annotation_arguments(annotation);
+        }
+
         if valid {
             Some(annotation)
         } else {
             None
         }
+    }
+
+    /// `GDScriptParser::validate_annotation_arguments` (`gdscript_parser.cpp:4406-4444`): the
+    /// argument count against the registered `MethodInfo`, plus the string-literal requirement for
+    /// the three annotations the parser resolves itself.
+    ///
+    /// Arity reads off the registration two ways. The maximum is the parameter count and is skipped
+    /// entirely for a vararg registration (`METHOD_FLAG_VARARG`, :4411); the minimum is the
+    /// parameter count minus the default count and is enforced even for a vararg (:4416). So
+    /// `@export_range` is "at least 2, no maximum", `@rpc` is "0 to 4", `@export_file` is anything,
+    /// and `@tool` is exactly none. Godot does not pluralize either message — `requires at least 1
+    /// arguments` is its literal output, and the port keeps it.
+    ///
+    /// Returning `false` drops the annotation before it reaches the annotation stack, exactly as
+    /// Godot's `nullptr` does.
+    fn validate_annotation_arguments(&mut self, annotation: NodeId) -> bool {
+        let (name, arguments) = match &self.tree.get(annotation).kind {
+            NodeKind::Annotation(a) => (a.name.clone(), a.arguments.clone()),
+            _ => return false,
+        };
+        // cpp:4407 — `parse_annotation` only reaches here for a registered name.
+        let Some(info) = registered_annotation(&name) else {
+            return false;
+        };
+
+        if !info.is_vararg && arguments.len() > info.params.len() {
+            self.push_error(format!(
+                r#"Annotation "{name}" requires at most {} arguments, but {} were given."#,
+                info.params.len(),
+                arguments.len()
+            ));
+            return false;
+        }
+        let min = info.min_arguments();
+        if arguments.len() < min {
+            self.push_error(format!(
+                r#"Annotation "{name}" requires at least {min} arguments, but {} were given."#,
+                arguments.len()
+            ));
+            return false;
+        }
+
+        // cpp:4422-4441 — "Some annotations need to be resolved and applied in the parser." Both of
+        // Godot's failure legs are one check here: `string_literal_value` is `Some` only for a plain
+        // String literal, so a non-literal expression and a `StringName`/`NodePath`/int literal are
+        // rejected alike, which is what the two legs amount to.
+        if matches!(
+            name.as_str(),
+            "@icon" | "@warning_ignore_start" | "@warning_ignore_restore"
+        ) {
+            for (i, &argument) in arguments.iter().enumerate() {
+                if self.string_literal_value(argument).is_none() {
+                    self.push_error_at(
+                        argument,
+                        format!(
+                            r#"Argument {} of annotation "{name}" must be a string literal."#,
+                            i + 1
+                        ),
+                    );
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 
     /// Godot `warning_ignore_annotation` (`gdscript_parser.cpp:5105-5179`) validates warning names
@@ -3120,13 +3316,12 @@ impl Parser {
             };
 
             for arg_id in args {
-                // Godot's `validate_annotation_arguments` (gdscript_parser.cpp:4377-4391) requires
+                // [`Self::validate_annotation_arguments`] (gdscript_parser.cpp:4422-4441) requires
                 // every `@warning_ignore_start`/`_restore` argument to be a `Variant::STRING`
                 // literal — a `StringName` (`&"…"`) or `NodePath` (`^"…"`) is rejected before it
-                // reaches `resolved_arguments`, so the region bookkeeping never sees it. (gdls does
-                // not yet emit Godot's "Argument N … must be a string literal." error for those —
-                // a deferred `validate_annotation_arguments` port — but it must at least not run
-                // region bookkeeping on an argument Godot discards.)
+                // reaches `resolved_arguments`, so the region bookkeeping never sees it. That check
+                // errors and drops the whole annotation; this one still has to skip such an
+                // argument, since the walk reads the arena rather than the annotation stack.
                 let Some(raw) = self.string_literal_value(arg_id) else {
                     continue;
                 };
