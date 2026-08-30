@@ -5471,83 +5471,70 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // user error. Degrade silently here; the typed-builtin-method registry lands with the
         // typed-collection slice.
         //
-        // analyzer.cpp:3725-3727 — UNSAFE_METHOD_ACCESS warning. Godot warns when a call
-        // method-lookup couldn't bind statically and the base is a soft Variant (gradual-typing
-        // fallback). Gate narrowly: only when the call is a subscript-attribute access on an
-        // identifier base that resolves to a function parameter declared with no annotation
-        // (the canonical "untyped parameter" gradual-typing shape). This is the corpus's
-        // `param.free()` case in `auto_inferred_type_dont_error.gd` and avoids the broader
-        // gradual-typing surface that would false-positive every variant-base call.
-        if is_subscript_callee && base_type.kind == DtKind::Variant && !base_type.is_hard_type() {
-            let base_is_untyped_param = call
-                .callee
-                .and_then(|c| match &ctx.node(c).kind {
-                    NodeKind::Subscript(s) => s.base,
-                    _ => None,
-                })
-                .and_then(|bid| match &ctx.node(bid).kind {
-                    NodeKind::Identifier(i) => Some(i.name.clone()),
-                    _ => None,
-                })
-                .and_then(|name| {
-                    ctx.current_function.and_then(|fn_id| {
-                        function_param_named(ctx, fn_id, &name).and_then(|pid| {
-                            match &ctx.node(pid).kind {
-                                NodeKind::Parameter(p) => {
-                                    // Godot's gate: parameter has no datatype_specifier
-                                    // AND no infer (`:=`). Both off means an untyped default.
-                                    if p.datatype_specifier.is_none() && !p.infer_datatype {
-                                        Some(())
-                                    } else {
-                                        None
-                                    }
-                                }
-                                _ => None,
-                            }
-                        })
-                    })
-                })
-                .is_some();
-            if base_is_untyped_param {
-                ctx.push_warning(
-                    crate::warnings::WarningCode::UnsafeMethodAccess,
-                    &[function_name.clone(), "Variant".to_owned()],
-                    id,
-                );
-            }
-        }
         // analyzer.cpp:3749-3753 — UNSAFE_METHOD_ACCESS on a method miss. Upstream's gate is
         // `!is_self && !(hard && BUILTIN)`: kind-agnostic, meta-agnostic, and it interpolates
         // `base_type.to_string()` raw, still a metatype, with no `type_from_metatype` conversion
         // anywhere in the miss branch. So a CLASS base renders as its identifier, which is why
         // upstream prints `"Weapon"`, `"MissProbe2"`, `"Inner"`.
         //
-        // gdls narrows that gate to the shapes where the miss is PROVABLE, per base kind. Every
-        // arm is a negative claim — "this name exists nowhere on this base" — so each has to show
-        // its chain was actually walked before it may speak, and all of them need `Exact`: the
-        // walk bottoms out in the native dump, and under a `Generic`/`Absent` DB a custom engine
-        // build may define exactly the method the dump lacks (#24).
+        // gdls splits that gate by base kind, because the same sentence claims two different
+        // things. On a `Class`, `Script` or non-meta `Native` base it asserts that a surface gdls
+        // walked lacks the name — a negative claim, so the ancestry must be introspectable end to
+        // end and the name must not shadow a metatype value. On a `Variant` base there is no
+        // surface to walk and the miss holds by construction, so the same row needs no chain
+        // firewall at all (#433). Hardness is NOT a gate of its own: upstream's test only ever
+        // excludes hard builtins, and a soft `Native`, `Class`, `Script` or `Builtin` miss warns
+        // upstream exactly as a hard one does.
         //
         // #418 widened this past `DtKind::Native`. It was Native-only because a Script or Class
         // miss used to degrade before reaching the branch; both now route here when their chain
         // is introspectable, so the claim is made at the one site that can see `name_is_value`.
-        let warn_miss_is_provable = match base_type.kind {
+        let warn_miss_gate = match base_type.kind {
+            // Nothing to walk: Variant has no static method surface, here or upstream, so the
+            // miss holds by construction and there is no absence to prove. Upstream warns on
+            // every shape of it — a hard `v: Variant`, a soft untyped local or parameter, the
+            // meta Variant the pseudo-type errors leave behind, and the dummy an undeclared
+            // identifier or an unfindable type leaves — printing `"Variant"` for all of them.
+            DtKind::Variant => true,
+            // An enum VALUE base warns beside its own `Cannot call function on enum value.`
+            // pair. The enum METAtype is the arm upstream's warning is an `else if` of, so it
+            // never reaches the probe.
+            DtKind::Enum => !base_type.is_meta_type,
             // A native METAtype miss is Godot's `"GDScriptNativeClass"` shape, which gdls does
             // not render; left out deliberately, as an under-report.
             DtKind::Native => !base_type.is_meta_type,
             DtKind::Class | DtKind::Script => true,
-            // Builtin is upstream's own exclusion. An ENUM metatype is excluded by the enum arm
-            // upstream is an `else if` of. A soft Variant keeps the narrow untyped-parameter arm
-            // above; a hard Variant is a documented under-report.
+            // Upstream's own exclusion is `hard && BUILTIN` — so a SOFT builtin miss warns
+            // (`"int"`), provided the dump carries that builtin's method table. `Nil` stays out:
+            // it renders `"null"`, a string this warning never prints upstream.
+            DtKind::Builtin => {
+                !base_type.is_hard_type()
+                    && !base_type.is_meta_type
+                    && base_type.builtin_type != VariantType::Nil
+                    && ctx
+                        .native
+                        .builtin_named(crate::data_type::variant_type_name(base_type.builtin_type))
+                        .is_some()
+            }
+            // Resolving / Unresolved stay silent: an under-report beside the error already out.
             _ => false,
         };
+        // The chain firewall belongs only to the kinds that claim to have WALKED a surface.
+        // `Exact` belongs to all of them: for the walked kinds because the claim bottoms out in
+        // the dump, and for `Variant` and enum values because under a `Generic` or `Absent` DB
+        // gdls manufactures Variants upstream never has (a stock-surface property miss degrades
+        // silently), each of which would launder into a phantom `"Variant"` row one call later.
+        let needs_chain_firewall = matches!(
+            base_type.kind,
+            DtKind::Native | DtKind::Class | DtKind::Script
+        );
         if !name_is_value
             && !is_self
             && !call.is_super
-            && base_type.is_hard_type()
-            && warn_miss_is_provable
-            && base_is_introspectable(ctx, &base_type)
-            && !metatype_value_shadow(ctx, &base_type, &function_name)
+            && warn_miss_gate
+            && (!needs_chain_firewall
+                || (base_is_introspectable(ctx, &base_type)
+                    && !metatype_value_shadow(ctx, &base_type, &function_name)))
             && ctx.native.provenance() == gd_types::ApiProvenance::Exact
         {
             ctx.push_warning(
@@ -6834,6 +6821,29 @@ pub(crate) fn resolve_interface_type_expr(
     {
         // An inner class of the declaring file (`var helper: InnerHelper`).
         return script_instance_datatype(ctx, declaring_file, path.clone());
+    } else if let Some(sref) = declaring_const_script(ctx, declaring_file, first) {
+        // A CONSTANT of the declaring file that names a script, used as a type:
+        // `const External2 = preload("…")` then `func f() -> External2`. Godot resolves it
+        // through the class's own constants (analyzer.cpp:847-900); the interface path reaches
+        // the same answer through the constant's recorded initializer shape. The trailing
+        // segments walk the same way a global class's do — `A.APrime` is an inner class of the
+        // preloaded script, `C.TestEnum` one of its enums — and the metatype lowers to the
+        // instance, like every other type position.
+        if path.len() == 2 {
+            if let Some(dt) = cross_file_enum_instance(ctx, sref.file, &path[1]) {
+                return dt;
+            }
+        }
+        if path.len() > 1 {
+            let mut inner = sref.inner.clone();
+            inner.extend(path[1..].iter().cloned());
+            let chain: Vec<&str> = inner.iter().map(String::as_str).collect();
+            if ctx.xfile.resolve_inner_chain(sref.file, &chain).is_some() {
+                return script_instance_datatype(ctx, sref.file, inner);
+            }
+            return DataType::variant();
+        }
+        return script_instance_datatype(ctx, sref.file, sref.inner);
     } else if ctx.native.global_enum(first).is_some() {
         result = crate::resolver::make_global_enum_type(ctx, first, "", false);
     } else if let Some(fid) = ctx.xfile.autoload_file(first) {
@@ -7117,6 +7127,31 @@ fn type_of_iface_member(
         }
         other => other,
     }
+}
+
+/// The script a constant of `file` (or its bases) names, for a TYPE position. Anything that is not
+/// a script metatype answers `None`, so a constant holding an int or a texture never becomes a
+/// type.
+fn declaring_const_script(
+    ctx: &mut AnalysisContext,
+    file: gd_project::FileId,
+    name: &str,
+) -> Option<crate::data_type::ScriptRef> {
+    let start = crate::data_type::ScriptRef {
+        file,
+        inner: Vec::new(),
+    };
+    let (decl_link, member) = iface_member_in_chain(ctx, &start, name)?;
+    if member.kind != gd_project::MemberKind::Const {
+        return None;
+    }
+    let ShapeAnswer::Type(dt) = type_of_iface_member(ctx, &decl_link, &member) else {
+        return None;
+    };
+    if dt.kind != DtKind::Script || !dt.is_meta_type {
+        return None;
+    }
+    dt.script_type.clone()
 }
 
 /// Fill in `dt` from the member's recorded initializer shape, for a member the shallow interface
