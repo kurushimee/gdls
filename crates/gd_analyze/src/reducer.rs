@@ -1713,7 +1713,14 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
 
     if !is_forward {
         if let Some(local) = lookup_local(ctx, &name) {
-            let dt = ctx.get_type(local.source).clone();
+            let mut dt = ctx.get_type(local.source).clone();
+            // analyzer.cpp:4454-4458 — a `LOCAL_BIND` read is stamped constant, which is what
+            // draws `Cannot assign a new value to a constant.` on `var b: ... b = 1`. A
+            // `LOCAL_ITERATOR` deliberately is not (:4450-4453), so a `for` variable stays
+            // assignable.
+            if local.kind == gd_syntax::ast::LocalKind::PatternBind {
+                dt.is_constant = true;
+            }
             if local.kind == gd_syntax::ast::LocalKind::Constant {
                 if let Some(init) = constant_initializer_of(ctx, local.source) {
                     if let Some(fv) = ctx.folds.get(init).cloned() {
