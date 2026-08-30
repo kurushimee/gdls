@@ -9041,12 +9041,12 @@ fn rename_override_group_locations(
         OverrideGroup::Single => return Ok(None),
         OverrideGroup::NativeRooted(cls) => {
             return Err(RequestRefusal::not_editable(format!(
-                "Cannot rename `{name}` to `{new_name}`: it overrides `{cls}.{name}`,                  a native engine method that cannot be renamed"
+                "Cannot rename `{name}` to `{new_name}`: it overrides `{cls}.{name}`, a native engine method that cannot be renamed"
             )))
         }
         OverrideGroup::Unprovable => {
             return Err(RequestRefusal::not_editable(format!(
-                "Cannot rename `{name}`: its override chain could not be resolved, so the                  rename cannot be applied to every class that declares it"
+                "Cannot rename `{name}`: its override chain could not be resolved, so the rename cannot be applied to every class that declares it"
             )))
         }
         OverrideGroup::Group(members) => members,
