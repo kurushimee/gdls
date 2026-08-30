@@ -5717,6 +5717,34 @@ fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: b
                     );
                 }
 
+                // analyzer.cpp:5041-5045 — an OBJECT base is indexed by property name, so
+                // anything that is not a `String` or a `StringName` cannot address it. A
+                // `Variant` index stays permissive, since the gradual-typing fallback is
+                // indistinguishable from an unannotated string here.
+                //
+                // The kind list is Godot's `kind != BUILTIN` narrowed by the `is_variant()`
+                // guard that opens the whole block (analyzer.cpp:4937): a Variant base is
+                // unsafe, not wrong. gdls also excludes its own `Unresolved` degrade, which
+                // upstream has no equivalent of — claiming a base gdls could not resolve
+                // rejects an int index would false-positive on exactly the projects it serves.
+                if matches!(
+                    base_type.kind,
+                    DtKind::Native | DtKind::Script | DtKind::Class | DtKind::Enum
+                ) && !index_type.is_variant()
+                    && index_type.is_set()
+                    && !matches!(
+                        index_type.builtin_type,
+                        VariantType::String | VariantType::StringName
+                    )
+                {
+                    ctx.push_error(
+                        format!(
+                            r#"Only "String" or "StringName" can be used as index for type "{base_type}", but received "{index_type}"."#
+                        ),
+                        idx,
+                    );
+                }
+
                 // analyzer.cpp:5047-5145 — the result-type table. Indexing a builtin has a
                 // KNOWN element type for most bases (`PackedByteArray[i]` is an int,
                 // `PackedVector2Array[i]` a Vector2, `String[i]` a String), and the result is
@@ -5744,8 +5772,8 @@ fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: b
                     };
                     let mut stamp = true;
                     match base_type.builtin_type {
-                        // Can't index at all (analyzer.cpp:5058-5068). The error itself is a
-                        // separate slice; only the type is stamped here.
+                        // Can't index at all (analyzer.cpp:5058-5068). Godot leaves the result
+                        // a `Variant` and says so; gdls used to stamp the type and stay silent.
                         VariantType::Rid
                         | VariantType::Bool
                         | VariantType::Callable
@@ -5754,7 +5782,15 @@ fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: b
                         | VariantType::Nil
                         | VariantType::NodePath
                         | VariantType::Signal
-                        | VariantType::StringName => stamp = false,
+                        | VariantType::StringName => {
+                            stamp = false;
+                            ctx.push_error(
+                                format!(
+                                    r#"Cannot use subscript operator on a base of type "{base_type}"."#
+                                ),
+                                base_id,
+                            );
+                        }
                         // Return int.
                         VariantType::PackedByteArray
                         | VariantType::PackedInt32Array
