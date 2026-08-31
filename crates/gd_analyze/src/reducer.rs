@@ -216,16 +216,13 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
                         // bare `name()` or `hp()` naming a member of the chain drew nothing at
                         // all: not the value-callable pair Godot answers with, and not not-found
                         // either (the chain-shadow gate correctly refuses to claim absence).
-                        let prev = ctx.reducing_callee;
                         let prev_node = ctx.reducing_callee_node;
-                        ctx.reducing_callee = true;
                         if matches!(&ctx.node(callee).kind, NodeKind::Identifier(_)) {
                             exempt_callee = Some(callee);
                             ctx.reducing_callee_node = Some(callee);
                         }
                         reduce_expression(ctx, callee, false);
                         ctx.reducing_callee_node = prev_node;
-                        ctx.reducing_callee = prev;
                     }
                 }
             }
@@ -1675,6 +1672,19 @@ fn folded_key_display(v: &FoldedValue) -> String {
 /// [`AnalysisContext::suite_stack`] (locals/iterator binds), then the current function's parameter
 /// list, then the current class's members + the in-file class-base chain, then native/global/
 /// builtin lookups.
+/// Whether `id` is the bare-identifier callee `reduce_call` is about to answer itself.
+///
+/// The four `reduce_identifier` steps that consult this exist because Godot's `reduce_call`
+/// resolves a call target through `reduce_identifier_from_base` and never through the standalone
+/// `reduce_identifier` (`gdscript_analyzer.cpp:3556-3559`), so those steps must not run for the
+/// callee. They must run for everything else, including an identifier that merely SITS INSIDE a
+/// callee expression — an argument of the inner call in `f(x)()`. Keying on the node keeps the
+/// exemption to the one identifier it is about; a flag raised across the whole callee subtree
+/// silently stripped types and the not-declared error off those arguments (#435).
+fn reducing_this_callee(ctx: &AnalysisContext, id: NodeId) -> bool {
+    ctx.reducing_callee_node == Some(id)
+}
+
 fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // Godot's `can_be_builtin` parameter, taken off the context and cleared so a nested reduction
     // started from here does not inherit it. See [`reduce_identifier_with_flags`].
@@ -1870,7 +1880,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             // reducer.rs:2322 (WP-I); this is the access counterpart, walked from the same
             // `static_context` flag. Skip when we're inside a Call's pre-reduce of the callee
             // (the call-version of the check will fire there) so we never double-emit.
-            if ctx.static_context && !ctx.reducing_callee {
+            if ctx.static_context && !reducing_this_callee(ctx, id) {
                 if let Some(kind) = non_static_instance_member_kind(ctx, class_id, &name) {
                     let parent = enclosing_concrete_function_name(ctx);
                     let kind_label = match kind {
@@ -1908,7 +1918,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // cross-file CallSig chain), and typing the callee as a constant Callable here would
     // mis-fire Godot's `Name "X" is a Callable` error that is reserved for callable-holding
     // variables.
-    if !ctx.reducing_callee {
+    if !reducing_this_callee(ctx, id) {
         if let Some(sr) = current_class_script_base(ctx) {
             // The SCOPE walk, not the chain walk: a bare identifier also sees what each base's
             // enclosing class declares (analyzer.cpp:320-344). #314.
@@ -2168,7 +2178,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     //    reaches this arm at all. Placed after the autoload arm because Godot checks autoloads
     //    (analyzer.cpp:4570) before utilities (4641) — a project autoload named like a utility
     //    shadows it — and no utility name can collide with anything steps 4-8 resolve.
-    if !ctx.reducing_callee
+    if !reducing_this_callee(ctx, id)
         && (ctx.native.utility(&name).is_some()
             || gd_types::is_variant_utility(&name)
             || gd_utility_return_type(&name).is_some())
@@ -2215,7 +2225,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     //    is the state where nothing is knowable: every native lookup misses, so an ungated
     //    step 10 would report `position` on a `Node2D` as undeclared. That is the one provenance
     //    this must stay silent under.
-    if !ctx.reducing_callee && name != "self" && name != "super" {
+    if !reducing_this_callee(ctx, id) && name != "self" && name != "super" {
         let dt = ctx.get_type(id);
         if !dt.is_set() && ctx.native.provenance() != gd_types::ApiProvenance::Absent {
             let is_native_member = is_plausible_native_member(ctx, &name);

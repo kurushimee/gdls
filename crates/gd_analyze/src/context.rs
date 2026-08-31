@@ -225,14 +225,7 @@ pub struct AnalysisContext<'a> {
     /// Whether resolution is in a `static` context (Godot's `static_context`); drives static-access
     /// checks in WP-E.
     pub static_context: bool,
-    /// Whether the current `reduce_identifier`/`reduce_subscript` call is reducing the **callee**
-    /// of an enclosing Call node. Lets the identifier path skip the
-    /// `Cannot access non-static …` check (analyzer.cpp:4464-4490) when the call-version of the
-    /// same check (analyzer.cpp:3642-3656, the `Cannot call non-static …` arm) will fire instead.
-    /// Mirrors Godot's choice to invoke `reduce_identifier_from_base` (no-access-check) from
-    /// `reduce_call` rather than the standalone `reduce_identifier` (with-access-check).
-    pub reducing_callee: bool,
-    /// The bare-Identifier callee currently being pre-reduced, if any (#429).
+    /// The bare-Identifier callee currently being pre-reduced, if any (#429, #435).
     ///
     /// gdls pre-reduces a bare callee that Godot never touches (`gdscript_analyzer.cpp:3556-3559`
     /// sets up the base and goes straight to `get_function_signature`). Godot's miss branch is
@@ -240,9 +233,15 @@ pub struct AnalysisContext<'a> {
     /// opens with a don't-re-resolve guard (`analyzer.cpp:4025-4027`) that only passes on a
     /// typeless node. `reduce_expression`'s tail-guard would hand the probe a `Variant` instead,
     /// so the one node named here is exempt from that guard; `reduce_call`'s dispatcher arm
-    /// re-stamps it afterwards if nothing determined it. Held as a `NodeId` and not folded into
-    /// `reducing_callee`, because that flag stays raised across the whole callee SUBTREE and the
-    /// exemption must reach exactly one node.
+    /// re-stamps it afterwards if nothing determined it.
+    ///
+    /// It is also what the four callee-position gates in `reduce_identifier` key on. Those exist
+    /// because Godot resolves a call target through `reduce_identifier_from_base` and never
+    /// through the standalone `reduce_identifier` (`analyzer.cpp:3556-3559`), so they must skip the
+    /// callee and nothing else. A bool raised across the whole callee SUBTREE also skipped them for
+    /// an identifier merely nested inside a callee expression — an argument of the inner call in
+    /// `f(x)()` — stripping its type and its `Identifier "x" not declared in the current scope.`
+    /// A `NodeId` reaches exactly the one node the exemption is about (#435).
     pub reducing_callee_node: Option<NodeId>,
     /// Godot's `reduce_identifier(p_identifier, can_be_builtin)` flag (analyzer.cpp:4388), carried
     /// on the context rather than as a parameter so `reduce_expression`'s dispatcher signature
@@ -444,7 +443,6 @@ impl<'a> AnalysisContext<'a> {
             current_resolving_member: None,
             init_shape_stack: Vec::new(),
             static_context: false,
-            reducing_callee: false,
             reducing_callee_node: None,
             identifier_can_be_builtin: false,
             native_property_scope: FxHashMap::default(),
