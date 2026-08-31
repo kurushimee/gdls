@@ -4363,6 +4363,178 @@ fn convert_folded_value(
 ///
 /// `rpc_configured` is Godot's `function->rpc_config.get_type() != Variant::NIL`, which the apply
 /// sets on its way out even when an argument was rejected — only the duplicate returns early.
+/// Whether `name` is bound to `export_annotations` — the apply that builds a hint string out of its
+/// arguments and therefore runs the value loop above.
+///
+/// `@export*` is not one family. `@export_storage`, `@export_custom`, and `@export_tool_button`
+/// each register their OWN apply (`gdscript_parser.cpp:5008/5019/5047`) which reads its arguments
+/// positionally and never renders them into a hint string, so none of the value checks apply to
+/// them — `@export_custom(0, "")` is legal and means an empty hint string. The list is the
+/// `export_annotations<...>` rows of the registration table (`gdscript_parser.cpp:152-173`),
+/// transcribed in order; the grouping annotations below them are `STANDALONE` and never reach a
+/// variable.
+fn annotation_uses_export_hint_string(name: &str) -> bool {
+    matches!(
+        name,
+        "@export"
+            | "@export_enum"
+            | "@export_file"
+            | "@export_file_path"
+            | "@export_dir"
+            | "@export_global_file"
+            | "@export_global_dir"
+            | "@export_multiline"
+            | "@export_placeholder"
+            | "@export_range"
+            | "@export_exp_easing"
+            | "@export_color_no_alpha"
+            | "@export_node_path"
+            | "@export_flags"
+            | "@export_flags_2d_render"
+            | "@export_flags_2d_physics"
+            | "@export_flags_2d_navigation"
+            | "@export_flags_3d_render"
+            | "@export_flags_3d_physics"
+            | "@export_flags_3d_navigation"
+            | "@export_flags_avoidance"
+    )
+}
+
+/// The `@export*` per-argument value loop (`gdscript_parser.cpp:4680-4740`). Returns `true` when it
+/// reported — upstream returns from the whole apply on the first bad argument, so the caller skips
+/// the rest of the export checks for that annotation.
+///
+/// The arguments are the ones [`resolve_annotation`] folded, which is short of what was written
+/// when resolution stopped early; the missing tail is simply not checked, since a rejected argument
+/// has already been reported once. That is the same rule [`apply_rpc_annotation`] follows.
+///
+/// Upstream renders each argument with `String(Variant)` and then asks whether it is empty or
+/// contains a comma. Only a string-like value can be either: every other type an `@export*`
+/// parameter accepts is a number, whose rendering is neither. So a non-string fold is skipped here
+/// rather than rendered, which is the same answer without needing a `Variant::stringify` port —
+/// and `resolve_annotation` has already rejected anything whose type does not fit the parameter.
+fn apply_export_argument_values(ctx: &mut AnalysisContext, ann_id: NodeId, name: &str) -> bool {
+    if !annotation_uses_export_hint_string(name) {
+        return false;
+    }
+    let args: Vec<crate::FoldedValue> = ctx
+        .annotation_resolved_args
+        .get(&ann_id)
+        .cloned()
+        .unwrap_or_default();
+    let arg_nodes = match &ctx.node(ann_id).kind {
+        NodeKind::Annotation(a) => a.arguments.clone(),
+        _ => return false,
+    };
+    for (i, value) in args.iter().enumerate() {
+        // Each error anchors on its own ARGUMENT, not on the annotation.
+        let anchor = arg_nodes.get(i).copied().unwrap_or(ann_id);
+        let n = i + 1;
+        let arg = match value {
+            crate::FoldedValue::String(v)
+            | crate::FoldedValue::StringName(v)
+            | crate::FoldedValue::NodePath(v) => v.clone(),
+            _ => continue,
+        };
+        // `@export_placeholder` is the one annotation whose argument may be anything at all — it
+        // IS the placeholder text.
+        if name != "@export_placeholder" {
+            if arg.is_empty() {
+                ctx.push_error(
+                    format!(r#"Argument {n} of annotation "{name}" is empty."#),
+                    anchor,
+                );
+                return true;
+            }
+            if arg.contains(',') {
+                ctx.push_error(
+                    format!(
+                        r#"Argument {n} of annotation "{name}" contains a comma. Use separate arguments instead."#
+                    ),
+                    anchor,
+                );
+                return true;
+            }
+        }
+        // cpp:4694 — deliberately NOT an `else if`: `@export_flags` runs both checks.
+        if name == "@export_flags" {
+            const MAX_FLAGS: i64 = 32;
+            let (flag_name, explicit_value) = match arg.split_once(':') {
+                Some((n, v)) => (n, Some(v)),
+                None => (arg.as_str(), None),
+            };
+            if flag_name.is_empty() {
+                ctx.push_error(
+                    format!(
+                        r#"Invalid argument {n} of annotation "@export_flags": Expected flag name."#
+                    ),
+                    anchor,
+                );
+                return true;
+            }
+            match explicit_value {
+                Some(v) => {
+                    if v.is_empty() {
+                        ctx.push_error(
+                            format!(
+                                r#"Invalid argument {n} of annotation "@export_flags": Expected flag value."#
+                            ),
+                            anchor,
+                        );
+                        return true;
+                    }
+                    let Some(parsed) = godot_valid_int(v) else {
+                        ctx.push_error(
+                            format!(
+                                r#"Invalid argument {n} of annotation "@export_flags": The flag value must be a valid integer."#
+                            ),
+                            anchor,
+                        );
+                        return true;
+                    };
+                    if !(1..(1i64 << MAX_FLAGS)).contains(&parsed) {
+                        ctx.push_error(
+                            format!(
+                                r#"Invalid argument {n} of annotation "@export_flags": The flag value must be at least 1 and at most 2 ** {MAX_FLAGS} - 1."#
+                            ),
+                            anchor,
+                        );
+                        return true;
+                    }
+                }
+                None => {
+                    if i as i64 >= MAX_FLAGS {
+                        ctx.push_error(
+                            format!(
+                                r#"Invalid argument {n} of annotation "@export_flags": Starting from argument {}, the flag value must be specified explicitly."#,
+                                MAX_FLAGS + 1
+                            ),
+                            anchor,
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// `String::is_valid_int` + `String::to_int` (`core/string/ustring.cpp`): an optional leading `+`
+/// or `-` followed by at least one digit and nothing else. Deliberately not Rust's `parse::<i64>`,
+/// which accepts the same shapes but would also have to agree on overflow — Godot's `to_int` wraps
+/// on an out-of-range literal where Rust's parse fails, and the caller's range check is what is
+/// supposed to answer for a huge value.
+fn godot_valid_int(text: &str) -> Option<i64> {
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Saturating stands in for Godot's wrap: either way the value fails the 1..2**32 range check
+    // below it, which is the only thing the result feeds.
+    Some(text.parse::<i64>().unwrap_or(i64::MAX))
+}
+
 fn apply_rpc_annotation(ctx: &mut AnalysisContext, ann_id: NodeId, rpc_configured: &mut bool) {
     if *rpc_configured {
         ctx.push_error(
@@ -4778,6 +4950,13 @@ fn emit_variable_annotation_warnings(ctx: &mut AnalysisContext, class_id: NodeId
                     continue;
                 }
                 exported = true;
+
+                // gdscript_parser.cpp:4680-4740 — the per-argument value loop. `exported` is
+                // already set above, exactly as upstream sets it before this loop (:4674), so a
+                // rejected argument still makes the NEXT `@export*` a duplicate.
+                if apply_export_argument_values(ctx, ann_id, &name) {
+                    continue;
+                }
 
                 // gdscript_parser.cpp:4792 — simple `@export` needs something to infer from.
                 if name == "@export" && !has_type_specifier && initializer.is_none() {
