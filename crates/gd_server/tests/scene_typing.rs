@@ -158,3 +158,59 @@ func f():
          Got: {diags:?}"
     );
 }
+
+/// #458 pinned on the other side: the one hop through a variable holding a `$` access is a
+/// NAVIGATION answer only. `@onready var h := $Health` then `var c: Control = h` is the same
+/// Godot-tolerated downcast as `var c: Control = $Health`, so the diagnostic path must still see
+/// `h` as bare `Node` and stay silent. Wiring the hop into the analyzer would turn this into an
+/// `Cannot assign` false positive on the single most common Godot idiom.
+#[test]
+fn a_variable_holding_a_dollar_access_stays_bare_node_for_diagnostics() {
+    let p = TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
+    p.write("extension_api.json", API);
+    p.write(
+        "player.tscn",
+        r#"[gd_scene format=3]
+[ext_resource type="Script" path="res://player.gd" id="1"]
+[node name="Root" type="Node2D"]
+script = ExtResource("1")
+[node name="Health" type="Node2D" parent="."]
+[node name="Special" type="Node2D" parent="."]
+unique_name_in_owner = true
+"#,
+    );
+    let src = "\
+extends Node2D
+
+@onready var h := $Health
+@onready var u := %Special
+
+func wants(_c: Control) -> void:
+\tpass
+
+func f():
+\tvar c: Control = h
+\tvar d: Control = u
+\twants(h)
+\tprint(c, d)
+";
+    p.write("player.gd", src);
+
+    let mut ws = Workspace::load(&p.root, &options(&p));
+    let diags = diags_of(&mut ws, &p, "player.gd", src);
+    let false_positives: Vec<&String> = diags
+        .iter()
+        .filter(|m| {
+            m.contains("Cannot assign a value of type Node2D")
+                || (m.contains("argument 1 should be") && m.contains("Node2D"))
+        })
+        .collect();
+    assert!(
+        false_positives.is_empty(),
+        "the #458 navigation hop must never reach the diagnostic path. Got: {diags:?}"
+    );
+}
