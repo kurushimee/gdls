@@ -2747,26 +2747,6 @@ fn reduce_cast(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
-    // analyzer.cpp:2744 — `INT_AS_ENUM_WITHOUT_MATCH`. When the operand folds to a specific
-    // integer literal and the cast target is an enum whose members don't include that value,
-    // Godot warns `Cannot cast <value> as Enum "<file.gd.Name>": no enum member has matching value.`.
-    // Godot raises this inside `update_const_expression_builtin_type` with `p_is_cast=true`;
-    // gdls's `reduce_cast` has its own validity matrix below, so the check is inlined here.
-    if cast_type.kind == DtKind::Enum
-        && !cast_type.enum_values_inexact
-        && (op_type.builtin_type == VariantType::Int || op_type.kind == DtKind::Enum)
-    {
-        if let Some(crate::foldtable::FoldedValue::Int(v)) = ctx.folds.get(operand_id).cloned() {
-            if !cast_type.enum_values.values().any(|&val| val == v) {
-                ctx.push_warning(
-                    crate::warnings::WarningCode::IntAsEnumWithoutMatch,
-                    &["cast".to_owned(), v.to_string(), cast_type.to_string()],
-                    id,
-                );
-            }
-        }
-    }
-
     // analyzer.cpp:3800-3810 — the four mutually-exclusive arms covering Int↔Enum widening,
     // Builtin↔Builtin (via Variant::can_convert), and non-Builtin↔non-Builtin (bidirectional
     // `is_type_compatible`). The Int→Enum and Enum→Int arms are both valid by definition (the
@@ -3736,17 +3716,63 @@ pub(crate) fn update_const_expression_builtin_type(
         return;
     }
 
-    // analyzer.cpp:2747-2751 — when the source VALUE's `builtin_type` already matches the
-    // target's, the conversion is a no-op narrowing: stamp the target type onto the expression
-    // and return. The comparison is on bare `builtin_type` with no kind gate, exactly as
-    // upstream — that's what re-types an int constant flowing into an enum slot (enums carry
-    // `builtin_type = INT`) so the caller's later compatibility check sees an enum source and
-    // INT_AS_ENUM_WITHOUT_CAST fires exactly once, from this function's wrapper call.
+    // analyzer.cpp:2756 — the VALUE's own type, read off the fold rather than the expression.
+    // Everything below reads this, and upstream computes it here, before the second
+    // compatibility check: an expression typed `Variant` that folds to a concrete value is
+    // checked against the value's type, not the static one.
     let value_type = ctx
         .folds
         .get(expr_id)
         .map(type_from_variant)
         .unwrap_or_else(|| expression_type.clone());
+
+    // analyzer.cpp:2757-2760 — a `Variant`-typed expression passed the first check for free
+    // (everything is compatible with Variant), so the folded value gets its own check. An enum
+    // cast is exempt for the same reason it is above.
+    if expression_type.is_variant()
+        && !is_enum_cast
+        && !is_type_compatible_with_source(ctx, p_type, &value_type, true, expr_id)
+    {
+        ctx.push_error(
+            format!(r#"Cannot {p_usage} a value of type "{value_type}" as "{p_type}"."#),
+            expr_id,
+        );
+        return;
+    }
+
+    // analyzer.cpp:2762-2766 — `INT_AS_ENUM_WITHOUT_MATCH`. An integer constant reaching an
+    // enum-typed slot whose members carry no such value. Upstream has exactly ONE site for this
+    // warning, right here, and `p_usage` is what supplies the verb — which is why the same
+    // check serves `assign`, `return`, `pass`, `include`, and `cast` (#466). gdls used to inline
+    // it in `reduce_cast` alone, so only the cast verb ever fired.
+    //
+    // It runs BEFORE the re-typing below, which is what keeps it from reading a value this
+    // function has already narrowed to the enum.
+    //
+    // `enum_values_inexact` is the one gdls-only gate: a cross-file enum whose value expressions
+    // the interface extractor could not read carries placeholders, and "no member has this
+    // value" is a claim about values gdls does not have.
+    if p_type.kind == DtKind::Enum
+        && !p_type.enum_values_inexact
+        && value_type.builtin_type == VariantType::Int
+    {
+        if let Some(crate::foldtable::FoldedValue::Int(v)) = ctx.folds.get(expr_id).cloned() {
+            if !p_type.enum_values.values().any(|&val| val == v) {
+                ctx.push_warning(
+                    crate::warnings::WarningCode::IntAsEnumWithoutMatch,
+                    &[p_usage.to_owned(), v.to_string(), p_type.to_string()],
+                    expr_id,
+                );
+            }
+        }
+    }
+
+    // analyzer.cpp:2768-2771 — when the source VALUE's `builtin_type` already matches the
+    // target's, the conversion is a no-op narrowing: stamp the target type onto the expression
+    // and return. The comparison is on bare `builtin_type` with no kind gate, exactly as
+    // upstream — that's what re-types an int constant flowing into an enum slot (enums carry
+    // `builtin_type = INT`) so the caller's later compatibility check sees an enum source and
+    // INT_AS_ENUM_WITHOUT_CAST fires exactly once, from this function's wrapper call.
     if value_type.builtin_type == p_type.builtin_type {
         ctx.set_type(expr_id, p_type.clone());
     }
