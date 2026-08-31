@@ -313,14 +313,18 @@ fn a_native_member_through_a_metatype_never_reports_a_miss() {
 }
 
 /// `get_function_signature` also tries the `GDScript` class surface for any SCRIPT or CLASS
-/// metatype (analyzer.cpp:6013), so these resolve in Godot and draw a different error gdls has not
-/// ported. Suppressed rather than reported as missing — a deliberate under-report.
+/// metatype (analyzer.cpp:6013), so these resolve in Godot rather than missing. gdls used to
+/// suppress them, for want of the error upstream reports there; it now resolves them the same way
+/// and reports it (#467), so each draws the ported instance-call error and never a static miss.
 #[test]
-fn a_gdscript_script_surface_name_through_a_metatype_is_suppressed() {
+fn a_gdscript_script_surface_name_through_a_metatype_draws_the_instance_call_error() {
     for name in ["reload", "duplicate", "get_instance_base_type"] {
         let (errors, warnings) = diagnose(&body(&format!("Lib.{name}()")));
-        assert!(
-            !errors.iter().any(|e| e.contains("Static function")),
+        assert_eq!(
+            errors,
+            vec![format!(
+                r#"Cannot call non-static function "{name}()" on the class "Lib" directly. Make an instance instead."#
+            )],
             "{name}: {errors:?}"
         );
         assert_eq!(warnings, Vec::<String>::new(), "{name}: {warnings:?}");
