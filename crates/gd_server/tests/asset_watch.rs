@@ -158,3 +158,39 @@ fn reconcile_recovers_asset_drift() {
         "reconcile must drop an asset deleted while the watcher was off"
     );
 }
+
+/// #447: a `.uid` sidecar is an asset, and it is also the thing that makes `preload("uid://…")`
+/// resolve. Creating one mid-session re-points the uid without a restart; deleting it takes the
+/// mapping away again rather than leaving a stale target behind.
+#[test]
+fn a_uid_sidecar_change_repoints_the_mapping() {
+    let p = common::TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
+    p.write("src/hero.gd", "class_name Hero\nextends Node\n");
+
+    let mut ws = Workspace::load(&p.root, &options(&p.root));
+    assert_eq!(
+        ws.index.resolve_res_path("uid://ctest447"),
+        None,
+        "no sidecar on disk at cold load, so the uid resolves to nothing"
+    );
+
+    let sidecar = p.root.join("src/hero.gd.uid");
+    p.write("src/hero.gd.uid", "uid://ctest447\n");
+    ws.sync_uid_sidecar(&sidecar);
+    assert_eq!(
+        ws.index.resolve_res_path("uid://ctest447"),
+        ws.index.file_id(&p.root.join("src/hero.gd")),
+        "the new sidecar points the uid at its resource"
+    );
+
+    ws.drop_uid_sidecar(&sidecar);
+    assert_eq!(
+        ws.index.resolve_res_path("uid://ctest447"),
+        None,
+        "deleting the sidecar unresolves the uid rather than keeping a stale target"
+    );
+}

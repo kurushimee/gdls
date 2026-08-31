@@ -54,6 +54,7 @@ GDExtension classes (addons providing native `.dll`, `.so`, or `.dylib` classes)
 
 - **Autoloads.** The `[autoload]` section maps singleton names to script or scene paths; the *type* comes from the referenced script's `class_name` or base. Autoload typing is subtle even in Godot, so gdls tracks the referenced script and resolves its type through the normal pipeline. A scene target resolves through its `uid://` to the scene's root script; a scriptless root falls to the bare `Node` floor.
 - **The `res://` root**, needed to resolve `preload` and `load("res://…")` and to map paths.
+- **The `uid:// → res://` map**, scanned from the `*.uid` sidecars Godot writes next to each resource. Godot dereferences a uid at the `FileAccess` layer, so every spelling that takes a `res://` path takes a `uid://` one too. The index holds the map and derefs inside `resolve_path`, ahead of the `res://` strip, which is what gives `preload("uid://…")`, a path-`extends`, the dependency edge, and autoload targets one answer from one place. A uid with no sidecar resolves to nothing and is never joined onto the root, so an unknown uid under-reports rather than inventing a target. One thing deliberately does *not* deref: `willRenameFiles` refuses a `uid://` literal, because a uid names the file by identity and a move leaves it correct — rewriting it to `res://` text would downgrade a stable reference, which the Godot editor never does.
 - **Warning configuration**: which warnings are enabled, disabled, or promoted. Feeds `04-diagnostics-strict-mode.md`.
 
 The `class_name` registry maps each global type name to its script path and resolved type, built from the eager interface pass (§4).
@@ -84,11 +85,12 @@ The `class_name` registry maps each global type name to its script path and reso
 
 Reactions:
 
-- **A `.gd` change** re-extracts the interface, updates the `class_name` registry immediately (adding, renaming, or removing a global type), and invalidates dependents per §5. A file *appearing* re-links the consumers waiting on it both by name (`extends MyBase` referencing a just-added `class_name`) and by path (`extends "res://b.gd"` whose target file was just created). The path case goes through `Index`'s `path_referencers` reverse index, the path-keyed analogue of `name_referencers`, so a path-extends consumer's stale "unknown base" diagnostics refresh without waiting for the consumer itself to be edited.
+- **A `.gd` change** re-extracts the interface, updates the `class_name` registry immediately (adding, renaming, or removing a global type), and invalidates dependents per §5. A file *appearing* re-links the consumers waiting on it both by name (`extends MyBase` referencing a just-added `class_name`) and by path (`extends "res://b.gd"` whose target file was just created). The path case goes through `Index`'s `path_referencers` reverse index, the path-keyed analogue of `name_referencers`, so a path-extends consumer's stale "unknown base" diagnostics refresh without waiting for the consumer itself to be edited. A uid-spelled reference re-links through the same branch, since the path it is recorded under is the dereferenced one.
 - **A `project.godot` change** reloads autoloads, the `res://` root, and warning config, then calls `gd_server::Workspace::rebuild_policy` to drop the analysis cache so later `publishDiagnostics` runs under the new strict configuration.
 - **An `extension_api.json` change** reloads the native class DB (§1).
 - **A `.gdextension` add or remove, or a watched `doc_classes` XML change**, re-enumerates and re-ingests GDExtension classes (§2).
 - **A `.tscn` change** reindexes the scene (`reindex_scene`, `remove_scene`). It does not re-diagnose the scene's attached scripts, because a `$` or `%` type is scene-independent and republishing would be byte-identical churn (`02-frontend-port.md` §11).
+- **A `.uid` sidecar change** re-points that resource's uid and re-analyzes every file referencing it, tracked through `uid_referencers`, the uid-keyed sibling of `path_referencers`. The sidecar is also an asset, so the asset index sees it on the same event.
 - **Any other file** updates the asset index, so `load` and `preload` completion stay current.
 
 **Why this fixes the pain:** there is no `EditorFileSystem`, no focus-gated rescan, and no editor sync in the loop. A new, renamed, or deleted class shows up in the index as soon as the file changes on disk, no matter which file the client has open.
@@ -172,7 +174,7 @@ If the client advertises `workspace.symbol.resolveSupport`, gdls returns `Worksp
 Every mutation to `gd_project::Index` (from `Workspace::reindex`, `::remove`, or the watcher) flows through a thin `IndexMutation` wrapper that:
 
 1. Applies the requested change, delegating to `Index::on_file_changed` or `::on_file_removed`.
-2. Runs `Index::verify()`, which checks that every `FileId` in `interfaces` has a path in `paths`; that every `class_name` in `registry` resolves to a `FileId` that exists; that `DepGraph.forward` and `DepGraph.reverse` are mutual inverses, every forward edge having its reverse counterpart and the other way round; and that `name_referencers` values are subsets of `interfaces` keys.
+2. Runs `Index::verify()`, which checks that every `FileId` in `interfaces` has a path in `paths`; that every `class_name` in `registry` resolves to a `FileId` that exists; that `DepGraph.forward` and `DepGraph.reverse` are mutual inverses, every forward edge having its reverse counterpart and the other way round; and that `name_referencers`, `path_referencers`, and `uid_referencers` values are subsets of `interfaces` keys and agree with their forward tables.
 3. Reacts to a violation by build profile. In debug it panics with a structured message. In release it logs `index_invariant_violated{file, invariant}` via `tracing`, quarantines the offending file by dropping it from the index, and keeps going: never lie, never serve stale data, but also never crash mid-session.
 
 ## 8. Persistent warm-start cache
