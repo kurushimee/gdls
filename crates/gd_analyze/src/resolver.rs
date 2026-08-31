@@ -4478,6 +4478,10 @@ fn apply_export_argument_values(ctx: &mut AnalysisContext, ann_id: NodeId, name:
                 return true;
             }
         }
+        // cpp:4720-4731 — `@export_node_path`'s arguments name the classes a path may point at.
+        if name == "@export_node_path" && apply_node_path_class_check(ctx, &arg, n, anchor) {
+            return true;
+        }
         // cpp:4694 — deliberately NOT an `else if`: `@export_flags` runs both checks.
         if name == "@export_flags" {
             const MAX_FLAGS: i64 = 32;
@@ -4538,6 +4542,77 @@ fn apply_export_argument_values(ctx: &mut AnalysisContext, ann_id: NodeId, name:
                 }
             }
         }
+    }
+    false
+}
+
+/// The `@export_node_path` leg of the argument loop (gdscript_parser.cpp:4720-4731): each argument
+/// names a class that a path is allowed to point at, and Godot checks that the class exists, is
+/// exposed, and inherits `Node`. Returns `true` when it reported — the caller then stops, matching
+/// upstream's `return false` out of the whole apply.
+///
+/// A `class_name` argument resolves through the global-class registry to its native base
+/// (`ScriptServer::get_global_class_native_base`), so `@export_node_path("MyNode2D")` is legal.
+///
+/// Two gates keep this from inventing errors, both on the "was not found" leg, which is the only
+/// negative claim here:
+///
+/// * the API dump must be [`ApiProvenance::Exact`]. A generic dump proves what exists, never what
+///   does not, and a project on a custom build legitimately names classes a stock dump lacks.
+/// * a name the project registers as a `class_name` whose own base chain gdls could not walk to a
+///   native root is unknown, not absent.
+///
+/// The "does not inherit Node" leg needs neither: it only fires on a class the DB does carry, and
+/// engine ancestry does not move between builds.
+fn apply_node_path_class_check(
+    ctx: &mut AnalysisContext,
+    arg: &str,
+    n: usize,
+    anchor: NodeId,
+) -> bool {
+    let global_file = ctx.xfile.global_class_file(arg);
+    let native_class = match global_file {
+        Some(file) => {
+            let script_ref = ScriptRef {
+                file,
+                inner: Vec::new(),
+            };
+            match crate::script_chain::chain_native_root(ctx, &script_ref) {
+                Some(root) => root,
+                // fail-open: a registered global class whose chain gdls could not walk.
+                None => return false,
+            }
+        }
+        None => arg.to_string(),
+    };
+
+    // `ClassDB::class_exists` + `ClassDB::is_class_exposed`. The dump only carries exposed
+    // classes, so carrying the name IS both conditions.
+    if ctx.native.class_named(&native_class).is_none() {
+        if ctx.native.provenance() != gd_types::ApiProvenance::Exact {
+            return false;
+        }
+        // A global class always resolved to a native root above; if the DB does not carry that
+        // root the gap is gdls's, not the user's.
+        if global_file.is_some() {
+            return false;
+        }
+        ctx.push_error(
+            format!(
+                r#"Invalid argument {n} of annotation "@export_node_path": The class "{arg}" was not found in the global scope."#
+            ),
+            anchor,
+        );
+        return true;
+    }
+    if !ctx.native.is_subclass_of_named(&native_class, "Node") {
+        ctx.push_error(
+            format!(
+                r#"Invalid argument {n} of annotation "@export_node_path": The class "{arg}" does not inherit "Node"."#
+            ),
+            anchor,
+        );
+        return true;
     }
     false
 }
