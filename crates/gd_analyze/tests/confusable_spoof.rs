@@ -41,7 +41,7 @@ fn confusables(src: &str) -> Vec<(usize, String)> {
             d.warning_code() == Some(gd_analyze::warnings::WarningCode::ConfusableIdentifier)
         })
         .map(|d| {
-            let line = src[..d.span().start as usize].matches('\n').count() + 1;
+            let line = src[..d.span().start].matches('\n').count() + 1;
             (line, d.message().to_owned())
         })
         .collect()
