@@ -333,6 +333,48 @@ fn capability_advertised_only_when_offered() {
 // 2. Multi-file rename: every resolving literal rewritten; unrelated + dynamic untouched
 // ---------------------------------------------------------------------------------------------
 
+/// #447 firewall: a `preload("uid://…")` is NEVER rewritten by a rename, even though the index now
+/// resolves that uid to the very file being moved. A uid names the file by identity, so the move
+/// leaves it correct; rewriting it to `res://` text would silently downgrade a stable reference —
+/// which is exactly what the Godot editor refuses to do. Two layers keep it out: the candidate
+/// collector only ever admits `res://` text, and `ResIdentity::resolve` refuses a uid outright, so
+/// relaxing either one alone still leaves the literal untouched. The `res://` literal in the same
+/// file is the control — it is rewritten, so a passing test is not a dead write-set.
+#[test]
+fn a_uid_literal_survives_a_rename_untouched() {
+    let p = bare_project();
+    p.write("a.gd", "extends Node\n");
+    p.write("a.gd.uid", "uid://ctest447\n");
+    let b_src =
+        "extends Node\nconst U = preload(\"uid://ctest447\")\nconst R = preload(\"res://a.gd\")\n";
+    p.write("b.gd", b_src);
+
+    let (client, thread) = boot();
+    init_open(&p, &client, caps_full(), &["a.gd", "b.gd"]);
+
+    let result = will_rename(&client, 10, &p, "a.gd", "renamed/a2.gd");
+    let view = flatten_edit(result);
+
+    assert_eq!(
+        view.edits.len(),
+        1,
+        "only the res:// literal is rewritten; the uid:// one is refused; got {:?}",
+        view.edits
+    );
+    let (_, range, new_text) = &view.edits[0];
+    let after = apply_edit_to(b_src, range, new_text);
+    assert!(
+        after.contains("preload(\"uid://ctest447\")"),
+        "the uid literal must be byte-identical: {after}"
+    );
+    assert!(
+        after.contains("preload(\"res://renamed/a2.gd\")"),
+        "the res:// literal still moves: {after}"
+    );
+
+    shutdown(&client, thread);
+}
+
 /// Renaming `a.gd` (preloaded by b.gd AND c.gd) rewrites EVERY `preload("res://a.gd")` literal to
 /// the new path. An unrelated `preload("res://other.gd")` and a dynamic `load(var)` are UNTOUCHED.
 /// Each emitted edit, applied to its source, yields exactly the new `res://` path inside the quotes.

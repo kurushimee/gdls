@@ -39,8 +39,9 @@ pub const MAX_INSTANCE_DEPTH: usize = 64;
 ///
 /// `id` is the *string* key other sections reference via `ExtResource("<id>")` — Godot ids are
 /// strings that are frequently numeric (`"2"`) but may be alphanumeric (`"13_4dhva"`). `path` is the
-/// `res://…` target (preferred); `uid` is the `uid://…` it was written with (used to resolve `path`
-/// only when `path` is absent, via the project UID map).
+/// `res://…` target (preferred); `uid` is the `uid://…` it was written with. A scene saved by a
+/// recent editor carries both, and `path` is what every consumer here reads; a `uid`-only entry is
+/// not resolved back to a path.
 #[derive(Clone, Debug, Eq, Serialize, Deserialize)]
 pub struct ExtResource {
     /// `type="…"` — e.g. `"Script"`, `"PackedScene"`, `"Texture2D"`. May be empty if omitted.

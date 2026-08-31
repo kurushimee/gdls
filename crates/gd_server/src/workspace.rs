@@ -213,7 +213,7 @@ impl Workspace {
 
         // Attempt warm-start: load the persisted cache and stat-diff it against disk.
         // On any failure (missing file, key mismatch, verify failure) fall through to cold build.
-        let (index, scenes, assets, stat_table) = match cache::load(root, &key) {
+        let (mut index, scenes, assets, stat_table) = match cache::load(root, &key) {
             Some(loaded) => {
                 log::info!(
                     "cache: warm-start candidate found; stat-diffing {} cached files",
@@ -236,6 +236,11 @@ impl Workspace {
                 (idx, scene_idx, asset_idx, stats)
             }
         };
+
+        // #447: the index resolves `uid://` in a `preload` or a path-`extends` through this map,
+        // so it has to be in place before the first analysis reads a dependency edge. The scan
+        // itself already ran as part of `ProjectModel::load_checked`.
+        set_index_uid_map(&mut index, root, project.uids.clone());
 
         let policy = WarnPolicy::build(
             &project.warnings,
@@ -981,6 +986,46 @@ impl Workspace {
         self.update_stat_from_disk(path);
     }
 
+    /// #447: a `<resource>.uid` sidecar was created or edited — re-read it and re-point the
+    /// resource's uid in both the project model and the index, so `preload("uid://…")` follows the
+    /// change without waiting for a restart. An unreadable or non-`uid://` body drops the mapping
+    /// rather than keeping a stale one.
+    pub fn sync_uid_sidecar(&mut self, sidecar: &Utf8Path) {
+        let Some(resource) = sidecar.as_str().strip_suffix(".uid") else {
+            return;
+        };
+        let uid = std::fs::read_to_string(sidecar)
+            .ok()
+            .map(|text| text.trim().to_owned())
+            .filter(|uid| uid.starts_with("uid://"));
+        self.apply_uid_sidecar(Utf8Path::new(resource), uid.as_deref());
+    }
+
+    /// #447: a `.uid` sidecar was deleted — its resource has no uid any more.
+    pub fn drop_uid_sidecar(&mut self, sidecar: &Utf8Path) {
+        if let Some(resource) = sidecar.as_str().strip_suffix(".uid") {
+            self.apply_uid_sidecar(Utf8Path::new(resource), None);
+        }
+    }
+
+    /// The shared half of the two calls above: translate the resource to `res://` and push the
+    /// mapping into the project model and the index together, so the two never disagree.
+    fn apply_uid_sidecar(&mut self, resource: &Utf8Path, uid: Option<&str>) {
+        let Some(res) = self.project.path_to_res(resource) else {
+            log::debug!("uid sidecar for {resource} is not under the project root; skipping");
+            return;
+        };
+        self.project.uids.retain(|_, target| target != &res);
+        if let Some(uid) = uid {
+            self.project.uids.insert(uid.to_owned(), res.clone());
+        }
+        let owned = res.clone();
+        let uid = uid.map(str::to_owned);
+        self.index.txn(resource, move |idx| {
+            idx.sync_uid_for_resource(&owned, uid.as_deref());
+        });
+    }
+
     /// #127: drop a deleted asset from the [`AssetIndex`] and its stat entry (watcher Deleted).
     pub fn remove_asset(&mut self, path: &Utf8Path) {
         if let Some(res) = self.project.path_to_res(path) {
@@ -1036,6 +1081,10 @@ impl Workspace {
         }
         self.dialect_origin = dialect_origin;
         self.project = project;
+        // A `project.godot` reload re-scans the `.uid` sidecars, so hand the fresh map over; every
+        // file whose uid target moved is re-resolved and marked dirty by the swap.
+        let uids = self.project.uids.clone();
+        set_index_uid_map(&mut self.index, &root, uids);
         // Mid-session reloads never spawn Godot (no resolution path does since v1.0.2); a
         // `.gdextension` change marks the auto-dump meta stale and the next startup's background
         // dump refreshes it.
@@ -1791,6 +1840,16 @@ fn warm_index_from_cache(
 /// Build a stat table by iterating all interned files in the index after a cold build.
 /// Used so the cold path and the warm path both produce a populated stat table — the cold build
 /// doesn't stat files during `Index::build`, so we sweep them here.
+/// Install a fresh `uid:// → res://` map on the index, through the verifying [`Index::txn`] seam.
+///
+/// `txn` wants the file a mutation is about; a whole-project map swap is about `project.godot`,
+/// which is where the scan is triggered from and which the index never interns, so a quarantine
+/// pass on it is a no-op.
+fn set_index_uid_map(index: &mut Index, root: &Utf8Path, uids: FxHashMap<String, String>) {
+    let anchor = root.join("project.godot");
+    index.txn(&anchor, move |idx| idx.set_uid_map(uids));
+}
+
 fn build_stat_table_from_index(index: &Index) -> FxHashMap<Utf8PathBuf, FileStat> {
     let mut table = FxHashMap::default();
     for (fid, _) in index.iter_interfaces() {

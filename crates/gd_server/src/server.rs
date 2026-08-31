@@ -2323,11 +2323,29 @@ fn apply_reaction_inner(
                 return;
             }
             match change {
-                FileChange::Created | FileChange::Modified => state.workspace.reindex_asset(&path),
-                FileChange::Deleted => state.workspace.remove_asset(&path),
+                FileChange::Created | FileChange::Modified => {
+                    state.workspace.reindex_asset(&path);
+                    // #447: a `.uid` sidecar is an asset like any other, and it is also what makes
+                    // `preload("uid://…")` resolve. Re-read it so the mapping tracks the file.
+                    if path.extension() == Some("uid") {
+                        state.workspace.sync_uid_sidecar(&path);
+                    }
+                }
+                FileChange::Deleted => {
+                    state.workspace.remove_asset(&path);
+                    if path.extension() == Some("uid") {
+                        state.workspace.drop_uid_sidecar(&path);
+                    }
+                }
                 FileChange::Renamed { from, to } => {
                     state.workspace.remove_asset(&from);
                     state.workspace.reindex_asset(&to);
+                    if from.extension() == Some("uid") {
+                        state.workspace.drop_uid_sidecar(&from);
+                    }
+                    if to.extension() == Some("uid") {
+                        state.workspace.sync_uid_sidecar(&to);
+                    }
                 }
             }
         }

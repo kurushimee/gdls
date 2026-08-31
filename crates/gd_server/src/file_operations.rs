@@ -141,6 +141,14 @@ impl ResIdentity {
     /// real on-disk file. Anything that resolves to neither (a dynamic/unresolvable path, a missing
     /// target) yields `None` and is therefore never in the write-set.
     fn resolve(index: &gd_project::Index, res: &str) -> Option<ResIdentity> {
+        // #447: a `uid://…` literal names the file by identity, not by location, so a move leaves
+        // it correct and the Godot editor deliberately never rewrites one. The resolvers below now
+        // deref uids, which would otherwise pull the literal into the write-set and replace it with
+        // `res://` text — a silent downgrade of a stable reference. Refusing here covers every
+        // caller at once.
+        if res.starts_with("uid://") {
+            return None;
+        }
         if let Some(fid) = index.resolve_res_path(res) {
             return Some(ResIdentity::Gd(fid));
         }

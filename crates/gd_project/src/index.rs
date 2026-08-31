@@ -63,6 +63,21 @@ pub struct Index {
     /// The inverse of `file_path_ref`: normalized target path → files that `extends "res://…"` it.
     /// Keys may name a path with no live file (a *waiting* referencer — the whole point).
     path_referencers: FxHashMap<Utf8PathBuf, FxHashSet<FileId>>,
+    /// `uid://…` → the `res://` path its `.uid` sidecar names. Godot 4.4+ writes uid references by
+    /// default when the editor saves a script, so this is the form a modern project's `preload`s
+    /// increasingly take, and without it the whole reference resolves to nothing (#447). Mirrors
+    /// [`crate::ProjectModel::uids`], which is rebuilt from a sidecar walk on every startup — the
+    /// index is handed a copy rather than serializing one into the cache.
+    uids: FxHashMap<String, String>,
+    /// The inverse of [`Self::uids`], so a sidecar that is deleted or re-pointed can be found by
+    /// the resource path the watcher reports rather than by the uid it used to carry.
+    uids_by_res: FxHashMap<String, String>,
+    /// The `uid://` strings each file's interface references, resolved or not. The uid-keyed
+    /// analogue of `file_refs`: a uid that maps to nothing today is exactly the waiting referencer
+    /// a sidecar appearing later has to re-link.
+    uid_refs: FxHashMap<FileId, FxHashSet<String>>,
+    /// The inverse of [`Self::uid_refs`]: `uid://…` → files referencing it.
+    uid_referencers: FxHashMap<String, FxHashSet<FileId>>,
     /// Files whose full analysis is stale and must be recomputed on next demand. Drained by
     /// the LSP republish path (`Index::take_dirty`) after a watcher-driven reindex — its sole
     /// remaining job is *republish targeting* (which open buffers to refresh). Cache *validity*
@@ -92,6 +107,10 @@ impl Index {
             name_referencers: FxHashMap::default(),
             file_path_ref: FxHashMap::default(),
             path_referencers: FxHashMap::default(),
+            uids: FxHashMap::default(),
+            uids_by_res: FxHashMap::default(),
+            uid_refs: FxHashMap::default(),
+            uid_referencers: FxHashMap::default(),
             dirty: FxHashSet::default(),
             epochs: FxHashMap::default(),
         }
@@ -297,6 +316,7 @@ impl Index {
             self.deps.remove(fid);
             self.set_name_refs(fid, FxHashSet::default());
             self.set_path_ref(fid, None); // drop this file's own path-extends bookkeeping
+            self.set_uid_refs(fid, FxHashSet::default()); // and its uid references
             self.dirty.remove(&fid);
         }
         for name in removed_names {
@@ -400,7 +420,22 @@ impl Index {
     /// callers can resolve references to non-GDScript resources (`.tscn`/`.tres`/assets — the index
     /// holds only `.gd`; see `gd_files`). The caller is responsible for confirming the path exists.
     pub fn res_to_path(&self, res: &str) -> Option<Utf8PathBuf> {
-        crate::paths::res_to_path(&self.root, res)
+        crate::paths::res_to_path(&self.root, self.deref_uid(res)?)
+    }
+
+    /// A `uid://…` reference resolved to the `res://` path its sidecar names; anything else passes
+    /// through untouched. `None` for a uid this project has no sidecar for — never joined onto the
+    /// root, since a uid is an opaque token and not a path fragment.
+    ///
+    /// Godot resolves uids at the `FileAccess` layer (`core/io/file_access.cpp:262-266`), so every
+    /// spelling that accepts `res://` accepts `uid://` too. Putting the deref here, ahead of the
+    /// `res://` strip, is what gives the analyzer's `preload` reduction, the dependency edges,
+    /// `InitShape::Preload`, and path-`extends` the same answer from one change (#447).
+    fn deref_uid<'a>(&'a self, res: &'a str) -> Option<&'a str> {
+        if res.starts_with("uid://") {
+            return self.uids.get(res).map(String::as_str);
+        }
+        Some(res)
     }
 
     // --- Read accessors -------------------------------------------------------------------------
@@ -506,6 +541,62 @@ impl Index {
     /// so they move in lockstep through this one chokepoint. Every dirtying site
     /// (`on_file_changed`, the reverse-dependency closure, the name/path relink passes) routes
     /// here, which is what keeps the epoch a faithful "must re-analyze" signal for the cache.
+    /// Replace the whole `uid:// → res://` map and re-resolve every file that references a uid
+    /// whose answer changed. Called once at workspace bootstrap with [`crate::paths::build_uid_map`]'s
+    /// scan, and again whenever the project is reloaded.
+    ///
+    /// `pub(crate)`: outside `gd_project` this is reachable only via the [`IndexMut`] that
+    /// [`Index::txn`] hands out, so a runtime uid change can never skip the post-verify.
+    pub(crate) fn set_uid_map(&mut self, uids: FxHashMap<String, String>) {
+        // Only the uids whose target actually moved need their referencers touched; a full project
+        // has thousands of sidecars and a reload usually changes none of them.
+        let mut changed: Vec<String> = Vec::new();
+        for (uid, res) in &uids {
+            if self.uids.get(uid) != Some(res) {
+                changed.push(uid.clone());
+            }
+        }
+        for uid in self.uids.keys() {
+            if !uids.contains_key(uid) {
+                changed.push(uid.clone());
+            }
+        }
+        self.uids_by_res = uids.iter().map(|(u, r)| (r.clone(), u.clone())).collect();
+        self.uids = uids;
+        for uid in changed {
+            self.relink_uid_referencers(&uid);
+        }
+    }
+
+    /// Point `resource` (a `res://…` path) at `uid`, or drop its mapping when `uid` is `None` — the
+    /// single-sidecar counterpart of [`Self::set_uid_map`], for a `.uid` file created, edited, or
+    /// deleted mid-session. A resource owns at most one uid, so re-pointing it also retires the one
+    /// it held before.
+    pub(crate) fn sync_uid_for_resource(&mut self, resource: &str, uid: Option<&str>) {
+        let mut touched: Vec<String> = Vec::new();
+        if let Some(old) = self.uids_by_res.remove(resource) {
+            if Some(old.as_str()) != uid {
+                self.uids.remove(&old);
+                touched.push(old);
+            } else {
+                self.uids_by_res.insert(resource.to_owned(), old);
+            }
+        }
+        if let Some(uid) = uid {
+            if self.uids.get(uid).map(String::as_str) != Some(resource) {
+                // A uid can only name one resource; steal it off whatever held it.
+                if let Some(prev) = self.uids.insert(uid.to_owned(), resource.to_owned()) {
+                    self.uids_by_res.remove(&prev);
+                }
+                self.uids_by_res.insert(resource.to_owned(), uid.to_owned());
+                touched.push(uid.to_owned());
+            }
+        }
+        for uid in touched {
+            self.relink_uid_referencers(&uid);
+        }
+    }
+
     fn mark_dirty(&mut self, fid: FileId) {
         self.dirty.insert(fid);
         *self.epochs.entry(fid).or_insert(0) += 1;
@@ -531,6 +622,9 @@ impl Index {
     ///   6. Every `FileId` in `path_referencers` values is in `interfaces.keys()` (the key path
     ///      itself may be a not-yet-created target — a waiting referencer).
     ///   7. `file_path_ref` and `path_referencers` are mutual inverses on their domains.
+    ///   8. Every `FileId` in `uid_referencers` values is in `interfaces.keys()` (the key uid itself
+    ///      may be unresolvable — a file referencing a `uid://` with no sidecar still waits on it).
+    ///   9. `uid_refs` and `uid_referencers` are mutual inverses on their domains.
     pub fn verify(&self) -> Result<(), Vec<IndexInvariant>> {
         let mut violations = Vec::new();
 
@@ -640,6 +734,48 @@ impl Index {
             }
         }
 
+        // Invariant 8: uid_referencers values ⊆ interfaces.keys().
+        for (uid, referencers) in &self.uid_referencers {
+            for &fid in referencers {
+                if !self.interfaces.contains_key(&fid) {
+                    violations.push(IndexInvariant::UidRefererNotIndexed {
+                        uid: uid.clone(),
+                        fid,
+                    });
+                }
+            }
+        }
+
+        // Invariant 9: uid_refs ↔ uid_referencers are mutual inverses on their domains.
+        for (&fid, uids) in &self.uid_refs {
+            for uid in uids {
+                if !self
+                    .uid_referencers
+                    .get(uid)
+                    .is_some_and(|set| set.contains(&fid))
+                {
+                    violations.push(IndexInvariant::UidRefsInverseMissing {
+                        fid,
+                        uid: uid.clone(),
+                    });
+                }
+            }
+        }
+        for (uid, set) in &self.uid_referencers {
+            for &fid in set {
+                if !self
+                    .uid_refs
+                    .get(&fid)
+                    .is_some_and(|uids| uids.contains(uid))
+                {
+                    violations.push(IndexInvariant::UidRefsInverseMissing {
+                        fid,
+                        uid: uid.clone(),
+                    });
+                }
+            }
+        }
+
         if violations.is_empty() {
             Ok(())
         } else {
@@ -664,7 +800,7 @@ impl Index {
 
     /// `res://…` → an already-indexed *and live* `FileId`, if that file is known.
     fn resolve_path(&self, res: &str) -> Option<FileId> {
-        let abs = crate::paths::res_to_path(&self.root, res)?;
+        let abs = crate::paths::res_to_path(&self.root, self.deref_uid(res)?)?;
         let fid = self.ids.get(&normalize(&abs)).copied()?;
         // Liveness gate: `ids`/`paths` is the append-only "ever-seen" arena — a
         // removed file keeps its slot so live `FileId`s never shift (see `verify` invariant 1) —
@@ -747,14 +883,23 @@ impl Index {
 
         self.deps.set_deps(fid, deps);
         self.set_name_refs(fid, names);
+        // The uid strings this file references, resolved or not — see `uid_refs_of`.
+        let uids = match self.interfaces.get(&fid) {
+            Some(iface) => uid_refs_of(iface),
+            None => FxHashSet::default(),
+        };
+        self.set_uid_refs(fid, uids);
         // Record the path-`extends` target *regardless of liveness* (unlike the live-gated edge
         // above) so a file later created at that path can re-link this consumer — see
         // `relink_path_referencers` / `on_file_changed` branch 5. `res_to_path` + `normalize`
         // produces the same key `resolve_path` and `intern` use, so the created file's
         // `on_file_changed` lands in this `path_referencers` bucket.
+        // Dereffed first, so `path_referencers` is keyed by the real target path and a `.gd`
+        // created there re-links an `extends "uid://…"` consumer through the same branch a
+        // `res://` one takes.
         let path_target = path_extends
             .as_deref()
-            .and_then(|res| crate::paths::res_to_path(&self.root, res))
+            .and_then(|res| self.res_to_path(res))
             .map(|abs| normalize(&abs));
         self.set_path_ref(fid, path_target);
     }
@@ -776,6 +921,46 @@ impl Index {
         }
         if !names.is_empty() {
             self.file_refs.insert(fid, names);
+        }
+    }
+
+    /// Replace `fid`'s recorded `uid://` references, keeping the `uid → referencers` inverse
+    /// consistent. Mirror of [`Self::set_name_refs`]; prunes empty inverse sets.
+    fn set_uid_refs(&mut self, fid: FileId, uids: FxHashSet<String>) {
+        if let Some(old) = self.uid_refs.remove(&fid) {
+            for uid in old {
+                if let Some(set) = self.uid_referencers.get_mut(&uid) {
+                    set.remove(&fid);
+                    if set.is_empty() {
+                        self.uid_referencers.remove(&uid);
+                    }
+                }
+            }
+        }
+        for uid in &uids {
+            self.uid_referencers
+                .entry(uid.clone())
+                .or_default()
+                .insert(fid);
+        }
+        if !uids.is_empty() {
+            self.uid_refs.insert(fid, uids);
+        }
+    }
+
+    /// Re-resolve and invalidate every file that references `uid` — its mapping just changed.
+    /// Mirror of [`Self::relink_referencers`] for the uid-keyed table.
+    fn relink_uid_referencers(&mut self, uid: &str) {
+        let referencers: Vec<FileId> = self
+            .uid_referencers
+            .get(uid)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        for fid in referencers {
+            self.recompute_edges(fid);
+            self.mark_dirty(fid);
         }
     }
 
@@ -884,6 +1069,19 @@ fn path_extends_of(iface: &Interface) -> Option<String> {
         Extends::Path { path, .. } => Some(path.clone()),
         _ => None,
     }
+}
+
+/// Every `uid://…` string an interface references — its `preload`/`load` targets and its
+/// path-`extends`, resolved or not. Recording the UNRESOLVED ones is the point: a uid that maps to
+/// nothing today is exactly the file a sidecar appearing later has to re-link (#447).
+fn uid_refs_of(iface: &Interface) -> FxHashSet<String> {
+    iface
+        .preload_deps
+        .iter()
+        .cloned()
+        .chain(path_extends_of(iface))
+        .filter(|s| s.starts_with("uid://"))
+        .collect()
 }
 
 /// Canonicalize a path so a Windows backslash path (from a disk walk) and a forward-slash path
@@ -1016,6 +1214,21 @@ impl Index {
             }
         }
 
+        // Rebuild `uid_refs` and its inverse from the interfaces themselves — the uid strings a
+        // file references are a pure function of its `preload_deps` and its `Extends::Path`, both
+        // of which the cache carries, so they need no storage of their own.
+        let mut uid_refs: FxHashMap<FileId, FxHashSet<String>> = FxHashMap::default();
+        let mut uid_referencers: FxHashMap<String, FxHashSet<FileId>> = FxHashMap::default();
+        for (fid, iface) in &interfaces {
+            let set = uid_refs_of(iface);
+            for uid in &set {
+                uid_referencers.entry(uid.clone()).or_default().insert(*fid);
+            }
+            if !set.is_empty() {
+                uid_refs.insert(*fid, set);
+            }
+        }
+
         // Rebuild `file_path_ref` map and the `path_referencers` inverse.
         let mut file_path_ref: FxHashMap<FileId, Utf8PathBuf> = FxHashMap::default();
         let mut path_referencers: FxHashMap<Utf8PathBuf, FxHashSet<FileId>> = FxHashMap::default();
@@ -1038,6 +1251,16 @@ impl Index {
             name_referencers,
             file_path_ref,
             path_referencers,
+            // The uid map is NOT serialized: `ProjectModel::load_checked` re-walks the `*.uid`
+            // sidecars on every startup, warm or cold, so caching it would duplicate state that is
+            // rebuilt for free and cost a format invalidation. The workspace hands it in right
+            // after the load (`Index::set_uid_map`), and `uid_refs` is rebuilt below from the
+            // interfaces themselves — the same "reverse maps are derived, never serialized"
+            // doctrine that governs `name_referencers` and `path_referencers`.
+            uids: FxHashMap::default(),
+            uids_by_res: FxHashMap::default(),
+            uid_refs,
+            uid_referencers,
             // Runtime-only fields start empty/zeroed — correct for a fresh warm-start.
             dirty: FxHashSet::default(),
             epochs: FxHashMap::default(),
@@ -1151,6 +1374,10 @@ pub enum IndexInvariant {
     FilePathRefInverseMissing { fid: FileId, path: Utf8PathBuf },
     /// `path_referencers[path]` contains `fid` whose `file_path_ref[fid]` ≠ `path`.
     PathRefsInverseMissing { fid: FileId, path: Utf8PathBuf },
+    /// `uid_referencers[uid]` contains a `FileId` not present in `interfaces` (a stale referencer).
+    UidRefererNotIndexed { uid: String, fid: FileId },
+    /// `uid_refs` and `uid_referencers` disagree about whether `fid` references `uid`.
+    UidRefsInverseMissing { fid: FileId, uid: String },
 }
 
 /// The sole mutation surface for the *runtime incremental* mutators outside `gd_project`.
@@ -1181,6 +1408,17 @@ impl IndexMut<'_> {
     /// Drop a deleted file from the index. Forwards to [`Index::on_file_removed`].
     pub fn on_file_removed(&mut self, path: &Utf8Path) {
         self.inner.on_file_removed(path);
+    }
+
+    /// Replace the project's `uid:// → res://` map. Forwards to [`Index::set_uid_map`].
+    pub fn set_uid_map(&mut self, uids: FxHashMap<String, String>) {
+        self.inner.set_uid_map(uids);
+    }
+
+    /// Point one resource at a uid, or drop its mapping. Forwards to
+    /// [`Index::sync_uid_for_resource`].
+    pub fn sync_uid_for_resource(&mut self, resource: &str, uid: Option<&str>) {
+        self.inner.sync_uid_for_resource(resource, uid);
     }
 
     /// WP-RD10 release-test seam: inject a guaranteed [`Index::verify`] violation **without
@@ -1362,9 +1600,9 @@ fn violation_paths(v: &IndexInvariant, index: &Index) -> Vec<Utf8PathBuf> {
         | IndexInvariant::NameRefsInverseMissing { fid, .. }
         | IndexInvariant::PathRefererNotIndexed { fid, .. }
         | IndexInvariant::FilePathRefInverseMissing { fid, .. }
-        | IndexInvariant::PathRefsInverseMissing { fid, .. } => {
-            from_fid(*fid).into_iter().collect()
-        }
+        | IndexInvariant::PathRefsInverseMissing { fid, .. }
+        | IndexInvariant::UidRefererNotIndexed { fid, .. }
+        | IndexInvariant::UidRefsInverseMissing { fid, .. } => from_fid(*fid).into_iter().collect(),
     }
 }
 
@@ -1470,6 +1708,143 @@ mod tests {
     /// reads as "X's epoch is unchanged". A never-touched / unindexed file reads 0.
     fn epoch(idx: &Index, rel: &str) -> u64 {
         idx.file_id(&abs(rel)).map_or(0, |f| idx.epoch_of(f))
+    }
+
+    /// A `uid://` map installed after the cold build makes `preload("uid://…")` resolve — the #447
+    /// seam. Without the map the same literal answers `None`, which is what typed the const
+    /// `Variant`.
+    #[test]
+    fn a_uid_resolves_only_once_the_map_is_installed() {
+        let mut idx = cold_index(&[
+            ("a.gd", "const Lib = preload(\"uid://abc\")\n"),
+            ("b.gd", "class_name MyLib\nextends Node\n"),
+        ]);
+        assert_eq!(
+            idx.resolve_res_path("uid://abc"),
+            None,
+            "an unmapped uid resolves to nothing rather than being joined onto the root"
+        );
+        let mut uids = FxHashMap::default();
+        uids.insert("uid://abc".to_owned(), "res://b.gd".to_owned());
+        idx.txn(&abs("project.godot"), move |i| i.set_uid_map(uids));
+        assert_eq!(
+            idx.resolve_res_path("uid://abc"),
+            idx.file_id(&abs("b.gd")),
+            "the mapped uid resolves to the same FileId its res:// path does"
+        );
+        assert!(idx.verify().is_ok());
+    }
+
+    /// Installing the map re-resolves and invalidates the files that reference the uid, and leaves
+    /// everyone else alone.
+    #[test]
+    fn installing_the_map_invalidates_only_the_uids_referencers() {
+        let mut idx = cold_index(&[
+            ("a.gd", "const Lib = preload(\"uid://abc\")\n"),
+            ("b.gd", "class_name MyLib\nextends Node\n"),
+            ("c.gd", "extends Node\n"),
+        ]);
+        let (before_a, before_c) = (epoch(&idx, "a.gd"), epoch(&idx, "c.gd"));
+        let mut uids = FxHashMap::default();
+        uids.insert("uid://abc".to_owned(), "res://b.gd".to_owned());
+        idx.txn(&abs("project.godot"), move |i| i.set_uid_map(uids));
+        assert!(
+            epoch(&idx, "a.gd") > before_a,
+            "the referencing file is re-analyzed"
+        );
+        assert_eq!(
+            epoch(&idx, "c.gd"),
+            before_c,
+            "an unrelated file is untouched"
+        );
+        let a = idx.file_id(&abs("a.gd")).expect("a is indexed");
+        let b = idx.file_id(&abs("b.gd")).expect("b is indexed");
+        assert!(
+            idx.deps.dependents(b).any(|d| d == a),
+            "the dependency edge a → b is recorded through the uid"
+        );
+    }
+
+    /// A path-`extends` written as a uid re-links through the same waiting-target branch a `res://`
+    /// one takes, so creating the target later wakes the consumer up.
+    #[test]
+    fn a_uid_path_extends_links_to_its_target() {
+        let mut idx = cold_index(&[("a.gd", "extends \"uid://abc\"\n")]);
+        let mut uids = FxHashMap::default();
+        uids.insert("uid://abc".to_owned(), "res://b.gd".to_owned());
+        idx.txn(&abs("project.godot"), move |i| i.set_uid_map(uids));
+        let before = epoch(&idx, "a.gd");
+        let tree = gd_syntax::parse("class_name MyBase\nextends Node\n").tree;
+        idx.txn(&abs("b.gd"), |i| {
+            i.on_file_changed(&abs("b.gd"), interface::extract(&tree));
+        });
+        assert!(
+            epoch(&idx, "a.gd") > before,
+            "creating the uid's target re-analyzes the file extending it"
+        );
+        assert!(idx.verify().is_ok());
+    }
+
+    /// One sidecar changing mid-session re-points the uid and wakes its referencers, without a full
+    /// re-scan.
+    #[test]
+    fn syncing_one_sidecar_repoints_the_uid() {
+        let mut idx = cold_index(&[
+            ("a.gd", "const Lib = preload(\"uid://abc\")\n"),
+            ("b.gd", "class_name MyLib\nextends Node\n"),
+            ("c.gd", "class_name Other\nextends Node\n"),
+        ]);
+        let mut uids = FxHashMap::default();
+        uids.insert("uid://abc".to_owned(), "res://b.gd".to_owned());
+        idx.txn(&abs("project.godot"), move |i| i.set_uid_map(uids));
+        let before = epoch(&idx, "a.gd");
+        idx.txn(&abs("c.gd"), |i| {
+            i.sync_uid_for_resource("res://c.gd", Some("uid://abc"));
+        });
+        assert_eq!(
+            idx.resolve_res_path("uid://abc"),
+            idx.file_id(&abs("c.gd")),
+            "a uid names one resource; the new sidecar steals it"
+        );
+        assert!(
+            epoch(&idx, "a.gd") > before,
+            "the referencing file is re-analyzed against the new target"
+        );
+        assert!(idx.verify().is_ok());
+    }
+
+    /// Deleting a sidecar drops the mapping, and the reference goes back to unresolvable rather
+    /// than to a stale target.
+    #[test]
+    fn dropping_a_sidecar_unresolves_the_uid() {
+        let mut idx = cold_index(&[
+            ("a.gd", "const Lib = preload(\"uid://abc\")\n"),
+            ("b.gd", "class_name MyLib\nextends Node\n"),
+        ]);
+        let mut uids = FxHashMap::default();
+        uids.insert("uid://abc".to_owned(), "res://b.gd".to_owned());
+        idx.txn(&abs("project.godot"), move |i| i.set_uid_map(uids));
+        idx.txn(&abs("b.gd"), |i| {
+            i.sync_uid_for_resource("res://b.gd", None);
+        });
+        assert_eq!(idx.resolve_res_path("uid://abc"), None);
+        assert!(idx.verify().is_ok());
+    }
+
+    /// Removing a file that referenced a uid clears it out of the inverse table, so `verify`'s
+    /// "every referencer is live" invariant keeps holding.
+    #[test]
+    fn removing_a_uid_referencer_prunes_the_inverse() {
+        let mut idx = cold_index(&[
+            ("a.gd", "const Lib = preload(\"uid://abc\")\n"),
+            ("b.gd", "class_name MyLib\nextends Node\n"),
+        ]);
+        idx.txn(&abs("a.gd"), |i| i.on_file_removed(&abs("a.gd")));
+        assert!(idx.verify().is_ok());
+        let mut uids = FxHashMap::default();
+        uids.insert("uid://abc".to_owned(), "res://b.gd".to_owned());
+        idx.txn(&abs("project.godot"), move |i| i.set_uid_map(uids));
+        assert!(idx.verify().is_ok());
     }
 
     #[test]
