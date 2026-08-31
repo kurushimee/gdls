@@ -4897,6 +4897,16 @@ fn emit_variable_annotation_warnings(ctx: &mut AnalysisContext, class_id: NodeId
     // gdscript_parser.cpp:4530 / :4861 / :4932 — the node-ness of the enclosing class, read once.
     // `None` means the base chain is unknown, in which case gdls stays silent and lets the apply
     // through rather than inventing a rejection.
+    // `is_tool()` (gdscript_parser.h) — the parser-wide flag `@tool` on the script's own head
+    // sets. It is per SCRIPT, not per class, so an inner class reads the same value; and it is
+    // read off the tree rather than the cross-file interface so a file analyzed on its own, with
+    // no project behind it, still answers correctly.
+    let script_is_tool = ctx.tree.root_id().is_some_and(|root| {
+        ctx.tree.get(root).annotations.iter().any(
+            |&a| matches!(&ctx.tree.get(a).kind, NodeKind::Annotation(an) if an.name == "@tool"),
+        )
+    });
+
     let native_base = nearest_native_ancestor(ctx, class_id);
     let is_node_derived = native_base
         .as_ref()
@@ -4953,6 +4963,53 @@ fn emit_variable_annotation_warnings(ctx: &mut AnalysisContext, class_id: NodeId
                     continue;
                 }
                 onready = true;
+            } else if name == "@export_tool_button" {
+                // `export_tool_button_annotation` (gdscript_parser.cpp:5047-5091) is its own apply
+                // with its own order: the tool-script check runs BEFORE the static and duplicate
+                // checks every other `@export*` leads with, so a non-tool script with a static
+                // tool button reports the tool error, not the static one.
+                if !script_is_tool {
+                    ctx.push_error(
+                        r#"Tool buttons can only be used in tool scripts (add "@tool" to the top of the script)."#,
+                        ann_id,
+                    );
+                    continue;
+                }
+                if is_static {
+                    ctx.push_error(
+                        format!(r#"Annotation "{name}" cannot be applied to a static variable."#),
+                        ann_id,
+                    );
+                    continue;
+                }
+                if exported {
+                    ctx.push_error(
+                        format!(
+                            r#"Annotation "{name}" cannot be used with another "@export" annotation."#
+                        ),
+                        ann_id,
+                    );
+                    continue;
+                }
+                // :5069-5074 — a hard, non-Variant type must be `Callable`. Both guards are
+                // upstream's own, and together they are also the fail-open gate: a gdls degrade
+                // yields either a `Variant` kind or a soft type, and neither reaches the check.
+                let var_type = ctx.get_type(var_id).clone();
+                if !var_type.is_variant()
+                    && var_type.is_hard_type()
+                    && (var_type.kind != DtKind::Builtin
+                        || var_type.builtin_type != VariantType::Callable)
+                {
+                    ctx.push_error(
+                        format!(
+                            r#""@export_tool_button" annotation requires a variable of type "Callable", but type "{var_type}" was given instead."#
+                        ),
+                        ann_id,
+                    );
+                    continue;
+                }
+                // :5077 — set only once every check has passed, unlike `export_annotations`.
+                exported = true;
             } else if name.starts_with("@export") {
                 // gdscript_parser.cpp:4665-4674 — `static`, then a second `@export*` of any kind.
                 if is_static {
