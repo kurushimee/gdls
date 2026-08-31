@@ -6,11 +6,12 @@
 
 mod common;
 
-use common::{file_uri, notification, recv, request, shutdown, TempProject};
+use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};
 use lsp_types::{
-    DiagnosticSeverity, DidOpenTextDocumentParams, InitializeParams, InitializedParams,
-    TextDocumentItem,
+    DiagnosticSeverity, DidOpenTextDocumentParams, DocumentLink, DocumentLinkParams,
+    GotoDefinitionParams, Hover, HoverParams, InitializeParams, InitializedParams, Location,
+    Position, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
 };
 
 const LIB_GD: &str = "\
@@ -145,5 +146,93 @@ fn a_uid_path_extends_reaches_the_base() {
         vec![r#"Function "nofunc()" not found in base self."#],
         "the inherited member resolves and only the absent one is reported"
     );
+    shutdown(&client, handle);
+}
+
+/// The `result` payload of the next response, unwrapped.
+fn recv_result(client: &Connection) -> serde_json::Value {
+    recv_response(client).result.expect("a result payload")
+}
+
+/// The read-only navigation surface follows a uid the same way it follows a `res://` path: the
+/// literal is a link, hovers as its target, and ctrl-clicks to it. All three used to decline on the
+/// `res://` prefix check alone, so a uid literal was inert text.
+#[test]
+fn the_read_only_surface_follows_a_uid_literal() {
+    let p = project();
+    let src = "extends Node\nconst Lib = preload(\"uid://ctest447\")\n";
+    p.write("user.gd", src);
+    let (client, handle) = boot(&p);
+    let abs = p.root.join("user.gd");
+    let uri = file_uri(&abs);
+    let _ = open_errors(&client, &p, "user.gd");
+    let lib_uri = file_uri(&p.root.join("lib.gd"));
+
+    // documentLink: one link, pointing at the uid's target.
+    client
+        .sender
+        .send(request(
+            10,
+            "textDocument/documentLink",
+            DocumentLinkParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        ))
+        .unwrap();
+    let links: Vec<DocumentLink> =
+        serde_json::from_value(recv_result(&client)).expect("documentLink result");
+    assert_eq!(links.len(), 1, "exactly one link; got {links:?}");
+    assert_eq!(
+        links[0].target.as_ref(),
+        Some(&lib_uri),
+        "the uid literal links to the file its sidecar names"
+    );
+
+    // The cursor inside the literal: hover names the target, definition jumps to it.
+    let inside = Position {
+        line: 1,
+        character: 25,
+    };
+    client
+        .sender
+        .send(request(
+            11,
+            "textDocument/hover",
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: inside,
+                },
+                work_done_progress_params: Default::default(),
+            },
+        ))
+        .unwrap();
+    let hover: Option<Hover> = serde_json::from_value(recv_result(&client)).expect("hover result");
+    let rendered = serde_json::to_string(&hover.expect("a uid literal hovers")).unwrap();
+    assert!(
+        rendered.contains("lib.gd"),
+        "the hover names the resolved file; got {rendered}"
+    );
+
+    client
+        .sender
+        .send(request(
+            12,
+            "textDocument/definition",
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: inside,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        ))
+        .unwrap();
+    let def: Location = serde_json::from_value(recv_result(&client)).expect("definition result");
+    assert_eq!(def.uri, lib_uri, "ctrl-click on a uid opens its target");
+
     shutdown(&client, handle);
 }

@@ -295,7 +295,7 @@ pub fn document_link(state: &mut ServerState, params: DocumentLinkParams) -> Vec
         else {
             continue;
         };
-        if !path.starts_with("res://") {
+        if !is_resource_literal(path) {
             continue;
         }
         // Resolve the literal to an on-disk project file, then link it. Two cases, both keeping
@@ -2782,7 +2782,7 @@ fn hover_preload_string(state: &ServerState, tree: &ParseTree, node_id: NodeId) 
     else {
         return None;
     };
-    if !path.starts_with("res://") {
+    if !is_resource_literal(path) {
         return None;
     }
     // Resolve to an on-disk project file with the same logic as `document_link`, so hover and
@@ -3802,6 +3802,17 @@ fn cursor_references_global_class(
 
 /// M6-C1: resolve a `res://`-path string literal to a [`Location`] at the start of the target
 /// file. Called when the cursor's innermost node is a [`NodeKind::Literal`] whose value is a
+/// Whether a string literal is a resource reference the read-only navigation surface follows:
+/// a `res://` path, or the `uid://` that names the same file by identity (#447). `Index`
+/// dereferences a uid before the `res://` strip, so both spellings reach the same target through
+/// the same resolvers. Anything else (`user://`, a format string, plain text) is not a reference.
+///
+/// This is READ-side only. `willRenameFiles` deliberately refuses a `uid://` literal — see
+/// `file_operations::ResIdentity::resolve`.
+fn is_resource_literal(path: &str) -> bool {
+    path.starts_with("res://") || path.starts_with("uid://")
+}
+
 /// [`Literal::String`] starting with `"res://"`. Non-res strings (e.g. `"user://x"`,
 /// format strings, regular text) return `None` — the outer `definition` handler degrades to the
 /// normal identifier path.
@@ -3816,7 +3827,7 @@ fn find_res_path_definition(
     else {
         return None;
     };
-    if !path.starts_with("res://") {
+    if !is_resource_literal(path) {
         return None;
     }
     // Resolve to a real file on disk, the same two ways `document_link` does (#348). The index
