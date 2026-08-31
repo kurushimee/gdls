@@ -1,18 +1,17 @@
 {
   "barrier_ok": true,
-  "elapsed_s": 1.4,
+  "elapsed_s": 1.5,
   "files_opened": 249,
   "unreadable": [],
   "files_with_diagnostics": 249,
   "severity_histogram": {
-    "2": 115
+    "2": 75
   },
   "files_with_errors": 0,
-  "files_warnings_only": 45,
+  "files_warnings_only": 23,
   "error_message_histogram": {},
   "warning_message_histogram": {
-    "INTEGER_DIVISION": 72,
-    "NARROWING_CONVERSION": 41,
+    "INTEGER_DIVISION": 73,
     "UNUSED_VARIABLE": 1,
     "STATIC_CALLED_ON_INSTANCE": 1
   },

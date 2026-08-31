@@ -114,3 +114,54 @@ fn a_variant_base_is_never_index_checked() {
         Vec::<String>::new()
     );
 }
+
+/// #435: a member of an OUTER class is not reachable through an explicit base either. Reading
+/// `Inner.OC` where `OC` belongs to the enclosing class used to resolve silently, because the
+/// in-file walk saw the outer chain. Godot's walk with an explicit base is the inheritance chain
+/// alone (`gdscript_analyzer.cpp:4270-4275`), so the name is simply not there.
+#[test]
+fn an_outer_classs_member_is_not_reachable_through_an_inner_class() {
+    let src = "extends Node\nconst OC := 1\nenum OE { A }\n\n\
+               class Inner:\n\tvar v := 1\n\n\
+               func f() -> void:\n\tprint(Inner.OC)\n\tprint(Inner.OE)\n";
+    let dialect = Dialect::DEFAULT;
+    let tree = gd_syntax::parse_with_options(
+        src,
+        &ParseOptions {
+            dialect,
+            script_path: "",
+        },
+    )
+    .tree;
+    let db = native_db();
+    let policy = WarnPolicy::build(
+        &WarningConfig::default(),
+        &StrictSettings::default(),
+        dialect,
+    );
+    let result = analyze_with_options(
+        &tree,
+        Some(FileId::new(1)),
+        "a.gd",
+        &db,
+        &NoCrossFile,
+        &policy,
+        AnalyzeOptions {
+            dialect,
+            ..Default::default()
+        },
+    );
+    let errors: Vec<String> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == gd_analyze::Severity::Error)
+        .map(|d| d.message().to_owned())
+        .collect();
+    assert_eq!(
+        errors,
+        vec![
+            r#"Cannot find member "OC" in base "Inner"."#,
+            r#"Cannot find member "OE" in base "Inner"."#,
+        ]
+    );
+}

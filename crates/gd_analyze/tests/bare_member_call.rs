@@ -266,3 +266,86 @@ fn a_bare_call_on_an_unparseable_bases_member_stays_silent() {
     assert_eq!(errors, Vec::<String>::new());
     assert_eq!(warnings, Vec::<String>::new());
 }
+
+// ===================================================================================================
+// #435 — the callee walk stops at the outer boundary.
+// ===================================================================================================
+
+/// The issue's repro. A bare call naming an OUTER class's member from an inner class is a miss,
+/// not a value. Godot's callee resolution walks the base chain only: with an explicit base its
+/// self-name arm is gated off (`gdscript_analyzer.cpp:4188`) and its ancestry loop breaks the
+/// moment it leaves that chain (`:4270-4275`), so the outer class is gathered and never reached.
+#[test]
+fn an_outer_classs_member_called_bare_is_a_miss() {
+    let src = "extends Node\n\nconst OC := 1\n\nstatic func osf() -> void:\n\tpass\n\n\
+               class Inner:\n\tfunc f() -> void:\n\t\tOC()\n\t\tosf()\n";
+    let (errors, _) = diagnose(src);
+    assert_eq!(
+        errors,
+        vec![
+            r#"Function "OC()" not found in base self."#,
+            r#"Function "osf()" not found in base self."#,
+        ]
+    );
+}
+
+/// A local, a local typed `Callable`, and a parameter, each called bare. None of them is on the
+/// chain, so all three are misses — the `Name "x" is a Callable` hint is reserved for a member
+/// holding a callable, which the probe DOES reach.
+#[test]
+fn a_local_or_parameter_called_bare_is_a_miss() {
+    let src = "extends Node\n\nfunc f() -> void:\n\tvar x: int = 1\n\tx()\n\n\
+               func h() -> void:\n\tvar c: Callable = Callable()\n\tc()\n\n\
+               func i(p: int) -> void:\n\tp()\n";
+    let (errors, _) = diagnose(src);
+    assert_eq!(
+        errors,
+        vec![
+            r#"Function "x()" not found in base self."#,
+            r#"Function "c()" not found in base self."#,
+            r#"Function "p()" not found in base self."#,
+        ]
+    );
+}
+
+/// A native class name called bare is a miss too: `Node` is a global, not a member of the chain.
+#[test]
+fn a_native_class_name_called_bare_is_a_miss() {
+    let (errors, _) = diagnose(&body("Node", "Node()"));
+    assert_eq!(errors, vec![r#"Function "Node()" not found in base self."#]);
+}
+
+/// The preservation half. A member of the class ITSELF, and one inherited through an in-file base,
+/// both still draw the full value-callable pair — that is what the chain walk exists for.
+#[test]
+fn an_own_or_inherited_member_still_draws_the_pair() {
+    let own = "extends Node\n\nconst C := 1\n\nfunc f() -> void:\n\tC()\n";
+    let (errors, _) = diagnose(own);
+    assert_eq!(
+        errors,
+        vec![not_a_function("C"), value_msg("C", "int")],
+        "an own member keeps the pair"
+    );
+
+    let inherited = "extends Node\n\nclass Mid:\n\tconst MC := 1\n\n\
+                     class Leaf extends Mid:\n\tfunc f() -> void:\n\t\tMC()\n";
+    let (errors, _) = diagnose(inherited);
+    assert_eq!(
+        errors,
+        vec![not_a_function("MC"), value_msg("MC", "int")],
+        "an in-file inherited member keeps the pair"
+    );
+}
+
+/// A member holding a `Callable` keeps the `.call()` hint — the one message that arm is for.
+#[test]
+fn a_member_holding_a_callable_keeps_the_call_hint() {
+    let src = "extends Node\n\nvar cv: Callable = Callable()\n\nfunc f() -> void:\n\tcv()\n";
+    let (errors, _) = diagnose(src);
+    assert!(
+        errors.contains(
+            &r#"Name "cv" is a Callable. You can call it with "cv.call()" instead."#.to_owned()
+        ),
+        "{errors:?}"
+    );
+}
