@@ -195,6 +195,12 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
     /// the next analysis of a referring file). `res://` resolves against the project root; a
     /// relative path joins the referring file's directory. Everything else (no sidecar,
     /// unreadable, no `type=`) is `None` — the analyzer degrades to Variant (#444).
+    ///
+    /// Deliberate trade, not a free property: this is a blocking `read_to_string` inside
+    /// `reduce_preload` — one syscall per preload per analysis pass, reaching past the
+    /// in-memory index straight to disk, against the "eager interfaces, lazy bodies"
+    /// arrangement elsewhere. Bounded by preloads-in-one-file, so it is fine in practice;
+    /// if a 10k-file profile ever says otherwise, this is the line to memoize.
     fn imported_resource_class(&self, from: Option<FileId>, raw: &str) -> Option<String> {
         let asset_path = if let Some(abs) = gd_project::paths::res_to_path(&self.project_root, raw)
         {
