@@ -65,7 +65,7 @@ godot --dump-extension-api-with-docs
 
 Diagnostics (push and pull), hover, definition, declaration, type definition, references, implementation, call hierarchy, type hierarchy, document and workspace symbols, completion, signature help, rename, document highlight, semantic tokens, inlay hints, document colors, code actions, folding and selection ranges, document links, and file-rename edits. Any editor gets the whole set with no gdls-specific client code and none of the Godot editor LSP's custom protocol. The full surface is in [`docs/05-lsp-cc-integration.md`](docs/05-lsp-cc-integration.md), and the capabilities gdls deliberately does not serve, with reasons, are in [`docs/09-lsp-conventions.md`](docs/09-lsp-conventions.md) §5.
 
-Against Godot's own vendored corpus, both ratchets sit at 1.0000 — the parser at 185/185 and the analyzer at 196/196, with empty known-failures lists on either side.
+Against Godot's own vendored corpus, both ratchets sit at 1.0000 — the parser at 185/185 and the analyzer at 199/199, with empty known-failures lists on either side.
 
 The latest release is v3.0.0. [`CHANGELOG.md`](CHANGELOG.md) has the release history, and [`docs/08-history.md`](docs/08-history.md) has how the project was built.
 
