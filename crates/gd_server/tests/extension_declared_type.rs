@@ -32,13 +32,26 @@ const NODE_API: &str = r#"{
 /// declares (analyzer-visible even when the extension ships no doc XML and the dump missed it).
 const LIMBO_GDEXTENSION: &str = "[configuration]\n\nentry_symbol = \"limbo_library_init\"\n\n[icons]\n\nBTTask=\"res://addons/limboai/icons/bt_task.svg\"\nBlackboard=\"res://addons/limboai/icons/blackboard.svg\"\n";
 
-fn setup_project(with_extension: bool) -> TempProject {
+/// The partial-visibility shape: the dump captured ONE of the extension's hints (`Blackboard`)
+/// but not the other. The all-or-nothing degradation notice stays silent here (one hint
+/// resolves ⇒ "the extension is visible"), but the missing hint must still be recorded — the
+/// analyzer may not negatively claim it either.
+const PARTIAL_API: &str = r#"{
+    "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+    "classes": [
+        {"name": "Object"},
+        {"name": "Node", "inherits": "Object"},
+        {"name": "Blackboard", "inherits": "Object"}
+    ]
+}"#;
+
+fn setup_project(with_extension: bool, api: &str) -> TempProject {
     let p = TempProject::new();
     p.write(
         "project.godot",
         "config_version=5\n\n[application]\n\nconfig/name=\"ExtTypes\"\nconfig/features=PackedStringArray(\"4.6\")\n",
     );
-    p.write("extension_api.json", NODE_API);
+    p.write("extension_api.json", api);
     if with_extension {
         p.write("addons/limboai/limboai.gdextension", LIMBO_GDEXTENSION);
     }
@@ -113,7 +126,7 @@ fn open_and_collect(
 
 #[test]
 fn extension_declared_class_type_degrades_silently() {
-    let p = setup_project(true);
+    let p = setup_project(true, NODE_API);
     let (client, handle) = boot(&p);
     let diags = open_and_collect(&client, &p, "src/main.gd").diagnostics;
     let offending: Vec<_> = diags
@@ -128,10 +141,30 @@ fn extension_declared_class_type_degrades_silently() {
 }
 
 #[test]
+fn a_partially_visible_extension_still_records_its_missing_hints() {
+    // The dump carries `Blackboard` but not `BTTask`; the `[icons]` section declares both.
+    // The degradation notice stays silent (one hint resolves), and before the unconditional
+    // recording this was exactly the row that slipped through: BTTask still emitted
+    // `Could not find type`.
+    let p = setup_project(true, PARTIAL_API);
+    let (client, handle) = boot(&p);
+    let diags = open_and_collect(&client, &p, "src/main.gd").diagnostics;
+    let offending: Vec<_> = diags
+        .iter()
+        .filter(|d| d.message.contains("Could not find type"))
+        .collect();
+    assert!(
+        offending.is_empty(),
+        "the missing half of a partially-visible extension must degrade silently: {offending:?}"
+    );
+    shutdown(&client, handle);
+}
+
+#[test]
 fn undeclared_unknown_type_still_errors() {
     // Same dump, no `.gdextension`: nothing declares `BTTask`, so the Exact-provenance
     // negative claim stands (the gate must not swallow genuine typos).
-    let p = setup_project(false);
+    let p = setup_project(false, NODE_API);
     let (client, handle) = boot(&p);
     let diags = open_and_collect(&client, &p, "src/main.gd").diagnostics;
     assert!(
