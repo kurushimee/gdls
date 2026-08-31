@@ -24,7 +24,9 @@ use gd_syntax::ast::{Member, NodeId, NodeKind};
 use gd_syntax::Dialect;
 
 use crate::context::AnalysisContext;
-use crate::data_type::{DataType, DtKind, MethodSig, ScriptRef, TypeSource, VariantType};
+use crate::data_type::{
+    variant_type_name, DataType, DtKind, MethodSig, ScriptRef, TypeSource, VariantType,
+};
 
 /// The `RESOLVING` cycle sentinel datatype (Godot sets this before resolving a class/member/type).
 fn resolving() -> DataType {
@@ -4987,20 +4989,20 @@ fn emit_variable_annotation_warnings(ctx: &mut AnalysisContext, class_id: NodeId
                     continue;
                 }
 
-                // gdscript_parser.cpp:4861 / :4932 — a Node-typed export needs a Node-derived
-                // class. The base's string in the template is `base_type.to_string()`, which for
-                // this chain walk is the bare native name (e.g. "Resource", "RefCounted").
-                if is_node_derived == Some(false) {
-                    let var_type = ctx.get_type(var_id).clone();
-                    if type_is_node_typed_for_export(ctx, &var_type) {
-                        let base = native_base.as_deref().unwrap_or_default();
-                        ctx.push_error(
-                            format!(
-                                r#"Node export is only supported in Node-derived classes, but the current class inherits "{base}"."#
-                            ),
-                            ann_id,
-                        );
-                    }
+                // gdscript_parser.cpp:4744-4965 — the export TYPE checks, including the
+                // Node-export-in-a-non-Node-class error. Only the annotations that route to
+                // `export_annotations<...>` reach them; `@export_storage`, `@export_custom`, and
+                // `@export_tool_button` register their own apply and check nothing here.
+                if annotation_uses_export_hint_string(&name) {
+                    apply_export_type_checks(
+                        ctx,
+                        ann_id,
+                        &name,
+                        var_id,
+                        initializer,
+                        is_node_derived,
+                        native_base.as_deref(),
+                    );
                 }
             }
         }
@@ -5079,26 +5081,349 @@ pub(crate) fn class_ancestry_introspectable(ctx: &AnalysisContext, class_id: Nod
     false
 }
 
-/// `true` when the variable's declared type makes the `@export` annotation a "Node export" — the
-/// Godot's `PROPERTY_HINT_NODE_TYPE` path (gdscript_parser.cpp:4844 / :4915). Hits when:
-/// * the type is a native Object whose chain reaches Node, or
-/// * the type is `Array[T]` / `Dictionary[K, V]` and any container element is itself Node-typed.
-fn type_is_node_typed_for_export(ctx: &AnalysisContext, dt: &DataType) -> bool {
-    if dt.kind == DtKind::Native && !dt.native_type.is_empty() {
-        return ctx.native.is_subclass_of_named(&dt.native_type, "Node");
+/// `_get_annotation_error_string` (gdscript_parser.cpp:4549-4599). Each expected builtin type
+/// contributes its own name, its `Array[…]` form, and every packed array whose element type it is,
+/// and the whole list is joined with an Oxford comma. Godot quotes each name with
+/// `String::quote()`, so the message carries literal double quotes around every one of them.
+fn export_annotation_error_string(
+    annotation_name: &str,
+    expected_types: &[VariantType],
+    provided_type: &DataType,
+) -> String {
+    let mut types: Vec<String> = Vec::new();
+    for &t in expected_types {
+        let name = variant_type_name(t);
+        types.push(name.to_string());
+        types.push(format!("Array[{name}]"));
+        // The switch at :4556-4578 — the packed arrays whose element type is `t`.
+        match t {
+            VariantType::Int => {
+                types.push("PackedByteArray".into());
+                types.push("PackedInt32Array".into());
+                types.push("PackedInt64Array".into());
+            }
+            VariantType::Float => {
+                types.push("PackedFloat32Array".into());
+                types.push("PackedFloat64Array".into());
+            }
+            VariantType::String => types.push("PackedStringArray".into()),
+            VariantType::Vector2 => types.push("PackedVector2Array".into()),
+            VariantType::Vector3 => types.push("PackedVector3Array".into()),
+            VariantType::Color => types.push("PackedColorArray".into()),
+            VariantType::Vector4 => types.push("PackedVector4Array".into()),
+            _ => {}
+        }
     }
-    if dt.kind == DtKind::Builtin
-        && matches!(
-            dt.builtin_type,
-            VariantType::Array | VariantType::Dictionary
-        )
+
+    let quoted: Vec<String> = types.iter().map(|t| format!("\"{t}\"")).collect();
+    let list = match quoted.len() {
+        0 => String::new(),
+        1 => quoted[0].clone(),
+        2 => format!("{} or {}", quoted[0], quoted[1]),
+        n => format!("{}, or {}", quoted[..n - 1].join(", "), quoted[n - 1]),
+    };
+
+    format!(
+        r#""{annotation_name}" annotation requires a variable of type {list}, but type "{provided_type}" was given instead."#
+    )
+}
+
+/// The `t_type` template argument of each `export_annotations<hint, t_type>` registration
+/// (gdscript_parser.cpp:152-173), which the tail check at :4967 compares the variable's type
+/// against. Only ever read for a name [`annotation_uses_export_hint_string`] accepts, and `@export`
+/// and `@export_enum` clear `use_default_variable_type_check` before the tail runs, so their `NIL`
+/// is carried for parity and never compared.
+fn export_annotation_expected_variant_type(name: &str) -> VariantType {
+    match name {
+        "@export_file"
+        | "@export_file_path"
+        | "@export_dir"
+        | "@export_global_file"
+        | "@export_global_dir"
+        | "@export_multiline"
+        | "@export_placeholder" => VariantType::String,
+        "@export_range" | "@export_exp_easing" => VariantType::Float,
+        "@export_color_no_alpha" => VariantType::Color,
+        "@export_node_path" => VariantType::NodePath,
+        "@export_flags"
+        | "@export_flags_2d_render"
+        | "@export_flags_2d_physics"
+        | "@export_flags_2d_navigation"
+        | "@export_flags_3d_render"
+        | "@export_flags_3d_physics"
+        | "@export_flags_3d_navigation"
+        | "@export_flags_avoidance" => VariantType::Int,
+        // "@export" and "@export_enum".
+        _ => VariantType::Nil,
+    }
+}
+
+/// What the object leg of the `@export` switch concluded (gdscript_parser.cpp:4808-4823).
+enum ExportObjectLeg {
+    /// A `Resource`-derived export, or an enum / builtin / Variant that never reaches ClassDB.
+    Fine,
+    /// A `Node`-derived export — the class it sits in must itself be Node-derived (:4861 / :4932).
+    NodeExport,
+    /// Neither, so upstream's "Export type can only be …" fired and the apply returned.
+    Rejected,
+    /// gdls could not see far enough to make the call. Upstream never has this case; here it means
+    /// an unindexed base or a class absent from the native DB, and it must stay silent.
+    Unknown,
+}
+
+/// The `case NATIVE / SCRIPT / CLASS` leg of the `@export` switch (gdscript_parser.cpp:4808-4823),
+/// which upstream answers with two `ClassDB::is_parent_class` probes on `export_type.native_type`.
+///
+/// gdls resolves the native root of the type first, because a `Script`/`Class` kind carries a
+/// project type whose native ancestor lives behind the cross-file chain. Two things upstream never
+/// has to check gate the probes: a chain gdls could not walk to a native root, and a native name
+/// the loaded dump does not carry. `is_subclass_of_named` answers `false` to BOTH probes for an
+/// unknown name, which lands in the "Rejected" leg — so without the second gate an API dump that
+/// is `Absent`, or merely missing a GDExtension class, would invent this error on ordinary code.
+/// That also makes an explicit [`crate::native_db::ApiProvenance`] branch unnecessary: an absent
+/// dump carries no classes at all, and a generic one only answers for real engine classes, whose
+/// Resource/Node ancestry does not move between releases.
+fn export_object_leg(ctx: &AnalysisContext, export_type: &DataType) -> ExportObjectLeg {
+    let root = match export_type.kind {
+        DtKind::Native => Some(export_type.native_type.clone()).filter(|s| !s.is_empty()),
+        DtKind::Script => export_type
+            .script_type
+            .as_ref()
+            .and_then(|sr| crate::script_chain::chain_native_root(ctx, sr)),
+        DtKind::Class => export_type
+            .class_node
+            .and_then(|id| nearest_native_ancestor(ctx, id)),
+        _ => None,
+    };
+    let Some(root) = root else {
+        return ExportObjectLeg::Unknown;
+    };
+    if ctx.native.class_named(&root).is_none() {
+        return ExportObjectLeg::Unknown;
+    }
+    if ctx.native.is_subclass_of_named(&root, "Resource") {
+        ExportObjectLeg::Fine
+    } else if ctx.native.is_subclass_of_named(&root, "Node") {
+        ExportObjectLeg::NodeExport
+    } else {
+        ExportObjectLeg::Rejected
+    }
+}
+
+/// One pass of the `@export` kind switch — the key leg at gdscript_parser.cpp:4802-4858 and, for a
+/// typed `Dictionary`, the value leg at :4877-4926, which are the same switch written twice.
+/// Returns the leg's verdict; the caller turns `Rejected` into the error and `NodeExport` into the
+/// node-derived check.
+///
+/// The `ENUM` and `VARIANT` legs carry no diagnostic: everything they do upstream writes
+/// `export_info`, which a language server has no consumer for. Upstream's `default:` leg (a
+/// `RESOLVING`/`UNRESOLVED` kind) is the one place this port deliberately stays silent — in gdls
+/// those two kinds are routinely a capability degrade rather than a broken program.
+fn export_kind_leg(ctx: &AnalysisContext, export_type: &DataType) -> ExportObjectLeg {
+    match export_type.kind {
+        DtKind::Builtin | DtKind::Enum | DtKind::Variant => ExportObjectLeg::Fine,
+        DtKind::Native | DtKind::Script | DtKind::Class => export_object_leg(ctx, export_type),
+        // fail-open: upstream's `default:` error. See the doc comment above.
+        DtKind::Resolving | DtKind::Unresolved => ExportObjectLeg::Unknown,
+    }
+}
+
+/// The export TYPE checks — everything after the argument loop in `GDScriptParser::export_annotations`
+/// (gdscript_parser.cpp:4742-4965).
+///
+/// Upstream's whole purpose there is to fill `variable->export_info` with a property type, a hint,
+/// and a hint string. gdls has no consumer for any of that, so only the errors and the control flow
+/// that reaches them are ported; every `export_info` write is dropped, and with it the `is_array`
+/// re-wrap at :4975 and the dictionary key/value prefix strings.
+///
+/// The provided type printed in every message is the variable's OWN datatype
+/// (`variable->get_datatype()`), not the element type extracted below — so `Array[RefCounted]`
+/// reports as `"Array[RefCounted]"`.
+#[allow(clippy::too_many_arguments)]
+fn apply_export_type_checks(
+    ctx: &mut AnalysisContext,
+    ann_id: NodeId,
+    name: &str,
+    var_id: NodeId,
+    initializer: Option<NodeId>,
+    is_node_derived: Option<bool>,
+    native_base: Option<&str>,
+) {
+    let provided = ctx.get_type(var_id).clone();
+    let mut export_type = provided.clone();
+
+    // :4745-4748 — a `Variant` declaration defers to the initializer's type.
+    if export_type.is_variant() {
+        if let Some(init_id) = initializer {
+            let init_type = ctx.get_type(init_id).clone();
+            if init_type.is_set() {
+                export_type = init_type;
+                export_type.type_source = TypeSource::Inferred;
+            }
+        }
+    }
+
+    // :4752-4760 — process the annotation on the ELEMENT type of an array or packed array.
+    if export_type.kind == DtKind::Builtin
+        && export_type.builtin_type == VariantType::Array
+        && !export_type.container_element_types.is_empty()
     {
-        return dt
-            .container_element_types
-            .iter()
-            .any(|inner| type_is_node_typed_for_export(ctx, inner));
+        export_type = export_type.container_element_types[0].clone();
+    } else if export_type.is_typed_container_type() {
+        let element = crate::data_type::typed_container_element(export_type.builtin_type)
+            .expect("invariant: is_typed_container_type implies a packed-array element type");
+        let source = export_type.type_source;
+        export_type = DataType {
+            kind: DtKind::Builtin,
+            builtin_type: element,
+            type_source: source,
+            ..Default::default()
+        };
     }
-    false
+
+    // :4762-4768 — a typed `Dictionary` runs the switch twice, on the key and then on the value.
+    // Upstream stashes the value type inside the key's own element slot to reuse one variable; a
+    // named local is the mechanical equivalent.
+    let mut dict_value_type: Option<DataType> = None;
+    if export_type.kind == DtKind::Builtin
+        && export_type.builtin_type == VariantType::Dictionary
+        && !export_type.container_element_types.is_empty()
+    {
+        dict_value_type = Some(
+            export_type
+                .container_element_types
+                .get(1)
+                .cloned()
+                .unwrap_or_else(DataType::variant),
+        );
+        export_type = export_type.container_element_types[0].clone();
+    }
+
+    let mut use_default_variable_type_check = true;
+
+    if name == "@export_range" {
+        // :4772-4776 — the INT special case only writes `export_info`.
+    } else if name == "@export_multiline" {
+        // :4777-4785
+        use_default_variable_type_check = false;
+        // fail-open: a type gdls itself could not pin down must not answer this check.
+        if !export_type.is_positively_dynamic() {
+            return;
+        }
+        if export_type.kind != DtKind::Builtin
+            || !matches!(
+                export_type.builtin_type,
+                VariantType::String | VariantType::Dictionary
+            )
+        {
+            ctx.push_error(
+                export_annotation_error_string(
+                    name,
+                    &[VariantType::String, VariantType::Dictionary],
+                    &provided,
+                ),
+                ann_id,
+            );
+            return;
+        }
+    } else if name == "@export" {
+        // :4786-4940
+        use_default_variable_type_check = false;
+
+        // :4797-4800 — "the type of the initialized value can't be inferred". gdls cannot yet tell
+        // its own inference gap from a genuine one here, so this error is not ported; the switch
+        // below simply has nothing to say about an undetected type.
+        if export_type.has_no_type() {
+            return;
+        }
+
+        let mut node_export = match export_kind_leg(ctx, &export_type) {
+            ExportObjectLeg::Rejected => {
+                ctx.push_error(
+                    "Export type can only be built-in, a resource, a node, or an enum.",
+                    ann_id,
+                );
+                return;
+            }
+            ExportObjectLeg::Unknown => return,
+            leg => matches!(leg, ExportObjectLeg::NodeExport),
+        };
+
+        // :4869-4941 — the value pass. Upstream rewrites a Variant or untyped value kind to
+        // BUILTIN first (:4877-4879), which is exactly "no diagnostic".
+        if let Some(value_type) = dict_value_type {
+            if !(value_type.is_variant() || value_type.has_no_type()) {
+                match export_kind_leg(ctx, &value_type) {
+                    ExportObjectLeg::Rejected => {
+                        ctx.push_error(
+                            "Export type can only be built-in, a resource, a node, or an enum.",
+                            ann_id,
+                        );
+                        return;
+                    }
+                    ExportObjectLeg::Unknown => return,
+                    ExportObjectLeg::NodeExport => node_export = true,
+                    ExportObjectLeg::Fine => node_export = false,
+                }
+            } else {
+                node_export = false;
+            }
+        }
+
+        // :4861 / :4932 — a Node-typed export needs a Node-derived class. `is_node_derived` is
+        // `None` when the chain could not be walked, which stays silent. The base's string in the
+        // template is `base_type.to_string()`, which for this chain walk is the bare native name.
+        if node_export && is_node_derived == Some(false) {
+            let base = native_base.unwrap_or_default();
+            ctx.push_error(
+                format!(
+                    r#"Node export is only supported in Node-derived classes, but the current class inherits "{base}"."#
+                ),
+                ann_id,
+            );
+            return;
+        }
+    } else if name == "@export_enum" {
+        // :4942-4955
+        use_default_variable_type_check = false;
+        let enum_type = if export_type.kind == DtKind::Builtin
+            && export_type.builtin_type == VariantType::String
+        {
+            VariantType::String
+        } else {
+            VariantType::Int
+        };
+        // `is_variant()` covers `Resolving`/`Unresolved`, so an unresolved type excuses itself.
+        if !export_type.is_variant()
+            && (export_type.kind != DtKind::Builtin || export_type.builtin_type != enum_type)
+        {
+            ctx.push_error(
+                export_annotation_error_string(
+                    name,
+                    &[VariantType::Int, VariantType::String],
+                    &provided,
+                ),
+                ann_id,
+            );
+            return;
+        }
+    }
+
+    // :4967-4977 — the default check against the registration's `t_type`, with the float/int
+    // tolerance. No DB lookup happens here, and `is_variant()` again excuses an unresolved type.
+    if use_default_variable_type_check {
+        let t_type = export_annotation_expected_variant_type(name);
+        if !export_type.is_variant()
+            && (export_type.kind != DtKind::Builtin || export_type.builtin_type != t_type)
+            && (t_type != VariantType::Float || export_type.builtin_type != VariantType::Int)
+            && (t_type != VariantType::Int || export_type.builtin_type != VariantType::Float)
+        {
+            ctx.push_error(
+                export_annotation_error_string(name, &[t_type], &provided),
+                ann_id,
+            );
+        }
+    }
 }
 
 /// Classify a class-variable initializer for the `GET_NODE_DEFAULT_WITHOUT_ONREADY` check
