@@ -317,6 +317,12 @@ pub struct FunctionNode {
 pub struct GetNodeNode {
     pub full_path: String,
     pub use_dollar: bool,
+    /// The path segments written as bare identifiers, in order. Godot runs its spoof check on each
+    /// of these (`gdscript_parser.cpp:3670-3677`) and on nothing else in the path — a segment
+    /// written as a string literal is deliberately not checked, so `$"pοrt"` stays silent where
+    /// `$pοrt` warns. Kept alongside `full_path`, which cannot answer the question once the
+    /// segments are joined.
+    pub ident_segments: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

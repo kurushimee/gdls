@@ -6251,20 +6251,48 @@ fn warn_class_member_shadows_global(ctx: &mut AnalysisContext, node_id: NodeId, 
     }
 }
 
-/// CONFUSABLE_IDENTIFIER warning (analyzer.cpp's `is_confusable_identifier` helper) — fires
-/// when an identifier contains a non-ASCII alphabetic character that's visually similar
-/// to an ASCII letter (Cyrillic А vs Latin A, Greek α vs Latin a, etc.). Godot uses
-/// Unicode's Confusables table; gdls approximates with a "contains any non-ASCII alphabetic
-/// character" gate, which catches the corpus's `my_vАr` style identifiers (Cyrillic А in
-/// the middle of an ASCII name) without false-positiving on identifiers that gdls's
-/// tokenizer doesn't accept anyway (Godot limits identifiers to letters / digits /
-/// underscores in the relevant tokenization paths).
+/// `TextServer::spoof_check` (`text_server_adv.cpp:7903-7928`) — ICU `uspoof_check` with the
+/// allowed set `uspoof_getRecommendedSet() ∪ uspoof_getInclusionSet()` and restriction level
+/// `USPOOF_MODERATELY_RESTRICTIVE`. `true` means the name is a spoofing risk.
+///
+/// UTS #39 §5.2 is what that restriction level is: a single-script identifier passes, and so does
+/// Latin mixed with one of the CJK script sets; what fails is mixing Latin with Cyrillic or Greek,
+/// and any character outside the allowed set. `check_restriction_level` answers both halves —
+/// `detect_restriction_level` returns `Unrestricted` for a character whose Identifier_Status is not
+/// Allowed, which is the same set ICU builds from those two calls.
+///
+/// Three documented under-reports, all in the safe direction. The crate's tables are Unicode 16
+/// where the engine bundles ICU 78 (Unicode 17), so Bopomofo does not yet read as restricted; the
+/// ICU `INVISIBLE` bit is not modelled, so a doubled combining mark (`á́b`) passes; and the check
+/// runs on declarations and node names only, matching where gdls calls it rather than every
+/// `parse_identifier` upstream covers.
+///
+/// A character the crate's tables do not know at all returns early as "not a spoof". That keeps a
+/// future Unicode data bump from turning table-blindness into a false positive on ordinary code.
+pub(crate) fn spoof_check(name: &str) -> bool {
+    use unicode_security::restriction_level::{RestrictionLevel, RestrictionLevelDetection};
+    use unicode_security::GeneralSecurityProfile;
+
+    if name.is_ascii() {
+        return false;
+    }
+    if name
+        .chars()
+        .any(|c| !c.is_ascii() && c.identifier_type().is_none())
+    {
+        return false;
+    }
+    !name.check_restriction_level(RestrictionLevel::ModeratelyRestrictive)
+}
+
+/// CONFUSABLE_IDENTIFIER (`gdscript_parser.cpp:2822-2825`) — Godot runs `TS->spoof_check` on every
+/// identifier it parses as a declaration, and warns when it comes back true. #497.
 fn warn_confusable_identifier(ctx: &mut AnalysisContext, node_id: NodeId) {
     let name = decl_identifier_name(ctx, node_id);
     if name.is_empty() {
         return;
     }
-    if !name.chars().any(|c| !c.is_ascii() && c.is_alphabetic()) {
+    if !spoof_check(&name) {
         return;
     }
     let ident_id = match &ctx.node(node_id).kind {

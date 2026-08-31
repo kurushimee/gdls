@@ -9166,6 +9166,25 @@ fn reduce_get_node(ctx: &mut AnalysisContext, id: NodeId) {
         }
         _ => return,
     };
+    // CONFUSABLE_IDENTIFIER on each bare-identifier segment (gdscript_parser.cpp:3670-3677). Godot
+    // warns from the PARSER, so this runs ahead of the two context checks below — a `$pοrt` inside
+    // a static function draws both the context error and this warning, as it does upstream. The
+    // anchor is the whole `$…` node, so the reported line is the line the access is written on,
+    // and a path with two bad segments warns twice on it.
+    let segments = match &ctx.node(id).kind {
+        NodeKind::GetNode(n) => n.ident_segments.clone(),
+        _ => Vec::new(),
+    };
+    for segment in segments {
+        if crate::resolver::spoof_check(&segment) {
+            ctx.push_warning(
+                crate::warnings::WarningCode::ConfusableIdentifier,
+                std::slice::from_ref(&segment),
+                id,
+            );
+        }
+    }
+
     // WP-P10: get_node shorthand context restrictions (analyzer.cpp's `reduce_get_node`,
     // analyzer.cpp:3864-3887). Two contexts make `$Node` / `%Unique` invalid; Godot checks the
     // non-Node class FIRST, then the static-function context, and each check that fires pushes its

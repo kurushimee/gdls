@@ -166,6 +166,7 @@ dependencies = [
  "gd_syntax",
  "gd_types",
  "rustc-hash",
+ "unicode-security",
  "which",
 ]
 
