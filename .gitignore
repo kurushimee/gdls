@@ -11,3 +11,7 @@
 # warm-start index cache directories — written by the server into <project-root>/.gdls/ at
 # runtime; never committed (each developer's cache is local and build-config-keyed)
 **/.gdls/
+
+# Acceptance-sweep artifacts (`scripts/acceptance/scan_diags.py`); the kept baselines live outside the repo.
+scan-report.json
+scan-report-stderr.log

@@ -49,7 +49,23 @@ const MAIN_GD: &str = "extends Node2D\n\n\
                        \t$Health\n\
                        \t%Special\n\
                        \tget_node(\"Sprite\")\n\
-                       \t$/root/Elsewhere\n";
+                       \t$/root/Elsewhere\n\
+                       \n\
+                       @onready var sp := $Sprite\n\
+                       @onready var lb := %Special\n\
+                       @onready var h := $Health\n\
+                       var typed: Node2D = $Sprite\n\
+                       \n\
+                       func g():\n\
+                       \tsp.flip_h\n\
+                       \tlb.tooltip_text\n\
+                       \th.hp\n\
+                       \ttyped.flip_h\n\
+                       \tvar l = get_node(\"Sprite\")\n\
+                       \tl.flip_h\n\
+                       \n\
+                       func shadowed(sp: Node2D):\n\
+                       \tsp.flip_h\n";
 
 /// A project whose `main.tscn` attaches `main.gd` at the root, with a native-only child (`Sprite`, a
 /// `Sprite2D`), a script-carrying child (`Health`, running `health.gd` = `class_name Health`), and a
@@ -603,6 +619,207 @@ fn a_nested_scene_access_does_not_hijack_the_enclosing_base() {
     assert!(
         !labels.iter().any(|l| l == "flip_h"),
         "an Array base must not answer with Sprite2D's members, got {labels:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+// ===================================================================================================
+// #458 — one hop through a variable that holds the access.
+// ===================================================================================================
+
+/// The line index of the single line containing `needle` in [`MAIN_GD`], and the column just past
+/// the first character of `needle`'s member. Keeps these tests off hard-coded line numbers, which
+/// the fixture has drifted under before.
+fn at(needle: &str, member: &str) -> Position {
+    at_nth(needle, member, false)
+}
+
+/// [`at`] against the LAST line matching `needle` — `\tsp.flip_h` appears in both `g()` and the
+/// shadowing function, and the two must answer differently.
+fn at_last(needle: &str, member: &str) -> Position {
+    at_nth(needle, member, true)
+}
+
+fn at_nth(needle: &str, member: &str, last: bool) -> Position {
+    let matches: Vec<usize> = MAIN_GD
+        .lines()
+        .enumerate()
+        .filter(|(_, l)| l.contains(needle))
+        .map(|(i, _)| i)
+        .collect();
+    let line = *(if last {
+        matches.last()
+    } else {
+        matches.first()
+    })
+    .unwrap_or_else(|| panic!("{needle} in MAIN_GD"));
+    let text = MAIN_GD.lines().nth(line).unwrap();
+    let character = text.find(member).expect("member on that line") as u32 + 1;
+    Position {
+        line: line as u32,
+        character,
+    }
+}
+
+/// `@onready var sp := $Sprite` then `sp.flip_h` — the single most common Godot idiom. The member
+/// read off `sp` hovers as `Sprite2D`'s property, where it used to answer bare `Node`'s surface.
+#[test]
+fn hover_past_a_variable_holding_an_access_uses_the_scene_type() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    let md = hover_md(&client, 10, &uri, at("\tsp.flip_h", "flip_h"));
+    assert!(
+        md.contains("Sprite2D") && md.contains("flip_h"),
+        "expected the Sprite2D property hover, got: {md}"
+    );
+
+    // The unique-name spelling reaches the same seam.
+    let md = hover_md(&client, 11, &uri, at("lb.tooltip_text", "tooltip_text"));
+    assert!(
+        md.contains("Control") && md.contains("tooltip_text"),
+        "expected the Control property hover, got: {md}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The same hop through a LOCAL, written with the `get_node("…")` call form.
+#[test]
+fn hover_past_a_local_holding_a_get_node_call() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    let md = hover_md(&client, 10, &uri, at("\tl.flip_h", "flip_h"));
+    assert!(
+        md.contains("Sprite2D") && md.contains("flip_h"),
+        "expected the Sprite2D property hover, got: {md}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A node carrying a script resolves to that script, so a member the script declares jumps into its
+/// file rather than answering nothing.
+#[test]
+fn definition_past_a_variable_holding_a_scripted_node() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    let raw = def_raw(&client, 10, &uri, at("\th.hp", "hp"));
+    let text = raw.to_string();
+    assert!(
+        text.contains("health.gd"),
+        "expected a jump into health.gd, got: {text}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The two refusals, both of which must fall back rather than answer. An explicitly annotated
+/// declaration keeps the author's type ("Annotated type takes precedence"), and a parameter that
+/// shadows the member is a different symbol entirely.
+#[test]
+fn an_annotation_or_a_shadow_falls_back_to_the_analyzer() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    // `var typed: Node2D = $Sprite` — `flip_h` is a Sprite2D member, so the annotated Node2D has
+    // nothing to answer with, and no scene type may rescue it.
+    let raw = def_raw(&client, 10, &uri, at("typed.flip_h", "flip_h"));
+    assert!(
+        raw.is_null() || !raw.to_string().contains("Sprite2D"),
+        "an annotated declaration must not pick up the scene type, got: {raw}"
+    );
+
+    // `func shadowed(sp: Node2D)` — the parameter shadows the member of the same name, so the
+    // SECOND `sp.flip_h` (inside that function) must not answer the way the first one does.
+    let raw = def_raw(&client, 11, &uri, at_last("\tsp.flip_h", "flip_h"));
+    let text = raw.to_string();
+    assert!(
+        !text.contains("Sprite2D"),
+        "a shadowing parameter must not pick up the member's scene type, got: {text}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Completion after `sp.` offers `Sprite2D`'s surface. This is the payoff line of the whole hop:
+/// bare `Node` has hundreds of members and none of them are the one the author wants.
+#[test]
+fn completion_past_a_variable_holding_an_access_offers_the_scene_surface() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    let pos = at("\tsp.flip_h", "flip_h");
+    client
+        .sender
+        .send(request(
+            10,
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": pos.line, "character": pos.character - 1 },
+            }),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(resp.error.is_none(), "completion errored: {:?}", resp.error);
+    let raw = resp.result.expect("completion result");
+    let labels: Vec<String> = raw
+        .get("items")
+        .unwrap_or(&raw)
+        .as_array()
+        .expect("completion items")
+        .iter()
+        .filter_map(|i| i.get("label")?.as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        labels.iter().any(|l| l == "flip_h"),
+        "Sprite2D's own property must be offered; got {labels:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// signatureHelp on a method that only `Sprite2D` declares. The hop feeds the same seam, so the
+/// call's signature is found where bare `Node` had nothing to offer.
+#[test]
+fn signature_help_past_a_variable_holding_an_access() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let src = format!("{MAIN_GD}\nfunc h():\n\tsp.set_flip_h(\n");
+    let (client, server_thread) = boot(&p, &uri, &src);
+
+    let line = src.lines().count() as u32 - 1;
+    let character = src.lines().last().unwrap().len() as u32;
+    client
+        .sender
+        .send(request(
+            10,
+            "textDocument/signatureHelp",
+            serde_json::json!({
+                "textDocument": { "uri": uri.as_str() },
+                "position": { "line": line, "character": character },
+            }),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_none(),
+        "signatureHelp errored: {:?}",
+        resp.error
+    );
+    let raw = resp.result.expect("signatureHelp result");
+    assert!(
+        raw.to_string().contains("set_flip_h"),
+        "expected Sprite2D's set_flip_h signature, got: {raw}"
     );
 
     shutdown(&client, server_thread);
