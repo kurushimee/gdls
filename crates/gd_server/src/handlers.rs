@@ -8778,6 +8778,19 @@ pub fn prepare_rename(
         return Err(refusal);
     }
 
+    // #489: the override-group gate, the other refusal `rename` can reach. Neither of its refusing
+    // verdicts depends on the new name, so answering `Ok(Some(range))` here for a method that
+    // overrides an engine virtual popped the editor's rename box for a symbol that can never be
+    // renamed — `_ready`, `_process`, and `_init` are most of what a GDScript file declares.
+    // Canonicalized the same way rename step 5 does, or the group walk anchors on the wrong node.
+    let key = CanonicalKey::for_uri(&uri);
+    let anchor = rename_canonical_anchor(state, &params, &parsed.tree, &key, &text, byte, &name);
+    if let Some(group) = override_group_at(state, &anchor) {
+        if let Some(refusal) = override_group_refusal(&group, &name, None) {
+            return Err(refusal);
+        }
+    }
+
     let range = mapper.span_to_range(parsed.tree.get(node_id).span);
     if state.caps.rename_prepare_support {
         Ok(Some(PrepareRenameResponse::RangeWithPlaceholder {
@@ -8906,69 +8919,7 @@ pub fn rename(
     // `Direction.NORTH` use-click), and `definition()` is member-FIRST — canonicalizing a value that
     // shares its name with a `const NORTH`/member would jump to that member and rename the WRONG
     // symbol. So treat it like a local: collect from the cursor, which is complete.
-    let skip_canonicalization = resolve_local_binding(&parsed.tree, byte, &old_name).is_some()
-        || cursor_is_enum_value(state, &uri, &parsed.tree, &key, &text, byte, &old_name);
-    // Whether THIS cursor positively refers to the project `class_name old_name` (a class decl-click,
-    // a Class-kind use binding at the span, or a type-position base). When it does NOT, `definition()`
-    // must not be allowed to canonicalize the rename onto that class via its name-only step-2
-    // fallback: a same-named in-file symbol (an anon-enum hoisted const) would otherwise jump to the
-    // unrelated `class_name` declaration and the rename would rewrite it (#159). The guard below
-    // rejects exactly that jump and keeps the cursor's own (complete) reference set.
-    //
-    // This is a FAIL-CLOSED backstop, not the primary fix for the anon-enum case: there, the
-    // `declaration_locations` gate already removes the class, and `definition()` itself resolves the
-    // Member in-file (step 1.5) before its name-only class fallback, so canonicalization stays
-    // in-file. The backstop decouples rename's safety from `definition()`'s step ordering — if a
-    // binding-recording gap leaves a cursor with no in-file Use binding, or `definition()`'s own
-    // name-only class resolution changes (#158), the rename still cannot canonicalize onto an
-    // unrelated class.
-    let cursor_refers_global_class =
-        cursor_references_global_class(state, &uri, &parsed.tree, &key, &text, byte, &old_name);
-
-    // (5a) Class-scope vs global-`class_name` type-name collision is resolved PER OCCURRENCE by the
-    // scope-aware resolver ([`ParseTree::type_name_shadowed_by_enclosing_scope`]), not by a file-level
-    // fail-closed refuse-guard (the #166 coarse guard #167 supersedes). In type-annotation position
-    // Godot checks suite-locals before the global registry but the global registry BEFORE class-scope
-    // members (gdscript_analyzer.cpp:689 < :787 < :845), so:
-    //   - A GLOBAL-class rename collects every type-position `: Foo` whose `Foo` is not shadowed by a
-    //     SUITE-LOCAL — including a class-scope `: Foo` whose root/inner class declares its own
-    //     `enum`/inner-`class`/`const Foo` (that annotation binds the GLOBAL while it exists, so it IS
-    //     a genuine reference and IS edited). The companion expression `Foo.A` binds the local member
-    //     (expression resolution checks members before the global, the reverse order) and records no
-    //     Class-use binding at the global, so it is excluded by construction. Only a suite-local
-    //     (func-local `const Foo`) shadow precedes the global and is suppressed. No whole-rename refusal.
-    //   - A class-scope `: Foo` cursor (root OR inner) is admitted as a global reference by the firewall
-    //     carve-out and canonicalizes onto the global `class_name` decl — the faithful target, since the
-    //     annotation binds the global. A suite-local-shadowed cursor is NOT admitted (it is the local).
-
-    // If the cursor is positively proven to be the global `class_name`, canonicalize straight to
-    // that declaration. The older `definition()` path is name-first for in-file members, so an
-    // `extends Foo` cursor in a file that also declares `enum Foo` could otherwise retarget the enum
-    // even though Godot's inheritance resolver chose the global class.
-    let positive_global_class_decl = cursor_refers_global_class
-        .then(|| find_global_class_definition(state, &old_name))
-        .flatten();
-    let global_class_decl = (!cursor_refers_global_class)
-        .then(|| find_global_class_definition(state, &old_name))
-        .flatten();
-    let edit_tdp = if skip_canonicalization {
-        tdp.clone()
-    } else if let Some(loc) = positive_global_class_decl {
-        TextDocumentPositionParams {
-            text_document: lsp_types::TextDocumentIdentifier { uri: loc.uri },
-            position: loc.range.start,
-        }
-    } else {
-        let resolved = definition(
-            state,
-            GotoDefinitionParams {
-                text_document_position_params: tdp.clone(),
-                work_done_progress_params: WorkDoneProgressParams::default(),
-                partial_result_params: lsp_types::PartialResultParams::default(),
-            },
-        );
-        canonicalization_target(&tdp, resolved, global_class_decl.as_ref())
-    };
+    let edit_tdp = rename_canonical_anchor(state, &tdp, &parsed.tree, &key, &text, byte, &old_name);
 
     // (6) Reuse `references` (declaration + every reference) for the edit set — index/binding-backed
     // resolution, never a text grep. `include_declaration: true` so the declaration token is edited
@@ -9007,6 +8958,153 @@ pub fn rename(
 /// what makes the `super.X()` invariant hold by construction: a super site is edited exactly when
 /// the declaration its call binding resolves to is edited, and the group always contains every
 /// declaration in the chain.
+/// Rename step 5, extracted: move the cursor onto the symbol's DECLARATION before anything reads
+/// its reference set or its override group.
+///
+/// `references` is click-site-dependent for a method — a click on a bare `helper()` call can yield
+/// a NARROWER set than a click on the declaration. For a read that is a cosmetic gap; for a
+/// MUTATING rename it silently drops occurrences, so the declaration is the canonical anchor.
+/// `prepareRename` canonicalizes the same way, so its pre-flight asks about the same symbol the
+/// rename will act on (#489).
+fn rename_canonical_anchor(
+    state: &mut ServerState,
+    tdp: &TextDocumentPositionParams,
+    parsed_tree: &gd_syntax::ast::ParseTree,
+    key: &CanonicalKey,
+    text: &str,
+    byte: usize,
+    old_name: &str,
+) -> TextDocumentPositionParams {
+    let uri = tdp.text_document.uri.clone();
+    let skip_canonicalization = resolve_local_binding(parsed_tree, byte, old_name).is_some()
+        || cursor_is_enum_value(state, &uri, parsed_tree, key, text, byte, old_name);
+    // Whether THIS cursor positively refers to the project `class_name old_name` (a class decl-click,
+    // a Class-kind use binding at the span, or a type-position base). When it does NOT, `definition()`
+    // must not be allowed to canonicalize the rename onto that class via its name-only step-2
+    // fallback: a same-named in-file symbol (an anon-enum hoisted const) would otherwise jump to the
+    // unrelated `class_name` declaration and the rename would rewrite it (#159). The guard below
+    // rejects exactly that jump and keeps the cursor's own (complete) reference set.
+    //
+    // This is a FAIL-CLOSED backstop, not the primary fix for the anon-enum case: there, the
+    // `declaration_locations` gate already removes the class, and `definition()` itself resolves the
+    // Member in-file (step 1.5) before its name-only class fallback, so canonicalization stays
+    // in-file. The backstop decouples rename's safety from `definition()`'s step ordering — if a
+    // binding-recording gap leaves a cursor with no in-file Use binding, or `definition()`'s own
+    // name-only class resolution changes (#158), the rename still cannot canonicalize onto an
+    // unrelated class.
+    let cursor_refers_global_class =
+        cursor_references_global_class(state, &uri, parsed_tree, key, text, byte, old_name);
+
+    // (5a) Class-scope vs global-`class_name` type-name collision is resolved PER OCCURRENCE by the
+    // scope-aware resolver ([`ParseTree::type_name_shadowed_by_enclosing_scope`]), not by a file-level
+    // fail-closed refuse-guard (the #166 coarse guard #167 supersedes). In type-annotation position
+    // Godot checks suite-locals before the global registry but the global registry BEFORE class-scope
+    // members (gdscript_analyzer.cpp:689 < :787 < :845), so:
+    //   - A GLOBAL-class rename collects every type-position `: Foo` whose `Foo` is not shadowed by a
+    //     SUITE-LOCAL — including a class-scope `: Foo` whose root/inner class declares its own
+    //     `enum`/inner-`class`/`const Foo` (that annotation binds the GLOBAL while it exists, so it IS
+    //     a genuine reference and IS edited). The companion expression `Foo.A` binds the local member
+    //     (expression resolution checks members before the global, the reverse order) and records no
+    //     Class-use binding at the global, so it is excluded by construction. Only a suite-local
+    //     (func-local `const Foo`) shadow precedes the global and is suppressed. No whole-rename refusal.
+    //   - A class-scope `: Foo` cursor (root OR inner) is admitted as a global reference by the firewall
+    //     carve-out and canonicalizes onto the global `class_name` decl — the faithful target, since the
+    //     annotation binds the global. A suite-local-shadowed cursor is NOT admitted (it is the local).
+
+    // If the cursor is positively proven to be the global `class_name`, canonicalize straight to
+    // that declaration. The older `definition()` path is name-first for in-file members, so an
+    // `extends Foo` cursor in a file that also declares `enum Foo` could otherwise retarget the enum
+    // even though Godot's inheritance resolver chose the global class.
+    let positive_global_class_decl = cursor_refers_global_class
+        .then(|| find_global_class_definition(state, old_name))
+        .flatten();
+    let global_class_decl = (!cursor_refers_global_class)
+        .then(|| find_global_class_definition(state, old_name))
+        .flatten();
+    let edit_tdp = if skip_canonicalization {
+        tdp.clone()
+    } else if let Some(loc) = positive_global_class_decl {
+        TextDocumentPositionParams {
+            text_document: lsp_types::TextDocumentIdentifier { uri: loc.uri },
+            position: loc.range.start,
+        }
+    } else {
+        let resolved = definition(
+            state,
+            GotoDefinitionParams {
+                text_document_position_params: tdp.clone(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: lsp_types::PartialResultParams::default(),
+            },
+        );
+        canonicalization_target(tdp, resolved, global_class_decl.as_ref())
+    };
+    edit_tdp
+}
+
+/// The refusal an [`OverrideGroup`] verdict owes, or `None` when the group is renameable.
+///
+/// Neither refusing verdict depends on the NEW name — it appears only in the message — which is
+/// what lets `prepareRename` reach the same answer `rename` will (#489). `new_name` is `Some` from
+/// `rename`, where naming the target reads better, and `None` from the pre-flight.
+fn override_group_refusal(
+    group: &OverrideGroup,
+    name: &str,
+    new_name: Option<&str>,
+) -> Option<RequestRefusal> {
+    match group {
+        OverrideGroup::NativeRooted(cls) => {
+            let head = match new_name {
+                Some(new_name) => format!("Cannot rename `{name}` to `{new_name}`"),
+                None => format!("Cannot rename `{name}`"),
+            };
+            Some(RequestRefusal::not_editable(format!(
+                "{head}: it overrides `{cls}.{name}`, a native engine method that cannot be renamed"
+            )))
+        }
+        OverrideGroup::Unprovable => Some(RequestRefusal::not_editable(format!(
+            "Cannot rename `{name}`: its override chain could not be resolved, so the rename cannot \
+             be applied to every class that declares it"
+        ))),
+        OverrideGroup::Single | OverrideGroup::Group(_) => None,
+    }
+}
+
+/// The override-group verdict at a canonicalized anchor, for callers that only need to know whether
+/// the rename can proceed. Shared by `rename`'s step 7 and `prepareRename`'s pre-flight.
+///
+/// `None` when the position resolves to no member declaration at all, which is not a refusal — the
+/// generic single-symbol path owns that case.
+fn override_group_at(
+    state: &mut ServerState,
+    tdp: &TextDocumentPositionParams,
+) -> Option<OverrideGroup> {
+    let uri = tdp.text_document.uri.clone();
+    let text = state.vfs.get(uri.as_str()).map(|d| d.text())?;
+    let key = CanonicalKey::for_uri(&uri);
+    let parsed = state.workspace.parse(&key, &text);
+    let rope = Rope::from_str(&text);
+    let mapper = PositionMapper::new(&rope, state.encoding);
+    let byte = mapper.position_to_byte(tdp.position);
+    let node_id = parsed.tree.innermost_node_at(byte)?;
+    let name = cursor_identifier(&parsed.tree, node_id)?;
+    let anchor_path = uri_to_path(&uri)?;
+    let file = state.workspace.index.file_id(&anchor_path)?;
+    // The anchor is already canonicalized onto the DECLARATION (rename step 5), so the click sits
+    // on a member declaration and this yields the declaring class's inner path.
+    let root_class = parsed.tree.root_id()?;
+    let node_span = parsed.tree.get(node_id).span;
+    let class_path =
+        member_decl_click_class_path(&parsed.tree, root_class, &mut Vec::new(), &name, node_span)?;
+    Some(override_group(
+        &state.workspace.index,
+        &state.workspace.native,
+        file,
+        &class_path,
+        &name,
+    ))
+}
+
 fn rename_override_group_locations(
     state: &mut ServerState,
     anchor: &ReferenceParams,
@@ -9054,15 +9152,13 @@ fn rename_override_group_locations(
     );
     let members = match group {
         OverrideGroup::Single => return Ok(None),
-        OverrideGroup::NativeRooted(cls) => {
-            return Err(RequestRefusal::not_editable(format!(
-                "Cannot rename `{name}` to `{new_name}`: it overrides `{cls}.{name}`, a native engine method that cannot be renamed"
-            )))
-        }
-        OverrideGroup::Unprovable => {
-            return Err(RequestRefusal::not_editable(format!(
-                "Cannot rename `{name}`: its override chain could not be resolved, so the rename cannot be applied to every class that declares it"
-            )))
+        OverrideGroup::NativeRooted(_) | OverrideGroup::Unprovable => {
+            return Err(
+                override_group_refusal(&group, &name, Some(new_name)).expect(
+                    "invariant: \
+                     a NativeRooted or Unprovable group always yields a refusal",
+                ),
+            )
         }
         OverrideGroup::Group(members) => members,
     };
