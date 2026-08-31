@@ -70,7 +70,15 @@ fn a_value_callable_message_names_the_property_enum() {
     );
 }
 
-/// The enum type reaches the assignment check too, so a bare int into the slot warns.
+/// The enum type reaches the assignment check too, so a bare int into the slot draws BOTH enum
+/// warnings.
+///
+/// The second row looks wrong and is faithful: `1` really is `PROCESS_MODE_PAUSABLE`, but a
+/// property-derived enum type carries no member table — upstream's `make_enum_type`
+/// (`gdscript_analyzer.cpp:133-151`) sets `enum_type` and `native_type` and never populates
+/// `enum_values`, so its own `enum_has_value` answers false for every value. `godot --check-only`
+/// prints exactly these two rows for `process_mode = 1`, `= 99`, and `self.process_mode = 1`
+/// alike. Reproducing an upstream quirk is the job; "fixing" it here would be a divergence.
 #[test]
 fn an_int_assigned_to_the_property_warns_without_a_cast() {
     let (errors, warnings) = diagnose("extends Node\n\nfunc f() -> void:\n\tprocess_mode = 1\n");
@@ -80,6 +88,9 @@ fn an_int_assigned_to_the_property_warns_without_a_cast() {
         vec![
             "Integer used when an enum value is expected. If this is intended, cast the integer \
              to the enum type using the \"as\" keyword."
+                .to_owned(),
+            r#"Cannot assign 1 as Enum "Node.ProcessMode": no enum member has matching value."#
+                .to_owned(),
         ]
     );
 }
