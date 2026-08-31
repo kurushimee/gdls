@@ -944,5 +944,5 @@
 # native enum used as a call base, which needed the subscript `!valid` arm to stop wiping the
 # degraded type's `native_type` (analyzer.cpp:4913 sets the KIND only).
 #
-# The list is empty: analyze fidelity is 196/196 = 1.0000. Keep it that way — a new entry here is
+# The list is empty: analyze fidelity is 199/199 = 1.0000. Keep it that way — a new entry here is
 # a regression unless the same PR explains why the file cannot pass.
