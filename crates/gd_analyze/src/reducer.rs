@@ -4903,8 +4903,14 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                                 // an inherited native method through a cross-file chain binds
                                 // its real signature.
                                 let root = crate::script_chain::chain_native_root(ctx, &sr);
-                                let native_sig = root.as_ref().and_then(|root| {
-                                    lookup_native_method(ctx, root, &function_name)
+                                let gd_sig = base_type
+                                    .is_meta_type
+                                    .then(|| gdscript_surface_method(ctx, &function_name))
+                                    .flatten();
+                                let native_sig = gd_sig.or_else(|| {
+                                    root.as_ref().and_then(|root| {
+                                        lookup_native_method(ctx, root, &function_name)
+                                    })
                                 });
                                 if let Some(s) = native_sig {
                                     return_type = Some(s.return_dt.clone());
@@ -4941,12 +4947,22 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         // the not-found branch would re-reduce `self.queue_free` to a Callable
                         // VALUE and emit the bogus `Name "X" is a Callable...` error on every
                         // native method call through a class base.
-                        if let Some(s) = lookup_native_method(ctx, &root, &function_name) {
+                        // A metatype reaches GDScript's own surface first (analyzer.cpp:6017-
+                        // 6025), ahead of the chain's native root.
+                        let gd_sig = base_type
+                            .is_meta_type
+                            .then(|| gdscript_surface_method(ctx, &function_name))
+                            .flatten();
+                        let picked = gd_sig.map(|s| (s, "GDScript".to_owned())).or_else(|| {
+                            lookup_native_method(ctx, &root, &function_name)
+                                .map(|s| (s, root.clone()))
+                        });
+                        if let Some((s, owner)) = picked {
                             return_type = Some(s.return_dt.clone());
                             sig = s;
                             found = true;
                             sig_resolved = true;
-                            native_callee = Some(root);
+                            native_callee = Some(owner);
                         }
                     }
                 }
@@ -4954,7 +4970,16 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         }
     } else if base_type.kind == DtKind::Native && !base_type.native_type.is_empty() {
         // Native method via NativeDb (walks inherits internally).
-        if let Some(s) = lookup_native_method(ctx, &base_type.native_type, &function_name) {
+        if let Some(mut s) = lookup_native_method(ctx, &base_type.native_type, &function_name) {
+            // analyzer.cpp:6036-6039 — every method of an engine SINGLETON is flagged static, which
+            // is what keeps `OS.get_name()` and `Engine.get_frames_drawn()` legal through the class
+            // name. Stamped here rather than inside `lookup_native_method`, whose other callers
+            // (`shape_method_return`) already compensate for this themselves and would double up.
+            // A singleton native is never a chain root — both engines reject `extends OS` — so the
+            // probe sites do not need it.
+            if ctx.native.singleton_type(&base_type.native_type).is_some() {
+                s.is_static = true;
+            }
             return_type = Some(s.return_dt.clone());
             sig = s;
             found = true;
@@ -4995,9 +5020,15 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     // inner-class methods etc., so a phantom "Function not found" is never
                     // acceptable here.
                     let root = crate::script_chain::chain_native_root(ctx, script_ref);
-                    let native_sig = root
-                        .as_ref()
-                        .and_then(|root| lookup_native_method(ctx, root, &function_name));
+                    // A metatype reaches GDScript's own surface first (analyzer.cpp:6017-6025).
+                    let native_sig = base_type
+                        .is_meta_type
+                        .then(|| gdscript_surface_method(ctx, &function_name))
+                        .flatten()
+                        .or_else(|| {
+                            root.as_ref()
+                                .and_then(|root| lookup_native_method(ctx, root, &function_name))
+                        });
                     if let Some(s) = native_sig {
                         return_type = Some(s.return_dt.clone());
                         sig = s;
@@ -5111,6 +5142,16 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // `found = true` with `sig` at its zero-arg default, whose `is_static` is `false` — so
         // without this gate an unresolved call in a static function reported "cannot call
         // non-static", a claim about a signature gdls never read.
+        //
+        // analyzer.cpp:3664-3667 — an enum METAtype is treated as a dictionary value for the
+        // purpose of a call, so `E.has("A")` and `E.keys()` bind `Dictionary`'s own non-static
+        // methods and must not read as "called on the class". Upstream clears the bit on its
+        // local copy right here; every later reader inside this branch sees the cleared value,
+        // and the miss branch is mutually exclusive with it.
+        if base_type.kind == DtKind::Enum && base_type.is_meta_type {
+            base_type.is_meta_type = false;
+        }
+
         if is_self && sig_resolved && ctx.static_context && !sig.is_static && !is_constructor {
             // analyzer.cpp:3645-3654 — name the enclosing concrete function (walking through any
             // lambda chain) so a `static_func ... var f = func (): non_static_func()` reports
@@ -5130,6 +5171,40 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                     id,
                 );
             }
+        } else if !is_self
+            && sig_resolved
+            && base_type.is_meta_type
+            && !sig.is_static
+            && !is_constructor
+            && (!matches!(base_type.kind, DtKind::Class | DtKind::Script)
+                || base_is_introspectable(ctx, &base_type))
+        {
+            // analyzer.cpp:3670-3673 — an instance method reached through the CLASS rather than an
+            // instance. Two gates upstream does not spell, both for the same reason the first arm
+            // carries them:
+            //
+            // * `sig_resolved` (#406): the Variant-degrade fallbacks set `found = true` with `sig`
+            //   at its zero-arg default, whose `is_static` is false, so without it an unresolved
+            //   call through a metatype would claim non-staticness about a signature gdls never
+            //   read.
+            // * `!is_constructor`: upstream's `get_function_signature` force-sets
+            //   `METHOD_FLAG_STATIC` for a constructor (analyzer.cpp:5963-5966), so `X.new()` is
+            //   static there. gdls's constructor paths leave `sig.is_static` at `_init`'s default
+            //   of false, so the exemption is carried explicitly.
+            //
+            // And the same chain firewall the miss branch uses, for the same reason: staticness is
+            // a claim about a signature's SHAPE, and a chain with a missing link or a file that did
+            // not parse cleanly cannot testify to one — error recovery may have dropped the very
+            // `static` this turns on. Only `Class` and `Script` bases have a chain to walk; a
+            // `Native` or `Builtin` metatype reads its signature straight out of the dump.
+            base_type.is_meta_type = false; // analyzer.cpp:3671 — "For `to_string()`."
+            let base_display = class_identifier_name_or_default(ctx, &base_type);
+            ctx.push_error(
+                format!(
+                    r#"Cannot call non-static function "{function_name}()" on the class "{base_display}" directly. Make an instance instead."#
+                ),
+                id,
+            );
         } else if is_self && !sig.is_static {
             ctx.mark_lambda_use_self();
         }
@@ -6133,26 +6208,36 @@ fn native_surface_has_nonmethod(ctx: &AnalysisContext, root: &str, name: &str) -
     false
 }
 
+/// `ClassDB::get_method_info("GDScript", name)` (analyzer.cpp:6017-6025) — the surface a SCRIPT or
+/// CLASS **metatype** carries beyond its own chain. `Weapon.reload()`, `Weapon.source_code`, and
+/// `Weapon.get_instance_base_type()` all resolve there upstream, and then draw
+/// `Cannot call non-static function "X()" on the class "Y" directly.` rather than a miss (#467).
+///
+/// Tried only for a metatype, and ahead of the chain's own native root, so a name carried by both
+/// binds the GDScript one exactly as upstream does — `duplicate()` through a class name is
+/// `Resource::duplicate`, not the `Node::duplicate` the chain would otherwise reach.
+fn gdscript_surface_method(ctx: &AnalysisContext, name: &str) -> Option<CallSig> {
+    lookup_native_method(ctx, "GDScript", name)
+}
+
 /// Whether a name reached through a METATYPE base resolves to something other than a script
 /// method, so claiming the method is absent would be a lie (#426).
 ///
-/// Two surfaces upstream consults that gdls's chain walk does not. The native tail of
-/// `reduce_identifier_from_base` (analyzer.cpp:4333-4386) has no metatype gate at all, so a native
-/// property, signal, constant, or enum resolves through a class's own name — `Weapon.process_mode`
-/// is `Node.ProcessMode`, not a missing method. And `get_function_signature` (analyzer.cpp:6013)
-/// also tries `ClassDB::get_method_info("GDScript", name)` for any SCRIPT or CLASS metatype, so
-/// `Weapon.reload()` and `Weapon.duplicate()` resolve and then draw
-/// `Cannot call non-static function "%s()" on the class "%s" directly.` — a different error gdls
-/// has not ported.
+/// The native tail of `reduce_identifier_from_base` (analyzer.cpp:4333-4386) has no metatype gate
+/// at all, so a native property, signal, constant, or enum resolves through a class's own name —
+/// `Weapon.process_mode` is `Node.ProcessMode`, not a missing method. Suppressing the miss there
+/// is a deliberate under-report: the code is erroneous either way in Godot, and the alternative is
+/// emitting a diagnostic upstream never prints.
 ///
-/// Suppressing both is a deliberate under-report: the code is erroneous either way in Godot, and
-/// the alternative is emitting a diagnostic upstream never prints.
+/// This used to suppress `ClassDB::get_method_info("GDScript", name)` hits as well
+/// (`Weapon.reload()`, `Weapon.duplicate()`), for want of the error upstream reports there. Those
+/// names now RESOLVE, through `gdscript_surface_method` in `reduce_call`, and draw the ported
+/// `Cannot call non-static function "X()" on the class "Y" directly.` (#467), so they can no
+/// longer reach this probe on a `Class` or `Script` base. A `Native` metatype never could: the
+/// static-miss error arm is `Class | Script` only, and `warn_miss_gate` excludes meta natives.
 fn metatype_value_shadow(ctx: &AnalysisContext, base_type: &DataType, name: &str) -> bool {
     if !base_type.is_meta_type {
         return false;
-    }
-    if lookup_native_method(ctx, "GDScript", name).is_some() {
-        return true;
     }
     native_root_for_base(ctx, base_type)
         .is_some_and(|root| native_surface_has_nonmethod(ctx, &root, name))
@@ -8310,8 +8395,23 @@ fn reduce_identifier_from_base(
     // already handles the RESOLVING-sentinel cycle trigger through `resolve_class_member_by_name`.
     if base.kind == DtKind::Class {
         if let Some(class_id) = base.class_node {
-            if let Some((member_dt, fold, decl_class)) =
-                lookup_class_member(ctx, class_id, &name, identifier_id)
+            // analyzer.cpp:4228-4257 — the VARIABLE, SIGNAL and FUNCTION arms refuse to bind an
+            // INSTANCE member through a metatype: `Inner.i_v`, `Inner.sig`, and an uncalled
+            // `Inner.i_m` all leave the identifier typeless, and the subscript caller's `!valid`
+            // tail then reports `Cannot find member "X" in base "Inner".` (#467). Constants,
+            // enums, enum values, and inner classes carry no such gate and still bind, and neither
+            // does the native tail below, so a class-declared name shadowing a native property
+            // still falls through and resolves exactly as upstream.
+            //
+            // Upstream skips per class inside its ancestry loop while this skips the whole in-file
+            // walk on the first name hit. The two differ only when an ancestor legally carries a
+            // same-named member of the other staticness, which GDScript's shadowing rules reject,
+            // and the divergence is toward silence.
+            let meta_skips_instance_member = base.is_meta_type
+                && non_static_instance_member_kind(ctx, class_id, &name).is_some();
+            if let Some((member_dt, fold, decl_class)) = (!meta_skips_instance_member)
+                .then(|| lookup_class_member(ctx, class_id, &name, identifier_id))
+                .flatten()
             {
                 // Record the resolved in-file attribute read (`self.hp`, an access on a base
                 // typed as this file's own class) — the in-file twin of `record_member_use`'s
