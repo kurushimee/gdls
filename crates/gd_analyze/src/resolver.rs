@@ -626,6 +626,26 @@ fn meta_member(
 
 /// `get_class_node_current_scope_classes` (analyzer.cpp:320): the class itself, its (in-file) base
 /// chain, and its outer-class chain — deduplicated, in Godot's order.
+/// The in-file INHERITANCE chain of `class_id` — the class then each base link, and nothing else.
+///
+/// The chain half of [`scope_classes`]. Godot gathers the same full scope
+/// (`get_class_node_current_scope_classes`, `gdscript_analyzer.cpp:320-344`) but, when
+/// `reduce_identifier_from_base` was handed an explicit base, breaks out of the loop the moment it
+/// leaves the base chain (`:4270-4275`) — so an outer class is gathered and never reached. This is
+/// that walk, expressed directly (#435).
+pub(crate) fn chain_classes(ctx: &AnalysisContext, class_id: NodeId) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    let mut cur = Some(class_id);
+    while let Some(node) = cur {
+        if out.contains(&node) {
+            break;
+        }
+        out.push(node);
+        cur = ctx.base_type(node).class_node;
+    }
+    out
+}
+
 pub(crate) fn scope_classes(ctx: &AnalysisContext, class_id: NodeId) -> Vec<NodeId> {
     fn walk(ctx: &AnalysisContext, node: NodeId, out: &mut Vec<NodeId>) {
         if out.contains(&node) {

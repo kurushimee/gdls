@@ -216,16 +216,13 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
                         // bare `name()` or `hp()` naming a member of the chain drew nothing at
                         // all: not the value-callable pair Godot answers with, and not not-found
                         // either (the chain-shadow gate correctly refuses to claim absence).
-                        let prev = ctx.reducing_callee;
                         let prev_node = ctx.reducing_callee_node;
-                        ctx.reducing_callee = true;
                         if matches!(&ctx.node(callee).kind, NodeKind::Identifier(_)) {
                             exempt_callee = Some(callee);
                             ctx.reducing_callee_node = Some(callee);
                         }
                         reduce_expression(ctx, callee, false);
                         ctx.reducing_callee_node = prev_node;
-                        ctx.reducing_callee = prev;
                     }
                 }
             }
@@ -1675,6 +1672,19 @@ fn folded_key_display(v: &FoldedValue) -> String {
 /// [`AnalysisContext::suite_stack`] (locals/iterator binds), then the current function's parameter
 /// list, then the current class's members + the in-file class-base chain, then native/global/
 /// builtin lookups.
+/// Whether `id` is the bare-identifier callee `reduce_call` is about to answer itself.
+///
+/// The four `reduce_identifier` steps that consult this exist because Godot's `reduce_call`
+/// resolves a call target through `reduce_identifier_from_base` and never through the standalone
+/// `reduce_identifier` (`gdscript_analyzer.cpp:3556-3559`), so those steps must not run for the
+/// callee. They must run for everything else, including an identifier that merely SITS INSIDE a
+/// callee expression — an argument of the inner call in `f(x)()`. Keying on the node keeps the
+/// exemption to the one identifier it is about; a flag raised across the whole callee subtree
+/// silently stripped types and the not-declared error off those arguments (#435).
+fn reducing_this_callee(ctx: &AnalysisContext, id: NodeId) -> bool {
+    ctx.reducing_callee_node == Some(id)
+}
+
 fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // Godot's `can_be_builtin` parameter, taken off the context and cleared so a nested reduction
     // started from here does not inherit it. See [`reduce_identifier_with_flags`].
@@ -1833,7 +1843,9 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
 
     // 3. Class-member + base-chain lookup (analyzer.cpp:4450-4455 → reduce_identifier_from_base).
     if let Some(class_id) = ctx.current_class {
-        if let Some((dt, fold, decl_class)) = lookup_class_member(ctx, class_id, &name, id) {
+        if let Some((dt, fold, decl_class)) =
+            lookup_class_member(ctx, class_id, &name, id, ClassScopeWalk::FullScope)
+        {
             // Record on resolution success only — unresolved/forward-reference cases would
             // pollute the bindings. The recorded `target_kind` is reserved for a future kind-aware
             // `references` filter (`Binding::matches_use` / `find_use_bindings`); the v1 handler
@@ -1870,8 +1882,10 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             // reducer.rs:2322 (WP-I); this is the access counterpart, walked from the same
             // `static_context` flag. Skip when we're inside a Call's pre-reduce of the callee
             // (the call-version of the check will fire there) so we never double-emit.
-            if ctx.static_context && !ctx.reducing_callee {
-                if let Some(kind) = non_static_instance_member_kind(ctx, class_id, &name) {
+            if ctx.static_context && !reducing_this_callee(ctx, id) {
+                if let Some(kind) =
+                    non_static_instance_member_kind(ctx, class_id, &name, ClassScopeWalk::FullScope)
+                {
                     let parent = enclosing_concrete_function_name(ctx);
                     let kind_label = match kind {
                         NonStaticKind::Variable => "non-static variable",
@@ -1890,7 +1904,9 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
                     ctx.push_error(msg, id);
                 }
             }
-            if non_static_instance_member_kind(ctx, class_id, &name).is_some() {
+            if non_static_instance_member_kind(ctx, class_id, &name, ClassScopeWalk::FullScope)
+                .is_some()
+            {
                 ctx.mark_lambda_use_self();
             }
             return;
@@ -1908,7 +1924,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // cross-file CallSig chain), and typing the callee as a constant Callable here would
     // mis-fire Godot's `Name "X" is a Callable` error that is reserved for callable-holding
     // variables.
-    if !ctx.reducing_callee {
+    if !reducing_this_callee(ctx, id) {
         if let Some(sr) = current_class_script_base(ctx) {
             // The SCOPE walk, not the chain walk: a bare identifier also sees what each base's
             // enclosing class declares (analyzer.cpp:320-344). #314.
@@ -2168,7 +2184,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     //    reaches this arm at all. Placed after the autoload arm because Godot checks autoloads
     //    (analyzer.cpp:4570) before utilities (4641) — a project autoload named like a utility
     //    shadows it — and no utility name can collide with anything steps 4-8 resolve.
-    if !ctx.reducing_callee
+    if !reducing_this_callee(ctx, id)
         && (ctx.native.utility(&name).is_some()
             || gd_types::is_variant_utility(&name)
             || gd_utility_return_type(&name).is_some())
@@ -2215,7 +2231,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     //    is the state where nothing is knowable: every native lookup misses, so an ungated
     //    step 10 would report `position` on a `Node2D` as undeclared. That is the one provenance
     //    this must stay silent under.
-    if !ctx.reducing_callee && name != "self" && name != "super" {
+    if !reducing_this_callee(ctx, id) && name != "self" && name != "super" {
         let dt = ctx.get_type(id);
         if !dt.is_set() && ctx.native.provenance() != gd_types::ApiProvenance::Absent {
             let is_native_member = is_plausible_native_member(ctx, &name);
@@ -2371,9 +2387,14 @@ fn non_static_instance_member_kind(
     ctx: &AnalysisContext,
     class_id: NodeId,
     name: &str,
+    walk: ClassScopeWalk,
 ) -> Option<NonStaticKind> {
     use gd_syntax::ast::Member;
-    for class in crate::resolver::scope_classes(ctx, class_id) {
+    let scope = match walk {
+        ClassScopeWalk::FullScope => crate::resolver::scope_classes(ctx, class_id),
+        ClassScopeWalk::ChainOnly => crate::resolver::chain_classes(ctx, class_id),
+    };
+    for class in scope {
         let member = match &ctx.node(class).kind {
             NodeKind::Class(c) => c
                 .members_indices
@@ -2497,11 +2518,26 @@ fn stamp_member_const(ctx: &mut AnalysisContext, id: NodeId, c: MemberConst) {
     }
 }
 
+/// How far [`lookup_class_member`] walks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClassScopeWalk {
+    /// The class, its inheritance chain, AND its outer chain — Godot's
+    /// `get_class_node_current_scope_classes` (`analyzer.cpp:320-344`), which is what a bare
+    /// identifier read sees.
+    FullScope,
+    /// The inheritance chain only, and no self-name match. What Godot's
+    /// `reduce_identifier_from_base` reaches when it was handed an explicit base: the self-name arm
+    /// is gated `p_base == nullptr` (`:4188`) and the loop breaks the moment it leaves the base
+    /// chain (`:4270-4275`), so an outer class is gathered and never visited (#435).
+    ChainOnly,
+}
+
 fn lookup_class_member(
     ctx: &mut AnalysisContext,
     class_id: NodeId,
     name: &str,
     identifier_id: NodeId,
+    walk: ClassScopeWalk,
 ) -> Option<(DataType, MemberConst, NodeId)> {
     // analyzer.cpp:4450-4455 — Godot's `reduce_identifier` walks the *full* scope
     // (`get_class_node_current_scope_classes`): the class, its inheritance chain, and its outer
@@ -2509,7 +2545,10 @@ fn lookup_class_member(
     // referencing an enum/class declared on the *outer* class (e.g. `MyEnum.V1` from inside an
     // inner class's method, when both outer and inner declare a `MyEnum`) resolved to Variant
     // instead of the lexically-closest enum.
-    let scope = crate::resolver::scope_classes(ctx, class_id);
+    let scope = match walk {
+        ClassScopeWalk::FullScope => crate::resolver::scope_classes(ctx, class_id),
+        ClassScopeWalk::ChainOnly => crate::resolver::chain_classes(ctx, class_id),
+    };
     for class in scope {
         // analyzer.cpp:4161-4167 — the class itself is in scope under its own `class_name`.
         // gdls's `xfile.global_class_file` path only fires for cross-file lookups (and is
@@ -2527,7 +2566,7 @@ fn lookup_class_member(
                 .unwrap_or(false),
             _ => false,
         };
-        if class_ident_match {
+        if class_ident_match && walk == ClassScopeWalk::FullScope {
             // analyzer.cpp:4187 → :4046 — the class names itself (or an enclosing
             // class): a class object, constant with no value this table can hold.
             return Some((ctx.get_type(class).clone(), MemberConst::Yes(None), class));
@@ -5409,6 +5448,21 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         let mut name_is_value = false;
         if !enum_meta_base && !call.is_super && !chain_evidence_is_partial {
             if let Some(callee) = callee_id {
+                // #435: hand the probe Godot's state. Godot never reduces a bare identifier
+                // callee (`analyzer.cpp:3556-3559`), so this probe is the FIRST thing to type it,
+                // and its don't-re-resolve guard (`:4025-4027`) only passes on a typeless node.
+                // gdls pre-reduces the callee through the full-scope `reduce_identifier`, which
+                // sees enclosing classes, locals, and utilities that Godot's chain walk cannot
+                // reach — so the probe was a no-op and the type it had already stamped drove the
+                // value/Callable message where Godot answers "not found in base self".
+                //
+                // Only a BARE identifier is cleared. An attribute callee (`a.b()`) is genuinely
+                // un-reduced here, exactly as upstream leaves it. The stale fold the pre-reduce may
+                // have left on the node is harmless: nothing downstream reads a miss-branch
+                // callee's fold, and `FoldTable` has no removal.
+                if matches!(&ctx.node(callee).kind, NodeKind::Identifier(_)) {
+                    ctx.set_type(callee, DataType::default());
+                }
                 reduce_identifier_from_base(ctx, callee, Some(&base_type));
                 let cdt = ctx.get_type(callee).clone();
                 if cdt.is_set() && !cdt.is_variant() {
@@ -8184,6 +8238,16 @@ fn reduce_identifier_from_base(
         NodeKind::Identifier(i) => i.name.clone(),
         _ => return,
     };
+    // #435: what the in-file class walk below is allowed to reach. With an EXPLICIT base, Godot's
+    // self-name arm is gated `p_base == nullptr` (`analyzer.cpp:4188`) and its ancestry loop breaks
+    // the moment it leaves the base chain (`:4270-4275`), so an outer class is gathered and never
+    // visited. Only the implicit-base case (a bare read falling back to `current_class`) sees the
+    // full scope.
+    let walk = if base.is_some() {
+        ClassScopeWalk::ChainOnly
+    } else {
+        ClassScopeWalk::FullScope
+    };
     let base = match base {
         Some(b) => b.clone(),
         None => {
@@ -8434,9 +8498,9 @@ fn reduce_identifier_from_base(
             // same-named member of the other staticness, which GDScript's shadowing rules reject,
             // and the divergence is toward silence.
             let meta_skips_instance_member = base.is_meta_type
-                && non_static_instance_member_kind(ctx, class_id, &name).is_some();
+                && non_static_instance_member_kind(ctx, class_id, &name, walk).is_some();
             if let Some((member_dt, fold, decl_class)) = (!meta_skips_instance_member)
-                .then(|| lookup_class_member(ctx, class_id, &name, identifier_id))
+                .then(|| lookup_class_member(ctx, class_id, &name, identifier_id, walk))
                 .flatten()
             {
                 // Record the resolved in-file attribute read (`self.hp`, an access on a base
