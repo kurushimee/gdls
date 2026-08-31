@@ -2549,7 +2549,18 @@ fn lookup_class_member(
         ClassScopeWalk::FullScope => crate::resolver::scope_classes(ctx, class_id),
         ClassScopeWalk::ChainOnly => crate::resolver::chain_classes(ctx, class_id),
     };
+    // analyzer.cpp:4177 / :4269-4275 — `is_base` starts true and goes false the moment the walk
+    // steps off the in-file INHERITANCE chain, which for this depth-first list is exactly where
+    // the outer classes begin. Godot gates the VARIABLE, SIGNAL, and FUNCTION arms on it
+    // (`:4228`, `:4238`, `:4247`) and leaves the constant, enum, enum-value, and inner-class arms
+    // ungated, so an outer class contributes only what a lexical scope legitimately contributes.
+    // The `break` that follows it upstream is what `ClassScopeWalk::ChainOnly` already models.
+    let mut is_base = true;
     for class in scope {
+        let this_is_base = is_base;
+        if is_base {
+            is_base = ctx.base_type(class).class_node.is_some();
+        }
         // analyzer.cpp:4161-4167 — the class itself is in scope under its own `class_name`.
         // gdls's `xfile.global_class_file` path only fires for cross-file lookups (and is
         // inert under `NoCrossFile`); the in-file case has to match here so a reference to
@@ -2602,6 +2613,9 @@ fn lookup_class_member(
             // use against the declaring inner-class chain, not the accessed one. #153.
             return match m {
                 gd_syntax::ast::Member::Variable(vid) | gd_syntax::ast::Member::Signal(vid) => {
+                    if !this_is_base {
+                        continue;
+                    }
                     Some((ctx.get_type(vid).clone(), MemberConst::No))
                 }
                 // analyzer.cpp:4259 → :4046 (inner class) and :4220-4223 (named enum, whose
@@ -2618,6 +2632,9 @@ fn lookup_class_member(
                 // the make_callable_type slice; the constant-Callable shape on its own
                 // suffices for the assignment-rejection arm.
                 gd_syntax::ast::Member::Function(_) => {
+                    if !this_is_base {
+                        continue;
+                    }
                     Some((make_callable_type(), MemberConst::No))
                 }
                 gd_syntax::ast::Member::Constant(cid) => {
