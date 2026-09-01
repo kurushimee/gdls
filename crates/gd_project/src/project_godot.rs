@@ -32,6 +32,34 @@ impl WarnLevel {
     }
 }
 
+/// What a `debug/gdscript/warnings/directory_rules` entry decides for the scripts under it
+/// (`GDScriptParser::WarningDirectoryRule::Decision`). Stored in `project.godot` as `0` / `1`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarnDirectoryDecision {
+    Exclude,
+    Include,
+}
+
+/// One directory rule. `directory` is `res://`-rooted, simplified, and carries a trailing slash,
+/// matching the shape `GDScriptParser::update_project_settings` normalizes to before it compares
+/// against a script's own path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WarnDirectoryRule {
+    pub directory: String,
+    pub decision: WarnDirectoryDecision,
+}
+
+/// Godot's registered default for `debug/gdscript/warnings/directory_rules`
+/// (`modules/gdscript/gdscript.cpp`): third-party code under `res://addons` is not the user's to
+/// fix, so none of its warnings are reported. Identical at `4.6.3-stable` and `4.7.2-stable`.
+#[must_use]
+pub fn default_warning_directory_rules() -> Vec<WarnDirectoryRule> {
+    vec![WarnDirectoryRule {
+        directory: "res://addons/".to_owned(),
+        decision: WarnDirectoryDecision::Exclude,
+    }]
+}
+
 /// The project's GDScript warning configuration, as captured from `project.godot`. M3/M5 layer strict
 /// profiles on top; M2 only records what the project itself declares.
 #[derive(Clone, Debug)]
@@ -39,16 +67,118 @@ pub struct WarningConfig {
     pub enable: bool,
     /// Warning name (lowercase, as in the setting key) → level.
     pub levels: FxHashMap<String, WarnLevel>,
+    /// Which directories report warnings at all, deepest rule first. Defaults to Godot's own
+    /// registered default rather than to "empty", so a project that never mentions the setting
+    /// still excludes `res://addons/` the way the engine does.
+    pub directory_rules: Vec<WarnDirectoryRule>,
 }
 
 impl Default for WarningConfig {
     fn default() -> Self {
-        // Godot's default: warnings on.
+        // Godot's default: warnings on, addons excluded.
         Self {
             enable: true,
             levels: FxHashMap::default(),
+            directory_rules: default_warning_directory_rules(),
         }
     }
+}
+
+impl WarningConfig {
+    /// Whether the script at `res_path` reports warnings at all — Godot's
+    /// `evaluate_warning_directory_rules_for_script_path` (`gdscript_parser.cpp:328`). The first
+    /// rule whose directory prefixes the path decides, and the list is already deepest-first, so a
+    /// nested `Include` carves an exception out of a broader `Exclude`. A path that is not
+    /// `res://`-rooted (an untitled buffer, a `.gd` outside the project) matches nothing and keeps
+    /// its warnings.
+    #[must_use]
+    pub fn ignores_warnings_in(&self, res_path: &str) -> bool {
+        self.directory_rules
+            .iter()
+            .find(|rule| res_path.starts_with(&rule.directory))
+            .is_some_and(|rule| rule.decision == WarnDirectoryDecision::Exclude)
+    }
+}
+
+/// Parse the `{ "res://dir": 0, … }` dictionary Godot writes for `directory_rules`, dropping the
+/// entries it would drop: a key that is not `res://`-rooted and a decision outside the enum both
+/// `ERR_CONTINUE` upstream. Returns `None` for a value that is not a dictionary at all, so the
+/// caller keeps the default rather than silently turning every rule off.
+fn parse_directory_rules(val: &str) -> Option<Vec<WarnDirectoryRule>> {
+    let body = val.trim().strip_prefix('{')?.strip_suffix('}')?;
+    let mut rules = Vec::new();
+    for entry in split_outside_quotes(body, ',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let mut halves = split_outside_quotes(entry, ':');
+        let (Some(key), Some(value)) = (halves.next(), halves.next()) else {
+            continue;
+        };
+        let decision = match value.trim().parse::<u8>() {
+            Ok(0) => WarnDirectoryDecision::Exclude,
+            Ok(1) => WarnDirectoryDecision::Include,
+            _ => continue,
+        };
+        let Some(directory) = simplify_res_dir(&unquote(key.trim())) else {
+            continue;
+        };
+        rules.push(WarnDirectoryRule {
+            decision,
+            directory,
+        });
+    }
+    Some(rules)
+}
+
+/// Split on `sep`, ignoring separators inside a double-quoted run. Godot's own reader is a full
+/// `Variant` parser; a rules dictionary only ever holds string keys and integer values, so this
+/// covers it without pulling one in.
+fn split_outside_quotes(s: &str, sep: char) -> impl Iterator<Item = &str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    for (i, c) in s.char_indices() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+        } else if c == sep && !in_quotes {
+            parts.push(&s[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    parts.push(&s[start..]);
+    parts.into_iter()
+}
+
+/// A rule key normalized the way Godot normalizes one: `simplify_path`, then a mandatory trailing
+/// slash. `None` for anything not `res://`-rooted, which upstream rejects outright.
+fn simplify_res_dir(raw: &str) -> Option<String> {
+    let rest = raw.trim().strip_prefix("res://")?;
+    let mut segments: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+    let mut out = String::from("res://");
+    for seg in segments {
+        out.push_str(seg);
+        out.push('/');
+    }
+    Some(out)
+}
+
+/// Order the rules the way `update_project_settings` does before evaluating them: deepest
+/// directory first, so `res://addons/mine` beats `res://addons`. Upstream sorts on the slash count
+/// with an unstable sort; a stable one here keeps two same-depth rules in file order instead of an
+/// arbitrary one.
+fn sort_directory_rules(rules: &mut [WarnDirectoryRule]) {
+    rules.sort_by_key(|r| std::cmp::Reverse(r.directory.matches('/').count()));
 }
 
 /// What an autoload / `main_scene` value points at. `res://` paths are classified by extension;
@@ -125,6 +255,7 @@ pub fn parse_with_confidence(text: &str) -> (ProjectGodot, f32) {
     let mut section = String::new();
     let mut meaningful = 0usize;
     let mut recognized = 0usize;
+    let mut exclude_addons: Option<bool> = None;
     for line in logical_lines(text) {
         let t = line.trim();
         if t.is_empty() || t.starts_with(';') {
@@ -169,11 +300,36 @@ pub fn parse_with_confidence(text: &str) -> (ProjectGodot, f32) {
         } else if let Some(w) = full.strip_prefix("debug/gdscript/warnings/") {
             if w == "enable" {
                 pg.warnings.enable = val == "true";
+            } else if w == "directory_rules" {
+                if let Some(rules) = parse_directory_rules(val) {
+                    pg.warnings.directory_rules = rules;
+                }
+            } else if w == "exclude_addons" {
+                // Deprecated, and still migrated: upstream reads it, clears it, and writes the
+                // result into `directory_rules` as `res://addons` — so it OVERRIDES whatever that
+                // key said about addons. Applied after the scan, since either key may come first.
+                exclude_addons = Some(val == "true");
             } else if let Some(level) = warn_level_value(w, val) {
                 pg.warnings.levels.insert(w.to_owned(), level);
             }
         }
     }
+    if let Some(exclude) = exclude_addons {
+        let decision = if exclude {
+            WarnDirectoryDecision::Exclude
+        } else {
+            WarnDirectoryDecision::Include
+        };
+        let rules = &mut pg.warnings.directory_rules;
+        match rules.iter_mut().find(|r| r.directory == "res://addons/") {
+            Some(rule) => rule.decision = decision,
+            None => rules.push(WarnDirectoryRule {
+                directory: "res://addons/".to_owned(),
+                decision,
+            }),
+        }
+    }
+    sort_directory_rules(&mut pg.warnings.directory_rules);
     // An empty/absent config is a valid "all defaults" project, not corruption — full confidence.
     let confidence = if meaningful == 0 {
         1.0
@@ -400,6 +556,118 @@ mod tests {
         assert_eq!(
             parse_features_version(r#"PackedStringArray("4.6", "4.7", "phase2")"#),
             Some((4, 7))
+        );
+    }
+
+    fn rules(text: &str) -> Vec<(String, WarnDirectoryDecision)> {
+        parse(text)
+            .warnings
+            .directory_rules
+            .into_iter()
+            .map(|r| (r.directory, r.decision))
+            .collect()
+    }
+
+    /// #601: a project that never mentions the setting still excludes `res://addons`, because
+    /// that is what `GLOBAL_DEF` registers.
+    #[test]
+    fn addons_are_excluded_without_any_setting() {
+        assert_eq!(
+            rules("config_version=5\n"),
+            vec![("res://addons/".to_owned(), WarnDirectoryDecision::Exclude)]
+        );
+        assert!(WarningConfig::default().ignores_warnings_in("res://addons/x/y.gd"));
+        assert!(!WarningConfig::default().ignores_warnings_in("res://src/y.gd"));
+        // A name that merely starts with the same letters is not inside the directory.
+        assert!(!WarningConfig::default().ignores_warnings_in("res://addons_of_mine/y.gd"));
+        // A buffer with no `res://` path at all matches nothing and keeps its warnings.
+        assert!(!WarningConfig::default().ignores_warnings_in(""));
+    }
+
+    #[test]
+    fn an_explicit_rule_list_replaces_the_default() {
+        let text = "[debug]\n\ngdscript/warnings/directory_rules={\n\"res://vendor\": 0,\n\"res://addons\": 1\n}\n";
+        assert_eq!(
+            rules(text),
+            vec![
+                ("res://vendor/".to_owned(), WarnDirectoryDecision::Exclude),
+                ("res://addons/".to_owned(), WarnDirectoryDecision::Include),
+            ]
+        );
+        let cfg = parse(text).warnings;
+        assert!(cfg.ignores_warnings_in("res://vendor/lib.gd"));
+        assert!(!cfg.ignores_warnings_in("res://addons/mine/plugin.gd"));
+    }
+
+    /// Deepest directory first, so a nested `Include` carves an exception out of a broader
+    /// `Exclude` no matter which order the file lists them in.
+    #[test]
+    fn the_deepest_rule_decides() {
+        for text in [
+            "[debug]\n\ngdscript/warnings/directory_rules={\n\"res://addons\": 0,\n\"res://addons/mine/deep\": 1\n}\n",
+            "[debug]\n\ngdscript/warnings/directory_rules={\n\"res://addons/mine/deep\": 1,\n\"res://addons\": 0\n}\n",
+        ] {
+            let cfg = parse(text).warnings;
+            assert!(!cfg.ignores_warnings_in("res://addons/mine/deep/a.gd"), "{text}");
+            assert!(cfg.ignores_warnings_in("res://addons/mine/shallow.gd"), "{text}");
+        }
+    }
+
+    /// The deprecated boolean is still migrated, and it overrides whatever the rule list said
+    /// about `res://addons` — upstream writes it into the dictionary after reading that key.
+    #[test]
+    fn exclude_addons_migrates_and_wins() {
+        let cfg = parse("[debug]\n\ngdscript/warnings/exclude_addons=false\n").warnings;
+        assert!(!cfg.ignores_warnings_in("res://addons/x.gd"));
+
+        let cfg = parse(
+            "[debug]\n\ngdscript/warnings/directory_rules={\n\"res://addons\": 1\n}\ngdscript/warnings/exclude_addons=true\n",
+        )
+        .warnings;
+        assert!(cfg.ignores_warnings_in("res://addons/x.gd"));
+
+        // `exclude_addons` is not a warning code, so it never lands as a level (#441's guard).
+        assert!(!parse("[debug]\n\ngdscript/warnings/exclude_addons=true\n")
+            .warnings
+            .levels
+            .contains_key("exclude_addons"));
+    }
+
+    /// The entries upstream drops with `ERR_CONTINUE`: a key outside `res://` and a decision
+    /// outside the enum. A value that is not a dictionary at all leaves the default standing,
+    /// rather than silently switching every directory on.
+    #[test]
+    fn malformed_rule_entries_are_dropped_not_obeyed() {
+        let cfg = parse(
+            "[debug]\n\ngdscript/warnings/directory_rules={\n\"/etc\": 0,\n\"res://ok\": 0,\n\"res://bad\": 7\n}\n",
+        )
+        .warnings;
+        assert_eq!(
+            cfg.directory_rules,
+            vec![WarnDirectoryRule {
+                directory: "res://ok/".to_owned(),
+                decision: WarnDirectoryDecision::Exclude,
+            }]
+        );
+
+        assert_eq!(
+            rules("[debug]\n\ngdscript/warnings/directory_rules=true\n"),
+            vec![("res://addons/".to_owned(), WarnDirectoryDecision::Exclude)]
+        );
+    }
+
+    /// A key is `simplify_path`-ed and given exactly one trailing slash before it is compared.
+    #[test]
+    fn rule_paths_are_normalized() {
+        let cfg =
+            parse("[debug]\n\ngdscript/warnings/directory_rules={\n\"res://a//b/./c/../\": 0\n}\n")
+                .warnings;
+        assert_eq!(
+            cfg.directory_rules,
+            vec![WarnDirectoryRule {
+                directory: "res://a/b/".to_owned(),
+                decision: WarnDirectoryDecision::Exclude,
+            }]
         );
     }
 

@@ -43,6 +43,10 @@ Strict mode is a post-analysis policy layer, not new analysis machinery. Godot a
 
 **Precedence:** built-in defaults, then `project.godot` config, then the profile, then fine-grained overrides, then inline `@warning_ignore(code)`, which always wins for its scope.
 
+**Which directories report warnings at all** is decided before any of that. `debug/gdscript/warnings/directory_rules` maps a `res://` directory to `Exclude` or `Include`, and Godot registers a default of `{"res://addons": Exclude}` — third-party code is not the user's to fix, so none of its warnings are reported. The rules are matched deepest-first, so a nested `Include` carves an exception out of a broader `Exclude`, and the deprecated boolean `debug/gdscript/warnings/exclude_addons` still migrates into the `res://addons` entry and overrides whatever the rule list said about it. An excluded script emits no warning at all, not even one the project promoted to an error, because upstream tests the flag above the level lookup. Errors proper are untouched. The mechanism is byte-identical at both supported releases, so it takes no dialect guard.
+
+The `strict` profile is the one place gdls departs: it already overrides a project-wide `warnings/enable = false`, and it overrides the directory exclusions the same way, so a deliberate audit sweep still sees inside `res://addons/`. The `godot` profile — the default, and what a user gets — honours them exactly.
+
 Configuration can change mid-session through `workspace/didChangeConfiguration`, which rebuilds the policy and drops the analysis cache so later publishes run under the new settings.
 
 ## 4. Interaction with `@warning_ignore`
