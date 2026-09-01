@@ -85,7 +85,7 @@ fn round_trip_warm_equivalent_to_cold() {
 
     // Build a cold index and snapshot it.
     let cold = Index::build(&root);
-    let scenes = gd_project::SceneIndex::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root, Default::default());
     let assets = gd_project::AssetIndex::build(&root);
     let cold_file_count = cold.file_count();
     assert!(
@@ -177,7 +177,7 @@ fn a_nested_init_shape_round_trips() {
 
     let key = make_key(&root);
     let files = stat_gd_files(&root);
-    let scenes = gd_project::SceneIndex::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root, Default::default());
     let assets = gd_project::AssetIndex::build(&root);
     cache::save(&root, &cold, &scenes, &assets, &files, key.clone());
 
@@ -207,7 +207,7 @@ fn corrupt_file_yields_none_and_quarantines() {
 
     let key = make_key(&root);
     let cold = Index::build(&root);
-    let scenes = gd_project::SceneIndex::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root, Default::default());
     let assets = gd_project::AssetIndex::build(&root);
     let files = stat_gd_files(&root);
     cache::save(&root, &cold, &scenes, &assets, &files, key.clone());
@@ -250,7 +250,7 @@ fn key_mismatch_yields_none_without_quarantine() {
 
     let save_key = make_key(&root);
     let cold = Index::build(&root);
-    let scenes = gd_project::SceneIndex::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root, Default::default());
     let assets = gd_project::AssetIndex::build(&root);
     let files = stat_gd_files(&root);
     cache::save(&root, &cold, &scenes, &assets, &files, save_key);
@@ -293,7 +293,7 @@ fn file_id_stable_across_round_trip() {
     let root = make_project(&tmp);
 
     let cold = Index::build(&root);
-    let scenes = gd_project::SceneIndex::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root, Default::default());
     let assets = gd_project::AssetIndex::build(&root);
     let a_path = root.join("a.gd");
     let b_path = root.join("b.gd");
@@ -331,7 +331,7 @@ fn stat_delta_detects_size_change() {
     let root = make_project(&tmp);
 
     let cold = Index::build(&root);
-    let scenes = gd_project::SceneIndex::build(&root);
+    let scenes = gd_project::SceneIndex::build(&root, Default::default());
     let assets = gd_project::AssetIndex::build(&root);
     let key = make_key(&root);
 
@@ -407,7 +407,7 @@ fn concurrent_writers_never_corrupt_the_cache() {
 
     // Pre-build a cold index and key to reuse across threads.
     let cold = Index::build(&root);
-    let scenes = Arc::new(gd_project::SceneIndex::build(&root));
+    let scenes = Arc::new(gd_project::SceneIndex::build(&root, Default::default()));
     let assets = Arc::new(gd_project::AssetIndex::build(&root));
     let key = Arc::new(make_key(&root));
     let files = Arc::new(stat_gd_files(&root));

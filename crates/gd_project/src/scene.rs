@@ -524,13 +524,17 @@ fn finalize(scene: &mut Scene) {
     }
 }
 
-/// Resolve an `ExtResource("<id>")` / `ExtResource(<id>)` reference value to its `res://` path via
-/// the scene's ext-resource table. Returns `None` if the value isn't an `ExtResource(...)` ref, the
-/// id is unknown, or the resource carries no `path` (a uid-only ext_resource — the caller can later
-/// resolve the uid through the project map; at parse time we only have the table).
+/// Resolve an `ExtResource("<id>")` / `ExtResource(<id>)` reference value through the scene's
+/// ext-resource table. Returns `None` only if the value isn't an `ExtResource(...)` ref or the id
+/// is unknown.
+///
+/// A `path`-less entry yields its `uid://…` VERBATIM rather than nothing. Parsing is pure — it has
+/// no project uid map to consult — so the uid is carried through for [`crate::SceneIndex`] to
+/// canonicalize at insert time. Nothing downstream of the index ever sees a `uid://` here. #484.
 fn resolve_ext_ref_path(scene: &Scene, value: &str) -> Option<String> {
     let id = parse_ext_resource_id(value)?;
-    scene.ext_resources.get(&id).and_then(|r| r.path.clone())
+    let res = scene.ext_resources.get(&id)?;
+    res.path.clone().or_else(|| res.uid.clone())
 }
 
 /// Extract the id from an `ExtResource("13_4dhva")` or `ExtResource(2)` value. The id is returned

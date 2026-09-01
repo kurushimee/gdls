@@ -213,7 +213,7 @@ impl Workspace {
 
         // Attempt warm-start: load the persisted cache and stat-diff it against disk.
         // On any failure (missing file, key mismatch, verify failure) fall through to cold build.
-        let (mut index, scenes, assets, stat_table) = match cache::load(root, &key) {
+        let (mut index, mut scenes, assets, stat_table) = match cache::load(root, &key) {
             Some(loaded) => {
                 log::info!(
                     "cache: warm-start candidate found; stat-diffing {} cached files",
@@ -228,7 +228,7 @@ impl Workspace {
                 let idx = Index::build_with_progress(root, dialect, &mut |done, total| {
                     sink.progress(done, Some(total), "parsing scripts");
                 });
-                let scene_idx = SceneIndex::build(root);
+                let scene_idx = SceneIndex::build(root, project.uids.clone());
                 let asset_idx = AssetIndex::build(root);
                 let mut stats = build_stat_table_from_index(&idx);
                 add_scene_stats(&mut stats, &scene_idx, root);
@@ -241,6 +241,23 @@ impl Workspace {
         // so it has to be in place before the first analysis reads a dependency edge. The scan
         // itself already ran as part of `ProjectModel::load_checked`.
         set_index_uid_map(&mut index, root, project.uids.clone());
+
+        // #484: the scene index resolves a `path`-less `[ext_resource]` through the same map. A
+        // COLD build already had it; a WARM one loaded scenes canonicalized against the previous
+        // session's map, and a sidecar changed while gdls was off leaves the `.tscn` untouched, so
+        // no stat diff catches it. Re-read the scenes that name a uid with no path — by the
+        // issue's own framing that set is near-empty in any editor-written project.
+        scenes.set_uid_map(project.uids.clone());
+        for res in scenes.uid_referencing_scenes() {
+            let Some(path) = gd_project::res_to_path(root, &res) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(text) => scenes.reindex(&res, &text),
+                // Unreadable — keep the prior scene, matching every other reindex path.
+                Err(e) => log::warn!("scene index: uid re-resolve skipped unreadable {path}: {e}"),
+            }
+        }
 
         let policy = WarnPolicy::build(
             &project.warnings,
@@ -1015,15 +1032,56 @@ impl Workspace {
             log::debug!("uid sidecar for {resource} is not under the project root; skipping");
             return;
         };
+        // The uid this resource used to answer to. On a re-point, the scenes that named the OLD
+        // uid must re-resolve too — they now point at nothing, and leaving them on the stale target
+        // would be the one outcome worse than degrading.
+        let previous_uid: Option<String> = self
+            .project
+            .uids
+            .iter()
+            .find(|(_, target)| *target == &res)
+            .map(|(u, _)| u.clone());
         self.project.uids.retain(|_, target| target != &res);
         if let Some(uid) = uid {
             self.project.uids.insert(uid.to_owned(), res.clone());
         }
         let owned = res.clone();
-        let uid = uid.map(str::to_owned);
-        self.index.txn(resource, move |idx| {
-            idx.sync_uid_for_resource(&owned, uid.as_deref());
-        });
+        let uid_owned = uid.map(str::to_owned);
+        {
+            let uid_owned = uid_owned.clone();
+            self.index.txn(resource, move |idx| {
+                idx.sync_uid_for_resource(&owned, uid_owned.as_deref());
+            });
+        }
+
+        // #484: the scene index resolves a `path`-less `[ext_resource]` through the same map, so it
+        // has to move in lockstep — the two maps disagreeing is how a scene ends up pointing at a
+        // file the project no longer declares.
+        self.refresh_uid_scenes(previous_uid.as_deref(), uid_owned.as_deref());
+    }
+
+    /// Re-read every scene that names either uid with no `path`, after the uid map has changed.
+    /// Covers all four sidecar events: a uid that appeared resolves those scenes for the first
+    /// time, one that was re-pointed re-resolves both sides, and one that was deleted degrades its
+    /// scenes back to "no script" rather than leaving them on a stale target. #484.
+    fn refresh_uid_scenes(&mut self, old_uid: Option<&str>, new_uid: Option<&str>) {
+        self.scenes.set_uid_map(self.project.uids.clone());
+        let mut targets: Vec<String> = Vec::new();
+        for uid in [old_uid, new_uid].into_iter().flatten() {
+            targets.extend(self.scenes.scenes_referencing_uid(uid).map(str::to_owned));
+        }
+        targets.sort();
+        targets.dedup();
+        let root = self.project.root.clone();
+        for res in targets {
+            let Some(path) = gd_project::res_to_path(&root, &res) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(text) => self.scenes.reindex(&res, &text),
+                Err(e) => log::warn!("scene index: uid re-resolve skipped unreadable {path}: {e}"),
+            }
+        }
     }
 
     /// #127: drop a deleted asset from the [`AssetIndex`] and its stat entry (watcher Deleted).
@@ -1085,6 +1143,18 @@ impl Workspace {
         // file whose uid target moved is re-resolved and marked dirty by the swap.
         let uids = self.project.uids.clone();
         set_index_uid_map(&mut self.index, &root, uids);
+        // #484: the scene index reads the same map, and the whole map may have moved here — so
+        // re-resolve every scene that names a uid, not just the two a single sidecar event touches.
+        self.scenes.set_uid_map(self.project.uids.clone());
+        for res in self.scenes.uid_referencing_scenes() {
+            let Some(path) = gd_project::res_to_path(&root, &res) else {
+                continue;
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(text) => self.scenes.reindex(&res, &text),
+                Err(e) => log::warn!("scene index: uid re-resolve skipped unreadable {path}: {e}"),
+            }
+        }
         // Mid-session reloads never spawn Godot (no resolution path does since v1.0.2); a
         // `.gdextension` change marks the auto-dump meta stale and the next startup's background
         // dump refreshes it.
