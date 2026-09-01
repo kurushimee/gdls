@@ -362,6 +362,48 @@ fn override_method() {
     assert_eq!(prefix_text(m, &ctx).as_deref(), Some("_re"));
 }
 
+/// #509: `_` lexes as `TokenKind::Underscore`, not an identifier, so the prefix-anchored block
+/// never saw it — the override list appeared on `func `, vanished on `func _`, and came back on
+/// `func _r`. `_` is the first character of every Godot virtual, so that was the one prefix a user
+/// reaching for an override always types. Godot opens `COMPLETION_OVERRIDE_METHOD` before it
+/// consumes the name at all, so it completes here too.
+#[test]
+fn a_lone_underscore_after_func_is_still_an_override_position() {
+    let m = "func _|";
+    let ctx = at(m);
+    assert_eq!(ctx.kind, CompletionKind::OverrideMethod);
+    // The `_` is the prefix, so accepting an item REPLACES it rather than producing `func __ready`.
+    assert_eq!(prefix_text(m, &ctx).as_deref(), Some("_"));
+
+    // Inside an inner class too — the position test is "statement start in a class body".
+    let inner = "class I:\n\textends Node\n\tfunc _|";
+    assert_eq!(at(inner).kind, CompletionKind::OverrideMethod);
+}
+
+/// The scoping half of #509: admitting `_` at `func _` must not turn it into a word token
+/// everywhere. `_` is legal in several positions for entirely unrelated reasons, and none of them
+/// changes.
+#[test]
+fn a_lone_underscore_elsewhere_is_unchanged() {
+    for m in [
+        // Godot's match wildcard — an identifier list here would be nonsense.
+        "func f(x):\n\tmatch x:\n\t\t_|",
+        // Declaration names the user is inventing (`COMPLETION_DECLARATION`, a bare `break`).
+        "var _|",
+        "const _|",
+        "class _|",
+        "signal _|",
+        // A named lambda in expression position is not an override, with `_` as with any name.
+        "func f():\n\tvar g = func _|",
+    ] {
+        assert_ne!(
+            at(m).kind,
+            CompletionKind::OverrideMethod,
+            "`_` must not open an override position in {m:?}"
+        );
+    }
+}
+
 #[test]
 fn type_attribute_is_distinct_from_instance_attribute() {
     // `var x: Foo.` → member access ON A TYPE: nested types/enums/constants of `Foo`, NOT `Foo`'s
