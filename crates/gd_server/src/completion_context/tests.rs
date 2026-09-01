@@ -1320,3 +1320,124 @@ fn a_static_func_lambda_is_not_an_override_position() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------------
+// #514 — the type positions Godot opens BEFORE it consumes the name, so an empty slot is a type slot.
+// ---------------------------------------------------------------------------------------------------
+
+/// A parameter's type colon. `is_declaration_colon` scans left for a `var`/`const` and bails on the
+/// `(` it would have to cross, so every one of these fell through to the general identifier set.
+/// Godot reaches the same `parse_type` from `parse_parameter` (`gdscript_parser.cpp:1529`) for all
+/// four shapes.
+#[test]
+fn a_parameter_type_colon_is_a_type_position() {
+    for m in [
+        "func f(p: |):\n\tpass",
+        // Glued to the colon — the user has typed nothing yet either way.
+        "func f(p:|):\n\tpass",
+        // Not just the first parameter.
+        "func f(a: int, q: |):\n\tpass",
+        // A bare lambda, a named lambda, and a signal all route through `parse_parameter` too.
+        "func f():\n\tvar g = func(p: |): pass",
+        "func f():\n\tvar g = func named(p: |): pass",
+        "signal s(p: |)",
+    ] {
+        assert_eq!(
+            at(m).kind,
+            CompletionKind::TypeName,
+            "`{m}` is a parameter type position"
+        );
+    }
+}
+
+/// The second slot of a typed collection. Godot recurses into `parse_type` for it
+/// (`gdscript_parser.cpp:3893`), so it is the same context the `[` slot already is.
+#[test]
+fn a_typed_collection_comma_is_a_type_position() {
+    for m in [
+        "var a: Dictionary[String, |]",
+        "func g(p: Dictionary[String, |]):\n\tpass",
+        // Unclosed at end of input — the same slot, still being typed.
+        "var a: Dictionary[String, |",
+    ] {
+        assert_eq!(
+            at(m).kind,
+            CompletionKind::TypeName,
+            "`{m}` is a typed-collection type slot"
+        );
+    }
+}
+
+/// `is` / `is not` / `as` with the cursor past the keyword. Both operators read their right side
+/// with `parse_type` (`gdscript_parser.cpp:3826` and `:3465`), which opens the context before it
+/// consumes the identifier (`:3871`). `is ` was the worst of the three: it matched no arm at all, so
+/// the editor got an empty popup.
+#[test]
+fn a_type_test_or_cast_keyword_opens_a_type_position() {
+    for m in [
+        "func f(x):\n\tif x is |:\n\t\tpass",
+        "func f(x):\n\tif x is not |:\n\t\tpass",
+        "func f(x):\n\tprint(x as |)",
+        "func f(x):\n\tvar y := x as |",
+    ] {
+        assert_eq!(
+            at(m).kind,
+            CompletionKind::TypeName,
+            "`{m}` is a type position"
+        );
+    }
+    // Mid-word, the whole word is the prefix so accepting an item replaces it.
+    let m = "func f(x):\n\tprint(x as S|tr)";
+    let ctx = at(m);
+    assert_eq!(ctx.kind, CompletionKind::TypeName);
+    assert_eq!(prefix_text(m, &ctx).as_deref(), Some("Str"));
+}
+
+/// The scoping half of #514. Each of these looks like one of the three new arms in the token stream
+/// and is not one.
+#[test]
+fn the_new_type_positions_do_not_swallow_their_look_alikes() {
+    for m in [
+        // A dictionary entry's colon, at class scope and inside a call.
+        "var d := {\"a\": |}",
+        "func f():\n\tprint({\"p\": |})",
+        // A lambda's BLOCK colon inside a parameter list — the token before it is `)`, not a name.
+        "func f(cb = func(): |):\n\tpass",
+        // A plain call is not a parameter list.
+        "func f():\n\tfoo(a: |)",
+        // Commas that are not typed-collection slots.
+        "func f():\n\tvar a := [1, |]",
+        "func f(d: Dictionary):\n\tprint(d[1, |])",
+        "func f(p: int = [1, |]):\n\tpass",
+        // The slot for a new parameter NAME, not its type.
+        "func f(p, |):\n\tpass",
+        // `not` is a type position only as the `is not` pair.
+        "func f(x):\n\tif not |:\n\t\tpass",
+        "func f(x):\n\tassert(not |)",
+    ] {
+        assert_ne!(
+            at(m).kind,
+            CompletionKind::TypeName,
+            "`{m}` must not become a type position"
+        );
+    }
+}
+
+/// The positions that already worked keep their exact classification — this widens what is claimed,
+/// it does not re-route anything.
+#[test]
+fn the_type_positions_that_already_worked_are_unchanged() {
+    assert_eq!(
+        at("var a: |").kind,
+        CompletionKind::PropertyDeclarationOrType
+    );
+    assert_eq!(
+        at("func f() -> |:\n\tpass").kind,
+        CompletionKind::TypeNameOrVoid
+    );
+    assert_eq!(at("var a: Array[|]").kind, CompletionKind::TypeName);
+    assert_eq!(
+        at("func f():\n\tvar y: Array[|] = []").kind,
+        CompletionKind::TypeName
+    );
+}

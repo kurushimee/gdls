@@ -990,6 +990,23 @@ fn classify_anchored(
         return Some(CompletionContext::new(CompletionKind::Subscript, prefix));
     }
 
+    // #514: the SECOND slot of a typed collection — `Dictionary[String, <cursor>]`. Godot recurses
+    // into `parse_type` for it (`gdscript_parser.cpp:3893`), so it is the same `COMPLETION_TYPE_NAME`
+    // the `[` slot above already is. The probe is at the comma's own end byte rather than at the
+    // cursor: with a trailing space the innermost node at the cursor has widened out to the enclosing
+    // declaration, but the `Type` node still covers the comma, and it never covers the comma of an
+    // array literal (`[a, ]`) or a multi-index subscript (`d[1, ]`) — which is exactly the
+    // discrimination this arm needs.
+    if anchor_kind == Comma
+        && matches!(
+            enclosing_open_bracket(tokens, anchor),
+            Some((_, BracketOpen))
+        )
+        && ast_is_type_position(tree, tokens[i].span.end)
+    {
+        return Some(CompletionContext::new(CompletionKind::TypeName, prefix));
+    }
+
     // Property accessor: `get = ` / `set = ` binds a getter/setter to a *method name*, so the class's
     // methods are wanted, not an arbitrary expression. `get`/`set` are contextual identifiers; this
     // is a property accessor when the `get`/`set` identifier opens a line (preceded by layout) — i.e.
@@ -1024,6 +1041,29 @@ fn classify_anchored(
             CompletionKind::TypeNameOrVoid,
             prefix,
         ));
+    }
+
+    // #514: `x is <cursor>`, `x is not <cursor>`, `x as <cursor>`. Both operators read their right
+    // side with `parse_type` — `parse_type_test` (`gdscript_parser.cpp:3826`) and `parse_cast`
+    // (`:3465`) — and `parse_type` opens `COMPLETION_TYPE_NAME` BEFORE it consumes the identifier
+    // (`:3871`), so the empty slot is a type position exactly as the filled one is. gdls used to
+    // reach it only once a character existed, leaving `is ` with an empty popup and `as ` with the
+    // enclosing call's arguments. `parse_type_test` matches `NOT` first, hence the `is not` arm.
+    // Present at both supported tags, so no dialect guard is owed.
+    //
+    // Gated on the cursor having left the keyword (`x is|` may still be the user typing `island`),
+    // the same trailing-layout convention the declaration-keyword arms use. The glued case already
+    // resolves through the word + AST arm below and is untouched.
+    if tokens[i].span.end < byte {
+        match anchor_kind {
+            Is | As => return Some(CompletionContext::new(CompletionKind::TypeName, prefix)),
+            // `not` is a type position only as the `is not` pair; `if not `, `assert(not )` and
+            // friends take an expression.
+            Not if prev_meaningful(tokens, i).is_some_and(|p| tokens[p].kind == Is) => {
+                return Some(CompletionContext::new(CompletionKind::TypeName, prefix));
+            }
+            _ => {}
+        }
     }
     // #509: `_` lexes as `TokenKind::Underscore` (Godot's match wildcard,
     // `gdscript_tokenizer.cpp:576`), not an identifier, so the prefix-anchored block below never
@@ -1150,7 +1190,15 @@ fn classify_anchored(
     // (`gdscript_parser.cpp:1241`, reached only under `p_allow_property`): types PLUS `get`/`set`.
     // Every other type-only slot (function-local `var`, `const`, parameter, cast, `Array[`) keeps
     // plain `TypeName` — `parse_property` is unreachable there.
-    if anchor_kind == Colon && is_declaration_colon(tokens, i) {
+    // #514 extends this arm to a PARAMETER's type colon. `is_declaration_colon` scans left for a
+    // `var`/`const` and bails on the `(` it would have to cross, so `func f(p: <cursor>)` fell
+    // through to the general identifier set. Godot reaches the same `parse_type` from
+    // `parse_parameter` (`gdscript_parser.cpp:1529`), which covers a declaration, a bare or named
+    // lambda, and a `signal`. A parameter colon is never a class-body `var`, so it always renders
+    // plain `TypeName` — `parse_property` is unreachable there.
+    if anchor_kind == Colon
+        && (is_declaration_colon(tokens, i) || is_parameter_list_colon(tokens, i))
+    {
         let kind = if is_class_body_var_colon(tokens, i) {
             CompletionKind::PropertyDeclarationOrType
         } else {
@@ -1170,6 +1218,40 @@ fn classify_anchored(
     }
 
     None
+}
+
+/// Whether the `:` at index `i` is a PARAMETER's type colon — `func f(p: |)`, `func(p: |)`,
+/// `var g = func named(p: |)`, `signal s(p: |)`. Three conditions, each excluding a colon that looks
+/// the same in the token stream:
+///
+/// 1. The colon's own bracket frame is a `(`, which drops every colon inside a `{}` — a dictionary
+///    literal entry (`{a: |}`, `foo({p: |})`) and a match pattern.
+/// 2. That `(` opens a parameter list: it directly follows `func` (a bare lambda), or an identifier
+///    that itself follows `func` or `signal` (a declaration, a named lambda, a signal). A plain call
+///    `foo(a: |)` is not one.
+/// 3. The colon follows a parameter NAME, i.e. an identifier whose own predecessor is that same `(`
+///    or a `,`. This is what separates a parameter's type colon from a lambda's block-opening colon
+///    in `func f(cb = func(): |)`, where the token before the colon is `)`.
+fn is_parameter_list_colon(tokens: &[Token], i: usize) -> bool {
+    use TokenKind::*;
+    let Some((open, ParenthesisOpen)) = enclosing_open_bracket(tokens, Some(i)) else {
+        return false;
+    };
+    let opens_parameter_list = match prev_meaningful(tokens, open) {
+        Some(p) if tokens[p].kind == Func => true,
+        Some(p) if tokens[p].kind == Identifier => {
+            prev_meaningful(tokens, p).is_some_and(|q| matches!(tokens[q].kind, Func | Signal))
+        }
+        _ => false,
+    };
+    if !opens_parameter_list {
+        return false;
+    }
+    prev_meaningful(tokens, i).is_some_and(|name| {
+        tokens[name].kind == Identifier
+            && prev_meaningful(tokens, name)
+                .is_some_and(|before| before == open || tokens[before].kind == Comma)
+    })
 }
 
 /// Index of the declaration type-hint colon (`var x:` / `const x:` / param `p:`) that opens the type
