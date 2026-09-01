@@ -690,14 +690,11 @@ fn run_dump_ladder(binary: &Utf8Path, root: &Utf8Path, project: &ProjectModel) -
     // Rung 1 — direct.
     let mut best: Option<NativeDb> = None;
     if run_dump(binary, root).is_ok() {
-        match adopt(&root.join("extension_api.json"), &locked) {
-            Ok(db) => {
-                if failing_extensions(&db, &project.gdextensions).is_empty() {
-                    return adopted_outcome(&db);
-                }
-                best = Some(db); // partial — keep it as the fallback while trying the shadow
+        if let Ok(db) = adopt(&root.join("extension_api.json"), &locked) {
+            if failing_extensions(&db, &project.gdextensions).is_empty() {
+                return adopted_outcome(&db);
             }
-            Err(()) => {}
+            best = Some(db); // partial — keep it as the fallback while trying the shadow
         }
     }
 
