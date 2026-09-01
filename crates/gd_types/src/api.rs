@@ -136,6 +136,9 @@ pub struct EnumDef {
     pub name: String,
     #[serde(default)]
     pub is_bitfield: bool,
+    /// The enum's own description from the with-docs dump (see [`ClassDef::description`]).
+    #[serde(default)]
+    pub description: String,
     #[serde(default)]
     pub values: Vec<EnumValue>,
 }
@@ -143,7 +146,14 @@ pub struct EnumDef {
 #[derive(Clone, Debug, Deserialize)]
 pub struct EnumValue {
     pub name: String,
+    /// No `#[serde(default)]` here on purpose: every enum value in a real dump carries
+    /// `value` (verified across 4.7.2's 5380), and defaulting a malformed dump would
+    /// silently fold every constant to `0` — exactly the failure mode the `Exact`
+    /// provenance machinery exists to avoid. A missing key is a load error, loudly.
     pub value: i64,
+    /// This value's description from the with-docs dump (see [`ClassDef::description`]).
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -151,6 +161,9 @@ pub struct ClassConstant {
     pub name: String,
     #[serde(default)]
     pub value: i64,
+    /// The constant's description from the with-docs dump (see [`ClassDef::description`]).
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -160,6 +173,9 @@ pub struct GlobalConstant {
     pub value: i64,
     #[serde(default)]
     pub is_bitfield: bool,
+    /// The constant's description from the with-docs dump (see [`ClassDef::description`]).
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

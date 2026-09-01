@@ -3116,8 +3116,11 @@ fn native_member_description(member: gd_types::NativeMember<'_>) -> Option<&str>
         NativeMember::Property(p) => Some(&p.description),
         NativeMember::Method(m) => Some(&m.description),
         NativeMember::Signal(s) => Some(&s.description),
-        // The dump carries no per-member description for enums / constants / enum values.
-        NativeMember::Enum(_) | NativeMember::Constant(_) | NativeMember::EnumValue { .. } => None,
+        // Constants and enum members carry docs only in a with-docs dump
+        // (`--dump-extension-api-with-docs`); the stock fallback leaves them empty (#456).
+        NativeMember::Enum(e) => Some(&e.description),
+        NativeMember::Constant(k) => Some(&k.description),
+        NativeMember::EnumValue { doc, .. } => Some(doc),
     }
 }
 

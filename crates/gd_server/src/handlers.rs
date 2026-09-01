@@ -1856,10 +1856,11 @@ fn native_member_hover_md(
         gd_types::NativeMember::Method(m) => m.description.as_str(),
         gd_types::NativeMember::Property(p) => p.description.as_str(),
         gd_types::NativeMember::Signal(s) => s.description.as_str(),
-        // A builtin type's constants are documented in the dump (`Vector2.ZERO`, `Color.RED`);
-        // an engine class's are not, and carry an empty string (#370).
+        // Constants and enum members carry docs only in a with-docs dump; the stock
+        // fallback leaves them empty (#456, #370).
         gd_types::NativeMember::Constant(k) => k.description.as_str(),
-        _ => "",
+        gd_types::NativeMember::Enum(e) => e.description.as_str(),
+        gd_types::NativeMember::EnumValue { doc, .. } => doc,
     };
     // M7 (#62): dump descriptions are BBCode — converted to GFM here at the hover boundary
     // (anti-catalog W8: raw BBCode never reaches the wire). The body is assembled as markdown

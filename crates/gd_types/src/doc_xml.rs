@@ -62,10 +62,16 @@ pub fn parse_class(xml: &str) -> Result<ClassDef, DocXmlError> {
                 for c in elements(section, "constant") {
                     let cname = attr(c, "name").to_owned();
                     let value = attr(c, "value").parse::<i64>().unwrap_or(0);
+                    // The element's text content is the constant's documentation.
+                    let description = c.text().unwrap_or("").trim().to_owned();
                     match c.attribute("enum") {
                         // Doc XML models enums as constants grouped by an `enum=` attribute.
-                        Some(en) => push_enum_value(&mut enums, en, cname, value),
-                        None => constants.push(ClassConstant { name: cname, value }),
+                        Some(en) => push_enum_value(&mut enums, en, cname, value, description),
+                        None => constants.push(ClassConstant {
+                            name: cname,
+                            value,
+                            description,
+                        }),
                     }
                 }
             }
@@ -237,10 +243,17 @@ fn normalized_type(n: Node) -> String {
     }
 }
 
-fn push_enum_value(enums: &mut Vec<EnumDef>, enum_name: &str, value_name: String, value: i64) {
+fn push_enum_value(
+    enums: &mut Vec<EnumDef>,
+    enum_name: &str,
+    value_name: String,
+    value: i64,
+    description: String,
+) {
     let entry = EnumValue {
         name: value_name,
         value,
+        description,
     };
     if let Some(e) = enums.iter_mut().find(|e| e.name == enum_name) {
         e.values.push(entry);
@@ -248,6 +261,7 @@ fn push_enum_value(enums: &mut Vec<EnumDef>, enum_name: &str, value_name: String
         enums.push(EnumDef {
             name: enum_name.to_owned(),
             is_bitfield: false,
+            description: String::new(),
             values: vec![entry],
         });
     }

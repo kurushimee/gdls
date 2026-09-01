@@ -6418,7 +6418,7 @@ fn native_surface_has_nonmethod(ctx: &AnalysisContext, root: &str, name: &str) -
             || class.signals.iter().any(|sg| db.name_of(sg.name) == name)
             || class.constants.iter().any(|k| db.name_of(k.name) == name)
             || class.enums.iter().any(|e| {
-                db.name_of(e.name) == name || e.values.iter().any(|(vn, _)| db.name_of(*vn) == name)
+                db.name_of(e.name) == name || e.values.iter().any(|v| db.name_of(v.name) == name)
             })
         {
             return true;
@@ -8636,11 +8636,12 @@ fn reduce_identifier_from_base(
 
             // 2. Value belonging to an enum (analyzer.cpp:4069-4078).
             for ne in &bt.enums {
-                if let Some((_, val)) = ne
+                if let Some(ev) = ne
                     .values
                     .iter()
-                    .find(|(sym, _)| ctx.native.name_of(*sym) == name)
+                    .find(|v| ctx.native.name_of(v.name) == name)
                 {
+                    let val = ev.value;
                     let enum_name = ctx.native.name_of(ne.name).to_owned();
                     let t = crate::resolver::make_builtin_enum_type(
                         ctx,
@@ -8649,7 +8650,7 @@ fn reduce_identifier_from_base(
                         false,
                     );
                     ctx.set_type(identifier_id, t);
-                    ctx.folds.set(identifier_id, FoldedValue::Int(*val));
+                    ctx.folds.set(identifier_id, FoldedValue::Int(val));
                     return;
                 }
             }
@@ -9201,12 +9202,12 @@ fn lookup_native_constant(
         }
         // Constant declared inside an enum.
         for ne in &nc.enums {
-            if let Some((_, v)) = ne
+            if let Some(ev) = ne
                 .values
                 .iter()
-                .find(|(sym, _)| ctx.native.name_of(*sym) == name)
+                .find(|v| ctx.native.name_of(v.name) == name)
             {
-                return Some((*v, Some(ctx.native.name_of(ne.name).to_owned())));
+                return Some((ev.value, Some(ctx.native.name_of(ne.name).to_owned())));
             }
         }
         cur = nc.inherits.map(|s| ctx.native.name_of(s).to_owned());

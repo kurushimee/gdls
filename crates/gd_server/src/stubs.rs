@@ -195,9 +195,10 @@ pub(crate) fn render(db: &NativeDb, class: &NativeClass) -> RenderedStub {
         let decl = format!("enum {name} {{");
         member_lines.insert(name.clone(), anchor(line, &decl, "enum ", &name));
         push(&mut text, &mut line, &decl);
-        for (vname, value) in &e.values {
-            let vname = db.name_of(*vname).to_owned();
-            let decl = format!("\t{vname} = {value},");
+        for v in &e.values {
+            let vname = db.name_of(v.name).to_owned();
+            push_doc(&mut text, &mut line, &v.description);
+            let decl = format!("\t{vname} = {},", v.value);
             member_lines.insert(vname.clone(), anchor(line, &decl, "\t", &vname));
             push(&mut text, &mut line, &decl);
         }
@@ -289,9 +290,10 @@ pub(crate) fn render_builtin(db: &NativeDb, bt: &gd_types::BuiltinType) -> Rende
         let decl = format!("enum {name} {{");
         member_lines.insert(name.clone(), anchor(line, &decl, "enum ", &name));
         push(&mut text, &mut line, &decl);
-        for (vname, value) in &e.values {
-            let vname = db.name_of(*vname).to_owned();
-            let decl = format!("\t{vname} = {value},");
+        for v in &e.values {
+            let vname = db.name_of(v.name).to_owned();
+            push_doc(&mut text, &mut line, &v.description);
+            let decl = format!("\t{vname} = {},", v.value);
             member_lines.insert(vname.clone(), anchor(line, &decl, "\t", &vname));
             push(&mut text, &mut line, &decl);
         }
