@@ -34,7 +34,8 @@ const TEXTURE_API: &str = r#"{
         {"name": "Resource", "inherits": "Object"},
         {"name": "Texture2D", "inherits": "Resource"},
         {"name": "CompressedTexture2D", "inherits": "Texture2D"},
-        {"name": "PackedScene", "inherits": "Resource"}
+        {"name": "PackedScene", "inherits": "Resource"},
+        {"name": "Theme", "inherits": "Resource"}
     ]
 }"#;
 
@@ -298,5 +299,78 @@ fn a_uid_two_resources_claim_stays_variant_clean() {
         diags.is_empty(),
         "a contested uid must degrade, never pick: {diags:?}"
     );
+    shutdown(&client, handle);
+}
+
+/// #525: a text resource says what it holds on its own header line. `Resource` is only a floor, and
+/// passing it where a `Theme` is wanted reported an unsafe argument the engine never emits.
+#[test]
+fn a_text_resource_types_as_the_class_its_header_names() {
+    let p = setup_project(
+        "src/theme.gd",
+        "extends Node\n\nconst T := preload(\"res://assets/main.tres\")\n\nfunc f() -> void:\n\tvar n: int = T\n\tn = n + 0\n",
+    );
+    p.write(
+        "assets/main.tres",
+        "[gd_resource type=\"Theme\" format=3 uid=\"uid://theme525\"]\n\n[resource]\n",
+    );
+    let (client, handle) = boot(&p);
+    let diags = open_and_collect(&client, &p, "src/theme.gd").diagnostics;
+    assert_eq!(diags.len(), 2, "typed from the header: {diags:?}");
+    for d in &diags {
+        assert!(
+            d.message.contains("Theme"),
+            "the header's class, not the extension's floor: {d:?}"
+        );
+    }
+    shutdown(&client, handle);
+}
+
+/// A resource carrying a script is an INSTANCE of that script. Its `type=` is only the script's own
+/// native base, so `script_class` is the answer when both are present.
+#[test]
+fn a_scripted_resource_types_as_the_script_it_carries() {
+    let p = setup_project(
+        "src/use.gd",
+        "extends Node\n\nconst D := preload(\"res://assets/data.tres\")\n\nfunc f() -> void:\n\tvar n: int = D\n\tn = n + 0\n",
+    );
+    p.write("src/my_data.gd", "class_name MyData\nextends Resource\n");
+    p.write(
+        "assets/data.tres",
+        "[gd_resource type=\"Resource\" script_class=\"MyData\" format=3]\n\n[resource]\n",
+    );
+    let (client, handle) = boot(&p);
+    let diags = open_and_collect(&client, &p, "src/use.gd").diagnostics;
+    assert_eq!(diags.len(), 2, "typed from script_class: {diags:?}");
+    for d in &diags {
+        assert!(
+            d.message.contains("MyData"),
+            "the script the resource carries: {d:?}"
+        );
+    }
+    shutdown(&client, handle);
+}
+
+/// A `script_class` naming nothing the project declares falls back to the header's `type=`, and a
+/// header naming nothing at all falls back to the extension's `Resource` floor. Neither is claimed.
+#[test]
+fn an_unresolvable_header_falls_back_rather_than_claiming() {
+    let p = setup_project(
+        "src/use.gd",
+        "extends Node\n\nconst D := preload(\"res://assets/data.tres\")\n\nfunc f() -> void:\n\tvar n: int = D\n\tn = n + 0\n",
+    );
+    p.write(
+        "assets/data.tres",
+        "[gd_resource type=\"Theme\" script_class=\"NoSuchClass\" format=3]\n\n[resource]\n",
+    );
+    let (client, handle) = boot(&p);
+    let diags = open_and_collect(&client, &p, "src/use.gd").diagnostics;
+    assert_eq!(diags.len(), 2, "{diags:?}");
+    for d in &diags {
+        assert!(
+            d.message.contains("Theme"),
+            "an unknown script_class falls back to type=: {d:?}"
+        );
+    }
     shutdown(&client, handle);
 }
