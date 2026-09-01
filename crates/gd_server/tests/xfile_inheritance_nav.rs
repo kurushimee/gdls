@@ -418,3 +418,255 @@ fn prepare_call_hierarchy_at_call_site_targets_the_callee() {
     );
     shutdown(&client, handle);
 }
+
+// ===================================================================================================
+// #541 — a bare call to a cross-file inherited method. `boost(SPEED)` on CHILD_GD line 4, column 1.
+// ===================================================================================================
+
+/// A definition request at `(line, character)` in `child.gd`, as a scalar location.
+fn definition_at(
+    client: &Connection,
+    uri: &lsp_types::Uri,
+    id: i32,
+    line: u32,
+    character: u32,
+) -> Option<Location> {
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/definition",
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(line, character),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            },
+        ))
+        .unwrap();
+    let resp = recv_response(client);
+    let result: Option<GotoDefinitionResponse> =
+        serde_json::from_value(resp.result.unwrap_or(serde_json::Value::Null)).unwrap_or(None);
+    match result {
+        Some(GotoDefinitionResponse::Scalar(loc)) => Some(loc),
+        Some(GotoDefinitionResponse::Array(mut v)) => v.pop(),
+        _ => None,
+    }
+}
+
+/// References at `(line, character)` in `uri`, as `(file name, start line)` pairs, sorted.
+fn references_at(
+    client: &Connection,
+    uri: &lsp_types::Uri,
+    id: i32,
+    line: u32,
+    character: u32,
+) -> Vec<(String, u32)> {
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/references",
+            ReferenceParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(line, character),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+                context: ReferenceContext {
+                    include_declaration: true,
+                },
+            },
+        ))
+        .unwrap();
+    let resp = recv_response(client);
+    let locs: Vec<Location> =
+        serde_json::from_value(resp.result.unwrap_or(serde_json::Value::Null)).unwrap_or_default();
+    let mut out: Vec<(String, u32)> = locs
+        .iter()
+        .map(|l| {
+            let s = l.uri.as_str();
+            (
+                s.rsplit('/').next().unwrap_or(s).to_owned(),
+                l.range.start.line,
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Every edit a rename at `(line, character)` produces, as `(file name, start line)` pairs, sorted.
+fn rename_at(
+    client: &Connection,
+    uri: &lsp_types::Uri,
+    id: i32,
+    line: u32,
+    character: u32,
+    new_name: &str,
+) -> Vec<(String, u32)> {
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/rename",
+            lsp_types::RenameParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(line, character),
+                },
+                new_name: new_name.to_owned(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        ))
+        .unwrap();
+    let resp = recv_response(client);
+    assert!(resp.error.is_none(), "rename errored: {:?}", resp.error);
+    let edit: lsp_types::WorkspaceEdit =
+        serde_json::from_value(resp.result.expect("rename result")).unwrap();
+    let mut out: Vec<(String, u32)> = Vec::new();
+    // This harness negotiates a minimal client, so the server answers with `changes` rather than
+    // `documentChanges`. Read both, so the helper does not silently see an empty set.
+    if let Some(changes) = edit.changes {
+        for (uri, edits) in changes {
+            let s = uri.as_str();
+            let name = s.rsplit('/').next().unwrap_or(s).to_owned();
+            for e in edits {
+                out.push((name.clone(), e.range.start.line));
+            }
+        }
+    }
+    if let Some(lsp_types::DocumentChanges::Edits(docs)) = edit.document_changes {
+        for doc in docs {
+            let s = doc.text_document.uri.as_str();
+            let name = s.rsplit('/').next().unwrap_or(s).to_owned();
+            for e in doc.edits {
+                let range = match e {
+                    lsp_types::OneOf::Left(t) => t.range,
+                    lsp_types::OneOf::Right(t) => t.text_edit.range,
+                };
+                out.push((name.clone(), range.start.line));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The repro. `definition` on the bare `boost(SPEED)` answered null, because
+/// `reduce_identifier` skips its use record in callee position and the cross-file half of that
+/// record was never made anywhere else.
+#[test]
+fn definition_on_a_bare_inherited_call_jumps_to_the_declaring_file() {
+    let p = project();
+    let (client, handle) = boot_with_api(&p);
+    let _ = did_open(&client, &p, "child.gd");
+    let child_uri = file_uri(&p.root.join("child.gd"));
+
+    // line 4 = `\tboost(SPEED)`, character 1 is the `b` of `boost`.
+    let loc = definition_at(&client, &child_uri, 2, 4, 1).expect("a definition location");
+    assert!(
+        loc.uri.as_str().ends_with("base.gd"),
+        "expected base.gd, got {}",
+        loc.uri.as_str()
+    );
+    // `func boost(amount: int) -> void:` is line 5 (0-based) of BASE_GD.
+    assert_eq!(loc.range.start.line, 5);
+    shutdown(&client, handle);
+}
+
+/// The corruption case: renaming from the DECLARATION has to reach the bare call. Before this,
+/// the edit set covered the declaration and every dotted site and silently skipped the bare one,
+/// so applying it left a call to a method that no longer existed.
+#[test]
+fn renaming_the_declaration_reaches_the_bare_inherited_call() {
+    let p = project();
+    let (client, handle) = boot_with_api(&p);
+    let _ = did_open(&client, &p, "base.gd");
+    let _ = did_open(&client, &p, "child.gd");
+    let base_uri = file_uri(&p.root.join("base.gd"));
+
+    // line 5 = `func boost(amount: int) -> void:`, character 6 is inside `boost`.
+    let edits = rename_at(&client, &base_uri, 3, 5, 6, "accelerate");
+    assert_eq!(
+        edits,
+        vec![("base.gd".to_owned(), 5), ("child.gd".to_owned(), 4)],
+        "the declaration and the bare call, both"
+    );
+    shutdown(&client, handle);
+}
+
+/// Renaming FROM the bare call site gives the identical set: rename canonicalizes through
+/// `definition`, so the answer cannot depend on which end the user clicked.
+#[test]
+fn renaming_from_the_bare_call_gives_the_same_edits() {
+    let p = project();
+    let (client, handle) = boot_with_api(&p);
+    let _ = did_open(&client, &p, "base.gd");
+    let _ = did_open(&client, &p, "child.gd");
+    let base_uri = file_uri(&p.root.join("base.gd"));
+    let child_uri = file_uri(&p.root.join("child.gd"));
+
+    let from_decl = rename_at(&client, &base_uri, 3, 5, 6, "accelerate");
+    let from_call = rename_at(&client, &child_uri, 4, 4, 1, "accelerate");
+    assert!(!from_call.is_empty(), "two empty sets are not agreement");
+    assert_eq!(from_call, from_decl);
+    shutdown(&client, handle);
+}
+
+/// References from the declaration include the bare call.
+#[test]
+fn references_on_the_declaration_include_the_bare_inherited_call() {
+    let p = project();
+    let (client, handle) = boot_with_api(&p);
+    let _ = did_open(&client, &p, "base.gd");
+    let _ = did_open(&client, &p, "child.gd");
+    let base_uri = file_uri(&p.root.join("base.gd"));
+
+    let refs = references_at(&client, &base_uri, 5, 5, 6);
+    assert!(
+        refs.contains(&("child.gd".to_owned(), 4)),
+        "expected the bare call among {refs:?}"
+    );
+    shutdown(&client, handle);
+}
+
+/// A bare NATIVE inherited call anchors nothing new, so it keeps answering from the native side
+/// and rename still refuses it. The fail-closed half.
+#[test]
+fn a_bare_native_call_is_unchanged() {
+    let p = project();
+    p.write(
+        "native_caller.gd",
+        "extends Node\nfunc go() -> void:\n\tset_process(true)\n",
+    );
+    let (client, handle) = boot_with_api(&p);
+    let _ = did_open(&client, &p, "native_caller.gd");
+    let uri = file_uri(&p.root.join("native_caller.gd"));
+
+    client
+        .sender
+        .send(request(
+            6,
+            "textDocument/rename",
+            lsp_types::RenameParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(2, 1),
+                },
+                new_name: "nope".to_owned(),
+                work_done_progress_params: WorkDoneProgressParams::default(),
+            },
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    assert!(
+        resp.error.is_some(),
+        "renaming a native method must be refused, got {:?}",
+        resp.result
+    );
+    shutdown(&client, handle);
+}

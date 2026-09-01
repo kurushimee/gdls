@@ -2046,7 +2046,8 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // `reduce_call` resolves bare inherited calls itself (the in-file class walk + the
     // cross-file CallSig chain), and typing the callee as a constant Callable here would
     // mis-fire Godot's `Name "X" is a Callable` error that is reserved for callable-holding
-    // variables.
+    // variables. #541: `reduce_call` also makes the `Binding::Use` this skip would otherwise
+    // owe, so definition / references / rename still have a record to ride.
     if !reducing_this_callee(ctx, id) {
         if let Some(sr) = current_class_script_base(ctx) {
             // The SCOPE walk, not the chain walk: a bare identifier also sees what each base's
@@ -5901,6 +5902,29 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         if !sig.shape_resolved_params.is_empty() {
             let slots = std::mem::take(&mut sig.shape_resolved_params);
             ctx.record_call_param_resolution(call_span, slots);
+        }
+        // #541: a BARE callee resolved through the cross-file chain records the use that
+        // `reduce_identifier`'s step 3.5 skips in callee position. A bare same-file callee already
+        // gets one from the in-file member walk, and definition / references / rename all ride that
+        // record — without the cross-file half, a bare call to an inherited method resolved
+        // nowhere, and `rename` emitted an edit set that silently left it behind.
+        //
+        // Dispatch-accurate by construction: the link is the one `script_chain_call` returned, so
+        // this claims exactly the declaration the call binds to. A dotted callee stays a recording
+        // cut (recall rides the `Call` projection), `super.m()` keeps #333's path, and a chain that
+        // bottoms out in the native root sets `native_callee` instead, so nothing native is
+        // anchored here. Additive per WP-N1b: no type, no diagnostic.
+        if let (Some(link), Some(callee_id)) = (cross_file_callee.as_ref(), call.callee) {
+            if callee_kind && !call.is_super {
+                let site = ctx.node(callee_id).span;
+                ctx.record_binding(crate::binding::Binding::use_(
+                    Some(link.file),
+                    link.inner.clone(),
+                    crate::binding::BindingTargetKind::Function,
+                    function_name.clone(),
+                    site,
+                ));
+            }
         }
         let callee = if let Some(link) = cross_file_callee {
             CalleeTarget::Script {

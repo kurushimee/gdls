@@ -2108,3 +2108,167 @@ func go() -> void:
     let result = analyze_file(&ubase_project(), "res://c.gd", consumer);
     assert_eq!(error_messages(&result), Vec::<String>::new());
 }
+
+// ===================================================================================================
+// #541 — a bare call to a cross-file inherited method records its own use site.
+// ===================================================================================================
+
+const CHAIN_BASE_GD: &str = "\
+class_name ChainBase
+extends Node
+func describe() -> String:
+\treturn \"base\"
+";
+
+const CHAIN_MID_GD: &str = "\
+class_name ChainMid
+extends ChainBase
+";
+
+/// Every `Binding::Use` in `result` naming `name`, as (declaring file, inner path, site).
+fn use_sites(
+    result: &AnalysisResult,
+    name: &str,
+) -> Vec<(Option<FileId>, Vec<String>, gd_syntax::ByteSpan)> {
+    result
+        .bindings()
+        .iter()
+        .filter_map(|b| match b {
+            Binding::Use {
+                target_file,
+                target_class_path,
+                target_kind: BindingTargetKind::Function,
+                target_name,
+                site,
+            } if target_name == name => Some((*target_file, target_class_path.clone(), *site)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The repro. `reduce_identifier` skips step 3.5 in callee position, so a bare call to an
+/// inherited method used to record only the `Binding::Call` — and definition, references and
+/// rename all ride the `Use`. Rename therefore rewrote the declaration and every dotted call site
+/// while silently leaving the bare one behind.
+#[test]
+fn a_bare_cross_file_inherited_call_records_a_use() {
+    let consumer = "\
+extends ChainBase
+func h() -> void:
+\tdescribe()
+";
+    let project = Project::new(&[("res://base.gd", CHAIN_BASE_GD), ("res://sub.gd", "")]);
+    let result = analyze_file(&project, "res://sub.gd", consumer);
+    assert_eq!(error_messages(&result), Vec::<String>::new());
+
+    let sites = use_sites(&result, "describe");
+    assert_eq!(sites.len(), 1, "expected one use; got {sites:?}");
+    assert_eq!(sites[0].0, Some(project.fid("res://base.gd")));
+    assert_eq!(sites[0].1, Vec::<String>::new());
+    // The site is the callee IDENTIFIER, not the whole call: a consumer projects it as the token
+    // the user clicked and rename edits exactly that range.
+    assert_eq!(&consumer[sites[0].2.start..sites[0].2.end], "describe");
+}
+
+/// A grandparent is the same walk, one link further: this is the chain, not one hop.
+#[test]
+fn a_grandparent_call_records_the_declaring_file() {
+    let consumer = "\
+extends ChainMid
+func h() -> void:
+\tdescribe()
+";
+    let project = Project::new(&[
+        ("res://base.gd", CHAIN_BASE_GD),
+        ("res://mid.gd", CHAIN_MID_GD),
+        ("res://sub.gd", ""),
+    ]);
+    let result = analyze_file(&project, "res://sub.gd", consumer);
+    let sites = use_sites(&result, "describe");
+    assert_eq!(sites.len(), 1, "expected one use; got {sites:?}");
+    assert_eq!(
+        sites[0].0,
+        Some(project.fid("res://base.gd")),
+        "the DECLARING file, not the link the chain walked through"
+    );
+}
+
+/// A method declared on an inner class of the base carries that class's inner path, so two
+/// same-named methods in one file stay distinct under references and rename.
+#[test]
+fn an_inner_class_base_carries_its_class_path() {
+    let lib = "\
+class_name InnerLib
+class Box:
+\tfunc describe() -> String:
+\t\treturn \"box\"
+";
+    let consumer = "\
+extends RefCounted
+func h(b: InnerLib.Box) -> void:
+\tb.describe()
+";
+    let project = Project::new(&[("res://lib.gd", lib), ("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    // A DOTTED callee stays a recording cut — recall rides the `Call` projection there — so the
+    // new record must NOT appear for it.
+    assert_eq!(use_sites(&result, "describe"), Vec::new());
+}
+
+/// `self.m()` is a dotted callee: unchanged, still a recording cut.
+#[test]
+fn a_self_call_records_no_new_use() {
+    let consumer = "\
+extends ChainBase
+func h() -> void:
+\tself.describe()
+";
+    let project = Project::new(&[("res://base.gd", CHAIN_BASE_GD), ("res://sub.gd", "")]);
+    let result = analyze_file(&project, "res://sub.gd", consumer);
+    assert_eq!(use_sites(&result, "describe"), Vec::new());
+}
+
+/// `super.m()` keeps its own path (#333) and records nothing here.
+#[test]
+fn a_super_call_records_no_new_use() {
+    let consumer = "\
+extends ChainBase
+func describe() -> String:
+\treturn super.describe()
+";
+    let project = Project::new(&[("res://base.gd", CHAIN_BASE_GD), ("res://sub.gd", "")]);
+    let result = analyze_file(&project, "res://sub.gd", consumer);
+    assert_eq!(use_sites(&result, "describe"), Vec::new());
+}
+
+/// A bare call to a NATIVE inherited method resolves through `native_callee`, never
+/// `cross_file_callee`, so nothing is anchored to a project file — the fail-closed half.
+#[test]
+fn a_bare_native_call_anchors_nothing() {
+    let consumer = "\
+extends Node
+func h() -> void:
+\tset_process(true)
+";
+    let project = Project::new(&[("res://use.gd", "")]);
+    let result = analyze_file(&project, "res://use.gd", consumer);
+    assert_eq!(use_sites(&result, "set_process"), Vec::new());
+}
+
+/// A bare call to a method the file declares ITSELF is projected from its `Binding::Call` (the
+/// in-file function id resolves it), and that path was never broken. It records no `Use`, and the
+/// new record must not start adding one — a second record for one site would double every
+/// same-file entry in a references answer.
+#[test]
+fn a_bare_same_file_call_records_no_use() {
+    let consumer = "\
+extends ChainBase
+func own() -> void:
+\tpass
+func h() -> void:
+\town()
+";
+    let project = Project::new(&[("res://base.gd", CHAIN_BASE_GD), ("res://sub.gd", "")]);
+    let result = analyze_file(&project, "res://sub.gd", consumer);
+    assert_eq!(use_sites(&result, "own"), Vec::new());
+}
