@@ -190,6 +190,37 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
         self.inner.resolve_path_from(from, raw)
     }
 
+    /// The importer's product class for an imported asset, read from `<asset>.import`'s
+    /// `[remap] type=` line at analysis time (read-through: a changed sidecar is picked up by
+    /// the next analysis of a referring file). `res://` resolves against the project root; a
+    /// relative path joins the referring file's directory. Everything else (no sidecar,
+    /// unreadable, no `type=`) is `None` — the analyzer degrades to Variant (#444).
+    ///
+    /// Deliberate trade, not a free property: this is a blocking `read_to_string` inside
+    /// `reduce_preload` — one syscall per preload per analysis pass, reaching past the
+    /// in-memory index straight to disk, against the "eager interfaces, lazy bodies"
+    /// arrangement elsewhere. Bounded by preloads-in-one-file, so it is fine in practice;
+    /// if a 10k-file profile ever says otherwise, this is the line to memoize.
+    fn imported_resource_class(&self, from: Option<FileId>, raw: &str) -> Option<String> {
+        let asset_path = if let Some(abs) = gd_project::paths::res_to_path(&self.project_root, raw)
+        {
+            abs
+        } else {
+            // Relative form: resolve against the referring script's directory, mirroring
+            // `resolve_path_from`'s join. `from` is the preload's containing file.
+            let from = from?;
+            let from_dir = Utf8Path::new(self.inner.index.path(from)?)
+                .parent()?
+                .to_path_buf();
+            gd_project::normalize_path(&from_dir.join(raw))
+        };
+        // The sidecar is a sibling file with `.import` APPENDED (`tex.svg` → `tex.svg.import`);
+        // `with_extension` would replace the real extension.
+        let sidecar_path = camino::Utf8PathBuf::from(format!("{asset_path}.import"));
+        let sidecar = std::fs::read_to_string(sidecar_path.as_std_path()).ok()?;
+        parse_import_remap_type(&sidecar)
+    }
+
     fn file_path(&self, file: FileId) -> Option<&str> {
         self.inner.file_path(file)
     }
@@ -281,6 +312,43 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
     }
 }
 
+/// Parse the `type=` line out of a `.import` sidecar's `[remap]` section — the class the importer
+/// produced for the asset (`CompressedTexture2D` for a default-imported texture, `Image` under the
+/// "Image" importer, …). Godot writes these as ConfigFile INI:
+///
+/// ```ini
+/// [remap]
+///
+/// importer="texture"
+/// type="CompressedTexture2D"
+/// ```
+///
+/// Section-scoped (`[params]` and later sections may carry their own `type=`-ish keys), tolerant
+/// of `//`-comments and `=`-spacing, and exact about the key — `importer` must not match. A missing
+/// section, missing key, or EMPTY value is `None` (the caller degrades to Variant; never guess).
+fn parse_import_remap_type(sidecar: &str) -> Option<String> {
+    let mut in_remap = false;
+    for line in sidecar.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_remap = trimmed == "[remap]";
+            continue;
+        }
+        if !in_remap {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "type" {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        return (!value.is_empty()).then(|| value.to_owned());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +364,43 @@ mod tests {
     /// insert at most one or two entries; the production default is 512). NonZeroUsize::new only
     /// panics on zero, which 32 obviously isn't.
     const TEST_CACHE_CAPACITY: usize = 32;
+
+    #[test]
+    fn remap_type_parses_from_a_real_shaped_sidecar() {
+        let sidecar = "\
+[remap]
+
+importer=\"texture\"
+type=\"CompressedTexture2D\"
+uid=\"uid://abc123\"
+path=\"res://.godot/imported/tex.svg-abc.ctex\"
+
+[params]
+
+compress/mode=0\n";
+        assert_eq!(
+            parse_import_remap_type(sidecar).as_deref(),
+            Some("CompressedTexture2D")
+        );
+    }
+
+    #[test]
+    fn remap_type_is_section_scoped_and_key_exact() {
+        // No [remap] section at all — [params] carrying a `type=`-adjacent key must not match…
+        assert_eq!(parse_import_remap_type("[params]\ntype=0\n"), None);
+        // …and inside [remap], `importer=` must not match either (`type` is exact-key).
+        assert_eq!(
+            parse_import_remap_type("[remap]\nimporter=\"texture\"\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn remap_type_missing_or_empty_is_none() {
+        assert_eq!(parse_import_remap_type(""), None);
+        assert_eq!(parse_import_remap_type("[remap]\n"), None);
+        assert_eq!(parse_import_remap_type("[remap]\ntype=\"\"\n"), None);
+    }
 
     fn test_cache() -> LruCache<CanonicalKey, CacheEntry<AnalysisResult>> {
         LruCache::new(NonZeroUsize::new(TEST_CACHE_CAPACITY).unwrap())

@@ -9715,6 +9715,30 @@ fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
                 return;
             }
         }
+
+        // #444: an imported asset types as whatever its importer produced — the `type=` line of
+        // the `<path>.import` sidecar's `[remap]` section (analyzer.cpp:4749-4751 over the loaded
+        // Resource). No guessing from the extension: a missing/unreadable sidecar degrades to
+        // Variant exactly as today, and a sidecar naming a class this dump doesn't know stays
+        // Variant too (a missed precise type is a known limitation; a wrong one is a defect).
+        if let Some(class) = ctx
+            .xfile
+            .imported_resource_class(ctx.file, &path_str)
+            .filter(|c| ctx.native.class_named(c).is_some())
+        {
+            ctx.set_type(
+                id,
+                DataType {
+                    type_source: TypeSource::AnnotatedInferred,
+                    kind: DtKind::Native,
+                    builtin_type: VariantType::Object,
+                    native_type: class,
+                    is_constant: true,
+                    ..Default::default()
+                },
+            );
+            return;
+        }
     }
 
     // Path unresolved (`NoCrossFile`, unknown corpus path, non-string fold) ⇒ degrade to Variant.

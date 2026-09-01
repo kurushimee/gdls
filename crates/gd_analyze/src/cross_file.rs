@@ -128,6 +128,21 @@ pub trait CrossFileQuery {
         self.resolve_res_path(raw)
     }
 
+    /// The resource class an IMPORTED asset preloads as: the `type=` line of the asset's `.import`
+    /// sidecar `[remap]` section. Godot types `preload` by the class of the resource the importer
+    /// produced (analyzer.cpp:4749-4751 over the loaded Resource), and never guesses from the
+    /// extension — a `.png` is `CompressedTexture2D` under the default importer, `Image` under the
+    /// "Image" importer. The sidecar is where that class lives on disk.
+    ///
+    /// `raw` is the preload argument as written (a `res://…` path, or one RELATIVE to the
+    /// referring script `from` — analyzer.cpp:437's relativization, mirroring
+    /// [`CrossFileQuery::resolve_path_from`]). `None` (no `from` for a relative path, no sidecar,
+    /// unreadable file, no `type=` line) degrades to the caller's Variant fallback — no guessing
+    /// either way. Default `None` keeps test stubs and `NoCrossFile` permissive.
+    fn imported_resource_class(&self, _from: Option<FileId>, _raw: &str) -> Option<String> {
+        None
+    }
+
     /// True iff the file's class is `@tool`. Used by MISSING_TOOL emission in resolve_class_inheritance.
     fn is_file_tool(&self, file: FileId) -> bool {
         self.interface(file).is_some_and(|i| i.is_tool)
