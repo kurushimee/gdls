@@ -3348,3 +3348,106 @@ fn resource_path_omits_engine_sidecars() {
 
     shutdown(&client, server_thread);
 }
+
+/// #514: five type positions returned the wrong list — or, for `is`, nothing at all — until the user
+/// typed a character. Godot opens `COMPLETION_TYPE_NAME` from `parse_type`
+/// (`gdscript_parser.cpp:3871`) BEFORE consuming the identifier, and all five route through it.
+/// Each row asserts the real type list (a native class, a builtin, a project `class_name`, and
+/// `Variant`), no `void` (only `->` allows it), no local variable, and a zero-width edit at the
+/// cursor so accepting an item inserts rather than deletes.
+#[test]
+fn zero_prefix_type_positions_list_types() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/zp.gd"));
+    // Each entry: (source, cursor line, cursor column, what it is).
+    let rows: &[(&str, u32, u32, &str)] = &[
+        (
+            "extends Node2D\n\nfunc f(p: ) -> void:\n\tpass\n",
+            2,
+            10,
+            "a parameter's type colon",
+        ),
+        (
+            "extends Node2D\n\nsignal s(p: )\n",
+            2,
+            12,
+            "a signal parameter's type colon",
+        ),
+        (
+            "extends Node2D\n\nvar a: Dictionary[String, ]\n",
+            2,
+            26,
+            "a typed collection's second slot",
+        ),
+        (
+            "extends Node2D\n\nfunc f(x) -> void:\n\tif x is :\n\t\tpass\n",
+            3,
+            9,
+            "the right side of `is`",
+        ),
+        (
+            "extends Node2D\n\nfunc f(x) -> void:\n\tif x is not :\n\t\tpass\n",
+            3,
+            13,
+            "the right side of `is not`",
+        ),
+        (
+            "extends Node2D\n\nfunc f(x) -> void:\n\tvar local := 1\n\tprint(x as )\n",
+            4,
+            12,
+            "the right side of `as`",
+        ),
+    ];
+    for (i, (src, line, col, what)) in rows.iter().enumerate() {
+        let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+        let raw = complete_raw(&client, 514 + i as i32, &uri, Position::new(*line, *col));
+        let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+        let ls = labels(&list);
+        for want in ["Node", "Color", "Hero", "Variant"] {
+            assert!(
+                ls.contains(&want.to_string()),
+                "{what} must offer `{want}`; got {} items starting {:?}",
+                ls.len(),
+                &ls[..ls.len().min(6)]
+            );
+        }
+        assert!(
+            !ls.contains(&"void".to_string()),
+            "{what} is not a return type, so `void` must not appear"
+        );
+        assert!(
+            !ls.contains(&"local".to_string()),
+            "{what} must not be the general identifier set"
+        );
+        let node = list.items.iter().find(|it| it.label == "Node").unwrap();
+        let range = match node.text_edit.as_ref().expect("an edit") {
+            lsp_types::CompletionTextEdit::Edit(e) => e.range,
+            lsp_types::CompletionTextEdit::InsertAndReplace(e) => e.replace,
+        };
+        assert_eq!(
+            range.start, range.end,
+            "{what} has nothing typed, so the edit must be zero-width at the cursor"
+        );
+        shutdown(&client, server_thread);
+    }
+}
+
+/// The scoping half of #514, end to end: a dictionary-literal colon still returns the identifier set
+/// and an array-literal comma is still a plain expression slot.
+#[test]
+fn zero_prefix_look_alikes_still_return_identifiers() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/zpn.gd"));
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar local := 1\n\tprint({\"a\": })\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+    let raw = complete_raw(&client, 5140, &uri, Position::new(4, 13));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+    assert!(
+        ls.contains(&"local".to_string()),
+        "a dict-literal value slot is an expression, so the local is in scope; got {:?}",
+        &ls[..ls.len().min(6)]
+    );
+
+    shutdown(&client, server_thread);
+}
