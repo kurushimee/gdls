@@ -1,4 +1,5 @@
-//! #550 — a `:=` whose initializer is a call that missed fails to infer.
+//! #550 / #553 — a `:=` whose initializer missed fails to infer, on the call path and the
+//! attribute path alike.
 //!
 //! Godot's `call_type` is default-constructed (`gdscript_analyzer.cpp:3283`) and never assigned
 //! anywhere in the miss branch (`:3722-3776`), so every reported miss stamps UNRESOLVED /
@@ -149,4 +150,70 @@ fn an_unwalkable_base_keeps_its_silence() {
 fn a_resolved_call_still_infers() {
     let src = "extends Node\n\nfunc real() -> int:\n\treturn 1\n\nfunc go() -> void:\n\tvar a := real()\n\tvar b := Vector2(1, 2)\n\tprint(a, b)\n";
     assert_eq!(errors(src), Vec::<String>::new());
+}
+
+// ===================================================================================================
+// #553 — the same failure on the ATTRIBUTE path. Godot leaves a member miss unset
+// (analyzer.cpp:4878-4913 and :4144-4158), so `var x := n.nope` is an inference failure too.
+// ===================================================================================================
+
+/// A property miss on a NATIVE base whose chain gdls walked in full.
+#[test]
+fn a_native_property_miss_fails_inference() {
+    let src = "extends Node\n\nfunc go(n: Node) -> void:\n\tvar a := n.nope_prop\n\tprint(a)\n";
+    assert_eq!(errors(src), vec![cannot_infer("a")]);
+}
+
+/// The realistic shape: a property that exists one level DOWN the hierarchy. `position` is on
+/// `Node2D`, not `Node`, and this is what a project actually writes by accident.
+#[test]
+fn a_property_from_the_wrong_level_fails_inference() {
+    let src = "extends Node\n\nfunc go(n: Node) -> void:\n\tvar e := n.position\n\tprint(e)\n";
+    assert_eq!(errors(src), vec![cannot_infer("e")]);
+}
+
+/// A miss on a builtin INSTANCE reports the member row and then fails inference, in that order.
+#[test]
+fn a_builtin_property_miss_fails_inference() {
+    let src = "extends Node\n\nfunc go(v: Vector2) -> void:\n\tvar c := v.nope_prop\n\tprint(c)\n";
+    assert_eq!(
+        errors(src),
+        vec![
+            r#"Cannot find member "nope_prop" in base "Vector2"."#.to_owned(),
+            cannot_infer("c"),
+        ]
+    );
+}
+
+/// An annotated declaration has nothing to infer.
+#[test]
+fn an_annotated_property_declaration_gets_no_inference_row() {
+    let src = "extends Node\n\nfunc go(n: Node) -> void:\n\tvar a: int = n.nope_prop\n\tprint(a)\n";
+    assert_eq!(errors(src), Vec::<String>::new());
+}
+
+/// A property that RESOLVES still infers precisely.
+#[test]
+fn a_resolved_property_still_infers() {
+    let src = "extends Node\n\nfunc go(n: Node2D, v: Vector2) -> void:\n\tvar a := n.position\n\tvar b := v.x\n\tprint(a, b)\n";
+    assert_eq!(errors(src), Vec::<String>::new());
+}
+
+/// Under a dump that is not the engine surface the negative is not provable, so neither half
+/// fires and the access keeps its soft `Variant`.
+#[test]
+fn a_property_miss_is_silent_without_an_exact_dump() {
+    let mut db = native_db();
+    db.set_provenance(ApiProvenance::Generic);
+    let src = "extends Node\n\nfunc go(n: Node, v: Vector2) -> void:\n\tvar a := n.nope_prop\n\tvar c := v.nope_prop\n\tprint(a, c)\n";
+    assert_eq!(errors_with(src, &db), Vec::<String>::new());
+}
+
+/// A `Dictionary` read is not a miss — any key is a member. It has ALWAYS been an inference
+/// failure upstream (#468), and that answer is unchanged.
+#[test]
+fn a_dictionary_read_keeps_its_existing_answer() {
+    let src =
+        "extends Node\n\nfunc go(d: Dictionary) -> void:\n\tvar a := d.anything\n\tprint(a)\n";
+    assert_eq!(errors(src), vec![cannot_infer("a")]);
 }

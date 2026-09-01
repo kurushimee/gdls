@@ -7398,7 +7398,25 @@ fn reduce_subscript_attribute(
                     sub_id,
                 );
             }
-            result_type = DataType::variant();
+            // #553: Godot leaves the datatype UNSET on a member miss (analyzer.cpp:4878-4913), so
+            // `var x := n.nope` is an inference failure on top of whatever this arm said. gdls
+            // cannot leave it `Unresolved` — the `reduce_expression` tail-guard promotes that
+            // straight back to a soft `Variant` — so it takes the same `Variant`/`Undetected`
+            // dummy #468 built and #550 gave the call path.
+            //
+            // Gated on `negative_is_sound`, the very predicate the warning above is gated on: only
+            // where gdls saw the base's full member surface is "no type" a claim about the code
+            // rather than about gdls's view. An unsound negative keeps the soft `Variant` and its
+            // silence — a `Script` base gdls sees shallowly never reaches this arm at all.
+            result_type = if negative_is_sound {
+                DataType {
+                    kind: DtKind::Variant,
+                    type_source: TypeSource::Undetected,
+                    ..Default::default()
+                }
+            } else {
+                DataType::variant()
+            };
         }
     }
 
@@ -8928,6 +8946,21 @@ fn reduce_identifier_from_base(
                     format!(r#"Cannot find member "{name}" in base "{base}"."#),
                     identifier_id,
                 );
+                // #553: Godot leaves the datatype unset here (analyzer.cpp:4144-4158), which is
+                // what makes `var x := v.nope` an inference failure on top of the miss. gdls
+                // cannot leave the kind `Unresolved` — the `reduce_expression` tail-guard would
+                // promote it back to a soft `Variant` — so it takes the same `Variant`/
+                // `Undetected` dummy the Dictionary arm above uses. Only behind the error: the
+                // trimmed-dump fall-through below proves nothing and keeps its soft Variant.
+                ctx.set_type(
+                    identifier_id,
+                    DataType {
+                        kind: DtKind::Variant,
+                        type_source: TypeSource::Undetected,
+                        ..DataType::default()
+                    },
+                );
+                return;
             }
         }
         // A builtin the (possibly trimmed) dump doesn't carry proves nothing about the name —
