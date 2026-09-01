@@ -131,7 +131,12 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// The `ParamTyping` variant shape changed, so a v18 cache does not deserialize at all; a lenient
 /// decode would hold no shapes and keep serving the untyped slot, the same serve-the-older-answer
 /// failure v15 and v17 fixed. v18 files are ignored and rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 19;
+/// v20 (#555): the path-reference index went multi-valued — `file_path_ref` (one path-`extends`
+/// target per file) became `file_path_refs` (that target plus every `preload`/`load` literal), so a
+/// file appearing at or vanishing from a preloaded path re-links the consumers waiting on it. A v19
+/// cache decodes into the old single-valued shape and would rebuild the inverse with the preload
+/// paths missing, leaving those consumers permanently un-relinked. v19 files are ignored and rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 20;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool

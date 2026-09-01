@@ -38,7 +38,7 @@ pub use interface::{
     Interface, MemberDecl, MemberFlags, MemberKind, ParamTyping, TypeExpr, INIT_SHAPE_MAX_DEPTH,
 };
 pub use model::{AutoloadTyping, LoadOutcome, ProjectModel};
-pub use paths::{path_to_res, res_to_path};
+pub use paths::{join_lexical, path_to_res, res_to_path};
 pub use project_godot::{
     autoload_key_span, classify, parse as parse_project_godot, Autoload, ProjectGodot, ResTarget,
     WarnLevel, WarningConfig,

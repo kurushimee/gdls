@@ -679,7 +679,8 @@ pub fn definition(
                         crate::xfile::AutoloadEnv::default(),
                         &state.workspace.scenes,
                         &state.workspace.project.root,
-                    );
+                    )
+                    .with_project_loaded(state.workspace.project.is_loaded());
                     gd_analyze::enumerate::script_chain_declaring_link(
                         &xfile,
                         &state.workspace.native,
@@ -1678,7 +1679,8 @@ fn script_base_native_owner(
         crate::xfile::AutoloadEnv::default(),
         &state.workspace.scenes,
         &state.workspace.project.root,
-    );
+    )
+    .with_project_loaded(state.workspace.project.is_loaded());
     let native = &state.workspace.native;
     if gd_analyze::enumerate::script_chain_declaring_link(&xfile, native, sr, name).is_some() {
         return None;
@@ -1700,7 +1702,8 @@ fn script_base_declaring_iface<'a>(
         crate::xfile::AutoloadEnv::default(),
         &state.workspace.scenes,
         &state.workspace.project.root,
-    );
+    )
+    .with_project_loaded(state.workspace.project.is_loaded());
     let link = gd_analyze::enumerate::script_chain_declaring_link(
         &xfile,
         &state.workspace.native,

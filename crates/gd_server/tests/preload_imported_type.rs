@@ -149,6 +149,10 @@ fn imported_asset_without_a_sidecar_stays_variant_clean() {
         "src/tex.gd",
         "extends Node\n\nconst TEX := preload(\"res://assets/tex.svg\")\n\nfunc f() -> void:\n\tvar n: int = TEX\n\tn = n + 0\n",
     );
+    // The asset itself is on disk — only the sidecar is missing, which is what this isolates.
+    // Godot answers an unimported `.svg` with `has no resource loaders`, a message gdls does not
+    // port, so silence is the whole expectation here (#555).
+    p.write("assets/tex.svg", "<svg/>\n");
     let (client, handle) = boot(&p);
     let diags = open_and_collect(&client, &p, "src/tex.gd").diagnostics;
     assert!(

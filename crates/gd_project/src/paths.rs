@@ -32,6 +32,30 @@ pub fn res_to_path(root: &Utf8Path, res: &str) -> Option<Utf8PathBuf> {
     Some(root.join(rel))
 }
 
+/// Join a path RELATIVE to `base_dir`, collapsing `.` and `..` lexically. `None` when the traversal
+/// pops past `base_dir`'s own root, which is the only way the result could name something outside
+/// the tree the caller reasoned about.
+///
+/// Lexical on purpose: [`crate::normalize_path`] folds separators and drive case but leaves `..`
+/// alone, so a join that keeps the segment renders as `res://sub/../a.gd` where Godot's own
+/// `simplify_path` renders `res://a.gd`. Every consumer that turns a `preload` argument into a path
+/// — the index's relative resolution and the missing-preload check — shares this one definition so
+/// they cannot disagree about what a `../` means.
+#[must_use]
+pub fn join_lexical(base_dir: &Utf8Path, rel: &str) -> Option<Utf8PathBuf> {
+    let mut parts: Vec<&str> = base_dir.as_str().split('/').collect();
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(Utf8PathBuf::from(parts.join("/")))
+}
+
 /// `<root>/a/b.gd` → `"res://a/b.gd"` (forward slashes, as Godot writes them).
 pub fn path_to_res(root: &Utf8Path, path: &Utf8Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
@@ -149,6 +173,29 @@ pub fn build_uid_map(root: &Utf8Path) -> FxHashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `..` collapse Godot's `simplify_path` does, and the refusal that keeps a traversal from
+    /// naming something outside the tree the caller reasoned about (#555).
+    #[test]
+    fn join_lexical_collapses_and_refuses_escapes() {
+        let dir = Utf8Path::new("/proj/src");
+        assert_eq!(
+            join_lexical(dir, "../gone.tres").as_deref(),
+            Some(Utf8Path::new("/proj/gone.tres"))
+        );
+        assert_eq!(
+            join_lexical(dir, "./a/./b.gd").as_deref(),
+            Some(Utf8Path::new("/proj/src/a/b.gd"))
+        );
+        assert_eq!(
+            join_lexical(dir, "sub/../a.gd").as_deref(),
+            Some(Utf8Path::new("/proj/src/a.gd"))
+        );
+        assert!(
+            join_lexical(dir, "../../../../etc/passwd").is_none(),
+            "a traversal past the base's root has no answer"
+        );
+    }
 
     #[test]
     fn res_path_round_trip() {

@@ -128,6 +128,18 @@ pub trait CrossFileQuery {
         self.resolve_res_path(raw)
     }
 
+    /// The `res://`-rendered path a `preload`/`load` argument names that this project view can
+    /// PROVE holds no file, or `None` when it exists or the impl cannot testify (#555). `from` is
+    /// the referring file, which a relative literal needs.
+    ///
+    /// Fail-closed by construction: the default answers `None`, so `NoCrossFile`, [`SyntacticQuery`],
+    /// and every test stub stay silent. Only an impl with a live, watcher-fresh view of the project
+    /// tree may answer `Some` — the claim is a negative one, and gdls does not make those on a
+    /// partial view (the same discipline the native DB's `ApiProvenance::Exact` gate enforces).
+    fn preload_missing_path(&self, _from: Option<FileId>, _raw: &str) -> Option<String> {
+        None
+    }
+
     /// `uid://…` → the `res://` path the project's uid map names, or `None` when nothing declares
     /// that uid. Godot 4.4+ rewrites a `preload` argument to the uid form on save, so a modern
     /// project writes `preload("uid://cvc120a27s57m")` where it used to write the path, and every
@@ -341,18 +353,7 @@ impl CrossFileQuery for SyntacticQuery<'_> {
         // Relative: join against the referring file's directory and normalize `.`/`..`
         // lexically (the index keys are normalized absolute paths).
         let base = self.index.path(from)?;
-        let dir = base.parent()?;
-        let mut parts: Vec<&str> = dir.as_str().split('/').collect();
-        for seg in raw.split('/') {
-            match seg {
-                "" | "." => {}
-                ".." => {
-                    parts.pop()?;
-                }
-                s => parts.push(s),
-            }
-        }
-        let joined = camino::Utf8PathBuf::from(parts.join("/"));
+        let joined = gd_project::join_lexical(base.parent()?, raw)?;
         self.index.file_id(&joined)
     }
 

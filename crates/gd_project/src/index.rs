@@ -55,12 +55,14 @@ pub struct Index {
     file_refs: FxHashMap<FileId, FxHashSet<String>>,
     /// The inverse of `file_refs`: name → files referencing it.
     name_referencers: FxHashMap<String, FxHashSet<FileId>>,
-    /// Each file's `extends "res://…"` target, normalized to an absolute path — the path-keyed
-    /// analogue of `file_refs`. A path-`extends` references no `class_name`, so the `name_*` tables
-    /// can't re-link it; this lets a file *appearing at* that path re-link the consumers waiting on
-    /// it, even ones with no resolved edge yet. At most one per file (a class extends a single base).
-    file_path_ref: FxHashMap<FileId, Utf8PathBuf>,
-    /// The inverse of `file_path_ref`: normalized target path → files that `extends "res://…"` it.
+    /// Every absolute path a file names as a literal: its `extends "res://…"` target and every
+    /// `preload`/`load` argument. The path-keyed analogue of `file_refs`. A path literal references
+    /// no `class_name`, so the `name_*` tables can't re-link it; this lets a file *appearing at* or
+    /// *vanishing from* one of these paths re-link the consumers waiting on it, even ones with no
+    /// resolved edge yet. Recorded regardless of liveness and regardless of extension — a `preload`
+    /// of a `.tres` belongs here exactly as a preload of a `.gd` does (#555).
+    file_path_refs: FxHashMap<FileId, FxHashSet<Utf8PathBuf>>,
+    /// The inverse of `file_path_refs`: normalized target path → files naming it.
     /// Keys may name a path with no live file (a *waiting* referencer — the whole point).
     path_referencers: FxHashMap<Utf8PathBuf, FxHashSet<FileId>>,
     /// `uid://…` → the `res://` path its `.uid` sidecar names. Godot 4.4+ writes uid references by
@@ -105,7 +107,7 @@ impl Index {
             deps: DepGraph::new(),
             file_refs: FxHashMap::default(),
             name_referencers: FxHashMap::default(),
-            file_path_ref: FxHashMap::default(),
+            file_path_refs: FxHashMap::default(),
             path_referencers: FxHashMap::default(),
             uids: FxHashMap::default(),
             uids_by_res: FxHashMap::default(),
@@ -294,6 +296,17 @@ impl Index {
         }
     }
 
+    /// A non-script resource appeared at, or vanished from, `path` — re-link every file that names
+    /// it as a literal (#555). The asset analogue of [`Self::on_file_changed`]'s branch 5: a
+    /// `preload("res://theme.tres")` carries no `FileId` edge, so nothing else can reach its
+    /// consumers, and their missing-preload row would otherwise outlive the file's return.
+    ///
+    /// `pub(crate)` for the same reason as [`Self::on_file_changed`].
+    pub(crate) fn on_resource_path_changed(&mut self, path: &Utf8Path) {
+        let key = normalize(path);
+        self.relink_path_referencers(&key);
+    }
+
     /// Drop a deleted file from the index and invalidate everything that depended on it or named a
     /// `class_name` it declared.
     ///
@@ -315,7 +328,7 @@ impl Index {
             self.interfaces.remove(&fid);
             self.deps.remove(fid);
             self.set_name_refs(fid, FxHashSet::default());
-            self.set_path_ref(fid, None); // drop this file's own path-extends bookkeeping
+            self.set_path_refs(fid, FxHashSet::default()); // drop its own path-literal bookkeeping
             self.set_uid_refs(fid, FxHashSet::default()); // and its uid references
             self.dirty.remove(&fid);
         }
@@ -630,7 +643,7 @@ impl Index {
     ///   5. `file_refs` and `name_referencers` are mutual inverses on their domains.
     ///   6. Every `FileId` in `path_referencers` values is in `interfaces.keys()` (the key path
     ///      itself may be a not-yet-created target — a waiting referencer).
-    ///   7. `file_path_ref` and `path_referencers` are mutual inverses on their domains.
+    ///   7. `file_path_refs` and `path_referencers` are mutual inverses on their domains.
     ///   8. Every `FileId` in `uid_referencers` values is in `interfaces.keys()` (the key uid itself
     ///      may be unresolvable — a file referencing a `uid://` with no sidecar still waits on it).
     ///   9. `uid_refs` and `uid_referencers` are mutual inverses on their domains.
@@ -718,22 +731,27 @@ impl Index {
             }
         }
 
-        // Invariant 7: file_path_ref ↔ path_referencers are mutual inverses on their domains.
-        for (&fid, path) in &self.file_path_ref {
-            let in_inverse = self
-                .path_referencers
-                .get(path)
-                .is_some_and(|set| set.contains(&fid));
-            if !in_inverse {
-                violations.push(IndexInvariant::FilePathRefInverseMissing {
-                    fid,
-                    path: path.clone(),
-                });
+        // Invariant 7: file_path_refs ↔ path_referencers are mutual inverses on their domains.
+        for (&fid, paths) in &self.file_path_refs {
+            for path in paths {
+                let in_inverse = self
+                    .path_referencers
+                    .get(path)
+                    .is_some_and(|set| set.contains(&fid));
+                if !in_inverse {
+                    violations.push(IndexInvariant::FilePathRefInverseMissing {
+                        fid,
+                        path: path.clone(),
+                    });
+                }
             }
         }
         for (path, set) in &self.path_referencers {
             for &fid in set {
-                let in_inverse = self.file_path_ref.get(&fid).is_some_and(|p| p == path);
+                let in_inverse = self
+                    .file_path_refs
+                    .get(&fid)
+                    .is_some_and(|paths| paths.contains(path));
                 if !in_inverse {
                     violations.push(IndexInvariant::PathRefsInverseMissing {
                         fid,
@@ -831,20 +849,8 @@ impl Index {
             return None;
         }
         let dir = self.path(from)?.parent()?;
-        let mut parts: Vec<&str> = dir.as_str().split('/').collect();
-        for seg in raw.split('/') {
-            match seg {
-                "" | "." => {}
-                ".." => {
-                    parts.pop()?;
-                }
-                other => parts.push(other),
-            }
-        }
-        let fid = self
-            .ids
-            .get(&normalize(camino::Utf8Path::new(&parts.join("/"))))
-            .copied()?;
+        let joined = crate::paths::join_lexical(dir, raw)?;
+        let fid = self.ids.get(&normalize(&joined)).copied()?;
         self.interfaces.contains_key(&fid).then_some(fid)
     }
 
@@ -906,11 +912,33 @@ impl Index {
         // Dereffed first, so `path_referencers` is keyed by the real target path and a `.gd`
         // created there re-links an `extends "uid://…"` consumer through the same branch a
         // `res://` one takes.
-        let path_target = path_extends
+        // #555 widened this from the single path-`extends` target to every literal path the file
+        // names, so a `preload` target appearing or vanishing re-links its consumers too. Same
+        // liveness rule, same dereference-first rule, and `res_to_path` + `normalize` still produces
+        // the key `resolve_path` and `intern` use.
+        let mut path_targets: FxHashSet<Utf8PathBuf> = FxHashSet::default();
+        let own_dir = self
+            .path(fid)
+            .and_then(Utf8Path::parent)
+            .map(Utf8Path::to_path_buf);
+        for raw in path_extends
             .as_deref()
-            .and_then(|res| self.res_to_path(res))
-            .map(|abs| normalize(&abs));
-        self.set_path_ref(fid, path_target);
+            .into_iter()
+            .chain(preloads.iter().map(String::as_str))
+        {
+            let abs = match self.deref_uid(raw) {
+                Some(res) if res.starts_with("res://") => self.res_to_path(res),
+                // A bare relative literal joins onto the writing file's own directory.
+                Some(res) if !res.contains("://") => own_dir
+                    .as_deref()
+                    .and_then(|dir| crate::paths::join_lexical(dir, res)),
+                _ => None,
+            };
+            if let Some(abs) = abs {
+                path_targets.insert(normalize(&abs));
+            }
+        }
+        self.set_path_refs(fid, path_targets);
     }
 
     /// Replace `fid`'s recorded name references, keeping the `name → referencers` inverse consistent.
@@ -973,25 +1001,29 @@ impl Index {
         }
     }
 
-    /// Replace `fid`'s recorded path-`extends` target, keeping the `target path → referencers`
-    /// inverse consistent. `None` clears it (the file no longer path-extends, or was removed).
-    /// Mirror of [`Self::set_name_refs`] for the single-valued path edge; prunes empty inverse
-    /// sets so removed targets don't accumulate.
-    fn set_path_ref(&mut self, fid: FileId, target: Option<Utf8PathBuf>) {
-        if let Some(old) = self.file_path_ref.remove(&fid) {
-            if let Some(set) = self.path_referencers.get_mut(&old) {
-                set.remove(&fid);
-                if set.is_empty() {
-                    self.path_referencers.remove(&old);
+    /// Replace `fid`'s recorded literal path targets, keeping the `target path → referencers`
+    /// inverse consistent. An empty set clears them (the file names no path, or was removed).
+    /// Mirror of [`Self::set_name_refs`]; prunes empty inverse sets so removed targets don't
+    /// accumulate.
+    fn set_path_refs(&mut self, fid: FileId, targets: FxHashSet<Utf8PathBuf>) {
+        if let Some(old) = self.file_path_refs.remove(&fid) {
+            for path in old {
+                if let Some(set) = self.path_referencers.get_mut(&path) {
+                    set.remove(&fid);
+                    if set.is_empty() {
+                        self.path_referencers.remove(&path);
+                    }
                 }
             }
         }
-        if let Some(target) = target {
+        for target in &targets {
             self.path_referencers
                 .entry(target.clone())
                 .or_default()
                 .insert(fid);
-            self.file_path_ref.insert(fid, target);
+        }
+        if !targets.is_empty() {
+            self.file_path_refs.insert(fid, targets);
         }
     }
 
@@ -1180,9 +1212,9 @@ pub struct IndexCache {
     /// `file → set of class names it references` — the forward half of the name-reference index.
     /// `name_referencers` (the inverse) is rebuilt from this on load.
     file_refs: Vec<(FileId, Vec<String>)>,
-    /// `file → path it `extends "res://…"`to` — the forward half of the path-reference index.
+    /// `file → every literal path it names` — the forward half of the path-reference index.
     /// `path_referencers` (the inverse) is rebuilt from this on load.
-    file_path_ref: Vec<(FileId, Utf8PathBuf)>,
+    file_path_refs: Vec<(FileId, Vec<Utf8PathBuf>)>,
 }
 
 impl Index {
@@ -1209,10 +1241,14 @@ impl Index {
                     (fid, names_vec)
                 })
                 .collect(),
-            file_path_ref: self
-                .file_path_ref
+            file_path_refs: self
+                .file_path_refs
                 .iter()
-                .map(|(&fid, path)| (fid, path.clone()))
+                .map(|(&fid, paths)| {
+                    let mut v: Vec<Utf8PathBuf> = paths.iter().cloned().collect();
+                    v.sort_unstable();
+                    (fid, v)
+                })
                 .collect(),
         }
     }
@@ -1263,15 +1299,20 @@ impl Index {
             }
         }
 
-        // Rebuild `file_path_ref` map and the `path_referencers` inverse.
-        let mut file_path_ref: FxHashMap<FileId, Utf8PathBuf> = FxHashMap::default();
+        // Rebuild `file_path_refs` map and the `path_referencers` inverse.
+        let mut file_path_refs: FxHashMap<FileId, FxHashSet<Utf8PathBuf>> = FxHashMap::default();
         let mut path_referencers: FxHashMap<Utf8PathBuf, FxHashSet<FileId>> = FxHashMap::default();
-        for (fid, path) in cache.file_path_ref {
-            path_referencers
-                .entry(path.clone())
-                .or_default()
-                .insert(fid);
-            file_path_ref.insert(fid, path);
+        for (fid, paths) in cache.file_path_refs {
+            let set: FxHashSet<Utf8PathBuf> = paths.into_iter().collect();
+            for path in &set {
+                path_referencers
+                    .entry(path.clone())
+                    .or_default()
+                    .insert(fid);
+            }
+            if !set.is_empty() {
+                file_path_refs.insert(fid, set);
+            }
         }
 
         Index {
@@ -1283,7 +1324,7 @@ impl Index {
             deps: cache.deps,
             file_refs,
             name_referencers,
-            file_path_ref,
+            file_path_refs,
             path_referencers,
             // The uid map is NOT serialized: `ProjectModel::load_checked` re-walks the `*.uid`
             // sidecars on every startup, warm or cold, so caching it would duplicate state that is
@@ -1360,11 +1401,11 @@ impl Index {
             }
         }
         // File-path-ref forward data must match.
-        if self.file_path_ref.len() != other.file_path_ref.len() {
+        if self.file_path_refs.len() != other.file_path_refs.len() {
             return false;
         }
-        for (fid, path) in &self.file_path_ref {
-            if other.file_path_ref.get(fid) != Some(path) {
+        for (fid, paths) in &self.file_path_refs {
+            if other.file_path_refs.get(fid) != Some(paths) {
                 return false;
             }
         }
@@ -1404,9 +1445,9 @@ pub enum IndexInvariant {
     /// The *key* path may legitimately have no file — that's a waiting referencer — but every
     /// referencing `FileId` must be live.
     PathRefererNotIndexed { path: Utf8PathBuf, fid: FileId },
-    /// `file_path_ref[fid] = path` but `path_referencers[path]` does NOT contain `fid`.
+    /// `file_path_refs[fid]` contains `path` but `path_referencers[path]` does NOT contain `fid`.
     FilePathRefInverseMissing { fid: FileId, path: Utf8PathBuf },
-    /// `path_referencers[path]` contains `fid` whose `file_path_ref[fid]` ≠ `path`.
+    /// `path_referencers[path]` contains `fid` whose `file_path_refs[fid]` lacks `path`.
     PathRefsInverseMissing { fid: FileId, path: Utf8PathBuf },
     /// `uid_referencers[uid]` contains a `FileId` not present in `interfaces` (a stale referencer).
     UidRefererNotIndexed { uid: String, fid: FileId },
@@ -1442,6 +1483,12 @@ impl IndexMut<'_> {
     /// Drop a deleted file from the index. Forwards to [`Index::on_file_removed`].
     pub fn on_file_removed(&mut self, path: &Utf8Path) {
         self.inner.on_file_removed(path);
+    }
+
+    /// Re-link the files naming `path` as a literal after a non-script resource was created or
+    /// deleted there. Forwards to [`Index::on_resource_path_changed`].
+    pub fn on_resource_path_changed(&mut self, path: &Utf8Path) {
+        self.inner.on_resource_path_changed(path);
     }
 
     /// Replace the project's `uid:// → res://` map. Forwards to [`Index::set_uid_map`].

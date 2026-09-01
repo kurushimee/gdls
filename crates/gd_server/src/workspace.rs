@@ -590,7 +590,8 @@ impl Workspace {
                         autoloads,
                         &self.scenes,
                         &self.project.root,
-                    );
+                    )
+                    .with_project_loaded(self.project.is_loaded());
                     Rc::new(gd_analyze::analyze_with_options(
                         tree,
                         file,
@@ -745,7 +746,8 @@ impl Workspace {
             autoloads,
             &self.scenes,
             &self.project.root,
-        );
+        )
+        .with_project_loaded(self.project.is_loaded());
         gd_analyze::analyze_with_options(
             tree,
             file,
@@ -787,7 +789,8 @@ impl Workspace {
             autoloads,
             &self.scenes,
             &self.project.root,
-        );
+        )
+        .with_project_loaded(self.project.is_loaded());
         xfile.scene_node_facts(file, query)
     }
 
@@ -1080,6 +1083,17 @@ impl Workspace {
                 Err(e) => log::warn!("scene index: uid re-resolve skipped unreadable {path}: {e}"),
             }
         }
+    }
+
+    /// #555: a non-script resource appeared at, or vanished from, `path`. Re-link every script that
+    /// names it in a `preload`/`load` literal, so a missing-preload row appears the moment the file
+    /// goes and clears the moment it comes back. A `.gd` needs no call here — `on_file_changed` /
+    /// `on_file_removed` already carry it — and neither does a Modified event, since the row turns
+    /// on existence alone.
+    pub fn relink_resource_path(&mut self, path: &Utf8Path) {
+        self.index.txn(path, |idx| {
+            idx.on_resource_path_changed(path);
+        });
     }
 
     /// #127: drop a deleted asset from the [`AssetIndex`] and its stat entry (watcher Deleted).

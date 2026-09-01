@@ -451,7 +451,8 @@ fn enumerate_members(state: &ServerState, tree: &ParseTree, dt: &DataType) -> Ve
         crate::xfile::AutoloadEnv::default(),
         &state.workspace.scenes,
         &state.workspace.project.root,
-    );
+    )
+    .with_project_loaded(state.workspace.project.is_loaded());
     enumerate::members_of_type(dt, &state.workspace.native, &xfile, tree)
 }
 
@@ -884,7 +885,8 @@ fn self_chain_members(
         crate::xfile::AutoloadEnv::default(),
         &state.workspace.scenes,
         &state.workspace.project.root,
-    );
+    )
+    .with_project_loaded(state.workspace.project.is_loaded());
     enumerate::members_of_type(dt, &state.workspace.native, &xfile, tree)
 }
 
@@ -1549,7 +1551,8 @@ fn call_arg_receiver_class(
             crate::xfile::AutoloadEnv::default(),
             &state.workspace.scenes,
             &state.workspace.project.root,
-        );
+        )
+        .with_project_loaded(state.workspace.project.is_loaded());
         enumerate::script_chain_native_root(&xfile, &state.workspace.native, sr)
     })
 }
@@ -1942,7 +1945,8 @@ fn super_method_items(
         crate::xfile::AutoloadEnv::default(),
         &state.workspace.scenes,
         &state.workspace.project.root,
-    );
+    )
+    .with_project_loaded(state.workspace.project.is_loaded());
     enumerate::script_parent_members(&xfile, &state.workspace.native, &sr)
         .into_iter()
         .filter(|m| matches!(m.kind, MemberItemKind::Method))
