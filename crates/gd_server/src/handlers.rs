@@ -1543,6 +1543,17 @@ fn render_hover(
                     .file_id(&entry.path)
                     .map(|f| (f, Vec::new()));
                 Some(ident.name.clone())
+            } else if state
+                .workspace
+                .native
+                .is_extension_declared_missing(&ident.name)
+            {
+                // #536: a `.gdextension` declares this class and the loaded dump does not carry
+                // it. The analyzer refuses to call the name undeclared, so the card must not fall
+                // through to the `Variant` that refusal leaves behind — `Variant` is a real type,
+                // and naming it here reads as a claim about something the author did not write.
+                // No parent, because gdls genuinely does not know one.
+                Some(format!("<Native> class {}", ident.name))
             } else {
                 None
             }
