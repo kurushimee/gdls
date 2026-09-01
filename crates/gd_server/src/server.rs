@@ -3501,7 +3501,7 @@ fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) 
 /// yields the empty set (the `didClose` clear-path). The pull-only `resultId` is deliberately
 /// NOT computed here: the push path would discard it on every didOpen/didChange
 /// ([`result_id_for`] is the pull handler's job, exactly once per pull).
-fn diagnostic_items(state: &mut ServerState, uri: &Uri) -> Vec<Diagnostic> {
+pub(crate) fn diagnostic_items(state: &mut ServerState, uri: &Uri) -> Vec<Diagnostic> {
     // v1.0.4 (#34): stub buffers never self-diagnose — a materialized native API page need not
     // be analyzable GDScript, only readable as it. Matched against the stubs BASE root (any
     // version/hash: an old-hash stub can stay open across a mid-session dump swap). The caller
