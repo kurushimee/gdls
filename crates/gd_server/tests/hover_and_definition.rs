@@ -2475,3 +2475,231 @@ fn a_decoded_builtin_constant_hovers_as_its_type() {
 
     shutdown(&client, handle);
 }
+
+/// Shared body for the local-binding cases (#580). Declares a class member `speed` and a class
+/// const `NAME`, then shadows `speed` with a function local, so the member-versus-local priority is
+/// exercised alongside every local shape Godot admits.
+const LOCALS_SRC: &str = concat!(
+    "var speed := 1.0\n",                                  // line 0
+    "const NAME := \"x\"\n",                               // line 1
+    "\n",                                                  // line 2
+    "func go(n: int) -> void:\n",                          // line 3
+    "\tvar speed := 2.0\n",                                // line 4
+    "\tvar local := n * 2\n",                              // line 5
+    "\tfor it in [1, 2]:\n",                               // line 6
+    "\t\tprint(it, local, speed)\n",                       // line 7
+    "\tvar cb := func(p: int) -> int: return p + local\n", // line 8
+    "\tprint(cb.call(1), self.speed, NAME)\n",             // line 9
+    "\tmatch n:\n",                                        // line 10
+    "\t\tvar bound: print(bound)\n",                       // line 11
+);
+
+fn scalar_start(response: Option<GotoDefinitionResponse>, what: &str) -> Position {
+    let response = response.unwrap_or_else(|| panic!("{what} resolved to null"));
+    match response {
+        GotoDefinitionResponse::Scalar(loc) => loc.range.start,
+        other => panic!("expected scalar Location for {what}, got {other:?}"),
+    }
+}
+
+#[test]
+fn definition_jumps_to_a_local_binding_of_every_shape() {
+    // #580: a parameter, a `var` local, a `for` variable, a lambda parameter, and a `match` bind
+    // each answered null, because the walk knew locals only as shadow guards. Godot's
+    // `reduce_identifier` resolves local → parameter → class member, so each of these is the
+    // innermost declaration that owns the name at the cursor.
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/locals.gd".parse().unwrap();
+    did_open(&client, &uri, LOCALS_SRC);
+
+    // Use sites.
+    let cases = [
+        ("parameter `n`", Position::new(5, 14), Position::new(3, 8)),
+        ("local `local`", Position::new(7, 14), Position::new(5, 5)),
+        (
+            "`for` variable `it`",
+            Position::new(7, 9),
+            Position::new(6, 5),
+        ),
+        (
+            "lambda parameter `p`",
+            Position::new(8, 39),
+            Position::new(8, 16),
+        ),
+        (
+            "`match` bind `bound`",
+            Position::new(11, 19),
+            Position::new(11, 6),
+        ),
+    ];
+    for (what, at, expected) in cases {
+        assert_eq!(
+            scalar_start(definition_at(&client, &uri, at), what),
+            expected,
+            "a use of {what} must jump to its declaration"
+        );
+    }
+
+    shutdown(&client, handle);
+}
+
+#[test]
+fn definition_on_a_local_declaration_returns_that_declaration() {
+    // A caret on the declaration itself is the LSP's self-return: `references` already reports the
+    // declaration, so `definition` must agree rather than answering null.
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/localdecl.gd".parse().unwrap();
+    did_open(&client, &uri, LOCALS_SRC);
+
+    let cases = [
+        ("parameter `n`", Position::new(3, 8)),
+        ("local `local`", Position::new(5, 5)),
+        ("`for` variable `it`", Position::new(6, 5)),
+        ("`match` bind `bound`", Position::new(11, 6)),
+    ];
+    for (what, at) in cases {
+        assert_eq!(
+            scalar_start(definition_at(&client, &uri, at), what),
+            at,
+            "a caret on {what}'s declaration must return that declaration"
+        );
+    }
+
+    shutdown(&client, handle);
+}
+
+#[test]
+fn a_local_shadowing_a_class_member_jumps_to_the_local() {
+    // The more serious half of #580: this was not a null but a WRONG jump. The name-only member
+    // scan answered the local's use with the class member's declaration, contradicting Godot's
+    // local-before-member priority — and contradicting `references`, which collects the local.
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/shadow.gd".parse().unwrap();
+    did_open(&client, &uri, LOCALS_SRC);
+
+    // `speed` in `print(it, local, speed)` — the local at line 4, not the member at line 0.
+    assert_eq!(
+        scalar_start(
+            definition_at(&client, &uri, Position::new(7, 21)),
+            "shadowed `speed`"
+        ),
+        Position::new(4, 5),
+    );
+
+    shutdown(&client, handle);
+}
+
+#[test]
+fn a_local_does_not_capture_a_member_access_of_the_same_name() {
+    // The local arm must decline an attribute identifier, or `self.speed` would start answering
+    // with the function-local `speed`. Class-scope declarations keep resolving through the member
+    // scan exactly as before.
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/attr.gd".parse().unwrap();
+    did_open(&client, &uri, LOCALS_SRC);
+
+    assert_eq!(
+        scalar_start(
+            definition_at(&client, &uri, Position::new(9, 24)),
+            "`self.speed`"
+        ),
+        Position::new(0, 4),
+        "`self.speed` is the member even while a local `speed` is in scope"
+    );
+    assert_eq!(
+        scalar_start(definition_at(&client, &uri, Position::new(9, 31)), "`NAME`"),
+        Position::new(1, 6),
+        "a class const still resolves through the member scan"
+    );
+
+    shutdown(&client, handle);
+}
+
+#[test]
+fn a_lambda_body_reaches_the_local_it_captures() {
+    // The binding's own function bounds the search, not the cursor's, so a capture inside the
+    // nested lambda still reaches the enclosing function's local.
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/capture.gd".parse().unwrap();
+    did_open(&client, &uri, LOCALS_SRC);
+
+    assert_eq!(
+        scalar_start(
+            definition_at(&client, &uri, Position::new(8, 43)),
+            "captured `local`"
+        ),
+        Position::new(5, 5),
+    );
+
+    shutdown(&client, handle);
+}
+
+#[test]
+fn an_inner_block_local_shadows_the_outer_one() {
+    // Nested suites resolve innermost-first: the same name declared in an inner block owns the
+    // uses inside it, and the outer declaration owns the uses after it.
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/nested.gd".parse().unwrap();
+    let src = concat!(
+        "func go() -> void:\n", // line 0
+        "\tvar x := 1\n",       // line 1
+        "\tif true:\n",         // line 2
+        "\t\tvar x := 2\n",     // line 3
+        "\t\tprint(x)\n",       // line 4
+        "\tprint(x)\n",         // line 5
+    );
+    did_open(&client, &uri, src);
+
+    assert_eq!(
+        scalar_start(
+            definition_at(&client, &uri, Position::new(4, 8)),
+            "inner `x`"
+        ),
+        Position::new(3, 6),
+    );
+    assert_eq!(
+        scalar_start(
+            definition_at(&client, &uri, Position::new(5, 7)),
+            "outer `x`"
+        ),
+        Position::new(1, 5),
+    );
+
+    shutdown(&client, handle);
+}
+
+#[test]
+fn declaration_answers_a_local_the_same_way_definition_does() {
+    // `declaration` delegates to `definition`, so the local arm must reach it too — a client that
+    // binds go-to-declaration would otherwise still see null.
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/decl.gd".parse().unwrap();
+    did_open(&client, &uri, LOCALS_SRC);
+
+    let params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position::new(7, 14),
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+    };
+    client
+        .sender
+        .send(request(
+            12,
+            "textDocument/declaration",
+            serde_json::to_value(params).unwrap(),
+        ))
+        .unwrap();
+    let resp = recv_response(&client);
+    let response: Option<GotoDefinitionResponse> =
+        serde_json::from_value(resp.result.expect("declaration result is always present"))
+            .expect("valid Option<GotoDefinitionResponse>");
+    assert_eq!(
+        scalar_start(response, "`local` via declaration"),
+        Position::new(5, 5),
+    );
+
+    shutdown(&client, handle);
+}

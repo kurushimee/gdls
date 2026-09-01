@@ -341,7 +341,12 @@ fn declaration_returns_byte_identical_targets_to_definition() {
 
     // member-style: a class member used at line 7 → its declaration in this file (a real Location).
     // native-style: the `Node` native class name in `extends Node` at line 0 → native stub header.
-    for (line, character, what) in [(7u32, 10u32, "member use"), (0, 9, "native class name")] {
+    // local-style: a body-local used at line 6 → its `var` declaration at line 5 (#580).
+    for (line, character, what) in [
+        (7u32, 10u32, "member use"),
+        (0, 9, "native class name"),
+        (6, 8, "body-local use"),
+    ] {
         let def = definition_at(&client, &uri, Position::new(line, character));
         let decl = declaration_at(&client, &uri, Position::new(line, character));
         assert!(
@@ -354,21 +359,19 @@ fn declaration_returns_byte_identical_targets_to_definition() {
         );
     }
 
-    // local-style and the unresolved name: `definition` returns `null` for a body-local use (the
-    // in-file arm covers class members, not function-body locals) and for an unknown identifier;
-    // `declaration` must agree on `null` in both — equality holds for the null branch too.
-    for (line, character, what) in [(6u32, 8u32, "body-local use"), (8, 10, "unresolved name")] {
-        let def = definition_at(&client, &uri, Position::new(line, character));
-        let decl = declaration_at(&client, &uri, Position::new(line, character));
-        assert!(
-            def.is_none(),
-            "{what}: definition is null at {line}:{character}"
-        );
-        assert_eq!(
-            decl, def,
-            "{what}: declaration must also be null (== definition) at {line}:{character}"
-        );
-    }
+    // The unresolved name: `definition` returns `null` for an identifier nothing declares, and
+    // `declaration` must agree on `null` — the equality holds for the null branch too.
+    let (line, character) = (8u32, 10u32);
+    let def = definition_at(&client, &uri, Position::new(line, character));
+    let decl = declaration_at(&client, &uri, Position::new(line, character));
+    assert!(
+        def.is_none(),
+        "unresolved name: definition is null at {line}:{character}"
+    );
+    assert_eq!(
+        decl, def,
+        "unresolved name: declaration must also be null (== definition) at {line}:{character}"
+    );
 
     shutdown(&client, handle);
 }
