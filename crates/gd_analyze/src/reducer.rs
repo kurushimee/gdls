@@ -2898,6 +2898,26 @@ fn reduce_cast(ctx: &mut AnalysisContext, id: NodeId) {
         }
     }
 
+    // analyzer.cpp:3808-3815 — a literal operand cast to a TYPED container gets the target's
+    // element types pushed into it, which is what makes the per-element check fire
+    // (`Cannot have an element of type "X" in an array of type "Array[Y]".`). The annotated
+    // position already did this (`reduce_assignment`); the cast is the same narrowing by a
+    // different road, and without it `[1, 2] as Array[String]` passed silently (#562).
+    if let Some(operand_id) = cast.operand {
+        if let NodeKind::Array(_) = ctx.node(operand_id).kind {
+            if !cast_type.container_element_types.is_empty() {
+                let elem_t = cast_type.container_element_types[0].clone();
+                update_array_literal_element_type(ctx, operand_id, &elem_t);
+            }
+        } else if let NodeKind::Dictionary(_) = ctx.node(operand_id).kind {
+            if cast_type.container_element_types.len() >= 2 {
+                let key_t = cast_type.container_element_types[0].clone();
+                let val_t = cast_type.container_element_types[1].clone();
+                update_dictionary_literal_element_type(ctx, operand_id, &key_t, &val_t);
+            }
+        }
+    }
+
     // Validity check (analyzer.cpp:3792-3815). We skip when the cast target is itself Variant —
     // anything → Variant is always legal.
     if cast_type.is_variant() {
