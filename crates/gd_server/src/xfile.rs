@@ -88,6 +88,12 @@ pub struct WorkspaceXFileQuery<'a> {
     /// lookup. Held by value (a cheap clone of `Workspace.project.root`) so the query owns a
     /// consistent root for the duration of one analysis.
     project_root: camino::Utf8PathBuf,
+    /// #555: whether a real `project.godot` was loaded for this root. The gate on
+    /// [`Self::preload_missing_path`], the one query here that makes a NEGATIVE claim about the
+    /// project tree. Without a project there is no `res://` and the root is whatever folder the
+    /// client opened, so "nothing lives at this path" would be a guess. Defaults to `false`, so a
+    /// site that does not opt in stays silent.
+    project_loaded: bool,
 }
 
 impl<'a> WorkspaceXFileQuery<'a> {
@@ -106,7 +112,17 @@ impl<'a> WorkspaceXFileQuery<'a> {
             autoloads,
             scenes,
             project_root: gd_project::normalize_path(project_root),
+            project_loaded: false,
         }
+    }
+
+    /// Record that a real `project.godot` backs this root (#555). Set at every site that can serve
+    /// the shared analysis cache, so one cached `AnalysisResult` never depends on which surface
+    /// happened to build it.
+    #[must_use]
+    pub(crate) fn with_project_loaded(mut self, yes: bool) -> Self {
+        self.project_loaded = yes;
+        self
     }
 
     /// The on-disk path a `preload` argument names: `res://` against the project root, anything
@@ -224,6 +240,73 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
 
     fn resolve_res_path(&self, path: &str) -> Option<FileId> {
         self.inner.resolve_res_path(path)
+    }
+
+    /// #555. Every branch that cannot PROVE the absence returns `None`:
+    ///
+    /// * no loaded project — see `project_loaded`;
+    /// * a `uid://` (the uid map lags a rename, so an unresolved uid is not a missing file), a
+    ///   `user://` (outside the project tree entirely), or a `::` subresource path (real in Godot,
+    ///   and never its own file);
+    /// * a `res://` carrying `..`, which `res_to_path` rejects — falling through to the relative
+    ///   join would silently reinterpret it;
+    /// * anything that lands outside the project root;
+    /// * a path the index holds a LIVE interface for, which covers an unsaved buffer that exists
+    ///   only in memory.
+    ///
+    /// The last word is a live `stat`, not the index: the index is a snapshot and can lag a file
+    /// the user just created, while the disk cannot. The index's job here is the other half —
+    /// re-linking this file when the target appears or vanishes (`Index::on_file_changed` branch 5
+    /// and `Index::on_resource_path_changed`).
+    ///
+    /// Deliberately `exists()`, not `is_file()`: Godot reports a directory too, but a directory is
+    /// also how a half-written path reads, and an under-report is the cheaper mistake.
+    fn preload_missing_path(&self, from: Option<FileId>, raw: &str) -> Option<String> {
+        if !self.project_loaded
+            || raw.contains("::")
+            || raw.starts_with("uid://")
+            || raw.starts_with("user://")
+        {
+            return None;
+        }
+        // Resolved here rather than through `preload_asset_path`, which normalizes without
+        // collapsing `..` — `res_to_path` REJECTS a traversing `res://`, and `join_lexical`
+        // collapses a relative one or refuses when it climbs out of the tree.
+        let abs = match gd_project::res_to_path(&self.project_root, raw) {
+            Some(abs) => abs,
+            None if raw.starts_with("res://") => return None,
+            None => {
+                let base = camino::Utf8Path::new(self.inner.index.path(from?)?);
+                gd_project::join_lexical(base.parent()?, raw)?
+            }
+        };
+        let abs = gd_project::normalize_path(&abs);
+        if !abs.starts_with(&self.project_root) {
+            return None;
+        }
+        // A LIVE index entry, not merely an interned `FileId` — a path keeps its id after the file
+        // is removed. Liveness is what makes this the unsaved-buffer exemption it is meant to be.
+        if self
+            .inner
+            .index
+            .file_id(&abs)
+            .and_then(|fid| self.inner.interface(fid))
+            .is_some()
+        {
+            return None;
+        }
+        if abs.as_std_path().exists() {
+            return None;
+        }
+        // An imported asset is remapped: `ResourceLoader::exists` follows the `.import` to the
+        // baked file under `res://.godot/imported/`, so a source with a sidecar counts as present
+        // even when the source itself was never checked in. Godot then fails later, with a
+        // different message gdls does not port ("Could not preload resource file …"), so claiming
+        // absence here would be the wrong row on a real project.
+        if std::path::Path::new(&format!("{abs}.import")).exists() {
+            return None;
+        }
+        gd_project::path_to_res(&self.project_root, &abs)
     }
 
     fn resolve_path_from(&self, from: FileId, raw: &str) -> Option<FileId> {

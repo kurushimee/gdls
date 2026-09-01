@@ -142,6 +142,14 @@ impl ProjectModel {
         )
     }
 
+    /// Whether a real `project.godot` backed this load. `config_version` is the first key Godot
+    /// writes and no default supplies it, so a non-zero value means the file was found and parsed —
+    /// the positive-project signal a negative claim about the project tree has to clear (#555).
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        self.config_version > 0
+    }
+
     /// `"res://a/b.gd"` → `<root>/a/b.gd`.
     pub fn res_to_path(&self, res: &str) -> Option<Utf8PathBuf> {
         paths::res_to_path(&self.root, res)

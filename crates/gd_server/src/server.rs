@@ -2310,54 +2310,70 @@ fn apply_reaction_inner(
                 return;
             }
             match change {
-                FileChange::Created | FileChange::Modified => {
+                FileChange::Created => {
                     state.workspace.reindex_scene(&path);
                     // #523: a scene declares its own uid in its header line, so it is a uid source
                     // too — and it reaches the watcher here rather than through `Asset`.
+                    state.workspace.sync_uid_declaration(&path);
+                    state.workspace.relink_resource_path(&path);
+                }
+                FileChange::Modified => {
+                    state.workspace.reindex_scene(&path);
                     state.workspace.sync_uid_declaration(&path);
                 }
                 FileChange::Deleted => {
                     state.workspace.remove_scene(&path);
                     state.workspace.drop_uid_declaration(&path);
+                    state.workspace.relink_resource_path(&path);
                 }
                 FileChange::Renamed { from, to } => {
                     state.workspace.remove_scene(&from);
                     state.workspace.reindex_scene(&to);
                     state.workspace.drop_uid_declaration(&from);
                     state.workspace.sync_uid_declaration(&to);
+                    state.workspace.relink_resource_path(&from);
+                    state.workspace.relink_resource_path(&to);
                 }
             }
         }
         // #127: an arbitrary asset change keeps the AssetIndex live mid-session so `load`/`preload`
         // path completion offers newly-added textures/audio/`.tres`/… without a restart. Bounded to
         // the project root like Scene/GdSource. Disk-sourced (assets are never fed from editor
-        // buffers — they're not open documents). It does NOT re-diagnose any script: an asset is just
-        // a `res://` path string in the completion list, and no script's diagnostics depend on which
-        // sibling files exist — so re-publishing would be byte-identical churn (same reasoning as
-        // Scene). Only the index is mutated.
+        // buffers — they're not open documents). A Modified event only touches the index: an asset's
+        // CONTENTS change no script's diagnostics. Its EXISTENCE does, since #555 — a preload of a
+        // path with nothing at it now reports — so Created/Deleted/Renamed also re-link the scripts
+        // naming that path, and the post-batch dirty drain republishes them.
         Reaction::Asset { path, change } => {
             if !path_is_within(&path, project_root) {
                 log::warn!("watcher: dropping out-of-root asset event for {path}");
                 return;
             }
             match change {
-                FileChange::Created | FileChange::Modified => {
+                FileChange::Created => {
                     state.workspace.reindex_asset(&path);
                     // #447: a `.uid` sidecar is an asset like any other, and it is also what makes
                     // `preload("uid://…")` resolve. Re-read it so the mapping tracks the file.
                     // #523 widened that to the other two places a uid is written, a `.import` and
                     // a `.tres` header; the call itself sorts out which kind this is.
                     state.workspace.sync_uid_declaration(&path);
+                    state.workspace.relink_resource_path(&path);
+                }
+                FileChange::Modified => {
+                    state.workspace.reindex_asset(&path);
+                    state.workspace.sync_uid_declaration(&path);
                 }
                 FileChange::Deleted => {
                     state.workspace.remove_asset(&path);
                     state.workspace.drop_uid_declaration(&path);
+                    state.workspace.relink_resource_path(&path);
                 }
                 FileChange::Renamed { from, to } => {
                     state.workspace.remove_asset(&from);
                     state.workspace.reindex_asset(&to);
                     state.workspace.drop_uid_declaration(&from);
                     state.workspace.sync_uid_declaration(&to);
+                    state.workspace.relink_resource_path(&from);
+                    state.workspace.relink_resource_path(&to);
                 }
             }
         }

@@ -9841,13 +9841,14 @@ fn reduce_await(ctx: &mut AnalysisContext, id: NodeId) {
 /// Errors emitted in this slice:
 /// * **`Preloaded path must be a constant string.`** (analyzer.cpp:4702 / 4707) when the path is
 ///   not a foldable constant or the folded value isn't a String/StringName/NodePath.
+/// * **`Preload file "X" does not exist.`** (analyzer.cpp:4744-4750) when the project view can
+///   prove nothing lives at the path — see [`crate::CrossFileQuery::preload_missing_path`], which
+///   answers `None` for every view that cannot.
 ///
 /// Deferred:
-/// * **`Preload file "X" does not exist.`** / **`has no resource loaders`** (analyzer.cpp:4719-
-///   4721) — needs project-root + filesystem access; lands with the cross-file slice.
-/// * **Type-from-variant of the loaded resource** (analyzer.cpp:4751) — needs cross-file parser
-///   refs; for now we stay at Variant so `const P = preload("foo.gd")` doesn't error on use, just
-///   degrades any subsequent `P.Member` to Variant via the subscript path.
+/// * **`has no resource loaders (unrecognized file extension).`** (analyzer.cpp:4753) — the file
+///   exists but no loader claims it. The loader set is not knowable outside a running engine (a
+///   GDExtension registers its own), so gdls stays silent rather than guessing.
 fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
     let path_id = match &ctx.node(id).kind {
         NodeKind::Preload(p) => p.path,
@@ -9901,6 +9902,18 @@ fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
             Some(from) => ctx.xfile.resolve_path_from(from, &path_str),
             None => ctx.xfile.resolve_res_path(&path_str),
         };
+        // analyzer.cpp:4744-4750 — the path is relativized and simplified, then
+        // `ResourceLoader::exists` decides. gdls asks the project view instead, which answers only
+        // when it can prove the absence (`preload_missing_path`); Godot falls through after the
+        // error, so this does not return.
+        if resolved.is_none() {
+            if let Some(display) = ctx.xfile.preload_missing_path(ctx.file, &path_str) {
+                ctx.push_error(
+                    format!(r#"Preload file "{display}" does not exist."#),
+                    path_id,
+                );
+            }
+        }
         path_for_resource_typing = Some(path_str);
         if let Some(file) = resolved {
             let sref = crate::data_type::ScriptRef {
