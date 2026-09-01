@@ -2194,10 +2194,8 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
-    // 8. Global constants (PI, TAU, INF, NAN) — Godot's `GDScriptLanguage::get_global_map()`
-    //    exposes these as global constants. The dump does not carry them (its `global_constants`
-    //    array holds only the integer limits handled above), so the float set is listed here.
-    if matches!(name.as_str(), "PI" | "TAU" | "INF" | "NAN") {
+    // 8. Global constants (PI, TAU, INF, NAN) — see [`is_global_float_constant`].
+    if is_global_float_constant(&name) {
         ctx.set_type(
             id,
             DataType {
@@ -7747,7 +7745,22 @@ fn resolve_shape(
                     ShapeAnswer::Type(Box::new(script_instance_datatype(ctx, target, Vec::new())))
                 }
                 Some(target) => ShapeAnswer::Type(Box::new(script_meta_type(ctx, target))),
-                None => ShapeAnswer::Unknown,
+                // #521: not a project script — a `.tscn`, a `.gdshader`, an imported asset. The
+                // declaring file types those from the same map (`reduce_preload`), so the seam has
+                // to as well, or a member inferred from `preload("x.tscn")` reads as `PackedScene`
+                // at home and `Variant` everywhere else. Anchored on the DECLARING file, which is
+                // where the path was written. A `.new()` on one stays `Unknown`: the declaring file
+                // errors there, so the seam falls short rather than inventing an answer.
+                None if *construct => ShapeAnswer::Unknown,
+                None => match preload_nonscript_resource_type(ctx, Some(link.file), path) {
+                    // `is_constant` describes the preload EXPRESSION; what crosses is the member's
+                    // type, and the reading side stamps constness from the member's own kind.
+                    Some(dt) => ShapeAnswer::Type(Box::new(DataType {
+                        is_constant: false,
+                        ..dt
+                    })),
+                    None => ShapeAnswer::Unknown,
+                },
             }
         }
     }
@@ -7838,15 +7851,38 @@ fn resolve_value_head(
     if let Some(fid) = ctx.xfile.global_class_file(name) {
         return ShapeAnswer::Type(Box::new(script_meta_type(ctx, fid)));
     }
-    if let Some(fid) = ctx.xfile.autoload_file(name) {
-        return ShapeAnswer::Type(Box::new(script_instance_datatype(ctx, fid, Vec::new())));
+    // #521: the `@GlobalScope` names, in `reduce_identifier`'s own order (steps 7b, 7c, 8b, 8) and
+    // — like there — ABOVE the autoload fallback, so an autoload named like a global enum never
+    // shadows the language-level meaning. Without these, a member inferred from `MOUSE_BUTTON_LEFT`
+    // or `PI` read as its real type at home and `Variant` in every other file.
+    if let Some((enum_name, _)) = ctx.native.global_enum_value(name) {
+        return ShapeAnswer::Type(Box::new(crate::resolver::make_global_enum_type(
+            ctx, &enum_name, "", false,
+        )));
     }
     if ctx.native.global_enum(name).is_some() {
         return ShapeAnswer::Type(Box::new(crate::resolver::make_global_enum_type(
             ctx, name, "", true,
         )));
     }
+    if ctx.native.global_constant(name).is_some() {
+        return ShapeAnswer::Type(Box::new(hard_builtin(VariantType::Int)));
+    }
+    if is_global_float_constant(name) {
+        return ShapeAnswer::Type(Box::new(hard_builtin(VariantType::Float)));
+    }
+    if let Some(fid) = ctx.xfile.autoload_file(name) {
+        return ShapeAnswer::Type(Box::new(script_instance_datatype(ctx, fid, Vec::new())));
+    }
     ShapeAnswer::Unknown
+}
+
+/// The four `@GlobalScope` float constants. Godot exposes them through
+/// `GDScriptLanguage::get_global_map()`, and the dump does not carry them — its `global_constants`
+/// array holds only the integer limits — so the set is listed here rather than read. Shared by the
+/// in-file `reduce_identifier` and the cross-file [`resolve_value_head`] so the two cannot drift.
+fn is_global_float_constant(name: &str) -> bool {
+    matches!(name, "PI" | "TAU" | "INF" | "NAN")
 }
 
 /// One segment read off an already-resolved type.
@@ -9690,59 +9726,59 @@ fn reduce_preload(ctx: &mut AnalysisContext, id: NodeId) {
     }
 
     // Non-script resources: Godot types the preload by the loaded resource's class
-    // (analyzer.cpp:4749-4751 via type_from_variant over the Resource). A shallow extension map
-    // covers the unambiguous ones; everything else stays a soft Variant.
+    // (analyzer.cpp:4749-4751 via type_from_variant over the Resource).
     if let Some(path_str) = path_for_resource_typing {
-        let native_name = match path_str.rsplit('.').next() {
-            Some("tscn") | Some("scn") => Some("PackedScene"),
-            Some("gdshader") => Some("Shader"),
-            Some("tres") | Some("res") => Some("Resource"),
-            _ => None,
-        };
-        if let Some(n) = native_name {
-            if ctx.native.class_named(n).is_some() {
-                ctx.set_type(
-                    id,
-                    DataType {
-                        type_source: TypeSource::AnnotatedInferred,
-                        kind: DtKind::Native,
-                        builtin_type: VariantType::Object,
-                        native_type: n.to_owned(),
-                        is_constant: true,
-                        ..Default::default()
-                    },
-                );
-                return;
-            }
-        }
-
-        // #444: an imported asset types as whatever its importer produced — the `type=` line of
-        // the `<path>.import` sidecar's `[remap]` section (analyzer.cpp:4749-4751 over the loaded
-        // Resource). No guessing from the extension: a missing/unreadable sidecar degrades to
-        // Variant exactly as today, and a sidecar naming a class this dump doesn't know stays
-        // Variant too (a missed precise type is a known limitation; a wrong one is a defect).
-        if let Some(class) = ctx
-            .xfile
-            .imported_resource_class(ctx.file, &path_str)
-            .filter(|c| ctx.native.class_named(c).is_some())
-        {
-            ctx.set_type(
-                id,
-                DataType {
-                    type_source: TypeSource::AnnotatedInferred,
-                    kind: DtKind::Native,
-                    builtin_type: VariantType::Object,
-                    native_type: class,
-                    is_constant: true,
-                    ..Default::default()
-                },
-            );
+        if let Some(dt) = preload_nonscript_resource_type(ctx, ctx.file, &path_str) {
+            ctx.set_type(id, dt);
             return;
         }
     }
 
     // Path unresolved (`NoCrossFile`, unknown corpus path, non-string fold) ⇒ degrade to Variant.
     ctx.set_type(id, DataType::variant());
+}
+
+/// The type a `preload` of a NON-script resource carries, from `from`'s point of view. `None` when
+/// nothing can be said, which degrades to Variant at every call site.
+///
+/// Two sources, in order. A shallow extension map covers the unambiguous cases, and #444's `.import`
+/// sidecar covers an imported asset — the `type=` line of its `[remap]` section, which is whatever
+/// the importer produced. Neither guesses: a class the dump doesn't know stays `None`, because a
+/// missed precise type is a known limitation and a wrong one is a defect.
+///
+/// Shared by `reduce_preload` and the cross-file `InitShape::Preload` seam (#521) so a member
+/// inferred from `preload("x.tscn")` reads as `PackedScene` in every file, not just its own. `from`
+/// is the file the path was WRITTEN in, which is what anchors a relative path and the sidecar
+/// lookup — the declaring file across the seam, not the reader.
+fn preload_nonscript_resource_type(
+    ctx: &mut AnalysisContext,
+    from: Option<gd_project::FileId>,
+    path: &str,
+) -> Option<DataType> {
+    let native = |n: &str| DataType {
+        type_source: TypeSource::AnnotatedInferred,
+        kind: DtKind::Native,
+        builtin_type: VariantType::Object,
+        native_type: n.to_owned(),
+        is_constant: true,
+        ..Default::default()
+    };
+    let by_extension = match path.rsplit('.').next() {
+        Some("tscn") | Some("scn") => Some("PackedScene"),
+        Some("gdshader") => Some("Shader"),
+        Some("tres") | Some("res") => Some("Resource"),
+        _ => None,
+    };
+    if let Some(n) = by_extension {
+        if ctx.native.class_named(n).is_some() {
+            return Some(native(n));
+        }
+    }
+    let imported = ctx
+        .xfile
+        .imported_resource_class(from, path)
+        .filter(|c| ctx.native.class_named(c).is_some())?;
+    Some(native(&imported))
 }
 
 // ===================================================================================================
