@@ -391,15 +391,24 @@ fn references_on_the_base_declaration_include_the_super_call_site() {
     assert_eq!(
         from_decl,
         {
+            // #504: the whole override group, the same set
+            // `renaming_either_end_of_an_override_chain_edits_the_whole_group` below asserts —
+            // an override chain is one symbol, so the reference list and the edit set are the
+            // same list. This case used to stop at the base-bound half (the declaration, the
+            // `super.describe()` site, and the Actor-typed call), which hid `p.describe()`
+            // from a user asking who calls the method it dispatches to.
             let mut want = vec![
                 format!("{}:6:5", actor.as_str()),
+                format!("{}:6:5", player.as_str()),
                 format!("{}:7:21", player.as_str()),
+                format!("{}:4:9", game.as_str()),
                 format!("{}:5:9", game.as_str()),
             ];
             want.sort();
             want
         },
-        "the declaration, the `super.describe()` site, and the Actor-typed call in game.gd"
+        "the whole override group: both declarations, the `super.describe()` site, and both \
+         call sites in game.gd"
     );
     // The same set from the super cursor: a super site names the base, so both cursors are the
     // same symbol.
