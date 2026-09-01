@@ -149,6 +149,12 @@ var scene_preload := preload(\"res://scene.tscn\")
 var enum_const := SIDE_LEFT
 var float_const := PI
 var opaque_preload := preload(\"res://thing.xyz\")
+// #524: heads that are a native class.
+var native_enum_value := TileSet.TILE_SHAPE_SQUARE
+var native_const := Node.NOTIFICATION_READY
+var native_pseudo := TileSet.TileShape
+var native_bare := TileSet
+var native_miss := TileSet.NOT_A_THING
 
 enum Mode { IDLE, RUN }
 
@@ -494,4 +500,42 @@ fn a_member_named_like_a_global_constant_shadows_it() {
         errors.iter().any(|e| e.contains("String")),
         "the member `PI` must shadow the global, so `from_pi` is a String: {errors:?}"
     );
+}
+
+/// #524: a native class's enum VALUE crosses as that enum, so an argument typed
+/// `TileSet.TileShape` takes it without a word. As `Variant` the reader reported an unsafe
+/// argument the engine never does.
+#[test]
+fn a_native_enum_value_member_crosses_with_its_enum() {
+    let (errors, access) = diagnose("var s: TileSet.TileShape = h.native_enum_value\n\tprint(s)");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(access.is_empty(), "{access:?}");
+    // A REAL enum, so the wrong enum is refused.
+    let (errors, _) = diagnose("var m: Image.Interpolation = h.native_enum_value\n\tprint(m)");
+    assert!(!errors.is_empty(), "a TileShape is not an Interpolation");
+}
+
+/// A bare class constant has no enum membership in the dump, and Godot types it `int`.
+#[test]
+fn a_native_class_constant_member_crosses_as_int() {
+    let (errors, access) = diagnose("var n: int = h.native_const\n\tprint(n)");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(access.is_empty(), "{access:?}");
+}
+
+/// The three heads that must NOT cross: `TileSet.TileShape` used as a value, a bare `TileSet`, and
+/// a name the class does not carry. Each is an error in the DECLARING file, so the member there has
+/// no type at all, and the seam carries that no-type-ness (#468) rather than minting a claim. The
+/// reader stays silent on both counts — no error and no access claim.
+#[test]
+fn a_pseudo_type_a_bare_class_name_and_an_absent_name_carry_nothing() {
+    for stmt in [
+        "print(h.native_pseudo.nope)",
+        "print(h.native_bare.nope)",
+        "print(h.native_miss.nope)",
+    ] {
+        let (errors, access) = diagnose(stmt);
+        assert!(errors.is_empty(), "{stmt}: {errors:?}");
+        assert!(access.is_empty(), "{stmt}: {access:?}");
+    }
 }
