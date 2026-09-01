@@ -3230,12 +3230,11 @@ fn resolve_script_member_doc(
 }
 
 /// Documentation + detail for a global symbol (utility / constant). Utilities render their
-/// `(params) -> Return` signature as detail; the dump carries no per-utility description, so
-/// documentation stays `None`.
+/// `(params) -> Return` signature as detail, plus the description a with-docs dump carries.
 fn resolve_global_doc(
     state: &ServerState,
     name: &str,
-    _format: ProseFormat,
+    format: ProseFormat,
 ) -> (Option<String>, Option<Documentation>) {
     let native = &state.workspace.native;
     if let Some(util) = native.utilities().find(|u| native.name_of(u.name) == name) {
@@ -3255,7 +3254,8 @@ fn resolve_global_doc(
             params.join(", "),
             native.display_type(&util.return_type, None)
         );
-        return (Some(detail), None);
+        let doc = (!util.description.is_empty()).then(|| prose_doc(format, &util.description));
+        return (Some(detail), doc);
     }
     (None, None)
 }

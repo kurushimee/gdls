@@ -21,7 +21,7 @@ Audited in `modules/gdscript/language_server/` at `4.6.3-stable`. This is the ba
 | Capability | Godot's own LSP | gdls |
 |---|---|---|
 | `hover` | signature, doc, and a "Defined in" link, including member and method signatures (`text_document.cpp:347`, `godot_lsp.h:1284`) | full signatures for members, calls, and `preload`, plus doc prose |
-| `definition` | `Location` at the symbol; resolves `class_name` in expression position via `is_global_class` (`workspace.cpp:650`) | in-file members, cross-file classes, `class_name` in expression position, `preload`/`load` strings, autoloads, and native symbols into materialized stubs |
+| `definition` | `Location` at the symbol; resolves `class_name` in expression position via `is_global_class` (`workspace.cpp:650`) | in-file members, cross-file classes, `class_name` in expression position, `preload`/`load` strings, autoloads, and native symbols — engine classes, Variant types, and global utilities alike — into materialized stubs |
 | preload `res://` navigation | via `documentLink` on any file-resolving string literal (`extend_parser.cpp:186-215`), not `definition` | both: `documentLink` on `res://` literals, and `definition` inside the string |
 | autoload navigation | no dedicated handling | resolves the singleton name to its script |
 | `references` | project-wide textual name scan plus per-hit re-resolve (`workspace.cpp:472`) | index-backed and binding-correct, including cross-file member and signal call sites through typed vars |
@@ -190,13 +190,21 @@ A signature is spelled one way. The parameter list between the parentheses comes
 
 `@deprecated` and `@experimental` render as a banner above the prose, so a reader who stops at the first line still learns the symbol is on its way out. `@deprecated` additionally drives two non-prose signals: `CompletionItem.tags: [Deprecated]`, downgraded to the pre-3.15 `deprecated: true` boolean for a client that never advertised `completionItem.tagSupport`, and never both; and the standard `deprecated` semantic-token modifier on the declaration and on every resolved use (member reads, call sites, class names), each read from the declaring file's `Interface`. Native symbols never carry either signal, since `extension_api.json` at 4.6.3 has no deprecation field, with or without docs, so there is nothing to claim one from.
 
-### 7.3 Performance and scale
+### 7.3 Materialized API pages
+
+A native symbol's `definition` is a real `Location` in a real file, because LSP through 3.17 has no virtual-document mechanism and a custom URI scheme is ruled out (§3 W4). Pages live in the user-level cache, keyed by renderer version and the dump's content hash, and never inside a workspace root, so the project indexer cannot ingest one as a script. They are read-only by convention and never self-diagnose; a page need only read as GDScript, not parse as it.
+
+Every symbol Godot documents has a page to land on, which means one per engine class, one per Variant type, and two more for the things that belong to no class: `@GlobalScope.gd` for the Variant utilities the dump carries, and `@GDScript.gd` for the ones the language compiles in. The split mirrors Godot's own documentation. The second page is the reason `len` and `range` resolve in a project whose dump is stale, trimmed, or missing entirely — those functions live in the engine binary, not in `extension_api.json`, so their declarations are transcribed from the `REGISTER_FUNC` table rather than read from data.
+
+A declaration line on a page is produced by the same builder as the hover for the same symbol, so the two can never drift apart.
+
+### 7.4 Performance and scale
 
 Per-feature latency rows live in `bench/budget.toml` (`06-testing-fidelity.md` §7.2), with completion the critical one. The memory-pressure ladder splits requests by price: at Hard pressure, analysis-priced requests are refused with `ContentModified` while parse- and index-priced features stay served.
 
 `partialResultToken` streaming for `references` and `workspace/symbol` at 10k-file scale (sending the entire result via `$/progress` with an empty final response) is available in the spec and not currently used; adopt it only if acceptance-project latency demands it.
 
-### 7.4 Testing
+### 7.5 Testing
 
 The fidelity ratchets cover the frontend and do not touch this layer. What covers it instead: per-capability protocol-shape tests over the in-memory `Connection`, asserting both the gated and ungated projection of every response; the vendored editor-capability profiles in `crates/gd_server/tests/fixtures/client_caps/`, replayed by `tests/editor_profiles.rs`; completion-semantics spot checks against the Godot editor as a manual differential oracle, since the editor's completion is not headless; and the `.tscn` fuzz target under the same any-panic-blocks-release rule. See `06-testing-fidelity.md`.
 

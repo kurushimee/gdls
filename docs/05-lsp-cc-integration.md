@@ -93,7 +93,7 @@ Other Claude Code config fields that work here: `transport` (`"stdio"` is the de
 | `formatter.command` / `formatter.args` | string / string[] | The external formatter executable and its argument vector. No shell is involved, so neither value can be interpreted as a shell expression. `documentFormattingProvider` is advertised only when `command` is set. |
 | `memory.cacheCapacity` / `softCapMb` / `hardCapMb` | number | Parse and analysis cache size, and the memory-pressure ladder thresholds (`06-testing-fidelity.md` §7.3). |
 | `analyzer.iterLimit` / `checkpointDelayUs` | number | The per-file fixpoint iteration cap and the cancellation-checkpoint interval. |
-| `stubCacheDir` | string | Override the root under which native-class API stubs, the `definition` targets for native symbols, are materialized. Default: the user-level gdls cache (`%LOCALAPPDATA%\gdls` or `~/.cache/gdls`), deliberately outside any workspace root. Normally left unset. |
+| `stubCacheDir` | string | Override the root under which the API pages are materialized — one per engine class and Variant type, plus `@GlobalScope.gd` and `@GDScript.gd`, which together are the `definition` targets for every native symbol. Default: the user-level gdls cache (`%LOCALAPPDATA%\gdls` or `~/.cache/gdls`), deliberately outside any workspace root. Normally left unset. |
 
 Malformed options fall back to documented defaults with a `window/showMessage(Warning)`; `initialize` never fails on them.
 

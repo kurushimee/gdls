@@ -352,3 +352,45 @@ fn the_signature_table_and_the_return_table_answer_for_the_same_names() {
         );
     }
 }
+
+#[test]
+fn the_display_table_answers_for_the_same_names_as_the_analyzer_tables() {
+    // #584 added a fourth table off the same registration, `gd_types::GDSCRIPT_UTILITY_FUNCTIONS`,
+    // which renders the `@GDScript.gd` stub page and the hover for a bare call. It lives in
+    // `gd_types` (below `gd_analyze`), so this is the only crate that can see both halves and
+    // catch a name in one and not the other.
+    let display: Vec<&str> = gd_types::GDSCRIPT_UTILITY_FUNCTIONS
+        .iter()
+        .map(|u| u.name)
+        .collect();
+    assert_eq!(
+        display,
+        [
+            "convert",
+            "type_exists",
+            "char",
+            "ord",
+            "range",
+            "load",
+            "inst_to_dict",
+            "dict_to_inst",
+            "Color8",
+            "print_debug",
+            "print_stack",
+            "get_stack",
+            "len",
+            "is_instance_of",
+        ],
+        "the display table must hold the REGISTER_FUNC set, in registration order"
+    );
+    for name in &display {
+        assert!(
+            gd_analyze::is_gdscript_utility(name),
+            "{name} renders but the analyzer does not resolve it"
+        );
+        assert!(
+            !gd_types::is_variant_utility(name),
+            "{name} is GDScript-only; a Variant utility of the same name would render twice"
+        );
+    }
+}
