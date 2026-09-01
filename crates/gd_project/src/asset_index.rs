@@ -97,9 +97,15 @@ impl AssetIndex {
 
     /// Record an asset at `res_path` (a `res://…` non-script/non-scene file). The key is normalized
     /// via [`scene::normalize_res`] so a `\`-spelled path and a `/`-spelled one collapse, matching the
-    /// scene index's key discipline.
+    /// scene index's key discipline. An engine sidecar ([`is_engine_sidecar`]) is dropped here rather
+    /// than at each call site, so the cold walk, the incremental file event, and a stale cache all
+    /// agree on what an asset is.
     pub fn insert(&mut self, res_path: impl Into<String>) {
-        self.assets.insert(scene::normalize_res(&res_path.into()));
+        let res = scene::normalize_res(&res_path.into());
+        if is_engine_sidecar(&res) {
+            return;
+        }
+        self.assets.insert(res);
     }
 
     /// Drop the asset at `res_path` (a deleted file).
@@ -107,7 +113,8 @@ impl AssetIndex {
         self.assets.remove(&scene::normalize_res(res_path));
     }
 
-    /// Whether `res_path` is indexed as an asset.
+    /// Whether `res_path` is indexed as an asset. An engine sidecar is never indexed, so this is
+    /// always `false` for one.
     #[must_use]
     pub fn contains(&self, res_path: &str) -> bool {
         self.assets.contains(&scene::normalize_res(res_path))
@@ -153,6 +160,24 @@ impl AssetIndex {
     }
 }
 
+/// Whether `path` is one of the two bookkeeping sidecars the engine writes beside a real file:
+/// `<file>.uid` (the resource UID) and `<file>.import` (the import settings). Neither is a loadable
+/// resource, and Godot keeps both out of the file system it completes resource paths from — a file
+/// enters `EditorFileSystemDirectory` only when its extension is a recognized resource extension
+/// (`_process_file_system`, `editor/file_system/editor_file_system.cpp`), and the uid scan skips the
+/// pair by name (`if (ext == "uid" || ext == "import") { continue; }`, same file). The comparison is
+/// case-insensitive because the engine lowercases the extension before its own check.
+///
+/// Deliberately just these two. gdls has no importer registry to reproduce the full recognized-
+/// extension set, and a project's own `.json` / `.txt` / `.csv` are legitimately preloadable, so a
+/// wider whitelist would hide real files.
+#[must_use]
+pub fn is_engine_sidecar(path: &str) -> bool {
+    Utf8Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("uid") || e.eq_ignore_ascii_case("import"))
+}
+
 /// Resolve a `res://` asset path to its absolute filesystem path under `root` (no existence check),
 /// mirroring [`crate::paths::res_to_path`]. Kept beside the asset index for call-site clarity.
 #[must_use]
@@ -163,6 +188,41 @@ pub fn res_to_path(root: &Utf8Path, res: &str) -> Option<Utf8PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_sidecars_are_never_assets() {
+        let mut idx = AssetIndex::new();
+        // The two the engine writes beside a real file. Neither is loadable.
+        idx.insert("res://src/player.gd.uid");
+        idx.insert("res://art/icon.png.import");
+        // Case-insensitive: the engine lowercases the extension before its own check.
+        idx.insert("res://art/icon.png.IMPORT");
+        idx.insert("res://src/player.gd.UID");
+        assert!(idx.is_empty(), "a sidecar must not enter the asset index");
+        assert!(!idx.contains("res://src/player.gd.uid"));
+
+        // The real files beside them still do, including a bare name that merely CONTAINS the word.
+        idx.insert("res://art/icon.png");
+        idx.insert("res://data/uid");
+        idx.insert("res://data/import.json");
+        idx.insert("res://data/uid.txt");
+        assert_eq!(idx.len(), 4);
+    }
+
+    /// A cache written before the sidecar filter existed still carries them; reconstructing must
+    /// drop them rather than resurrect them, so an upgrade doesn't need a cache bump.
+    #[test]
+    fn from_cache_drops_sidecars_a_stale_snapshot_carries() {
+        let idx = AssetIndex::from_cache(AssetIndexCache {
+            assets: vec![
+                "res://art/icon.png".to_owned(),
+                "res://art/icon.png.import".to_owned(),
+                "res://src/player.gd.uid".to_owned(),
+            ],
+        });
+        assert_eq!(idx.len(), 1);
+        assert!(idx.contains("res://art/icon.png"));
+    }
 
     #[test]
     fn insert_remove_contains() {

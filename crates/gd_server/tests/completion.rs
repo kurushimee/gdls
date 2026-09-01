@@ -3311,3 +3311,40 @@ fn static_override_skips_an_already_declared_static_init() {
 
     shutdown(&client, server_thread);
 }
+
+/// #515: the engine's two bookkeeping sidecars are not resources, and Godot never sees them — a file
+/// enters `EditorFileSystemDirectory` only if its extension is a recognized resource extension. They
+/// were reaching the list because `AssetIndex` took every non-`.gd`/`.tscn` file under the root, so
+/// `preload("res://src/")` offered `src/hero.gd.uid` right beside `src/hero.gd`.
+#[test]
+fn resource_path_omits_engine_sidecars() {
+    let p = p4_project(); // indexes src/hero.gd
+    p.write("src/hero.gd.uid", "uid://abc123\n");
+    p.write("src/icon.png", "PNG-PLACEHOLDER\n");
+    p.write("src/icon.png.import", "[remap]\n\nimporter=\"texture\"\n");
+    let uri = file_uri(&p.root.join("src/def.gd"));
+
+    let src = "extends Node2D\n\nfunc f() -> void:\n\tvar c = preload(\"res://src/\")\n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+    // `res://src/` occupies columns 18..28, cursor at column 28.
+    let raw = complete_raw(&client, 515, &uri, Position::new(3, 28));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let ls = labels(&list);
+
+    assert!(
+        !ls.iter()
+            .any(|l| l.ends_with(".uid") || l.ends_with(".import")),
+        "a sidecar must never be offered as a resource path; got {ls:?}"
+    );
+    // The real files beside them are untouched — this is a filter, not a narrowing of the listing.
+    assert!(
+        ls.iter().any(|l| l == "src/hero.gd"),
+        "the script must still be offered; got {ls:?}"
+    );
+    assert!(
+        ls.iter().any(|l| l == "src/icon.png"),
+        "the imported asset must still be offered; got {ls:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
