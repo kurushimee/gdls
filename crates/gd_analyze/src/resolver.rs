@@ -1958,7 +1958,12 @@ fn resolve_class_member(
             ctx.current_resolving_member = prev_resolving;
             ctx.static_context = prev_static;
             warn_confusable_identifier(ctx, id);
-            warn_class_member_shadows_global(ctx, id, "variable");
+            // analyzer.cpp:2237 — `is_shadowing(identifier, "variable", p_is_local)`, run for a
+            // MEMBER too. `false` skips the current-class stop (a member does not shadow its own
+            // class) and leaves the global and native ones, which is how a member named after a
+            // `Node` method reports. Godot's wording still says "The local variable"; the template
+            // is shared with the local arm and upstream does not vary it.
+            is_shadowing(ctx, id, "variable", false);
         }
         Member::Constant(id) => {
             let name = decl_identifier_name(ctx, id);
@@ -1984,6 +1989,8 @@ fn resolve_class_member(
                     );
                 }
             }
+            // analyzer.cpp:2251 — the constant twin of the member-variable call above.
+            is_shadowing(ctx, id, "constant", false);
             // analyzer.cpp:1115-1119 — apply the constant's annotations after resolving it.
             resolve_node_annotations(ctx, id);
             // Const-only typed-array element narrowing: when the init is a homogeneous-typed
@@ -2294,12 +2301,8 @@ pub(crate) fn resolve_function_signature(ctx: &mut AnalysisContext, func_id: Nod
     for param in &params {
         resolve_parameter(ctx, *param);
         // analyzer.cpp:1787 — `is_shadowing(identifier, "function parameter", true)` per
-        // parameter. The full Godot helper (analyzer.cpp:6135) also checks global identifiers,
-        // base classes, and native ancestors; we currently port only the current-class branch
-        // (the corpus's lambda-parameter-shadows-class-member case at
-        // `warnings/lambda_shadowing_arg.gd`). The other branches stay deferred — once they
-        // land we'll lift the broader `warnings/shadowning.gd` case alongside.
-        warn_parameter_shadowing(ctx, *param);
+        // parameter.
+        is_shadowing(ctx, *param, "function parameter", true);
     }
 
     // Rest parameter resolution + Godot-specific type validation
@@ -2311,6 +2314,8 @@ pub(crate) fn resolve_function_signature(ctx: &mut AnalysisContext, func_id: Nod
     };
     if let Some(rp) = rest_param {
         resolve_parameter(ctx, rp);
+        // analyzer.cpp:1826 — the rest parameter takes the same check every named one does.
+        is_shadowing(ctx, rp, "function parameter", true);
         // analyzer.cpp:1801-1820 — the Array validation applies only when a type IS specified;
         // an untyped rest parameter is an *inferred* `Array` plus an UNTYPED_DECLARATION
         // warning, never an error (validating the unspecified shape false-positived
@@ -3004,71 +3009,6 @@ fn member_decl_ident_span(
         _ => None,
     }?;
     Some(ctx.node(id).span)
-}
-
-/// Slice of Godot's `is_shadowing(identifier, "function parameter", true)` (analyzer.cpp:6135-6188).
-/// Looks up `param_id`'s name in the current class's `members_indices`; if found, emits
-/// SHADOWED_VARIABLE with [context, name, member-kind, declaring-line]. Godot's broader walk
-/// over global identifiers / base classes / native ancestors stays deferred until the
-/// `warnings/shadowning.gd` slice.
-fn warn_parameter_shadowing(ctx: &mut AnalysisContext, param_id: NodeId) {
-    let Some(class_id) = ctx.current_class else {
-        return;
-    };
-    let name = decl_identifier_name(ctx, param_id);
-    if name.is_empty() {
-        return;
-    }
-    // Anchor the diagnostic at the parameter's identifier when present, otherwise the parameter
-    // itself — matches Godot's `parser->push_warning(p_identifier, …)` line fidelity.
-    let identifier_id = match &ctx.node(param_id).kind {
-        NodeKind::Parameter(p) => p.identifier.unwrap_or(param_id),
-        _ => param_id,
-    };
-    let member_idx = match &ctx.node(class_id).kind {
-        NodeKind::Class(c) => c.members_indices.get(&name).copied(),
-        _ => None,
-    };
-    let Some(idx) = member_idx else {
-        return;
-    };
-    let Some(member) = nth_member(ctx, class_id, idx) else {
-        return;
-    };
-    // analyzer.cpp:6170 — `base_class->has_member(name).get_type_name()` returns the
-    // ClassNode::Member::get_type_name() lowercase noun matching Godot's
-    // Member::Kind→string mapping in gdscript_parser.h:602-625.
-    let member_kind = member_kind_name(member.clone()).to_owned();
-    let member_node = match member {
-        Member::Class(id)
-        | Member::Constant(id)
-        | Member::Function(id)
-        | Member::Signal(id)
-        | Member::Variable(id)
-        | Member::Enum(id) => id,
-        Member::EnumValue(_) | Member::Group(_) => return,
-    };
-    let member_line = ctx.node(member_node).loc.start.line.to_string();
-    let related = member_decl_ident_span(ctx, member_node)
-        .map(|span| {
-            vec![crate::diagnostic::RelatedInfo {
-                file: None,
-                span,
-                message: PREVIOUS_DECL_LABEL.to_owned(),
-            }]
-        })
-        .unwrap_or_default();
-    ctx.push_warning_with_related(
-        crate::warnings::WarningCode::ShadowedVariable,
-        &[
-            "function parameter".to_owned(),
-            name,
-            member_kind,
-            member_line,
-        ],
-        identifier_id,
-        related,
-    );
 }
 
 /// `analyzer.cpp:2079-2085` — CONFUSABLE_LOCAL_DECLARATION. When declaring a variable or
@@ -6138,7 +6078,7 @@ fn resolve_variable_local(ctx: &mut AnalysisContext, var_id: NodeId) {
     // UNUSED_VARIABLE (analyzer.cpp:2214-2218): `usages == 0` and not `_`-prefixed, anchored
     // at the declaration. Queued after resolve_assignable's own warnings, as upstream.
     warn_unused_local(ctx, var_id, crate::warnings::WarningCode::UnusedVariable);
-    warn_local_shadowing(ctx, var_id, "variable");
+    is_shadowing(ctx, var_id, "variable", true);
     warn_confusable_identifier(ctx, var_id);
 }
 
@@ -6244,29 +6184,6 @@ fn warn_unused_pattern_bind(ctx: &mut AnalysisContext, bind_id: NodeId) {
     );
 }
 
-/// SHADOWED_GLOBAL_IDENTIFIER for class-level variables (mirrors `warn_local_shadowing`'s
-/// global-identifier branch but anchored on class members instead of locals). Class members
-/// don't shadow same-class members (they ARE members), so only the global-collision check
-/// applies here.
-fn warn_class_member_shadows_global(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) {
-    let name = decl_identifier_name(ctx, node_id);
-    if name.is_empty() {
-        return;
-    }
-    if let Some(global_desc) = shadowed_global_identifier_description(ctx, &name) {
-        let ident_id = match &ctx.node(node_id).kind {
-            NodeKind::Variable(v) => v.identifier.unwrap_or(node_id),
-            NodeKind::Constant(c) => c.identifier.unwrap_or(node_id),
-            _ => node_id,
-        };
-        ctx.push_warning(
-            crate::warnings::WarningCode::ShadowedGlobalIdentifier,
-            &[kind.to_owned(), name, global_desc],
-            ident_id,
-        );
-    }
-}
-
 /// `TextServer::spoof_check` (`text_server_adv.cpp:7903-7928`) — ICU `uspoof_check` with the
 /// allowed set `uspoof_getRecommendedSet() ∪ uspoof_getInclusionSet()` and restriction level
 /// `USPOOF_MODERATELY_RESTRICTIVE`. `true` means the name is a spoofing risk.
@@ -6347,7 +6264,7 @@ fn resolve_constant_local(ctx: &mut AnalysisContext, const_id: NodeId) {
             );
         }
     }
-    warn_local_shadowing(ctx, const_id, "constant");
+    is_shadowing(ctx, const_id, "constant", true);
 }
 
 /// What a bare-identifier call can do inside a constant expression.
@@ -6717,7 +6634,23 @@ fn shadowed_global_identifier_description(ctx: &AnalysisContext, name: &str) -> 
     None
 }
 
-fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) {
+/// `GDScriptAnalyzer::is_shadowing` (analyzer.cpp:6124-6197), byte-identical at 4.6.3 and 4.7.2.
+///
+/// One walk, three stops, first hit wins: the global identifiers (a builtin function, a builtin
+/// type, a native class, a project `class_name`), then — only inside a local scope — the current
+/// class and every script base above it, then the native ancestry. The stop that fires decides both
+/// the warning code and how many symbols the message takes, which is why this cannot be split: skip
+/// a middle stop and a name declared on a script base gets blamed on `Node` instead, with the wrong
+/// wording and no line number.
+///
+/// `context` is Godot's noun for the thing being declared ("function parameter", "variable",
+/// "constant", `"for" iterator variable`, "pattern bind"). `in_local_scope` is Godot's
+/// `p_in_local_scope`: false for a class member, which shadows nothing in its own class because it
+/// IS the class.
+///
+/// `node_id` is the declaration; the warning anchors on its identifier, as upstream's
+/// `IdentifierNode *p_identifier` does.
+fn is_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str, in_local_scope: bool) {
     let name = decl_identifier_name(ctx, node_id);
     if name.is_empty() {
         return;
@@ -6725,6 +6658,7 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
     let ident_id = match &ctx.node(node_id).kind {
         NodeKind::Variable(v) => v.identifier.unwrap_or(node_id),
         NodeKind::Constant(c) => c.identifier.unwrap_or(node_id),
+        NodeKind::Parameter(p) => p.identifier.unwrap_or(node_id),
         _ => node_id,
     };
 
@@ -6746,42 +6680,14 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
     let Some(class_id) = ctx.current_class else {
         return;
     };
-    let member_idx = match &ctx.node(class_id).kind {
-        NodeKind::Class(c) => c.members_indices.get(&name).copied(),
-        _ => None,
-    };
-    if let Some(idx) = member_idx {
-        if let Some(member) = nth_member(ctx, class_id, idx) {
-            let member_kind = member_kind_name(member.clone()).to_owned();
-            let member_node = match member {
-                Member::Class(id)
-                | Member::Constant(id)
-                | Member::Function(id)
-                | Member::Signal(id)
-                | Member::Variable(id)
-                | Member::Enum(id) => Some(id),
-                Member::EnumValue(_) | Member::Group(_) => None,
-            };
-            if let Some(member_node) = member_node {
-                let member_line = ctx.node(member_node).loc.start.line.to_string();
-                let related = member_decl_ident_span(ctx, member_node)
-                    .map(|span| {
-                        vec![crate::diagnostic::RelatedInfo {
-                            file: None,
-                            span,
-                            message: PREVIOUS_DECL_LABEL.to_owned(),
-                        }]
-                    })
-                    .unwrap_or_default();
-                ctx.push_warning_with_related(
-                    crate::warnings::WarningCode::ShadowedVariable,
-                    &[kind.to_owned(), name, member_kind, member_line],
-                    ident_id,
-                    related,
-                );
-                return;
-            }
-        }
+
+    // analyzer.cpp:6154-6177 — the current class and the in-file base chain, LOCAL SCOPE ONLY.
+    // A class member is not shadowing its own class's members; it is one of them.
+    if in_local_scope && current_class_shadow(ctx, class_id, &name, kind, ident_id) {
+        return;
+    }
+    if in_local_scope && in_file_base_shadow(ctx, class_id, &name, kind, ident_id) {
+        return;
     }
 
     // analyzer.cpp:6135-6188 — SHADOWED_VARIABLE_BASE_CLASS. Walk the base class chain
@@ -6791,7 +6697,7 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
     // interface, and emit the 5-symbol template
     // `... already-declared X at line N in the base class "Y".`.
     let base = ctx.bases.get(&class_id).cloned().unwrap_or_default();
-    if base.kind == DtKind::Script {
+    if in_local_scope && base.kind == DtKind::Script {
         if let Some(sr) = base.script_type.as_ref() {
             let chain = crate::script_chain::resolve_script_chain(ctx, sr);
             for link in &chain.links {
@@ -6807,7 +6713,14 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
                         MK::Signal => "signal",
                         MK::Enum => "enum",
                     };
-                    let base_name = iface.class_name.as_deref().unwrap_or("").to_owned();
+                    // Godot falls back to the base's `fqcn` when it declares no `class_name`
+                    // (analyzer.cpp:6167-6170), which for a head class is its own script path.
+                    // An empty string here named nothing at all.
+                    let base_name = iface
+                        .class_name
+                        .clone()
+                        .or_else(|| ctx.xfile.file_path(link.file).map(str::to_owned))
+                        .unwrap_or_default();
                     let member_line = member.line.to_string();
                     // The structured twin of `at line N in the base class "Y"`: the member's
                     // recorded name token in the declaring base file (zero-width only in
@@ -6839,17 +6752,51 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
         }
     }
 
+    // analyzer.cpp:6179-6200 — the native ancestry, one class at a time (upstream passes
+    // `p_no_inheritance = true` to each `ClassDB::has_*` and lets this loop do the walking), in
+    // ClassDB's own probe order. The order is load-bearing: a name that is both a method and a
+    // property on the same class must read as "method", so a generic member lookup — which probes
+    // properties first — cannot stand in for this.
+    //
+    // No `ApiProvenance::Exact` gate. This is a POSITIVE claim — the base class HAS this member —
+    // and a dump that is merely generic still only reports members that genuinely exist. A member
+    // a thin dump lacks simply goes unwarned.
     if let Some(native) = nearest_native_ancestor(ctx, class_id) {
         let mut cur = ctx.native.class_named(&native);
         while let Some(c) = cur {
-            if c.methods.iter().any(|m| ctx.native.name_of(m.name) == name) {
-                // No related location: the shadowed declaration is a native method — its only
+            let hit = if c.methods.iter().any(|m| ctx.native.name_of(m.name) == name) {
+                Some("method")
+            } else if c.signals.iter().any(|g| ctx.native.name_of(g.name) == name) {
+                Some("signal")
+            } else if c
+                .properties
+                .iter()
+                .any(|p| ctx.native.name_of(p.name) == name)
+            {
+                Some("property")
+            } else if c.constants.iter().any(|k| ctx.native.name_of(k.name) == name)
+                // ClassDB registers every enum's values as integer constants too, so an enum VALUE
+                // reads as "constant" here, not "enum".
+                || c.enums.iter().any(|e| {
+                    e.values
+                        .iter()
+                        .any(|v| ctx.native.name_of(v.name) == name)
+                })
+            {
+                Some("constant")
+            } else if c.enums.iter().any(|e| ctx.native.name_of(e.name) == name) {
+                Some("enum")
+            } else {
+                None
+            };
+            if let Some(member_kind) = hit {
+                // No related location: the shadowed declaration is a native member — its only
                 // honest anchor would be a server-side API stub, which the analyzer cannot
                 // materialize.
                 let defining = ctx.native.name_of(c.name).to_owned();
                 ctx.push_warning(
                     crate::warnings::WarningCode::ShadowedVariableBaseClass,
-                    &[kind.to_owned(), name, "method".to_owned(), defining],
+                    &[kind.to_owned(), name, member_kind.to_owned(), defining],
                     ident_id,
                 );
                 return;
@@ -6861,6 +6808,115 @@ fn warn_local_shadowing(ctx: &mut AnalysisContext, node_id: NodeId, kind: &str) 
                 .and_then(|n| ctx.native.class_named(&n));
         }
     }
+}
+
+/// `is_shadowing`'s current-class stop (analyzer.cpp:6157-6161): a member of the class the
+/// declaration sits in. Returns whether it fired.
+fn current_class_shadow(
+    ctx: &mut AnalysisContext,
+    class_id: NodeId,
+    name: &str,
+    kind: &str,
+    ident_id: NodeId,
+) -> bool {
+    let Some(idx) = (match &ctx.node(class_id).kind {
+        NodeKind::Class(c) => c.members_indices.get(name).copied(),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let Some(member) = nth_member(ctx, class_id, idx) else {
+        return false;
+    };
+    let member_kind = member_kind_name(member.clone()).to_owned();
+    let Some(member_node) = member_node_id(&member) else {
+        return false;
+    };
+    let member_line = ctx.node(member_node).loc.start.line.to_string();
+    let related = member_decl_ident_span(ctx, member_node)
+        .map(|span| {
+            vec![crate::diagnostic::RelatedInfo {
+                file: None,
+                span,
+                message: PREVIOUS_DECL_LABEL.to_owned(),
+            }]
+        })
+        .unwrap_or_default();
+    ctx.push_warning_with_related(
+        crate::warnings::WarningCode::ShadowedVariable,
+        &[kind.to_owned(), name.to_owned(), member_kind, member_line],
+        ident_id,
+        related,
+    );
+    true
+}
+
+/// `is_shadowing`'s in-file base stop (analyzer.cpp:6162-6176): the `class Inner extends Outer`
+/// chain, which lives entirely in this tree. The cross-file chain is the next stop after it.
+/// Returns whether it fired.
+fn in_file_base_shadow(
+    ctx: &mut AnalysisContext,
+    class_id: NodeId,
+    name: &str,
+    kind: &str,
+    ident_id: NodeId,
+) -> bool {
+    let mut cur = ctx
+        .bases
+        .get(&class_id)
+        .cloned()
+        .unwrap_or_default()
+        .class_node;
+    // A cyclic `extends` is reported elsewhere; bound the walk so this can never spin on one.
+    let mut guard = 0;
+    while let Some(base_id) = cur {
+        guard += 1;
+        if guard > 64 {
+            return false;
+        }
+        let member_idx = match &ctx.node(base_id).kind {
+            NodeKind::Class(c) => c.members_indices.get(name).copied(),
+            _ => None,
+        };
+        if let Some(idx) = member_idx {
+            if let Some(member) = nth_member(ctx, base_id, idx) {
+                let member_kind = member_kind_name(member.clone()).to_owned();
+                if let Some(member_node) = member_node_id(&member) {
+                    let member_line = ctx.node(member_node).loc.start.line.to_string();
+                    let base_name = class_fqcn(ctx, base_id);
+                    let related = member_decl_ident_span(ctx, member_node)
+                        .map(|span| {
+                            vec![crate::diagnostic::RelatedInfo {
+                                file: None,
+                                span,
+                                message: PREVIOUS_DECL_LABEL.to_owned(),
+                            }]
+                        })
+                        .unwrap_or_default();
+                    ctx.push_warning_with_related(
+                        crate::warnings::WarningCode::ShadowedVariableBaseClass,
+                        &[
+                            kind.to_owned(),
+                            name.to_owned(),
+                            member_kind,
+                            member_line,
+                            base_name,
+                        ],
+                        ident_id,
+                        related,
+                    );
+                    return true;
+                }
+            }
+        }
+        cur = ctx
+            .bases
+            .get(&base_id)
+            .cloned()
+            .unwrap_or_default()
+            .class_node;
+    }
+    false
 }
 
 /// `resolve_if` (analyzer.cpp:2246): reduce the condition, resolve both blocks.
@@ -7123,6 +7179,11 @@ fn resolve_for(ctx: &mut AnalysisContext, for_id: NodeId) {
     // analyzer.cpp:2370 — default `p_is_root=true`.
     if let Some(b) = loop_body {
         resolve_suite(ctx, b, true);
+    }
+
+    // analyzer.cpp:2386-2390 — AFTER the body, so the order matches upstream's emit order.
+    if let Some(v) = variable {
+        is_shadowing(ctx, v, r#""for" iterator variable"#, true);
     }
 }
 
@@ -7503,7 +7564,7 @@ fn resolve_match_pattern(
                 ctx.set_type(b, bind_type);
                 // analyzer.cpp:2492-2496 — shadow first, then unused, so the two land in that
                 // order on a bind that is both.
-                warn_local_shadowing(ctx, b, "pattern bind");
+                is_shadowing(ctx, b, "pattern bind", true);
                 warn_unused_pattern_bind(ctx, b);
             }
         }
