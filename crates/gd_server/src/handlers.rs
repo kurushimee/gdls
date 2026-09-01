@@ -840,9 +840,30 @@ pub fn definition(
         };
     }
 
-    // (1) In-file member.
     let doc = state.vfs.get(uri.as_str())?;
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
+
+    // (0.9) #580: a function-local binding — parameter, lambda parameter, `var`/`const` local,
+    // `for` variable, `match` pattern bind. Godot's `reduce_identifier` priority chain is local →
+    // parameter → class member → native → `class_name` → builtin (analyzer.cpp:4363), so this MUST
+    // precede step (1)'s member scan: a local shadowing a same-named class member resolves LOCAL.
+    // Without the arm every local answered `null`, and a shadowing local answered with the MEMBER's
+    // declaration — a wrong jump, not just a missing one.
+    //
+    // Anchored on the same `resolve_local_binding` that `references`, `documentHighlight`, and the
+    // rename firewall use, rather than a second scope walk, so `definition` inherits their
+    // binding-correct scoping by construction — innermost-first shadowing, declaration-click
+    // self-return, the declaration-completes-before-use rule, and declining attribute idents
+    // (`obj.x`) and Lua-style dictionary keys, which stay with steps (0.5)/(1.5).
+    if let Some((decl_ident, _)) = resolve_local_binding(&parsed.tree, byte, &name) {
+        let range = mapper.span_to_range(parsed.tree.get(decl_ident).span);
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: uri.clone(),
+            range,
+        }));
+    }
+
+    // (1) In-file member.
     if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
         return Some(GotoDefinitionResponse::Scalar(loc));
     }
