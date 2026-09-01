@@ -236,18 +236,7 @@ pub(crate) fn spawn_background_dump(
     let spawned = std::thread::Builder::new()
         .name("gdls-api-dump".to_owned())
         .spawn(move || {
-            let outcome = match run_dump(&binary, &root) {
-                Ok(()) => match try_adopt_dump(&root, &project, &binary) {
-                    Ok(db) => DumpOutcome::Adopted {
-                        classes: db.class_count(),
-                        version: version_label(&db).to_owned(),
-                    },
-                    Err(()) => DumpOutcome::Failed(
-                        "dump produced but not adoptable (unparseable — quarantined)".to_owned(),
-                    ),
-                },
-                Err(e) => DumpOutcome::Failed(e),
-            };
+            let outcome = run_dump_ladder(&binary, &root, &project);
             // A send error means the event loop dropped the receiver (session over) — fine.
             let _ = tx.send(outcome);
         });
@@ -421,6 +410,360 @@ fn gdextension_stats(root: &Utf8Path, project: &ProjectModel) -> Vec<FileStat> {
     stats
 }
 
+/// Windows-only Godot loader detail: before loading a GDExtension library, the engine copies it
+/// to a sibling with a `~`-prefixed name and loads the COPY, so the original stays replaceable
+/// while running. The copy name is fixed, so while one Godot process has an extension loaded,
+/// a second one (our dump child) cannot create/replace the same `~` path — its load of that
+/// extension fails, and the dump silently comes out without the extension's classes.
+///
+/// This walks each extension's addon directory for `~` loader copies and probes writability:
+/// a copy a running editor still has mapped fails a write-mode open. Those are exactly the
+/// extensions a dump taken right now will miss, which is worth naming BEFORE the silent miss.
+///
+/// `~RF*.TMP` siblings are Windows restart-manager leftovers from earlier failed replaces, not
+/// live load copies — skipped without probing (there can be hundreds). Unix makes no `~` copies
+/// and the loader there locks the original instead; the probe is a Windows-shaped no-op via the
+/// always-false `is_locked`, so callers run unchanged on every platform.
+fn locked_extension_copies(
+    root: &Utf8Path,
+    extensions: &[gd_project::gdextension::GdExtension],
+) -> Vec<Utf8PathBuf> {
+    #[cfg(windows)]
+    {
+        collect_locked_extension_copies(root, extensions, probe_write_locked)
+    }
+    #[cfg(not(windows))]
+    {
+        collect_locked_extension_copies(root, extensions, |_| false)
+    }
+}
+
+/// The platform-independent core: enumerate candidate `~` loader copies and keep the ones the
+/// injected probe reports as locked. Split from the platform probe for tests.
+fn collect_locked_extension_copies(
+    root: &Utf8Path,
+    extensions: &[gd_project::gdextension::GdExtension],
+    is_locked: impl Fn(&Utf8Path) -> bool,
+) -> Vec<Utf8PathBuf> {
+    let mut locked = Vec::new();
+    for ext in extensions {
+        let addon_dir = if ext.addon_dir.is_absolute() {
+            ext.addon_dir.clone()
+        } else {
+            root.join(&ext.addon_dir)
+        };
+        if !addon_dir.as_std_path().is_dir() {
+            continue;
+        }
+        // Loader copies sit next to the library they were made from — a couple of directory
+        // levels down (e.g. `bin/`, `libs/`, `bin/windows/`) — never deeper.
+        for entry in walkdir::WalkDir::new(addon_dir.as_std_path())
+            .max_depth(3)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str() else {
+                continue;
+            };
+            if !name.starts_with('~') || name.contains("~RF") {
+                continue;
+            }
+            let Ok(path) = Utf8PathBuf::from_path_buf(entry.into_path()) else {
+                continue;
+            };
+            if is_locked(&path) {
+                locked.push(path);
+            }
+        }
+    }
+    locked.sort();
+    locked
+}
+
+/// Write-mode open as the lock probe. A dll another Godot process has mapped was opened without
+/// share-write, so a write access fails with a sharing violation; a copy nobody holds opens and
+/// closes harmlessly. A NotFound race means the copy vanished — not a lock.
+#[cfg(windows)]
+fn probe_write_locked(path: &Utf8Path) -> bool {
+    use std::fs::OpenOptions;
+    match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.as_std_path())
+    {
+        Ok(_) => false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// GDExtensions whose hinted classes are ALL absent from an adopted dump: their load failed in
+/// the dump process, so the dump is partial for them. Empty means the dump captured every
+/// declared extension (or the project declares none with class hints).
+fn failing_extensions(
+    db: &NativeDb,
+    extensions: &[gd_project::gdextension::GdExtension],
+) -> Vec<String> {
+    let mut failed = Vec::new();
+    for ext in extensions {
+        if ext.class_hints.is_empty() {
+            continue;
+        }
+        if !ext.class_hints.iter().any(|h| db.class_named(h).is_some()) {
+            failed.push(ext.config.to_string());
+        }
+    }
+    failed
+}
+
+/// The staged shadow tree for a locked-dump retry. Lives under `.gdls/` so nothing the dump
+/// touches ever appears in the user's tree; a fixed path means a crashed run's leftovers are
+/// simply replaced at the next staging.
+fn shadow_root(root: &Utf8Path) -> Utf8PathBuf {
+    root.join(".gdls").join("dump_shadow")
+}
+
+/// Stage a minimal project that reaches the SAME GDExtensions without touching any file a
+/// running editor holds. The trick is where Godot's Windows loader puts its `~`-prefixed load
+/// copy: a string sibling of the library path. The staged addon directories are REAL
+/// directories (hardlinks to the original files where the filesystem allows, byte copies
+/// otherwise), so the dump child's `~` copies land inside the shadow — fresh lock real estate —
+/// instead of colliding with the editor's. Hardlinks make staging free for multi-MB SDK dlls;
+/// the byte-copy fallback covers exFAT/network volumes where links are unavailable.
+///
+/// `project.godot` is minimal but carries the REAL `config/features` line verbatim: a
+/// `.gdextension`'s library table keys on feature tags, and a shadow claiming the wrong feature
+/// set loads the wrong (or no) library build. `.godot/extension_list.cfg` is GENERATED from the
+/// hint-bearing extensions only: the real list's hint-less addons (native SDKs, renderer
+/// helpers) can crash headless dump mode before it writes, and without class hints they have
+/// nothing to contribute to the dump anyway.
+fn stage_shadow_dump(root: &Utf8Path, project: &ProjectModel) -> Result<Utf8PathBuf, String> {
+    let shadow = shadow_root(root);
+    let _ = std::fs::remove_dir_all(shadow.as_std_path());
+    std::fs::create_dir_all(shadow.join(".godot").as_std_path())
+        .map_err(|e| format!("mkdir shadow/.godot: {e}"))?;
+
+    let real = std::fs::read_to_string(root.join("project.godot").as_std_path())
+        .map_err(|e| format!("read project.godot: {e}"))?;
+    let features = real.lines().find_map(|line| {
+        let t = line.trim();
+        t.starts_with("config/features=").then(|| t.to_owned())
+    });
+    let mut pg =
+        String::from("config_version=5\n\n[application]\n\nconfig/name=\"gdls dump shadow\"\n");
+    if let Some(f) = features {
+        pg.push_str(&f);
+        pg.push('\n');
+    }
+    std::fs::write(shadow.join("project.godot").as_std_path(), pg)
+        .map_err(|e| format!("write shadow project.godot: {e}"))?;
+
+    // extension_list.cfg: GENERATED, listing only the hint-bearing extensions. The real list
+    // would also load hint-less addons, and those are exactly the ones a dump neither needs nor
+    // tolerates — native-SDK addons (Steam, EOS) and renderer helpers can crash headless dump
+    // mode before it writes anything, and without class hints they have nothing to contribute.
+    let hinting: Vec<&gd_project::gdextension::GdExtension> = project
+        .gdextensions
+        .iter()
+        .filter(|e| !e.class_hints.is_empty())
+        .collect();
+    let mut cfg_text = String::new();
+    for ext in &hinting {
+        if let Some(res) = gd_project::paths::path_to_res(root, &ext.config) {
+            cfg_text.push_str(&res);
+            cfg_text.push('\n');
+        }
+    }
+    std::fs::write(
+        shadow
+            .join(".godot")
+            .join("extension_list.cfg")
+            .as_std_path(),
+        cfg_text,
+    )
+    .map_err(|e| format!("write shadow extension_list.cfg: {e}"))?;
+
+    // One mirror per distinct hint-bearing addon directory — two extensions can share one.
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    for ext in &hinting {
+        let addon = if ext.addon_dir.is_absolute() {
+            ext.addon_dir.clone()
+        } else {
+            root.join(&ext.addon_dir)
+        };
+        let Ok(canon) = std::fs::canonicalize(addon.as_std_path()) else {
+            continue; // addon dir gone since enumeration — its extension can't load anyway
+        };
+        if seen.contains(&canon) {
+            continue;
+        }
+        seen.push(canon);
+        mirror_addon_dir(root, &addon, &shadow)?;
+    }
+    Ok(shadow)
+}
+
+/// Mirror one addon directory tree into the shadow: hardlink every regular file, byte-copy when
+/// linking fails. Restart-manager litter (`~…~RF*.TMP`) and VCS metadata are skipped; other
+/// loader copies (`~`-prefixed) are skipped too, but every mirrored dynamic library gets a FRESH
+/// `~` twin next to it: on Windows the engine loads the `~` copy when one exists, and CRASHES
+/// (0xC0000005, observed on 4.7.2 headless dump runs) when it has to create the copy itself
+/// inside the shadow. Pre-creating it is what makes the staged dump load the extension at all.
+fn mirror_addon_dir(
+    root: &Utf8Path,
+    real_dir: &Utf8Path,
+    shadow_base: &Utf8Path,
+) -> Result<(), String> {
+    for entry in walkdir::WalkDir::new(real_dir.as_std_path())
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(src) = Utf8PathBuf::from_path_buf(entry.path().to_path_buf()) else {
+            continue;
+        };
+        let name = src.file_name().unwrap_or_default();
+        if name.starts_with('~') || name.starts_with(".git") {
+            continue;
+        }
+        let Ok(rel) = src.strip_prefix(root) else {
+            continue; // not under the project root — nothing sane to mirror it to
+        };
+        let dst = shadow_base.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent.as_std_path())
+                .map_err(|e| format!("mkdir {}: {e}", dst.parent().unwrap_or(&dst)))?;
+        }
+        if std::fs::hard_link(src.as_std_path(), dst.as_std_path()).is_err() {
+            std::fs::copy(src.as_std_path(), dst.as_std_path())
+                .map_err(|e| format!("stage {src}: {e}"))?;
+        }
+        if is_dynamic_library(name) {
+            let twin = dst.with_file_name(format!("~{name}"));
+            if !twin.as_std_path().exists()
+                && std::fs::hard_link(dst.as_std_path(), twin.as_std_path()).is_err()
+            {
+                let _ = std::fs::copy(dst.as_std_path(), twin.as_std_path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The library extensions a GDExtension's platform table can resolve to on this machine. The
+/// loader's `~`-copy treatment applies to these, so only these get pre-created twins.
+fn is_dynamic_library(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".dll") || lower.ends_with(".so") || lower.ends_with(".dylib")
+}
+
+/// The dump ladder. Rung 1: the direct dump — unchanged behavior whenever no loader copy is
+/// locked and the result captures every declared extension. Rung 2: the staged shadow dump,
+/// taken whenever the direct path was (or would be) partial. Rung 3: fall back to whatever the
+/// direct run produced anyway — a stock-surface dump with precise per-extension notices still
+/// beats no dump, and the stale meta makes the next start retry the ladder.
+fn run_dump_ladder(binary: &Utf8Path, root: &Utf8Path, project: &ProjectModel) -> DumpOutcome {
+    let locked = locked_extension_copies(root, &project.gdextensions);
+    if !locked.is_empty() {
+        log::warn!(
+            "native API: {} Godot loader cop{} under the addon directories {} locked by another \
+             Godot process (an open editor has the project's extensions mapped): {} — a direct \
+             dump would miss those extensions",
+            locked.len(),
+            if locked.len() == 1 { "y" } else { "ies" },
+            if locked.len() == 1 { "is" } else { "are" },
+            list_up_to(&locked, 3),
+        );
+    }
+
+    let adopt = |produced: &Utf8Path, locked: &[Utf8PathBuf]| {
+        try_adopt_dump(produced, root, project, binary, locked)
+    };
+
+    // Rung 1 — direct.
+    let mut best: Option<NativeDb> = None;
+    if run_dump(binary, root).is_ok() {
+        match adopt(&root.join("extension_api.json"), &locked) {
+            Ok(db) => {
+                if failing_extensions(&db, &project.gdextensions).is_empty() {
+                    return adopted_outcome(&db);
+                }
+                best = Some(db); // partial — keep it as the fallback while trying the shadow
+            }
+            Err(()) => {}
+        }
+    }
+
+    // Rung 2 — staged shadow (booting one is only worth it when some extension carries class
+    // hints — a hint-less project has nothing to capture from a shadow). Even an unlocked
+    // direct dump lands here when its result is partial (e.g. a never-imported project: the
+    // shadow generates the extension list the real project lacks).
+    let shadow_worthwhile = project
+        .gdextensions
+        .iter()
+        .any(|e| !e.class_hints.is_empty());
+    if shadow_worthwhile {
+        match stage_shadow_dump(root, project) {
+            Ok(shadow) => {
+                let produced = shadow.join("extension_api.json");
+                let run = run_dump(binary, &shadow);
+                let shadow_adopt = if run.is_ok() && produced.as_std_path().exists() {
+                    adopt(&produced, &locked)
+                } else {
+                    match &run {
+                        Err(e) => log::warn!("native API: shadow dump failed: {e}"),
+                        Ok(()) => log::warn!("native API: shadow dump produced no artifact"),
+                    }
+                    Err(())
+                };
+                let _ = std::fs::remove_dir_all(shadow.as_std_path());
+                match shadow_adopt {
+                    Ok(db) => {
+                        if failing_extensions(&db, &project.gdextensions).is_empty() {
+                            return adopted_outcome(&db);
+                        }
+                        best = best.or(Some(db));
+                    }
+                    Err(()) => {
+                        log::warn!("native API: shadow dump not adoptable (quarantined)")
+                    }
+                }
+            }
+            Err(e) => log::warn!("native API: shadow staging failed: {e}"),
+        }
+    }
+
+    // Rung 3 — the best dump we have, partial or not (notices name the gaps).
+    if let Some(db) = best {
+        return adopted_outcome(&db);
+    }
+    DumpOutcome::Failed("no adoptable dump (direct and shadow both failed)".to_owned())
+}
+
+fn adopted_outcome(db: &NativeDb) -> DumpOutcome {
+    DumpOutcome::Adopted {
+        classes: db.class_count(),
+        version: version_label(db).to_owned(),
+    }
+}
+
+/// Bounded path list for log lines.
+fn list_up_to(paths: &[Utf8PathBuf], max: usize) -> String {
+    let shown: Vec<&str> = paths.iter().take(max).map(|p| p.as_str()).collect();
+    let mut s = shown.join(", ");
+    if paths.len() > max {
+        s.push_str(&format!(", and {} more", paths.len() - max));
+    }
+    s
+}
+
 /// Spawn the dump. The child's cwd is the project root and `--path` names it explicitly; the
 /// output lands at `<root>/extension_api.json` (Godot's fixed behavior). Guarded: a pre-existing
 /// user file at that path means NO dump (never clobber — resolution step 3 will use it).
@@ -585,14 +928,18 @@ fn drain_tail<R: std::io::Read>(pipe: Option<R>) -> String {
     String::from_utf8_lossy(&tail).into_owned()
 }
 
-/// Move the fresh root dump into `.gdls/`, parse it, write the meta, run the GDExtension
-/// post-check. Any failure quarantines/cleans and reports `Err` so resolution falls through.
+/// Move the fresh dump into `.gdls/`, parse it, write the meta, and name any extension whose
+/// classes the dump missed. `produced` is the dump artifact wherever the ladder staged it (the
+/// project root for the direct run, the shadow for a staged one); `root` is always the REAL
+/// project (meta keys and notices reference it). Any failure quarantines/cleans and reports
+/// `Err` so the ladder falls through.
 fn try_adopt_dump(
+    produced: &Utf8Path,
     root: &Utf8Path,
     project: &ProjectModel,
     binary: &Utf8Path,
+    locked: &[Utf8PathBuf],
 ) -> Result<NativeDb, ()> {
-    let produced = root.join("extension_api.json");
     let managed = dump_path(root);
     if let Err(e) = std::fs::create_dir_all(managed.parent().expect("managed path has parent")) {
         log::warn!("native API: mkdir .gdls failed: {e}");
@@ -636,21 +983,30 @@ fn try_adopt_dump(
         }
     }
 
-    // `.godot/extension_list.cfg` caveat: a never-imported project loads no extensions, so the
-    // dump silently misses their classes. Detect the symptom and name the remediation.
-    if !project.gdextensions.is_empty() {
-        let any_hint_resolves = project
-            .gdextensions
-            .iter()
-            .flat_map(|e| e.class_hints.iter())
-            .any(|h| db.class_named(h).is_some());
-        if !any_hint_resolves {
-            log::info!(
-                "native API: the project declares GDExtensions but none of their classes are in \
-                 the dump — open the project once in the Godot editor (this generates \
-                 .godot/extension_list.cfg) and restart gdls to capture them"
-            );
+    // Per-extension post-check: an extension whose hinted classes are ALL absent from the dump
+    // had its load fail in the dump process — name it, and name the likely cause so the fix is
+    // a decision, not a hunt.
+    for ext in &project.gdextensions {
+        if ext.class_hints.is_empty() {
+            continue;
         }
+        if ext.class_hints.iter().any(|h| db.class_named(h).is_some()) {
+            continue;
+        }
+        let cause = if locked.is_empty() {
+            "the project may never have been imported — open it once in the Godot editor (this \
+             generates .godot/extension_list.cfg) and restart gdls to capture them"
+        } else {
+            "Godot loader copies under the addon directories were locked by another Godot \
+             process at dump time — close it and delete .gdls/extension_api.json to re-dump \
+             with the extension's classes"
+        };
+        log::warn!(
+            "native API: GDExtension {}: none of its {} hinted class(es) made it into the dump \
+             — {cause}",
+            ext.config,
+            ext.class_hints.len()
+        );
     }
 
     Ok(db)
@@ -884,6 +1240,212 @@ mod tests {
                 "{class}::{method} must resolve on the seeded embedded DB"
             );
         }
+    }
+
+    /// Two-extension fixture: real `project.godot` with a features line, a real
+    /// `extension_list.cfg`, and two addon dirs carrying libraries, a loader copy, restart-
+    /// manager litter, and VCS metadata.
+    fn ext_fixture() -> (tempfile::TempDir, Utf8PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf8 tempdir");
+        std::fs::write(
+            root.join("project.godot").as_std_path(),
+            "config_version=5\n\n[application]\n\nconfig/name=\"T\"\nconfig/features=PackedStringArray(\"4.7\", \"Forward Plus\")\n",
+        )
+        .expect("project.godot");
+        std::fs::create_dir_all(root.join(".godot").as_std_path()).expect(".godot");
+        std::fs::write(
+            root.join(".godot").join("extension_list.cfg").as_std_path(),
+            "res://addons/foo/foo.gdextension\nres://addons/bar/bar.gdextension\n",
+        )
+        .expect("extension_list.cfg");
+        std::fs::create_dir_all(root.join("addons/foo/bin").as_std_path()).expect("foo/bin");
+        std::fs::write(
+            root.join("addons/foo/foo.gdextension").as_std_path(),
+            "[configuration]\nentry_symbol=\"foo_lib_init\"\n\n[icons]\nFoo=\"res://addons/foo/icon.svg\"\n",
+        )
+        .expect("foo.gdextension");
+        std::fs::write(root.join("addons/foo/bin/lib.dll").as_std_path(), b"lib").expect("lib");
+        std::fs::write(root.join("addons/foo/bin/~lib.dll").as_std_path(), b"copy").expect("~copy");
+        std::fs::write(
+            root.join("addons/foo/bin/~lib.dll~RF1.TMP").as_std_path(),
+            b"litter",
+        )
+        .expect("rf litter");
+        std::fs::write(root.join("addons/foo/.gitignore").as_std_path(), b"*\n")
+            .expect(".gitignore");
+        std::fs::create_dir_all(root.join("addons/bar/win64").as_std_path()).expect("bar/win64");
+        std::fs::write(
+            root.join("addons/bar/bar.gdextension").as_std_path(),
+            "[configuration]\nentry_symbol=\"bar_lib_init\"\n\n[icons]\nBar=\"res://addons/bar/icon.svg\"\n",
+        )
+        .expect("bar.gdextension");
+        std::fs::write(root.join("addons/bar/win64/lib.dll").as_std_path(), b"lib").expect("lib");
+        (dir, root)
+    }
+
+    /// A live loader copy a running editor still holds mapped is reported; restart-manager
+    /// litter (never a live copy) is skipped without probing.
+    #[test]
+    fn locked_probe_skips_rf_litter_and_reports_real_copies() {
+        let (_dir, root) = ext_fixture();
+        let exts = ext_fixture_extensions(&root);
+        let locked = collect_locked_extension_copies(&root, &exts, |p| {
+            p.file_name().is_some_and(|n| n == "~lib.dll")
+        });
+        assert_eq!(locked, vec![root.join("addons/foo/bin/~lib.dll")]);
+    }
+
+    /// The shadow mirrors every addon dir (hardlink or copy — indistinguishable to a reader),
+    /// The shadow mirrors every hint-bearing addon dir (hardlink or copy — indistinguishable to
+    /// a reader), carries the real features line verbatim, generates the extension list from the
+    /// hints, and never stages loader copies or VCS metadata.
+    #[test]
+    fn shadow_staging_mirrors_addons_and_carries_the_real_config() {
+        let (_dir, root) = ext_fixture();
+        let project = ProjectModel::load(&root);
+        let shadow = stage_shadow_dump(&root, &project).expect("staging succeeds");
+        let pg = std::fs::read_to_string(shadow.join("project.godot").as_std_path())
+            .expect("shadow project.godot");
+        assert!(
+            pg.contains("config/features=PackedStringArray(\"4.7\", \"Forward Plus\")"),
+            "the features line must be copied verbatim: {pg}"
+        );
+        let cfg = std::fs::read_to_string(
+            shadow
+                .join(".godot")
+                .join("extension_list.cfg")
+                .as_std_path(),
+        )
+        .expect("shadow extension_list.cfg");
+        assert!(
+            cfg.contains("res://addons/foo/foo.gdextension")
+                && cfg.contains("res://addons/bar/bar.gdextension"),
+            "generated list covers every hint-bearing extension: {cfg}"
+        );
+        assert!(shadow.join("addons/foo/bin/lib.dll").as_std_path().exists());
+        assert!(
+            shadow
+                .join("addons/foo/bin/~lib.dll")
+                .as_std_path()
+                .exists(),
+            "a fresh loader-copy twin must be pre-created for every mirrored library"
+        );
+        assert!(shadow
+            .join("addons/bar/win64/lib.dll")
+            .as_std_path()
+            .exists());
+        assert_eq!(
+            std::fs::read(shadow.join("addons/foo/bin/lib.dll").as_std_path()).expect("read"),
+            b"lib",
+            "staged content parity (hardlink or copy)"
+        );
+        assert!(
+            shadow
+                .join("addons/foo/bin/~lib.dll")
+                .as_std_path()
+                .exists(),
+            "a fresh loader-copy twin must be pre-created for every mirrored library"
+        );
+        assert!(
+            !shadow
+                .join("addons/foo/bin/~lib.dll~RF1.TMP")
+                .as_std_path()
+                .exists(),
+            "restart-manager litter must never be staged"
+        );
+        assert!(
+            !shadow.join("addons/foo/.gitignore").as_std_path().exists(),
+            "VCS metadata must never be staged"
+        );
+    }
+
+    /// A hint-less extension (no `[icons]` — e.g. a native-SDK addon) is excluded from the
+    /// shadow entirely: not listed in the extension list, not mirrored. Loading it buys the
+    /// dump nothing and native-SDK addons are the ones that crash dump mode.
+    #[test]
+    fn shadow_staging_skips_hintless_extensions_entirely() {
+        let (_dir, root) = ext_fixture();
+        std::fs::write(
+            root.join("addons/bar/bar.gdextension").as_std_path(),
+            "[configuration]\nentry_symbol=\"bar_lib_init\"\n",
+        )
+        .expect("strip bar icons");
+        let project = ProjectModel::load(&root);
+        let shadow = stage_shadow_dump(&root, &project).expect("staging succeeds");
+        let cfg = std::fs::read_to_string(
+            shadow
+                .join(".godot")
+                .join("extension_list.cfg")
+                .as_std_path(),
+        )
+        .expect("generated cfg");
+        assert!(
+            cfg.contains("res://addons/foo/foo.gdextension"),
+            "the hint-bearing extension stays: {cfg}"
+        );
+        assert!(
+            !cfg.contains("bar.gdextension"),
+            "the hint-less extension must not be listed: {cfg}"
+        );
+        assert!(
+            !shadow.join("addons/bar").as_std_path().exists(),
+            "the hint-less addon must not be mirrored"
+        );
+    }
+
+    /// The validator names an extension only when EVERY hint is absent: a fully-absent extension
+    /// means its load failed; a partially-covered one is per-name territory (#480), not a dump
+    /// failure; no hints means nothing to check.
+    #[test]
+    fn failing_extensions_names_only_the_fully_absent_ones() {
+        let db = NativeDb::from_json(
+            r#"{"header":{"version_major":4,"version_minor":6,"version_patch":3,"version_full_name":"Godot Engine v4.6.3.fake"},"classes":[{"name":"Foo"}]}"#,
+        )
+        .expect("mini db");
+        let exts = vec![
+            gd_project::gdextension::GdExtension {
+                config: Utf8PathBuf::from("res://a/a.gdextension"),
+                addon_dir: Utf8PathBuf::from("res://addons/a"),
+                class_hints: vec!["Foo".to_owned()],
+            },
+            gd_project::gdextension::GdExtension {
+                config: Utf8PathBuf::from("res://b/b.gdextension"),
+                addon_dir: Utf8PathBuf::from("res://addons/b"),
+                class_hints: vec!["Ghost".to_owned()],
+            },
+            gd_project::gdextension::GdExtension {
+                config: Utf8PathBuf::from("res://c/c.gdextension"),
+                addon_dir: Utf8PathBuf::from("res://addons/c"),
+                class_hints: vec!["Foo".to_owned(), "Ghost".to_owned()],
+            },
+            gd_project::gdextension::GdExtension {
+                config: Utf8PathBuf::from("res://d/d.gdextension"),
+                addon_dir: Utf8PathBuf::from("res://addons/d"),
+                class_hints: vec![],
+            },
+        ];
+        assert_eq!(
+            failing_extensions(&db, &exts),
+            vec!["res://b/b.gdextension".to_owned()],
+            "only the fully-absent extension is a dump failure"
+        );
+    }
+
+    /// Helper: the two extensions the fixture's project.godot/extension_list.cfg describe.
+    fn ext_fixture_extensions(root: &Utf8Path) -> Vec<gd_project::gdextension::GdExtension> {
+        vec![
+            gd_project::gdextension::GdExtension {
+                config: Utf8PathBuf::from("res://addons/foo/foo.gdextension"),
+                addon_dir: root.join("addons/foo"),
+                class_hints: vec!["Foo".to_owned()],
+            },
+            gd_project::gdextension::GdExtension {
+                config: Utf8PathBuf::from("res://addons/bar/bar.gdextension"),
+                addon_dir: root.join("addons/bar"),
+                class_hints: vec!["Bar".to_owned()],
+            },
+        ]
     }
 
     /// `run_dump` behavior against fake "godot" binaries (issue #25). Shell-script fixtures, so
