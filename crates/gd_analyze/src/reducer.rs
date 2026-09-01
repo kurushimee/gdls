@@ -5064,15 +5064,6 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         if let Some(class_id) = base_type.class_node {
             match lookup_class_function_or_member(ctx, class_id, &function_name) {
                 ClassCallLookup::Function(fn_id, declaring_class) => {
-                    // analyzer.cpp:3614-3618 — super-call on abstract/virtual function.
-                    if call.is_super && ctx.abstract_nodes.contains(&fn_id) {
-                        ctx.push_error(
-                            format!(
-                                r#"Cannot call the parent class' abstract function "{function_name}()" because it hasn't been defined."#
-                            ),
-                            id,
-                        );
-                    }
                     in_file_function_id = Some(fn_id);
                     in_file_class_id = Some(declaring_class);
                     sig = function_signature(ctx, fn_id);
@@ -5328,14 +5319,21 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // mirrors it for a NATIVE-resolved sig: `lookup_native_method` carries the dump's `is_virtual`
         // (= `METHOD_FLAG_VIRTUAL`). This subsumes the old `_init`-only not-found arm — every native
         // virtual (`_init`, `_notification`, `_enter_tree`, …) errors the same way when super-called.
-        // In-file abstract/virtual super-calls are handled at their resolution site (the `Class` arm
-        // emits the abstract-function variant); this arm is the NATIVE counterpart. Abstract
-        // (`VIRTUAL_REQUIRED`) native methods don't exist in the dump model, so only the virtual
-        // message applies.
+        // #559 made this the ONE site, as it is upstream: the virtual arm reads a native sig's
+        // dump flag, and the abstract arm reads `@abstract` off the parse tree in-file or off
+        // `MemberFlags::is_abstract` across a file boundary. Godot tests them in this order, and a
+        // GDScript `@abstract func` carries only `VIRTUAL_REQUIRED`, so the two never collide.
         if call.is_super && sig.is_virtual {
             ctx.push_error(
                 format!(
                     r#"Cannot call the parent class' virtual function "{function_name}()" because it hasn't been defined."#
+                ),
+                id,
+            );
+        } else if call.is_super && sig.is_abstract {
+            ctx.push_error(
+                format!(
+                    r#"Cannot call the parent class' abstract function "{function_name}()" because it hasn't been defined."#
                 ),
                 id,
             );
@@ -6051,6 +6049,14 @@ pub(crate) struct CallSig {
     /// `Cannot call the parent class' virtual function "<v>()" because it hasn't been defined.`.
     /// Only `lookup_native_method` sets it; in-file/script sigs leave it `false`.
     pub(crate) is_virtual: bool,
+    /// Whether the resolved GDSCRIPT method is declared `@abstract` (Godot's
+    /// `METHOD_FLAG_VIRTUAL_REQUIRED`). The other half of the same super-call check
+    /// (analyzer.cpp:3637-3644): a `super.<a>()` reaching a parent's abstract declaration has no
+    /// body to run, and emits `Cannot call the parent class' abstract function "<a>()" because it
+    /// hasn't been defined.`. Set from the parse tree in-file and from
+    /// [`gd_project::MemberFlags::is_abstract`] across a file boundary (#559); native methods
+    /// leave it `false`, since the dump has no abstract flag.
+    pub(crate) is_abstract: bool,
     /// Whether `(min_params, max_params)` reflect the method's REAL parameter list and may drive
     /// the arity check (analyzer.cpp:5944). `false` for a native method seeded by
     /// `seed_dump_omitted_methods` — those carry an empty `params` purely so the name-existence
@@ -6370,6 +6376,9 @@ fn function_signature(ctx: &AnalysisContext, fn_id: NodeId) -> CallSig {
         sig.is_vararg = f.rest_parameter.is_some();
         sig.is_static = f.is_static;
         sig.is_coroutine = f.is_coroutine;
+        // #559: the parser records `@abstract` out of band (`AnalysisContext::abstract_nodes`),
+        // so read it from there rather than from a `FunctionNode` field.
+        sig.is_abstract = ctx.abstract_nodes.contains(&fn_id);
         // In-file declared parameters are authoritative — arity-checkable.
         sig.arity_known = true;
         let defaults = f
@@ -6643,6 +6652,7 @@ fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> 
         is_coroutine: false,
         // Builtin (Variant) methods are never virtual and have no super-call path.
         is_virtual: false,
+        is_abstract: false,
         // Builtin methods are always real dump entries (never seeded); `arity_known` rides the
         // ingest flag for symmetry with the native path.
         arity_known: m.arity_known,
@@ -6690,6 +6700,8 @@ pub(crate) fn lookup_native_method(
                 // GDScript functions can be coroutines.
                 is_coroutine: false,
                 is_virtual: m.is_virtual,
+                // The dump has no abstract flag; a native method is never `@abstract`.
+                is_abstract: false,
                 // `false` for a `seed_dump_omitted_methods` stub (empty `params` is a name-only
                 // placeholder, not the real arity) — keeps the arity check off dump-omitted
                 // virtuals ClassDB resolves with real parameters.
@@ -7608,6 +7620,9 @@ fn script_chain_call(
             // A cross-file GDScript method is not a native virtual; the super-virtual check is the
             // NATIVE-resolution counterpart only.
             is_virtual: false,
+            // #559: what makes `super.step()` reach the same answer across a file boundary that it
+            // already reached inside one.
+            is_abstract: member.flags.is_abstract,
             // Resolved through the cross-file interface — `required_params`/`par_n` are the real
             // declared arity, so the call is arity-checkable.
             arity_known: true,
