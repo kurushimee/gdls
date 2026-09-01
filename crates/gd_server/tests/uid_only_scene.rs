@@ -92,7 +92,7 @@ fn a_sidecar_appearing_re_resolves_the_scene() {
     );
 
     p.write("src/hero.gd.uid", "uid://c484hero\n");
-    ws.sync_uid_sidecar(&p.root.join("src/hero.gd.uid"));
+    ws.sync_uid_declaration(&p.root.join("src/hero.gd.uid"));
 
     assert_eq!(
         ws.scenes()
@@ -117,7 +117,7 @@ fn deleting_the_sidecar_unresolves_the_scene() {
 
     let sidecar = p.root.join("src/hero.gd.uid");
     p.remove("src/hero.gd.uid");
-    ws.drop_uid_sidecar(&sidecar);
+    ws.drop_uid_declaration(&sidecar);
 
     assert_eq!(
         ws.scenes()
@@ -145,9 +145,9 @@ fn re_pointing_a_sidecar_moves_the_link() {
 
     // The host names `uid://c484hero`; hand that uid to villain.gd instead.
     p.remove("src/hero.gd.uid");
-    ws.drop_uid_sidecar(&p.root.join("src/hero.gd.uid"));
+    ws.drop_uid_declaration(&p.root.join("src/hero.gd.uid"));
     p.write("src/villain.gd.uid", "uid://c484hero\n");
-    ws.sync_uid_sidecar(&p.root.join("src/villain.gd.uid"));
+    ws.sync_uid_declaration(&p.root.join("src/villain.gd.uid"));
 
     assert_eq!(
         ws.scenes()

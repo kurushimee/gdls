@@ -1003,25 +1003,23 @@ impl Workspace {
         self.update_stat_from_disk(path);
     }
 
-    /// #447: a `<resource>.uid` sidecar was created or edited — re-read it and re-point the
-    /// resource's uid in both the project model and the index, so `preload("uid://…")` follows the
-    /// change without waiting for a restart. An unreadable or non-`uid://` body drops the mapping
+    /// #447, widened by #523: a file that DECLARES a uid was created or edited — a `.uid` sidecar,
+    /// a `.import`, or a text `.tres`/`.tscn` header — so re-read it and re-point the resource's
+    /// uid in both the project model and the index. `preload("uid://…")` then follows the change
+    /// without waiting for a restart. A file that declares nothing readable drops the mapping
     /// rather than keeping a stale one.
-    pub fn sync_uid_sidecar(&mut self, sidecar: &Utf8Path) {
-        let Some(resource) = sidecar.as_str().strip_suffix(".uid") else {
+    pub fn sync_uid_declaration(&mut self, declaring: &Utf8Path) {
+        let Some(resource) = uid_resource_of(declaring) else {
             return;
         };
-        let uid = std::fs::read_to_string(sidecar)
-            .ok()
-            .map(|text| text.trim().to_owned())
-            .filter(|uid| uid.starts_with("uid://"));
-        self.apply_uid_sidecar(Utf8Path::new(resource), uid.as_deref());
+        let uid = gd_project::paths::uid_declaration(declaring).map(|(_, uid, _)| uid);
+        self.apply_uid_sidecar(&resource, uid.as_deref());
     }
 
-    /// #447: a `.uid` sidecar was deleted — its resource has no uid any more.
-    pub fn drop_uid_sidecar(&mut self, sidecar: &Utf8Path) {
-        if let Some(resource) = sidecar.as_str().strip_suffix(".uid") {
-            self.apply_uid_sidecar(Utf8Path::new(resource), None);
+    /// #447: a file that declared a uid was deleted — its resource has no uid any more.
+    pub fn drop_uid_declaration(&mut self, declaring: &Utf8Path) {
+        if let Some(resource) = uid_resource_of(declaring) {
+            self.apply_uid_sidecar(&resource, None);
         }
     }
 
@@ -2557,5 +2555,21 @@ mod bail_recovery_tests {
             Rc::ptr_eq(&served, &complete),
             "the served result must be the SAME complete Rc that the seeding analyze cached"
         );
+    }
+}
+
+/// Which resource a uid-declaring file speaks FOR, by file kind: a sidecar and an `.import` name
+/// the file they sit beside, while a text resource or scene declares its own. Answers `None` for
+/// every other kind, which is what keeps the watcher arms from calling into the uid map for an
+/// ordinary asset. Deliberately independent of whether the file is currently readable — a DELETED
+/// `.import` still has to retire its resource's uid.
+fn uid_resource_of(declaring: &Utf8Path) -> Option<Utf8PathBuf> {
+    match declaring.extension() {
+        Some("uid") => Some(Utf8PathBuf::from(declaring.as_str().strip_suffix(".uid")?)),
+        Some("import") => Some(Utf8PathBuf::from(
+            declaring.as_str().strip_suffix(".import")?,
+        )),
+        Some("tres") | Some("tscn") => Some(declaring.to_owned()),
+        _ => None,
     }
 }

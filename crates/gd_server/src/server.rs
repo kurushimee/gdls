@@ -2310,11 +2310,21 @@ fn apply_reaction_inner(
                 return;
             }
             match change {
-                FileChange::Created | FileChange::Modified => state.workspace.reindex_scene(&path),
-                FileChange::Deleted => state.workspace.remove_scene(&path),
+                FileChange::Created | FileChange::Modified => {
+                    state.workspace.reindex_scene(&path);
+                    // #523: a scene declares its own uid in its header line, so it is a uid source
+                    // too — and it reaches the watcher here rather than through `Asset`.
+                    state.workspace.sync_uid_declaration(&path);
+                }
+                FileChange::Deleted => {
+                    state.workspace.remove_scene(&path);
+                    state.workspace.drop_uid_declaration(&path);
+                }
                 FileChange::Renamed { from, to } => {
                     state.workspace.remove_scene(&from);
                     state.workspace.reindex_scene(&to);
+                    state.workspace.drop_uid_declaration(&from);
+                    state.workspace.sync_uid_declaration(&to);
                 }
             }
         }
@@ -2335,25 +2345,19 @@ fn apply_reaction_inner(
                     state.workspace.reindex_asset(&path);
                     // #447: a `.uid` sidecar is an asset like any other, and it is also what makes
                     // `preload("uid://…")` resolve. Re-read it so the mapping tracks the file.
-                    if path.extension() == Some("uid") {
-                        state.workspace.sync_uid_sidecar(&path);
-                    }
+                    // #523 widened that to the other two places a uid is written, a `.import` and
+                    // a `.tres` header; the call itself sorts out which kind this is.
+                    state.workspace.sync_uid_declaration(&path);
                 }
                 FileChange::Deleted => {
                     state.workspace.remove_asset(&path);
-                    if path.extension() == Some("uid") {
-                        state.workspace.drop_uid_sidecar(&path);
-                    }
+                    state.workspace.drop_uid_declaration(&path);
                 }
                 FileChange::Renamed { from, to } => {
                     state.workspace.remove_asset(&from);
                     state.workspace.reindex_asset(&to);
-                    if from.extension() == Some("uid") {
-                        state.workspace.drop_uid_sidecar(&from);
-                    }
-                    if to.extension() == Some("uid") {
-                        state.workspace.sync_uid_sidecar(&to);
-                    }
+                    state.workspace.drop_uid_declaration(&from);
+                    state.workspace.sync_uid_declaration(&to);
                 }
             }
         }
