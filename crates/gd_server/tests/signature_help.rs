@@ -69,7 +69,9 @@ const SIG_API: &str = r#"{
         {"name": "Node2D", "inherits": "CanvasItem"}
     ],
     "builtin_classes": [
-        {"name": "Vector2", "constructors": [
+        {"name": "Vector2",
+         "constants": [{"name": "ZERO", "type": "Vector2", "value": "Vector2(0, 0)"}],
+         "constructors": [
             {},
             {"arguments": [{"name": "from", "type": "Vector2"}]},
             {"arguments": [{"name": "from", "type": "Vector2i"}]},
@@ -113,7 +115,8 @@ fn sig_project() -> TempProject {
          func greet(target: String, loud: bool = false) -> int:\n\treturn 0\n\n\
          ## Restore [param amount] hit points to the hero.\n\
          func heal(amount: int) -> void:\n\tpass\n\n\
-         func tag(annotated: String, hard := \"\", soft = 1, bare = null) -> void:\n\tpass\n",
+         func tag(annotated: String, hard := \"\", soft = 1, bare = null) -> void:\n\tpass\n\n\
+         func pin(spot := Vector2.ZERO) -> void:\n\tpass\n",
     );
     p
 }
@@ -1333,6 +1336,23 @@ fn an_unresolvable_super_call_is_null_not_the_current_class() {
         serde_json::Value::Null,
         "no parent declares `greet`, so there is no signature to show"
     );
+
+    shutdown(&client, server_thread);
+}
+
+/// #532: a parameter whose default is a builtin constant is labelled with the constant's TYPE. The
+/// shallow decode records the path `Vector2.ZERO`, and printing it raw put the initializer where
+/// the type belongs — twice on the same line, since the default is rendered after it.
+#[test]
+fn a_builtin_constant_default_labels_the_parameter_with_its_type() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f(h: Hero) -> void:\n\th.pin()\n";
+    let uri = file_uri(&p.root.join("src/pin_consumer.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor inside `h.pin(` — tab(1) + `h.pin(`(6) = 7.
+    let h = sig(&client, 10, &uri, Position::new(3, 7));
+    assert_eq!(only_label(&h), "void pin(spot: Vector2 = Vector2.ZERO)");
 
     shutdown(&client, server_thread);
 }

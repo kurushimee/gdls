@@ -402,6 +402,7 @@ fn collect_interface_members(
     iface: &Interface,
     owner_file: FileId,
     owner_inner: &[String],
+    native: &NativeDb,
     seen: &mut FxHashSet<String>,
     out: &mut Vec<MemberItem>,
 ) {
@@ -421,7 +422,7 @@ fn collect_interface_members(
             IfaceMemberKind::Enum => MemberItemKind::Enum,
         };
         out.push(
-            MemberItem::new(m.name.clone(), kind, interface_member_detail(m))
+            MemberItem::new(m.name.clone(), kind, interface_member_detail(m, native))
                 .with_owner(owner.clone())
                 .with_static(m.flags.is_static),
         );
@@ -458,31 +459,34 @@ fn collect_interface_members(
 /// the native arm produces. `MemberDecl.ty` is the RETURN type for a func, so rendering it alone
 /// made a zero-arg `func describe() -> String` read exactly like a property of type `String`, and
 /// made a `-> void` method render as nothing at all (#505).
-fn interface_member_detail(m: &gd_project::MemberDecl) -> Option<String> {
+fn interface_member_detail(m: &gd_project::MemberDecl, db: &NativeDb) -> Option<String> {
     match m.kind {
         gd_project::MemberKind::Func => Some(format!(
             "({}) -> {}",
-            interface_params(m),
+            interface_params(m, db),
             // `interface::type_expr` collapses an explicit `-> void` and an absent return
             // annotation to the same `TypeExpr::None`. Render `void`, matching the hover
             // formatter's decision for the same ambiguity: in typed GDScript explicit-void
             // functions vastly outnumber genuinely-unannotated ones.
-            m.ty.render().unwrap_or_else(|| "void".to_owned())
+            m.ty.render_resolved(db)
+                .unwrap_or_else(|| "void".to_owned())
         )),
-        gd_project::MemberKind::Signal => Some(format!("({})", interface_params(m))),
-        _ => m.ty.render(),
+        gd_project::MemberKind::Signal => Some(format!("({})", interface_params(m, db))),
+        _ => m.ty.render_resolved(db),
     }
 }
 
 /// `name: Type, …` for an interface member's parameter list. `param_names` runs parallel to
 /// `params`; an unnamed parameter renders type-only, and an unannotated one renders `Variant`,
 /// which is what an unannotated GDScript parameter accepts.
-fn interface_params(m: &gd_project::MemberDecl) -> String {
+fn interface_params(m: &gd_project::MemberDecl, db: &NativeDb) -> String {
     m.params
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let ty = p.render().unwrap_or_else(|| "Variant".to_owned());
+            let ty = p
+                .render_resolved(db)
+                .unwrap_or_else(|| "Variant".to_owned());
             match m.param_names.get(i).map(String::as_str) {
                 Some(n) if !n.is_empty() => format!("{n}: {ty}"),
                 _ => ty,
@@ -523,7 +527,7 @@ fn script_chain_members_seen(
     let mut seen: FxHashSet<String> = FxHashSet::default();
     for link in script_chain_links(xfile, native, start) {
         if let Some(iface) = link_interface(xfile, &link) {
-            collect_interface_members(iface, link.file, &link.inner, &mut seen, &mut out);
+            collect_interface_members(iface, link.file, &link.inner, native, &mut seen, &mut out);
         }
     }
     (out, seen)
@@ -551,7 +555,7 @@ pub fn script_parent_members(
     // Skip the first link (`start` itself); collect the script links strictly above it.
     for link in script_chain_links(xfile, native, start).into_iter().skip(1) {
         if let Some(iface) = link_interface(xfile, &link) {
-            collect_interface_members(iface, link.file, &link.inner, &mut seen, &mut out);
+            collect_interface_members(iface, link.file, &link.inner, native, &mut seen, &mut out);
         }
     }
     // The native class the parent chain bottoms out in — the same root `start` reaches (a script
