@@ -158,7 +158,7 @@ fn the_registration_table_is_well_formed() {
     for a in all {
         assert!(a.name.starts_with('@'), "{}", a.name);
         assert!(
-            a.default_arg_count <= a.params.len(),
+            a.default_arg_count() <= a.params.len(),
             "{} has more defaults than parameters",
             a.name
         );
@@ -167,6 +167,59 @@ fn the_registration_table_is_well_formed() {
             all.iter().filter(|b| b.name == a.name).count(),
             1,
             "{} is registered twice",
+            a.name
+        );
+    }
+}
+
+/// The signature `hover` renders for an annotation, pinned against Godot's own
+/// `_make_arguments_hint(info, -1, true)` (`gdscript_editor.cpp:750`): no return type, each
+/// parameter as `name: Type`, the `varray` defaults on the trailing parameters as their construct
+/// strings, and `...args: Array` for a vararg.
+#[test]
+fn registered_annotation_signatures_match_godots_argument_hint() {
+    let sig = |name: &str| {
+        gd_syntax::parser::registered_annotation(name)
+            .expect("registered")
+            .signature()
+    };
+    assert_eq!(sig("@tool"), "@tool()");
+    assert_eq!(sig("@icon"), "@icon(icon_path: String)");
+    assert_eq!(
+        sig("@export_range"),
+        "@export_range(min: float, max: float, step: float = 1.0, extra_hints: String = \"\", ...args: Array)"
+    );
+    // Vararg with no defaults, and vararg with one.
+    assert_eq!(
+        sig("@export_flags"),
+        "@export_flags(names: String, ...args: Array)"
+    );
+    assert_eq!(
+        sig("@export_file"),
+        "@export_file(filter: String = \"\", ...args: Array)"
+    );
+    // Every parameter defaulted.
+    assert_eq!(
+        sig("@rpc"),
+        "@rpc(mode: String = \"authority\", sync: String = \"call_remote\", transfer_mode: String = \"reliable\", transfer_channel: int = 0)"
+    );
+    // An int default rendered as its construct string (`PROPERTY_USAGE_DEFAULT` is 6).
+    assert_eq!(
+        sig("@export_custom"),
+        "@export_custom(hint: int, hint_string: String, usage: int = 6)"
+    );
+}
+
+/// Every registration renders without panicking, and the defaults never outnumber the parameters.
+#[test]
+fn every_registered_annotation_renders_a_well_formed_signature() {
+    for a in gd_syntax::parser::REGISTERED_ANNOTATIONS {
+        let sig = a.signature();
+        assert!(sig.starts_with(a.name), "{sig} must open with {}", a.name);
+        assert!(sig.ends_with(')'), "{sig} must close its parameter list");
+        assert!(
+            a.defaults.len() <= a.params.len(),
+            "{} has more defaults than parameters",
             a.name
         );
     }

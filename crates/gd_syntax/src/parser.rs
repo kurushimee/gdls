@@ -303,8 +303,20 @@ pub enum AnnotationParamType {
     String,
 }
 
-/// One `PropertyInfo(Variant::T, "name")` parameter of a registered annotation. The name is carried
-/// so the table reads as the mechanical transcription it is; nothing consumes it yet.
+impl AnnotationParamType {
+    /// The type name Godot renders for this parameter (`_get_visual_datatype` on a `PropertyInfo`
+    /// of the matching `Variant::Type`).
+    #[must_use]
+    pub fn visual_name(self) -> &'static str {
+        match self {
+            AnnotationParamType::Int => "int",
+            AnnotationParamType::Float => "float",
+            AnnotationParamType::String => "String",
+        }
+    }
+}
+
+/// One `PropertyInfo(Variant::T, "name")` parameter of a registered annotation.
 #[derive(Clone, Copy, Debug)]
 pub struct AnnotationParam {
     pub ty: AnnotationParamType,
@@ -317,10 +329,11 @@ pub struct RegisteredAnnotation {
     pub name: &'static str,
     /// The `MethodInfo` parameter list, in declaration order.
     pub params: &'static [AnnotationParam],
-    /// `p_default_arguments.size()` — how many trailing parameters the `varray(…)` supplies. The
-    /// default VALUES are not transcribed because no ported check reads them; each entry's comment
-    /// carries the literal `varray` so the count can be re-derived at the next audit.
-    pub default_arg_count: usize,
+    /// The `varray(…)` default values the registration supplies, as the construct strings Godot
+    /// renders them with (`Variant::get_construct_string`), covering the LAST `defaults.len()`
+    /// parameters. Transcribed verbatim from the registering call, so `@export_range`'s
+    /// `varray(1.0, "")` is `["1.0", "\"\""]`. `default_arg_count` is this length.
+    pub defaults: &'static [&'static str],
     /// `p_is_vararg`, which sets `METHOD_FLAG_VARARG` (`gdscript_parser.cpp:1928`).
     pub is_vararg: bool,
 }
@@ -337,7 +350,48 @@ impl RegisteredAnnotation {
     /// (`gdscript_parser.cpp:4416`). Enforced for varargs too.
     #[must_use]
     pub fn min_arguments(&self) -> usize {
-        self.params.len() - self.default_arg_count
+        self.params.len() - self.default_arg_count()
+    }
+
+    /// `p_default_arguments.size()` — how many trailing parameters the `varray(…)` supplies.
+    #[must_use]
+    pub fn default_arg_count(&self) -> usize {
+        self.defaults.len()
+    }
+
+    /// The signature Godot shows for this annotation — `_make_arguments_hint(info, -1, true)`
+    /// (`gdscript_editor.cpp:750`) with no argument highlighted: no return type (the annotation
+    /// branch skips it), then `@name(` , each parameter as `name: Type`, a ` = <default>` on the
+    /// trailing ones the `varray` supplies, and `...args: Array` for a vararg.
+    #[must_use]
+    pub fn signature(&self) -> String {
+        let mut out = String::from(self.name);
+        out.push('(');
+        let first_default = self.params.len() - self.defaults.len();
+        for (i, param) in self.params.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(param.name);
+            out.push_str(": ");
+            out.push_str(param.ty.visual_name());
+            if let Some(d) = i
+                .checked_sub(first_default)
+                .and_then(|k| self.defaults.get(k))
+            {
+                out.push_str(" = ");
+                out.push_str(d);
+            }
+        }
+        if self.is_vararg {
+            if !self.params.is_empty() {
+                out.push_str(", ");
+            }
+            // `MethodInfo` does not carry the rest parameter's name, so Godot hard-codes this.
+            out.push_str("...args: Array");
+        }
+        out.push(')');
+        out
     }
 }
 
@@ -348,13 +402,13 @@ const fn p(ty: AnnotationParamType, name: &'static str) -> AnnotationParam {
 const fn ann(
     name: &'static str,
     params: &'static [AnnotationParam],
-    default_arg_count: usize,
+    defaults: &'static [&'static str],
     is_vararg: bool,
 ) -> RegisteredAnnotation {
     RegisteredAnnotation {
         name,
         params,
-        default_arg_count,
+        defaults,
         is_vararg,
     }
 }
@@ -369,22 +423,32 @@ pub const REGISTERED_ANNOTATIONS: &[RegisteredAnnotation] = {
     use AnnotationParamType::{Float, Int, String};
     &[
         // Script annotations.
-        ann("@tool", &[], 0, false),
-        ann("@icon", &[p(String, "icon_path")], 0, false),
-        ann("@static_unload", &[], 0, false),
-        ann("@abstract", &[], 0, false),
+        ann("@tool", &[], &[], false),
+        ann("@icon", &[p(String, "icon_path")], &[], false),
+        ann("@static_unload", &[], &[], false),
+        ann("@abstract", &[], &[], false),
         // Onready annotation.
-        ann("@onready", &[], 0, false),
+        ann("@onready", &[], &[], false),
         // Export annotations.
-        ann("@export", &[], 0, false),
-        ann("@export_enum", &[p(String, "names")], 0, true), // varray()
-        ann("@export_file", &[p(String, "filter")], 1, true), // varray("")
-        ann("@export_file_path", &[p(String, "filter")], 1, true), // varray("")
-        ann("@export_dir", &[], 0, false),
-        ann("@export_global_file", &[p(String, "filter")], 1, true), // varray("")
-        ann("@export_global_dir", &[], 0, false),
-        ann("@export_multiline", &[p(String, "hint")], 1, true), // varray("")
-        ann("@export_placeholder", &[p(String, "placeholder")], 0, false),
+        ann("@export", &[], &[], false),
+        ann("@export_enum", &[p(String, "names")], &[], true), // varray()
+        ann("@export_file", &[p(String, "filter")], &["\"\""], true), // varray("")
+        ann("@export_file_path", &[p(String, "filter")], &["\"\""], true), // varray("")
+        ann("@export_dir", &[], &[], false),
+        ann(
+            "@export_global_file",
+            &[p(String, "filter")],
+            &["\"\""],
+            true,
+        ), // varray("")
+        ann("@export_global_dir", &[], &[], false),
+        ann("@export_multiline", &[p(String, "hint")], &["\"\""], true), // varray("")
+        ann(
+            "@export_placeholder",
+            &[p(String, "placeholder")],
+            &[],
+            false,
+        ),
         ann(
             "@export_range",
             &[
@@ -393,53 +457,58 @@ pub const REGISTERED_ANNOTATIONS: &[RegisteredAnnotation] = {
                 p(Float, "step"),
                 p(String, "extra_hints"),
             ],
-            2, // varray(1.0, "")
+            &["1.0", "\"\""], // varray(1.0, "")
             true,
         ),
-        ann("@export_exp_easing", &[p(String, "hints")], 1, true), // varray("")
-        ann("@export_color_no_alpha", &[], 0, false),
-        ann("@export_node_path", &[p(String, "type")], 1, true), // varray("")
-        ann("@export_flags", &[p(String, "names")], 0, true),    // varray()
-        ann("@export_flags_2d_render", &[], 0, false),
-        ann("@export_flags_2d_physics", &[], 0, false),
-        ann("@export_flags_2d_navigation", &[], 0, false),
-        ann("@export_flags_3d_render", &[], 0, false),
-        ann("@export_flags_3d_physics", &[], 0, false),
-        ann("@export_flags_3d_navigation", &[], 0, false),
-        ann("@export_flags_avoidance", &[], 0, false),
-        ann("@export_storage", &[], 0, false),
+        ann("@export_exp_easing", &[p(String, "hints")], &["\"\""], true), // varray("")
+        ann("@export_color_no_alpha", &[], &[], false),
+        ann("@export_node_path", &[p(String, "type")], &["\"\""], true), // varray("")
+        ann("@export_flags", &[p(String, "names")], &[], true),          // varray()
+        ann("@export_flags_2d_render", &[], &[], false),
+        ann("@export_flags_2d_physics", &[], &[], false),
+        ann("@export_flags_2d_navigation", &[], &[], false),
+        ann("@export_flags_3d_render", &[], &[], false),
+        ann("@export_flags_3d_physics", &[], &[], false),
+        ann("@export_flags_3d_navigation", &[], &[], false),
+        ann("@export_flags_avoidance", &[], &[], false),
+        ann("@export_storage", &[], &[], false),
         // `hint` and `usage` also carry PROPERTY_USAGE_CLASS_IS_ENUM("PropertyHint") and
         // CLASS_IS_BITFIELD("PropertyUsageFlags"); validation reads only `Variant::INT`.
         ann(
             "@export_custom",
             &[p(Int, "hint"), p(String, "hint_string"), p(Int, "usage")],
-            1, // varray(PROPERTY_USAGE_DEFAULT)
+            &["6"], // varray(PROPERTY_USAGE_DEFAULT)
             false,
         ),
         ann(
             "@export_tool_button",
             &[p(String, "text"), p(String, "icon")],
-            1, // varray("")
+            &["\"\""], // varray("")
             false,
         ),
         // Export grouping annotations.
-        ann("@export_category", &[p(String, "name")], 0, false),
+        ann("@export_category", &[p(String, "name")], &[], false),
         ann(
             "@export_group",
             &[p(String, "name"), p(String, "prefix")],
-            1, // varray("")
+            &["\"\""], // varray("")
             false,
         ),
         ann(
             "@export_subgroup",
             &[p(String, "name"), p(String, "prefix")],
-            1, // varray("")
+            &["\"\""], // varray("")
             false,
         ),
         // Warning annotations.
-        ann("@warning_ignore", &[p(String, "warning")], 0, true), // varray()
-        ann("@warning_ignore_start", &[p(String, "warning")], 0, true), // varray()
-        ann("@warning_ignore_restore", &[p(String, "warning")], 0, true), // varray()
+        ann("@warning_ignore", &[p(String, "warning")], &[], true), // varray()
+        ann("@warning_ignore_start", &[p(String, "warning")], &[], true), // varray()
+        ann(
+            "@warning_ignore_restore",
+            &[p(String, "warning")],
+            &[],
+            true,
+        ), // varray()
         // Networking. Keep in sync with `rpc_annotation()`.
         ann(
             "@rpc",
@@ -449,7 +518,7 @@ pub const REGISTERED_ANNOTATIONS: &[RegisteredAnnotation] = {
                 p(String, "transfer_mode"),
                 p(Int, "transfer_channel"),
             ],
-            4, // varray("authority", "call_remote", "reliable", 0)
+            &["\"authority\"", "\"call_remote\"", "\"reliable\"", "0"], // varray("authority", "call_remote", "reliable", 0)
             false,
         ),
     ]
