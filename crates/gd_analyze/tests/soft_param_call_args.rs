@@ -109,6 +109,28 @@ func takes_null(a = null) -> void:
 
 func takes_variant(a: Variant) -> void:
 \tprint(a)
+
+// #528: one row per shape the seam resolves, and one per shape it must keep refusing.
+func takes_preload(a := preload(\"res://thing.tres\")) -> void:
+\tprint(a)
+
+func takes_global_enum(a := SIDE_LEFT) -> void:
+\tprint(a)
+
+func takes_float_const(a := PI) -> void:
+\tprint(a)
+
+func takes_soft_native_enum(a = TileSet.TILE_SHAPE_SQUARE) -> void:
+\tprint(a)
+
+func takes_bare_class(a := TileSet) -> void:
+\tprint(a)
+
+func takes_pseudo(a := TileSet.TileShape) -> void:
+\tprint(a)
+
+func takes_absent(a := TileSet.NOT_A_THING) -> void:
+\tprint(a)
 ";
 
 fn warnings_of(src: &str) -> Vec<String> {
@@ -225,14 +247,14 @@ fn a_null_default_is_a_plain_soft_variant() {
     );
 }
 
-/// A default the shallow pass cannot decode is a type gdls has NOT read. Godot names it
-/// (`TileSet.TileShape`); gdls stays silent rather than naming `"Variant"`, which would be an
-/// outright wrong answer in a row that is otherwise correct to fire.
+/// A default the SHALLOW pass cannot decode still has its shape recorded, and the seam resolves it
+/// (#528). The row Godot emits — naming `TileSet.TileShape` — is emitted here too. Before that, the
+/// slot had no type at all and this call was silent, which was an under-report, never a wrong name.
 #[test]
-fn a_cross_file_undecodable_default_stays_silent() {
+fn a_cross_file_undecodable_default_resolves_at_the_seam() {
     assert_eq!(
         warnings_of(&call("lib.takes_unknown(v)")),
-        Vec::<String>::new()
+        vec![unsafe_arg(1, "takes_unknown", "TileSet.TileShape")]
     );
 }
 
@@ -261,6 +283,73 @@ fn hardness_still_decides_the_error_arm() {
         errors,
         vec![
             r#"Invalid argument for "takes_inferred()" function: argument 1 should be "String" but is "int"."#
+                .to_owned()
+        ]
+    );
+}
+
+// ===================================================================================================
+// #528: every shape the member seam resolves, reached through a parameter default.
+// ===================================================================================================
+
+/// A preload, a global enum value, and a global float constant all cross into a parameter slot and
+/// name their real type in the row Godot emits.
+#[test]
+fn the_resolvable_default_shapes_all_reach_a_parameter() {
+    for (stmt, func, ty) in [
+        ("lib.takes_preload(v)", "takes_preload", "Resource"),
+        ("lib.takes_global_enum(v)", "takes_global_enum", "Side"),
+        ("lib.takes_float_const(v)", "takes_float_const", "float"),
+    ] {
+        assert_eq!(
+            warnings_of(&call(stmt)),
+            vec![unsafe_arg(1, func, ty)],
+            "{stmt}"
+        );
+    }
+}
+
+/// The three shapes that must keep answering nothing. Each is an error in the DECLARING file — a
+/// bare native class name is Godot's `GDScriptNativeClass`, an enum used as a value cannot stand on
+/// its own, and an absent name has no type at all — so the slot has nothing to carry and the call
+/// stays silent rather than claiming `Variant`.
+#[test]
+fn the_refused_default_shapes_stay_refused() {
+    for stmt in [
+        "lib.takes_bare_class(v)",
+        "lib.takes_pseudo(v)",
+        "lib.takes_absent(v)",
+    ] {
+        assert_eq!(warnings_of(&call(stmt)), Vec::<String>::new(), "{stmt}");
+    }
+}
+
+/// Softness survives the resolution. A plain `=` default is `INFERRED` in Godot, so an incompatible
+/// hard argument passes without an error even though the slot now has a real type; the `:=` twin
+/// beside it does not.
+#[test]
+fn a_resolved_default_keeps_the_hardness_its_writing_gave_it() {
+    let src = "extends Node\n\nfunc go(lib: ParLib, n: String) -> void:\n\tlib.takes_soft_native_enum(n)\n\tlib.takes_unknown(n)\n";
+    let project = Project::new(&[("res://lib.gd", LIB_GD), ("res://main.gd", src)]);
+    let tree = parse(src).tree;
+    let result = analyze(
+        &tree,
+        Some(FileId::new(2)),
+        "res://main.gd",
+        &native_db(),
+        &project,
+        &policy(),
+    );
+    let errors: Vec<String> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == gd_analyze::Severity::Error)
+        .map(|d| d.message().to_owned())
+        .collect();
+    assert_eq!(
+        errors,
+        vec![
+            r#"Invalid argument for "takes_unknown()" function: argument 1 should be "TileSet.TileShape" but is "String"."#
                 .to_owned()
         ]
     );

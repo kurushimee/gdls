@@ -50,6 +50,7 @@ impl AutoloadQuery {
                 args: vec![],
             }],
             params_typing: vec![gd_project::ParamTyping::Annotated],
+            param_inits: vec![None],
             param_names: vec!["msg".to_string()],
             required_params: 1,
             flags: Default::default(),

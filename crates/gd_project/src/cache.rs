@@ -125,7 +125,13 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// The serialized variant shapes changed, so a v17 cache does not deserialize at all; and a
 /// lenient decode would only hold the flat shapes, which read as `Variant` for every call-rooted
 /// initializer until the next cold index. v17 files are ignored and rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 18;
+/// v19 (#528): `MemberDecl` gained `param_inits`, and `ParamTyping::Unknown` gained the `:=`/`=`
+/// bit, so a parameter whose default the shallow pass could not read (`f(a := TileSet.TILE_SHAPE_SQUARE)`)
+/// carries the shape the analyzer resolves at the seam — exactly the road a member's `init` took.
+/// The `ParamTyping` variant shape changed, so a v18 cache does not deserialize at all; a lenient
+/// decode would hold no shapes and keep serving the untyped slot, the same serve-the-older-answer
+/// failure v15 and v17 fixed. v18 files are ignored and rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 19;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
