@@ -7303,11 +7303,8 @@ fn check_return_compatibility(
     }
 }
 
-/// `resolve_assert` (analyzer.cpp:2385): reduce the condition + message. The `Expected string for
-/// assert error message.` error (analyzer.cpp:2389-2391) needs the result type of the message
-/// expression, which arrives once `reduce_call`/`reduce_identifier` land in E3 — until then the
-/// message expression types as `Variant` and the check is silenced. The `ASSERT_ALWAYS_TRUE`/
-/// `ASSERT_ALWAYS_FALSE` warnings (analyzer.cpp:2396-2404) join with WP-F.
+/// `resolve_assert` (analyzer.cpp:2397): reduce the condition + message, then check the message's
+/// type. The `ASSERT_ALWAYS_TRUE` / `ASSERT_ALWAYS_FALSE` warnings (analyzer.cpp:2396-2404) follow.
 fn resolve_assert(ctx: &mut AnalysisContext, assert_id: NodeId) {
     let (cond, msg) = match &ctx.node(assert_id).kind {
         NodeKind::Assert(a) => (a.condition, a.message),
@@ -7318,6 +7315,19 @@ fn resolve_assert(ctx: &mut AnalysisContext, assert_id: NodeId) {
     }
     if let Some(m) = msg {
         crate::reducer::reduce_expression(ctx, m, false);
+        // #556, analyzer.cpp:2400-2404 — the message must be a builtin `String`. Not
+        // constant-gated: a `Variant`-typed expression fails because its KIND is not builtin, and a
+        // `StringName` fails because only `String` passes.
+        //
+        // The `has_no_type` exemption is upstream's own, and it is what keeps this check honest
+        // here for free: everything gdls could not resolve carries the no-type dummy, so a degrade
+        // is skipped without a provenance gate of its own. The anchor is the message expression.
+        let mt = ctx.get_type(m).clone();
+        if !mt.has_no_type()
+            && (mt.kind != DtKind::Builtin || mt.builtin_type != VariantType::String)
+        {
+            ctx.push_error("Expected string for assert error message.", m);
+        }
     }
     // ASSERT_ALWAYS_TRUE / ASSERT_ALWAYS_FALSE (analyzer.cpp:2393-2399): a constant condition.
     // The FALSE arm skips a literal bool (`assert(false)` is a deliberate trap). An `Opaque`
