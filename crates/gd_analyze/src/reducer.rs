@@ -671,6 +671,27 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
             let lv = ctx.folds.get(l).cloned();
             let rv = ctx.folds.get(r).cloned();
             if let (Some(lv), Some(rv)) = (lv, rv) {
+                // A constant `"fmt" % value` is not formatted here (see the `has_opaque` note
+                // below), but it is still validated: sprintf's errors all fall out of the format
+                // string and the value's type, never the rendered output. On failure Godot keeps
+                // the node constant with the error text as its value (analyzer.cpp:3149, :3163).
+                if op_node.operation == BinaryOp::Modulo {
+                    if let Some(fmt) = crate::sprintf::format_string(&lv) {
+                        if let Some(msg) = crate::sprintf::validate(fmt, &rv, ctx.dialect) {
+                            ctx.push_error(
+                                format!(
+                                    "{msg} in operator {}.",
+                                    binary_op_symbol(op_node.operation)
+                                ),
+                                id,
+                            );
+                            let folded = FoldedValue::String(msg.to_owned());
+                            ctx.set_type(id, type_from_variant(&folded));
+                            ctx.folds.set(id, folded);
+                            return;
+                        }
+                    }
+                }
                 let has_opaque = matches!(lv, FoldedValue::Opaque(..))
                     || matches!(rv, FoldedValue::Opaque(..))
                     // Constant `"fmt %s" % x` — the format itself isn't evaluated (Godot folds

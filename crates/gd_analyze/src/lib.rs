@@ -31,6 +31,7 @@ pub mod foldtable;
 pub mod reducer;
 pub mod resolver;
 pub mod script_chain;
+mod sprintf;
 pub mod stringify;
 pub mod typetable;
 pub mod warn_policy;
