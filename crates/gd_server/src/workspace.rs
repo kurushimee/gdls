@@ -568,12 +568,7 @@ impl Workspace {
         let result = match cached {
             Some(hit) => hit,
             None => {
-                // Godot threads `parser->script_path` into the head class's `fqcn` for
-                // `<file.gd>.<EnumName>` rendering (`gdscript_analyzer.cpp`; working-tree line
-                // numbers drift, so cite the symbol). We pass the file basename (e.g. `foo.gd`)
-                // rather than the absolute Windows path so the `Display for DataType` `get_file()`
-                // mirror (which strips at the last `/`) produces the same string Godot emits.
-                let script_path = path.file_name().unwrap_or_default();
+                let script_path = self.analyzer_script_path(path);
                 let result = {
                     // The borrow of `&self.analysis_cache` ends with this block, before the
                     // `analysis_cache.insert(...)` below. WorkspaceXFileQuery overrides
@@ -600,7 +595,7 @@ impl Workspace {
                     Rc::new(gd_analyze::analyze_with_options(
                         tree,
                         file,
-                        script_path,
+                        &script_path,
                         &self.native,
                         &xfile,
                         &self.policy,
@@ -728,6 +723,22 @@ impl Workspace {
         env
     }
 
+    /// Godot's `parser->script_path`: the path the script was loaded from.
+    ///
+    /// It surfaces to the user as the head class's `fqcn` (`gdscript_parser.cpp:993`), which is
+    /// what names a base class in a shadowing warning and a class in the abstract-native
+    /// instantiation error. An editor session loads by `res://` path, so that is what a Godot user
+    /// reads. Enum rendering strips it back to a basename on the way out through the
+    /// `String::get_file()` mirror in `Display for DataType`, so the full path costs nothing there.
+    ///
+    /// A buffer outside the project, or one open before a project loads, has no `res://` form; the
+    /// basename is the fallback, since leaking an absolute host path into a message would be worse
+    /// than a short one.
+    fn analyzer_script_path(&self, path: &Utf8Path) -> String {
+        gd_project::path_to_res(&self.project.root, path)
+            .unwrap_or_else(|| path.file_name().unwrap_or_default().to_owned())
+    }
+
     /// Analyze a tree/text **without reading or writing either cache** — the M10 (#75) codeAction
     /// mutation gate's probe. The mutating warning quickfixes apply their candidate edit to an
     /// in-memory copy of the buffer and re-analyze it to confirm the edit introduces no new ERROR
@@ -742,7 +753,7 @@ impl Workspace {
     /// acceptable place to pay an analyze).
     pub fn analyze_ephemeral(&self, path: &Utf8Path, tree: &ParseTree) -> AnalysisResult {
         let file = self.index.file_id(path);
-        let script_path = path.file_name().unwrap_or_default();
+        let script_path = self.analyzer_script_path(path);
         let autoloads = self.build_autoload_maps(&self.project, &self.scenes);
         let xfile = WorkspaceXFileQuery::new(
             &self.index,
@@ -756,7 +767,7 @@ impl Workspace {
         gd_analyze::analyze_with_options(
             tree,
             file,
-            script_path,
+            &script_path,
             &self.native,
             &xfile,
             &self.policy,
