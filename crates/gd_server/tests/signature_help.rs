@@ -66,7 +66,7 @@ const SIG_API: &str = r#"{
             ]}
         ]},
         {"name": "CanvasItem", "inherits": "Node"},
-        {"name": "Node2D", "inherits": "CanvasItem"}
+        {"name": "Node2D", "inherits": "CanvasItem", "is_instantiable": true}
     ],
     "builtin_classes": [
         {"name": "Vector2",
@@ -116,7 +116,18 @@ fn sig_project() -> TempProject {
          ## Restore [param amount] hit points to the hero.\n\
          func heal(amount: int) -> void:\n\tpass\n\n\
          func tag(annotated: String, hard := \"\", soft = 1, bare = null) -> void:\n\tpass\n\n\
-         func pin(spot := Vector2.ZERO) -> void:\n\tpass\n",
+         func pin(spot := Vector2.ZERO) -> void:\n\tpass\n\n\
+         const HOME := Vector2.ZERO\n\n\
+         func park(spot := HOME) -> void:\n\tpass\n\n\
+         func lost(spot := nowhere) -> void:\n\tpass\n",
+    );
+    // #537: a constructor whose `_init` carries the same undecodable HARD default, so the
+    // `Type.new(` arm is pinned too — it reaches `_init` down a different path than a method call.
+    p.write(
+        "src/depot.gd",
+        "class_name Depot\nextends Node2D\n\n\
+         const HOME := Vector2.ZERO\n\n\
+         func _init(spot := HOME) -> void:\n\tpass\n",
     );
     p
 }
@@ -1353,6 +1364,59 @@ fn a_builtin_constant_default_labels_the_parameter_with_its_type() {
     // Cursor inside `h.pin(` — tab(1) + `h.pin(`(6) = 7.
     let h = sig(&client, 10, &uri, Position::new(3, 7));
     assert_eq!(only_label(&h), "void pin(spot: Vector2 = Vector2.ZERO)");
+
+    shutdown(&client, server_thread);
+}
+
+/// #537: a HARD `:=` default the shallow interface pass could not decode (here `HOME`, a same-file
+/// const) has no written annotation and no readable literal, so the label had nothing to print and
+/// fell back to `Variant` — while the diagnostics on the very same call named `Vector2`. The
+/// analyzer now publishes the slot it resolved for this call, and the popup reads that answer.
+#[test]
+fn a_resolved_default_is_labelled_with_the_type_the_analyzer_found() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f(h: Hero) -> void:\n\th.park()\n";
+    let uri = file_uri(&p.root.join("src/park_consumer.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor inside `h.park(` — tab(1) + `h.park(`(7) = 8.
+    let h = sig(&client, 10, &uri, Position::new(3, 8));
+    assert_eq!(only_label(&h), "void park(spot: Vector2 = HOME)");
+
+    shutdown(&client, server_thread);
+}
+
+/// The constructor arm carries the same slots: `Depot.new(` resolves through `_init`, which is a
+/// different lookup than an instance method, and losing the answer there would leave every
+/// constructor popup labelling what the method popup names.
+#[test]
+fn a_constructors_resolved_default_is_labelled_too() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f(h: Hero) -> void:\n\th.park()\n\tvar d := Depot.new()\n\tprint(d)\n";
+    let uri = file_uri(&p.root.join("src/depot_consumer.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // The `h.park()` above shares the file so the two calls' records are told apart by span.
+    // Cursor inside `Depot.new(` — tab(1) + `var d := Depot.new(`(19) = 20.
+    let h = sig(&client, 10, &uri, Position::new(4, 20));
+    assert_eq!(only_label(&h), "void _init(spot: Vector2 = HOME)");
+
+    shutdown(&client, server_thread);
+}
+
+/// Nothing resolves `nowhere`, so the slot renders with NO type at all. `Variant` is a real
+/// GDScript type and printing it here would be a claim gdls never checked; the default expression
+/// alone is the honest label.
+#[test]
+fn an_unresolvable_default_labels_the_slot_without_a_type() {
+    let p = sig_project();
+    let src = "extends Node\n\nfunc f(h: Hero) -> void:\n\th.lost()\n";
+    let uri = file_uri(&p.root.join("src/lost_consumer.gd"));
+    let (client, server_thread) = boot(&p, caps(true, true), &uri, src);
+
+    // Cursor inside `h.lost(` — tab(1) + `h.lost(`(7) = 8.
+    let h = sig(&client, 10, &uri, Position::new(3, 8));
+    assert_eq!(only_label(&h), "void lost(spot = nowhere)");
 
     shutdown(&client, server_thread);
 }

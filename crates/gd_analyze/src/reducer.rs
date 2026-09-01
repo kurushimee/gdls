@@ -5029,6 +5029,8 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                         // coroutine call too (analyzer.cpp:5870 stamp; propagated at ~4345). #217.
                         sig.is_coroutine = init_sig.is_coroutine;
                         sig.arity_known = true;
+                        // #537: a constructor popup asks the same question of the same `_init`.
+                        sig.shape_resolved_params = init_sig.shape_resolved_params;
                         sig_resolved = true;
                     }
                     ChainCall::Other { .. } => {
@@ -5894,6 +5896,12 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             .map(|c| class_inner_path(ctx, c))
             .unwrap_or_default();
         let call_span = ctx.node(id).span;
+        // #537: recorded under the same gate and the same span as the binding below, so a consumer
+        // that located the call has located this too.
+        if !sig.shape_resolved_params.is_empty() {
+            let slots = std::mem::take(&mut sig.shape_resolved_params);
+            ctx.record_call_param_resolution(call_span, slots);
+        }
         let callee = if let Some(link) = cross_file_callee {
             CalleeTarget::Script {
                 file: link.file,
@@ -6001,6 +6009,11 @@ pub(crate) struct CallSig {
     /// which is safe because the `CallSig::default()` stubs (constructor, Variant-degrade) are
     /// already excluded from the arity check by `sig_resolved`.
     pub(crate) arity_known: bool,
+    /// #537: the parameter slots whose type came from resolving a cross-file default's
+    /// `InitShape` — `(index, resolved type)`. Recorded onto the result at the call site so
+    /// `signatureHelp` can label the slot with the same answer the argument checks used, rather
+    /// than deriving a second one. Only HARD (`:=`) slots, and empty everywhere else.
+    pub(crate) shape_resolved_params: Vec<(usize, DataType)>,
 }
 
 /// The `MethodInfo` Godot hands `validate_call_arg` for a utility call, as a `CallSig`.
@@ -6571,6 +6584,7 @@ fn lookup_builtin_method(ctx: &AnalysisContext, vt: VariantType, name: &str) -> 
         par_types,
         min_params,
         max_params,
+        shape_resolved_params: Vec::new(),
         is_vararg: m.is_vararg,
         is_static: m.is_static,
         is_coroutine: false,
@@ -6616,6 +6630,7 @@ pub(crate) fn lookup_native_method(
                 par_types,
                 min_params,
                 max_params,
+                shape_resolved_params: Vec::new(),
                 is_vararg: m.is_vararg,
                 is_static: m.is_static,
                 // Native methods never carry a coroutine flag in the dump — only in-file
@@ -7456,6 +7471,10 @@ fn script_chain_call(
     // shallow pass could not decode — carries the no-type dummy instead of a `Variant`, so the
     // argument checks stay off it entirely rather than naming a type gdls never read.
     use gd_project::ParamTyping;
+    // #537: the slots below whose type came from a shape rather than from the interface's own
+    // decode. Kept beside `par_types` so the label surface can read the very answer the argument
+    // checks are about to use.
+    let mut shape_resolved: Vec<(usize, DataType)> = Vec::new();
     let par_types: Vec<DataType> = member
         .params
         .iter()
@@ -7482,6 +7501,11 @@ fn script_chain_call(
                     let mut dt = *dt;
                     if !hard {
                         dt.type_source = TypeSource::Inferred;
+                    }
+                    // A soft slot renders `Variant` in Godot's own arguments hint, so only a hard
+                    // one is worth carrying to a label.
+                    if hard {
+                        shape_resolved.push((i, dt.clone()));
                     }
                     return dt;
                 }
@@ -7516,6 +7540,7 @@ fn script_chain_call(
             // Resolved through the cross-file interface — `required_params`/`par_n` are the real
             // declared arity, so the call is arity-checkable.
             arity_known: true,
+            shape_resolved_params: shape_resolved,
         }),
         link,
     )
