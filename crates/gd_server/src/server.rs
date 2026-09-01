@@ -1069,15 +1069,23 @@ fn serve_inner(
             "Godot {}.{}.{}",
             h.version_major, h.version_minor, h.version_patch
         );
+        // #503: WARNING, and the consequence spelled out. The stock surface carries `Generic`
+        // provenance, and `Generic` gates off EVERY negative diagnostic in the file, not just
+        // claims about engine classes — `Function "x()" not found in base self.` and misses on
+        // the user's OWN classes go with it. Saying only that custom classes are missing reads
+        // as "the surface is fine", so a user chasing vanished errors has nothing to connect
+        // this to. The release-mismatch notice one branch up already says it this way; the two
+        // states cost the same, so they announce the same.
         show_message(
             &state,
-            lsp_types::MessageType::INFO,
+            lsp_types::MessageType::WARNING,
             &format!(
                 "gdls is using its built-in stock {served} API surface — no project dump was \
                  found. Engine classes and their documentation are available, but classes from \
-                 your own Godot build or from GDExtensions are not. To use your engine's real \
-                 API, set `godotBinaryPath` (or the GDLS_GODOT environment variable), or point \
-                 `extensionApiPath` at an extension_api.json."
+                 your own Godot build or from GDExtensions are not, so gdls will not report \
+                 unknown identifiers or members anywhere in your code. To use your engine's \
+                 real API, set `godotBinaryPath` (or the GDLS_GODOT environment variable), or \
+                 point `extensionApiPath` at an extension_api.json."
             ),
         );
     }
