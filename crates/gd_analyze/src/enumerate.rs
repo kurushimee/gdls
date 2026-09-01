@@ -175,9 +175,12 @@ fn native_member_item(db: &NativeDb, declaring: Option<&str>, m: &NativeMember) 
             it.is_virtual = meth.is_virtual;
             it
         }
-        NativeMember::Signal(s) => {
-            MemberItem::new(db.name_of(s.name), MemberItemKind::Signal, None).with_owner(owner)
-        }
+        NativeMember::Signal(s) => MemberItem::new(
+            db.name_of(s.name),
+            MemberItemKind::Signal,
+            Some(native_signal_detail(db, declaring, s)),
+        )
+        .with_owner(owner),
         NativeMember::Enum(e) => {
             MemberItem::new(db.name_of(e.name), MemberItemKind::Enum, None).with_owner(owner)
         }
@@ -192,8 +195,22 @@ fn native_member_item(db: &NativeDb, declaring: Option<&str>, m: &NativeMember) 
 
 /// A native method's `(params) -> Return` detail string, types rendered the editor way.
 fn native_method_detail(db: &NativeDb, declaring: Option<&str>, m: &gd_types::Method) -> String {
-    let params: Vec<String> = m
-        .params
+    format!(
+        "({}) -> {}",
+        native_params(db, declaring, &m.params),
+        db.display_type(&m.return_type, declaring)
+    )
+}
+
+/// A native signal's `(params)` detail string. No arrow: a signal has no return, and the params
+/// are the whole question a `connect` callsite is asking.
+fn native_signal_detail(db: &NativeDb, declaring: Option<&str>, s: &gd_types::Signal) -> String {
+    format!("({})", native_params(db, declaring, &s.params))
+}
+
+/// `name: Type, …` for a native parameter list, types rendered the editor way.
+fn native_params(db: &NativeDb, declaring: Option<&str>, params: &[gd_types::Param]) -> String {
+    params
         .iter()
         .map(|p| {
             format!(
@@ -202,12 +219,8 @@ fn native_method_detail(db: &NativeDb, declaring: Option<&str>, m: &gd_types::Me
                 db.display_type(&p.ty, declaring)
             )
         })
-        .collect();
-    format!(
-        "({}) -> {}",
-        params.join(", "),
-        db.display_type(&m.return_type, declaring)
-    )
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Every member of a native class, **including inherited** (the [`NativeDb::all_members`] chain
@@ -440,8 +453,43 @@ fn collect_interface_members(
 
 /// A short detail string for an interface member, from its written type annotation (no lattice
 /// re-resolution — Phase 1 enumerates). `None` when untyped.
+///
+/// A `func`/`signal` renders its parameter list, the same `(params) -> Return` /  `(params)` shape
+/// the native arm produces. `MemberDecl.ty` is the RETURN type for a func, so rendering it alone
+/// made a zero-arg `func describe() -> String` read exactly like a property of type `String`, and
+/// made a `-> void` method render as nothing at all (#505).
 fn interface_member_detail(m: &gd_project::MemberDecl) -> Option<String> {
-    m.ty.render()
+    match m.kind {
+        gd_project::MemberKind::Func => Some(format!(
+            "({}) -> {}",
+            interface_params(m),
+            // `interface::type_expr` collapses an explicit `-> void` and an absent return
+            // annotation to the same `TypeExpr::None`. Render `void`, matching the hover
+            // formatter's decision for the same ambiguity: in typed GDScript explicit-void
+            // functions vastly outnumber genuinely-unannotated ones.
+            m.ty.render().unwrap_or_else(|| "void".to_owned())
+        )),
+        gd_project::MemberKind::Signal => Some(format!("({})", interface_params(m))),
+        _ => m.ty.render(),
+    }
+}
+
+/// `name: Type, …` for an interface member's parameter list. `param_names` runs parallel to
+/// `params`; an unnamed parameter renders type-only, and an unannotated one renders `Variant`,
+/// which is what an unannotated GDScript parameter accepts.
+fn interface_params(m: &gd_project::MemberDecl) -> String {
+    m.params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let ty = p.render().unwrap_or_else(|| "Variant".to_owned());
+            match m.param_names.get(i).map(String::as_str) {
+                Some(n) if !n.is_empty() => format!("{n}: {ty}"),
+                _ => ty,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Every member reachable from a script/class `start` through its `extends` chain, as owned
