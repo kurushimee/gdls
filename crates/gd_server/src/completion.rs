@@ -802,6 +802,27 @@ fn identifier_items(
         );
     }
 
+    // (5b) #536: a class the project declares through a `.gdextension` that this dump does not
+    // carry. The analyzer already refuses to claim such a name is undeclared, and Godot with the
+    // extension loaded lists it from ClassDB; leaving it out of the list while staying silent
+    // about it is the two halves disagreeing about the same name. The item carries the name and
+    // nothing else, which is all gdls knows — `completionItem/resolve` finds no class body and
+    // returns it unchanged.
+    for class in state.workspace.native.extension_declared_missing_names() {
+        let class = class.to_string();
+        push(
+            &class,
+            CompletionItemKind::CLASS,
+            false,
+            CompletionData::NativeClass {
+                class: class.clone(),
+            },
+            &mut items,
+            &mut seen,
+            &mut rank,
+        );
+    }
+
     // (6) Godot's fixed keyword tier, verbatim and in its own order — the last thing
     // `_find_identifiers` appends (`gdscript_editor.cpp:1620-1631`). `PI`/`TAU`/`INF`/`NAN` are
     // constants and `self`/`super` are neither constants nor keywords, but upstream emits all
@@ -1082,6 +1103,18 @@ fn type_name_items(
 
     // Native engine classes.
     for class in native.class_names() {
+        push(
+            class,
+            CompletionItemKind::CLASS,
+            CompletionData::NativeClass {
+                class: class.to_string(),
+            },
+        );
+    }
+
+    // #536: extension-declared classes this dump lacks. A type position is where they are written,
+    // and the analyzer accepts them there, so this is the tier that most needed them.
+    for class in native.extension_declared_missing_names() {
         push(
             class,
             CompletionItemKind::CLASS,

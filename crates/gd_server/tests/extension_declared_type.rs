@@ -10,11 +10,13 @@
 
 mod common;
 
-use common::{file_uri, notification, recv, request, shutdown, TempProject};
+use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};
 use lsp_types::{
-    DidOpenTextDocumentParams, InitializeParams, InitializedParams, PositionEncodingKind,
-    PublishDiagnosticsParams, TextDocumentItem,
+    CompletionParams, CompletionResponse, DidOpenTextDocumentParams, Hover, HoverContents,
+    HoverParams, InitializeParams, InitializedParams, PartialResultParams, Position,
+    PositionEncodingKind, PublishDiagnosticsParams, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, WorkDoneProgressParams,
 };
 
 /// Engine-`Exact` dump WITHOUT any extension class — the "dump ran without extension
@@ -174,4 +176,98 @@ fn undeclared_unknown_type_still_errors() {
         "an undeclared unknown type must still emit the error: {diags:?}"
     );
     shutdown(&client, handle);
+}
+
+/// #536: gdls is sure enough that `BTTask` exists to refuse a "could not find type" claim about
+/// it, so it is sure enough to offer it. Leaving it out of the list while staying silent about it
+/// is the two halves disagreeing about the same name.
+#[test]
+fn an_extension_declared_class_is_offered_and_hovers_as_itself() {
+    let p = setup_project(true, NODE_API);
+    p.write("src/main.gd", "extends Node\n\nvar task: BTTask\n");
+    let (client, handle) = boot(&p);
+    let diags = open_and_collect(&client, &p, "src/main.gd").diagnostics;
+    assert!(diags.is_empty(), "the carve-out still holds: {diags:?}");
+
+    let uri = file_uri(&p.root.join("src/main.gd"));
+
+    // The card names the class, not the `Variant` the analyzer's refusal leaves behind.
+    let hover = hover_at(&client, &uri, Position::new(2, 12));
+    let md = hover.as_ref().map(hover_markdown).unwrap_or_default();
+    assert!(
+        md.contains("<Native> class BTTask"),
+        "an extension-declared class hovers as itself: {md:?}"
+    );
+
+    // Both declared names reach the type-position list, in a project whose dump carries neither.
+    let labels = completion_labels(&client, &uri, Position::new(2, 16));
+    assert!(
+        labels.iter().any(|l| l == "BTTask") && labels.iter().any(|l| l == "Blackboard"),
+        "both `[icons]` names are offered in a type position"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// A name the dump DOES carry is offered once, from the class tier, not twice.
+#[test]
+fn a_partially_visible_extension_offers_each_name_once() {
+    let p = setup_project(true, PARTIAL_API);
+    p.write("src/main.gd", "extends Node\n\nvar task: BTTask\n");
+    let (client, handle) = boot(&p);
+    let _ = open_and_collect(&client, &p, "src/main.gd");
+    let uri = file_uri(&p.root.join("src/main.gd"));
+    let labels = completion_labels(&client, &uri, Position::new(2, 16));
+    assert_eq!(
+        labels.iter().filter(|l| *l == "Blackboard").count(),
+        1,
+        "the dump carries Blackboard, so the declared-missing tier must not repeat it"
+    );
+    assert!(labels.iter().any(|l| l == "BTTask"));
+    shutdown(&client, handle);
+}
+
+fn hover_at(client: &Connection, uri: &lsp_types::Uri, position: Position) -> Option<Hover> {
+    let params = HoverParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    client
+        .sender
+        .send(request(20, "textDocument/hover", params))
+        .unwrap();
+    let resp = recv_response(client);
+    serde_json::from_value(resp.result.expect("hover result")).expect("valid Option<Hover>")
+}
+
+fn hover_markdown(hover: &Hover) -> String {
+    match &hover.contents {
+        HoverContents::Markup(m) => m.value.clone(),
+        other => panic!("expected markup hover contents, got {other:?}"),
+    }
+}
+
+fn completion_labels(client: &Connection, uri: &lsp_types::Uri, position: Position) -> Vec<String> {
+    let params = CompletionParams {
+        text_document_position: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+        partial_result_params: PartialResultParams::default(),
+        context: None,
+    };
+    client
+        .sender
+        .send(request(21, "textDocument/completion", params))
+        .unwrap();
+    let resp = recv_response(client);
+    let value = resp.result.expect("completion result");
+    match serde_json::from_value::<CompletionResponse>(value).expect("valid CompletionResponse") {
+        CompletionResponse::Array(items) => items.into_iter().map(|i| i.label).collect(),
+        CompletionResponse::List(list) => list.items.into_iter().map(|i| i.label).collect(),
+    }
 }

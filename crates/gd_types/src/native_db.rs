@@ -360,7 +360,21 @@ impl NativeDb {
             .insert(self.interner.intern(name));
     }
 
-    /// Whether the project declares `name` via a GDExtension while this dump lacks it — the
+    /// Enumerate every extension-declared class this dump lacks, **sorted** — the same set
+    /// [`Self::is_extension_declared_missing`] answers one name at a time. gdls is sure enough
+    /// these names exist to refuse a "could not find type" claim about them, so it is sure enough
+    /// to offer them; a consumer that needs a class BODY still finds nothing and degrades.
+    pub fn extension_declared_missing_names(&self) -> impl Iterator<Item = &str> + '_ {
+        let mut all: Vec<&str> = self
+            .extension_declared_missing
+            .iter()
+            .map(|s| self.name_of(*s))
+            .collect();
+        all.sort_unstable();
+        all.into_iter()
+    }
+
+    /// Whether the project declares `name` via a GDExtension while this dump lacks it — the    /// Whether the project declares `name` via a GDExtension while this dump lacks it — the
     /// per-class carve-out to the `Exact`-provenance negative-claim soundness bar.
     pub fn is_extension_declared_missing(&self, name: &str) -> bool {
         self.interner
