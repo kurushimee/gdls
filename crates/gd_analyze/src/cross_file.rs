@@ -138,6 +138,19 @@ pub trait CrossFileQuery {
         None
     }
 
+    /// The class a TEXT resource holds, read off its own header line
+    /// (`[gd_resource type="Theme" script_class="Foo" …]`). Godot loads the resource and types the
+    /// `preload` by what came back (analyzer.cpp:4723's `type_from_variant`); the header carries
+    /// that answer without the load, and a `script_class` names the script an instance carries
+    /// rather than the script's native base. `raw` is the preload argument as written, already
+    /// dereferenced if it was a uid. `None` — a binary `.res`, an unreadable file, no header —
+    /// degrades to the caller's `Resource` floor. Candidates come back in priority order, so a
+    /// `script_class` the project does not declare still lets `type=` answer. Empty by default,
+    /// which keeps test stubs permissive.
+    fn text_resource_classes(&self, _from: Option<FileId>, _raw: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The resource class an IMPORTED asset preloads as: the `type=` line of the asset's `.import`
     /// sidecar `[remap]` section. Godot types `preload` by the class of the resource the importer
     /// produced (analyzer.cpp:4749-4751 over the loaded Resource), and never guesses from the

@@ -109,6 +109,48 @@ impl<'a> WorkspaceXFileQuery<'a> {
         }
     }
 
+    /// The on-disk path a `preload` argument names: `res://` against the project root, anything
+    /// else joined onto the referring script's own directory (analyzer.cpp:437's relativization,
+    /// mirroring `resolve_path_from`). `from` is the preload's containing file, and is what a
+    /// relative form needs.
+    fn preload_asset_path(&self, from: Option<FileId>, raw: &str) -> Option<camino::Utf8PathBuf> {
+        if let Some(abs) = gd_project::paths::res_to_path(&self.project_root, raw) {
+            return Some(abs);
+        }
+        let from_dir = Utf8Path::new(self.inner.index.path(from?)?)
+            .parent()?
+            .to_path_buf();
+        Some(gd_project::normalize_path(&from_dir.join(raw)))
+    }
+
+    /// #525: the class a TEXT resource holds, read off its own header line
+    /// (`[gd_resource type="Theme" script_class="Foo" …]`). Godot loads the resource and types the
+    /// `preload` by what came back (analyzer.cpp:4723's `type_from_variant`); the header is that
+    /// answer without the load. `script_class` wins when present — a resource carrying a script is
+    /// an instance of that script, and its `type=` is only the script's own native base.
+    ///
+    /// Reads ONE line. A scene is the largest text file in a project, and a binary `.res` has no
+    /// readable header at all, which comes back `None` and keeps the caller's `Resource` floor.
+    fn text_resource_header_classes(&self, from: Option<FileId>, raw: &str) -> Vec<String> {
+        let Some(header) = self.resource_header_line(from, raw) else {
+            return Vec::new();
+        };
+        ["script_class", "type"]
+            .into_iter()
+            .filter_map(|key| header_quoted_value(&header, key))
+            .collect()
+    }
+
+    /// The first line of a resource file, or `None` when there is nothing readable there.
+    fn resource_header_line(&self, from: Option<FileId>, raw: &str) -> Option<String> {
+        use std::io::BufRead;
+        let path = self.preload_asset_path(from, raw)?;
+        let file = std::fs::File::open(path.as_std_path()).ok()?;
+        let mut header = String::new();
+        std::io::BufReader::new(file).read_line(&mut header).ok()?;
+        Some(header)
+    }
+
     /// Resolve `query` against ONE scene `scene_res` that attaches `script_res`, returning the type
     /// fact of the access target. Returns `None` (→ permissive at the caller) on any uncertainty:
     ///
@@ -190,6 +232,10 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
         self.inner.resolve_path_from(from, raw)
     }
 
+    fn resolve_uid(&self, uid: &str) -> Option<String> {
+        self.inner.resolve_uid(uid)
+    }
+
     /// The importer's product class for an imported asset, read from `<asset>.import`'s
     /// `[remap] type=` line at analysis time (read-through: a changed sidecar is picked up by
     /// the next analysis of a referring file). `res://` resolves against the project root; a
@@ -201,23 +247,12 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
     /// in-memory index straight to disk, against the "eager interfaces, lazy bodies"
     /// arrangement elsewhere. Bounded by preloads-in-one-file, so it is fine in practice;
     /// if a 10k-file profile ever says otherwise, this is the line to memoize.
-    fn resolve_uid(&self, uid: &str) -> Option<String> {
-        self.inner.resolve_uid(uid)
+    fn text_resource_classes(&self, from: Option<FileId>, raw: &str) -> Vec<String> {
+        self.text_resource_header_classes(from, raw)
     }
 
     fn imported_resource_class(&self, from: Option<FileId>, raw: &str) -> Option<String> {
-        let asset_path = if let Some(abs) = gd_project::paths::res_to_path(&self.project_root, raw)
-        {
-            abs
-        } else {
-            // Relative form: resolve against the referring script's directory, mirroring
-            // `resolve_path_from`'s join. `from` is the preload's containing file.
-            let from = from?;
-            let from_dir = Utf8Path::new(self.inner.index.path(from)?)
-                .parent()?
-                .to_path_buf();
-            gd_project::normalize_path(&from_dir.join(raw))
-        };
+        let asset_path = self.preload_asset_path(from, raw)?;
         // The sidecar is a sibling file with `.import` APPENDED (`tex.svg` → `tex.svg.import`);
         // `with_extension` would replace the real extension.
         let sidecar_path = camino::Utf8PathBuf::from(format!("{asset_path}.import"));
@@ -330,6 +365,18 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
 /// Section-scoped (`[params]` and later sections may carry their own `type=`-ish keys), tolerant
 /// of `//`-comments and `=`-spacing, and exact about the key — `importer` must not match. A missing
 /// section, missing key, or EMPTY value is `None` (the caller degrades to Variant; never guess).
+/// `key="Value"` out of a `[gd_resource …]` / `[gd_scene …]` header line. Exact about the key, so
+/// `script_class` never answers a `type` query, and an empty value is `None` (the caller degrades
+/// rather than claiming a class named "").
+fn header_quoted_value(header: &str, key: &str) -> Option<String> {
+    let needle = format!(" {key}=\"");
+    let at = header.find(&needle)?;
+    let rest = &header[at + needle.len()..];
+    let end = rest.find('"')?;
+    let value = &rest[..end];
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 fn parse_import_remap_type(sidecar: &str) -> Option<String> {
     let mut in_remap = false;
     for line in sidecar.lines() {

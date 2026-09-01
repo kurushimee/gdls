@@ -9798,6 +9798,24 @@ fn preload_nonscript_resource_type(
     } else {
         path
     };
+    // #525: a text resource says what it holds on its own header line, and that is what Godot's
+    // `type_from_variant` answers after loading it. Read it BEFORE the extension map, whose
+    // `Resource` is only a floor — passing a `Resource` where a `Theme` is wanted reports an unsafe
+    // argument the engine never does. A `script_class` names the script the resource carries, so
+    // the preload is an INSTANCE of that script; a plain `type=` is a native class.
+    if matches!(path.rsplit('.').next(), Some("tres") | Some("res")) {
+        for name in ctx.xfile.text_resource_classes(from, path) {
+            if ctx.native.class_named(&name).is_some() {
+                return Some(native(&name));
+            }
+            if let Some(fid) = ctx.xfile.global_class_file(&name) {
+                let mut dt = script_instance_datatype(ctx, fid, Vec::new());
+                dt.type_source = TypeSource::AnnotatedInferred;
+                dt.is_constant = true;
+                return Some(dt);
+            }
+        }
+    }
     let by_extension = match path.rsplit('.').next() {
         Some("tscn") | Some("scn") => Some("PackedScene"),
         Some("gdshader") => Some("Shader"),
