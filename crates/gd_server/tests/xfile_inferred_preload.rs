@@ -5,11 +5,12 @@
 
 mod common;
 
-use common::{file_uri, notification, recv, request, shutdown, TempProject};
+use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};
 use lsp_types::{
-    DidOpenTextDocumentParams, InitializeParams, InitializedParams, PublishDiagnosticsParams,
-    TextDocumentItem,
+    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, InitializeParams,
+    InitializedParams, Position, PublishDiagnosticsParams, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, WorkDoneProgressParams,
 };
 
 const LIB_GD: &str = "\
@@ -17,6 +18,10 @@ class_name PreloadLib
 extends Node
 var scene := preload(\"res://thing.tscn\")
 var glob := PI
+var typed: Node = null
+var opaque = untyped()
+func untyped():
+\treturn 1
 ";
 
 const READER_GD: &str = "\
@@ -49,8 +54,19 @@ fn project() -> TempProject {
     p.write("lib.gd", LIB_GD);
     p.write("reader.gd", READER_GD);
     p.write("bad_reader.gd", BAD_READER_GD);
+    p.write("heir.gd", HEIR_GD);
     p
 }
+
+/// A subclass reading the same members BARE — the other hover path, which resolves through the
+/// binding rather than through a base expression.
+const HEIR_GD: &str = "\
+extends PreloadLib
+func use() -> void:
+\tprint(scene)
+\tprint(typed)
+\tprint(opaque)
+";
 
 fn boot(p: &TempProject) -> (Connection, std::thread::JoinHandle<anyhow::Result<()>>) {
     let (server, client) = Connection::memory();
@@ -108,6 +124,94 @@ fn open(client: &Connection, uri: &lsp_types::Uri, text: &str) -> PublishDiagnos
         ))
         .unwrap();
     recv_publish(client)
+}
+
+fn hover_at(client: &Connection, uri: &lsp_types::Uri, position: Position) -> Option<Hover> {
+    let params = HoverParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        },
+        work_done_progress_params: WorkDoneProgressParams::default(),
+    };
+    client
+        .sender
+        .send(request(10, "textDocument/hover", params))
+        .unwrap();
+    let resp = recv_response(client);
+    let value = resp.result.expect("hover result always present");
+    serde_json::from_value(value).expect("valid Option<Hover>")
+}
+
+fn hover_markdown(hover: &Hover) -> &str {
+    match &hover.contents {
+        HoverContents::Markup(m) => m.value.as_str(),
+        other => panic!("expected markup hover contents, got {other:?}"),
+    }
+}
+
+/// #526: the card and the diagnostics have to agree about what a member is. The strict profile
+/// checks `l.scene` against `PackedScene`, so hover must say `PackedScene` too — it used to render
+/// the bare `var scene`, because the shallow interface has no type for a `preload` and the card
+/// read only that.
+#[test]
+fn a_cross_file_member_hovers_with_the_type_the_analyzer_resolved() {
+    let p = project();
+    let (client, server_thread) = boot(&p);
+    let uri = file_uri(&p.root.join("reader.gd"));
+    let _ = open(&client, &uri, READER_GD);
+
+    // `l.scene` on line 2, at the `s` of `scene`.
+    let scene = hover_at(&client, &uri, Position::new(2, 10)).expect("hover on l.scene");
+    assert!(
+        hover_markdown(&scene).contains("var scene: PackedScene"),
+        "the card must name what the diagnostics checked: {}",
+        hover_markdown(&scene)
+    );
+
+    // `l.glob` on line 3, at the `g` of `glob`.
+    let glob = hover_at(&client, &uri, Position::new(3, 10)).expect("hover on l.glob");
+    assert!(
+        hover_markdown(&glob).contains("var glob: float"),
+        "a member inferred from PI reads as float: {}",
+        hover_markdown(&glob)
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The bare-read path reaches the same answer, and the two things that must NOT change: an
+/// annotated member keeps the author's own spelling, and a member the analyzer could only call
+/// `Variant` stays bare rather than being handed a type gdls never read.
+#[test]
+fn a_bare_read_of_an_inherited_member_agrees_and_the_negatives_hold() {
+    let p = project();
+    let (client, server_thread) = boot(&p);
+    let uri = file_uri(&p.root.join("heir.gd"));
+    let _ = open(&client, &uri, HEIR_GD);
+
+    let scene = hover_at(&client, &uri, Position::new(2, 9)).expect("hover on scene");
+    assert!(
+        hover_markdown(&scene).contains("var scene: PackedScene"),
+        "{}",
+        hover_markdown(&scene)
+    );
+
+    let typed = hover_at(&client, &uri, Position::new(3, 9)).expect("hover on typed");
+    assert!(
+        hover_markdown(&typed).contains("var typed: Node"),
+        "an annotation is the author's own spelling: {}",
+        hover_markdown(&typed)
+    );
+
+    let opaque = hover_at(&client, &uri, Position::new(4, 9)).expect("hover on opaque");
+    assert!(
+        !hover_markdown(&opaque).contains("var opaque:"),
+        "nothing better than Variant means nothing appended: {}",
+        hover_markdown(&opaque)
+    );
+
+    shutdown(&client, server_thread);
 }
 
 #[test]
