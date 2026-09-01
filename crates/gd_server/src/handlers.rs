@@ -4283,7 +4283,7 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // (`l.helper()`) identically. A bare property read (`node.position`) is deliberately NOT matched
     // (it isn't a call callee) so it falls through to the raw-identifier scan — the method path emits
     // `Binding::Call` records only and would otherwise drop every property-read occurrence.
-    let is_method_or_signal = is_member_or_attribute_ident(&parsed.tree, node_id);
+    let structurally_method = is_member_or_attribute_ident(&parsed.tree, node_id);
 
     // M6-D: an autoload singleton name (e.g. `Global` in `Global.popup_error()`) is the base of a
     // subscript, not a call callee, so `is_member_or_attribute_ident` returns false and it would
@@ -4338,55 +4338,65 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
     // collection (`push_callee_ident_locations`) and the decl canonicalization discriminate a
     // same-file ROOT method from an inner-class method of the same name. Empty = the root class.
     let mut target_class_path: Vec<String> = Vec::new();
-    let target_file: Option<gd_project::FileId> = if is_method_or_signal {
-        // Analyze the current file to determine target_file.
-        let target_file_from_binding = if let Some(p) = current_path
-            .as_ref()
-            .filter(|p| p.extension() == Some("gd"))
-        {
-            let cur_result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
-            // Look for a Binding::Call whose callee identifier span (in the parse tree)
-            // contains the cursor byte. If found (call-site click), capture BOTH the callee's
-            // Script-declaring file AND its inner-class `class_path` (#213). The shared callee-span
-            // map (`callee_spans`, hoisted above) is built lazily on the first matching binding and
-            // reused by push_callee_ident_locations below.
-            cur_result.bindings().iter().find_map(|b| {
-                if let Binding::Call {
-                    callee,
-                    callee_name,
-                    call_site,
-                    ..
-                } = b
-                {
-                    if callee_name == name.as_str() {
-                        let spans =
-                            callee_spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
-                        if let Some(ident_span) = spans.get(call_site).copied() {
-                            if ident_span.start <= byte && byte < ident_span.end {
-                                let cp = match callee {
-                                    CalleeTarget::Script { class_path, .. } => class_path.clone(),
-                                    _ => Vec::new(),
-                                };
-                                return Some((callee.script_file(), cp));
-                            }
+    // #544: the call-site probe runs for ANY `.gd` cursor, not only a structurally-method one, so
+    // a click on a BARE callee reaches the same routing a click on the declaration takes. Before
+    // this, a bare click fell to the non-method path, which collects `Binding::Use` sites only —
+    // no dotted call sites, no override group — and answered a strict subset of what the same
+    // symbol returns from any other anchor. The reroute is gated on the callee resolving to a
+    // SCRIPT: a bare native or utility call (`print()`, `set_process()`) keeps its current answer.
+    let target_file_from_binding = if let Some(p) = current_path
+        .as_ref()
+        .filter(|p| p.extension() == Some("gd"))
+    {
+        let cur_result = analyze_with_request_token(state, &key, p, &parsed.tree, &text);
+        // Look for a Binding::Call whose callee identifier span (in the parse tree)
+        // contains the cursor byte. If found (call-site click), capture BOTH the callee's
+        // Script-declaring file AND its inner-class `class_path` (#213). The shared callee-span
+        // map (`callee_spans`, hoisted above) is built lazily on the first matching binding and
+        // reused by push_callee_ident_locations below.
+        cur_result.bindings().iter().find_map(|b| {
+            if let Binding::Call {
+                callee,
+                callee_name,
+                call_site,
+                ..
+            } = b
+            {
+                if callee_name == name.as_str() {
+                    let spans =
+                        callee_spans.get_or_insert_with(|| callee_name_token_spans(&parsed.tree));
+                    if let Some(ident_span) = spans.get(call_site).copied() {
+                        if ident_span.start <= byte && byte < ident_span.end {
+                            let cp = match callee {
+                                CalleeTarget::Script { class_path, .. } => class_path.clone(),
+                                _ => Vec::new(),
+                            };
+                            return Some((callee.script_file(), cp));
                         }
                     }
                 }
-                None
-            })
-        } else {
+            }
             None
-        };
-        // Distinguish the two None origins that the old `.flatten().or(current_fid)` conflated —
-        // collapsing them dropped every cross-file reference for native subscript calls
-        // (e.g. `node.queue_free()`, whose Binding::Call classifies a non-Script callee):
-        //   Some((Some(f), cp)) — call-site click on a resolved callee: declaring file `f`, chain `cp`.
-        //   Some((None, _))     — call-site click on a NATIVE/unresolved callee: keep target_file None so
-        //                         the scan falls back to push_identifier_locations (raw text scan) rather
-        //                         than filtering on a Script file no Binding::Call carries.
-        //   None                — no Binding::Call at the cursor (declaration-site click): the current
-        //                         file declares the method, so target_file = current_fid and the chain
-        //                         is the clicked decl's own inner-class path.
+        })
+    } else {
+        None
+    };
+    // Distinguish the two None origins that the old `.flatten().or(current_fid)` conflated —
+    // collapsing them dropped every cross-file reference for native subscript calls
+    // (e.g. `node.queue_free()`, whose Binding::Call classifies a non-Script callee):
+    //   Some((Some(f), cp)) — call-site click on a resolved callee: declaring file `f`, chain `cp`.
+    //   Some((None, _))     — call-site click on a NATIVE/unresolved callee: keep target_file None so
+    //                         the scan falls back to push_identifier_locations (raw text scan) rather
+    //                         than filtering on a Script file no Binding::Call carries.
+    //   None                — no Binding::Call at the cursor (declaration-site click): the current
+    //                         file declares the method, so target_file = current_fid and the chain
+    //                         is the clicked decl's own inner-class path.
+    // A bare callee joins the method path only when the analyzer resolved it to a project script.
+    // `Some((None, _))` is a native or unresolved callee: it keeps the raw-identifier answer it has
+    // today, so `print()` and `set_process()` are unaffected and rename still refuses them.
+    let is_method_or_signal =
+        structurally_method || matches!(&target_file_from_binding, Some((Some(_), _)));
+    let target_file: Option<gd_project::FileId> = if is_method_or_signal {
         match target_file_from_binding {
             Some((cf, cp)) => {
                 target_class_path = cp;
@@ -5217,7 +5227,7 @@ fn collect_in_file_highlight_sites(
     // Same role detection as `references`: a method/signal callee (declaration click or call-site
     // attribute click) takes the call-projection path; everything else takes the non-method
     // classification. Purely structural — no analyzer call.
-    let is_method_or_signal = is_member_or_attribute_ident(&parsed.tree, node_id);
+    let structurally_method = is_member_or_attribute_ident(&parsed.tree, node_id);
 
     // An autoload singleton name resolves to the autoload script's FileId only when the analyzer
     // pinned THIS span to it — a local/param/member named the same shadows the singleton. Matches
@@ -5252,39 +5262,43 @@ fn collect_in_file_highlight_sites(
     // #213: carry the callee's inner-class `class_path` alongside `target_file` — mirrors `references`
     // so a same-file ROOT method and inner-class method of the same name highlight distinctly.
     let mut target_class_path: Vec<String> = Vec::new();
-    let target_file: Option<gd_project::FileId> = if is_method_or_signal {
-        let target_file_from_binding = if let Some(p) = current_path
-            .as_ref()
-            .filter(|p| p.extension() == Some("gd"))
-        {
-            let cur_result = analyze_with_request_token(state, key, p, &parsed.tree, text);
-            cur_result.bindings().iter().find_map(|b| {
-                if let Binding::Call {
-                    callee,
-                    callee_name,
-                    call_site,
-                    ..
-                } = b
-                {
-                    if callee_name == name {
-                        let spans =
-                            callee_spans.get_or_insert_with(|| callee_ident_spans(&parsed.tree));
-                        if let Some(ident_span) = spans.get(call_site).copied() {
-                            if ident_span.start <= byte && byte < ident_span.end {
-                                let cp = match callee {
-                                    CalleeTarget::Script { class_path, .. } => class_path.clone(),
-                                    _ => Vec::new(),
-                                };
-                                return Some((callee.script_file(), cp));
-                            }
+    // #544: same reroute as `references`. documentHighlight's contract is the in-file subset of
+    // that answer, so a bare-callee click has to take the same path or the two disagree.
+    let target_file_from_binding = if let Some(p) = current_path
+        .as_ref()
+        .filter(|p| p.extension() == Some("gd"))
+    {
+        let cur_result = analyze_with_request_token(state, key, p, &parsed.tree, text);
+        cur_result.bindings().iter().find_map(|b| {
+            if let Binding::Call {
+                callee,
+                callee_name,
+                call_site,
+                ..
+            } = b
+            {
+                if callee_name == name {
+                    let spans =
+                        callee_spans.get_or_insert_with(|| callee_name_token_spans(&parsed.tree));
+                    if let Some(ident_span) = spans.get(call_site).copied() {
+                        if ident_span.start <= byte && byte < ident_span.end {
+                            let cp = match callee {
+                                CalleeTarget::Script { class_path, .. } => class_path.clone(),
+                                _ => Vec::new(),
+                            };
+                            return Some((callee.script_file(), cp));
                         }
                     }
                 }
-                None
-            })
-        } else {
+            }
             None
-        };
+        })
+    } else {
+        None
+    };
+    let is_method_or_signal =
+        structurally_method || matches!(&target_file_from_binding, Some((Some(_), _)));
+    let target_file: Option<gd_project::FileId> = if is_method_or_signal {
         match target_file_from_binding {
             Some((cf, cp)) => {
                 target_class_path = cp;
@@ -6579,15 +6593,16 @@ fn callee_name_token_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
 /// This replaces [`push_identifier_locations`] for method/signal targets in the M6-E references
 /// fix: raw textual identifier matching would include unrelated same-named declarations (e.g.
 /// `func helper():` in `other.gd`) whereas this filters to genuine callers of the specific method
-/// declared in `target_file`. Only subscript-attribute call sites are emitted here; bare and
-/// `super` call sites are intentionally absent — but NOT dropped from references. The dispatcher
-/// pre-reduces a bare callee (and a subscript callee's base) as an identifier, recording a
-/// `Binding::Use` at that narrow span which [`push_binding_locations`] reports. (Bare calls DO
-/// classify their declaring script on `CalleeTarget::Script` — recall for them rides that `Use`
-/// binding, not this call projection; see `references_finds_bare_same_file_call` and
-/// `references_finds_signal_emit_and_connect_sites`. A bare callee that resolves through the
-/// CROSS-FILE chain gets its `Use` from `reduce_call` rather than the dispatcher's pre-reduce,
-/// since `reduce_identifier` skips step 3.5 in callee position — #541.)
+/// declared in `target_file`. Every callee SHAPE is emitted — subscript-attribute, `super`, and
+/// (since #544) bare — because the span map is [`callee_name_token_spans`], which covers all three.
+/// A bare site is therefore reported twice, once here and once by the `Binding::Use` collector,
+/// but both spans are the same identifier node, so the final sort-and-dedup collapses them.
+///
+/// Before #544 this emitted subscript-attribute sites only, on the grounds that recall for a bare
+/// call rides its `Use` binding. It does — but only when the anchor took the method path at all,
+/// and a bare-callee click did not, so the same symbol answered a strict subset from that one
+/// anchor. See `references_symmetry.rs`, `references_finds_bare_same_file_call` and
+/// `references_finds_signal_emit_and_connect_sites`.
 ///
 /// Caller must ensure `target_file` is `Some` before calling; the `None` guard lives in
 /// `references()` (fall back to `push_identifier_locations` when `target_file` is `None`).
@@ -6625,7 +6640,7 @@ fn push_callee_ident_locations(
                 && class_path.as_slice() == target_class_path
                 && callee_name == name
             {
-                let spans = callee_spans.get_or_insert_with(|| callee_ident_spans(tree));
+                let spans = callee_spans.get_or_insert_with(|| callee_name_token_spans(tree));
                 if let Some(span) = spans.get(call_site).copied() {
                     out.push(Location {
                         uri: uri.clone(),
