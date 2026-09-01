@@ -1022,6 +1022,27 @@ fn classify_anchored(
             prefix,
         ));
     }
+    // #509: `_` lexes as `TokenKind::Underscore` (Godot's match wildcard,
+    // `gdscript_tokenizer.cpp:576`), not an identifier, so the prefix-anchored block below never
+    // saw it — and `_` is the first character of every Godot virtual, so the override list
+    // appeared on `func `, vanished on `func _`, and came back on `func _r`. Godot opens
+    // `COMPLETION_OVERRIDE_METHOD` before it consumes the name at all
+    // (`gdscript_parser.cpp:1781`), so it completes here too.
+    //
+    // Scoped to this one position rather than widened into `is_word_token`, which also gates the
+    // assignment, member, and type-position arms — `_` is legal in those for unrelated reasons
+    // (`match _:` above all). The span rides along as the prefix so the completion REPLACES the
+    // `_` instead of inserting before it and producing `func __ready`.
+    if anchor_kind == Underscore && tokens[i].span.end == byte {
+        if let Some(p) = prev_meaningful(tokens, i) {
+            if tokens[p].kind == Func && is_class_body_func_position(tokens, p) {
+                return Some(CompletionContext::new(
+                    CompletionKind::OverrideMethod,
+                    Some(tokens[i].span),
+                ));
+            }
+        }
+    }
     if is_word_token(anchor_kind) && tokens[i].span.end == byte {
         if let Some(p) = prev_meaningful(tokens, i) {
             match tokens[p].kind {
