@@ -117,7 +117,7 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
     // cursor, so the client inserts without deleting). Override stubs are the one exception: accepting
     // a full signature over an existing `func name():` skeleton must consume that stale same-line
     // signature tail too, or the client applies source-invalid `func name(...):\n\t$0():`.
-    let edit_range = if matches!(ctx.kind, CompletionKind::OverrideMethod) {
+    let edit_range = if matches!(ctx.kind, CompletionKind::OverrideMethod { .. }) {
         override_method_range(&mapper, &tokens, &text, ctx.prefix, byte, tdp.position)
     } else {
         prefix_range(&mapper, ctx.prefix, tdp.position)
@@ -244,10 +244,17 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
             property_method_items(state, &parsed.tree, analyzed.as_deref(), &render)
         }
         CompletionKind::PropertyAccessor => property_accessor_items(&render),
-        CompletionKind::OverrideMethod => {
+        CompletionKind::OverrideMethod { is_static } => {
             let own_file =
                 crate::uri::uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
-            override_method_items(state, &parsed.tree, analyzed.as_deref(), own_file, &render)
+            override_method_items(
+                state,
+                &parsed.tree,
+                analyzed.as_deref(),
+                own_file,
+                *is_static,
+                &render,
+            )
         }
         // Deferred (`$`/`%`/`get_node`/path) — scene-aware node-path + resource-path completion
         // (M11 Phase 3). Each arm returns an empty list when nothing concrete is known (no scene
@@ -1978,23 +1985,26 @@ fn property_accessor_items(render: &RenderCtx) -> Vec<CompletionItem> {
 }
 
 // ===================================================================================================
-// OVERRIDE_METHOD — `func <cursor>` in a class body: overridable virtuals with a signature stub.
+// OVERRIDE_METHOD — `[static ]func <cursor>` in a class body: overridable methods with a stub.
 // ===================================================================================================
 
-/// `func <cursor>` at class-body statement start — the overridable parent methods, each rendered as
-/// a full signature stub (Godot `COMPLETION_OVERRIDE_METHOD`, `gdscript_editor.cpp:3681`).
+/// `func <cursor>` — or `static func <cursor>` — at class-body statement start: the overridable
+/// parent methods, each rendered as a full signature stub (Godot `COMPLETION_OVERRIDE_METHOD`,
+/// `gdscript_editor.cpp:3681`).
 ///
 /// **Two sources, in Godot's order** (`gdscript_editor.cpp:3685-3759`):
 /// - **Script-parent methods.** Godot's CLASS branch (`:3688-3708`) walks the `extends` chain
 ///   inserting **every** inherited `FUNCTION` member (not just virtuals — any parent `func` is
 ///   overridable), skipping ones already seen or already defined in the current class. The
-///   `static`-ness must match the cursor's (`:3701`); this context only fires for a bare
-///   non-`static` `func` (the classifier's [`is_class_body_func_position`] requires `func` to open
-///   the line), so only non-`static` parent funcs are offered. The stub is rendered from the
+///   `static`-ness must match the cursor's (`:3701`), which the classifier reports as
+///   `OverrideMethod { is_static }`: a bare `func` offers only non-`static` parent funcs, a `static
+///   func` only `static` ones. The stub is rendered from the
 ///   declaring file's real parsed signature (params with their **written** default text, never a
 ///   fabricated default — see [`script_override_stub_item`]).
 /// - **Native virtuals** (the chain's native tail, `:3729+`): the `is_virtual` methods (`_ready`,
-///   `_process`, …), with their real `(params) -> Ret` from the native DB.
+///   `_process`, …), with their real `(params) -> Ret` from the native DB. At a `static func` cursor
+///   Godot builds no virtual list at all and pushes one synthetic `_static_init` in its place
+///   (`:3742`), so that single entry is the whole native tail there.
 ///
 /// **A method the class already overrides is skipped** (Godot's `has_function(...) continue`,
 /// `:3697`/`:3744`). `self_chain_members` yields the chain **name-first** (the in-file override's own
@@ -2006,13 +2016,14 @@ fn override_method_items(
     tree: &ParseTree,
     analyzed: Option<&AnalysisResult>,
     own_file: Option<gd_project::FileId>,
+    is_static: bool,
     render: &RenderCtx,
 ) -> Vec<CompletionItem> {
     let Some(analyzed) = analyzed else {
         return Vec::new();
     };
     let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
-    self_chain_members(state, tree, analyzed)
+    let mut items: Vec<CompletionItem> = self_chain_members(state, tree, analyzed)
         .into_iter()
         // First-wins name-dedup across the whole chain (script members + the native tail): an
         // own/inherited method shadows the same-named parent method (the already-overridden skip).
@@ -2022,7 +2033,11 @@ fn override_method_items(
         .filter_map(|m| match &m.owner {
             // Native virtuals: `is_virtual` is set only for native members. Rendered from the
             // member's `detail` (`(params) -> Ret`).
-            MemberOwner::Native(_) if matches!(m.kind, MemberItemKind::Method) && m.is_virtual => {
+            // A `static func` cursor drops the whole virtual list — see the `_static_init` tail
+            // appended below (`gdscript_editor.cpp:3742`).
+            MemberOwner::Native(_)
+                if !is_static && matches!(m.kind, MemberItemKind::Method) && m.is_virtual =>
+            {
                 Some(OverrideStub::Native(m))
             }
             // The class's OWN methods (declared in this very file) are not override candidates —
@@ -2037,7 +2052,7 @@ fn override_method_items(
             // The owner's `inner` chain is intentionally ignored (`..`): override stubs are resolved
             // by file + name (`script_override_stub`), not per-inner-class.
             MemberOwner::Script { file, .. } if matches!(m.kind, MemberItemKind::Method) => {
-                let stub = script_override_stub(state, *file, &m.name)?;
+                let stub = script_override_stub(state, *file, &m.name, is_static)?;
                 Some(OverrideStub::Script(m, stub))
             }
             _ => None,
@@ -2049,8 +2064,25 @@ fn override_method_items(
                 script_override_stub_item(&m.name, &signature, rank, render)
             }
         })
-        .collect()
+        .collect();
+    // The static tail. Godot swaps the native virtual list for one synthetic entry at a `static func`
+    // cursor — `_static_init` is not truly virtual, but it is the one native-side name a static
+    // function can "override" (`gdscript_editor.cpp:3742`). It carries no parameters and returns
+    // nothing, so it renders as `_static_init() -> void:`. The chain's own dedup set decides whether
+    // to offer it: a class that already declares `_static_init` consumed the name above.
+    if is_static && !seen.contains(STATIC_INIT) {
+        items.push(script_override_stub_item(
+            STATIC_INIT,
+            &format!("{STATIC_INIT}() -> void"),
+            items.len(),
+            render,
+        ));
+    }
+    items
 }
+
+/// The one name a `static func` cursor can override (`gdscript_editor.cpp:3745`).
+const STATIC_INIT: &str = "_static_init";
 
 /// One resolved override-completion entry, tagged by source so the rank-and-render pass can build
 /// the right item (a native virtual from its `detail`, a script parent from its reparsed signature).
@@ -2060,10 +2092,10 @@ enum OverrideStub {
 }
 
 /// The `name<signature>` override-stub text for a script-parent method (e.g.
-/// `do_it(times: int, who, loud: bool = true) -> String`), or `None` when the method is `static` (it
-/// can't be overridden from a non-`static` `func` cursor — Godot's `is_static !=
-/// member.function->is_static` skip, `gdscript_editor.cpp:3701`), or when the declaring file / its
-/// `func` node / its signature span can't be resolved.
+/// `do_it(times: int, who, loud: bool = true) -> String`), or `None` when the method's staticness
+/// does not match the cursor's (Godot's `is_static != member.function->is_static` skip,
+/// `gdscript_editor.cpp:3701`), or when the declaring file / its `func` node / its signature span
+/// can't be resolved.
 ///
 /// The signature is the **verbatim source substring** the author wrote — Godot renders
 /// `identifier->name + member.function->signature + ":"`, where `signature` is the literal source
@@ -2076,15 +2108,16 @@ fn script_override_stub(
     state: &ServerState,
     file: gd_project::FileId,
     name: &str,
+    is_static: bool,
 ) -> Option<String> {
     let iface = state.workspace.index.interface(file)?;
     let decl = iface
         .members
         .iter()
         .find(|m| m.name == name && m.kind == gd_project::MemberKind::Func)?;
-    // The `OverrideMethod` context only fires for a bare (non-`static`) `func` cursor, so a `static`
-    // parent method does not match and is skipped (faithful to the `is_static !=` gate).
-    if decl.flags.is_static {
+    // A `static func` cursor offers only the parent's `static` methods, and a bare `func` cursor
+    // only the non-`static` ones (the `is_static !=` gate).
+    if decl.flags.is_static != is_static {
         return None;
     }
     let name_span = decl.name_span;

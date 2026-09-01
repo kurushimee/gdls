@@ -137,7 +137,10 @@ pub enum CompletionKind {
     SuperMethod,
 
     /// A `func <name>` at class-body statement start — completing a virtual-method override stub.
-    OverrideMethod,
+    /// `is_static` mirrors Godot's own read of the node it opened the context on
+    /// (`gdscript_editor.cpp:3688`): a `static func <name>` cursor offers the parent's STATIC
+    /// methods plus the synthetic `_static_init`, never the virtual list. #511.
+    OverrideMethod { is_static: bool },
 
     /// The method-name side of a property accessor: `var x: int:\n\tget = |` / `set = |`. The class's
     /// methods are wanted (the accessor binds a getter/setter by name), NOT an arbitrary expression —
@@ -1035,11 +1038,13 @@ fn classify_anchored(
     // `_` instead of inserting before it and producing `func __ready`.
     if anchor_kind == Underscore && tokens[i].span.end == byte {
         if let Some(p) = prev_meaningful(tokens, i) {
-            if tokens[p].kind == Func && is_class_body_func_position(tokens, p) {
-                return Some(CompletionContext::new(
-                    CompletionKind::OverrideMethod,
-                    Some(tokens[i].span),
-                ));
+            if tokens[p].kind == Func {
+                if let Some(is_static) = class_body_func_static(tokens, p) {
+                    return Some(CompletionContext::new(
+                        CompletionKind::OverrideMethod { is_static },
+                        Some(tokens[i].span),
+                    ));
+                }
             }
         }
     }
@@ -1056,9 +1061,10 @@ fn classify_anchored(
                     return Some(CompletionContext::new(CompletionKind::InheritType, prefix));
                 }
                 // `func <name>` at class-body statement start → override-method completion.
-                Func if is_class_body_func_position(tokens, p) => {
+                Func if class_body_func_static(tokens, p).is_some() => {
+                    let is_static = class_body_func_static(tokens, p) == Some(true);
                     return Some(CompletionContext::new(
-                        CompletionKind::OverrideMethod,
+                        CompletionKind::OverrideMethod { is_static },
                         prefix,
                     ));
                 }
@@ -1110,8 +1116,13 @@ fn classify_anchored(
         return Some(CompletionContext::new(CompletionKind::InheritType, None));
     }
     // `func ` with a trailing space at class-body statement start.
-    if anchor_kind == Func && is_class_body_func_position(tokens, i) {
-        return Some(CompletionContext::new(CompletionKind::OverrideMethod, None));
+    if anchor_kind == Func {
+        if let Some(is_static) = class_body_func_static(tokens, i) {
+            return Some(CompletionContext::new(
+                CompletionKind::OverrideMethod { is_static },
+                None,
+            ));
+        }
     }
 
     // Empty bare accessor-keyword position (`var x: int:\n\t|`, or a second blank accessor line after
@@ -1367,14 +1378,27 @@ fn is_assign_op(kind: TokenKind) -> bool {
 /// `func` opens a statement: a declaration `func` is at line start, so its raw predecessor token is
 /// a layout boundary (`Newline`/`Indent`/`Dedent`) or there is no predecessor. A lambda `func`
 /// follows an expression token (`=`, `(`, `,`, `return`, …), which is never layout.
-fn is_class_body_func_position(tokens: &[Token], i: usize) -> bool {
-    match i.checked_sub(1) {
+/// The same question, plus the answer Godot reads off the function node it opened the context on
+/// (`gdscript_editor.cpp:3688`): `Some(is_static)` for a class-body declaration, `None` for a named
+/// lambda in expression position. `static` must itself open the line, so `x = static func f` stays
+/// a lambda. #511.
+fn class_body_func_static(tokens: &[Token], i: usize) -> Option<bool> {
+    let Some(prev) = i.checked_sub(1) else {
         // `func` is the very first token → a top-level declaration.
-        None => true,
-        // Raw predecessor is layout ⇒ `func` opens a line ⇒ declaration. Otherwise it follows an
-        // expression token ⇒ a named lambda, not an override.
-        Some(prev) => is_layout(tokens[prev].kind),
+        return Some(false);
+    };
+    // Raw predecessor is layout ⇒ `func` opens a line ⇒ declaration. Otherwise it follows an
+    // expression token ⇒ a named lambda, not an override.
+    if is_layout(tokens[prev].kind) {
+        return Some(false);
     }
+    if tokens[prev].kind == TokenKind::Static {
+        return match prev.checked_sub(1) {
+            None => Some(true),
+            Some(before) => is_layout(tokens[before].kind).then_some(true),
+        };
+    }
+    None
 }
 
 /// Whether the `:` token at index `i` introduces a declaration's type annotation (`var x:`,

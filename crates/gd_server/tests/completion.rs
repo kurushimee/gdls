@@ -3231,3 +3231,83 @@ fn a_client_without_tag_support_gets_the_deprecated_boolean() {
 
     shutdown(&client, server_thread);
 }
+
+/// #511: a `static func` cursor offers the STATIC half of the override list. Godot filters script
+/// parents by `is_static != member.function->is_static` (`gdscript_editor.cpp:3701`) and swaps the
+/// whole native virtual list for one synthetic `_static_init` (`:3742`) — so the two halves are
+/// exactly the mirror of what a bare `func` cursor offers.
+#[test]
+fn static_override_offers_static_parents_and_static_init() {
+    let p = p4_project();
+    p.write(
+        "src/stat_base.gd",
+        "class_name OvStatBase\nextends Node\n\nstatic func make(n: int) -> OvStatBase:\n\treturn null\n\nfunc plain(x) -> void:\n\tpass\n",
+    );
+    let uri = file_uri(&p.root.join("src/stat_child.gd"));
+    let src = "extends OvStatBase\n\nstatic func \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 511, &uri, Position::new(2, 12));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    let label_of = |name: &str| {
+        list.items
+            .iter()
+            .find(|i| i.filter_text.as_deref() == Some(name))
+            .map(|i| i.label.clone())
+    };
+
+    // The static parent method, with its verbatim signature.
+    assert_eq!(
+        label_of("make").as_deref(),
+        Some("make(n: int) -> OvStatBase:"),
+        "a static parent method is the override candidate at a static cursor; got {:?}",
+        list.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+    // The non-static one is not — the mirror of the bare-`func` gate.
+    assert!(
+        label_of("plain").is_none(),
+        "a non-static parent method must NOT be offered at a static cursor"
+    );
+    // The native tail is one synthetic entry, not `Node`'s virtuals.
+    assert_eq!(
+        label_of("_static_init").as_deref(),
+        Some("_static_init() -> void:"),
+        "the static native tail is the synthetic `_static_init`"
+    );
+    assert!(
+        label_of("_ready").is_none(),
+        "the native virtual list is dropped entirely at a static cursor"
+    );
+    // The general identifier set is what this used to fall through to: a class-body override list is
+    // small and all-method, never hundreds of in-scope names.
+    assert!(
+        list.items.len() < 20,
+        "a static override list must not be the general identifier set; got {} items",
+        list.items.len()
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A class that already declares `_static_init` is not offered it again — the same first-wins
+/// name-dedup that skips an already-overridden virtual (`gdscript_editor.cpp:3744`).
+#[test]
+fn static_override_skips_an_already_declared_static_init() {
+    let p = p4_project();
+    let uri = file_uri(&p.root.join("src/has_init.gd"));
+    let src = "extends Node\n\nstatic func _static_init() -> void:\n\tpass\n\nstatic func \n";
+    let (client, server_thread) = boot(&p, rich_caps(), &uri, src);
+
+    let raw = complete_raw(&client, 512, &uri, Position::new(5, 12));
+    let list: CompletionList = serde_json::from_value(raw).expect("a CompletionList");
+    assert!(
+        !list
+            .items
+            .iter()
+            .any(|i| i.filter_text.as_deref() == Some("_static_init")),
+        "an already-declared `_static_init` must not be re-offered; got {:?}",
+        list.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
+
+    shutdown(&client, server_thread);
+}
