@@ -9786,6 +9786,18 @@ fn preload_nonscript_resource_type(
         is_constant: true,
         ..Default::default()
     };
+    // #523: Godot 4.4+ rewrites a `preload` argument to `uid://…` on save, and every answer below
+    // is read off a real path — the extension, and the `.import` sidecar sitting beside the file.
+    // Dereference once here, so the two callers (`reduce_preload` and the cross-file shape
+    // resolver) cannot disagree. A uid nothing declares degrades to Variant, as an unresolvable
+    // path always has.
+    let dereferenced;
+    let path = if path.starts_with("uid://") {
+        dereferenced = ctx.xfile.resolve_uid(path)?;
+        dereferenced.as_str()
+    } else {
+        path
+    };
     let by_extension = match path.rsplit('.').next() {
         Some("tscn") | Some("scn") => Some("PackedScene"),
         Some("gdshader") => Some("Shader"),

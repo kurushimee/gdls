@@ -201,6 +201,10 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
     /// in-memory index straight to disk, against the "eager interfaces, lazy bodies"
     /// arrangement elsewhere. Bounded by preloads-in-one-file, so it is fine in practice;
     /// if a 10k-file profile ever says otherwise, this is the line to memoize.
+    fn resolve_uid(&self, uid: &str) -> Option<String> {
+        self.inner.resolve_uid(uid)
+    }
+
     fn imported_resource_class(&self, from: Option<FileId>, raw: &str) -> Option<String> {
         let asset_path = if let Some(abs) = gd_project::paths::res_to_path(&self.project_root, raw)
         {

@@ -364,6 +364,15 @@ impl Index {
         }
     }
 
+    /// The `res://` path a `uid://…` names, or `None` when nothing in the project declares it.
+    /// The public face of the map [`Self::deref_uid`] reads: every consumer that has to turn a
+    /// written `preload` argument into a path goes through one map, so the answer cannot drift
+    /// between the script route and the resource route.
+    #[must_use]
+    pub fn uid_target(&self, uid: &str) -> Option<&str> {
+        self.uids.get(uid).map(String::as_str)
+    }
+
     /// Resolve an `extends "res://path.gd"` literal to an indexed file. M2's [`Self::resolve_base`]
     /// only exposed this folded into a [`Resolution`]; M3's analyzer needs the bare `FileId` so it can
     /// build the base's `DataType` itself.

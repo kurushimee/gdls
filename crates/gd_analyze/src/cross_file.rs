@@ -128,6 +128,16 @@ pub trait CrossFileQuery {
         self.resolve_res_path(raw)
     }
 
+    /// `uid://…` → the `res://` path the project's uid map names, or `None` when nothing declares
+    /// that uid. Godot 4.4+ rewrites a `preload` argument to the uid form on save, so a modern
+    /// project writes `preload("uid://cvc120a27s57m")` where it used to write the path, and every
+    /// consumer that reads the argument as a path has to dereference it first. Default `None` keeps
+    /// test stubs and `NoCrossFile` permissive — an unresolved uid degrades exactly as an
+    /// unresolvable path does.
+    fn resolve_uid(&self, _uid: &str) -> Option<String> {
+        None
+    }
+
     /// The resource class an IMPORTED asset preloads as: the `type=` line of the asset's `.import`
     /// sidecar `[remap]` section. Godot types `preload` by the class of the resource the importer
     /// produced (analyzer.cpp:4749-4751 over the loaded Resource), and never guesses from the
@@ -302,6 +312,10 @@ impl CrossFileQuery for SyntacticQuery<'_> {
 
     fn resolve_res_path(&self, path: &str) -> Option<FileId> {
         self.index.resolve_res_path(path)
+    }
+
+    fn resolve_uid(&self, uid: &str) -> Option<String> {
+        self.index.uid_target(uid).map(str::to_owned)
     }
 
     fn resolve_path_from(&self, from: FileId, raw: &str) -> Option<FileId> {

@@ -180,17 +180,63 @@ fn a_uid_sidecar_change_repoints_the_mapping() {
 
     let sidecar = p.root.join("src/hero.gd.uid");
     p.write("src/hero.gd.uid", "uid://ctest447\n");
-    ws.sync_uid_sidecar(&sidecar);
+    ws.sync_uid_declaration(&sidecar);
     assert_eq!(
         ws.index.resolve_res_path("uid://ctest447"),
         ws.index.file_id(&p.root.join("src/hero.gd")),
         "the new sidecar points the uid at its resource"
     );
 
-    ws.drop_uid_sidecar(&sidecar);
+    ws.drop_uid_declaration(&sidecar);
     assert_eq!(
         ws.index.resolve_res_path("uid://ctest447"),
         None,
         "deleting the sidecar unresolves the uid rather than keeping a stale target"
     );
+}
+
+/// #523: the other two places a uid is written track the same way. An `.import` appearing beside an
+/// asset points the uid at that asset; a `.tres` header points at the file itself. Both retire the
+/// mapping when the declaring file goes away, rather than leaving a stale target behind.
+#[test]
+fn an_import_and_a_header_uid_track_the_same_way() {
+    let p = common::TempProject::new();
+    p.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
+    p.write("assets/tex.svg", "");
+
+    let mut ws = Workspace::load(&p.root, &options(&p.root));
+    assert_eq!(ws.index.uid_target("uid://ctest523i"), None);
+    assert_eq!(ws.index.uid_target("uid://ctest523h"), None);
+
+    let import = p.root.join("assets/tex.svg.import");
+    p.write(
+        "assets/tex.svg.import",
+        "[remap]\n\ntype=\"CompressedTexture2D\"\nuid=\"uid://ctest523i\"\n",
+    );
+    ws.sync_uid_declaration(&import);
+    assert_eq!(
+        ws.index.uid_target("uid://ctest523i"),
+        Some("res://assets/tex.svg"),
+        "an `.import` points the uid at the asset it sits beside"
+    );
+
+    let theme = p.root.join("assets/theme.tres");
+    p.write(
+        "assets/theme.tres",
+        "[gd_resource type=\"Theme\" format=3 uid=\"uid://ctest523h\"]\n\n[resource]\n",
+    );
+    ws.sync_uid_declaration(&theme);
+    assert_eq!(
+        ws.index.uid_target("uid://ctest523h"),
+        Some("res://assets/theme.tres"),
+        "a text resource declares its own uid in its header"
+    );
+
+    ws.drop_uid_declaration(&import);
+    ws.drop_uid_declaration(&theme);
+    assert_eq!(ws.index.uid_target("uid://ctest523i"), None);
+    assert_eq!(ws.index.uid_target("uid://ctest523h"), None);
 }

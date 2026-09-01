@@ -9,6 +9,10 @@
 //!
 //! `.gd`/`.tscn`/`.gdshader`/`.tres` preloads keep their existing extension handling (not
 //! imported assets, no sidecar exists) and are covered by the cross-file suites.
+//!
+//! #523 added the other spelling of the same argument. Godot 4.4+ rewrites a `preload` path to
+//! `uid://…` on save, so the tests below pin that the uid form reaches exactly the same answers,
+//! and that a uid nothing declares — or one two resources claim — degrades to Variant in silence.
 
 mod common;
 
@@ -29,7 +33,8 @@ const TEXTURE_API: &str = r#"{
         {"name": "Node", "inherits": "Object"},
         {"name": "Resource", "inherits": "Object"},
         {"name": "Texture2D", "inherits": "Resource"},
-        {"name": "CompressedTexture2D", "inherits": "Texture2D"}
+        {"name": "CompressedTexture2D", "inherits": "Texture2D"},
+        {"name": "PackedScene", "inherits": "Resource"}
     ]
 }"#;
 
@@ -196,5 +201,102 @@ fn relative_preload_resolves_against_the_scripts_directory() {
             "typed as the importer's product: {d:?}"
         );
     }
+    shutdown(&client, handle);
+}
+
+/// The uid form of the first test: same asset, same sidecar, argument written the way Godot 4.4+
+/// writes it. The `.import` carries both the uid and the class, so one file answers both halves.
+#[test]
+fn a_uid_preload_types_through_the_import_sidecar() {
+    let p = setup_project(
+        "src/tex.gd",
+        "extends Node\n\nconst TEX := preload(\"uid://tex1\")\n\nfunc f() -> void:\n\tvar n: int = TEX\n\tn = n + 0\n",
+    );
+    p.write(
+        "assets/tex.svg.import",
+        "[remap]\n\nimporter=\"texture\"\ntype=\"CompressedTexture2D\"\nuid=\"uid://tex1\"\n",
+    );
+    let (client, handle) = boot(&p);
+    let diags = open_and_collect(&client, &p, "src/tex.gd").diagnostics;
+    assert_eq!(
+        diags.len(),
+        2,
+        "the uid form types exactly as the path form does: {diags:?}"
+    );
+    for d in &diags {
+        assert!(
+            d.message.contains("CompressedTexture2D"),
+            "typed as the importer's product, not Variant: {d:?}"
+        );
+    }
+    shutdown(&client, handle);
+}
+
+/// A scene declares its uid in its own header line, and types by extension once dereferenced.
+#[test]
+fn a_uid_preload_of_a_scene_types_as_packed_scene() {
+    let p = setup_project(
+        "src/scn.gd",
+        "extends Node\n\nconst SCN := preload(\"uid://scene1\")\n\nfunc f() -> void:\n\tvar n: int = SCN\n\tn = n + 0\n",
+    );
+    p.write(
+        "scenes/world.tscn",
+        "[gd_scene format=3 uid=\"uid://scene1\"]\n\n[node name=\"Root\" type=\"Node\"]\n",
+    );
+    let (client, handle) = boot(&p);
+    let diags = open_and_collect(&client, &p, "src/scn.gd").diagnostics;
+    assert_eq!(
+        diags.len(),
+        2,
+        "a scene uid types as PackedScene: {diags:?}"
+    );
+    for d in &diags {
+        assert!(
+            d.message.contains("PackedScene"),
+            "typed from the dereferenced extension: {d:?}"
+        );
+    }
+    shutdown(&client, handle);
+}
+
+/// Nothing in the project declares this uid. Degrade to Variant in silence, exactly as an
+/// unresolvable path does — the "never false-positive" rule.
+#[test]
+fn a_uid_nothing_declares_stays_variant_clean() {
+    let p = setup_project(
+        "src/tex.gd",
+        "extends Node\n\nconst TEX := preload(\"uid://nobody\")\n\nfunc f() -> void:\n\tvar n: int = TEX\n\tn = n + 0\n",
+    );
+    let (client, handle) = boot(&p);
+    let diags = open_and_collect(&client, &p, "src/tex.gd").diagnostics;
+    assert!(
+        diags.is_empty(),
+        "an unresolved uid must stay silent: {diags:?}"
+    );
+    shutdown(&client, handle);
+}
+
+/// Two resources claiming one uid is what copying a file without re-importing leaves behind.
+/// Picking either would be a coin flip, so the uid resolves to nothing.
+#[test]
+fn a_uid_two_resources_claim_stays_variant_clean() {
+    let p = setup_project(
+        "src/tex.gd",
+        "extends Node\n\nconst TEX := preload(\"uid://tex1\")\n\nfunc f() -> void:\n\tvar n: int = TEX\n\tn = n + 0\n",
+    );
+    p.write(
+        "assets/tex.svg.import",
+        "[remap]\n\ntype=\"CompressedTexture2D\"\nuid=\"uid://tex1\"\n",
+    );
+    p.write(
+        "assets/copy.svg.import",
+        "[remap]\n\ntype=\"CompressedTexture2D\"\nuid=\"uid://tex1\"\n",
+    );
+    let (client, handle) = boot(&p);
+    let diags = open_and_collect(&client, &p, "src/tex.gd").diagnostics;
+    assert!(
+        diags.is_empty(),
+        "a contested uid must degrade, never pick: {diags:?}"
+    );
     shutdown(&client, handle);
 }
