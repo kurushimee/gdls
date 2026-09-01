@@ -4459,6 +4459,11 @@ fn constant_arg_value_type(ctx: &AnalysisContext, arg: NodeId) -> Option<Variant
 /// `validate_call_arg`'s first arm stays quiet for (analyzer.cpp:6097). The soft
 /// `DataType::variant()` would draw `requires the subtype "Variant"` on every `Array.append`,
 /// `Object.set`, and `Dictionary.has` in a project (#449).
+///
+/// Since #587 a declared `Variant` already comes back hard, so this hardens only what is left:
+/// the shapes [`type_from_type_ref`] degrades to Variant because it cannot model them — a name
+/// a trimmed dump does not carry, a pointer. Godot never sees those, and a parameter is the one
+/// place where treating an unmodelled type as "accepts anything" is the safe direction.
 fn dump_param_type(ctx: &AnalysisContext, p: &gd_types::Param) -> DataType {
     let mut t = type_from_type_ref(ctx, &p.ty);
     if t.kind == DtKind::Variant {
@@ -6648,7 +6653,15 @@ pub(crate) fn gd_utility_return_type(name: &str) -> Option<DataType> {
         ..Default::default()
     };
     Some(match name {
-        "convert" => DataType::variant(),
+        // `RETVAR` is `PropertyInfo(Variant::NIL, .., PROPERTY_USAGE_NIL_IS_VARIANT)`
+        // (gdscript_utility_functions.cpp:560), which `type_from_property` reads back as a HARD
+        // Variant like every other declared type — so `var x := convert(1, TYPE_INT)` draws
+        // `INFERENCE_ON_VARIANT` (#587).
+        "convert" => DataType {
+            type_source: TypeSource::AnnotatedExplicit,
+            kind: DtKind::Variant,
+            ..Default::default()
+        },
         "type_exists" => builtin(VariantType::Bool),
         "char" | "_char" => builtin(VariantType::String),
         "ord" => builtin(VariantType::Int),
@@ -9562,6 +9575,10 @@ fn lookup_native_constant(
 /// CLASS_IS_ENUM / CLASS_IS_BITFIELD arms (analyzer.cpp:5744-5759); typed collections stay
 /// soft Variant (the typed-collection slice is deferred work — hardening them here would
 /// activate container-element checks this port hasn't validated against the corpus).
+///
+/// Everything the dump does declare is HARD, matching `type_from_property`'s unconditional
+/// `type_source = ANNOTATED_EXPLICIT`. The one exception is a type gdls cannot model at all,
+/// where a soft Variant is the honest answer.
 fn type_from_type_ref(ctx: &AnalysisContext, ty: &gd_types::TypeRef) -> DataType {
     use gd_types::TypeRef;
     match ty {
@@ -9657,7 +9674,20 @@ fn type_from_type_ref(ctx: &AnalysisContext, ty: &gd_types::TypeRef) -> DataType
                 vec![type_from_type_ref(ctx, key), type_from_type_ref(ctx, value)];
             t
         }
-        TypeRef::Variant | TypeRef::Pointer(_) => DataType::variant(),
+        // analyzer.cpp:5841-5848 (`type_from_property`): every type read off the engine's
+        // reflection is `ANNOTATED_EXPLICIT`, Variant included — the dump SAYS the return is
+        // Variant, which is a declared fact, not an inference. A soft one here silently
+        // disabled `INFERENCE_ON_VARIANT` for `var x := abs(-1)` and every other
+        // Variant-returning native member (#587).
+        TypeRef::Variant => DataType {
+            type_source: TypeSource::AnnotatedExplicit,
+            kind: DtKind::Variant,
+            ..Default::default()
+        },
+        // A pointer has no `DataType` to map to — upstream never sees one, since these appear
+        // only on GDExtension-facing entries the analyzer does not reach. Stays a SOFT Variant:
+        // it is gdls admitting it cannot model the type, not the dump declaring one.
+        TypeRef::Pointer(_) => DataType::variant(),
     }
 }
 

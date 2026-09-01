@@ -167,8 +167,10 @@ fn utility_as_call_argument_is_clean() {
 /// `Name "print" is a Callable. You can call it with "print.call()" instead.` regression.
 #[test]
 fn direct_utility_call_unaffected() {
+    // `absi`, not `abs`: the dump types `abs` as returning Variant, so `:=` on it draws
+    // INFERENCE_ON_VARIANT — a true positive that has nothing to do with what this test pins.
     let src =
-        "extends Node\n\n\nfunc test() -> void:\n\tprint(\"x\")\n\tvar n := abs(-1)\n\tprint(n)\n";
+        "extends Node\n\n\nfunc test() -> void:\n\tprint(\"x\")\n\tvar n := absi(-1)\n\tprint(n)\n";
     assert_eq!(errors(src), Vec::<String>::new());
 }
 
