@@ -3643,7 +3643,8 @@ fn is_member_or_attribute_ident(tree: &ParseTree, ident_id: NodeId) -> bool {
             // `super.method()` — the callee is a bare `Identifier`, but it names a METHOD, so it
             // belongs on the method path with `l.method()` rather than the non-method
             // classification a bare identifier would otherwise get (#333). A bare NON-super callee
-            // stays off this path: its `Binding::Use` is what recall rides.
+            // stays off this path: its `Binding::Use` is what recall rides — in-file from the
+            // member walk, cross-file from `reduce_call`'s own record (#541).
             NodeKind::Call(c) if c.is_super && c.callee == Some(ident_id) => {
                 return true;
             }
@@ -6584,7 +6585,9 @@ fn callee_name_token_spans(tree: &ParseTree) -> FxHashMap<ByteSpan, ByteSpan> {
 /// `Binding::Use` at that narrow span which [`push_binding_locations`] reports. (Bare calls DO
 /// classify their declaring script on `CalleeTarget::Script` — recall for them rides that `Use`
 /// binding, not this call projection; see `references_finds_bare_same_file_call` and
-/// `references_finds_signal_emit_and_connect_sites`.)
+/// `references_finds_signal_emit_and_connect_sites`. A bare callee that resolves through the
+/// CROSS-FILE chain gets its `Use` from `reduce_call` rather than the dispatcher's pre-reduce,
+/// since `reduce_identifier` skips step 3.5 in callee position — #541.)
 ///
 /// Caller must ensure `target_file` is `Some` before calling; the `None` guard lives in
 /// `references()` (fall back to `push_identifier_locations` when `target_file` is `None`).

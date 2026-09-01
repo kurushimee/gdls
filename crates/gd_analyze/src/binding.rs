@@ -65,7 +65,9 @@ pub struct MemberXref {
 /// Emitted today: `Class` and `Member` from `reduce_identifier` (in-file members, cross-file
 /// `class_name`s, autoloads) and from `reduce_identifier_from_base`'s in-file CLASS branch;
 /// the precise kinds (`Variable` / `Constant` / `Function` / `Signal` / `Enum` / `EnumValue`)
-/// from `record_member_use` for every cross-file script-chain member hit; `EnumValueLocal`
+/// from `record_member_use` for every cross-file script-chain member hit, plus `Function` from
+/// `reduce_call` for a BARE callee resolved through the cross-file chain (#541 — the one use
+/// `reduce_identifier` skips in callee position); `EnumValueLocal`
 /// (qualified name) from `reduce_identifier_from_base`'s in-file ENUM-meta value arm. `Parameter`
 /// stays reserved (locals/params are function-scoped and never cross-file). The enum stays
 /// `#[non_exhaustive]` so a handler match on it remains correct when new variants land.
