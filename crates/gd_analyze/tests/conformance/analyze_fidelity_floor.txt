@@ -424,4 +424,11 @@
 # `lookup_class.gd` needs came out of the same probe (#314). Ratchet back to 1.00 with the
 # remaining entry, `enum_declaration_and_usage.gd`. That file now passes too (#325), so the
 # ratchet is back at its ceiling: every eligible analyzer golden matches, both dialects.
+#
+# === eligible set 199 -> 311 (#495) ===
+# The parse phase's corpus carries analyzer cases too, since Godot classifies a case by its `.out`
+# first line and never by the directory. Its `GDTEST_OK` goldens pin the whole pipeline being
+# silent, and running them cost three things: a normalized suite root (a `..` in the path made
+# every fixture an orphan that could not find its own `class_name`), four native classes the
+# fixture DB did not carry, and the confusable-identifier fix in #499. Still 1.00.
 1.00

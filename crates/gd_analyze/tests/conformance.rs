@@ -425,9 +425,13 @@ fn corpus_index(suite: &Suite) -> &'static Index {
             .iter()
             .map(|s| {
                 let root_buf = conformance_dir().join(s.dir);
-                let root = Utf8Path::from_path(&root_buf)
-                    .expect("corpus root utf-8")
-                    .to_path_buf();
+                // Normalized: a suite whose `dir` reaches out of the analyze corpus carries `..`
+                // components, and `Index::build` would then intern paths that the cleaned lookup in
+                // `analyze_diagnostics` can never match — every fixture reading as an orphan that
+                // does not know its own `class_name`.
+                let root = clean_path_components(
+                    Utf8Path::from_path(&root_buf).expect("corpus root utf-8"),
+                );
                 let mut index = Index::build(&root);
                 add_support_sources(&mut index, s.dialect);
                 index
@@ -490,15 +494,6 @@ struct Suite {
     dialect: Dialect,
     /// Index into the lazily built per-suite index vector.
     slot: usize,
-    /// Take only the `GDTEST_ANALYZER_ERROR` cases from this tree, skipping its `GDTEST_OK` ones.
-    ///
-    /// Set only for a tree another harness owns. `corpus/parser/` is the parse phase's corpus, and
-    /// its `GDTEST_OK` goldens pin the parse phase being silent; running them here would make this
-    /// harness the owner of a second corpus it was never sized against, and its native-DB fixture
-    /// does not carry the classes several of them name. The `GDTEST_ANALYZER_ERROR` goldens are
-    /// different: no harness checks them at all today, because the parse phase cannot produce the
-    /// error they pin. See #495 for the `GDTEST_OK` half.
-    analyzer_errors_only: bool,
 }
 
 const SUITES: &[Suite] = &[
@@ -507,20 +502,19 @@ const SUITES: &[Suite] = &[
         tag: "4.7",
         dialect: Dialect::Godot4_7,
         slot: 0,
-        analyzer_errors_only: false,
     },
     Suite {
         dir: "corpus/analyzer-4.6",
         tag: "4.6",
         dialect: Dialect::Godot4_6,
         slot: 1,
-        analyzer_errors_only: false,
     },
-    // Godot classifies a case by its `.out` first line, never by the directory it sits in, and
-    // three `GDTEST_ANALYZER_ERROR` goldens live under `parser/errors/` upstream — all three about
-    // `@export*` applies, which run after the parse. The corpus is vendored once, under the crate
-    // that owns the parse phase, so this suite reaches across to it rather than duplicating the
-    // files: `corpus/analyzer/` is a byte-for-byte mirror of Godot's tree and a copy would break
+    // Godot classifies a case by its `.out` first line, never by the directory it sits in, so the
+    // parse phase's corpus carries analyzer cases too: `GDTEST_ANALYZER_ERROR` goldens under
+    // `parser/errors/`, and a much larger set of `GDTEST_OK` ones that pin the WHOLE pipeline being
+    // silent. The corpus is vendored once, under the crate that owns the parse phase, so this suite
+    // reaches across to it rather than duplicating the files: `corpus/analyzer/` is a byte-for-byte
+    // mirror of Godot's tree and a copy would break
     // the `diff -rq` that proves it. The parser harness reads the same files and skips them, for
     // the same reason and by the same rule.
     Suite {
@@ -528,7 +522,6 @@ const SUITES: &[Suite] = &[
         tag: "4.7-parser",
         dialect: Dialect::Godot4_7,
         slot: 2,
-        analyzer_errors_only: true,
     },
 ];
 
@@ -690,11 +683,6 @@ fn analyze_phase_fidelity() {
                 skipped += 1;
                 continue;
             };
-
-            if suite.analyzer_errors_only && !matches!(expect, Expect::AnalyzerError(_)) {
-                skipped += 1;
-                continue;
-            }
 
             eligible += 1;
             // Godot's `parser->script_path` is the source-file path; the head class's `fqcn` derives
