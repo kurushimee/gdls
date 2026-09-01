@@ -179,11 +179,13 @@ pub enum ParamTyping {
     /// anything into it draws `requires the subtype "Variant"`.
     #[default]
     Untyped,
-    /// A default the shallow pass could not decode (`a := TileSet.TILE_SHAPE_SQUARE`). Godot has
-    /// a real type here and gdls does not, so the reader must degrade to "no type" rather than to
-    /// `Variant` — claiming `Variant` would render the wrong name in a warning that is otherwise
-    /// correct to fire.
-    Unknown,
+    /// A default the shallow pass could not decode (`a := TileSet.TILE_SHAPE_SQUARE`). The shape
+    /// of that default rides along in [`MemberDecl::param_inits`] for the analyzer to resolve at
+    /// the seam (#528); `hard` is the `:=`-versus-`=` split the resolved type needs, since the
+    /// `TypeExpr` that would otherwise carry it is `None` here. A slot that still resolves to
+    /// nothing degrades to "no type" rather than to `Variant` — claiming `Variant` would render
+    /// the wrong name in a warning that is otherwise correct to fire.
+    Unknown { hard: bool },
 }
 
 /// One exposed member of a class.
@@ -201,6 +203,11 @@ pub struct MemberDecl {
     /// Parallel to [`Self::params`]: how that parameter got its type, which a `TypeExpr` alone
     /// cannot say. Empty for non-func/signal members.
     pub params_typing: Vec<ParamTyping>,
+    /// Parallel to [`Self::params`]: the default's SHAPE, for the slots where the shallow decode
+    /// read nothing. `None` everywhere else, and empty for non-func members — a signal parameter
+    /// cannot carry a default. Members took this road first ([`Self::init`]); parameters follow it
+    /// so every shape the analyzer's seam resolves reaches a defaulted parameter too (#528).
+    pub param_inits: Vec<Option<Box<InitShape>>>,
     /// Parameter identifier names for `func`/`signal` members, parallel to `params`. Empty for
     /// non-func/signal members, and empty for parameters without identifiers (rare, defensive).
     /// Not included in `signature_hash` — param renames don't change call compatibility in
@@ -383,6 +390,7 @@ impl Interface {
             m.ty.hash(h);
             m.params.hash(h);
             m.params_typing.hash(h);
+            m.param_inits.hash(h);
             m.required_params.hash(h);
             m.flags.hash(h);
             m.init.hash(h);
@@ -635,6 +643,7 @@ fn var_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         ty,
         params: Vec::new(),
         params_typing: Vec::new(),
+        param_inits: Vec::new(),
         param_names: Vec::new(),
         required_params: 0,
         flags: MemberFlags {
@@ -672,6 +681,7 @@ fn const_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         ty,
         params: Vec::new(),
         params_typing: Vec::new(),
+        param_inits: Vec::new(),
         param_names: Vec::new(),
         required_params: 0,
         flags: MemberFlags::default(),
@@ -697,8 +707,11 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
     let mut params: Vec<TypeExpr> = Vec::with_capacity(f.parameters.len());
     let mut param_names: Vec<String> = Vec::with_capacity(f.parameters.len());
     let mut params_typing: Vec<ParamTyping> = Vec::with_capacity(f.parameters.len());
+    // Only the slots the shallow decode could not read carry a shape; every other slot already has
+    // its answer in `params`, and capturing one there would be a second source of truth.
+    let mut param_inits: Vec<Option<Box<InitShape>>> = Vec::with_capacity(f.parameters.len());
     for &p in &f.parameters {
-        let (ty, name, typing) = match &tree.get(p).kind {
+        let (ty, name, typing, init) = match &tree.get(p).kind {
             NodeKind::Parameter(pn) => {
                 let annotated = type_expr(tree, pn.datatype_specifier);
                 let (ty, typing) = if annotated != TypeExpr::None {
@@ -711,26 +724,36 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
                         TypeExpr::None if is_null_literal(tree, pn.initializer) => {
                             (TypeExpr::None, ParamTyping::Untyped)
                         }
-                        TypeExpr::None => (TypeExpr::None, ParamTyping::Unknown),
+                        TypeExpr::None => (
+                            TypeExpr::None,
+                            ParamTyping::Unknown {
+                                hard: pn.infer_datatype,
+                            },
+                        ),
                         t if pn.infer_datatype => (t, ParamTyping::InferredHard),
                         t => (t, ParamTyping::InferredSoft),
                     }
                 } else {
                     (TypeExpr::None, ParamTyping::Untyped)
                 };
+                let init = matches!(typing, ParamTyping::Unknown { .. })
+                    .then(|| capture_init_shape(tree, pn.initializer))
+                    .flatten();
                 (
                     ty,
                     ident_name(tree, pn.identifier)
                         .map(|n| n.to_owned())
                         .unwrap_or_default(),
                     typing,
+                    init,
                 )
             }
-            _ => (TypeExpr::None, String::new(), ParamTyping::Untyped),
+            _ => (TypeExpr::None, String::new(), ParamTyping::Untyped, None),
         };
         params.push(ty);
         param_names.push(name);
         params_typing.push(typing);
+        param_inits.push(init);
     }
     let defaulted = f
         .parameters
@@ -747,6 +770,7 @@ fn func_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         ty: type_expr(tree, f.return_type),
         params,
         params_typing,
+        param_inits,
         param_names,
         required_params,
         flags: MemberFlags {
@@ -789,7 +813,9 @@ fn signal_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         name,
         kind: MemberKind::Signal,
         ty: TypeExpr::None,
-        // A signal parameter cannot carry a default, so it is annotated or nothing.
+        // A signal parameter cannot carry a default, so it is annotated or nothing — and it
+        // carries no shape either.
+        param_inits: Vec::new(),
         params_typing: params
             .iter()
             .map(|t| {
@@ -827,6 +853,7 @@ fn enum_member(tree: &ParseTree, id: NodeId) -> Option<MemberDecl> {
         ty: TypeExpr::None,
         params: Vec::new(),
         params_typing: Vec::new(),
+        param_inits: Vec::new(),
         param_names: Vec::new(),
         required_params: 0,
         flags: MemberFlags::default(),
@@ -913,6 +940,7 @@ fn enum_value_member(tree: &ParseTree, value: &EnumValue) -> Option<MemberDecl> 
         ty: TypeExpr::None,
         params: Vec::new(),
         params_typing: Vec::new(),
+        param_inits: Vec::new(),
         param_names: Vec::new(),
         required_params: 0,
         flags: MemberFlags::default(),
@@ -1532,9 +1560,64 @@ var b := pick().new()
                 ParamTyping::Annotated,
                 ParamTyping::InferredHard,
                 ParamTyping::InferredSoft,
-                ParamTyping::Unknown,
+                ParamTyping::Unknown { hard: true },
             ]
         );
+        // #528: only the undecodable slot carries a shape — every other slot already has its
+        // answer in `params`, and a second source of truth there is how the two drift.
+        assert_eq!(
+            m.param_inits,
+            vec![
+                None,
+                None,
+                None,
+                None,
+                Some(Box::new(InitShape::Read {
+                    base: None,
+                    path: vec!["TileSet".to_owned(), "TILE_SHAPE_SQUARE".to_owned()],
+                })),
+            ]
+        );
+    }
+
+    /// A `=` default records the same shape but the other hardness, since the `TypeExpr` that
+    /// carries that split for a decoded slot is `None` here.
+    #[test]
+    fn an_undecodable_default_records_its_writing() {
+        let iface = iface("extends Node\nfunc f(a = TileSet.TILE_SHAPE_SQUARE) -> void:\n\tpass\n");
+        let m = iface.members.iter().find(|m| m.name == "f").expect("func");
+        assert_eq!(m.params_typing, vec![ParamTyping::Unknown { hard: false }]);
+        assert!(m.param_inits[0].is_some());
+    }
+
+    /// A shape the capture itself refuses stays refused, and the slot behaves as it did before.
+    #[test]
+    fn a_default_the_capture_refuses_carries_no_shape() {
+        let iface = iface("extends Node\nfunc f(a := [1, 2][0]) -> void:\n\tpass\n");
+        let m = iface.members.iter().find(|m| m.name == "f").expect("func");
+        assert!(matches!(m.params_typing[0], ParamTyping::Unknown { .. }));
+        assert_eq!(m.param_inits, vec![None]);
+    }
+
+    /// A signal parameter cannot carry a default, so it carries no shape either.
+    #[test]
+    fn a_signal_parameter_carries_no_shape() {
+        let iface = iface("extends Node\nsignal fired(a: int, b)\n");
+        let m = iface
+            .members
+            .iter()
+            .find(|m| m.name == "fired")
+            .expect("signal");
+        assert!(m.param_inits.is_empty());
+    }
+
+    /// Swapping only the default's SHAPE moves the hash: a caller checking arguments against the
+    /// resolved type has to be re-run.
+    #[test]
+    fn a_default_shape_change_moves_the_hash() {
+        let a = iface("extends Node\nfunc f(x := TileSet.TILE_SHAPE_SQUARE) -> void:\n\tpass\n");
+        let b = iface("extends Node\nfunc f(x := TileSet.TILE_SHAPE_ISOMETRIC) -> void:\n\tpass\n");
+        assert_ne!(a.signature_hash(), b.signature_hash());
     }
 
     #[test]

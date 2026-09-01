@@ -7466,7 +7466,25 @@ fn script_chain_call(
                 .get(i)
                 .copied()
                 .unwrap_or(ParamTyping::Untyped);
-            if typing == ParamTyping::Unknown {
+            if let ParamTyping::Unknown { hard } = typing {
+                // #528: the shallow pass read nothing off this default, but it recorded the
+                // default's SHAPE. Resolve it exactly as a member's own initializer resolves —
+                // same entry, same cycle stack, same depth cap — so every shape the seam already
+                // knows reaches a parameter too. Softness cannot come from the walk: a plain `=`
+                // default is `INFERRED` in Godot, and hardening it here would arm the
+                // `Invalid argument` error where upstream only warns.
+                let answer = member
+                    .param_inits
+                    .get(i)
+                    .and_then(Option::as_deref)
+                    .map(|shape| resolve_member_init_shape(ctx, &link, &member.name, shape));
+                if let Some(ShapeAnswer::Type(dt)) = answer {
+                    let mut dt = *dt;
+                    if !hard {
+                        dt.type_source = TypeSource::Inferred;
+                    }
+                    return dt;
+                }
                 return DataType {
                     kind: DtKind::Unresolved,
                     type_source: TypeSource::Undetected,
