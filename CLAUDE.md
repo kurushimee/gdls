@@ -85,7 +85,7 @@ The tokenizer and parser are also fuzzed (`cargo-fuzz`), and any panic blocks a 
 
 ## Project state
 
-`gdls` is complete and running. Every capability in `docs/05` §1 is shipped and advertised. The tracker holds a working list of known gaps rather than being empty, so read it before assuming a behavior is intended. Both ratchets hold at 1.0000 with empty known-failures lists — parse 185/185, analyze 199/199. The last release is v3.0.0 (2026-08-29), which adds Godot 4.7 alongside 4.6. `CHANGELOG.md` has the release history and `docs/08-history.md` has how it was built.
+`gdls` is complete and running. Every capability in `docs/05` §1 is shipped and advertised. The tracker holds a working list of known gaps rather than being empty, so read it before assuming a behavior is intended. Both ratchets hold at 1.0000 with empty known-failures lists — parse 185/185, analyze 311/311. The last release is v3.0.0 (2026-08-29), which adds Godot 4.7 alongside 4.6. `CHANGELOG.md` has the release history and `docs/08-history.md` has how it was built.
 
 Three lessons from that work still apply to anything new:
 

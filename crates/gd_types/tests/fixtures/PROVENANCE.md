@@ -21,7 +21,7 @@ jq 'walk(if type=="object" then del(.description, .brief_description) else . end
       global_constants:  .global_constants,
       utility_functions: .utility_functions,
       builtin_classes:   [.builtin_classes[]   | select(.name | IN("bool","int","float","String","Vector2","Vector2i","Vector3","Array","Dictionary","Color","Callable","PackedVector2Array"))],
-      classes:           [.classes[]           | select(.name | IN("Object","RefCounted","Node","CanvasItem","Node2D","Line2D","Node3D","VisualInstance3D","GeometryInstance3D","SpriteBase3D","Sprite3D","Resource","Script","GDScript","Time","TileSet","InstancePlaceholder","MainLoop","SceneTree","Viewport","Window","PhysicsDirectBodyState3D","PhysicsDirectBodyState3DExtension","OS","DirAccess"))],
+      classes:           [.classes[]           | select(.name | IN("Object","RefCounted","Node","CanvasItem","Node2D","Line2D","Node3D","VisualInstance3D","GeometryInstance3D","SpriteBase3D","Sprite3D","Resource","Script","GDScript","Time","TileSet","InstancePlaceholder","MainLoop","SceneTree","Viewport","Window","PhysicsDirectBodyState3D","PhysicsDirectBodyState3DExtension","OS","DirAccess","Image","Timer","Sprite2D","Control"))],
       singletons:        [.singletons[]        | select(.name | IN("Engine","OS","Time"))] }' \
   api/extension_api.json > crates/gd_types/tests/fixtures/trimmed_api.json
 ```
@@ -31,6 +31,8 @@ jq 'walk(if type=="object" then del(.description, .brief_description) else . end
 `Line2D` and the `PackedVector2Array` builtin are kept for the 4.7 `CONFUSABLE_TEMPORARY_MODIFICATION` fixture, which needs a native property whose type is a packed array plus that array's method list (to tell the mutating `clear()` from the `const` `size()`).
 
 `VisualInstance3D` and `GeometryInstance3D` carry no test of their own; they sit between `Node3D` and `SpriteBase3D` in the real dump, and dropping them would break the `Sprite3D` to `Node` chain the corpus walks. Whenever a class is added, add whatever the dump names in its `inherits` chain as well, up to a class already kept. Never patch a kept class's `inherits` to skip a gap: that makes a fixture claiming `Exact` describe an engine that does not exist.
+
+`Image`, `Timer`, `Sprite2D`, and `Control` are what the parser corpus's `features/export_variable.gd` names: `@export var x: Image`, `Array[Timer]`, and an `@export_node_path("Sprite2D", …, "Control", …)`. That golden is silent, so a class the fixture drops turns into a `Could not find type` the engine never reports (#495).
 
 `OS` and `DirAccess` back the cross-file call-chain tests, which need a native static call whose return type is another native class, and `String` backs the ones that then read a method off that return.
 
