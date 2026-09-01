@@ -686,6 +686,32 @@ impl<'a> AnalysisContext<'a> {
         self.sink.push_error(message, span);
     }
 
+    /// [`Self::push_error`] for a claim that something is ABSENT — an identifier that is not
+    /// declared, a type that cannot be found, a member or function that is not on a base.
+    ///
+    /// Such a claim is only as good as the tree it is measured against, and a tree that recovery
+    /// cut short may simply be missing the declaration being asked about: `var 5a = 1` leaves no
+    /// `a`, so a later `print(a)` reads as undeclared when the user declared it plainly. So when
+    /// [`gd_syntax::ParseTree::recovery_lost_source`] is set the claim is not made. This is the
+    /// same reasoning `Interface::parse_clean` already applies across a file boundary
+    /// (`docs/02` §7), with the boundary removed.
+    ///
+    /// The flag is narrower than `had_parse_errors` on purpose. `f(nope)()` draws a parse error
+    /// and abandons nothing, so `nope` really is undeclared and saying so is sound.
+    ///
+    /// Only for a claim whose search domain includes this file's own declarations. A claim about
+    /// the filesystem (`Preload file "…" does not exist.`) or about a cycle that is present in
+    /// the tree keeps the plain [`Self::push_error`] — recovery cannot invalidate either.
+    ///
+    /// The converse claim, that two things present in the tree contradict each other, keeps
+    /// [`Self::push_error`]: recovery can lose a declaration but it cannot invent the pair.
+    pub fn push_absence_error(&mut self, message: impl Into<String>, at: NodeId) {
+        if self.tree.recovery_lost_source {
+            return;
+        }
+        self.push_error(message, at);
+    }
+
     /// Like [`Self::push_error`] but at an explicit byte span (e.g. a synthesized location).
     pub fn push_error_at(&mut self, message: impl Into<String>, span: ByteSpan) {
         self.sink.push_error(message, span);
@@ -726,6 +752,18 @@ impl<'a> AnalysisContext<'a> {
         at_node: gd_syntax::ast::NodeId,
         related: Vec<crate::diagnostic::RelatedInfo>,
     ) {
+        // #575: a parse that lost or invented source is not judged on style. Recovery skips
+        // tokens and synthesizes placeholders — a dropped initializer, a swallowed `is` operand —
+        // and a warning about one of those describes gdls's recovery rather than the user's code.
+        // Godot's own server skips the analyzer outright on any failed parse
+        // (`language_server/gdscript_extend_parser.cpp:974`); gdls still runs it, because the rest
+        // of the file deserves its type errors, and it reads the narrower flag so a parse error
+        // that abandoned nothing — `f(nope)()` builds a complete tree and then objects to its
+        // shape — keeps every judgment the user's own code has earned. See
+        // [`Self::push_absence_error`] for the other half and `docs/02` §7 for the whole rule.
+        if self.tree.recovery_lost_source {
+            return;
+        }
         // A code Godot introduced after this project's version must never reach a user. Every
         // such emission site is behind a `DIALECT(...)` guard and `WarnPolicy` resolves the code
         // to `Ignore` anyway, so reaching here means one of those two went missing.

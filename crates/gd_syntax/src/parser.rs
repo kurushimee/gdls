@@ -690,6 +690,8 @@ impl Parser {
         while matches!(self.current.kind, TokenKind::Error | TokenKind::Newline) {
             if self.current.kind == TokenKind::Error {
                 self.panic_mode = true;
+                // An `Error` token is source that will join no node.
+                self.tree.recovery_lost_source = true;
                 self.errors.push(Diagnostic {
                     span: self.current.span,
                     message: self.current.source.to_string(),
@@ -718,6 +720,10 @@ impl Parser {
     /// A recovery node: not extent-tracked and not on the in-progress stack (Godot's
     /// `alloc_recovery_node`), used for synthesized placeholders during error recovery.
     fn alloc_recovery(&mut self, kind: NodeKind) -> NodeId {
+        // Invented material is the mirror image of discarded material: a dummy `Null` standing in
+        // for a dictionary value the source never supplied is exactly the kind of thing a
+        // downstream check would otherwise judge as if the user had written it.
+        self.tree.recovery_lost_source = true;
         self.tree.push(Node::new(kind))
     }
 
@@ -769,6 +775,8 @@ impl Parser {
     fn drain_current_errors(&mut self) {
         while self.current.kind == TokenKind::Error {
             self.panic_mode = true;
+            // Same as the leading drain: this source joins no node.
+            self.tree.recovery_lost_source = true;
             self.errors.push(Diagnostic {
                 span: self.current.span,
                 message: self.current.source.to_string(),
@@ -854,6 +862,9 @@ impl Parser {
                 | TokenKind::Annotation => return,
                 _ => {}
             }
+            // Recovery is about to abandon this token. Anything downstream that judges what the
+            // tree does NOT contain has to know the tree is now short of the source.
+            self.tree.recovery_lost_source = true;
             self.advance();
         }
     }
@@ -4183,6 +4194,7 @@ impl Parser {
             self.complete_extents(branch);
             // Consume the rest of the line; treat the next as a new branch.
             while self.current.kind != TokenKind::Newline && !self.is_at_end() {
+                self.tree.recovery_lost_source = true;
                 self.advance();
             }
             if !self.is_at_end() {

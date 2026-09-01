@@ -1048,7 +1048,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         {
             return bad_type;
         }
-        ctx.push_error(
+        ctx.push_absence_error(
             format!(r#"Could not find type "{first}" in the current scope."#),
             first_id,
         );
@@ -1071,7 +1071,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
                 } else {
                     format!(r#"Could not find type "{seg}" under base "{base_name}"."#)
                 };
-                ctx.push_error(msg, id);
+                ctx.push_absence_error(msg, id);
                 return bad_type;
             }
             let parent_class_node = result.class_node;
@@ -1128,7 +1128,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
                 }
                 MetaMember::Absent => {
                     // analyzer.cpp:915.
-                    ctx.push_error(
+                    ctx.push_absence_error(
                         format!(r#"Could not find type "{seg}" under base "{base_name}"."#),
                         id,
                     );
@@ -1160,7 +1160,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
                 } else {
                     format!(r#"Could not find type "{seg}" under base "{base_name}"."#)
                 };
-                ctx.push_error(msg, id);
+                ctx.push_absence_error(msg, id);
                 return bad_type;
             }
             let Some(sr) = result.script_type.clone() else {
@@ -1215,7 +1215,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
                 && crate::script_chain::chain_native_root(ctx, &sr).is_some()
             {
                 let base_name = crate::reducer::class_identifier_name_or_default(ctx, &result);
-                ctx.push_error(
+                ctx.push_absence_error(
                     format!(r#"Could not find type "{seg}" under base "{base_name}"."#),
                     id,
                 );
@@ -1231,7 +1231,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
             // enum set is what the dump carries, so under `Generic`/`Absent` a name gdls cannot
             // see is indistinguishable from a custom build's.
             if ctx.native.provenance() == gd_types::ApiProvenance::Exact {
-                ctx.push_error(
+                ctx.push_absence_error(
                     format!(r#"Could not find type "{seg}" in "{first}"."#),
                     chain[1],
                 );
@@ -4553,7 +4553,7 @@ fn apply_node_path_class_check(
         if global_file.is_some() {
             return false;
         }
-        ctx.push_error(
+        ctx.push_absence_error(
             format!(
                 r#"Invalid argument {n} of annotation "@export_node_path": The class "{arg}" was not found in the global scope."#
             ),

@@ -616,6 +616,21 @@ pub struct ParseTree {
     /// the one chokepoint every production parse goes through, and so `false` on a
     /// defensively-constructed tree, which is the safe default for a negative claim.
     pub had_parse_errors: bool,
+    /// `true` when error recovery DISCARDED or INVENTED source: it skipped tokens to resynchronize,
+    /// drained a lexer `Error` token that joined no node, or synthesized a placeholder in place of
+    /// something the source did not supply.
+    ///
+    /// The stronger sibling of [`Self::had_parse_errors`], and the one an *absence* claim has to
+    /// read. The two are not the same question: `f(nope)()` draws `Cannot call on an expression.`
+    /// while the parser builds a complete, correct tree and abandons nothing, so a name missing
+    /// from that tree really is missing; `var 5a = 1` drains an error token and resynchronizes past
+    /// the declaration, so a name missing from THAT tree may only be missing from gdls's recovery.
+    /// Anything judging what the tree does not contain — the absence errors, the whole warning set
+    /// — reads this flag, not the other one. See `docs/02` §7.
+    ///
+    /// Stamped at the five points where recovery actually loses or invents material, and nowhere
+    /// else: `grep -rn "recovery_lost_source = true"` in `parser.rs` is the whole set.
+    pub recovery_lost_source: bool,
     /// M7 (#62): `##` doc-comment associations, populated by [`crate::parse`] after the parse
     /// completes (`doc_comments::associate`). Riding on the tree means every existing
     /// interface-extraction call site gets docs with zero signature churn, and the parse cache
