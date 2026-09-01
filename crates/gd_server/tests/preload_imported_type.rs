@@ -264,8 +264,12 @@ fn a_uid_preload_of_a_scene_types_as_packed_scene() {
     shutdown(&client, handle);
 }
 
-/// Nothing in the project declares this uid. Degrade to Variant in silence, exactly as an
-/// unresolvable path does — the "never false-positive" rule.
+/// Nothing in the project declares this uid. The TYPE degrades to Variant in silence, so the
+/// `var n: int = TEX` line below draws nothing — the "never false-positive" rule.
+///
+/// The uid itself is a separate question, and #565 answered it: Godot reports an undeclared uid as
+/// a missing preload, printing the uid verbatim, so that one row is expected here. It is the only
+/// one; nothing about the resulting TYPE is claimed.
 #[test]
 fn a_uid_nothing_declares_stays_variant_clean() {
     let p = setup_project(
@@ -274,9 +278,10 @@ fn a_uid_nothing_declares_stays_variant_clean() {
     );
     let (client, handle) = boot(&p);
     let diags = open_and_collect(&client, &p, "src/tex.gd").diagnostics;
-    assert!(
-        diags.is_empty(),
-        "an unresolved uid must stay silent: {diags:?}"
+    assert_eq!(
+        diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+        vec![r#"Preload file "uid://nobody" does not exist."#],
+        "the missing-preload row and nothing about the type: {diags:?}"
     );
     shutdown(&client, handle);
 }
