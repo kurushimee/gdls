@@ -143,6 +143,12 @@ var soft_cast = get_parent() as CanvasItem
 var soft_int = 3
 var opaque := whatever()
 var single: Glob431
+// #521: shapes whose type the declaring file gets right and the seam used to drop.
+var res_preload := preload(\"res://thing.tres\")
+var scene_preload := preload(\"res://scene.tscn\")
+var enum_const := SIDE_LEFT
+var float_const := PI
+var opaque_preload := preload(\"res://thing.xyz\")
 
 enum Mode { IDLE, RUN }
 
@@ -383,4 +389,109 @@ fn an_inferred_member_is_soft_and_draws_nothing() {
         assert!(errors.is_empty(), "{stmt}: {errors:?}");
         assert!(access.is_empty(), "{stmt}: {access:?}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// #521 — an inferred member whose initializer is a `preload` or a `@GlobalScope` name. The declaring
+// file types all of these; before the fix the seam dropped them to `Variant`, which under the strict
+// profile turned into false-positive errors on everything read off them. These were the only
+// gdls-vs-engine disagreements left on the Pixelorama corpus.
+// ---------------------------------------------------------------------------------------------------
+
+/// A `preload` of a NON-script resource types by the resource's class, the same extension map the
+/// declaring file uses (`reduce_preload`). `PackedScene`/`Shader` are absent from the trimmed dump,
+/// so the fixture's positive case is `.tres`; the end-to-end `.tscn` case lives in gd_server.
+#[test]
+fn a_preloaded_resource_member_crosses_with_its_resource_class() {
+    let (errors, access) = diagnose("print(h.res_preload.resource_path)");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(
+        access.is_empty(),
+        "a `.tres` member reads as Resource: {access:?}"
+    );
+    // And it is a REAL type, so a member that is not on it is reported.
+    let (_, access) = diagnose("print(h.res_preload.nope)");
+    assert_eq!(access, vec![missing_prop("nope", "Resource")]);
+}
+
+/// The `class_named` gate holds: a class the dump does not carry stays Variant rather than becoming
+/// a name nothing can resolve. `PackedScene` is absent here, which makes `.tscn` the negative.
+#[test]
+fn a_preload_whose_class_the_dump_lacks_stays_variant() {
+    let (errors, access) = diagnose("print(h.scene_preload.instantiate())");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(
+        access,
+        vec![missing_method("instantiate", "Variant")],
+        "an unknown class must degrade to Variant, never be claimed"
+    );
+}
+
+/// An extension the map does not know, with no `.import` sidecar, stays Variant — no guessing.
+#[test]
+fn a_preload_of_an_unknown_extension_stays_variant() {
+    let (errors, access) = diagnose("print(h.opaque_preload.anything())");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(access, vec![missing_method("anything", "Variant")]);
+}
+
+/// A `@GlobalScope` enum VALUE carries its enum across, as `reduce_identifier` step 7b gives it.
+#[test]
+fn a_global_enum_value_member_crosses_with_its_enum() {
+    let (errors, access) = diagnose("print(h.enum_const)");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(access.is_empty(), "{access:?}");
+    // An enum is an int at heart, so an int-only operation on it is clean rather than unsafe.
+    let (errors, access) = diagnose("print(h.enum_const + 1)");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(access.is_empty(), "{access:?}");
+}
+
+/// The four `@GlobalScope` float constants (step 8).
+#[test]
+fn a_global_float_constant_member_crosses_as_float() {
+    let (errors, access) = diagnose("print(h.float_const + 1.0)");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(access.is_empty(), "{access:?}");
+    // A float has no members, so a property read off it is reported — proof the type is real.
+    let (errors, _) = diagnose("print(h.float_const.nope)");
+    assert!(
+        errors.iter().any(|e| e.contains("float")),
+        "the member must cross as a real float: {errors:?}"
+    );
+}
+
+/// A class member shadows a `@GlobalScope` name, exactly as it does in the declaring file — the
+/// chain lookup stays first in `resolve_value_head`.
+#[test]
+fn a_member_named_like_a_global_constant_shadows_it() {
+    let holder = format!("{HOLDER_GD}\nvar PI := \"not a float\"\nvar from_pi := PI\n");
+    let consumer = "extends Node\n\nfunc go(h: Holder431) -> void:\n\tprint(h.from_pi.nope)\n";
+    let project = Project::new(&[
+        ("res://helper.gd", HELPER_GD),
+        ("res://holder.gd", &holder),
+        ("res://main.gd", consumer),
+        ("res://autoload.gd", AUTOLOAD_GD),
+        ("res://dep.gd", DEP_GD),
+        ("res://cyca.gd", CYC_A_GD),
+        ("res://cycb.gd", CYC_B_GD),
+    ]);
+    let result = analyze(
+        &parse(consumer).tree,
+        Some(FileId::new(3)),
+        "res://main.gd",
+        &native_db(),
+        &project,
+        &policy(),
+    );
+    let errors: Vec<String> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity() == Severity::Error)
+        .map(|d| d.message().to_owned())
+        .collect();
+    assert!(
+        errors.iter().any(|e| e.contains("String")),
+        "the member `PI` must shadow the global, so `from_pi` is a String: {errors:?}"
+    );
 }

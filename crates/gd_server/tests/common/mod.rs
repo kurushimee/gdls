@@ -59,8 +59,9 @@ impl Default for TempProject {
     }
 }
 
-/// A minimal `extension_api.json`: `Object ← Node ← CanvasItem ← Node2D`, plus the handful of
-/// Variant utility functions the fixtures call.
+/// A minimal `extension_api.json`: `Object ← Node ← CanvasItem ← Node2D`, the three resource
+/// classes a `preload` types as (`Resource`, and `PackedScene`/`Shader` under it), plus the handful
+/// of Variant utility functions the fixtures call.
 ///
 /// A dump loaded from a path stamps [`gd_types::ApiProvenance::Exact`], which since #256 is the
 /// claim that a bare `name()` gdls cannot resolve genuinely does not exist. So a minimal dump has
@@ -88,7 +89,10 @@ pub const MINI_API: &str = r#"{
         {"name": "Object"},
         {"name": "Node", "inherits": "Object"},
         {"name": "CanvasItem", "inherits": "Node"},
-        {"name": "Node2D", "inherits": "CanvasItem"}
+        {"name": "Node2D", "inherits": "CanvasItem"},
+        {"name": "Resource", "inherits": "Object"},
+        {"name": "PackedScene", "inherits": "Resource"},
+        {"name": "Shader", "inherits": "Resource"}
     ]
 }"#;
 
