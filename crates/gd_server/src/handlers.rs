@@ -1782,8 +1782,55 @@ fn projected_base_type(
     analyzed: &AnalysisResult,
     base_id: NodeId,
 ) -> DataType {
-    crate::scene_nav::scene_type_of_base(state, uri, tree, base_id)
-        .unwrap_or_else(|| analyzed.types.get(base_id).clone())
+    if let Some(dt) = crate::scene_nav::scene_type_of_base(state, uri, tree, base_id) {
+        return dt;
+    }
+    let dt = analyzed.types.get(base_id).clone();
+    if dt.kind == DtKind::Unresolved {
+        if let Some(meta) = builtin_meta_base_type(tree, base_id) {
+            return meta;
+        }
+    }
+    dt
+}
+
+/// The `Vector2` in `Vector2.from_angle(1.0)` — a builtin type name as a CALL callee's base.
+///
+/// The analyzer leaves that node untyped, and it is right to: `reduce_call`'s subscript-callee arm
+/// short-circuits a builtin type name into a synthesized meta type and never reduces the base
+/// (`gdscript_analyzer.cpp:3597-3603`, where only the `else` branch calls `reduce_expression`). The
+/// type it builds is a local, consumed by the dispatch and discarded, so nothing writes it back —
+/// in Godot's own AST either.
+///
+/// Navigation reads the type table, so without this the base looks `Unresolved` and every surface
+/// gives up on a call the analyzer resolved perfectly well: `definition` and `signatureHelp` answer
+/// null, hover falls back to the expression's type label. Rebuilt HERE rather than stamped in the
+/// analyzer, so faithfulness is untouched and nothing enters an `AnalysisResult` (#591).
+///
+/// Only a bare identifier qualifies. `Vector2.ONE.normalized()` types its base through
+/// `reduce_subscript` like any other expression and never reaches this.
+pub(crate) fn builtin_meta_base_type(tree: &ParseTree, base_id: NodeId) -> Option<DataType> {
+    let NodeKind::Identifier(ident) = &tree.get(base_id).kind else {
+        return None;
+    };
+    let builtin_type = gd_analyze::resolver::builtin_type_from_name(&ident.name)?;
+    Some(DataType {
+        type_source: gd_analyze::TypeSource::AnnotatedExplicit,
+        kind: DtKind::Builtin,
+        builtin_type,
+        is_meta_type: true,
+        is_constant: true,
+        ..Default::default()
+    })
+}
+
+/// [`builtin_meta_base_type`] for a surface that knows the base only by where it ENDS — the byte
+/// before the dot. `signature_help` walks tokens rather than the base node, so it locates the base
+/// that way; the reconstruction itself is the same one.
+pub(crate) fn builtin_meta_type_ending_at(tree: &ParseTree, end: usize) -> Option<DataType> {
+    tree.iter_ids()
+        .find(|&id| tree.get(id).span.end == end && builtin_meta_base_type(tree, id).is_some())
+        .and_then(|id| builtin_meta_base_type(tree, id))
 }
 
 /// M6-F: when the cursor lands on a Call or Subscript node, resolve the callee's `MemberDecl`
@@ -10512,6 +10559,48 @@ mod tests {
 
     fn uri(s: &str) -> Uri {
         s.parse().expect("test uri")
+    }
+
+    /// #591: only a bare builtin type name qualifies for the reconstructed meta type. Anything
+    /// else in callee-base position — a local, a native class, a subscript, a call — is either
+    /// already typed by the analyzer or genuinely not a builtin, and must be left alone, or the
+    /// reconstruction would shadow a real type with a wrong one.
+    #[test]
+    fn only_a_bare_builtin_type_name_reconstructs_a_meta_type() {
+        let src = "func go():\n\tvar v := Vector2.ZERO\n\tprint(Vector2, v, Node2D, Color)\n";
+        let parsed = gd_syntax::parse(src);
+        let tree = &parsed.tree;
+
+        let named = |name: &str| -> Vec<Option<DataType>> {
+            tree.iter_ids()
+                .filter(
+                    |&id| matches!(&tree.get(id).kind, NodeKind::Identifier(i) if i.name == name),
+                )
+                .map(|id| builtin_meta_base_type(tree, id))
+                .collect()
+        };
+
+        for name in ["Vector2", "Color"] {
+            let hits = named(name);
+            assert!(!hits.is_empty(), "{name} appears in the fixture");
+            for dt in &hits {
+                let dt = dt.as_ref().unwrap_or_else(|| panic!("{name} is a builtin"));
+                assert!(dt.is_meta_type, "{name} reconstructs as a meta type");
+                assert_eq!(dt.kind, DtKind::Builtin);
+            }
+        }
+
+        for name in ["v", "Node2D", "go", "print"] {
+            for dt in named(name) {
+                assert!(dt.is_none(), "{name} is not a builtin type name");
+            }
+        }
+
+        // A non-identifier node never qualifies, whatever it evaluates to.
+        assert!(tree
+            .iter_ids()
+            .filter(|&id| !matches!(&tree.get(id).kind, NodeKind::Identifier(_)))
+            .all(|id| builtin_meta_base_type(tree, id).is_none()));
     }
 
     fn loc(u: &str, line: u32, character: u32) -> Location {
