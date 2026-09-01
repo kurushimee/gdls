@@ -217,12 +217,15 @@ pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: 
                         // all: not the value-callable pair Godot answers with, and not not-found
                         // either (the chain-shadow gate correctly refuses to claim absence).
                         let prev_node = ctx.reducing_callee_node;
+                        let prev_call = ctx.reducing_callee_call;
                         if matches!(&ctx.node(callee).kind, NodeKind::Identifier(_)) {
                             exempt_callee = Some(callee);
                             ctx.reducing_callee_node = Some(callee);
+                            ctx.reducing_callee_call = Some(id);
                         }
                         reduce_expression(ctx, callee, false);
                         ctx.reducing_callee_node = prev_node;
+                        ctx.reducing_callee_call = prev_call;
                     }
                 }
             }
@@ -1906,27 +1909,16 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         None
     });
     let is_forward = forward_local.is_some();
-    if let Some(ref fwd) = forward_local {
-        // Anchor the warning at the identifier node. For the initializer-reference case
-        // (`var a = a + 1`), the RHS `a` has a later byte position than the declaration `a`,
-        // but Godot's emit order puts CONFUSABLE before SHADOWED. Anchor at the
-        // declaration identifier when the usage is inside the declaration's span so gdls's
-        // stable byte-position sort preserves Godot's order.
-        let decl_span = ctx.node(fwd.source).span;
-        let ident_pos = ctx.node(id).span.start;
-        let anchor = if ident_pos >= decl_span.start && ident_pos < decl_span.end {
-            match &ctx.node(fwd.source).kind {
-                NodeKind::Variable(v) => v.identifier.unwrap_or(id),
-                NodeKind::Constant(c) => c.identifier.unwrap_or(id),
-                _ => id,
-            }
-        } else {
-            id
-        };
+    if forward_local.is_some() {
+        // analyzer.cpp:4469 — the anchor is `p_identifier`, the read being reduced, including
+        // for the initializer-reference case (`var a = a + 1`, where the read sits inside the
+        // declaration it will be shadowed by). CONFUSABLE still renders ahead of the SHADOWED
+        // that follows it on the same line, because `DiagnosticSink::finish` sorts warnings by
+        // line and keeps queue order within one.
         ctx.push_warning(
             crate::warnings::WarningCode::ConfusableLocalUsage,
             std::slice::from_ref(&name),
-            anchor,
+            id,
         );
     }
 
@@ -2781,7 +2773,15 @@ fn lookup_class_member(
                 gd_syntax::ast::Member::Group(_) => None,
             };
             if target_node.is_some() {
-                crate::resolver::resolve_class_member_by_name(ctx, class, name, identifier_id);
+                // analyzer.cpp:985 — the cyclic-reference anchor is whatever `p_source` the
+                // caller handed down. From a call, Godot never reduces the callee and passes
+                // `p_call` through `get_function_signature`, so the error covers the whole call.
+                let cyclic_source = if ctx.reducing_callee_node == Some(identifier_id) {
+                    ctx.reducing_callee_call.unwrap_or(identifier_id)
+                } else {
+                    identifier_id
+                };
+                crate::resolver::resolve_class_member_by_name(ctx, class, name, cyclic_source);
             }
             // The third element is the DECLARING class node (`class`) so the caller can record the
             // use against the declaring inner-class chain, not the accessed one. #153.
@@ -4652,11 +4652,14 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                             | VariantType::PackedColorArray
                     );
                     if !len_ok {
+                        // analyzer.cpp:3472 / :3523 — the anchor is
+                        // `p_call->arguments[err.argument]`, the offending argument, never the
+                        // call.
                         ctx.push_error(
                             format!(
                                 r#"Invalid argument for "len()" function: Value of type '{at}' can't provide a length."#
                             ),
-                            id,
+                            arg_id,
                         );
                     }
                 }
@@ -4686,7 +4689,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                             format!(
                                 r#"Invalid argument for "{function_name}()" function: Argument "x" must be "int", "float", "Vector2", "Vector2i", "Vector3", "Vector3i", "Vector4", or "Vector4i"."#
                             ),
-                            id,
+                            arg_id,
                         );
                     }
                 }
@@ -4946,7 +4949,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // site (`abstract_class_instantiate.gd`), so emit the companion alongside.
         ctx.push_error(
             r#"Name "new" is a Callable. You can call it with "new.call()" instead."#.to_owned(),
-            id,
+            call.callee.unwrap_or(id),
         );
         ctx.set_type(id, call_type);
         return;
