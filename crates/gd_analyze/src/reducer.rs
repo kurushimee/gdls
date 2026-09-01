@@ -1987,7 +1987,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
 
     // 3. Class-member + base-chain lookup (analyzer.cpp:4450-4455 → reduce_identifier_from_base).
     if let Some(class_id) = ctx.current_class {
-        if let Some((dt, fold, decl_class)) =
+        if let Some((dt, fold, decl_class, is_class)) =
             lookup_class_member(ctx, class_id, &name, id, ClassScopeWalk::FullScope)
         {
             // Record on resolution success only — unresolved/forward-reference cases would
@@ -2003,10 +2003,20 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             // member on an inheritance-chain base or outer class, not the current class), so a
             // same-named member of a different class in this file stays distinct.
             let class_path = class_inner_path(ctx, decl_class);
+            // #576: a hit on a CLASS is recorded as one, under the same
+            // `(Class, file, owner chain, name)` key the cross-file side and `record_type_use`
+            // use. Recorded as a `Member` it was a second identity for the same symbol, so
+            // `references` answered one of two disjoint sets depending on the cursor and `rename`
+            // rewrote whichever half it landed in.
+            let kind = if is_class {
+                BindingSymbolKind::Class
+            } else {
+                BindingSymbolKind::Member
+            };
             ctx.record_binding(Binding::use_(
                 ctx.file,
                 class_path,
-                BindingSymbolKind::Member,
+                kind,
                 name.clone(),
                 site,
             ));
@@ -2661,6 +2671,14 @@ fn stamp_member_const(ctx: &mut AnalysisContext, id: NodeId, c: MemberConst) {
     }
 }
 
+/// Whether a [`lookup_class_member`] hit landed on a class, which decides the binding identity the
+/// caller records for it (#576).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemberHitKind {
+    Class,
+    Other,
+}
+
 /// How far [`lookup_class_member`] walks.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClassScopeWalk {
@@ -2681,7 +2699,7 @@ fn lookup_class_member(
     name: &str,
     identifier_id: NodeId,
     walk: ClassScopeWalk,
-) -> Option<(DataType, MemberConst, NodeId)> {
+) -> Option<(DataType, MemberConst, NodeId, bool)> {
     // analyzer.cpp:4450-4455 — Godot's `reduce_identifier` walks the *full* scope
     // (`get_class_node_current_scope_classes`): the class, its inheritance chain, and its outer
     // chain. gdls previously only walked the inheritance chain (`ctx.bases`), so an identifier
@@ -2723,7 +2741,20 @@ fn lookup_class_member(
         if class_ident_match && walk == ClassScopeWalk::FullScope {
             // analyzer.cpp:4187 → :4046 — the class names itself (or an enclosing
             // class): a class object, constant with no value this table can hold.
-            return Some((ctx.get_type(class).clone(), MemberConst::Yes(None), class));
+            //
+            // #576: the third element is what the caller keys the binding on, and for a class it
+            // has to be the DECLARING owner, never the class itself — the same convention the
+            // cross-file side and `record_type_use` already follow. Keying on its own chain gave
+            // `Inner.new()` written inside `Inner` a target nothing else shared, so the symbol
+            // split in two and `rename` rewrote only half of it. The head class has no outer; its
+            // owner chain is the file root, which is the empty path.
+            let owner = crate::resolver::class_outer(ctx, class).unwrap_or(class);
+            return Some((
+                ctx.get_type(class).clone(),
+                MemberConst::Yes(None),
+                owner,
+                true,
+            ));
         }
         let member = match &ctx.node(class).kind {
             NodeKind::Class(c) => c
@@ -2754,6 +2785,10 @@ fn lookup_class_member(
             }
             // The third element is the DECLARING class node (`class`) so the caller can record the
             // use against the declaring inner-class chain, not the accessed one. #153.
+            let m_kind = match &m {
+                gd_syntax::ast::Member::Class(_) => MemberHitKind::Class,
+                _ => MemberHitKind::Other,
+            };
             return match m {
                 gd_syntax::ast::Member::Variable(vid) | gd_syntax::ast::Member::Signal(vid) => {
                     if !this_is_base {
@@ -2804,7 +2839,9 @@ fn lookup_class_member(
                 }),
                 gd_syntax::ast::Member::Group(_) => None,
             }
-            .map(|(dt, fold)| (dt, fold, class));
+            // #576: an inner class reached as a member of the class that declares it. `class` is
+            // already the owner, so only the flag is new.
+            .map(|(dt, fold)| (dt, fold, class, matches!(m_kind, MemberHitKind::Class)));
         }
     }
     None
@@ -9052,7 +9089,7 @@ fn reduce_identifier_from_base(
             // and the divergence is toward silence.
             let meta_skips_instance_member = base.is_meta_type
                 && non_static_instance_member_kind(ctx, class_id, &name, walk).is_some();
-            if let Some((member_dt, fold, decl_class)) = (!meta_skips_instance_member)
+            if let Some((member_dt, fold, decl_class, is_class)) = (!meta_skips_instance_member)
                 .then(|| lookup_class_member(ctx, class_id, &name, identifier_id, walk))
                 .flatten()
             {
@@ -9069,10 +9106,17 @@ fn reduce_identifier_from_base(
                 // the base's inheritance/outer scope (`B.field` where `B extends A` resolves to
                 // `A`) — so it stays distinct from a same-named member of another class in the file.
                 let class_path = class_inner_path(ctx, decl_class);
+                // #576, as at the bare-identifier site: an inner class reached through an
+                // attribute is a class, not a member.
+                let kind = if is_class {
+                    BindingSymbolKind::Class
+                } else {
+                    BindingSymbolKind::Member
+                };
                 ctx.record_binding(Binding::use_(
                     ctx.file,
                     class_path,
-                    BindingSymbolKind::Member,
+                    kind,
                     name.clone(),
                     site,
                 ));

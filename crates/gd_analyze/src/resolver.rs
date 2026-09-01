@@ -1376,7 +1376,7 @@ fn hides_global_script_class(ctx: &AnalysisContext, class_id: NodeId, name: &str
     Some(registered) != ctx.file || !is_head
 }
 
-fn class_outer(ctx: &AnalysisContext, class_id: NodeId) -> Option<NodeId> {
+pub(crate) fn class_outer(ctx: &AnalysisContext, class_id: NodeId) -> Option<NodeId> {
     match &ctx.node(class_id).kind {
         NodeKind::Class(c) => c.outer,
         _ => None,
