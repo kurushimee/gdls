@@ -7788,7 +7788,7 @@ fn resolve_value_path(
             let Some((head, rest)) = path.split_first() else {
                 return ShapeAnswer::Unknown;
             };
-            match resolve_value_head(ctx, link, head, HeadMode::Value) {
+            match resolve_value_head(ctx, link, head) {
                 ShapeAnswer::Type(dt) => (*dt, rest),
                 other => return other,
             }
@@ -7800,19 +7800,14 @@ fn resolve_value_path(
             other => return other,
         };
     }
+    // A bare native class name is the one head that cannot be the ANSWER. Godot renders its
+    // metatype `GDScriptNativeClass`, a shape gdls does not produce, so `var x := TileSet` falls
+    // short rather than claiming something the declaring file never had. Reading a member off it
+    // is fine — that is `TileSet.TILE_SHAPE_SQUARE`, and it is what the walk above just did.
+    if cur.kind == DtKind::Native && cur.is_meta_type {
+        return ShapeAnswer::Unknown;
+    }
     ShapeAnswer::Type(Box::new(cur))
-}
-
-/// Whether a chain head is being resolved as a value or as the base of a call.
-///
-/// A native class name is the one head that differs. As a VALUE it is refused: Godot renders its
-/// metatype `GDScriptNativeClass`, a shape gdls does not produce, so anything read off it would be
-/// a guess. As a CALL base it is exactly what `OS.get_data_dir()` needs, and `reduce_call`'s
-/// in-file path already types that expression from the same dump.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HeadMode {
-    Value,
-    CallBase,
 }
 
 /// The leading segment of a value chain, resolved in the declaring class's scope.
@@ -7820,7 +7815,6 @@ fn resolve_value_head(
     ctx: &mut AnalysisContext,
     link: &crate::data_type::ScriptRef,
     name: &str,
-    mode: HeadMode,
 ) -> ShapeAnswer {
     // A member of the declaring class or its bases shadows everything below.
     if let Some((decl_link, member)) = iface_member_in_chain(ctx, link, name) {
@@ -7845,7 +7839,7 @@ fn resolve_value_head(
     // lookup). Putting it any later would type `Time.get_ticks_msec()` off a project autoload
     // named `Time` where the declaring file itself picks the native class, and the seam's whole
     // contract is that it agrees with that file or falls short of it — never differs.
-    if mode == HeadMode::CallBase && ctx.native.class_named(name).is_some() {
+    if ctx.native.class_named(name).is_some() {
         return ShapeAnswer::Type(Box::new(native_meta_type(name.to_owned())));
     }
     if let Some(fid) = ctx.xfile.global_class_file(name) {
@@ -7895,6 +7889,35 @@ fn member_type_of(ctx: &mut AnalysisContext, base: &DataType, name: &str) -> Sha
         value.is_meta_type = false;
         value.builtin_type = VariantType::Int;
         return ShapeAnswer::Type(Box::new(value));
+    }
+    // #524: a native METAtype (`TileSet`, `Image`) reads its own enums, enum values and bare
+    // constants. `lookup_member` walks the `inherits` chain exactly as the in-file member walk
+    // does, so a member inferred from `TileSet.TILE_SHAPE_SQUARE` gets `TileSet.TileShape` here
+    // and not the `Variant` that made a reader report an unsafe argument the engine does not.
+    // A method, a signal and the enum ITSELF answer nothing: the first two are not values the
+    // seam models, and `var e := TileSet.TileShape` is an error in the declaring file
+    // ("Type ... in base ... cannot be used on its own"), so there is no type to carry.
+    if base.kind == DtKind::Native && base.is_meta_type {
+        let Some((owner_class, member)) = ctx.native.lookup_member(&base.native_type, name) else {
+            return ShapeAnswer::Unknown;
+        };
+        let owner_class = ctx.native.name_of(owner_class.name).to_owned();
+        return match member {
+            gd_types::NativeMember::EnumValue { owner, .. } => {
+                let enum_name = ctx.native.name_of(owner.name).to_owned();
+                ShapeAnswer::Type(Box::new(crate::resolver::make_native_enum_type(
+                    ctx,
+                    &enum_name,
+                    &owner_class,
+                    false,
+                )))
+            }
+            // A bare class constant carries no enum membership in the dump; Godot types it `int`.
+            gd_types::NativeMember::Constant(_) => {
+                ShapeAnswer::Type(Box::new(hard_builtin(VariantType::Int)))
+            }
+            _ => ShapeAnswer::Unknown,
+        };
     }
     let Some(sref) = base.script_type.clone() else {
         return ShapeAnswer::Unknown;
@@ -7964,7 +7987,7 @@ fn resolve_call_shape(
             let Some((head, rest)) = base_path.split_first() else {
                 return ShapeAnswer::Unknown;
             };
-            let mut cur = match resolve_value_head(ctx, link, head, HeadMode::CallBase) {
+            let mut cur = match resolve_value_head(ctx, link, head) {
                 ShapeAnswer::Type(dt) => *dt,
                 other => return other,
             };
