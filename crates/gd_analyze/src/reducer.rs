@@ -345,6 +345,8 @@ pub fn type_from_variant(value: &FoldedValue) -> DataType {
             FoldedValue::String(_) => VariantType::String,
             FoldedValue::StringName(_) => VariantType::StringName,
             FoldedValue::NodePath(_) => VariantType::NodePath,
+            FoldedValue::Array(_) => VariantType::Array,
+            FoldedValue::Dictionary(_) => VariantType::Dictionary,
             FoldedValue::Opaque(vt, _) => *vt,
         },
         ..Default::default()
@@ -431,6 +433,9 @@ fn folded_booleanize(v: &FoldedValue) -> Option<bool> {
         FoldedValue::String(s) | FoldedValue::StringName(s) | FoldedValue::NodePath(s) => {
             !s.is_empty()
         }
+        // `Variant::booleanize` is `!is_zero()`, and a collection is never zero — an empty one
+        // included (`core/variant/variant.cpp`, the ARRAY/DICTIONARY arms of `is_zero`).
+        FoldedValue::Array(_) | FoldedValue::Dictionary(_) => true,
         FoldedValue::Opaque(..) => return None,
     })
 }
@@ -676,7 +681,27 @@ fn reduce_binary_op(ctx: &mut AnalysisContext, id: NodeId) {
                             lv,
                             FoldedValue::String(_) | FoldedValue::StringName(_)
                         ));
-                if has_opaque {
+                // #385: a collection operand only reaches `Variant::evaluate` upstream when
+                // `get_operation_type` already accepted the pair — `Dictionary + Dictionary` is
+                // rejected by the TYPE check, with its own message, and never evaluated. So
+                // anything outside the set `eval_binary` can actually compute drops to the
+                // type-only tail below, which is where that message comes from and where a
+                // collection went before it had a fold at all.
+                let unevaluable_collection =
+                    (matches!(lv, FoldedValue::Array(_) | FoldedValue::Dictionary(_))
+                        || matches!(rv, FoldedValue::Array(_) | FoldedValue::Dictionary(_)))
+                        && !matches!(
+                            (op_node.operation, &lv, &rv),
+                            (
+                                BinaryOp::Addition,
+                                FoldedValue::Array(_),
+                                FoldedValue::Array(_)
+                            ) | (BinaryOp::CompEqual, _, _)
+                                | (BinaryOp::CompNotEqual, _, _)
+                        );
+                if unevaluable_collection {
+                    // fall through to the type-only tail
+                } else if has_opaque {
                     opaque_operand_types =
                         Some((folded_variant_type(&lv), folded_variant_type(&rv)));
                 } else if let Some(folded) = eval_binary(op_node.operation, &lv, &rv) {
@@ -1234,6 +1259,28 @@ fn eval_binary(op: BinaryOp, a: &FoldedValue, b: &FoldedValue) -> Option<FoldedV
     if matches!(a, Opaque(..)) || matches!(b, Opaque(..)) {
         return None;
     }
+    // #385 — the three operations `Variant::evaluate` performs on a collection. Everything else
+    // with a collection operand is rejected by the type check upstream and never reaches here;
+    // `reduce_binary_op` routes those to the type-only path.
+    match (op, a, b) {
+        (BinaryOp::Addition, Array(x), Array(y)) => {
+            let mut out = Vec::with_capacity(x.len() + y.len());
+            out.extend(x.iter().cloned());
+            out.extend(y.iter().cloned());
+            return Some(Array(std::sync::Arc::new(out)));
+        }
+        // `Variant::hash_compare` recurses element by element, which is what
+        // `crate::foldtable::string_like_eq` ports.
+        (BinaryOp::CompEqual, Array(_) | Dictionary(_), _)
+        | (BinaryOp::CompEqual, _, Array(_) | Dictionary(_)) => {
+            return Some(Bool(crate::foldtable::string_like_eq(a, b)));
+        }
+        (BinaryOp::CompNotEqual, Array(_) | Dictionary(_), _)
+        | (BinaryOp::CompNotEqual, _, Array(_) | Dictionary(_)) => {
+            return Some(Bool(!crate::foldtable::string_like_eq(a, b)));
+        }
+        _ => {}
+    }
     // Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`). Which pairs register is not obvious — `bool`
     // orders under `<` and `>` but not under `<=` and `>=`, and a bool against a number registers
     // nowhere — so `compare` opens by asking the same registry the type-only path asks, and folds
@@ -1420,6 +1467,7 @@ pub(crate) fn booleanize(v: &FoldedValue) -> bool {
         Int(i) => *i != 0,
         Float(f) => *f != 0.0,
         String(s) | StringName(s) | NodePath(s) => !s.is_empty(),
+        Array(_) | Dictionary(_) => true,
         // Unreachable in practice: `eval_binary` rejects Opaque operands before its
         // booleanize-driven logic arms run. Total for safety; never trust an unknown value.
         Opaque(..) => false,
@@ -1438,6 +1486,8 @@ pub(crate) fn folded_variant_type(v: &FoldedValue) -> VariantType {
         FoldedValue::String(_) => VariantType::String,
         FoldedValue::StringName(_) => VariantType::StringName,
         FoldedValue::NodePath(_) => VariantType::NodePath,
+        FoldedValue::Array(_) => VariantType::Array,
+        FoldedValue::Dictionary(_) => VariantType::Dictionary,
         FoldedValue::Opaque(vt, _) => *vt,
     }
 }
@@ -1480,6 +1530,93 @@ fn to_float(v: &FoldedValue) -> Option<f64> {
         FoldedValue::Float(f) => Some(*f),
         FoldedValue::Bool(b) => Some(*b as i64 as f64),
         _ => None,
+    }
+}
+
+/// `GDScriptAnalyzer::make_expression_reduced_value` (analyzer.cpp:5284), restricted to the two
+/// shapes the plain reducer cannot fold on its own: an array literal and a dictionary literal.
+///
+/// Why this is separate from [`reduce_array`] / [`reduce_dictionary`] rather than folded into them:
+/// Godot's own reducers do NOT set `reduced_value` for a collection. Only this pass does, and it
+/// runs from a constant site — a `const` initializer, an annotation argument. The visible
+/// consequence is that `{[1, 2]: 1, [1, 2]: 2}` is not a duplicate-key error upstream, because the
+/// keys carry no value when `reduce_dictionary` runs its check. Folding a collection during
+/// `reduce_array` would invent that error.
+///
+/// Like upstream, this writes nothing into the nested element nodes — the value is returned, and
+/// only the caller's own node is stamped. All-or-nothing: one element that will not fold abandons
+/// the whole collection (analyzer.cpp:5326-5331), so a partially-known collection never exists.
+///
+/// `depth` and the element budget have no upstream counterpart. Godot is folding a real `Variant`
+/// with real memory behind it and a parse tree it trusts; gdls folds inside a language server that
+/// must survive a hostile or half-written file, and the budget is what keeps a pathological literal
+/// from turning one keystroke into a multi-second fold. Exceeding either yields `None`, which reads
+/// as "not constant" everywhere downstream — an under-report.
+fn make_expression_reduced_value(
+    ctx: &mut AnalysisContext,
+    id: NodeId,
+    depth: usize,
+    budget: &mut usize,
+) -> Option<FoldedValue> {
+    // analyzer.cpp:5289-5292 — an already-constant expression answers with its own value.
+    if let Some(v) = ctx.folds.get(id).cloned() {
+        return Some(v);
+    }
+    if depth >= MAX_FOLD_DEPTH {
+        return None;
+    }
+
+    match &ctx.node(id).kind {
+        NodeKind::Array(a) => {
+            let elements = a.elements.clone();
+            // Upstream builds a TYPED container here when the literal's own datatype carries an
+            // element type (`make_array_from_element_datatype`). gdls's fold carries no element
+            // type, and it does not need one: the two consumers are the rendering, which prints a
+            // typed array exactly like an untyped one, and `Variant::get`, which does not consult
+            // it. `const A: Array[int] = [1]` reports the same message in both, oracle-pinned.
+            let mut out = Vec::with_capacity(elements.len());
+            for el in elements {
+                *budget = budget.checked_sub(1)?;
+                out.push(make_expression_reduced_value(ctx, el, depth + 1, budget)?);
+            }
+            Some(FoldedValue::Array(std::sync::Arc::new(out)))
+        }
+        NodeKind::Dictionary(d) => {
+            let pairs: Vec<(Option<NodeId>, Option<NodeId>)> =
+                d.elements.iter().map(|kv| (kv.key, kv.value)).collect();
+            let mut out = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                *budget = budget.checked_sub(1)?;
+                let key = make_expression_reduced_value(ctx, k?, depth + 1, budget)?;
+                let value = make_expression_reduced_value(ctx, v?, depth + 1, budget)?;
+                out.push((key, value));
+            }
+            Some(FoldedValue::Dictionary(std::sync::Arc::new(out)))
+        }
+        _ => None,
+    }
+}
+
+/// The nesting depth [`make_expression_reduced_value`] gives up at, matching the depth
+/// `Variant::stringify` stops rendering at — a value too deep to print is not worth folding.
+const MAX_FOLD_DEPTH: usize = 100;
+
+/// The total number of elements one constant site may fold. A guard on hostile input, not a port.
+const MAX_FOLD_ELEMENTS: usize = 4096;
+
+/// Fold a constant site's expression, stamping the result on that node only. Returns whether a
+/// value landed. Idempotent — a node that already carries a fold keeps it.
+pub(crate) fn fold_constant_site(ctx: &mut AnalysisContext, id: NodeId) -> bool {
+    if ctx.folds.get(id).is_some() {
+        return true;
+    }
+    let mut budget = MAX_FOLD_ELEMENTS;
+    match make_expression_reduced_value(ctx, id, 0, &mut budget) {
+        Some(v) => {
+            ctx.folds.set(id, v);
+            true
+        }
+        None => false,
     }
 }
 
@@ -1635,21 +1772,7 @@ fn folded_value_eq(a: &FoldedValue, b: &FoldedValue) -> bool {
 /// (analyzer.cpp:3831). Godot uses `Variant::stringify`; our small subset uses each value's
 /// natural display.
 fn folded_key_display(v: &FoldedValue) -> String {
-    match v {
-        FoldedValue::Nil => "<null>".to_owned(),
-        FoldedValue::Bool(b) => b.to_string(),
-        FoldedValue::Int(i) => i.to_string(),
-        FoldedValue::Float(f) => f.to_string(),
-        // `Variant::stringify` at the top level quote-wraps nothing, and renders all three
-        // string-likes as their bare text — `{^"y": 1, ^"y": 2}` reports `Key "y"`, oracle-pinned.
-        FoldedValue::String(s) | FoldedValue::StringName(s) | FoldedValue::NodePath(s) => s.clone(),
-        // A utility callable stringifies as its scoped name (`@GlobalScope::print`,
-        // `@GDScript::len`) — the one Opaque `folded_value_eq` can prove a duplicate, so the one
-        // the dup-key error can actually name.
-        FoldedValue::Opaque(_, Some(util)) => util.as_text(),
-        // Any other Opaque is never matched as a dup key; render the kind for safety.
-        FoldedValue::Opaque(vt, None) => data_type::variant_type_name(*vt).to_owned(),
-    }
+    crate::stringify::stringify(v)
 }
 
 // ===================================================================================================
@@ -6687,6 +6810,87 @@ fn invalid_index_type(base: &DataType, index: &DataType) -> bool {
     }
 }
 
+/// What a constant subscript could be decided to be. Godot's `Variant::get` answers with a value
+/// and a `valid` flag; gdls needs a third answer, because its fold table holds shapes whose
+/// indexing it has not ported and a missing arm must never read as "invalid".
+enum ConstIndex {
+    /// `valid == true` — the element, folded.
+    Value(FoldedValue),
+    /// `valid == false` — Godot would report `Cannot get index …`.
+    Invalid,
+    /// gdls cannot decide. Stay silent and let the type-based path speak.
+    Unknown,
+}
+
+/// `Variant::get(index, &valid)` (`core/variant/variant_setget.cpp`) over the folded subset, for
+/// the constant-subscript arm at analyzer.cpp:4920-4930.
+///
+/// Only the three bases whose indexing is unambiguous are decided: `Array` and `String` take an
+/// integer index (a float truncates, a negative counts from the end, out of range is invalid), and
+/// `Dictionary` is a key lookup under the same relation duplicate keys use. Every other base — a
+/// vector, a color, anything opaque — is `Unknown`, because reporting a miss on a container gdls
+/// cannot index would be inventing an error.
+fn const_index(base: &FoldedValue, index: &FoldedValue) -> ConstIndex {
+    // The integer an index reduces to, for the sequence bases. A float truncates; a bool and a
+    // string do NOT convert and are outright invalid, both oracle-pinned.
+    fn sequence_index(index: &FoldedValue) -> Option<Result<i64, ()>> {
+        match index {
+            FoldedValue::Int(i) => Some(Ok(*i)),
+            FoldedValue::Float(f) => Some(Ok(*f as i64)),
+            FoldedValue::Nil
+            | FoldedValue::Bool(_)
+            | FoldedValue::String(_)
+            | FoldedValue::StringName(_)
+            | FoldedValue::NodePath(_) => Some(Err(())),
+            // An Array/Dictionary/Opaque index — not decided here.
+            _ => None,
+        }
+    }
+
+    match base {
+        FoldedValue::Array(items) => match sequence_index(index) {
+            None => ConstIndex::Unknown,
+            Some(Err(())) => ConstIndex::Invalid,
+            Some(Ok(i)) => {
+                let len = items.len() as i64;
+                // `Array::get` wraps a negative index from the end.
+                let at = if i < 0 { i + len } else { i };
+                match usize::try_from(at).ok().and_then(|at| items.get(at)) {
+                    Some(v) => ConstIndex::Value(v.clone()),
+                    None => ConstIndex::Invalid,
+                }
+            }
+        },
+        FoldedValue::String(text) => match sequence_index(index) {
+            None => ConstIndex::Unknown,
+            Some(Err(())) => ConstIndex::Invalid,
+            Some(Ok(i)) => {
+                let chars: Vec<char> = text.chars().collect();
+                let len = chars.len() as i64;
+                let at = if i < 0 { i + len } else { i };
+                match usize::try_from(at).ok().and_then(|at| chars.get(at)) {
+                    Some(c) => ConstIndex::Value(FoldedValue::String(c.to_string())),
+                    None => ConstIndex::Invalid,
+                }
+            }
+        },
+        FoldedValue::Dictionary(pairs) => {
+            // An opaque key cannot be compared, so a miss against it proves nothing.
+            if matches!(index, FoldedValue::Opaque(_, None)) {
+                return ConstIndex::Unknown;
+            }
+            match pairs
+                .iter()
+                .find(|(k, _)| crate::foldtable::string_like_eq(k, index))
+            {
+                Some((_, v)) => ConstIndex::Value(v.clone()),
+                None => ConstIndex::Invalid,
+            }
+        }
+        _ => ConstIndex::Unknown,
+    }
+}
+
 fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: bool) {
     let sub = match ctx.node(id).kind.clone() {
         NodeKind::Subscript(s) => s,
@@ -6710,6 +6914,40 @@ fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: b
         gd_syntax::ast::SubscriptAccess::Index(index) => {
             if let Some(idx) = index {
                 reduce_expression(ctx, idx, false);
+
+                // analyzer.cpp:4920-4930 — when the base AND the index are both constant, Godot
+                // just tries the index and reports the failure with both values rendered. This
+                // runs ahead of the type-based checks below because upstream's `else` is what
+                // those checks are. #385.
+                if let (Some(base_v), Some(index_v)) =
+                    (ctx.folds.get(base_id).cloned(), ctx.folds.get(idx).cloned())
+                {
+                    match const_index(&base_v, &index_v) {
+                        ConstIndex::Value(v) => {
+                            let dt = type_from_variant(&v);
+                            ctx.folds.set(id, v);
+                            ctx.set_type(id, dt);
+                            return;
+                        }
+                        ConstIndex::Invalid => {
+                            let index_s = crate::stringify::stringify(&index_v);
+                            let base_s = crate::stringify::stringify(&base_v);
+                            ctx.push_error(
+                                format!(r#"Cannot get index "{index_s}" from "{base_s}"."#),
+                                idx,
+                            );
+                            ctx.set_type(
+                                id,
+                                DataType {
+                                    kind: DtKind::Variant,
+                                    ..Default::default()
+                                },
+                            );
+                            return;
+                        }
+                        ConstIndex::Unknown => {}
+                    }
+                }
 
                 // analyzer.cpp:4951-5040 — which index types a builtin base accepts. gdls used
                 // to port the `Array` row alone and stay permissive everywhere else; the whole

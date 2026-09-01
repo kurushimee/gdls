@@ -2251,7 +2251,7 @@ fn an_enum_value_that_needs_evaluating_hovers_without_a_number() {
 fn hover_on_a_constant_renders_its_value_when_it_folds() {
     let (client, handle) = boot();
     let uri: Uri = "file:///test/const_value.gd".parse().unwrap();
-    let src = "extends Node\n\nconst K := 7\nconst S := \"hi\"\nconst F := 1.5\nconst B := true\nconst D = K * 2\nconst ARR = [1, 2]\n";
+    let src = "extends Node\n\nconst K := 7\nconst S := \"hi\"\nconst F := 1.5\nconst B := true\nconst D = K * 2\nconst ARR = [1, 2]\nconst DICT = {\"a\": 1}\nconst V = print\n";
     did_open(&client, &uri, src);
 
     for (pos, want) in [
@@ -2266,12 +2266,24 @@ fn hover_on_a_constant_renders_its_value_when_it_folds() {
         assert!(md.contains(want), "wanted {want:?} at {pos:?}, got {md:?}");
     }
 
-    // An array literal has no `FoldedValue`, so the line stops at the type.
-    let hover = hover_at(&client, &uri, Position::new(7, 7)).expect("hover on ARR");
+    // #385 gave the fold table a collection representation, so a literal array or dictionary now
+    // renders its value too — as the GDScript source the user wrote, not Godot's `stringify` form.
+    for (pos, want) in [
+        (Position::new(7, 7), "const ARR: Array = [1, 2]"),
+        (Position::new(8, 7), "const DICT: Dictionary = {\"a\": 1}"),
+    ] {
+        let hover = hover_at(&client, &uri, pos).unwrap_or_else(|| panic!("hover at {pos:?}"));
+        let md = hover_markdown(&hover);
+        assert!(md.contains(want), "wanted {want:?} at {pos:?}, got {md:?}");
+    }
+
+    // A value the fold table holds only as an opaque type — here the constant `Callable` a bare
+    // utility reference folds to — still stops at the type. A placeholder there would read as fact.
+    let hover = hover_at(&client, &uri, Position::new(9, 6)).expect("hover on V");
     let md = hover_markdown(&hover);
     assert!(
-        md.contains("const ARR") && !md.contains('='),
-        "an unfoldable initializer must not render a value, got {md:?}"
+        md.contains("const V") && !md.contains('='),
+        "an unrenderable initializer must not render a value, got {md:?}"
     );
 
     shutdown(&client, handle);

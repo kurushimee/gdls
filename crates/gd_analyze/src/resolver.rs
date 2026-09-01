@@ -3142,6 +3142,12 @@ fn resolve_assignable(
         // intent without re-architecting the cycle handling.
         let pre_diag_count = ctx.error_count();
         crate::reducer::reduce_expression(ctx, init, false);
+        if is_constant {
+            // analyzer.cpp:2126 — a `const` initializer is folded through
+            // `make_expression_reduced_value`, which reaches the array and dictionary literals the
+            // plain reducer leaves valueless. #385.
+            crate::reducer::fold_constant_site(ctx, init);
+        }
         let initializer_type = ctx.get_type(init).clone();
         let init_emitted_errors = ctx.error_count() > pre_diag_count;
 
@@ -4296,6 +4302,8 @@ pub(crate) fn resolve_annotation(ctx: &mut AnalysisContext, ann_id: NodeId) {
         }
 
         crate::reducer::reduce_expression(ctx, arg_id, false);
+        // analyzer.cpp:1694 — the same fold pass the `const` initializer gets. #385.
+        crate::reducer::fold_constant_site(ctx, arg_id);
 
         let Some(value) = ctx.folds.get(arg_id).cloned() else {
             // Godot gates this on `make_expression_reduced_value` having produced a value, which
