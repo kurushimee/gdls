@@ -2354,3 +2354,70 @@ fn hover_on_a_constant_renders_its_value_when_it_folds() {
 
     shutdown(&client, handle);
 }
+
+/// #513: hovering an annotation's own name used to fall through to the "what type is the smallest
+/// node around here" arm and render the ENCLOSING CLASS — `CapProbe` for `@export_range`. It now
+/// renders the signature Godot shows for that annotation, built from the parser's registration
+/// table (`_make_arguments_hint(info, -1, true)`, `gdscript_editor.cpp:750`).
+#[test]
+fn hover_on_an_annotation_renders_its_signature() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/ann.gd".parse().unwrap();
+    let src = "@tool\nclass_name AnnProbe\nextends Node\n\n@export_range(0, 10, 1) var r: int = 3\n@onready var t: Timer = Timer.new()\n@warning_ignore(\"unused_variable\")\nfunc f() -> void:\n\tvar unused := 1\n";
+    did_open(&client, &uri, src);
+
+    // Every parameter, its type, and the `varray` defaults, plus the vararg tail.
+    let h1 = hover_at(&client, &uri, Position::new(4, 5)).expect("hover");
+    let md = hover_markdown(&h1);
+    assert_eq!(
+        md,
+        "```gdscript\n@export_range(min: float, max: float, step: float = 1.0, extra_hints: String = \"\", ...args: Array)\n```",
+        "the annotation's own signature, not the enclosing class"
+    );
+    // The `@` itself is part of the name, so the cursor there answers the same question.
+    let h2 = hover_at(&client, &uri, Position::new(4, 0)).expect("hover");
+    let at_sigil = hover_markdown(&h2);
+    assert_eq!(at_sigil, md, "the `@` is part of the annotation's name");
+
+    // A parameterless annotation still renders as a call, matching Godot's hint builder.
+    let h3 = hover_at(&client, &uri, Position::new(5, 4)).expect("hover");
+    let md = hover_markdown(&h3);
+    assert_eq!(md, "```gdscript\n@onready()\n```");
+    let h4 = hover_at(&client, &uri, Position::new(0, 2)).expect("hover");
+    let md = hover_markdown(&h4);
+    assert_eq!(md, "```gdscript\n@tool()\n```");
+    let h5 = hover_at(&client, &uri, Position::new(6, 6)).expect("hover");
+    let md = hover_markdown(&h5);
+    assert_eq!(
+        md,
+        "```gdscript\n@warning_ignore(warning: String, ...args: Array)\n```"
+    );
+
+    shutdown(&client, handle);
+}
+
+/// The scoping half of #513. An annotation's ARGUMENTS are ordinary expressions and keep their own
+/// hovers, and an annotation gdls does not know renders nothing at all — never the enclosing class,
+/// which is the answer that made the original card wrong.
+#[test]
+fn hover_inside_an_annotation_is_unchanged_and_an_unknown_one_is_silent() {
+    let (client, handle) = boot();
+    let uri: Uri = "file:///test/ann2.gd".parse().unwrap();
+    let src = "class_name AnnProbe2\nextends Node\n\nconst LIMIT := 10\n@export_range(0, LIMIT) var r: int = 3\n@whatever var q: int = 1\n";
+    did_open(&client, &uri, src);
+
+    // The `LIMIT` argument still hovers as the constant it is.
+    let h6 = hover_at(&client, &uri, Position::new(4, 18)).expect("hover on arg");
+    let md = hover_markdown(&h6);
+    assert!(
+        md.contains("LIMIT"),
+        "an annotation argument keeps its own hover, got {md:?}"
+    );
+    // An unregistered annotation gets no card rather than the enclosing class.
+    assert!(
+        hover_at(&client, &uri, Position::new(5, 3)).is_none(),
+        "an unknown annotation must not fall back to the enclosing class"
+    );
+
+    shutdown(&client, handle);
+}

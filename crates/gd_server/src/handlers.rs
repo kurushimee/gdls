@@ -397,6 +397,20 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         });
     }
 
+    // #513: the cursor is on an annotation's own name (`@export_range`, `@onready`). Nothing below
+    // answers that question, so it used to fall all the way through to the "what type is the
+    // smallest node around here" arm and render the ENCLOSING CLASS — a card confidently naming the
+    // wrong thing. Answered from the annotation registry instead, and claimed unconditionally so an
+    // unregistered `@whatever` gets no card rather than the class.
+    if let Some((span, name)) = annotation_name_at(&parsed.tree, byte) {
+        // Claimed either way: an unregistered `@whatever` gets no card, never the class.
+        let reg = gd_syntax::parser::registered_annotation(&name)?;
+        return Some(Hover {
+            contents: hover_contents(state, format!("```gdscript\n{}\n```", reg.signature())),
+            range: Some(mapper.span_to_range(span)),
+        });
+    }
+
     // v1.0.2 (issue #26): the cursor is on the NAME of a class-level declaration — render its
     // signature (the analyzer pins no type on the name identifier, so the typed-ancestor
     // fallback below would walk up to the class node and surface its `<Script #N>` meta).
@@ -1716,6 +1730,29 @@ fn projected_base_type(
 /// The signature format is `func name(name: ParamType, …) -> ReturnType` using the parameter
 /// names and unresolved syntactic type names from [`gd_project::MemberDecl`]. When a name is
 /// unavailable (empty string), the type alone is rendered.
+/// The annotation whose own NAME the cursor sits on, as `(name span, name)`. `None` when the byte
+/// is anywhere else — including inside an annotation's ARGUMENTS, which are ordinary expressions and
+/// keep their own hovers. An annotation node's span opens at the `@`, so its name occupies the first
+/// `name.len()` bytes.
+fn annotation_name_at(tree: &ParseTree, byte: usize) -> Option<(gd_syntax::ByteSpan, String)> {
+    tree.iter_ids().find_map(|id| {
+        let n = tree.get(id);
+        let gd_syntax::ast::NodeKind::Annotation(a) = &n.kind else {
+            return None;
+        };
+        let end = n.span.start + a.name.len();
+        (n.span.start <= byte && byte < end).then(|| {
+            (
+                gd_syntax::ByteSpan {
+                    start: n.span.start,
+                    end,
+                },
+                a.name.clone(),
+            )
+        })
+    })
+}
+
 fn hover_member_signature(
     state: &ServerState,
     uri: &Uri,
