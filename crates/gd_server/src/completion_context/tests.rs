@@ -358,7 +358,10 @@ fn override_method() {
     // `func _re` at class-body statement start → override-method completion, prefix "_re".
     let m = "func _re|";
     let ctx = at(m);
-    assert_eq!(ctx.kind, CompletionKind::OverrideMethod);
+    assert_eq!(
+        ctx.kind,
+        CompletionKind::OverrideMethod { is_static: false }
+    );
     assert_eq!(prefix_text(m, &ctx).as_deref(), Some("_re"));
 }
 
@@ -371,13 +374,19 @@ fn override_method() {
 fn a_lone_underscore_after_func_is_still_an_override_position() {
     let m = "func _|";
     let ctx = at(m);
-    assert_eq!(ctx.kind, CompletionKind::OverrideMethod);
+    assert_eq!(
+        ctx.kind,
+        CompletionKind::OverrideMethod { is_static: false }
+    );
     // The `_` is the prefix, so accepting an item REPLACES it rather than producing `func __ready`.
     assert_eq!(prefix_text(m, &ctx).as_deref(), Some("_"));
 
     // Inside an inner class too — the position test is "statement start in a class body".
     let inner = "class I:\n\textends Node\n\tfunc _|";
-    assert_eq!(at(inner).kind, CompletionKind::OverrideMethod);
+    assert_eq!(
+        at(inner).kind,
+        CompletionKind::OverrideMethod { is_static: false }
+    );
 }
 
 /// The scoping half of #509: admitting `_` at `func _` must not turn it into a word token
@@ -398,7 +407,7 @@ fn a_lone_underscore_elsewhere_is_unchanged() {
     ] {
         assert_ne!(
             at(m).kind,
-            CompletionKind::OverrideMethod,
+            CompletionKind::OverrideMethod { is_static: false },
             "`_` must not open an override position in {m:?}"
         );
     }
@@ -521,7 +530,7 @@ fn named_lambda_is_not_override_method() {
     let ctx = at(m);
     assert_ne!(
         ctx.kind,
-        CompletionKind::OverrideMethod,
+        CompletionKind::OverrideMethod { is_static: false },
         "a named lambda must not classify as OverrideMethod"
     );
 }
@@ -1179,7 +1188,10 @@ fn declaration_suppression_stops_at_the_name() {
     );
     // `func <name>` is a declaration too, but Godot gives it override-method completion, not
     // `COMPLETION_DECLARATION`. It must not be swept up here.
-    assert_eq!(at("func _rea|").kind, CompletionKind::OverrideMethod);
+    assert_eq!(
+        at("func _rea|").kind,
+        CompletionKind::OverrideMethod { is_static: false }
+    );
 }
 
 // ===================================================================================================
@@ -1268,4 +1280,43 @@ fn a_half_typed_declaration_keyword_is_still_a_word_prefix() {
         assert_eq!(prefix_text(m, &ctx).as_deref(), want, "fixture {m:?}");
     }
     assert_eq!(at("func f():\n\tvar |").kind, CompletionKind::None);
+}
+
+/// #511: a `static func` cursor is an override position too. Godot opens
+/// `COMPLETION_OVERRIDE_METHOD` from `parse_function` regardless of staticness
+/// (`gdscript_parser.cpp:1781`) and reads `is_static` back off the node it opened on
+/// (`gdscript_editor.cpp:3688`) to filter both halves of the list. Before this, `static` broke the
+/// "raw predecessor is layout" test, so the classifier fell through to the general identifier set.
+#[test]
+fn static_func_is_an_override_position() {
+    for m in [
+        "static func |",
+        "static func _|",
+        "static func _stat|",
+        "class I:\n\tstatic func _|",
+    ] {
+        assert_eq!(
+            at(m).kind,
+            CompletionKind::OverrideMethod { is_static: true },
+            "`{m}` must classify as a static override position"
+        );
+    }
+    // The prefix is still what accepting an item replaces.
+    let m = "static func _stat|";
+    assert_eq!(prefix_text(m, &at(m)).as_deref(), Some("_stat"));
+}
+
+/// `static` only makes the `func` static when `static` itself opens the line. A `static func`
+/// LAMBDA in expression position is still a lambda, and the author is naming it.
+#[test]
+fn a_static_func_lambda_is_not_an_override_position() {
+    for m in [
+        "func f():\n\tvar g = static func _|",
+        "func f():\n\tvar g = static func na|",
+    ] {
+        assert!(
+            !matches!(at(m).kind, CompletionKind::OverrideMethod { .. }),
+            "`{m}` is a named lambda, not an override position"
+        );
+    }
 }
