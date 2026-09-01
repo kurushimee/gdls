@@ -5555,6 +5555,12 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // it carries the usual `Exact` gate; the NIL half claims nothing about the dump — a
         // NIL-typed enum meta has no method table by construction (analyzer.cpp:174-176 and its
         // built-in / global twins) — so it fires unconditionally.
+        // #550: true once this branch has PUSHED a miss error — the claim that the code is wrong,
+        // as opposed to the quiet degrades beside it, which claim nothing and must keep their soft
+        // `Variant`. An error-count snapshot would not do: `reduce_identifier_from_base` runs
+        // inside this branch and could push something unrelated, laundering a degrade into a
+        // no-type answer.
+        let mut miss_reported = false;
         let mut enum_meta_base = false;
         if base_type.kind == DtKind::Enum && base_type.is_meta_type {
             let enum_name = if base_type.enum_type.is_empty() {
@@ -5676,6 +5682,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 format!(r#"Member "{function_name}" is not a function."#),
                 call.callee.unwrap_or(id),
             );
+            miss_reported = true;
         }
         // #406: the name shadows a NON-METHOD member of the chain's native root (a property, a
         // signal, a constant, an enum). Godot resolves the identifier to that value and answers
@@ -5720,6 +5727,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 format!(r#"Function "{function_name}()" not found in base {base_name}."#),
                 anchor,
             );
+            miss_reported = true;
         } else if !name_is_value
             && !call.is_super
             && !is_self
@@ -5760,6 +5768,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 ),
                 id,
             );
+            miss_reported = true;
         }
         // Builtin instance methods (e.g. `arr.push_back()`, `dict.size()`) — Godot emits
         // "Function "X()" not found in base Y." for unknown methods on hard-typed Builtin
@@ -5859,7 +5868,19 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // walked kinds stay out for the same reason they always were — a method miss on a
         // `Native`, `Class`, `Script` or `Builtin` base is far more often a gdls lookup gap than
         // a real one — so their soft `Variant` remains a documented under-report.
-        call_type = if base_type.has_no_type()
+        //
+        // #550: a REPORTED miss lands there too. Godot's `call_type` is default-constructed at
+        // analyzer.cpp:3283 and never assigned anywhere in this branch (:3722-3776), so every miss
+        // it reports stamps UNRESOLVED/UNDETECTED — which is what the `:=` check reads
+        // (analyzer.cpp:2141) to add `Cannot infer the type of "x" …` under the miss row. The
+        // three flags below are exactly the arms that pushed an error: each already proves its
+        // negative behind `Exact` provenance and a walkable surface, so the quiet degrades beside
+        // them — a trimmed dump entry, an unwalkable chain, a partial cross-file interface — push
+        // nothing, keep `Variant`, and stay the documented under-report they are.
+        call_type = if miss_reported
+            || enum_meta_base
+            || name_is_value
+            || base_type.has_no_type()
             || (base_type.kind == DtKind::Variant && base_type.is_positively_dynamic())
         {
             DataType {
