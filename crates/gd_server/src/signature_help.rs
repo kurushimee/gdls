@@ -203,10 +203,16 @@ fn resolve_signatures(
     arg_index: usize,
     fid: Option<gd_project::FileId>,
 ) -> Option<Vec<Sig>> {
+    // #537: the parameter slots the ANALYZER resolved for this very call, from a cross-file
+    // default's shape. Reading them back is what keeps the popup and the diagnostics from
+    // disagreeing about the same slot; deriving a second answer here could not.
+    let resolved = resolved_param_labels(state, tree, analyzed, tokens[open_idx].span.start);
+    let resolved = resolved.as_slice();
+
     // #392: a super call, before anything reads the callee token. A bare `super(` has no callee to
     // read at all, and `super.method(`'s callee is a plain identifier the attribute arm would
     // resolve against the CURRENT class — answering an override with itself.
-    if let Some(sigs) = super_call_sigs(state, tree, analyzed, text, tokens, open_idx) {
+    if let Some(sigs) = super_call_sigs(state, tree, analyzed, text, tokens, open_idx, resolved) {
         return Some(sigs);
     }
 
@@ -236,16 +242,16 @@ fn resolve_signatures(
         // Tried first so `Hero.new(` / `Node.new(` resolve deterministically to the class `_init`.
         if name == "new" {
             if let Some(base_name) = base_token_name_before(tokens, dot_idx) {
-                if let Some(sig) = resolve_typed_new(state, text, &base_name) {
+                if let Some(sig) = resolve_typed_new(state, text, &base_name, resolved) {
                     return Some(sig);
                 }
             }
         }
         return resolve_attribute_call(
-            state, uri, tree, analyzed, text, tokens, dot_idx, open_idx, &name,
+            state, uri, tree, analyzed, text, tokens, dot_idx, open_idx, &name, resolved,
         );
     }
-    resolve_bare_call(state, text, fid, &name, arg_index)
+    resolve_bare_call(state, text, fid, &name, arg_index, resolved)
 }
 
 /// #392: the signature of the PARENT method a `super(` or `super.method(` call names.
@@ -269,6 +275,7 @@ fn super_call_sigs(
     text: &str,
     tokens: &[Token],
     open_idx: usize,
+    resolved: &[(usize, String)],
 ) -> Option<Vec<Sig>> {
     // This `(` must open the SUPER call's own argument list, not a nested call inside it. The two
     // forms are `super (` and `super . name (`; anything else is a different call that merely sits
@@ -315,7 +322,7 @@ fn super_call_sigs(
     })?;
     match callee {
         CalleeTarget::Script { file, class_path } => {
-            script_method_sig(state, text, file, &class_path, &name)
+            script_method_sig(state, text, file, &class_path, &name, resolved)
         }
         CalleeTarget::Native { class } => native_method_sig(state, &class, &name),
         _ => None,
@@ -353,6 +360,7 @@ fn resolve_attribute_call(
     dot_idx: usize,
     open_idx: usize,
     method: &str,
+    resolved: &[(usize, String)],
 ) -> Option<Vec<Sig>> {
     let analyzed = analyzed?;
     let dot_start = tokens[dot_idx].span.start;
@@ -392,11 +400,11 @@ fn resolve_attribute_call(
                 if let Some(CalleeTarget::Script { file, class_path }) =
                     call_target_at_open_paren(analyzed, tokens[open_idx].span.start)
                 {
-                    if let Some(sig) = script_init_sig(state, text, file, &class_path) {
+                    if let Some(sig) = script_init_sig(state, text, file, &class_path, resolved) {
                         return Some(sig);
                     }
                 }
-                return script_init_sig(state, text, sr.file, &sr.inner);
+                return script_init_sig(state, text, sr.file, &sr.inner, resolved);
             }
             // Prefer the analyzer's resolved callee for THIS call: it carries the inner-class
             // `class_path` precisely, which the base VALUE's `ScriptRef` does not (an inner-class
@@ -405,11 +413,13 @@ fn resolve_attribute_call(
             if let Some(CalleeTarget::Script { file, class_path }) =
                 call_target_at_open_paren(analyzed, tokens[open_idx].span.start)
             {
-                if let Some(sig) = script_method_sig(state, text, file, &class_path, method) {
+                if let Some(sig) =
+                    script_method_sig(state, text, file, &class_path, method, resolved)
+                {
                     return Some(sig);
                 }
             }
-            script_method_sig(state, text, sr.file, &sr.inner, method)
+            script_method_sig(state, text, sr.file, &sr.inner, method, resolved)
         }
         // A `Class.new(` where the base is a *meta* type the analyzer left as a script/native ref is
         // handled by the meta-base name path in `resolve_bare_call`; nothing else resolves here.
@@ -423,6 +433,40 @@ fn resolve_attribute_call(
 /// BRACKETS the open paren (`call_site.start < open_paren_byte <= call_site.end`). This carries the
 /// inner-class `class_path` that the base value's `ScriptRef` does not (#113); `None` when the call
 /// isn't analyzer-resolved (the caller then falls back to the base value's own type).
+/// #537: the parameter labels the analyzer resolved for the call whose `(` sits at
+/// `open_paren_byte`, as `(index, rendered type)`.
+///
+/// The analyzer resolved these slots from a cross-file default's `InitShape` while computing this
+/// file's argument checks, and recorded them under the call's own span. Reading them back is the
+/// whole point: a popup that derived its own answer could disagree with the diagnostic sitting on
+/// the same argument. Rendered through `human_type_label`, the label hover and inlayHint share, so
+/// an enum reads `TileSet.TileShape` exactly as the diagnostic prints it.
+///
+/// Innermost-call rule matches [`call_target_at_open_paren`]: the latest-starting call whose span
+/// brackets this `(`, which also covers an incomplete call whose span ends at the paren.
+fn resolved_param_labels(
+    state: &ServerState,
+    tree: &ParseTree,
+    analyzed: Option<&AnalysisResult>,
+    open_paren_byte: usize,
+) -> Vec<(usize, String)> {
+    let Some(analysis) = analyzed else {
+        return Vec::new();
+    };
+    analysis
+        .call_param_resolutions()
+        .iter()
+        .filter(|(span, _)| span.start < open_paren_byte && open_paren_byte <= span.end)
+        .max_by_key(|(span, _)| span.start)
+        .map(|(_, slots)| {
+            slots
+                .iter()
+                .map(|(i, dt)| (*i, crate::handlers::human_type_label(state, tree, dt)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn call_target_at_open_paren(
     analysis: &AnalysisResult,
     open_paren_byte: usize,
@@ -596,6 +640,7 @@ fn resolve_bare_call(
     fid: Option<gd_project::FileId>,
     name: &str,
     arg_index: usize,
+    resolved: &[(usize, String)],
 ) -> Option<Vec<Sig>> {
     // (a) `@GlobalScope` / GDScript utility (`print`, `abs`, `randi`, …).
     if let Some(sig) = utility_sig(state, name) {
@@ -607,7 +652,7 @@ fn resolve_bare_call(
     }
     // (c) A method on the implicit-self class (own / inherited project method, else the native
     // root the chain bottoms out in).
-    resolve_self_method(state, text, fid, name)
+    resolve_self_method(state, text, fid, name, resolved)
 }
 
 /// Per-overload signatures for a bare builtin-type callee (`Vector2(`, `Color(`, `Callable(`) —
@@ -661,7 +706,12 @@ fn builtin_constructor_sigs(state: &ServerState, name: &str, arg_index: usize) -
 /// **type name** before the dot (not a value type). Tried before the value-typed attribute path so
 /// a `Hero.new(` resolves to `Hero`'s `_init` even though `Hero` (a meta type) carries no instance
 /// members. `None` when the name isn't a known type.
-fn resolve_typed_new(state: &ServerState, text: &str, base_name: &str) -> Option<Vec<Sig>> {
+fn resolve_typed_new(
+    state: &ServerState,
+    text: &str,
+    base_name: &str,
+    resolved: &[(usize, String)],
+) -> Option<Vec<Sig>> {
     // A native class → a constructor signature (the engine `_init` is not a dumped member, so the
     // truthful shape is `ClassName(...)`).
     if state.workspace.native.class_named(base_name).is_some() {
@@ -670,7 +720,7 @@ fn resolve_typed_new(state: &ServerState, text: &str, base_name: &str) -> Option
     // A project `class_name` → the declaring file's `_init` (or a no-arg constructor).
     if let Some(entry) = state.workspace.index.registry().get(base_name) {
         if let Some(fid) = state.workspace.index.file_id(&entry.path) {
-            return script_init_sig(state, text, fid, &[])
+            return script_init_sig(state, text, fid, &[], resolved)
                 .or_else(|| Some(vec![Sig::constructor(base_name)]));
         }
     }
@@ -687,6 +737,7 @@ fn resolve_self_method(
     text: &str,
     fid: Option<gd_project::FileId>,
     name: &str,
+    resolved: &[(usize, String)],
 ) -> Option<Vec<Sig>> {
     let fid = fid?;
     let (chain, root) = state
@@ -702,7 +753,7 @@ fn resolve_self_method(
                 .iter()
                 .any(|m| m.name == name && m.kind == gd_project::MemberKind::Func)
             {
-                return script_method_sig(state, text, *f, &[], name);
+                return script_method_sig(state, text, *f, &[], name, resolved);
             }
         }
     }
@@ -760,6 +811,7 @@ fn script_method_sig(
     fid: gd_project::FileId,
     class_path: &[String],
     name: &str,
+    resolved: &[(usize, String)],
 ) -> Option<Vec<Sig>> {
     let root = state.workspace.index.interface(fid)?;
     // Walk the inner-class chain to the OWNING class (each segment matches an inner class's
@@ -800,6 +852,7 @@ fn script_method_sig(
         func,
         doc,
         Some((decl, &state.workspace.native)),
+        resolved,
     )])
 }
 
@@ -816,10 +869,11 @@ fn script_init_sig(
     text: &str,
     fid: gd_project::FileId,
     class_path: &[String],
+    resolved: &[(usize, String)],
 ) -> Option<Vec<Sig>> {
     // `_init` may be declared on the class itself or inherited; the owning class's own declaration
     // is the common case (a constructor is rarely inherited as-is). Try it first.
-    if let Some(sig) = script_method_sig(state, text, fid, class_path, "_init") {
+    if let Some(sig) = script_method_sig(state, text, fid, class_path, "_init", resolved) {
         return Some(sig);
     }
     // No explicit `_init` — the implicit no-arg constructor, named for the class actually being
@@ -1060,9 +1114,10 @@ impl Sig {
         func: &gd_syntax::ast::FunctionNode,
         doc: Option<String>,
         decl: Option<(&gd_project::MemberDecl, &gd_types::NativeDb)>,
+        resolved: &[(usize, String)],
     ) -> Sig {
         let ret = return_type_label(tree, src, func.return_type);
-        Sig::from_function_node_returning(tree, src, &ret, name, func, doc, decl)
+        Sig::from_function_node_returning(tree, src, &ret, name, func, doc, decl, resolved)
     }
 
     /// Build a lambda's signature under the callee name the call site used (`call` /
@@ -1080,11 +1135,12 @@ impl Sig {
             Some(_) => return_type_label(tree, src, func.return_type),
             None => "Variant".to_string(),
         };
-        Sig::from_function_node_returning(tree, src, &ret, method, func, None, None)
+        Sig::from_function_node_returning(tree, src, &ret, method, func, None, None, &[])
     }
 
     /// The shared body of [`Sig::from_function_node`] / [`Sig::from_lambda`]: the `ret name(…)`
     /// label over `func`'s parameters, with the return label supplied by the caller.
+    #[allow(clippy::too_many_arguments)] // the declaring tree + its interface decl + the call's own resolutions
     fn from_function_node_returning(
         tree: &ParseTree,
         src: &str,
@@ -1093,6 +1149,7 @@ impl Sig {
         func: &gd_syntax::ast::FunctionNode,
         doc: Option<String>,
         decl: Option<(&gd_project::MemberDecl, &gd_types::NativeDb)>,
+        resolved: &[(usize, String)],
     ) -> Sig {
         let mut b = LabelBuilder::new(format!("{ret} {name}("));
         for (i, &pid) in func.parameters.iter().enumerate() {
@@ -1105,8 +1162,10 @@ impl Sig {
                 .identifier
                 .map(|id| ident_text(tree, id))
                 .unwrap_or_default();
-            let pty = param_type_label(tree, src, p, decl, i);
-            let mut frag = format!("{pname}: {pty}");
+            let mut frag = match param_type_label(tree, src, p, decl, i, resolved) {
+                Some(pty) => format!("{pname}: {pty}"),
+                None => pname.to_string(),
+            };
             if let Some(init) = p.initializer {
                 frag.push_str(" = ");
                 frag.push_str(node_source(tree, src, init));
@@ -1241,13 +1300,31 @@ fn param_type_label(
     p: &gd_syntax::ast::ParameterNode,
     decl: Option<(&gd_project::MemberDecl, &gd_types::NativeDb)>,
     index: usize,
-) -> String {
+    resolved: &[(usize, String)],
+) -> Option<String> {
     if let Some(t) = p
         .datatype_specifier
         .map(|id| clean_type_text(node_source(tree, src, id)))
         .filter(|t| !t.is_empty())
     {
-        return t;
+        return Some(t);
+    }
+    // #537: a HARD default the shallow decode could not read. The analyzer resolved it for this
+    // call and the label is that answer; with none, the slot renders NO type rather than
+    // `Variant` — `Variant` is a real GDScript type, so printing it beside a diagnostic that
+    // names the real one is the worse of the two silences.
+    if let Some(gd_project::ParamTyping::Unknown { hard }) =
+        decl.and_then(|(d, _)| d.params_typing.get(index)).copied()
+    {
+        if !hard {
+            // A soft `=` default prints `Variant` in Godot's own arguments hint
+            // (gdscript_editor.cpp:819-824): only a HARD type is rendered there.
+            return Some("Variant".to_string());
+        }
+        return resolved
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, label)| label.clone());
     }
     let inferred_hard = decl
         .and_then(|(d, _)| d.params_typing.get(index))
@@ -1258,10 +1335,10 @@ fn param_type_label(
         if let Some(t) =
             decl.and_then(|(d, db)| d.params.get(index).and_then(|p| p.render_resolved(db)))
         {
-            return t;
+            return Some(t);
         }
     }
-    "Variant".to_string()
+    Some("Variant".to_string())
 }
 
 /// Strip the leading annotation punctuation a `Type` node's source carries: the parser anchors a

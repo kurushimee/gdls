@@ -51,6 +51,21 @@ pub struct AnalysisResult {
     /// [`AnalysisContext::finish`]). A frozen output — never mutated post-construction.
     member_xrefs: FxHashMap<MemberName, Vec<MemberXref>>,
 
+    /// #537: per call site, the parameter slots whose type came from resolving a cross-file
+    /// default's `InitShape` — `(index, resolved type)`, keyed by the call's own span.
+    ///
+    /// The argument checks already computed these; recording them is what lets `signatureHelp`
+    /// label the same slot with the same answer instead of deriving a second one that could
+    /// disagree. Only a HARD (`:=`) slot is recorded: a soft slot prints `Variant` in Godot's own
+    /// arguments hint, so there is nothing for a consumer to do with it.
+    ///
+    /// Sparse — empty in every file that makes no such call. Recording is additive and never
+    /// changes any other field.
+    ///
+    /// **WP-RD1: private.** Read via [`Self::call_param_resolutions`]; the only write path is
+    /// [`AnalysisContext::record_call_param_resolution`].
+    call_param_resolutions: FxHashMap<ByteSpan, Vec<(usize, DataType)>>,
+
     /// Per-occurrence resolution records — every resolved call site ([`Binding::Call`]) and
     /// identifier / member-access ([`Binding::Use`]).
     ///
@@ -126,6 +141,13 @@ impl AnalysisResult {
         &self.member_xrefs
     }
 
+    /// The parameter slots this file's calls resolved from a cross-file default's shape (see the
+    /// field docs). Read side of the WP-RD1 chokepoint.
+    #[must_use]
+    pub fn call_param_resolutions(&self) -> &FxHashMap<ByteSpan, Vec<(usize, DataType)>> {
+        &self.call_param_resolutions
+    }
+
     /// Construct a result from explicit parts — **test-only.** Gated behind `cfg(test)` (for
     /// `gd_analyze`'s own unit tests) and the `test-support` feature (so dependent crates'
     /// integration tests — e.g. `gd_server::xfile` — can build literals across the crate
@@ -145,6 +167,7 @@ impl AnalysisResult {
             folds,
             diagnostics,
             member_xrefs,
+            call_param_resolutions: FxHashMap::default(),
             bindings,
             lambda_uses_self: FxHashSet::default(),
             bailed: false,
@@ -346,6 +369,13 @@ pub struct AnalysisContext<'a> {
     /// reducer can never push a raw `(file, member)` pair around it.
     member_xrefs: FxHashMap<MemberName, Vec<MemberXref>>,
 
+    /// #537 staging: per call site, the parameter slots resolved from a cross-file default's
+    /// shape. Moved into [`AnalysisResult::call_param_resolutions`] by [`Self::finish`].
+    ///
+    /// **WP-RD1: private staging.** The sole write path is
+    /// [`Self::record_call_param_resolution`].
+    call_param_resolutions: FxHashMap<ByteSpan, Vec<(usize, DataType)>>,
+
     /// Per-occurrence resolution records. Pushed by the reducer at every resolved call site
     /// and identifier / member-access via [`Self::record_binding`]. Moved into
     /// [`AnalysisResult::bindings`] by [`Self::finish`].
@@ -464,6 +494,7 @@ impl<'a> AnalysisContext<'a> {
             warning_ignore_regions,
             warning_ignored_lines,
             member_xrefs: FxHashMap::default(),
+            call_param_resolutions: FxHashMap::default(),
             bindings: Vec::new(),
             lambda_uses_self: FxHashSet::default(),
             // M5 WP-O3 / O4: governor + cancellation defaults. The bare `AnalysisContext::new`
@@ -585,6 +616,20 @@ impl<'a> AnalysisContext<'a> {
     /// its initializer. Append-only; duplicates within the same analyze pass are intentional
     /// (the downstream cycle check reads via `.iter().any(...)` and doesn't care about
     /// uniqueness).
+    /// #537: record the parameter slots a call site resolved from a cross-file default's shape.
+    /// One entry per call, keyed by the call's own span — the same span `Binding::Call` records,
+    /// so a consumer that found the call found this too.
+    pub(crate) fn record_call_param_resolution(
+        &mut self,
+        call_span: ByteSpan,
+        slots: Vec<(usize, DataType)>,
+    ) {
+        if slots.is_empty() {
+            return;
+        }
+        self.call_param_resolutions.insert(call_span, slots);
+    }
+
     pub fn record_member_xref(
         &mut self,
         from_member: &str,
@@ -803,6 +848,7 @@ impl<'a> AnalysisContext<'a> {
             folds: self.folds,
             diagnostics: self.sink.finish(),
             member_xrefs: self.member_xrefs,
+            call_param_resolutions: self.call_param_resolutions,
             bindings: self.bindings,
             lambda_uses_self: self.lambda_uses_self,
             bailed: self.bailed,
