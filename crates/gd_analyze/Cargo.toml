@@ -22,6 +22,7 @@ rustc-hash.workspace = true
 # v1.0.1: relative preload/extends path joins against the index's camino paths
 # (`SyntacticQuery::resolve_path_from`).
 camino.workspace = true
+unicode-security.workspace = true
 
 [dev-dependencies]
 # `which`: M5 WP-D1 — PATH lookup for the local-only differential harness's `godot` discovery

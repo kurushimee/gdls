@@ -1605,8 +1605,10 @@ impl Parser {
         let id = self.alloc(NodeKind::GetNode(GetNodeNode {
             full_path: String::new(),
             use_dollar: true,
+            ident_segments: Vec::new(),
         }));
         let mut full_path = String::new();
+        let mut ident_segments: Vec<String> = Vec::new();
         let mut use_dollar = true;
 
         #[derive(PartialEq)]
@@ -1670,6 +1672,8 @@ impl Parser {
             } else if self.current.kind.is_node_name() {
                 self.advance();
                 full_path.push_str(&self.previous.source);
+                // cpp:3670-3677 — only a bare-identifier segment is spoof-checked.
+                ident_segments.push(self.previous.source.to_string());
                 path_state = PathState::NodeName;
             } else if !self.check(TokenKind::Slash) && !self.check(TokenKind::Percent) {
                 self.push_error(format!(
@@ -1689,6 +1693,7 @@ impl Parser {
         if let NodeKind::GetNode(n) = &mut self.tree.get_mut(id).kind {
             n.full_path = full_path;
             n.use_dollar = use_dollar;
+            n.ident_segments = ident_segments;
         }
         Some(id)
     }
@@ -5399,5 +5404,24 @@ mod tests {
                 r#"Name "A" was already in this enum (at line 3)."#.to_owned(),
             ]
         );
+    }
+
+    /// `ident_segments` carries only the segments written as BARE IDENTIFIERS. Godot spoof-checks
+    /// exactly those (`gdscript_parser.cpp:3670-3677`), so a string-literal segment must not land
+    /// here — including it would warn on `$"pοrt"`, which Godot accepts.
+    #[test]
+    fn get_node_ident_segments_exclude_string_literals() {
+        let segments_of = |src: &str| -> Vec<String> {
+            let (tree, root, errs) = expr(src);
+            assert!(errs.is_empty(), "{src:?} parsed with errors: {errs:?}");
+            match kind_of(&tree, root) {
+                Some(NodeKind::GetNode(n)) => n.ident_segments.clone(),
+                other => panic!("{src:?} parsed as {other:?}"),
+            }
+        };
+        assert_eq!(segments_of("$a/\"b\"/c"), vec!["a", "c"]);
+        assert_eq!(segments_of("$a/b"), vec!["a", "b"]);
+        assert_eq!(segments_of("%uniq"), vec!["uniq"]);
+        assert_eq!(segments_of("$\"only\""), Vec::<String>::new());
     }
 }
