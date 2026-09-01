@@ -609,3 +609,116 @@ fn project_godot_client_event_triggers_coalesced_reload() {
 
     shutdown(&client, server_thread);
 }
+
+/// #519: the same freshness, for a class named only inside a FUNCTION BODY. No interface records
+/// such a use, so `name_referencers` could not see it, and the reverse-dependency closure could not
+/// either — a name that fails to resolve leaves no edge to traverse, so creating the class reached
+/// nobody and the consumer's "Identifier not declared" stood forever. `relink_referencers` now also
+/// scans each interface's `body_refs`.
+///
+/// The negative rides along: an unrelated open buffer must not be republished, because a
+/// `class_name` edit invalidates the files that name it, not the project.
+#[test]
+fn creating_a_class_clears_a_body_only_reference_and_leaves_others_alone() {
+    let p = sample_project();
+    let (client, _watcher_tx, server_thread) = boot_injected(&p, dynamic_registration_caps());
+    let reg = loop {
+        if let Message::Request(req) = recv(&client) {
+            break req;
+        }
+    };
+    client
+        .sender
+        .send(Message::Response(Response::new_ok(
+            reg.id,
+            serde_json::Value::Null,
+        )))
+        .unwrap();
+
+    let open = |rel: &str, text: &str| {
+        p.write(rel, text);
+        let uri = file_uri(&p.root.join(rel));
+        client
+            .sender
+            .send(notification(
+                "textDocument/didOpen",
+                DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: uri.clone(),
+                        language_id: "gdscript".to_string(),
+                        version: 1,
+                        text: text.to_string(),
+                    },
+                },
+            ))
+            .unwrap();
+        uri
+    };
+    // The consumer names `Fresh` only in a body; the other file never names it at all. A cast
+    // rather than a construction, so the assertion reads the reference and not `Node`'s abstractness
+    // in the trimmed fixture API.
+    let user_uri = open(
+        "user.gd",
+        "extends Node\n\nfunc go(x) -> void:\n\tprint(x as Fresh)\n",
+    );
+    let other_uri = open(
+        "other.gd",
+        "extends Node\n\nfunc unrelated() -> void:\n\tprint(1)\n",
+    );
+
+    // Drain the two didOpen publishes and check the consumer is broken to begin with.
+    let mut user_broken = false;
+    for _ in 0..2 {
+        loop {
+            if let Message::Notification(n) = recv(&client) {
+                if n.method == "textDocument/publishDiagnostics" {
+                    if n.params["uri"] == serde_json::json!(user_uri.as_str()) {
+                        user_broken = serde_json::to_string(&n.params).unwrap().contains("Fresh");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        user_broken,
+        "`Fresh` does not exist yet, so `user.gd` is broken"
+    );
+
+    // The class appears.
+    p.write("src/fresh.gd", "class_name Fresh\nextends Node\n");
+    client
+        .sender
+        .send(file_event(
+            &file_uri(&p.root.join("src/fresh.gd")),
+            FileChangeType::CREATED,
+        ))
+        .unwrap();
+
+    // Collect every publish that arrives, until the consumer's clean one shows up.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut republished_uris: Vec<String> = Vec::new();
+    let mut user_clean = false;
+    while Instant::now() < deadline && !user_clean {
+        if let Some(Message::Notification(n)) = try_recv(&client, Duration::from_millis(200)) {
+            if n.method != "textDocument/publishDiagnostics" {
+                continue;
+            }
+            let uri = n.params["uri"].as_str().unwrap_or_default().to_string();
+            republished_uris.push(uri.clone());
+            if uri == user_uri.as_str() {
+                user_clean = n.params["diagnostics"].as_array().unwrap().is_empty();
+            }
+        }
+    }
+    assert!(
+        user_clean,
+        "creating `Fresh` must clear the body-only reference; publishes were {republished_uris:?}"
+    );
+    assert!(
+        !republished_uris.iter().any(|u| u == other_uri.as_str()),
+        "a file that never names `Fresh` must not be republished; got {republished_uris:?}"
+    );
+
+    shutdown(&client, server_thread);
+}

@@ -339,7 +339,9 @@ pub struct Interface {
     /// this is *what this file depends on*, not *what it exposes*. It is deliberately NOT fed into
     /// the `name_referencers` index either — that set is the `references`/`rename` candidate
     /// fast-path, and filling it with every local's name would turn a cursor on an unresolvable
-    /// identifier into a project-wide analysis.
+    /// identifier into a project-wide analysis. `Index::relink_referencers` does SCAN it (#519), so
+    /// a `class_name` appearing still reaches a file that only used the name in a body, without that
+    /// file joining the rename fast-path. The scan binary-searches, so keep this sorted and deduped.
     pub body_refs: Vec<String>,
     /// `true` when the parse this interface was extracted from reported no syntax errors, so the
     /// member list is the complete set of declarations the source has.
