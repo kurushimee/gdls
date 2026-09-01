@@ -7850,6 +7850,13 @@ fn resolve_value_path(
     if cur.kind == DtKind::Native && cur.is_meta_type {
         return ShapeAnswer::Unknown;
     }
+    // #539: a NATIVE enum meta is the second head that cannot be the answer — `var e :=
+    // TileSet.TileShape` is "Type ... cannot be used on its own" in the declaring file. Reading a
+    // value THROUGH it is fine; the walk above just did. `is_pseudo_type` is what separates it
+    // from a SCRIPT enum meta, which is a real dictionary value in Godot and must keep crossing.
+    if cur.kind == DtKind::Enum && cur.is_meta_type && cur.is_pseudo_type {
+        return ShapeAnswer::Unknown;
+    }
     ShapeAnswer::Type(Box::new(cur))
 }
 
@@ -7928,18 +7935,22 @@ fn member_type_of(ctx: &mut AnalysisContext, base: &DataType, name: &str) -> Sha
         if !base.enum_values.contains_key(name) {
             return ShapeAnswer::Unknown;
         }
-        let mut value = base.clone();
-        value.is_meta_type = false;
-        value.builtin_type = VariantType::Int;
-        return ShapeAnswer::Type(Box::new(value));
+        // The same mint the in-file path uses (`ctx.set_type(id, type_from_metatype(base))`), so a
+        // value read through its enum's name is field for field the value read straight off the
+        // class. #539: a NATIVE enum meta is a pseudo-type, and carrying that bit onto the value
+        // would arm "cannot be used on its own" in the reading file — `type_from_metatype` clears
+        // it where the hand-flips here did not.
+        return ShapeAnswer::Type(Box::new(crate::resolver::type_from_metatype(base.clone())));
     }
     // #524: a native METAtype (`TileSet`, `Image`) reads its own enums, enum values and bare
     // constants. `lookup_member` walks the `inherits` chain exactly as the in-file member walk
     // does, so a member inferred from `TileSet.TILE_SHAPE_SQUARE` gets `TileSet.TileShape` here
     // and not the `Variant` that made a reader report an unsafe argument the engine does not.
-    // A method, a signal and the enum ITSELF answer nothing: the first two are not values the
-    // seam models, and `var e := TileSet.TileShape` is an error in the declaring file
-    // ("Type ... in base ... cannot be used on its own"), so there is no type to carry.
+    // A method and a signal answer nothing — neither is a value the seam models. #539: the enum
+    // itself answers its META (Godot's `make_native_enum_type(name, native)` at
+    // gdscript_analyzer.cpp:4363-4366), so a following segment can read a value through it. It is
+    // the walk's TAIL that keeps `var e := TileSet.TileShape` from carrying anything, since that
+    // is an error in the declaring file ("Type ... in base ... cannot be used on its own").
     if base.kind == DtKind::Native && base.is_meta_type {
         let Some((owner_class, member)) = ctx.native.lookup_member(&base.native_type, name) else {
             return ShapeAnswer::Unknown;
@@ -7953,6 +7964,18 @@ fn member_type_of(ctx: &mut AnalysisContext, base: &DataType, name: &str) -> Sha
                     &enum_name,
                     &owner_class,
                     false,
+                )))
+            }
+            // #539: `TileSet.TileShape` — the enum read off its own class, as a meta, so the next
+            // segment resolves `TileSet.TileShape.TILE_SHAPE_SQUARE` exactly as the unqualified
+            // `TileSet.TILE_SHAPE_SQUARE` resolves.
+            gd_types::NativeMember::Enum(e) => {
+                let enum_name = ctx.native.name_of(e.name).to_owned();
+                ShapeAnswer::Type(Box::new(crate::resolver::make_native_enum_type(
+                    ctx,
+                    &enum_name,
+                    &owner_class,
+                    true,
                 )))
             }
             // A bare class constant carries no enum membership in the dump; Godot types it `int`.
