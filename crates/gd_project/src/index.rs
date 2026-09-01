@@ -1003,14 +1003,39 @@ impl Index {
     }
 
     /// Re-resolve and invalidate every file that references `name` (its resolution just changed).
+    ///
+    /// Two sources, because a consumer can name a class in two places. `name_referencers` holds the
+    /// INTERFACE-level uses — `extends X`, a class-level `var b: X`, a parameter type — and is the
+    /// `references`/`rename` candidate fast-path. Body-level uses (`X.new()`, `x as X`, a local
+    /// `var b: X`) live in each interface's [`Interface::body_refs`], which is deliberately kept out
+    /// of that table (filling it with every local's name would turn a cursor on an unresolvable
+    /// identifier into a project-wide search), so they are found by scanning instead — each
+    /// `body_refs` is sorted and deduped, so the per-file test is a binary search.
+    ///
+    /// #519: without the scan, a `class_name` that APPEARS reaches nobody that used it in a body,
+    /// and the consumer's "Identifier not declared" never clears. The asymmetry is the point:
+    /// REMOVING the name works through the reverse-dependency closure because the consumer still
+    /// holds a resolved edge at that moment — but re-analyzing drops that edge, so adding the name
+    /// back has nothing to traverse. This scan is the only way in.
+    ///
+    /// The scan over-approximates: a file whose only `X` is an unrelated local is dirtied too. That
+    /// is the correct set rather than a tolerated cost — a new global named `X` is exactly what makes
+    /// such a local report `SHADOWED_GLOBAL_IDENTIFIER`, so it does have to re-analyze.
     fn relink_referencers(&mut self, name: &str) {
-        let referencers: Vec<FileId> = self
+        let mut referencers: FxHashSet<FileId> = self
             .name_referencers
             .get(name)
             .into_iter()
             .flatten()
             .copied()
             .collect();
+        referencers.extend(self.interfaces.iter().filter_map(|(fid, iface)| {
+            iface
+                .body_refs
+                .binary_search_by(|r| r.as_str().cmp(name))
+                .ok()
+                .map(|_| *fid)
+        }));
         for fid in referencers {
             self.recompute_edges(fid);
             self.mark_dirty(fid);
@@ -1967,6 +1992,121 @@ mod tests {
         };
         assert_eq!(idx.path(b).unwrap(), abs("b.gd"));
         assert!(epoch(&idx, "a.gd") > a_epoch0);
+    }
+
+    /// #519: the everyday shape — the consumer names the class only inside a FUNCTION BODY, which
+    /// no interface records. `name_referencers` cannot see it and the reverse-dependency closure
+    /// cannot either (a name that fails to resolve leaves no edge to traverse), so before the
+    /// `body_refs` scan the consumer was never invalidated and its "Identifier not declared" stood
+    /// forever.
+    #[test]
+    fn newly_added_class_name_links_a_body_only_referencer() {
+        for body in [
+            "func go() -> void:\n\tvar b := MyBase.new()\n",
+            "func go(x) -> void:\n\tprint(x as MyBase)\n",
+            "func go() -> void:\n\tvar b: MyBase = null\n",
+        ] {
+            let mut idx = cold_index(&[
+                ("a.gd", &format!("extends Node\n\n{body}")),
+                ("b.gd", "extends Node\n"),
+            ]);
+            idx.clear_dirty();
+            let a_epoch0 = epoch(&idx, "a.gd");
+
+            let new_b =
+                interface::extract(&gd_syntax::parse("class_name MyBase\nextends Node\n").tree);
+            idx.on_file_changed(&abs("b.gd"), new_b);
+
+            assert!(
+                epoch(&idx, "a.gd") > a_epoch0,
+                "a body-only reference must re-analyze when the class appears; body was {body:?}"
+            );
+        }
+    }
+
+    /// The round trip from the issue. Renaming the name away already worked (the consumer still held
+    /// a resolved edge at that moment); renaming it back is the half that did not.
+    #[test]
+    fn a_class_name_renamed_away_and_back_invalidates_a_body_only_referencer() {
+        let mut idx = cold_index(&[
+            (
+                "a.gd",
+                "extends Node\n\nfunc go() -> void:\n\tvar b := MyBase.new()\n",
+            ),
+            ("b.gd", "class_name MyBase\nextends Node\n"),
+        ]);
+        let away = interface::extract(&gd_syntax::parse("class_name MyOther\nextends Node\n").tree);
+        idx.clear_dirty();
+        let e0 = epoch(&idx, "a.gd");
+        idx.on_file_changed(&abs("b.gd"), away);
+        assert!(
+            epoch(&idx, "a.gd") > e0,
+            "renaming the name away invalidates"
+        );
+
+        let back = interface::extract(&gd_syntax::parse("class_name MyBase\nextends Node\n").tree);
+        idx.clear_dirty();
+        let e1 = epoch(&idx, "a.gd");
+        idx.on_file_changed(&abs("b.gd"), back);
+        assert!(
+            epoch(&idx, "a.gd") > e1,
+            "renaming it back must invalidate too — the edge it would have traversed is gone"
+        );
+    }
+
+    /// The scoping half of #519. A `class_name` edit invalidates the files that name it, not the
+    /// project: a file that never mentions `MyBase` keeps its epoch. The scan does dirty a file
+    /// whose only `MyBase` is an unrelated local, which is correct — a new global by that name is
+    /// exactly what makes such a local report `SHADOWED_GLOBAL_IDENTIFIER`.
+    #[test]
+    fn a_new_class_name_does_not_invalidate_a_file_that_never_names_it() {
+        let mut idx = cold_index(&[
+            (
+                "a.gd",
+                "extends Node\n\nfunc go() -> void:\n\tvar b := MyBase.new()\n",
+            ),
+            (
+                "other.gd",
+                "extends Node\n\nfunc unrelated() -> void:\n\tprint(1)\n",
+            ),
+            ("b.gd", "extends Node\n"),
+        ]);
+        idx.clear_dirty();
+        let (e_a, e_other) = (epoch(&idx, "a.gd"), epoch(&idx, "other.gd"));
+
+        let new_b = interface::extract(&gd_syntax::parse("class_name MyBase\nextends Node\n").tree);
+        idx.on_file_changed(&abs("b.gd"), new_b);
+
+        assert!(epoch(&idx, "a.gd") > e_a, "the referencer re-analyzes");
+        assert_eq!(
+            epoch(&idx, "other.gd"),
+            e_other,
+            "a file that never names the class must not re-analyze"
+        );
+    }
+
+    /// The name reaching the file only as an ATTRIBUTE tail (`d.MyBase`) is not a reference to the
+    /// global at all — `collect_body_refs` drops those, so the scan cannot resurrect them.
+    #[test]
+    fn an_attribute_tail_is_not_a_body_referencer() {
+        let mut idx = cold_index(&[
+            (
+                "a.gd",
+                "extends Node\n\nfunc go(d) -> void:\n\tprint(d.MyBase)\n",
+            ),
+            ("b.gd", "extends Node\n"),
+        ]);
+        idx.clear_dirty();
+        let e_a = epoch(&idx, "a.gd");
+
+        let new_b = interface::extract(&gd_syntax::parse("class_name MyBase\nextends Node\n").tree);
+        idx.on_file_changed(&abs("b.gd"), new_b);
+
+        assert_eq!(
+            epoch(&idx, "a.gd"),
+            e_a,
+            "`d.MyBase` names a member, not the global"
+        );
     }
 
     #[test]
