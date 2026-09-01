@@ -217,7 +217,7 @@ fn multiline_value_does_not_desync_sections() {
 // reverse maps line up with the fixtures' contents.
 #[test]
 fn build_over_fixtures_dir() {
-    let idx = SceneIndex::build(&fixtures_dir());
+    let idx = SceneIndex::build(&fixtures_dir(), Default::default());
     // 5 fixtures (main, child, fork_quirks, malformed, multiline_value). The malformed one still
     // produces a (partial) Scene and is indexed.
     assert!(idx.len() >= 5, "all fixtures indexed; got {}", idx.len());

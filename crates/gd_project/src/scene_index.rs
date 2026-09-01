@@ -41,6 +41,13 @@ pub struct SceneIndex {
     /// `instance=ExtResource(id)`). The scene→scene(instance) edge, used for transitive
     /// invalidation. Rebuilt alongside `script_to_scenes`.
     instanced_by: FxHashMap<String, FxHashSet<String>>,
+    /// `uid://…` → `res://…`, a copy of [`crate::ProjectModel::uids`]. The SAME map
+    /// [`crate::Index::set_uid_map`] receives, never a second resolver. #484.
+    uids: FxHashMap<String, String>,
+    /// `uid://…` → the scenes whose ext-resource table names that uid with no `path`, resolved or
+    /// not. Derived from the RAW table, so it survives canonicalization and answers "which scenes
+    /// must be re-read when this sidecar appears, changes, or is deleted?".
+    uid_referencers: FxHashMap<String, FxHashSet<String>>,
 }
 
 impl SceneIndex {
@@ -56,8 +63,10 @@ impl SceneIndex {
     /// never fail), and walk/UTF-8 errors are logged at `warn` — matching `gd_files`' discipline.
     /// Scenes are keyed by their `res://` path.
     #[must_use]
-    pub fn build(root: &Utf8Path) -> Self {
+    pub fn build(root: &Utf8Path, uids: FxHashMap<String, String>) -> Self {
         let mut idx = SceneIndex::new();
+        // Before the first `reindex`, so every scene canonicalizes against a populated map.
+        idx.set_uid_map(uids);
         for entry_result in WalkDir::new(root).into_iter().filter_entry(|e| {
             Utf8Path::from_path(e.path()).is_none_or(|p| !crate::exclude::is_excluded(p, root))
         }) {
@@ -111,10 +120,70 @@ impl SceneIndex {
     /// Record an already-parsed [`Scene`] at `res_path`. (Used by warm-load and tests.)
     pub fn insert_scene(&mut self, res_path: impl Into<String>, scene: Scene) {
         let key = scene::normalize_res(&res_path.into());
+        let mut scene = scene;
         // Drop the old scene's reverse entries before inserting the new one.
         self.remove_reverse(&key);
+        // The uid referencers come off the RAW ext table, which canonicalization never touches;
+        // the script/instance maps come off the node fields, which it rewrites. So: referencers
+        // first, then rewrite, then the rest — otherwise the forward maps would key by `uid://`.
+        self.add_uid_referencers(&key, &scene);
+        self.canonicalize(&mut scene);
         self.add_reverse(&key, &scene);
         self.scenes.insert(key, scene);
+    }
+
+    /// Rewrite every `uid://` a pure parse left in this scene's node fields to the `res://` path
+    /// the project's sidecars declare. #484.
+    ///
+    /// An unresolvable uid becomes `None`, never the uid string: that is exactly the behavior
+    /// before this existed — no script, no instance, the node still present with its native type —
+    /// and it keeps a `uid://` out of every consumer that compares these fields as paths or shows
+    /// them to a user. Idempotent, since no `uid://` survives the pass.
+    fn canonicalize(&self, scene: &mut Scene) {
+        let deref = |s: &String| -> Option<String> {
+            if s.starts_with("uid://") {
+                self.uids.get(s).cloned()
+            } else {
+                Some(s.clone())
+            }
+        };
+        for node in &mut scene.nodes {
+            if let Some(script) = &node.script {
+                node.script = deref(script);
+            }
+            if let scene::NodeType::Instanced(Some(sub)) = &node.ty {
+                node.ty = scene::NodeType::Instanced(deref(sub));
+            }
+        }
+    }
+
+    /// Replace the uid map. Stored scenes are NOT retro-fixed here — the caller re-reads the
+    /// scenes [`Self::scenes_referencing_uid`] names, which is the only set that can change.
+    pub fn set_uid_map(&mut self, uids: FxHashMap<String, String>) {
+        self.uids = uids;
+    }
+
+    /// The scenes whose ext-resource table names `uid` with no `path`. The work list for a sidecar
+    /// that appeared, changed, or was deleted.
+    #[must_use = "iterators are lazy and do nothing unless consumed"]
+    pub fn scenes_referencing_uid(&self, uid: &str) -> impl Iterator<Item = &str> + '_ {
+        self.uid_referencers
+            .get(uid)
+            .into_iter()
+            .flat_map(|set| set.iter().map(String::as_str))
+    }
+
+    /// Every scene carrying at least one `path`-less uid reference. The warm-start work list: a
+    /// sidecar changed while gdls was off leaves an unchanged `.tscn`, which no stat diff catches.
+    #[must_use]
+    pub fn uid_referencing_scenes(&self) -> Vec<String> {
+        let mut out: FxHashSet<&String> = FxHashSet::default();
+        for set in self.uid_referencers.values() {
+            out.extend(set.iter());
+        }
+        let mut out: Vec<String> = out.into_iter().cloned().collect();
+        out.sort();
+        out
     }
 
     /// Drop the scene at `res_path` (a deleted `.tscn`) and its reverse entries.
@@ -352,6 +421,22 @@ impl SceneIndex {
     // --- Reverse-map maintenance ----------------------------------------------------------------
 
     /// Add `scene`'s attached-script and instanced-sub-scene reverse entries under key `scene_key`.
+    /// Record this scene under every `path`-less uid its ext table names. Reads the raw table, so
+    /// it is independent of whether the uid resolved.
+    fn add_uid_referencers(&mut self, scene_key: &str, scene: &Scene) {
+        for ext in scene.ext_resources.values() {
+            if ext.path.is_some() {
+                continue;
+            }
+            if let Some(uid) = &ext.uid {
+                self.uid_referencers
+                    .entry(uid.clone())
+                    .or_default()
+                    .insert(scene_key.to_owned());
+            }
+        }
+    }
+
     fn add_reverse(&mut self, scene_key: &str, scene: &Scene) {
         for script in scene.attached_scripts() {
             self.script_to_scenes
@@ -376,6 +461,20 @@ impl SceneIndex {
         // Collect keys first to avoid borrowing `self.scenes` while mutating the reverse maps.
         let old_scripts: Vec<String> = old.attached_scripts().map(scene::normalize_res).collect();
         let old_subs: Vec<String> = old.instanced_scenes().map(scene::normalize_res).collect();
+        let old_uids: Vec<String> = old
+            .ext_resources
+            .values()
+            .filter(|e| e.path.is_none())
+            .filter_map(|e| e.uid.clone())
+            .collect();
+        for uid in old_uids {
+            if let Some(set) = self.uid_referencers.get_mut(&uid) {
+                set.remove(scene_key);
+                if set.is_empty() {
+                    self.uid_referencers.remove(&uid);
+                }
+            }
+        }
         for script in old_scripts {
             if let Some(set) = self.script_to_scenes.get_mut(&script) {
                 set.remove(scene_key);
