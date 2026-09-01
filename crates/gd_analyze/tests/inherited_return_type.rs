@@ -145,21 +145,34 @@ fn an_untyped_override_of_a_typed_parent_still_rejects_an_incompatible_value_at_
 // ===================================================================================================
 
 #[test]
-fn a_constant_array_type_test_is_silent_in_both_dialects_today() {
-    // 4.7 added `is_type_compatible_strict_collections` here, so `[] is Array[int]` on a constant
-    // became an error. gdls carries the guard, but cannot reach it: its fold model has no Array
-    // value, so a `const A = []` never counts as a constant operand and the arm is skipped. The
-    // guard goes live with array folding; until then this pins that neither tag errors.
-    for src in [
-        "func test():\n\tconst A = []\n\tprint(A is Array[int])\n",
-        "func test():\n\tconst A = []\n\tprint(A is Array)\n",
-    ] {
-        for d in [Dialect::Godot4_6, Dialect::Godot4_7] {
-            assert!(
-                errors(src, d).is_empty(),
-                "dialect {d:?} on {src:?}: {:?}",
-                errors(src, d)
-            );
-        }
+fn a_constant_array_type_test_is_strict_about_collections_at_4_7_only() {
+    // 4.7 added `is_type_compatible_strict_collections` to `reduce_type_test`'s constant arm, so
+    // `[] is Array[int]` on a constant became an error there and stays silent at 4.6. The arm only
+    // runs when the operand really is constant, which needed the array fold (#385) — before it the
+    // guard was carried but unreachable, and this test pinned the placeholder silence.
+    //
+    // Both rows are oracle-pinned against the 4.7.2 and 4.6.3 binaries.
+    let strict = "func test():\n\tconst A = []\n\tprint(A is Array[int])\n";
+    assert!(
+        errors(strict, Dialect::Godot4_7)
+            .iter()
+            .any(|m| m == r#"Expression is of type "Array" so it can't be of type "Array[int]"."#),
+        "4.7: {:?}",
+        errors(strict, Dialect::Godot4_7)
+    );
+    assert!(
+        errors(strict, Dialect::Godot4_6).is_empty(),
+        "4.6: {:?}",
+        errors(strict, Dialect::Godot4_6)
+    );
+
+    // An unparameterized `Array` is compatible at both tags — the guard is about the ELEMENT type.
+    let loose = "func test():\n\tconst A = []\n\tprint(A is Array)\n";
+    for d in [Dialect::Godot4_6, Dialect::Godot4_7] {
+        assert!(
+            errors(loose, d).is_empty(),
+            "dialect {d:?}: {:?}",
+            errors(loose, d)
+        );
     }
 }

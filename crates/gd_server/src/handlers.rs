@@ -2367,6 +2367,28 @@ fn render_folded(value: Option<&gd_analyze::FoldedValue>) -> Option<String> {
         // collection.
         FoldedValue::StringName(s) => format!("&{s:?}"),
         FoldedValue::NodePath(s) => format!("^{s:?}"),
+        // Rendered as GDScript source, not through `Variant::stringify`: this tail is meant to be
+        // readable as the literal the user wrote, so it keeps `null` over `<null>` and drops the
+        // spaces Godot pads a dictionary with. One unrenderable element gives up the whole
+        // collection, the same all-or-nothing rule the fold itself uses.
+        FoldedValue::Array(items) => {
+            let rendered: Option<Vec<String>> =
+                items.iter().map(|v| render_folded(Some(v))).collect();
+            format!("[{}]", rendered?.join(", "))
+        }
+        FoldedValue::Dictionary(pairs) => {
+            let rendered: Option<Vec<String>> = pairs
+                .iter()
+                .map(|(k, v)| {
+                    Some(format!(
+                        "{}: {}",
+                        render_folded(Some(k))?,
+                        render_folded(Some(v))?
+                    ))
+                })
+                .collect();
+            format!("{{{}}}", rendered?.join(", "))
+        }
         FoldedValue::Opaque(..) => return None,
     })
 }

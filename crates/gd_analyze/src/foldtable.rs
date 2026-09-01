@@ -13,6 +13,8 @@
 //! carry the bit with no value. So a gate reads [`FoldTable::is_constant`] and anything that
 //! dereferences a value reads [`FoldTable::get`]; neither set can contaminate the other.
 
+use std::sync::Arc;
+
 use crate::data_type::VariantType;
 use gd_syntax::ast::NodeId;
 
@@ -45,6 +47,19 @@ pub enum FoldedValue {
     /// while every other opaque constant (`None`) still compares as never-equal (its value is
     /// genuinely unknown, so it can't be *proven* a duplicate).
     Opaque(VariantType, Option<UtilityCallableId>),
+    /// A folded `Array` literal. `Arc` because a fold is cloned freely between the table and every
+    /// consumer, and a nested collection would otherwise copy its whole subtree each time.
+    ///
+    /// Only ever produced by `make_expression_reduced_value` at a constant site — Godot's
+    /// `reduce_array` does NOT set `reduced_value`, which is why `{[1, 2]: 1, [1, 2]: 2}` is not a
+    /// duplicate-key error upstream. Producing this during `reduce_array` would invent one.
+    Array(Arc<Vec<FoldedValue>>),
+    /// A folded `Dictionary` literal, in insertion order. Godot's `Dictionary` preserves it and
+    /// `Variant::stringify` walks it in that order, so the message text depends on it.
+    ///
+    /// A `Vec` of pairs rather than a map: [`FoldedValue`] is not `Eq + Hash` (it carries a float),
+    /// and the key relation this needs is [`string_like_eq`], not structural equality.
+    Dictionary(Arc<Vec<(FoldedValue, FoldedValue)>>),
 }
 
 /// The identity of a utility function referenced as a first-class `Callable` — its name and the
@@ -109,6 +124,17 @@ pub fn string_like_eq(a: &FoldedValue, b: &FoldedValue) -> bool {
         // Two references to the same utility fold to the same constant `Callable`, so they are a
         // provable duplicate. Every other opaque value is genuinely unknown and never matches.
         (V::Opaque(_, Some(x)), V::Opaque(_, Some(y))) => x == y,
+        // `Variant::hash_compare` recurses into a collection, comparing element by element under
+        // the same relation — so `String`/`StringName` stay equal at any depth.
+        (V::Array(x), V::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| string_like_eq(a, b))
+        }
+        (V::Dictionary(x), V::Dictionary(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y.iter())
+                    .all(|((ak, av), (bk, bv))| string_like_eq(ak, bk) && string_like_eq(av, bv))
+        }
         _ => false,
     }
 }
