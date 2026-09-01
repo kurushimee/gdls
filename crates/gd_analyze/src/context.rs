@@ -270,6 +270,12 @@ pub struct AnalysisContext<'a> {
     /// `f(x)()` — stripping its type and its `Identifier "x" not declared in the current scope.`
     /// A `NodeId` reaches exactly the one node the exemption is about (#435).
     pub reducing_callee_node: Option<NodeId>,
+    /// The `CallNode` whose callee [`Self::reducing_callee_node`] names. Godot's `reduce_call`
+    /// resolves a call target through `get_function_signature(p_call, …)`, so a member cycle it
+    /// trips over anchors on the whole call; gdls reaches the same guard by pre-reducing the
+    /// callee identifier, which would otherwise anchor on the callee alone (analyzer.cpp:985 vs
+    /// the identifier path at :4175).
+    pub reducing_callee_call: Option<NodeId>,
     /// Godot's `reduce_identifier(p_identifier, can_be_builtin)` flag (analyzer.cpp:4388), carried
     /// on the context rather than as a parameter so `reduce_expression`'s dispatcher signature
     /// stays identical to upstream's. `true` only while reducing the **base of a subscript**
@@ -482,6 +488,7 @@ impl<'a> AnalysisContext<'a> {
             init_shape_stack: Vec::new(),
             static_context: false,
             reducing_callee_node: None,
+            reducing_callee_call: None,
             identifier_can_be_builtin: false,
             native_property_scope: FxHashMap::default(),
             current_enum: None,
