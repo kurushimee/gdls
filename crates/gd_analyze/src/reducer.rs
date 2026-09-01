@@ -5699,19 +5699,23 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 let cdt = ctx.get_type(callee).clone();
                 if cdt.is_set() && !cdt.is_variant() {
                     name_is_value = true;
+                    // Upstream resolves through `callee_id` but reports on `p_call->callee`
+                    // (analyzer.cpp:3745/3747), so `Vector2.ZERO()` underlines the whole
+                    // `Vector2.ZERO`, not just the attribute the resolution walked to.
+                    let anchor = call.callee.unwrap_or(callee);
                     if cdt.kind == DtKind::Builtin && cdt.builtin_type == VariantType::Callable {
                         ctx.push_error(
                             format!(
                                 r#"Name "{function_name}" is a Callable. You can call it with "{function_name}.call()" instead."#
                             ),
-                            callee,
+                            anchor,
                         );
                     } else {
                         ctx.push_error(
                             format!(
                                 r#"Name "{function_name}" called as a function but is a "{cdt}"."#
                             ),
-                            callee,
+                            anchor,
                         );
                     }
                 }
