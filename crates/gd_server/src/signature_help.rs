@@ -369,9 +369,16 @@ fn resolve_attribute_call(
     // surface like hover, so it takes the precise type when the scenes agree — navigation-only, see
     // `crate::scene_nav`.
     let scene_dt = crate::scene_nav::scene_type_ending_at(state, uri, tree, dot_start);
-    let base_dt = match &scene_dt {
-        Some(dt) => dt,
-        None => smallest_typed_ending_at(tree, analyzed, dot_start)?,
+    // #591: `Vector2.from_angle(` — the analyzer leaves a builtin type name in callee-base
+    // position untyped, faithfully (see `handlers::builtin_meta_base_type`), so the typed-node
+    // scan finds nothing and the whole popup used to give up on a call it could describe.
+    let meta_dt = (scene_dt.is_none())
+        .then(|| crate::handlers::builtin_meta_type_ending_at(tree, dot_start))
+        .flatten();
+    let base_dt = match (&scene_dt, &meta_dt) {
+        (Some(dt), _) => dt,
+        (None, Some(dt)) => dt,
+        (None, None) => smallest_typed_ending_at(tree, analyzed, dot_start)?,
     };
 
     match base_dt.kind {

@@ -198,6 +198,8 @@ Every symbol Godot documents has a page to land on, which means one per engine c
 
 A declaration line on a page is produced by the same builder as the hover for the same symbol, so the two can never drift apart.
 
+Reaching a page sometimes needs a type the analyzer never assigned. `reduce_call` recognizes a builtin type name in a callee's base and synthesizes the meta type inline, without ever reducing that base node (`gdscript_analyzer.cpp:3597-3603`), so `Vector2` in `Vector2.from_angle(a)` carries no type in the result while the same name in `Vector2.ONE` does. The navigation surfaces rebuild it at the protocol boundary: `handlers::builtin_meta_base_type` answers a constant meta `DataType` for a bare identifier that names a builtin, and only when the analyzer left that node unresolved, so an already-typed base always wins. Like the scene-derived node types it sits beside, the reconstruction is a display and jump vehicle that never enters an `AnalysisResult` (`docs/02` §11).
+
 ### 7.4 Performance and scale
 
 Per-feature latency rows live in `bench/budget.toml` (`06-testing-fidelity.md` §7.2), with completion the critical one. The memory-pressure ladder splits requests by price: at Hard pressure, analysis-priced requests are refused with `ContentModified` while parse- and index-priced features stay served.
