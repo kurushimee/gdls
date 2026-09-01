@@ -172,7 +172,7 @@ fn annotate_symbol_details(
                     annotate_symbol_details(std::slice::from_mut(child), inner, db);
                 }
             } else if let Some(decl) = iface.members.iter().find(|m| m.name == child.name) {
-                child.detail = format_member_signature(&child.name, decl, db);
+                child.detail = format_member_signature(&child.name, decl, db, None);
             }
         }
     }
@@ -1854,7 +1854,14 @@ fn hover_member_signature(
                 .or_else(|| script_base_declaring_iface(state, script_ref, fn_name))?;
             let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
 
-            let sig = format_func_signature(fn_name, decl, &state.workspace.native);
+            let params = crate::signature_help::declaring_param_list(
+                state,
+                script_ref.file,
+                &script_ref.inner,
+                fn_name,
+            );
+            let sig =
+                format_func_signature(fn_name, decl, &state.workspace.native, params.as_deref());
             let mut md = String::from("```gdscript\n");
             md.push_str(&sig);
             md.push_str("\n```");
@@ -1960,7 +1967,13 @@ fn hover_call_binding_signature(
             let decl = iface.members.iter().find(|m| m.name.as_str() == name)?;
             let mut md = format!(
                 "```gdscript\n{}\n```",
-                format_func_signature(&name, decl, &state.workspace.native)
+                format_func_signature(
+                    &name,
+                    decl,
+                    &state.workspace.native,
+                    crate::signature_help::declaring_param_list(state, file, &class_path, &name)
+                        .as_deref(),
+                )
             );
             if let Some(doc) = &decl.doc {
                 crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
@@ -2066,12 +2079,21 @@ fn format_member_params(decl: &gd_project::MemberDecl, db: &gd_types::NativeDb) 
 }
 
 /// Format a `Func` member as `func name(param_name: ParamType, …) -> ReturnType`.
+///
+/// `params` is the declaring file's own parameter list when the caller could reach it — the same
+/// text `signatureHelp` puts between its parentheses, so the two surfaces read alike and hover
+/// keeps the defaults the interface does not carry (#570). Without it the interface-only rendering
+/// stands, which is right for a file that cannot be read and for `documentSymbol`.
 fn format_func_signature(
     fn_name: &str,
     decl: &gd_project::MemberDecl,
     db: &gd_types::NativeDb,
+    params: Option<&str>,
 ) -> String {
-    let params_str = format_member_params(decl, db);
+    let params_str = match params {
+        Some(p) => p.to_owned(),
+        None => format_member_params(decl, db),
+    };
     // `interface::type_expr` collapses BOTH an explicit `-> void` (empty type node) and an absent
     // return annotation to `TypeExpr::None`, so they're indistinguishable here. Render `void`:
     // explicit-void functions vastly outnumber truly-untyped ones in typed GDScript, so this is
@@ -2127,17 +2149,23 @@ fn hover_attribute_member_signature(
     // deeper in the chain); a Script-kind base's head interface is the fallback for accesses the
     // member walk deliberately skipped (e.g. an instance method referenced through a meta base —
     // still worth a signature hover).
-    let binding_iface = analyzed.bindings().iter().find_map(|b| match b {
+    // The declaring location rides along with the interface: hover renders a function's parameter
+    // list from the declaring file's own AST (#570), which needs the file and its inner-class path,
+    // and the interface alone carries neither.
+    let binding_at = analyzed.bindings().iter().find_map(|b| match b {
         Binding::Use {
             site,
             target_file: Some(f),
             target_name,
             ..
-        } if *site == attr_span && target_name.as_str() == name => {
-            state.workspace.index.interface(*f)
-        }
+        } if *site == attr_span && target_name.as_str() == name => state
+            .workspace
+            .index
+            .interface(*f)
+            .map(|i| (i, *f, Vec::new())),
         _ => None,
     });
+    let binding_iface = binding_at.as_ref().map(|(i, ..)| *i);
     // #258: `Owner.Kind.ONE` — a named enum's VALUE. The reducer records it as an
     // `EnumValueLocal` use whose `target_name` is the QUALIFIED `"Kind.ONE"` (see
     // `BindingTargetKind::EnumValueLocal`), so it is invisible to the bare-name member walk below;
@@ -2147,14 +2175,15 @@ fn hover_attribute_member_signature(
     }
 
     let base_dt = &projected_base_type(state, uri, tree, analyzed, base_id);
-    let direct_iface = if base_dt.kind == DtKind::Script {
-        base_dt
-            .script_type
-            .as_ref()
-            .and_then(|sr| iface_at_inner(&state.workspace.index, sr.file, &sr.inner))
+    let direct_at = if base_dt.kind == DtKind::Script {
+        base_dt.script_type.as_ref().and_then(|sr| {
+            iface_at_inner(&state.workspace.index, sr.file, &sr.inner)
+                .map(|i| (i, sr.file, sr.inner.clone()))
+        })
     } else {
         None
     };
+    let direct_iface = direct_at.as_ref().map(|(i, ..)| *i);
     // #258: an INNER CLASS reached as `Owner.Inner`. Inner classes live on `Interface::inner`,
     // never in `members` (there is no `MemberKind::Class`), so the member walk below can't see one
     // — its `##` doc reached hover only at its own declaration site.
@@ -2194,17 +2223,27 @@ fn hover_attribute_member_signature(
         return Some(md);
     }
 
-    if let Some(decl) = [binding_iface, direct_iface]
+    if let Some((decl, fid, class_path)) = [binding_at.as_ref(), direct_at.as_ref()]
         .into_iter()
         .flatten()
-        .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))
+        .find_map(|(i, f, path)| {
+            i.members
+                .iter()
+                .find(|m| m.name.as_str() == name)
+                .map(|m| (m, *f, path))
+        })
     {
-        let mut sig = format_member_signature(name, decl, &state.workspace.native)?;
+        let params = crate::signature_help::declaring_param_list(state, fid, class_path, name);
+        let mut sig =
+            format_member_signature(name, decl, &state.workspace.native, params.as_deref())?;
         // #526: the read itself carries the type the analyzer resolved, which is what the
         // diagnostics on this very expression were checked against.
         if let Some(ty) = resolved_member_type_suffix(state, tree, decl, analyzed.types.get(sub_id))
         {
             sig = format!("{sig}: {ty}");
+        }
+        if let Some(v) = const_value_suffix(decl, analyzed, sub_id) {
+            sig.push_str(&v);
         }
         let mut md = format!("```gdscript\n{sig}\n```");
         // #258: this path serves every NON-call member reference — `obj.width`, `Singleton.LIMIT`,
@@ -2312,9 +2351,21 @@ fn hover_bare_member_signature(
                 .and_then(|decl| {
                     resolved_member_type_suffix(state, tree, decl, analyzed.types.get(ident_id))
                 });
-            if let Some(md) =
-                member_declaration_hover_md(iface, name, &state.workspace.native, resolved)
-            {
+            let params =
+                crate::signature_help::declaring_param_list(state, file, &class_path, name);
+            let value = iface
+                .members
+                .iter()
+                .find(|m| m.name.as_str() == name)
+                .and_then(|decl| const_value_suffix(decl, analyzed, ident_id));
+            if let Some(md) = member_declaration_hover_md(
+                iface,
+                name,
+                &state.workspace.native,
+                resolved,
+                params.as_deref(),
+                value.as_deref(),
+            ) {
                 return Some(md);
             }
         }
@@ -2382,6 +2433,8 @@ fn member_declaration_hover_md(
     name: &str,
     db: &gd_types::NativeDb,
     resolved: Option<String>,
+    params: Option<&str>,
+    value: Option<&str>,
 ) -> Option<String> {
     if let Some(inner) = iface
         .inner
@@ -2398,10 +2451,14 @@ fn member_declaration_hover_md(
     let sig = if decl.kind == gd_project::MemberKind::Enum {
         format!("enum {name}")
     } else {
-        let base = format_member_signature(name, decl, db)?;
-        match resolved {
+        let base = format_member_signature(name, decl, db, params)?;
+        let typed = match resolved {
             Some(ty) => format!("{base}: {ty}"),
             None => base,
+        };
+        match value {
+            Some(v) => format!("{typed}{v}"),
+            None => typed,
         }
     };
     let mut md = format!("```gdscript\n{sig}\n```");
@@ -2435,6 +2492,24 @@ fn tree_declares_a_local_named(tree: &ParseTree, name: &str) -> bool {
                 | NodeKind::For(_)
         ) && declaration_identifier(tree, id).is_some_and(|iid| ident_name(tree, iid) == name)
     })
+}
+
+/// A `const` member's folded value, read off the node that READS it.
+///
+/// The declaration site already renders `const D: int = 14` from its initializer's fold; a use site
+/// showed only `const D: int`, which is the shorter half of the same card (#570). The reducer
+/// stamps a same-file constant read with the constant's own value, so the value is already in hand
+/// here — no second analysis, and no guess. A cross-file read carries none (the interface holds no
+/// values), and an unfoldable initializer carries none either; both keep the shorter line.
+fn const_value_suffix(
+    decl: &gd_project::MemberDecl,
+    analyzed: &AnalysisResult,
+    read_id: NodeId,
+) -> Option<String> {
+    if decl.kind != gd_project::MemberKind::Const {
+        return None;
+    }
+    render_folded(analyzed.folds.get(read_id)).map(|v| format!(" = {v}"))
 }
 
 /// #258: the use-site enum-value hover — `EnumName.VALUE` plus the value's `##` doc, resolved from
@@ -2542,10 +2617,11 @@ fn format_member_signature(
     name: &str,
     decl: &gd_project::MemberDecl,
     db: &gd_types::NativeDb,
+    params: Option<&str>,
 ) -> Option<String> {
     let sig = match decl.kind {
         gd_project::MemberKind::Func => {
-            let bare = format_func_signature(name, decl, db);
+            let bare = format_func_signature(name, decl, db, params);
             if decl.flags.is_static {
                 format!("static {bare}")
             } else {
@@ -2748,7 +2824,14 @@ fn hover_declaration_signature(
     }
     let member_decl = iface.members.iter().find(|m| m.name == name)?;
     let member_doc = member_decl.doc.clone();
-    let mut sig = format_member_signature(&name, member_decl, &state.workspace.native)?;
+    let class_path: Vec<String> = chain.iter().rev().cloned().collect();
+    let params = crate::signature_help::declaring_param_list(state, fid, &class_path, &name);
+    let mut sig = format_member_signature(
+        &name,
+        member_decl,
+        &state.workspace.native,
+        params.as_deref(),
+    )?;
 
     // An untyped `var`/`const` whose initializer the analyzer typed reads better with the
     // resolved type appended (`var made: ReproEntity` for `var made := ent.spawn(...)`).

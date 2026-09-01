@@ -1152,39 +1152,14 @@ impl Sig {
         resolved: &[(usize, String)],
     ) -> Sig {
         let mut b = LabelBuilder::new(format!("{ret} {name}("));
-        for (i, &pid) in func.parameters.iter().enumerate() {
+        let (params, rest) = param_fragments(tree, src, func, decl, resolved);
+        for (i, frag) in params.iter().enumerate() {
             b.sep(i);
-            let NodeKind::Parameter(p) = &tree.get(pid).kind else {
-                b.param("Variant");
-                continue;
-            };
-            let pname = p
-                .identifier
-                .map(|id| ident_text(tree, id))
-                .unwrap_or_default();
-            let mut frag = match param_type_label(tree, src, p, decl, i, resolved) {
-                Some(pty) => format!("{pname}: {pty}"),
-                None => pname.to_string(),
-            };
-            if let Some(init) = p.initializer {
-                frag.push_str(" = ");
-                frag.push_str(node_source(tree, src, init));
-            }
-            b.param(&frag);
+            b.param(frag);
         }
-        // A `func f(...args)` rest parameter (the variadic slot) is appended as a `...name: T`
-        // pseudo-parameter; being in `params`, it makes `active_parameter` clamp to it past the
-        // last declared argument (the variadic-call behavior).
-        if let Some(rest) = func.rest_parameter {
-            if let NodeKind::Parameter(p) = &tree.get(rest).kind {
-                let pname = p
-                    .identifier
-                    .map(|id| ident_text(tree, id))
-                    .unwrap_or_default();
-                let pty = annotation_label(tree, src, p.datatype_specifier);
-                b.sep_force();
-                b.param(&format!("...{pname}: {pty}"));
-            }
+        if let Some(frag) = rest {
+            b.sep_force();
+            b.param(&frag);
         }
         b.finish(doc)
     }
@@ -1198,6 +1173,100 @@ impl Sig {
         b.param("...");
         b.finish(None)
     }
+}
+
+/// Every parameter of `func`, rendered as `name: Type = default`, plus the `...name: T` rest slot
+/// when there is one.
+///
+/// The one place a GDScript parameter list is spelled. `signatureHelp` wraps it in Godot's arghint
+/// frame (`_make_arguments_hint`, gdscript_editor.cpp:750) and hover wraps it in GDScript
+/// declaration syntax; the list between the parentheses has to read the same on both, which it can
+/// only do by coming from here (#570).
+///
+/// A default is the initializer node's own source text, not a folded value: it is what the author
+/// wrote, and folding one would need the declaring file's analysis, which neither surface runs.
+fn param_fragments(
+    tree: &ParseTree,
+    src: &str,
+    func: &gd_syntax::ast::FunctionNode,
+    decl: Option<(&gd_project::MemberDecl, &gd_types::NativeDb)>,
+    resolved: &[(usize, String)],
+) -> (Vec<String>, Option<String>) {
+    let mut params = Vec::with_capacity(func.parameters.len());
+    for (i, &pid) in func.parameters.iter().enumerate() {
+        let NodeKind::Parameter(p) = &tree.get(pid).kind else {
+            params.push("Variant".to_owned());
+            continue;
+        };
+        let pname = p
+            .identifier
+            .map(|id| ident_text(tree, id))
+            .unwrap_or_default();
+        let mut frag = match param_type_label(tree, src, p, decl, i, resolved) {
+            Some(pty) => format!("{pname}: {pty}"),
+            None => pname.to_string(),
+        };
+        if let Some(init) = p.initializer {
+            frag.push_str(" = ");
+            frag.push_str(node_source(tree, src, init));
+        }
+        params.push(frag);
+    }
+    // A `func f(...args)` rest parameter (the variadic slot) is appended as a `...name: T`
+    // pseudo-parameter; being in `params`, it makes `active_parameter` clamp to it past the
+    // last declared argument (the variadic-call behavior).
+    let rest = func.rest_parameter.and_then(|rid| {
+        let NodeKind::Parameter(p) = &tree.get(rid).kind else {
+            return None;
+        };
+        let pname = p
+            .identifier
+            .map(|id| ident_text(tree, id))
+            .unwrap_or_default();
+        let pty = annotation_label(tree, src, p.datatype_specifier);
+        Some(format!("...{pname}: {pty}"))
+    });
+    (params, rest)
+}
+
+/// The parameter list of `name` as declared in `fid`, for hover to render inside its own frame.
+///
+/// Hover otherwise sees only the `Interface`, which carries parameter types but no defaults
+/// (`crates/gd_project/src/interface.rs`), so `mode: Mode = Mode.FAST` came out as `mode: Mode`.
+/// This reads the declaring file the same way [`script_method_sig`] does and shares its builder, so
+/// the two surfaces cannot drift. `None` when the declaration cannot be found or its file cannot be
+/// read, and the caller keeps the interface-only rendering.
+pub(crate) fn declaring_param_list(
+    state: &ServerState,
+    fid: gd_project::FileId,
+    class_path: &[String],
+    name: &str,
+) -> Option<String> {
+    let mut owner = state.workspace.index.interface(fid)?;
+    for seg in class_path {
+        owner = owner
+            .inner
+            .iter()
+            .find(|c| c.class_name.as_deref() == Some(seg.as_str()))?;
+    }
+    let decl = owner
+        .members
+        .iter()
+        .find(|m| m.name == name && m.kind == gd_project::MemberKind::Func)?;
+    let path = state.workspace.index.path(fid)?;
+    let src = file_text(state, path)?;
+    let parsed = state.workspace.parse_source(&src);
+    let func = function_at_name_span(&parsed.tree, decl.name_span, name)?;
+    let (params, rest) = param_fragments(
+        &parsed.tree,
+        &src,
+        func,
+        Some((decl, &state.workspace.native)),
+        &[],
+    );
+    let mut all = params;
+    all.extend(rest);
+    Some(all.join(", "))
 }
 
 /// Incrementally assembles a signature label while recording each parameter's `[start, end)` byte
