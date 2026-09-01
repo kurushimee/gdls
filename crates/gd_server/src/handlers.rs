@@ -123,7 +123,7 @@ pub fn document_symbol(
     // open buffer exactly (no index staleness) and renders through the byte-stable formatters
     // hover already pins. Flat responses drop it naturally (SymbolInformation has no field).
     let iface = gd_project::extract_interface(&parsed.tree);
-    annotate_symbol_details(&mut symbols, &iface);
+    annotate_symbol_details(&mut symbols, &iface, &state.workspace.native);
     if hierarchical {
         DocumentSymbolResponse::Nested(symbols)
     } else {
@@ -155,6 +155,7 @@ fn extends_detail(extends: &gd_project::Extends) -> Option<String> {
 fn annotate_symbol_details(
     symbols: &mut [lsp_types::DocumentSymbol],
     iface: &gd_project::Interface,
+    db: &gd_types::NativeDb,
 ) {
     for sym in symbols {
         sym.detail = extends_detail(&iface.extends);
@@ -168,10 +169,10 @@ fn annotate_symbol_details(
                     .iter()
                     .find(|i| i.class_name.as_deref() == Some(child.name.as_str()))
                 {
-                    annotate_symbol_details(std::slice::from_mut(child), inner);
+                    annotate_symbol_details(std::slice::from_mut(child), inner, db);
                 }
             } else if let Some(decl) = iface.members.iter().find(|m| m.name == child.name) {
-                child.detail = format_member_signature(&child.name, decl);
+                child.detail = format_member_signature(&child.name, decl, db);
             }
         }
     }
@@ -1839,7 +1840,7 @@ fn hover_member_signature(
                 .or_else(|| script_base_declaring_iface(state, script_ref, fn_name))?;
             let decl = iface.members.iter().find(|m| m.name.as_str() == fn_name)?;
 
-            let sig = format_func_signature(fn_name, decl);
+            let sig = format_func_signature(fn_name, decl, &state.workspace.native);
             let mut md = String::from("```gdscript\n");
             md.push_str(&sig);
             md.push_str("\n```");
@@ -1943,7 +1944,10 @@ fn hover_call_binding_signature(
         CalleeTarget::Script { file, class_path } => {
             let iface = iface_at_inner(&state.workspace.index, file, &class_path)?;
             let decl = iface.members.iter().find(|m| m.name.as_str() == name)?;
-            let mut md = format!("```gdscript\n{}\n```", format_func_signature(&name, decl));
+            let mut md = format!(
+                "```gdscript\n{}\n```",
+                format_func_signature(&name, decl, &state.workspace.native)
+            );
             if let Some(doc) = &decl.doc {
                 crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
             }
@@ -2028,12 +2032,14 @@ fn hover_bare_native_signature(
 
 /// Render a `MemberDecl`'s params as `name: Type, …` — zip `param_names` and `params` in lockstep;
 /// fall back to type-only when the name is empty.
-fn format_member_params(decl: &gd_project::MemberDecl) -> String {
+fn format_member_params(decl: &gd_project::MemberDecl, db: &gd_types::NativeDb) -> String {
     decl.params
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let type_str = p.render().unwrap_or_else(|| "Variant".to_owned());
+            let type_str = p
+                .render_resolved(db)
+                .unwrap_or_else(|| "Variant".to_owned());
             let name_str = decl.param_names.get(i).map(String::as_str).unwrap_or("");
             if name_str.is_empty() {
                 type_str
@@ -2046,14 +2052,21 @@ fn format_member_params(decl: &gd_project::MemberDecl) -> String {
 }
 
 /// Format a `Func` member as `func name(param_name: ParamType, …) -> ReturnType`.
-fn format_func_signature(fn_name: &str, decl: &gd_project::MemberDecl) -> String {
-    let params_str = format_member_params(decl);
+fn format_func_signature(
+    fn_name: &str,
+    decl: &gd_project::MemberDecl,
+    db: &gd_types::NativeDb,
+) -> String {
+    let params_str = format_member_params(decl, db);
     // `interface::type_expr` collapses BOTH an explicit `-> void` (empty type node) and an absent
     // return annotation to `TypeExpr::None`, so they're indistinguishable here. Render `void`:
     // explicit-void functions vastly outnumber truly-untyped ones in typed GDScript, so this is
     // correct far more often than `Variant` would be. (A precise split would need interface
     // extraction to carry "explicit void" vs "no annotation" — out of scope.)
-    let ret_str = decl.ty.render().unwrap_or_else(|| "void".to_owned());
+    let ret_str = decl
+        .ty
+        .render_resolved(db)
+        .unwrap_or_else(|| "void".to_owned());
     format!("func {fn_name}({params_str}) -> {ret_str}")
 }
 
@@ -2172,7 +2185,7 @@ fn hover_attribute_member_signature(
         .flatten()
         .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))
     {
-        let sig = format_member_signature(name, decl)?;
+        let sig = format_member_signature(name, decl, &state.workspace.native)?;
         let mut md = format!("```gdscript\n{sig}\n```");
         // #258: this path serves every NON-call member reference — `obj.width`, `Singleton.LIMIT`,
         // `obj.sig`, an uncalled `obj.method`. It rendered the bare signature, so a `var`/`const`/
@@ -2271,7 +2284,7 @@ fn hover_bare_member_signature(
     });
     if let Some((file, class_path)) = target {
         if let Some(iface) = iface_at_inner(&state.workspace.index, file, &class_path) {
-            if let Some(md) = member_declaration_hover_md(iface, name) {
+            if let Some(md) = member_declaration_hover_md(iface, name, &state.workspace.native) {
                 return Some(md);
             }
         }
@@ -2334,7 +2347,11 @@ fn bare_identifier_at(tree: &ParseTree, cursor_byte: usize) -> Option<NodeId> {
 /// Render an interface member's declaration card — the signature line plus its `##` doc. Shared
 /// with [`hover_attribute_member_signature`]'s member arm, whose three shapes (inner class, named
 /// enum, ordinary member) this reproduces because a bare name can reach all three.
-fn member_declaration_hover_md(iface: &gd_project::Interface, name: &str) -> Option<String> {
+fn member_declaration_hover_md(
+    iface: &gd_project::Interface,
+    name: &str,
+    db: &gd_types::NativeDb,
+) -> Option<String> {
     if let Some(inner) = iface
         .inner
         .iter()
@@ -2350,7 +2367,7 @@ fn member_declaration_hover_md(iface: &gd_project::Interface, name: &str) -> Opt
     let sig = if decl.kind == gd_project::MemberKind::Enum {
         format!("enum {name}")
     } else {
-        format_member_signature(name, decl)?
+        format_member_signature(name, decl, db)?
     };
     let mut md = format!("```gdscript\n{sig}\n```");
     if let Some(doc) = &decl.doc {
@@ -2486,10 +2503,14 @@ fn hover_enum_value_use(
 /// attribute-reference hover and the declaration-site hover (issue #26), so `obj.member` and the
 /// member's own declaration line read byte-for-byte the same. `None` for named enums (the
 /// analyzer's enum-meta type label is the better hover there).
-fn format_member_signature(name: &str, decl: &gd_project::MemberDecl) -> Option<String> {
+fn format_member_signature(
+    name: &str,
+    decl: &gd_project::MemberDecl,
+    db: &gd_types::NativeDb,
+) -> Option<String> {
     let sig = match decl.kind {
         gd_project::MemberKind::Func => {
-            let bare = format_func_signature(name, decl);
+            let bare = format_func_signature(name, decl, db);
             if decl.flags.is_static {
                 format!("static {bare}")
             } else {
@@ -2497,7 +2518,7 @@ fn format_member_signature(name: &str, decl: &gd_project::MemberDecl) -> Option<
             }
         }
         gd_project::MemberKind::Signal => {
-            format!("signal {}({})", name, format_member_params(decl))
+            format!("signal {}({})", name, format_member_params(decl, db))
         }
         gd_project::MemberKind::Var | gd_project::MemberKind::Property => {
             let keyword = if decl.flags.is_static {
@@ -2505,12 +2526,12 @@ fn format_member_signature(name: &str, decl: &gd_project::MemberDecl) -> Option<
             } else {
                 "var"
             };
-            match decl.ty.render() {
+            match decl.ty.render_resolved(db) {
                 Some(ty) => format!("{keyword} {name}: {ty}"),
                 None => format!("{keyword} {name}"),
             }
         }
-        gd_project::MemberKind::Const => match decl.ty.render() {
+        gd_project::MemberKind::Const => match decl.ty.render_resolved(db) {
             Some(ty) => format!("const {name}: {ty}"),
             None => format!("const {name}"),
         },
@@ -2692,7 +2713,7 @@ fn hover_declaration_signature(
     }
     let member_decl = iface.members.iter().find(|m| m.name == name)?;
     let member_doc = member_decl.doc.clone();
-    let mut sig = format_member_signature(&name, member_decl)?;
+    let mut sig = format_member_signature(&name, member_decl, &state.workspace.native)?;
 
     // An untyped `var`/`const` whose initializer the analyzer typed reads better with the
     // resolved type appended (`var made: ReproEntity` for `var made := ent.spawn(...)`).

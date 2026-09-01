@@ -93,6 +93,36 @@ impl TypeExpr {
             .collect();
         Some(format!("{base}[{}]", rendered.join(", ")))
     }
+
+    /// [`Self::render`], but able to tell a type name from a decoded INITIALIZER (#532).
+    ///
+    /// `initializer_type_expr` records `var v := Vector2.ZERO` as the path `Vector2.ZERO`, because
+    /// that is what the analyzer needs to look the constant's declared type up in the dump
+    /// (`resolve_interface_type_expr`'s builtin arm: `Vector2.ZERO` is a `Vector2`,
+    /// `Vector3.AXIS_X` is an `int`). A card that prints the path raw prints the initializer where
+    /// the type belongs. The shape is genuinely ambiguous — `Vector2.Axis` is a legitimate
+    /// annotation spelled the same way — so the answer comes from the dump, never from the
+    /// spelling, and anything the dump does not recognize renders exactly as before.
+    #[must_use]
+    pub fn render_resolved(&self, db: &gd_types::NativeDb) -> Option<String> {
+        let TypeExpr::Named { path, args } = self else {
+            return None;
+        };
+        if args.is_empty() && path.len() == 2 {
+            if let Some(bt) = db.builtin_named(&path[0]) {
+                if let Some(c) = bt.constants.iter().find(|c| db.name_of(c.name) == path[1]) {
+                    // The constant's own declared type; a constant the dump gives no type to is
+                    // one of its own builtin (`Vector2.ZERO` with the field absent).
+                    return Some(
+                        c.ty.map_or_else(|| path[0].clone(), |sym| db.name_of(sym).to_owned()),
+                    );
+                }
+                // A builtin ENUM is written exactly as it reads. Everything else under a builtin
+                // head is neither, and falls through untouched.
+            }
+        }
+        self.render()
+    }
 }
 
 /// Declaration flags that are part of a member's *interface* (they change how callers may use it).
@@ -1524,6 +1554,67 @@ var b := pick().new()
             i.members.iter().find(|m| m.name == "b").unwrap().ty,
             TypeExpr::None
         );
+    }
+
+    fn native_db() -> gd_types::NativeDb {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../gd_types/tests/fixtures/trimmed_api.json");
+        gd_types::NativeDb::load(path.to_str().expect("utf-8 path"))
+            .unwrap_or_else(|e| panic!("load native DB fixture at {}: {e}", path.display()))
+    }
+
+    /// #532: `Vector2.ZERO` is what the shallow decode records for a builtin-constant initializer,
+    /// not a type anyone wrote. The dump says which it is.
+    #[test]
+    fn a_decoded_builtin_constant_renders_as_its_type() {
+        let db = native_db();
+        let expr = |src: &str| {
+            let i = iface(src);
+            i.members
+                .iter()
+                .find(|m| m.name == "v")
+                .expect("member")
+                .ty
+                .clone()
+        };
+        let v = expr("extends Node\nvar v := Vector2.ZERO\n");
+        assert_eq!(v.render().as_deref(), Some("Vector2.ZERO"));
+        assert_eq!(v.render_resolved(&db).as_deref(), Some("Vector2"));
+    }
+
+    /// A builtin ENUM is spelled exactly as it reads, and the same two-segment shape must survive
+    /// untouched — which is why the answer comes from the dump and never from the spelling.
+    #[test]
+    fn a_builtin_enum_annotation_renders_as_written() {
+        let db = native_db();
+        let ty = iface("extends Node\nvar a: Vector2.Axis\n")
+            .members
+            .iter()
+            .find(|m| m.name == "a")
+            .expect("member")
+            .ty
+            .clone();
+        assert_eq!(ty.render_resolved(&db).as_deref(), Some("Vector2.Axis"));
+    }
+
+    /// Anything the dump does not recognize under a two-segment head renders exactly as before.
+    #[test]
+    fn an_unrecognized_path_renders_unchanged() {
+        let db = native_db();
+        for (src, want) in [
+            ("extends Node\nvar a: Outer.Inner\n", "Outer.Inner"),
+            ("extends Node\nvar a: int\n", "int"),
+            ("extends Node\nvar a: Array[int]\n", "Array[int]"),
+        ] {
+            let ty = iface(src)
+                .members
+                .iter()
+                .find(|m| m.name == "a")
+                .expect("member")
+                .ty
+                .clone();
+            assert_eq!(ty.render_resolved(&db).as_deref(), Some(want), "{src}");
+        }
     }
 
     #[test]

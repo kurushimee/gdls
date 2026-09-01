@@ -2421,3 +2421,57 @@ fn hover_inside_an_annotation_is_unchanged_and_an_unknown_one_is_silent() {
 
     shutdown(&client, handle);
 }
+
+/// #532: a member card must not print the initializer where the type belongs. `Vector2.ZERO` is
+/// what the shallow decode records for a builtin-constant initializer, and the dump says it is a
+/// `Vector2`. `Vector2.Axis`, spelled the same way, is a real annotation and stays as written.
+#[test]
+fn a_decoded_builtin_constant_hovers_as_its_type() {
+    let fixture_dir = std::env::temp_dir().join("gdls_532_render");
+    std::fs::create_dir_all(&fixture_dir).expect("create temp fixture dir");
+    let api_path = fixture_dir.join("extension_api.json");
+    std::fs::write(
+        &api_path,
+        r#"{
+        "header": { "version_major": 4, "version_minor": 6, "version_patch": 3 },
+        "classes": [ { "name": "Node" } ],
+        "builtin_classes": [
+            {
+                "name": "Vector2",
+                "constants": [ { "name": "ZERO", "type": "Vector2", "value": "Vector2(0, 0)" } ],
+                "enums": [ { "name": "Axis", "values": [ { "name": "AXIS_X", "value": 0 } ] } ]
+            }
+        ]
+    }"#,
+    )
+    .expect("write fixture JSON");
+
+    let init_options = serde_json::json!({
+        "extensionApiPath": api_path.to_string_lossy().as_ref(),
+    });
+    let (client, handle) = boot_with_options(Some(init_options));
+    let uri: Uri = "file:///test/render532.gd".parse().unwrap();
+    did_open(
+        &client,
+        &uri,
+        "extends Node\n\nvar spot := Vector2.ZERO\nvar axis: Vector2.Axis\n\nfunc use() -> void:\n\tprint(spot, axis)\n",
+    );
+
+    // The declaration card for `spot`.
+    let spot = hover_at(&client, &uri, Position::new(2, 5)).expect("hover on spot");
+    assert!(
+        hover_markdown(&spot).contains("var spot: Vector2\n"),
+        "the constant's own type, not the constant: {}",
+        hover_markdown(&spot)
+    );
+
+    // The annotation beside it, spelled the same way, is untouched.
+    let axis = hover_at(&client, &uri, Position::new(3, 5)).expect("hover on axis");
+    assert!(
+        hover_markdown(&axis).contains("Vector2.Axis"),
+        "a builtin enum annotation reads as written: {}",
+        hover_markdown(&axis)
+    );
+
+    shutdown(&client, handle);
+}

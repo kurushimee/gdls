@@ -799,7 +799,7 @@ fn script_method_sig(
         name,
         func,
         doc,
-        Some(decl),
+        Some((decl, &state.workspace.native)),
     )])
 }
 
@@ -1059,7 +1059,7 @@ impl Sig {
         name: &str,
         func: &gd_syntax::ast::FunctionNode,
         doc: Option<String>,
-        decl: Option<&gd_project::MemberDecl>,
+        decl: Option<(&gd_project::MemberDecl, &gd_types::NativeDb)>,
     ) -> Sig {
         let ret = return_type_label(tree, src, func.return_type);
         Sig::from_function_node_returning(tree, src, &ret, name, func, doc, decl)
@@ -1092,7 +1092,7 @@ impl Sig {
         name: &str,
         func: &gd_syntax::ast::FunctionNode,
         doc: Option<String>,
-        decl: Option<&gd_project::MemberDecl>,
+        decl: Option<(&gd_project::MemberDecl, &gd_types::NativeDb)>,
     ) -> Sig {
         let mut b = LabelBuilder::new(format!("{ret} {name}("));
         for (i, &pid) in func.parameters.iter().enumerate() {
@@ -1239,7 +1239,7 @@ fn param_type_label(
     tree: &ParseTree,
     src: &str,
     p: &gd_syntax::ast::ParameterNode,
-    decl: Option<&gd_project::MemberDecl>,
+    decl: Option<(&gd_project::MemberDecl, &gd_types::NativeDb)>,
     index: usize,
 ) -> String {
     if let Some(t) = p
@@ -1250,12 +1250,13 @@ fn param_type_label(
         return t;
     }
     let inferred_hard = decl
-        .and_then(|d| d.params_typing.get(index))
+        .and_then(|(d, _)| d.params_typing.get(index))
         .is_some_and(|t| *t == gd_project::ParamTyping::InferredHard);
     if inferred_hard {
-        if let Some(t) = decl
-            .and_then(|d| d.params.get(index))
-            .and_then(gd_project::TypeExpr::render)
+        // #532: `p := Vector2.ZERO` is decoded as the PATH `Vector2.ZERO`; rendered raw it would
+        // put the initializer where the type belongs.
+        if let Some(t) =
+            decl.and_then(|(d, db)| d.params.get(index).and_then(|p| p.render_resolved(db)))
         {
             return t;
         }
