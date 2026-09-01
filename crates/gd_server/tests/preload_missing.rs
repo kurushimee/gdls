@@ -81,16 +81,62 @@ fn an_existing_target_is_silent() {
     assert_eq!(errors(&mut ws, &p), Vec::<String>::new());
 }
 
-/// The four deliberate under-reports, each for its own reason: an unresolved `uid://` can mean a
-/// lagging uid map rather than a missing file; `user://` is outside the project tree; a file that
-/// exists but no loader claims is Godot's OTHER message, which gdls does not port; and a directory
-/// reads the same as a half-typed path.
+/// The three deliberate under-reports, each for its own reason: `user://` is outside the project
+/// tree; a file that exists but no loader claims is Godot's OTHER message, which gdls does not
+/// port; and a directory reads the same as a half-typed path.
 #[test]
 fn the_shapes_gdls_will_not_claim_stay_silent() {
     let p = project(
-        "extends Node\n\nconst A = preload(\"uid://bogus123\")\nconst B = preload(\"user://x.gd\")\nconst C = preload(\"res://notes.txt\")\nconst D = preload(\"res://src\")\n",
+        "extends Node\n\nconst B = preload(\"user://x.gd\")\nconst C = preload(\"res://notes.txt\")\nconst D = preload(\"res://src\")\n",
     );
     p.write("notes.txt", "hello\n");
+    let mut ws = Workspace::load(&p.root, &options(&p));
+    assert_eq!(errors(&mut ws, &p), Vec::<String>::new());
+}
+
+/// #565 — a `uid://` nothing declares. Godot prints the UID verbatim, not a `res://` path.
+#[test]
+fn an_undeclared_uid_reports_the_uid_verbatim() {
+    let p = project("extends Node\n\nconst A = preload(\"uid://bogusxyz123\")\n");
+    let mut ws = Workspace::load(&p.root, &options(&p));
+    assert_eq!(
+        errors(&mut ws, &p),
+        vec![r#"Preload file "uid://bogusxyz123" does not exist."#.to_owned()]
+    );
+}
+
+/// A uid a `.uid` sidecar declares, pointing at a file that is there.
+#[test]
+fn a_declared_uid_with_a_live_target_is_silent() {
+    let p = project("extends Node\n\nconst A = preload(\"uid://ctarget00001\")\n");
+    p.write("src/other.gd", "extends Node\n");
+    p.write("src/other.gd.uid", "uid://ctarget00001\n");
+    let mut ws = Workspace::load(&p.root, &options(&p));
+    assert_eq!(errors(&mut ws, &p), Vec::<String>::new());
+}
+
+/// A uid that resolves to a path holding nothing still reports the UID, not the path — Godot's
+/// message names the argument as written.
+#[test]
+fn a_declared_uid_with_a_dead_target_reports_the_uid() {
+    let p = project("extends Node\n\nconst A = preload(\"uid://cgone00000001\")\n");
+    p.write("src/gone.gd.uid", "uid://cgone00000001\n");
+    let mut ws = Workspace::load(&p.root, &options(&p));
+    assert_eq!(
+        errors(&mut ws, &p),
+        vec![r#"Preload file "uid://cgone00000001" does not exist."#.to_owned()]
+    );
+}
+
+/// Two resources claiming one uid: gdls drops it rather than answer with a coin flip, while Godot
+/// still resolves whichever claim it loaded last. The absence proves nothing, so it claims nothing.
+#[test]
+fn a_contested_uid_claims_nothing() {
+    let p = project("extends Node\n\nconst A = preload(\"uid://cdupe000000001\")\n");
+    p.write("src/one.gd", "extends Node\n");
+    p.write("src/one.gd.uid", "uid://cdupe000000001\n");
+    p.write("src/two.gd", "extends Node\n");
+    p.write("src/two.gd.uid", "uid://cdupe000000001\n");
     let mut ws = Workspace::load(&p.root, &options(&p));
     assert_eq!(errors(&mut ws, &p), Vec::<String>::new());
 }

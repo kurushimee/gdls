@@ -240,7 +240,12 @@ impl Workspace {
         // #447: the index resolves `uid://` in a `preload` or a path-`extends` through this map,
         // so it has to be in place before the first analysis reads a dependency edge. The scan
         // itself already ran as part of `ProjectModel::load_checked`.
-        set_index_uid_map(&mut index, root, project.uids.clone());
+        set_index_uid_map(
+            &mut index,
+            root,
+            project.uids.clone(),
+            project.contested_uids.clone(),
+        );
 
         // #484: the scene index resolves a `path`-less `[ext_resource]` through the same map. A
         // COLD build already had it; a WARM one loaded scenes canonicalized against the previous
@@ -1154,7 +1159,8 @@ impl Workspace {
         // A `project.godot` reload re-scans the `.uid` sidecars, so hand the fresh map over; every
         // file whose uid target moved is re-resolved and marked dirty by the swap.
         let uids = self.project.uids.clone();
-        set_index_uid_map(&mut self.index, &root, uids);
+        let contested = self.project.contested_uids.clone();
+        set_index_uid_map(&mut self.index, &root, uids, contested);
         // #484: the scene index reads the same map, and the whole map may have moved here — so
         // re-resolve every scene that names a uid, not just the two a single sidecar event touches.
         self.scenes.set_uid_map(self.project.uids.clone());
@@ -1927,9 +1933,17 @@ fn warm_index_from_cache(
 /// `txn` wants the file a mutation is about; a whole-project map swap is about `project.godot`,
 /// which is where the scan is triggered from and which the index never interns, so a quarantine
 /// pass on it is a no-op.
-fn set_index_uid_map(index: &mut Index, root: &Utf8Path, uids: FxHashMap<String, String>) {
+fn set_index_uid_map(
+    index: &mut Index,
+    root: &Utf8Path,
+    uids: FxHashMap<String, String>,
+    contested: rustc_hash::FxHashSet<String>,
+) {
     let anchor = root.join("project.godot");
-    index.txn(&anchor, move |idx| idx.set_uid_map(uids));
+    index.txn(&anchor, move |idx| {
+        idx.set_uid_map(uids);
+        idx.set_contested_uids(contested);
+    });
 }
 
 fn build_stat_table_from_index(index: &Index) -> FxHashMap<Utf8PathBuf, FileStat> {

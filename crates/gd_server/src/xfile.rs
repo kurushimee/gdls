@@ -245,9 +245,10 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
     /// #555. Every branch that cannot PROVE the absence returns `None`:
     ///
     /// * no loaded project — see `project_loaded`;
-    /// * a `uid://` (the uid map lags a rename, so an unresolved uid is not a missing file), a
-    ///   `user://` (outside the project tree entirely), or a `::` subresource path (real in Godot,
-    ///   and never its own file);
+    /// * a `user://` (outside the project tree entirely) or a `::` subresource path (real in
+    ///   Godot, and never its own file);
+    /// * a CONTESTED `uid://` — two resources claimed it, so gdls dropped it while Godot still
+    ///   resolves whichever claim it loaded last;
     /// * a `res://` carrying `..`, which `res_to_path` rejects — falling through to the relative
     ///   join would silently reinterpret it;
     /// * anything that lands outside the project root;
@@ -262,12 +263,25 @@ impl CrossFileQuery for WorkspaceXFileQuery<'_> {
     /// Deliberately `exists()`, not `is_file()`: Godot reports a directory too, but a directory is
     /// also how a half-written path reads, and an under-report is the cheaper mistake.
     fn preload_missing_path(&self, from: Option<FileId>, raw: &str) -> Option<String> {
-        if !self.project_loaded
-            || raw.contains("::")
-            || raw.starts_with("uid://")
-            || raw.starts_with("user://")
-        {
+        if !self.project_loaded || raw.contains("::") || raw.starts_with("user://") {
             return None;
+        }
+        // #565: a `uid://` is checked like any other path once dereferenced, and Godot prints the
+        // UID verbatim either way — for one nothing declares and for one whose target is gone.
+        // The claim is only sound because gdls's uid map now carries every source Godot consults,
+        // `.godot/uid_cache.bin` included (`gd_project::paths::build_uid_map`); a project with
+        // neither a sidecar nor a cache does not resolve the uid in Godot either.
+        if raw.starts_with("uid://") {
+            if self.inner.index.uid_is_contested(raw) {
+                return None;
+            }
+            let Some(target) = self.inner.index.uid_target(raw) else {
+                return Some(raw.to_owned());
+            };
+            let target = target.to_owned();
+            return self
+                .preload_missing_path(from, &target)
+                .map(|_| raw.to_owned());
         }
         // Resolved here rather than through `preload_asset_path`, which normalizes without
         // collapsing `..` — `res_to_path` REJECTS a traversing `res://`, and `join_lexical`

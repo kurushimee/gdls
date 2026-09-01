@@ -7,7 +7,7 @@
 //! `main_scene`, or `preload` resolves without parsing the editor's binary caches.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use walkdir::WalkDir;
 
 /// `"res://a/b.gd"` → `<root>/a/b.gd`.
@@ -70,6 +70,12 @@ pub fn path_to_res(root: &Utf8Path, path: &Utf8Path) -> Option<String> {
 /// sidecar last.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UidSource {
+    /// `.godot/uid_cache.bin`, the editor's own `ResourceUID` dump. Ranked LOWEST: it is a cache,
+    /// so a live declaration on disk always wins. It is read at all because it is a source Godot
+    /// itself consults and the three file kinds do not cover — a project that gitignores its
+    /// `.uid` sidecars still resolves every `preload("uid://…")` in the editor, and without this
+    /// gdls would see uids that resolve to nothing where Godot sees a file (#565).
+    Cache,
     Sidecar,
     Header,
     Import,
@@ -124,6 +130,61 @@ fn quoted_uid(text: &str) -> Option<String> {
     Some(rest[..end].to_owned())
 }
 
+/// Godot's `uid://` text for a numeric id (`ResourceUID::id_to_text`, core/io/resource_uid.cpp:55):
+/// base-34 over its own alphabet, most significant digit first. A negative id is the invalid
+/// sentinel and has no text form.
+fn uid_id_to_text(id: i64) -> Option<String> {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxy012345678";
+    if id < 0 {
+        return None;
+    }
+    let mut rest = id as u64;
+    let base = ALPHABET.len() as u64;
+    let mut digits = Vec::new();
+    loop {
+        digits.push(ALPHABET[(rest % base) as usize]);
+        rest /= base;
+        if rest == 0 {
+            break;
+        }
+    }
+    digits.reverse();
+    Some(format!("uid://{}", String::from_utf8_lossy(&digits)))
+}
+
+/// Every `(uid, res://path)` pair in `<root>/.godot/uid_cache.bin`
+/// (`ResourceUID::load_from_cache`, core/io/resource_uid.cpp:305).
+///
+/// The format is a little-endian `u32` entry count followed by `(i64 id, u32 len, utf8 path)`
+/// records. The count is NOT authoritative: `ResourceUID::update_cache` appends new records to the
+/// end without rewriting the header (:343-370), so this reads records until the file runs out and
+/// treats the count as a lower bound. A truncated or garbled tail simply stops the scan — a cache
+/// is a hint, and a partial one is still worth more than none.
+fn read_uid_cache(root: &Utf8Path) -> Vec<(String, String)> {
+    let path = root.join(".godot").join("uid_cache.bin");
+    let Ok(bytes) = std::fs::read(path.as_std_path()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut at = 4usize; // skip the entry count
+    while at + 12 <= bytes.len() {
+        let id = i64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+        let len = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().expect("4 bytes")) as usize;
+        at += 12;
+        if len > bytes.len() - at {
+            break;
+        }
+        let res = String::from_utf8_lossy(&bytes[at..at + len]).into_owned();
+        at += len;
+        if let Some(uid) = uid_id_to_text(id) {
+            if res.starts_with("res://") {
+                out.push((uid, res));
+            }
+        }
+    }
+    out
+}
+
 /// Scan the project tree and build a `uid:// → res://path` map. Skips the import cache (`.godot/`),
 /// whose copies carry the same uids as the originals. Unreadable files are silently skipped.
 ///
@@ -131,8 +192,24 @@ fn quoted_uid(text: &str) -> Option<String> {
 /// drops the uid entirely. Answering with either one would be a coin flip, and an unresolved
 /// `preload` degrades to the same `Variant` it had before the map existed.
 pub fn build_uid_map(root: &Utf8Path) -> FxHashMap<String, String> {
+    build_uid_map_checked(root).0
+}
+
+/// [`build_uid_map`] plus the uids it had to DROP because two resources claimed the same one.
+///
+/// The dropped set matters to any consumer that would otherwise read "not in the map" as "no such
+/// resource": a contested uid still resolves in Godot — `ResourceUID` keeps whichever claim it
+/// loaded last — so treating it as unresolvable would be a claim gdls cannot make (#565).
+#[must_use]
+pub fn build_uid_map_checked(root: &Utf8Path) -> (FxHashMap<String, String>, FxHashSet<String>) {
     // res:// → (source rank, uid), so a resource declaring its uid twice settles deterministically.
     let mut by_resource: FxHashMap<String, (UidSource, String)> = FxHashMap::default();
+    // The editor's cache first, so any live declaration below outranks it.
+    for (uid, res) in read_uid_cache(root) {
+        if uid != INVALID_UID {
+            by_resource.insert(res, (UidSource::Cache, uid));
+        }
+    }
     for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| e.file_name() != ".godot")
@@ -164,10 +241,11 @@ pub fn build_uid_map(root: &Utf8Path) -> FxHashMap<String, String> {
             contested.push(uid);
         }
     }
-    for uid in contested {
-        map.remove(&uid);
+    let contested: FxHashSet<String> = contested.into_iter().collect();
+    for uid in &contested {
+        map.remove(uid);
     }
-    map
+    (map, contested)
 }
 
 #[cfg(test)]
@@ -194,6 +272,71 @@ mod tests {
         assert!(
             join_lexical(dir, "../../../../etc/passwd").is_none(),
             "a traversal past the base's root has no answer"
+        );
+    }
+
+    /// `ResourceUID::id_to_text` (core/io/resource_uid.cpp:55) in reverse — the base-34 rendering
+    /// a `.godot/uid_cache.bin` entry has to be turned back into (#565). The expected string is a
+    /// real cache entry Godot 4.7.2 wrote beside the matching `.uid` sidecar.
+    #[test]
+    fn uid_id_renders_the_way_godot_writes_it() {
+        assert_eq!(uid_id_to_text(0).as_deref(), Some("uid://a"));
+        assert_eq!(uid_id_to_text(33).as_deref(), Some("uid://8"));
+        assert_eq!(uid_id_to_text(34).as_deref(), Some("uid://ba"));
+        assert_eq!(
+            uid_id_to_text(4_950_721_021_516_070_079).as_deref(),
+            Some("uid://ccsfwfu4pmdu2")
+        );
+        assert!(uid_id_to_text(-1).is_none(), "the invalid sentinel");
+    }
+
+    /// The cache's entry count is a lower bound: `ResourceUID::update_cache` appends records
+    /// without rewriting the header, so the reader has to keep going past it.
+    #[test]
+    fn the_uid_cache_is_read_past_its_own_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf-8 tempdir");
+        std::fs::create_dir_all(root.join(".godot").as_std_path()).expect("mkdir .godot");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // says one, carries two
+        for (id, res) in [(34i64, "res://a.gd"), (35i64, "res://b.gd")] {
+            bytes.extend_from_slice(&id.to_le_bytes());
+            bytes.extend_from_slice(&(res.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(res.as_bytes());
+        }
+        std::fs::write(root.join(".godot/uid_cache.bin").as_std_path(), &bytes).expect("write");
+        let got = read_uid_cache(root);
+        assert_eq!(
+            got,
+            vec![
+                ("uid://ba".to_owned(), "res://a.gd".to_owned()),
+                ("uid://bb".to_owned(), "res://b.gd".to_owned()),
+            ]
+        );
+    }
+
+    /// A live `.uid` sidecar outranks the cache for the same resource.
+    #[test]
+    fn a_sidecar_outranks_the_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Utf8Path::from_path(dir.path()).expect("utf-8 tempdir");
+        std::fs::create_dir_all(root.join(".godot").as_std_path()).expect("mkdir .godot");
+        let res = "res://a.gd";
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&34i64.to_le_bytes());
+        bytes.extend_from_slice(&(res.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(res.as_bytes());
+        std::fs::write(root.join(".godot/uid_cache.bin").as_std_path(), &bytes).expect("write");
+        std::fs::write(root.join("a.gd").as_std_path(), "extends Node\n").expect("write gd");
+        std::fs::write(root.join("a.gd.uid").as_std_path(), "uid://cfresh1\n").expect("write uid");
+        let map = build_uid_map(root);
+        assert_eq!(
+            map.get("uid://cfresh1").map(String::as_str),
+            Some("res://a.gd")
+        );
+        assert!(
+            !map.contains_key("uid://ba"),
+            "the stale cache entry for the same resource loses: {map:?}"
         );
     }
 

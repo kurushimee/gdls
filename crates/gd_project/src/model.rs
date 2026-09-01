@@ -46,6 +46,10 @@ pub struct ProjectModel {
     pub gdextensions: Vec<GdExtension>,
     /// `uid:// → res://path`, from scanning `*.uid` sidecars.
     pub uids: FxHashMap<String, String>,
+    /// The uids two resources claimed, which [`paths::build_uid_map`] refuses to answer for. Godot
+    /// still resolves one, so a consumer must not read its absence from `uids` as "no such
+    /// resource" (#565).
+    pub contested_uids: rustc_hash::FxHashSet<String>,
 }
 
 /// WP-RD13: the outcome of a [`ProjectModel::load_checked`] attempt, fine-grained enough for the
@@ -125,7 +129,7 @@ impl ProjectModel {
                 )
             }
         };
-        let uids = paths::build_uid_map(root);
+        let (uids, contested_uids) = paths::build_uid_map_checked(root);
         let gdextensions = gdextension::enumerate(root);
         (
             ProjectModel {
@@ -137,6 +141,7 @@ impl ProjectModel {
                 warnings: project.warnings,
                 gdextensions,
                 uids,
+                contested_uids,
             },
             outcome,
         )
@@ -304,6 +309,7 @@ mod tests {
             warnings: WarningConfig::default(),
             gdextensions: vec![],
             uids,
+            contested_uids: rustc_hash::FxHashSet::default(),
         };
 
         assert_eq!(
@@ -334,6 +340,7 @@ mod tests {
             warnings: WarningConfig::default(),
             gdextensions: vec![],
             uids,
+            contested_uids: rustc_hash::FxHashSet::default(),
         }
     }
 

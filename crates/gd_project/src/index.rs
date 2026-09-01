@@ -71,6 +71,10 @@ pub struct Index {
     /// [`crate::ProjectModel::uids`], which is rebuilt from a sidecar walk on every startup — the
     /// index is handed a copy rather than serializing one into the cache.
     uids: FxHashMap<String, String>,
+    /// The uids TWO resources claimed, which [`crate::paths::build_uid_map`] drops rather than
+    /// answer with a coin flip. Kept so a consumer can tell "gdls dropped this" from "no such
+    /// resource": Godot still resolves a contested uid, so the absence proves nothing (#565).
+    contested_uids: rustc_hash::FxHashSet<String>,
     /// The inverse of [`Self::uids`], so a sidecar that is deleted or re-pointed can be found by
     /// the resource path the watcher reports rather than by the uid it used to carry.
     uids_by_res: FxHashMap<String, String>,
@@ -110,6 +114,7 @@ impl Index {
             file_path_refs: FxHashMap::default(),
             path_referencers: FxHashMap::default(),
             uids: FxHashMap::default(),
+            contested_uids: rustc_hash::FxHashSet::default(),
             uids_by_res: FxHashMap::default(),
             uid_refs: FxHashMap::default(),
             uid_referencers: FxHashMap::default(),
@@ -453,6 +458,18 @@ impl Index {
     /// spelling that accepts `res://` accepts `uid://` too. Putting the deref here, ahead of the
     /// `res://` strip, is what gives the analyzer's `preload` reduction, the dependency edges,
     /// `InitShape::Preload`, and path-`extends` the same answer from one change (#447).
+    /// Whether `uid` is one [`crate::paths::build_uid_map`] dropped as contested. A `false` for a
+    /// uid the map also lacks is what makes "nothing declares this uid" a fact.
+    #[must_use]
+    pub fn uid_is_contested(&self, uid: &str) -> bool {
+        self.contested_uids.contains(uid)
+    }
+
+    /// Record the contested set alongside the map (see [`Self::uid_is_contested`]).
+    pub fn set_contested_uids(&mut self, uids: rustc_hash::FxHashSet<String>) {
+        self.contested_uids = uids;
+    }
+
     fn deref_uid<'a>(&'a self, res: &'a str) -> Option<&'a str> {
         if res.starts_with("uid://") {
             return self.uids.get(res).map(String::as_str);
@@ -1333,6 +1350,7 @@ impl Index {
             // interfaces themselves — the same "reverse maps are derived, never serialized"
             // doctrine that governs `name_referencers` and `path_referencers`.
             uids: FxHashMap::default(),
+            contested_uids: rustc_hash::FxHashSet::default(),
             uids_by_res: FxHashMap::default(),
             uid_refs,
             uid_referencers,
@@ -1494,6 +1512,11 @@ impl IndexMut<'_> {
     /// Replace the project's `uid:// → res://` map. Forwards to [`Index::set_uid_map`].
     pub fn set_uid_map(&mut self, uids: FxHashMap<String, String>) {
         self.inner.set_uid_map(uids);
+    }
+
+    /// Record the uids two resources claimed. Forwards to [`Index::set_contested_uids`].
+    pub fn set_contested_uids(&mut self, uids: rustc_hash::FxHashSet<String>) {
+        self.inner.set_contested_uids(uids);
     }
 
     /// Point one resource at a uid, or drop its mapping. Forwards to
