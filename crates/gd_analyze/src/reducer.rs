@@ -4941,7 +4941,11 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     // silent-Variant miss records `Unresolved`, never a guessed class).
     let mut native_callee: Option<String> = None;
 
-    if is_constructor {
+    // #546: a BUILTIN base never takes the constructor arm. Godot's `get_function_signature` puts
+    // its BUILTIN lookup (analyzer.cpp:5904-5937) ABOVE the `p_is_constructor` → `_init` rewrite
+    // (:5960), so `Vector2.new()` is looked up as an ordinary method, misses, and reports. Taking
+    // the arm here instead fabricated a `Vector2` instance for a call the engine refuses outright.
+    if is_constructor && base_type.kind != DtKind::Builtin {
         // `X.new()` returns an instance of X. The return type is synthesized directly (Godot's
         // `get_function_signature` with `p_is_constructor=true` sets `r_return_type = p_base_type`
         // at analyzer.cpp:5869 rather than `_init`'s declared return), so we don't take the
@@ -5649,9 +5653,13 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // has nothing of the kind — the call gate at analyzer.cpp:3757 is `is_self || (hard &&
         // BUILTIN)` flat. Godot answers `d.nope_p` with a Variant and `d.nope_m()` with an error.
         // `Nil` stays out at both arms: it has its own message and this is not the arm to emit it.
+        //
+        // #546: a METAtype is in too. Godot's gate carries no meta exclusion, so
+        // `Vector2.bogus_static()` reports exactly like `Vector2(1, 2).bogus()` does — the static
+        // method tables come from the same dump entry, so the negative is provable on the same
+        // terms. Excluding it left every mistyped static call silent.
         let builtin_base_is_introspectable = base_type.is_hard_type()
             && base_type.kind == DtKind::Builtin
-            && !base_type.is_meta_type
             && base_type.builtin_type != VariantType::Nil
             && ctx
                 .native
@@ -8672,7 +8680,7 @@ fn reduce_identifier_from_base(
     // --- ENUM branch (analyzer.cpp:4038-4053) ----------------------------------------------------
     if base.kind == DtKind::Enum {
         if base.is_meta_type {
-            if let Some(&val) = base.enum_values.get(&name) {
+            if let Some(&val) = base.enum_values.get(&raw_name) {
                 // gdls-only nav anchor (additive; Godot records nothing here — it just types the
                 // value, analyzer.cpp:4054-4068): a value of a named enum gets a by-identity
                 // `Binding::Use` so `references`/`rename` can resolve it to its DECLARING file
@@ -8712,7 +8720,7 @@ fn reduce_identifier_from_base(
                         .unwrap_or_default(),
                 };
                 if let Some(decl_file) = decl_file {
-                    let qualified = format!("{}.{}", base.enum_type, name);
+                    let qualified = format!("{}.{}", base.enum_type, raw_name);
                     let site = ctx.node(identifier_id).span;
                     // The QUALIFIED `<Enum>.<value>` name + the declaring inner-class path
                     // (`target_class_path`) jointly key the enum-value collector — never the bare
@@ -8758,7 +8766,7 @@ fn reduce_identifier_from_base(
             if let Some(c) = bt
                 .constants
                 .iter()
-                .find(|c| ctx.native.name_of(c.name) == name)
+                .find(|c| ctx.native.name_of(c.name) == raw_name)
             {
                 let const_bt =
                     c.ty.and_then(|sym| {
@@ -8788,7 +8796,7 @@ fn reduce_identifier_from_base(
                 if let Some(ev) = ne
                     .values
                     .iter()
-                    .find(|v| ctx.native.name_of(v.name) == name)
+                    .find(|v| ctx.native.name_of(v.name) == raw_name)
                 {
                     let val = ev.value;
                     let enum_name = ctx.native.name_of(ne.name).to_owned();
@@ -8805,16 +8813,38 @@ fn reduce_identifier_from_base(
             }
 
             // 3. The enum itself (analyzer.cpp:4080-4084).
-            if bt.enums.iter().any(|e| ctx.native.name_of(e.name) == name) {
-                let t =
-                    crate::resolver::make_builtin_enum_type(ctx, &name, base.builtin_type, true);
+            if bt
+                .enums
+                .iter()
+                .any(|e| ctx.native.name_of(e.name) == raw_name)
+            {
+                let t = crate::resolver::make_builtin_enum_type(
+                    ctx,
+                    &raw_name,
+                    base.builtin_type,
+                    true,
+                );
                 ctx.set_type(identifier_id, t);
                 return;
             }
 
-            // 4. Not found. Godot emits "Cannot find member" via the subscript caller — gdls's
-            //    subscript path emits the same. Leave datatype unset so the caller sees the
-            //    definitive "not found" verdict.
+            // 4. Not found (analyzer.cpp:4103-4113). Godot pushes the member miss HERE, and its
+            //    subscript caller pushes the same string again off the unset datatype — which is
+            //    why `--check-only` prints the row twice for a plain read. gdls reports it once,
+            //    from here, and stamps a SET Variant so the subscript arm stays quiet. That is
+            //    what gets the message onto the CALL path (#546), which has no compensating arm
+            //    of its own and was silent on `Vector2.bogus_static()` entirely.
+            //
+            //    Only under `Exact` provenance: a trimmed or absent dump cannot disprove a
+            //    member, and the same rule already gates every other negative claim. Without it,
+            //    the datatype stays unset and both callers keep the verdict they have today.
+            if base.is_hard_type() && ctx.native.provenance() == gd_types::ApiProvenance::Exact {
+                ctx.push_error(
+                    format!(r#"Cannot find member "{raw_name}" in base "{base}"."#),
+                    identifier_id,
+                );
+                ctx.set_type(identifier_id, DataType::variant());
+            }
             return;
         }
         // Non-meta builtin base (instance): members (`pos.x` → int, analyzer.cpp:4118-4124 via
