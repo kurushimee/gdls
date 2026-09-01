@@ -465,3 +465,121 @@ fn class_node_members_defensive_on_non_class_and_skips_groups() {
         );
     }
 }
+
+// --- #505: a member's `detail` is the signature, not the return type alone -------------------
+
+const DETAIL_GD: &str = "\
+class_name DetailProbe
+extends Node
+signal died(who: DetailProbe, reason: String)
+signal bare_signal
+const LIMIT := 5
+var hp: int = 1
+var untyped_var = 1
+func describe() -> String:
+\treturn \"\"
+func take_damage(amount: int) -> void:
+\tpass
+func no_annotations(a, b):
+\treturn a
+static func spawn_cost(f: int) -> int:
+\treturn f
+";
+
+fn detail_of<'a>(items: &'a [MemberItem], name: &str) -> Option<&'a str> {
+    items
+        .iter()
+        .find(|m| m.name == name)
+        .and_then(|m| m.detail.as_deref())
+}
+
+/// A `func`'s `detail` renders its parameter list and return, the same `(params) -> Return` shape
+/// the native arm produces. Rendering `MemberDecl.ty` alone made `describe()` read exactly like a
+/// property of type `String`, and made a `-> void` method render as nothing at all.
+#[test]
+fn a_script_method_detail_is_its_full_signature() {
+    let project = Project::new(&[("res://detail.gd", DETAIL_GD)]);
+    let native = native_db();
+    let start = ScriptRef {
+        file: project.fid("res://detail.gd"),
+        inner: Vec::new(),
+    };
+    let members = script_chain_members(&project, &native, &start);
+
+    assert_eq!(detail_of(&members, "describe"), Some("() -> String"));
+    assert_eq!(
+        detail_of(&members, "take_damage"),
+        Some("(amount: int) -> void")
+    );
+    assert_eq!(detail_of(&members, "spawn_cost"), Some("(f: int) -> int"));
+}
+
+/// An unannotated parameter renders `Variant` — what an unannotated GDScript parameter accepts —
+/// and an unwritten return renders `void`, the same call the hover formatter makes for the same
+/// ambiguity (`type_expr` collapses explicit `-> void` and no annotation into one value).
+#[test]
+fn an_unannotated_signature_renders_honestly_rather_than_emptily() {
+    let project = Project::new(&[("res://detail.gd", DETAIL_GD)]);
+    let native = native_db();
+    let start = ScriptRef {
+        file: project.fid("res://detail.gd"),
+        inner: Vec::new(),
+    };
+    let members = script_chain_members(&project, &native, &start);
+
+    assert_eq!(
+        detail_of(&members, "no_annotations"),
+        Some("(a: Variant, b: Variant) -> void")
+    );
+}
+
+/// A signal renders `(params)` with no arrow: it has no return, and the parameter list is the whole
+/// question a `connect` call site is asking. A signal with no parameters still renders `()`, so it
+/// is never mistaken for a property.
+#[test]
+fn a_signal_detail_is_its_parameter_list() {
+    let project = Project::new(&[("res://detail.gd", DETAIL_GD)]);
+    let native = native_db();
+    let start = ScriptRef {
+        file: project.fid("res://detail.gd"),
+        inner: Vec::new(),
+    };
+    let members = script_chain_members(&project, &native, &start);
+
+    assert_eq!(
+        detail_of(&members, "died"),
+        Some("(who: DetailProbe, reason: String)")
+    );
+    assert_eq!(detail_of(&members, "bare_signal"), Some("()"));
+}
+
+/// Properties and constants are unchanged: their `detail` is still the type the interface pass
+/// recorded — the written annotation, or the one the shallow pass read off a literal initializer.
+#[test]
+fn a_property_or_constant_detail_is_unchanged() {
+    let project = Project::new(&[("res://detail.gd", DETAIL_GD)]);
+    let native = native_db();
+    let start = ScriptRef {
+        file: project.fid("res://detail.gd"),
+        inner: Vec::new(),
+    };
+    let members = script_chain_members(&project, &native, &start);
+
+    assert_eq!(detail_of(&members, "hp"), Some("int"));
+    // `:=` and a bare `= 1` both cross as `int`: the shallow pass decodes a literal initializer.
+    assert_eq!(detail_of(&members, "LIMIT"), Some("int"));
+    assert_eq!(detail_of(&members, "untyped_var"), Some("int"));
+}
+
+/// A native signal renders its parameters too, so the script and native arms agree. Before #505 the
+/// native arm dropped them, which would have left script signals richer than engine ones.
+#[test]
+fn a_native_signal_detail_is_its_parameter_list_too() {
+    let native = native_db();
+    let members = gd_analyze::enumerate::native_class_members(&native, "Node");
+    let renamed = detail_of(&members, "renamed").expect("Node.renamed is a signal with params");
+    assert!(
+        renamed.starts_with('(') && renamed.ends_with(')') && !renamed.contains("->"),
+        "a signal renders `(params)` with no arrow: {renamed:?}"
+    );
+}
