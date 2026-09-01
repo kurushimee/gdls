@@ -8666,9 +8666,17 @@ fn link_fqcn(ctx: &AnalysisContext, link: &crate::data_type::ScriptRef) -> Strin
 }
 
 /// [`link_fqcn`] for a file's head class.
+///
+/// The path spelling has to be the one [`crate::resolver::class_fqcn`] uses for the file being
+/// analyzed, or the same enum gets two names and the identity check rejects the pair (#286). Both
+/// sides carry Godot's `parser->script_path`, which the server supplies as a `res://` path; the
+/// basename is only the fallback for a file with no `res://` form, matching the server's own.
 fn file_fqcn(ctx: &AnalysisContext, file: gd_project::FileId) -> String {
     if let Some(name) = ctx.xfile.interface(file).and_then(|i| i.class_name.clone()) {
         return name;
+    }
+    if let Some(res) = ctx.xfile.res_path(file) {
+        return res;
     }
     ctx.xfile
         .file_path(file)
