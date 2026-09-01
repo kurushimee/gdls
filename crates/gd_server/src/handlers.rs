@@ -2088,13 +2088,13 @@ fn hover_attribute_member_signature(
 
     // The subscript whose attribute identifier spans the cursor. Attribute identifier spans are
     // disjoint across nesting (each is a distinct source token), so the first hit is the only hit.
-    let (sub_base, attr_id) = tree.iter_ids().find_map(|id| {
+    let (sub_id, sub_base, attr_id) = tree.iter_ids().find_map(|id| {
         let node = tree.get(id);
         if let NodeKind::Subscript(sub) = &node.kind {
             if let Some(SubscriptAccess::Attribute(Some(attr_id))) = sub.access {
                 let s = tree.get(attr_id).span;
                 if s.start <= cursor_byte && cursor_byte < s.end {
-                    return Some((sub.base, attr_id));
+                    return Some((id, sub.base, attr_id));
                 }
             }
         }
@@ -2185,7 +2185,13 @@ fn hover_attribute_member_signature(
         .flatten()
         .find_map(|i| i.members.iter().find(|m| m.name.as_str() == name))
     {
-        let sig = format_member_signature(name, decl, &state.workspace.native)?;
+        let mut sig = format_member_signature(name, decl, &state.workspace.native)?;
+        // #526: the read itself carries the type the analyzer resolved, which is what the
+        // diagnostics on this very expression were checked against.
+        if let Some(ty) = resolved_member_type_suffix(state, tree, decl, analyzed.types.get(sub_id))
+        {
+            sig = format!("{sig}: {ty}");
+        }
         let mut md = format!("```gdscript\n{sig}\n```");
         // #258: this path serves every NON-call member reference — `obj.width`, `Singleton.LIMIT`,
         // `obj.sig`, an uncalled `obj.method`. It rendered the bare signature, so a `var`/`const`/
@@ -2284,7 +2290,17 @@ fn hover_bare_member_signature(
     });
     if let Some((file, class_path)) = target {
         if let Some(iface) = iface_at_inner(&state.workspace.index, file, &class_path) {
-            if let Some(md) = member_declaration_hover_md(iface, name, &state.workspace.native) {
+            // #526: the bare read's own type table entry, for a member the interface cannot type.
+            let resolved = iface
+                .members
+                .iter()
+                .find(|m| m.name.as_str() == name)
+                .and_then(|decl| {
+                    resolved_member_type_suffix(state, tree, decl, analyzed.types.get(ident_id))
+                });
+            if let Some(md) =
+                member_declaration_hover_md(iface, name, &state.workspace.native, resolved)
+            {
                 return Some(md);
             }
         }
@@ -2351,6 +2367,7 @@ fn member_declaration_hover_md(
     iface: &gd_project::Interface,
     name: &str,
     db: &gd_types::NativeDb,
+    resolved: Option<String>,
 ) -> Option<String> {
     if let Some(inner) = iface
         .inner
@@ -2367,7 +2384,11 @@ fn member_declaration_hover_md(
     let sig = if decl.kind == gd_project::MemberKind::Enum {
         format!("enum {name}")
     } else {
-        format_member_signature(name, decl, db)?
+        let base = format_member_signature(name, decl, db)?;
+        match resolved {
+            Some(ty) => format!("{base}: {ty}"),
+            None => base,
+        }
     };
     let mut md = format!("```gdscript\n{sig}\n```");
     if let Some(doc) = &decl.doc {
@@ -2717,20 +2738,10 @@ fn hover_declaration_signature(
 
     // An untyped `var`/`const` whose initializer the analyzer typed reads better with the
     // resolved type appended (`var made: ReproEntity` for `var made := ent.spawn(...)`).
-    if matches!(member_decl.ty, gd_project::TypeExpr::None)
-        && matches!(
-            member_decl.kind,
-            gd_project::MemberKind::Var
-                | gd_project::MemberKind::Property
-                | gd_project::MemberKind::Const
-        )
+    if let Some(ty) = analyzed
+        .and_then(|a| resolved_member_type_suffix(state, tree, member_decl, a.types.get(decl_id)))
     {
-        if let Some(a) = analyzed {
-            let dt = a.types.get(decl_id);
-            if dt.is_set() && !dt.is_variant() {
-                sig = format!("{sig}: {}", human_type_label(state, tree, dt));
-            }
-        }
+        sig = format!("{sig}: {ty}");
     }
 
     // A `const`'s own value, when the analyzer folded one — the same thing the native side shows
@@ -2753,6 +2764,37 @@ fn hover_declaration_signature(
         crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, &doc);
     }
     Some(md)
+}
+
+/// #526: the type to append to a member card whose INTERFACE carries none.
+///
+/// A member with no annotation gets its type from its initializer, and the shallow interface only
+/// decodes the shapes that need no evaluation. Everything else — a `preload`, a global constant, a
+/// native class's enum value — is resolved by the analyzer, and the reading file's own type table
+/// already holds the answer on the access node, because that is what the strict profile checked
+/// against. Reading it from there is what keeps the card and the diagnostics from disagreeing.
+///
+/// `None` when the interface already has an annotation (the author's own spelling wins), when the
+/// member is not a value, or when the analyzer read nothing better than `Variant` — a card must
+/// never claim a type gdls did not resolve.
+fn resolved_member_type_suffix(
+    state: &ServerState,
+    tree: &ParseTree,
+    decl: &gd_project::MemberDecl,
+    dt: &gd_analyze::DataType,
+) -> Option<String> {
+    if !matches!(decl.ty, gd_project::TypeExpr::None) {
+        return None;
+    }
+    if !matches!(
+        decl.kind,
+        gd_project::MemberKind::Var
+            | gd_project::MemberKind::Property
+            | gd_project::MemberKind::Const
+    ) {
+        return None;
+    }
+    (dt.is_set() && !dt.is_variant()).then(|| human_type_label(state, tree, dt))
 }
 
 /// A human-readable label for a resolved [`DataType`] — hover must never surface the
