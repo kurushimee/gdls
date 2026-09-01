@@ -7,7 +7,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::api::{self, ExtensionApi};
 use crate::intern::{Interner, Sym};
@@ -251,6 +251,13 @@ pub struct NativeDb {
     /// project-derived); [`NativeDb::empty`] is `Absent`; the embedded-fallback loader in
     /// `gd_server` downgrades its instance to `Generic`.
     provenance: ApiProvenance,
+    /// Classes the project's GDExtensions declare (`[icons]` hints) that this dump does NOT
+    /// carry. Filled by the server after the doc-XML merge pass. Godot's own ClassDB knows
+    /// these classes regardless of what the dump captured — a dump generated without
+    /// extension registration (a failed DLL load unregisters the rest; a never-imported
+    /// project) is engine-`Exact` yet extension-blind — so the analyzer's negative-claim
+    /// gates must decline "does not exist" about these names.
+    extension_declared_missing: FxHashSet<Sym>,
 }
 
 impl NativeDb {
@@ -268,6 +275,7 @@ impl NativeDb {
             header: api::Header::default(),
             content_hash: 0,
             provenance: ApiProvenance::Absent,
+            extension_declared_missing: FxHashSet::default(),
         }
     }
 
@@ -340,7 +348,24 @@ impl NativeDb {
             header: api.header,
             content_hash: 0,
             provenance: ApiProvenance::Exact,
+            extension_declared_missing: FxHashSet::default(),
         }
+    }
+
+    /// Record one extension-declared class absent from this dump (see the field doc). The
+    /// server calls this while walking the project's `.gdextension` hints; the analyzer reads
+    /// it back through [`NativeDb::is_extension_declared_missing`].
+    pub fn note_extension_declared_missing(&mut self, name: &str) {
+        self.extension_declared_missing
+            .insert(self.interner.intern(name));
+    }
+
+    /// Whether the project declares `name` via a GDExtension while this dump lacks it — the
+    /// per-class carve-out to the `Exact`-provenance negative-claim soundness bar.
+    pub fn is_extension_declared_missing(&self, name: &str) -> bool {
+        self.interner
+            .get(name)
+            .is_some_and(|s| self.extension_declared_missing.contains(&s))
     }
 
     /// True when no classes or builtins were ingested (the degraded state).
@@ -1740,6 +1765,17 @@ mod tests {
             );
         }
         assert!(db.builtin_members("NotAType").is_none());
+    }
+
+    #[test]
+    fn extension_declared_missing_round_trips() {
+        let mut db = mini_globals_db();
+        db.note_extension_declared_missing("BTTask");
+        assert!(db.is_extension_declared_missing("BTTask"));
+        // A name the project never declared, and an engine class the dump DOES carry, both
+        // stay out of the set — the carve-out must not swallow ordinary negative claims.
+        assert!(!db.is_extension_declared_missing("Blackboard"));
+        assert!(!db.is_extension_declared_missing("Node"));
     }
 
     /// An inline dump with two utilities and the `Error` / `Key` global enums — the portable way

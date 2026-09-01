@@ -2101,6 +2101,23 @@ fn load_native(
         // extension loaded has the classes; shipping no doc XML is then normal, not a
         // degradation). `extension_class_notice` decides; capturing `class_hints` is the
         // whole reason this check exists (`gdextension.rs`).
+        //
+        // Recording is UNCONDITIONAL and deliberately outside the notice branch: the notice
+        // is all-or-nothing (silent when any doc XML merged for the extension, or when any
+        // single hint already resolves), but the analyzer's carve-out is per-name. An
+        // extension declaring 20 classes whose doc XML covers 3 — or one hint captured by a
+        // dump that missed the rest — still leaves names Godot's ClassDB carries and this
+        // dump does not, and a "Could not find type" claim about those is exactly as
+        // unsound. Two-step collect: the filter borrows `db` immutably, the note mutates.
+        let missing: Vec<String> = ext
+            .class_hints
+            .iter()
+            .filter(|h| db.class_named(h).is_none())
+            .cloned()
+            .collect();
+        for name in &missing {
+            db.note_extension_declared_missing(name);
+        }
         if let Some(notice) = extension_class_notice(ext, &db, merged - before) {
             log::warn!("GDExtension {}: {notice}", ext.config);
         }
