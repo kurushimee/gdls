@@ -987,10 +987,17 @@ fn resolve_refuses_a_suppression_whose_buffer_moved() {
         Vec::new(),
         None,
     );
-    // No diagnostics in context ⇒ nothing offered; re-request with the real diagnostic.
+    // No diagnostics in context ⇒ no QUICKFIX offered; re-request with the real diagnostic.
+    // #545: the `source.fixAll` aggregate is built from the server's own diagnostics rather than
+    // the passed context, so it is offered here regardless — that is the point of that change, and
+    // this precondition only ever cared about the quickfix half.
     assert!(
-        actions.is_empty(),
-        "sanity: an empty context offers nothing"
+        !actions.iter().any(|a| matches!(
+            a,
+            CodeActionOrCommand::CodeAction(ca) if ca.kind == Some(CodeActionKind::QUICKFIX)
+        )),
+        "sanity: an empty context offers no quickfix; got {:?}",
+        action_titles(&actions)
     );
     let (_diag, action) = {
         // Re-publish by touching the file so a fresh diagnostic set arrives.
@@ -3160,6 +3167,203 @@ fn underscore_prefix_refused_when_name_in_enclosing_function() {
         find_action(&actions, "Prefix unused name").is_none(),
         "a `_`-prefix whose `_count` lives in the ENCLOSING function must be REFUSED (the lambda span \
          is nested in the enclosing span, not disjoint); got titles {:?}",
+        action_titles(&actions)
+    );
+    shutdown(&client, t);
+}
+
+// ===================================================================================================
+// #545: `source.fixAll` covers the FILE, not the requested range
+// ===================================================================================================
+
+/// Two auto-fixable warnings on different lines: a parameter on line 2, a local on line 3.
+const TWO_FIXABLE: &str =
+    "extends Node\n\nfunc go(unused_param: int) -> void:\n\tvar unused_local := 1\n";
+
+/// Every `TextEdit` a fixAll action carries, as `(newText, line)`, sorted.
+fn fix_all_edits(actions: &CodeActionResponse) -> Vec<(String, u32)> {
+    let action = actions
+        .iter()
+        .find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca)
+                if ca.kind == Some(CodeActionKind::SOURCE_FIX_ALL) =>
+            {
+                Some(ca.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "a source.fixAll action must be offered; got {:?}",
+                action_titles(actions)
+            )
+        });
+    let edit = action
+        .edit
+        .expect("the fixAll action carries its edits eagerly");
+    let mut out: Vec<(String, u32)> = Vec::new();
+    if let Some(changes) = edit.changes {
+        for (_uri, edits) in changes {
+            for e in edits {
+                out.push((e.new_text, e.range.start.line));
+            }
+        }
+    }
+    if let Some(lsp_types::DocumentChanges::Edits(docs)) = edit.document_changes {
+        for doc in docs {
+            for e in doc.edits {
+                let (text, range) = match e {
+                    lsp_types::OneOf::Left(t) => (t.new_text, t.range),
+                    lsp_types::OneOf::Right(t) => (t.text_edit.new_text, t.text_edit.range),
+                };
+                out.push((text, range.start.line));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The repro. A lightbulb opened on ONE warning sends only that warning's range and only that
+/// warning in `context.diagnostics`, and the aggregate built from that context fixed exactly one
+/// thing under a title that says "all". The candidate list is the file's own diagnostics now, so
+/// the title describes the edit.
+#[test]
+fn fix_all_covers_the_file_from_a_cursor_range() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_result, diags) = init_open(
+        &p,
+        &client,
+        &[("two.gd", TWO_FIXABLE)],
+        caps(true, false, true),
+    );
+    let uri = file_uri(&p.root.join("two.gd"));
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    let first = diags
+        .diagnostics
+        .first()
+        .expect("two fixable warnings are published")
+        .clone();
+    let actions = request_code_action(&client, 20, &uri, diag_range(&first), vec![first], None);
+
+    assert_eq!(
+        fix_all_edits(&actions),
+        vec![
+            ("_unused_local".to_string(), 3),
+            ("_unused_param".to_string(), 2),
+        ],
+        "the aggregate must carry BOTH files' fixes, not only the one under the cursor"
+    );
+    shutdown(&client, t);
+}
+
+/// The answer does not depend on the range: a whole-file request (what an editor sends on save)
+/// yields the same edits a cursor request does.
+#[test]
+fn fix_all_is_range_independent() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_result, diags) = init_open(
+        &p,
+        &client,
+        &[("two.gd", TWO_FIXABLE)],
+        caps(true, false, true),
+    );
+    let uri = file_uri(&p.root.join("two.gd"));
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    let first = diags.diagnostics.first().expect("a warning").clone();
+    let cursor = fix_all_edits(&request_code_action(
+        &client,
+        21,
+        &uri,
+        diag_range(&first),
+        vec![first],
+        None,
+    ));
+    let whole = fix_all_edits(&request_code_action(
+        &client,
+        22,
+        &uri,
+        Range::new(Position::new(0, 0), Position::new(4, 0)),
+        diags.diagnostics.clone(),
+        None,
+    ));
+    assert!(!cursor.is_empty(), "two empty sets are not agreement");
+    assert_eq!(cursor, whole);
+    shutdown(&client, t);
+}
+
+/// An EMPTY `context.diagnostics` is what a `source.fixAll` sweep on save can legitimately send.
+/// The aggregate is built from the server's own set, so it still fixes the file.
+#[test]
+fn fix_all_works_with_an_empty_context() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_result, _diags) = init_open(
+        &p,
+        &client,
+        &[("two.gd", TWO_FIXABLE)],
+        caps(true, false, true),
+    );
+    let uri = file_uri(&p.root.join("two.gd"));
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    let actions = request_code_action(
+        &client,
+        23,
+        &uri,
+        Range::new(Position::new(0, 0), Position::new(4, 0)),
+        Vec::new(),
+        Some(vec![CodeActionKind::SOURCE_FIX_ALL]),
+    );
+    assert_eq!(
+        fix_all_edits(&actions),
+        vec![
+            ("_unused_local".to_string(), 3),
+            ("_unused_param".to_string(), 2),
+        ]
+    );
+    shutdown(&client, t);
+}
+
+/// A file with nothing auto-fixable offers no aggregate at all — the refuse-gate is untouched.
+#[test]
+fn fix_all_is_absent_when_nothing_is_fixable() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let t = std::thread::spawn(move || gd_server::serve(server));
+    let (_result, _diags) = init_open(
+        &p,
+        &client,
+        &[(
+            "clean.gd",
+            "extends Node\n\nfunc go() -> void:\n\tprint(1)\n",
+        )],
+        caps(true, false, true),
+    );
+    let uri = file_uri(&p.root.join("clean.gd"));
+    while try_recv(&client, Duration::from_millis(200)).is_some() {}
+
+    let actions = request_code_action(
+        &client,
+        24,
+        &uri,
+        Range::new(Position::new(0, 0), Position::new(4, 0)),
+        Vec::new(),
+        Some(vec![CodeActionKind::SOURCE_FIX_ALL]),
+    );
+    assert!(
+        !actions.iter().any(|a| matches!(
+            a,
+            CodeActionOrCommand::CodeAction(ca) if ca.kind == Some(CodeActionKind::SOURCE_FIX_ALL)
+        )),
+        "no aggregate for a file with nothing to fix; got {:?}",
         action_titles(&actions)
     );
     shutdown(&client, t);

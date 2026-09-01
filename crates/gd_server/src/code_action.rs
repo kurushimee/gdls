@@ -1726,9 +1726,16 @@ fn apply_workspace_edit_to_text(
 /// safe applies.
 fn build_fix_all(state: &mut ServerState, params: &CodeActionParams) -> Option<CodeAction> {
     let uri = params.text_document.uri.clone();
+    // #545: the candidate list is the SERVER's own diagnostics for the file, not
+    // `params.context.diagnostics`. Per the LSP spec that array holds only what overlaps the
+    // requested range, so a lightbulb opened at a cursor produced an action titled "Fix all
+    // auto-fixable warnings" that fixed exactly one. Editors that run fixAll on save send the whole
+    // range and were already getting the right answer; reading the file's own set makes the title
+    // true whatever range the client asked about.
+    let own_diagnostics = crate::server::diagnostic_items(state, &uri);
     // Collect each safe fix's WorkspaceEdit, then merge their per-file TextEdits.
     let mut edits: Vec<WorkspaceEdit> = Vec::new();
-    for diag in &params.context.diagnostics {
+    for diag in &own_diagnostics {
         let Some(code) = diag_warning_code(diag) else {
             continue;
         };
