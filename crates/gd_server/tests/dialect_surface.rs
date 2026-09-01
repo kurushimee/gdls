@@ -339,6 +339,19 @@ fn the_stock_fallback_notice_names_the_release_it_actually_loaded() {
                 Ok(Message::Notification(n)) if n.method == "window/showMessage" => {
                     let msg = n.params["message"].as_str().unwrap_or("").to_owned();
                     if msg.contains("built-in stock") {
+                        // #503: the stock surface carries `Generic` provenance, which gates off
+                        // every negative diagnostic in the file — not just claims about engine
+                        // classes. The notice has to say that, and it has to arrive at the same
+                        // severity as the release-mismatch notice, which costs the user the same.
+                        assert_eq!(
+                            n.params["type"].as_u64(),
+                            Some(2),
+                            "the stock notice is a WARNING, not an INFO: {msg}"
+                        );
+                        assert!(
+                            msg.contains("will not report unknown identifiers or members"),
+                            "the stock notice must name the consequence: {msg}"
+                        );
                         notice = Some(msg);
                     }
                 }
