@@ -9,8 +9,9 @@
 //!
 //! The list is the `utility_functions` set of the 4.6.3-stable API surface (the
 //! `register_utility_functions` table in `variant_utility.cpp`), in registration order. The
-//! GDScript-only utilities (`len`, `range`, `load`, …) are a separate family resolved through the
-//! analyzer's hard-coded GDScript-utility table, not this one.
+//! GDScript-only utilities (`len`, `range`, `load`, …) are a separate family, resolved through the
+//! analyzer's hard-coded GDScript-utility table rather than this one, and rendered from
+//! [`GDSCRIPT_UTILITY_FUNCTIONS`] below.
 
 /// Every Variant utility function name, in the engine's registration order. Equivalent to the
 /// `utility_functions[].name` set of the stock `extension_api.json`; a DB ingest is verified
@@ -244,6 +245,116 @@ pub fn is_variant_utility_math(name: &str) -> bool {
 #[must_use]
 pub fn is_variant_utility(name: &str) -> bool {
     VARIANT_UTILITY_FUNCTIONS.contains(&name)
+}
+
+/// One GDScript-only utility function, rendered the way an editor shows it.
+///
+/// The three fields are already display text rather than a type model: nothing in gdls needs to
+/// reason over these types (the analyzer has its own `DataType` table for that), and every
+/// consumer here — the `@GDScript.gd` stub page and the hover for a bare call — wants exactly the
+/// declaration line.
+#[derive(Clone, Copy, Debug)]
+pub struct GdScriptUtility {
+    /// The registered name. `REGISTER_FUNC` strips a leading underscore, so `_char` registers
+    /// as `char` and that is the only name a script can call.
+    pub name: &'static str,
+    /// The parameter list as it appears between the parentheses; `...` for a vararg.
+    pub params: &'static str,
+    /// The return type, `void` when the registration is `RET(NIL)`.
+    pub return_type: &'static str,
+}
+
+/// The GDScript-only utility functions (`len`, `range`, `load`, …) — the family
+/// [`VARIANT_UTILITY_FUNCTIONS`] deliberately excludes. They are compiled into the engine and
+/// never appear in `extension_api.json`, so their signatures are transcribed from the
+/// `REGISTER_FUNC` table at `modules/gdscript/gdscript_utility_functions.cpp:570-589`, in
+/// registration order.
+///
+/// The five entries behind `#ifndef DISABLE_DEPRECATED` (`convert`, `type_exists`,
+/// `inst_to_dict`, `dict_to_inst`, `Color8`) are present because gdls mirrors a default build
+/// (`docs/02` §11d). Identical at both supported tags, so no dialect guard is owed.
+///
+/// `gd_analyze` holds two further tables keyed off the same registration — a return-type table
+/// and a `CallSig` table for argument checking. This one is the display half; a test there pins
+/// the three name sets together.
+pub const GDSCRIPT_UTILITY_FUNCTIONS: &[GdScriptUtility] = &[
+    GdScriptUtility {
+        name: "convert",
+        params: "what: Variant, type: Variant.Type",
+        return_type: "Variant",
+    },
+    GdScriptUtility {
+        name: "type_exists",
+        params: "type: StringName",
+        return_type: "bool",
+    },
+    GdScriptUtility {
+        name: "char",
+        params: "code: int",
+        return_type: "String",
+    },
+    GdScriptUtility {
+        name: "ord",
+        params: "char: String",
+        return_type: "int",
+    },
+    GdScriptUtility {
+        name: "range",
+        params: "...",
+        return_type: "Array",
+    },
+    GdScriptUtility {
+        name: "load",
+        params: "path: String",
+        return_type: "Resource",
+    },
+    GdScriptUtility {
+        name: "inst_to_dict",
+        params: "instance: Object",
+        return_type: "Dictionary",
+    },
+    GdScriptUtility {
+        name: "dict_to_inst",
+        params: "dictionary: Dictionary",
+        return_type: "Object",
+    },
+    GdScriptUtility {
+        name: "Color8",
+        params: "r8: int, g8: int, b8: int, a8: int = 255",
+        return_type: "Color",
+    },
+    GdScriptUtility {
+        name: "print_debug",
+        params: "...",
+        return_type: "void",
+    },
+    GdScriptUtility {
+        name: "print_stack",
+        params: "",
+        return_type: "void",
+    },
+    GdScriptUtility {
+        name: "get_stack",
+        params: "",
+        return_type: "Array",
+    },
+    GdScriptUtility {
+        name: "len",
+        params: "var: Variant",
+        return_type: "int",
+    },
+    GdScriptUtility {
+        name: "is_instance_of",
+        params: "value: Variant, type: Variant",
+        return_type: "bool",
+    },
+];
+
+/// The [`GDSCRIPT_UTILITY_FUNCTIONS`] entry for `name`, or `None` for anything else. A linear
+/// scan over 14 short names, reached only once a caller already knows it holds a callee name.
+#[must_use]
+pub fn gdscript_utility(name: &str) -> Option<&'static GdScriptUtility> {
+    GDSCRIPT_UTILITY_FUNCTIONS.iter().find(|u| u.name == name)
 }
 
 #[cfg(test)]

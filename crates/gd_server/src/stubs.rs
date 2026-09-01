@@ -324,6 +324,117 @@ pub(crate) fn render_builtin(db: &NativeDb, bt: &gd_types::BuiltinType) -> Rende
     }
 }
 
+/// The two global-scope pages. A utility function belongs to no class, so it has no class page
+/// to live on; these mirror Godot's own documentation split — `@GlobalScope` for the Variant
+/// utilities the dump carries, `@GDScript` for the ones the engine compiles in (#584).
+///
+/// A closed enum rather than a name string on purpose: the file stem becomes a path component,
+/// and [`is_identifier_shaped`] (the traversal guard for project-supplied class names) rejects a
+/// leading `@`. Compile-time stems never reach that guard and can never be attacker-chosen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GlobalPage {
+    /// Variant utilities, read from the dump: `print`, `abs`, `maxi`, …
+    GlobalScope,
+    /// GDScript-only utilities, compiled into the engine: `len`, `range`, `load`, …
+    GDScript,
+}
+
+impl GlobalPage {
+    /// The page's file stem, also its [`StubCache`] key. Disjoint from every class and builtin
+    /// name because no Godot type name starts with `@`.
+    fn stem(self) -> &'static str {
+        match self {
+            Self::GlobalScope => "@GlobalScope",
+            Self::GDScript => "@GDScript",
+        }
+    }
+}
+
+/// Render the `@GlobalScope` page: every Variant utility in the dump as a `func` declaration,
+/// each preceded by its description when the dump carries one. Utilities are already sorted by
+/// name ([`NativeDb::utilities`]), which keeps the page deterministic.
+///
+/// There is no class header to anchor — nothing ever types as `@GlobalScope` — so `class_line`
+/// stays at the header comment and no caller reads it.
+pub(crate) fn render_global_scope(db: &NativeDb) -> RenderedStub {
+    let mut text = String::new();
+    let mut member_lines = FxHashMap::default();
+    let mut line: u32 = 0;
+    push_line(&mut text, &mut line, "## @GlobalScope");
+    push_line(&mut text, &mut line, "##");
+    push_line(
+        &mut text,
+        &mut line,
+        "## Utility functions callable from anywhere.",
+    );
+    for u in db.utilities() {
+        push_line(&mut text, &mut line, "");
+        push_doc(&mut text, &mut line, &u.description);
+        let name = db.name_of(u.name).to_owned();
+        let decl = native_render::utility_detail(db, u);
+        member_lines.insert(name.clone(), func_anchor(line, &decl, &name));
+        push_line(&mut text, &mut line, &decl);
+    }
+    RenderedStub {
+        text,
+        class_line: 0,
+        class_name_col: 0,
+        member_lines,
+    }
+}
+
+/// Render the `@GDScript` page from [`gd_types::GDSCRIPT_UTILITY_FUNCTIONS`]. Independent of the
+/// dump — these functions are compiled into the engine — so the page is byte-identical under any
+/// [`gd_types::ApiProvenance`], including a project with no dump at all.
+pub(crate) fn render_gdscript_globals() -> RenderedStub {
+    let mut text = String::new();
+    let mut member_lines = FxHashMap::default();
+    let mut line: u32 = 0;
+    push_line(&mut text, &mut line, "## @GDScript");
+    push_line(&mut text, &mut line, "##");
+    push_line(
+        &mut text,
+        &mut line,
+        "## Utility functions the GDScript language itself provides.",
+    );
+    for u in gd_types::GDSCRIPT_UTILITY_FUNCTIONS {
+        push_line(&mut text, &mut line, "");
+        let decl = native_render::gdscript_utility_detail(u);
+        member_lines.insert(u.name.to_owned(), func_anchor(line, &decl, u.name));
+        push_line(&mut text, &mut line, &decl);
+    }
+    RenderedStub {
+        text,
+        class_line: 0,
+        class_name_col: 0,
+        member_lines,
+    }
+}
+
+/// Push one line and advance the counter — the free-function twin of the closure the class
+/// renderers use, so the global pages can share [`func_anchor`] across two bodies.
+fn push_line(text: &mut String, line: &mut u32, s: &str) {
+    text.push_str(s);
+    text.push('\n');
+    *line += 1;
+}
+
+/// The `"func "`-prefixed [`MemberAnchor`] for a rendered declaration, with the same drift
+/// assertion the class renderers make at every insert.
+fn func_anchor(line: u32, decl: &str, name: &str) -> MemberAnchor {
+    const PREFIX: &str = "func ";
+    debug_assert_eq!(
+        decl.get(PREFIX.len()..PREFIX.len() + name.len()),
+        Some(name),
+        "stub anchor drift: {decl:?} does not open with {PREFIX:?} + {name:?}"
+    );
+    MemberAnchor {
+        line,
+        name_col: PREFIX.len() as u32,
+        name_len: name.len() as u32,
+    }
+}
+
 /// Append a (possibly multi-line) docstring as `## ` comment lines. No-op when empty.
 fn push_doc(text: &mut String, line: &mut u32, doc: &str) {
     if doc.is_empty() {
@@ -387,22 +498,66 @@ pub(crate) fn ensure_class_stub(
             }
         }
     };
-    let path = dir.join(format!("{class_name}.gd"));
-    if !path.as_std_path().exists() {
-        let tmp = dir.join(format!(".{class_name}.gd.tmp"));
-        std::fs::write(tmp.as_std_path(), &stub.text).ok()?;
-        if std::fs::rename(tmp.as_std_path(), path.as_std_path()).is_err() {
-            // Windows refuses to rename onto an existing target, so losing a double-write
-            // race to a concurrent session lands here with that session's identical bytes
-            // already at `path` — serve them. Only a rename failure with NO file at the
-            // target is a real IO failure.
-            let _ = std::fs::remove_file(tmp.as_std_path());
-            if !path.as_std_path().exists() {
-                return None;
+    write_stub(&dir, class_name, &stub.text)?;
+    Some((dir.join(format!("{class_name}.gd")), stub))
+}
+
+/// [`ensure_class_stub`] for a global-scope page. Same cache, same directory, same
+/// write-once-atomically shape; the page enum replaces the name check, since the stems are
+/// compile-time constants that no dump can influence.
+pub(crate) fn ensure_global_stub(
+    cache: &StubCache,
+    db: &NativeDb,
+    page: GlobalPage,
+    override_root: Option<&str>,
+) -> Option<(Utf8PathBuf, Rc<RenderedStub>)> {
+    let dir = stub_dir(db, override_root)?;
+    std::fs::create_dir_all(dir.as_std_path()).ok()?;
+    if let Some(base) = stubs_base_dir(override_root) {
+        freshen_and_gc(&base, &dir);
+    }
+    let hash = db.content_hash();
+    let stem = page.stem();
+    let stub = {
+        let mut map = cache.0.borrow_mut();
+        match map.get(stem) {
+            Some((h, stub)) if *h == hash => Rc::clone(stub),
+            _ => {
+                map.retain(|_, (h, _)| *h == hash);
+                let rendered = match page {
+                    GlobalPage::GlobalScope => render_global_scope(db),
+                    GlobalPage::GDScript => render_gdscript_globals(),
+                };
+                let stub = Rc::new(rendered);
+                map.insert(stem.to_owned(), (hash, Rc::clone(&stub)));
+                stub
             }
         }
+    };
+    write_stub(&dir, stem, &stub.text)?;
+    Some((dir.join(format!("{stem}.gd")), stub))
+}
+
+/// Write `<dir>/<stem>.gd` when absent — atomic temp + rename. Identical bytes per key make a
+/// concurrent double-write benign. `None` on a real IO failure.
+fn write_stub(dir: &Utf8Path, stem: &str, text: &str) -> Option<()> {
+    let path = dir.join(format!("{stem}.gd"));
+    if path.as_std_path().exists() {
+        return Some(());
     }
-    Some((path, stub))
+    let tmp = dir.join(format!(".{stem}.gd.tmp"));
+    std::fs::write(tmp.as_std_path(), text).ok()?;
+    if std::fs::rename(tmp.as_std_path(), path.as_std_path()).is_err() {
+        // Windows refuses to rename onto an existing target, so losing a double-write race to
+        // a concurrent session lands here with that session's identical bytes already at
+        // `path` — serve them. Only a rename failure with NO file at the target is a real IO
+        // failure.
+        let _ = std::fs::remove_file(tmp.as_std_path());
+        if !path.as_std_path().exists() {
+            return None;
+        }
+    }
+    Some(())
 }
 
 /// `[A-Za-z_][A-Za-z0-9_]*` — the only class-name shape allowed to become a stub filename.
@@ -556,6 +711,152 @@ mod tests {
             "class docs head the page: {:?}",
             &a.text[..40]
         );
+    }
+
+    /// A dump carrying both utility families' worth of shapes: a typed one, a vararg one, a
+    /// void one, and one with a description.
+    fn utility_db() -> NativeDb {
+        NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "classes": [{"name": "Object", "is_instantiable": true}],
+                "utility_functions": [
+                    {"name": "maxi", "return_type": "int", "category": "math",
+                     "is_vararg": false, "hash": 1, "description": "The larger of two ints.",
+                     "arguments": [{"name": "a", "type": "int"}, {"name": "b", "type": "int"}]},
+                    {"name": "print", "category": "general", "is_vararg": true, "hash": 2,
+                     "arguments": [{"name": "arg1", "type": "Variant"}]},
+                    {"name": "randi", "return_type": "int", "category": "random",
+                     "is_vararg": false, "hash": 3}
+                ]
+            }"#,
+        )
+        .expect("utility-test dump")
+    }
+
+    #[test]
+    fn the_global_scope_page_declares_every_dump_utility_at_its_anchor() {
+        let db = utility_db();
+        let page = render_global_scope(&db);
+        let lines: Vec<&str> = page.text.lines().collect();
+        // Sorted by name, which is what `NativeDb::utilities` guarantees.
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("func "))
+                .copied()
+                .collect::<Vec<_>>(),
+            [
+                "func maxi(a: int, b: int) -> int",
+                "func print(arg1: Variant, ...) -> void",
+                "func randi() -> int",
+            ]
+        );
+        assert!(
+            page.text.contains("## The larger of two ints."),
+            "a with-docs dump's utility description precedes its declaration: {}",
+            &page.text[..120]
+        );
+        for name in ["maxi", "print", "randi"] {
+            let a = page.member_lines.get(name).expect("anchored");
+            let line = lines[a.line as usize];
+            assert_eq!(
+                &line[a.name_col as usize..(a.name_col + a.name_len) as usize],
+                name,
+                "anchor for {name} must land on its name token in {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gdscript_page_declares_the_engine_compiled_utilities() {
+        let page = render_gdscript_globals();
+        let lines: Vec<&str> = page.text.lines().collect();
+        assert_eq!(
+            lines.iter().filter(|l| l.starts_with("func ")).count(),
+            gd_types::GDSCRIPT_UTILITY_FUNCTIONS.len()
+        );
+        // The three shapes the table has: vararg, no-arg, and a trailing default.
+        for decl in [
+            "func range(...) -> Array",
+            "func print_stack() -> void",
+            "func Color8(r8: int, g8: int, b8: int, a8: int = 255) -> Color",
+            "func len(var: Variant) -> int",
+        ] {
+            assert!(page.text.contains(decl), "page must declare {decl:?}");
+        }
+        for u in gd_types::GDSCRIPT_UTILITY_FUNCTIONS {
+            let a = page.member_lines.get(u.name).expect("anchored");
+            let line = lines[a.line as usize];
+            assert_eq!(
+                &line[a.name_col as usize..(a.name_col + a.name_len) as usize],
+                u.name,
+                "anchor for {} must land on its name token in {line:?}",
+                u.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_gdscript_page_does_not_depend_on_the_dump() {
+        // Engine-compiled utilities are in no dump, so the page must be identical under a dump
+        // that carries none — including `ApiProvenance::Absent`.
+        let empty = NativeDb::empty();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().into_owned();
+        let a = ensure_global_stub(
+            &StubCache::default(),
+            &empty,
+            GlobalPage::GDScript,
+            Some(&root),
+        )
+        .expect("page written without a dump");
+        assert_eq!(a.1.text, render_gdscript_globals().text);
+    }
+
+    #[test]
+    fn each_global_page_writes_once_under_its_own_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_string_lossy().into_owned();
+        let db = utility_db();
+        let cache = StubCache::default();
+        for (page, stem) in [
+            (GlobalPage::GlobalScope, "@GlobalScope.gd"),
+            (GlobalPage::GDScript, "@GDScript.gd"),
+        ] {
+            let (path, stub) =
+                ensure_global_stub(&cache, &db, page, Some(&root)).expect("page written");
+            assert_eq!(path.file_name(), Some(stem));
+            let first = std::fs::metadata(path.as_std_path())
+                .unwrap()
+                .modified()
+                .unwrap();
+            let (path2, stub2) =
+                ensure_global_stub(&cache, &db, page, Some(&root)).expect("page reused");
+            assert_eq!(path, path2);
+            assert!(
+                Rc::ptr_eq(&stub, &stub2),
+                "second ensure reuses the session-cached render"
+            );
+            assert_eq!(
+                first,
+                std::fs::metadata(path2.as_std_path())
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                "second ensure must not rewrite the file"
+            );
+            assert_eq!(
+                std::fs::read_to_string(path.as_std_path()).unwrap(),
+                stub.text
+            );
+            // Both pages live in the class pages' directory, so the diagnostics gate and the
+            // GC cover them with no extra code.
+            assert!(is_stub_uri(
+                &crate::uri::path_to_file_uri(&path).unwrap(),
+                Some(&root)
+            ));
+        }
     }
 
     #[test]

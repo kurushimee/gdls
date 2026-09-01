@@ -190,6 +190,9 @@ pub struct UtilityFunction {
     pub is_vararg: bool,
     #[serde(default)]
     pub arguments: Vec<ArgumentDef>,
+    /// The function's description from the with-docs dump (see [`ClassDef::description`]).
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

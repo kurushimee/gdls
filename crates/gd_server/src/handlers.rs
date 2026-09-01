@@ -1331,8 +1331,8 @@ fn native_definition(
         return None;
     }
 
-    // 3. Bare call callee through the implicit self — the file's chain native root, with
-    // project members shadowing (the hover bare-call rule).
+    // 3. Bare call callee through the implicit self — the file's chain native root, then the
+    // global-scope utilities, with project members shadowing (the hover bare-call rule).
     let is_bare_callee = tree.iter_ids().any(|id| {
         if let NodeKind::Call(c) = &tree.get(id).kind {
             if let Some(callee) = c.callee {
@@ -1345,24 +1345,57 @@ fn native_definition(
         false
     });
     if is_bare_callee {
-        let fid = uri_to_path(uri).and_then(|p| state.workspace.index.file_id(&p))?;
-        let (chain, root) = state
-            .workspace
-            .index
-            .extends_chain_files(fid, &state.workspace.native);
-        let declared_in_project = chain.iter().any(|f| {
-            state
+        // The index lookup is not a precondition: a buffer outside any project root still calls
+        // `print`, and its utility must still resolve. Only the shadow check and the chain walk
+        // need a file id.
+        if let Some(fid) = uri_to_path(uri).and_then(|p| state.workspace.index.file_id(&p)) {
+            let (chain, root) = state
                 .workspace
                 .index
-                .interface(*f)
-                .is_some_and(|i| i.members.iter().any(|m| m.name == name))
-        });
-        if declared_in_project {
-            return None;
+                .extends_chain_files(fid, &state.workspace.native);
+            let declared_in_project = chain.iter().any(|f| {
+                state
+                    .workspace
+                    .index
+                    .interface(*f)
+                    .is_some_and(|i| i.members.iter().any(|m| m.name == name))
+            });
+            if declared_in_project {
+                return None;
+            }
+            if let Some(root) = root {
+                if let Some(loc) =
+                    native_member_stub_location(state, &root, name, stub_root.as_deref())
+                {
+                    return Some(loc);
+                }
+            }
         }
-        return native_member_stub_location(state, &root?, name, stub_root.as_deref());
+        return global_utility_stub_location(state, name, stub_root.as_deref());
     }
     None
+}
+
+/// Anchor a bare utility callee on its global-scope page (#584). A dump utility goes to
+/// `@GlobalScope.gd`, a GDScript-only one to `@GDScript.gd`; anything else is not a utility and
+/// answers null, as before. The two name sets are disjoint in Godot, and `@GlobalScope` is tried
+/// first because that is where a dump can add names.
+fn global_utility_stub_location(
+    state: &ServerState,
+    name: &str,
+    stub_root: Option<&str>,
+) -> Option<Location> {
+    let db = &state.workspace.native;
+    let page = if db.utility(name).is_some() {
+        crate::stubs::GlobalPage::GlobalScope
+    } else if gd_types::gdscript_utility(name).is_some() {
+        crate::stubs::GlobalPage::GDScript
+    } else {
+        return None;
+    };
+    let (path, stub) = crate::stubs::ensure_global_stub(&state.stub_cache, db, page, stub_root)?;
+    let anchor = *stub.member_lines.get(name)?;
+    stub_token_location(&path, anchor.line, anchor.name_col, anchor.name_len)
 }
 
 /// Materialize the stub of the class DECLARING `member` (found by the chain walk from `class`)
@@ -2071,10 +2104,22 @@ fn hover_bare_native_signature(
         }
     }
     // `@GlobalScope` utility — also reachable in buffers outside the project index.
-    let u = db.utility(&callee_name)?;
+    if let Some(u) = db.utility(&callee_name) {
+        let mut md = format!(
+            "```gdscript\n{}\n```",
+            crate::native_render::utility_detail(db, u)
+        );
+        crate::docs::append_doc(&mut md, crate::docs::ProseFormat::Markdown, &u.description);
+        return Some(md);
+    }
+    // A GDScript-only utility (`len`, `range`, …) is in no dump, so the declaration comes from
+    // the transcribed table. Without this arm `len(x)` fell through to the generic type label
+    // and hovered as `Variant`, its return type, while every neighbouring utility showed a
+    // signature (#584).
+    let g = gd_types::gdscript_utility(&callee_name)?;
     Some(format!(
         "```gdscript\n{}\n```",
-        crate::native_render::utility_detail(db, u)
+        crate::native_render::gdscript_utility_detail(g)
     ))
 }
 

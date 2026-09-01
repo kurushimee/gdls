@@ -98,6 +98,13 @@ pub fn utility_detail(db: &NativeDb, u: &UtilityFn) -> String {
     format!("func {}({args}) -> {ret}", db.name_of(u.name))
 }
 
+/// The [`utility_detail`] twin for a GDScript-only utility (`len`, `range`, …). Those functions
+/// are compiled into the engine and absent from every dump, so the declaration comes from the
+/// transcribed table rather than from `db` (#584).
+pub fn gdscript_utility_detail(u: &gd_types::GdScriptUtility) -> String {
+    format!("func {}({}) -> {}", u.name, u.params, u.return_type)
+}
+
 /// `name: Type = default, …` — every argument carrying a dump default renders it. Real dumps
 /// have contiguous trailing defaults, so this emits byte-for-byte what upstream's
 /// `arg_default_value_started` loop (gdscript_workspace.cpp:323-341) does, without its
@@ -254,6 +261,28 @@ mod tests {
         assert_eq!(
             utility_detail(&db, db.utility("clampi").unwrap()),
             "func clampi(value: int, min: int, max: int) -> int"
+        );
+    }
+
+    #[test]
+    fn gdscript_utility_lines_read_like_the_dump_backed_ones() {
+        let line = |name: &str| {
+            gdscript_utility_detail(gd_types::gdscript_utility(name).expect("registered"))
+        };
+        // Vararg, no-arg-with-a-value, trailing default, and the registered `char` name that
+        // `REGISTER_FUNC` derived by stripping `_char`'s underscore.
+        assert_eq!(line("range"), "func range(...) -> Array");
+        assert_eq!(line("get_stack"), "func get_stack() -> Array");
+        assert_eq!(line("print_stack"), "func print_stack() -> void");
+        assert_eq!(
+            line("Color8"),
+            "func Color8(r8: int, g8: int, b8: int, a8: int = 255) -> Color"
+        );
+        assert_eq!(line("char"), "func char(code: int) -> String");
+        assert_eq!(line("len"), "func len(var: Variant) -> int");
+        assert!(
+            gd_types::gdscript_utility("_char").is_none(),
+            "`_char` is the C++ symbol, never a callable name"
         );
     }
 }

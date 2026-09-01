@@ -181,6 +181,8 @@ pub struct UtilityFn {
     pub return_type: TypeRef,
     pub is_vararg: bool,
     pub params: Vec<Param>,
+    /// BBCode description from a with-docs dump; empty on the stock one.
+    pub description: String,
 }
 
 /// One member found by [`NativeDb::lookup_member`] / [`NativeDb::lookup_builtin_member`],
@@ -1440,6 +1442,7 @@ fn ingest_utility(u: api::UtilityFunction, it: &mut Interner) -> UtilityFn {
         return_type,
         is_vararg: u.is_vararg,
         params: ingest_args(u.arguments, it),
+        description: u.description,
     }
 }
 
@@ -1950,6 +1953,35 @@ mod tests {
             NativeMember::EnumValue { doc, .. } => assert_eq!(doc, ""),
             other => panic!("MODE_IDLE resolved to {other:?}, expected an enum value"),
         }
+    }
+
+    #[test]
+    fn utility_docs_ingest_from_the_dump() {
+        // #584: the global-scope stub page renders each utility's description above its
+        // declaration, the same way a class page renders a method's. A stock dump has none.
+        let db = NativeDb::from_json(
+            r#"{
+                "header": {"version_major": 4, "version_minor": 6, "version_patch": 3},
+                "utility_functions": [
+                    {"name": "maxi", "return_type": "int", "category": "math",
+                     "is_vararg": false, "hash": 1,
+                     "description": "Returns the maximum of two [int] values.",
+                     "arguments": [{"name": "a", "type": "int"}, {"name": "b", "type": "int"}]},
+                    {"name": "randi", "return_type": "int", "category": "random",
+                     "is_vararg": false, "hash": 2}
+                ]
+            }"#,
+        )
+        .expect("documented utilities dump");
+        assert_eq!(
+            db.utility("maxi").expect("maxi resolves").description,
+            "Returns the maximum of two [int] values."
+        );
+        assert_eq!(
+            db.utility("randi").expect("randi resolves").description,
+            "",
+            "an undocumented utility ingests as an empty string, never a panic"
+        );
     }
 
     #[test]
