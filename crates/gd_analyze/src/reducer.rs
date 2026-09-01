@@ -2385,7 +2385,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             // false-positive here. Corpus-safe: `is_autoload` is `false` for every corpus query.
             let is_autoload = ctx.xfile.is_autoload(&name);
             if !is_native_member && !is_autoload {
-                ctx.push_error(
+                ctx.push_absence_error(
                     format!(r#"Identifier "{name}" not declared in the current scope."#),
                     id,
                 );
@@ -5611,7 +5611,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             if base_type.builtin_type == VariantType::Dictionary {
                 if ctx.native.provenance() == gd_types::ApiProvenance::Exact {
                     enum_meta_base = true;
-                    ctx.push_error(
+                    ctx.push_absence_error(
                         format!(
                             r#"Enums only have Dictionary built-in methods. Function "{function_name}()" does not exist for enum "{enum_name}"."#
                         ),
@@ -5762,7 +5762,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             } else {
                 call.callee.unwrap_or(id)
             };
-            ctx.push_error(
+            ctx.push_absence_error(
                 format!(r#"Function "{function_name}()" not found in base {base_name}."#),
                 anchor,
             );
@@ -5801,7 +5801,7 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             // else the `fqcn`. gdls's Display impl returns the placeholder `<Class>`; render
             // the identifier inline here so the corpus's `MyClass` reads through.
             let base_display = class_identifier_name_or_default(ctx, &base_type);
-            ctx.push_error(
+            ctx.push_absence_error(
                 format!(
                     r#"Static function "{function_name}()" not found in base "{base_display}"."#
                 ),
@@ -7501,7 +7501,7 @@ fn reduce_subscript_attribute(
                 attr_id,
             );
         } else {
-            ctx.push_error(
+            ctx.push_absence_error(
                 format!(r#"Cannot find member "{attr_name}" in base "{base_str}"."#),
                 attr_id,
             );
@@ -8942,7 +8942,7 @@ fn reduce_identifier_from_base(
             //    member, and the same rule already gates every other negative claim. Without it,
             //    the datatype stays unset and both callers keep the verdict they have today.
             if base.is_hard_type() && ctx.native.provenance() == gd_types::ApiProvenance::Exact {
-                ctx.push_error(
+                ctx.push_absence_error(
                     format!(r#"Cannot find member "{raw_name}" in base "{base}"."#),
                     identifier_id,
                 );
@@ -9006,7 +9006,7 @@ fn reduce_identifier_from_base(
                 && base.builtin_type != VariantType::Nil
                 && ctx.native.provenance() == gd_types::ApiProvenance::Exact
             {
-                ctx.push_error(
+                ctx.push_absence_error(
                     format!(r#"Cannot find member "{name}" in base "{base}"."#),
                     identifier_id,
                 );
@@ -9219,7 +9219,7 @@ fn reduce_identifier_from_base(
                             .interface(sr.file)
                             .and_then(|i| i.class_name.clone())
                             .unwrap_or_default();
-                        ctx.push_error(
+                        ctx.push_absence_error(
                             format!(r#"Cannot find member "{name}" in base "{base_class_name}"."#),
                             identifier_id,
                         );
