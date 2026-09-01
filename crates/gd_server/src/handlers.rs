@@ -4305,6 +4305,39 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
         None
     };
 
+    // #504: a method override chain is ONE symbol, which is the position rename already takes
+    // (step 7). The collectors below filter on a single `(file, class_path)` identity — correct
+    // per #213, but it makes the answer depend on which end of the chain the cursor landed on:
+    // clicking `BaseUnit.take_damage` collected only base-bound sites and clicking
+    // `Hero.take_damage` only Hero-bound ones, two disjoint halves each presented as the whole
+    // answer. Collect over every member of the group instead, using the SAME walk rename uses.
+    //
+    // `NativeRooted` stays narrow: that group is effectively every script in the project, and a
+    // `_ready` reference list spanning the whole tree answers nothing. `Unprovable` stays narrow
+    // too — a read request degrades to the narrow set rather than guessing, and never refuses.
+    //
+    // This widens what `references` COLLECTS, and `rename` consumes it. That is safe by
+    // construction here: rename's step 7 already unions `references` over every member of this
+    // same group, so the union of unions is the identical edit set, and every fail-closed gate
+    // (native/stub refusal, `NativeRooted`/`Unprovable` refusal, half-apply refusal) still runs
+    // first and is untouched.
+    let target_members: Vec<(gd_project::FileId, Vec<String>)> = match target_file {
+        Some(tf) if is_method_or_signal => {
+            match override_group(
+                &state.workspace.index,
+                &state.workspace.native,
+                tf,
+                &target_class_path,
+                &name,
+            ) {
+                OverrideGroup::Group(members) => members,
+                _ => vec![(tf, target_class_path.clone())],
+            }
+        }
+        Some(tf) => vec![(tf, target_class_path.clone())],
+        None => Vec::new(),
+    };
+
     // Classify NON-method targets BEFORE declaration resolution — a LOCAL target's declaration
     // lives inside its function, and resolving it through the class-member table would return a
     // same-named member's declaration instead. See [`NonMethodTarget`]: a resolved member scans
@@ -4398,11 +4431,27 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
                     // Cross-file call-site click on a ROOT method: read the declaring file's tree.
                     find_decl_in_declaring_file(state, tf, &name, enc)
                 };
+                // #504: every OTHER member of the override group declares the same symbol, so
+                // its declaration belongs in the answer too. A member whose decl cannot be
+                // located is skipped with a log line — the read path under-reports, only the
+                // mutating path refuses.
+                for (mfile, mpath) in &target_members {
+                    if *mfile == tf && mpath.as_slice() == target_class_path.as_slice() {
+                        continue;
+                    }
+                    match member_decl_location(state, *mfile, mpath, &name) {
+                        Some(loc) => decls.push(loc),
+                        None => log::debug!(
+                            "references: override-group member {mfile:?}/{mpath:?}::{name} \
+                             has no locatable declaration; skipping it"
+                        ),
+                    }
+                }
                 if let Some(loc) = loc {
                     decls.push(loc);
                     true
                 } else {
-                    false
+                    !decls.is_empty()
                 }
             } else {
                 false
@@ -4496,31 +4545,35 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             // identifier scan to avoid false positives from identically-named declarations.
             // Only project when target_file is Some — if None (native/unresolved), fall back
             // to identifier scan so we never under-report for unresolvable targets.
-            if let Some(tf) = target_file {
+            if target_file.is_some() {
                 // #213: the `Binding::Use` member-use sites (recorded by `record_member_use` at the
                 // callee identifier) must also be class-path-filtered — the name-only
                 // `push_binding_locations` would re-admit a same-named other-class method's uses that
                 // the call-site filter excludes. Use the class-path-aware collector for the Some branch.
-                push_use_binding_locations_for(
-                    &mut locations,
-                    &result,
-                    tf,
-                    &target_class_path,
-                    &name,
-                    &uri,
-                    &mapper,
-                );
-                push_callee_ident_locations(
-                    &mut locations,
-                    &result,
-                    &parsed.tree,
-                    tf,
-                    &target_class_path,
-                    &name,
-                    &uri,
-                    &mapper,
-                    &mut callee_spans,
-                );
+                // #504: once per member of the override group, since a call binds to whichever link
+                // its receiver's static type reaches. The final dedup absorbs the overlap.
+                for (mfile, mpath) in &target_members {
+                    push_use_binding_locations_for(
+                        &mut locations,
+                        &result,
+                        *mfile,
+                        mpath,
+                        &name,
+                        &uri,
+                        &mapper,
+                    );
+                    push_callee_ident_locations(
+                        &mut locations,
+                        &result,
+                        &parsed.tree,
+                        *mfile,
+                        mpath,
+                        &name,
+                        &uri,
+                        &mapper,
+                        &mut callee_spans,
+                    );
+                }
             } else {
                 // Native/unresolved callee: name-only binding scan + raw identifier scan (no Script
                 // file to filter on).
@@ -4778,30 +4831,33 @@ pub fn references(state: &mut ServerState, params: ReferenceParams) -> Option<Ve
             // than raw identifier scan (which would pick up unrelated same-named declarations
             // like `func helper():` in other.gd). When target_file is None (native/unresolved),
             // fall back to identifier scan to avoid under-reporting.
-            if let Some(tf) = target_file {
+            if target_file.is_some() {
                 // #213: class-path-filter the candidate's member-use sites too (see the current-file
                 // block) — a candidate's same-named other-class method use is excluded by identity.
-                push_use_binding_locations_for(
-                    &mut locations,
-                    &cand_result,
-                    tf,
-                    &target_class_path,
-                    &name,
-                    &cand_uri,
-                    &cand_mapper,
-                );
+                // #504: once per override-group member, same as the current-file block.
                 let mut cand_callee_spans: Option<FxHashMap<ByteSpan, ByteSpan>> = None;
-                push_callee_ident_locations(
-                    &mut locations,
-                    &cand_result,
-                    &parsed.tree,
-                    tf,
-                    &target_class_path,
-                    &name,
-                    &cand_uri,
-                    &cand_mapper,
-                    &mut cand_callee_spans,
-                );
+                for (mfile, mpath) in &target_members {
+                    push_use_binding_locations_for(
+                        &mut locations,
+                        &cand_result,
+                        *mfile,
+                        mpath,
+                        &name,
+                        &cand_uri,
+                        &cand_mapper,
+                    );
+                    push_callee_ident_locations(
+                        &mut locations,
+                        &cand_result,
+                        &parsed.tree,
+                        *mfile,
+                        mpath,
+                        &name,
+                        &cand_uri,
+                        &cand_mapper,
+                        &mut cand_callee_spans,
+                    );
+                }
             } else {
                 // Native/unresolved callee: name-only binding scan + raw identifier scan.
                 push_binding_locations(
