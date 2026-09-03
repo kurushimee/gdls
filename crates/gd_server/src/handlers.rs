@@ -836,6 +836,13 @@ pub fn definition(
                 state.options.stub_cache_dir.as_deref(),
             )
             .map(GotoDefinitionResponse::Scalar),
+            Some(CalleeTarget::Builtin { class }) => builtin_member_stub_location(
+                state,
+                &class,
+                &name,
+                state.options.stub_cache_dir.as_deref(),
+            )
+            .map(GotoDefinitionResponse::Scalar),
             _ => None,
         };
     }
@@ -2084,6 +2091,18 @@ fn hover_call_binding_signature(
         CalleeTarget::Native { class } => {
             let (decl, member) = state.workspace.native.lookup_member(&class, &name)?;
             let declaring = state.workspace.native.name_of(decl.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
+        CalleeTarget::Builtin { class } => {
+            let (bt, member) = state
+                .workspace
+                .native
+                .lookup_builtin_member(&class, &name)?;
+            let declaring = state.workspace.native.name_of(bt.name).to_owned();
             Some(native_member_hover_md(
                 &state.workspace.native,
                 &declaring,
@@ -7949,6 +7968,28 @@ pub fn outgoing_calls(
                     None => {
                         log::debug!(
                             "outgoingCalls: omitting native callee {callee_name} — the {class} \
+                             stub could not be materialized"
+                        );
+                        continue;
+                    }
+                }
+            }
+            // Builtin callee (#583): the same anchoring as the Native arm, into the builtin's
+            // own rendered stub page (`String.gd`, `Vector2.gd`) — the same page `definition`
+            // jumps to for the identical caret. Builtins have no inheritance, so the detail is
+            // the builtin itself. Stub materialization failure omits the entry rather than
+            // fabricating a location, exactly like the Native arm.
+            CalleeTarget::Builtin { class } => {
+                match builtin_member_stub_location(
+                    state,
+                    &class,
+                    &callee_name,
+                    stub_root.as_deref(),
+                ) {
+                    Some(loc) => (loc.uri, loc.range, loc.range, Some(class)),
+                    None => {
+                        log::debug!(
+                            "outgoingCalls: omitting builtin callee {callee_name} — the {class} \
                              stub could not be materialized"
                         );
                         continue;

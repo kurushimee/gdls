@@ -5023,6 +5023,11 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     // when neither project arm resolved. Only set on a Some lookup (degrade-don't-lie: a
     // silent-Variant miss records `Unresolved`, never a guessed class).
     let mut native_callee: Option<String> = None;
+    // #583: the builtin a successful `lookup_builtin_method` ran against —
+    // `CalleeTarget::Builtin` when neither project nor native arm resolved. Same
+    // degrade-don't-lie rule as `native_callee`: a miss records `Unresolved`, never a guessed
+    // builtin.
+    let mut builtin_callee: Option<String> = None;
 
     // #546: a BUILTIN base never takes the constructor arm. Godot's `get_function_signature` puts
     // its BUILTIN lookup (analyzer.cpp:5904-5937) ABOVE the `p_is_constructor` → `_init` rewrite
@@ -5386,6 +5391,10 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
 
     if !found && base_type.kind == DtKind::Builtin && base_type.builtin_type != VariantType::Nil {
         if let Some(s) = lookup_builtin_method(ctx, base_type.builtin_type, &function_name) {
+            // #583: a dispatched builtin method is a resolvable callee, not a miss — the
+            // binding block below records `CalleeTarget::Builtin` so navigation anchors into
+            // the builtin's stub page the way it does for native classes.
+            builtin_callee = Some(data_type::variant_type_name(base_type.builtin_type).to_owned());
             return_type = Some(s.return_dt.clone());
             sig = s;
             found = true;
@@ -6000,7 +6009,9 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     //      `Unresolved` rather than a placeholder id.
     //   3. `native_callee` — a `lookup_native_method` hit: the class the lookup ran against
     //      (consumers resolve the DECLARING class via `NativeDb::lookup_member`).
-    //   4. `Unresolved` — builtin-value/enum methods, value-callables, misses.
+    //   4. `builtin_callee` — a `lookup_builtin_method` hit: the builtin's dump name (consumers
+    //      anchor into the builtin's own stub page, #583).
+    //   5. `Unresolved` — value-callables, misses.
     // Recording is additive (WP-N1b): it sets no type and emits no diagnostic.
     if callee_kind || is_subscript_callee || call.is_super {
         let caller = caller_function_name(ctx);
@@ -6057,6 +6068,8 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             }
         } else if let Some(class) = native_callee {
             CalleeTarget::Native { class }
+        } else if let Some(class) = builtin_callee {
+            CalleeTarget::Builtin { class }
         } else {
             CalleeTarget::Unresolved
         };

@@ -1,6 +1,6 @@
-//! Native callees in `callHierarchy/outgoingCalls` anchor into the materialized API stubs —
-//! the same pages `definition`/hover use — instead of fabricating a (0,0) location in the
-//! caller's own file; callees that resolve nowhere are omitted entirely (the
+//! Native and builtin callees in `callHierarchy/outgoingCalls` anchor into the materialized API
+//! stubs — the same pages `definition`/hover use — instead of fabricating a (0,0) location in
+//! the caller's own file; callees that resolve nowhere are omitted entirely (the
 //! rust-analyzer/gopls convention). Expanding a stub-anchored item answers with a clean empty
 //! list.
 
@@ -24,6 +24,12 @@ const NODE_API: &str = r#"{
         {"name": "Node", "inherits": "Object", "is_instantiable": true,
          "methods": [{"name": "queue_free", "is_const": false, "is_static": false,
                       "is_vararg": false, "is_virtual": false, "hash": 1, "arguments": []}]}
+    ],
+    "builtin_classes": [
+        {"name": "String",
+         "methods": [{"name": "to_upper", "is_const": true, "is_static": false,
+                      "is_vararg": false, "is_virtual": false, "hash": 2, "arguments": [],
+                      "return_value": {"type": "String"}}]}
     ]
 }"#;
 
@@ -34,7 +40,8 @@ struct NativeFixture {
 }
 
 /// Boot a server over a temp project whose script calls one resolvable native method
-/// (`queue_free()`) and one name resolvable nowhere (`mystery()`).
+/// (`queue_free()`), one name resolvable nowhere (`mystery()`), and one resolvable builtin-type
+/// method (`s.to_upper()` on a String literal).
 fn boot_native(client: &Connection) -> NativeFixture {
     let dir = tempfile::tempdir().expect("create fixture dir");
     let root = dir.path();
@@ -42,7 +49,7 @@ fn boot_native(client: &Connection) -> NativeFixture {
     let api_path = root.join("extension_api.json");
     std::fs::write(&api_path, NODE_API).unwrap();
     let stub_cache = root.join("stub-cache");
-    let src = "extends Node\nfunc go() -> void:\n\tqueue_free()\n\tmystery()\n";
+    let src = "extends Node\nfunc go() -> void:\n\tqueue_free()\n\tmystery()\n\tvar s := \"x\"\n\ts.to_upper()\n";
     let main_path = root.join("main.gd");
     std::fs::write(&main_path, src).unwrap();
 
@@ -191,6 +198,56 @@ fn outgoing_calls_anchor_native_callees_in_stubs() {
                 && c.to.range.end == Position::new(0, 0)
         }),
         "no to-item may carry the caller's uri with a (0,0) anchor; got {outgoing:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A builtin-type method call (`s.to_upper()` on a String literal) anchors into the builtin's
+/// own stub page — the same page `definition` jumps to for the identical caret (#583) — while
+/// the nowhere-resolvable callee stays omitted.
+#[test]
+fn outgoing_calls_anchor_builtin_callees_in_stubs() {
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let fixture = boot_native(&client);
+
+    let outgoing = outgoing_of_go(&client, &fixture);
+
+    let tu = outgoing
+        .iter()
+        .find(|c| c.to.name == "to_upper")
+        .unwrap_or_else(|| panic!("to_upper must appear; got {outgoing:?}"));
+    let stub_path = gd_server::uri::uri_to_path(&tu.to.uri).expect("stub uri is a file path");
+    assert!(
+        stub_path.as_str().ends_with("String.gd"),
+        "the builtin owns its stub page; got {stub_path:?}"
+    );
+    let stub_text = std::fs::read_to_string(stub_path.as_std_path()).expect("stub on disk");
+    let line = stub_text
+        .lines()
+        .nth(tu.to.selection_range.start.line as usize)
+        .expect("selectionRange line within the stub");
+    assert_eq!(line, "func to_upper() -> void");
+    assert!(
+        tu.to.detail.as_deref() == Some("String"),
+        "the detail names the builtin; got {:?}",
+        tu.to.detail
+    );
+    // `\ts.to_upper()` on line 5 — the callee's name token sits at cols 3..11.
+    assert!(
+        tu.from_ranges
+            .iter()
+            .any(|r| r.start == Position::new(5, 3) && r.end == Position::new(5, 11)),
+        "the call site's name token must be a from_range; got {:?}",
+        tu.from_ranges
+    );
+
+    // The nowhere-resolvable callee is still omitted — #583 changes only the premise for
+    // callees that DO resolve somewhere.
+    assert!(
+        !outgoing.iter().any(|c| c.to.name == "mystery"),
+        "an unresolvable callee must still be omitted; got {outgoing:?}"
     );
 
     shutdown(&client, server_thread);
