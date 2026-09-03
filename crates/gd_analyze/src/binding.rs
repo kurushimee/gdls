@@ -102,7 +102,7 @@ pub enum BindingTargetKind {
 
 /// What a resolved call site dispatches to — the callee classification the reducer derives from
 /// the resolution the call actually used. A CLOSED concept (project script / engine class /
-/// don't-know): `Unresolved` is the catch-all, so no `#[non_exhaustive]`.
+/// builtin type / don't-know): `Unresolved` is the catch-all, so no `#[non_exhaustive]`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CalleeTarget {
     /// A project script declares the callee. `class_path` is the inner-class chain WITHIN the
@@ -118,8 +118,13 @@ pub enum CalleeTarget {
     /// consumers resolve the DECLARING class via `NativeDb::lookup_member`, which walks
     /// `inherits`.
     Native { class: String },
+    /// The callee bound to a builtin-type method (`String.to_upper`, `Vector2.normalized`,
+    /// `Signal.emit`) — #583. `class` is the builtin's dump name; builtins have no
+    /// inheritance, so it is always the declaring type. Consumers anchor into the builtin's
+    /// rendered stub page, the same way [`Self::Native`] anchors into a class stub.
+    Builtin { class: String },
     /// The callee couldn't be pinned: value-callables, dynamic dispatch through
-    /// `Variant`/`Callable`, lambdas, builtin-value methods, trimmed-DB misses.
+    /// `Variant`/`Callable`, lambdas, trimmed-DB misses.
     Unresolved,
 }
 
