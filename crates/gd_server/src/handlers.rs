@@ -398,6 +398,21 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         });
     }
 
+    // #589: the cursor is on a plain identifier whose declaration was inferred from a `$`/`%`/
+    // `get_node("…")` access — the binding itself (`var h := $Hero`, bare uses of `h`). The #125
+    // arm above answers only for a cursor INSIDE the access; this arm carries the same
+    // scene-precise type one binding back, so hover stops contradicting what `h.combo` offers one
+    // character later. The one-hop read refuses annotated declarations (the author's annotation
+    // wins) and any identifier in a member-access slot (`a.h` is about `a`). Navigation-only,
+    // like the arm above — this never enters an `AnalysisResult`.
+    if let Some(dt) = crate::scene_nav::scene_identifier_type_at(state, &uri, &parsed.tree, byte) {
+        let label = human_type_label(state, &parsed.tree, &dt);
+        return Some(Hover {
+            contents: hover_contents(state, format!("```gdscript\n{label}\n```")),
+            range: Some(mapper.span_to_range(parsed.tree.get(node_id).span)),
+        });
+    }
+
     // #513: the cursor is on an annotation's own name (`@export_range`, `@onready`). Nothing below
     // answers that question, so it used to fall all the way through to the "what type is the
     // smallest node around here" arm and render the ENCLOSING CLASS — a card confidently naming the
@@ -1086,6 +1101,16 @@ pub fn type_definition(
     // whose declaration is a more useful jump than bare `Node`'s stub. Navigation-only — see
     // `crate::scene_nav`.
     if let Some((_, dt)) = crate::scene_nav::scene_node_type_at(state, &uri, &parsed.tree, byte) {
+        if let Some(loc) = type_decl_location(state, &dt) {
+            return Some(GotoTypeDefinitionResponse::Scalar(loc));
+        }
+    }
+
+    // #589: the same one-hop read for the binding itself — typeDefinition on `h` (from
+    // `var h := $Hero`) lands on the attached script exactly as it does on `$Hero`, instead of
+    // bare `Node`'s stub. Navigation-only; an annotated declaration (`lazy: Node`) is refused by
+    // the hop, so the author's own type keeps answering.
+    if let Some(dt) = crate::scene_nav::scene_identifier_type_at(state, &uri, &parsed.tree, byte) {
         if let Some(loc) = type_decl_location(state, &dt) {
             return Some(GotoTypeDefinitionResponse::Scalar(loc));
         }

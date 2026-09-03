@@ -824,3 +824,148 @@ fn signature_help_past_a_variable_holding_an_access() {
 
     shutdown(&client, server_thread);
 }
+
+// ===================================================================================================
+// #589 — the projection reaches the BINDING itself.
+// ===================================================================================================
+
+/// [`at`] without the `+1` — a one-letter binding's `find` is already its last character, so the
+/// +1 would land past the identifier (where the cursor gate correctly declines).
+fn at_name(needle: &str, name: &str) -> Position {
+    let mut pos = at(needle, name);
+    pos.character -= 1;
+    pos
+}
+
+/// Hover on the member declaration `@onready var sp := $Sprite` names the scene type, where it
+/// used to render the analyzer's bare `var sp: Node` — contradicting the precise card the access
+/// itself shows and the members `sp.` offers one character later.
+#[test]
+fn hover_on_a_binding_declared_from_an_access_shows_the_scene_type() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    let md = hover_md(&client, 10, &uri, at("@onready var sp := $Sprite", "sp"));
+    assert!(
+        md.contains("Sprite2D"),
+        "the binding must carry the access's scene type, got {md:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// Hover on a bare USE of such a binding — the base of `h.hp` — answers with the SCRIPT class the
+/// access reaches, matching what definition on `h.hp` already jumps to.
+#[test]
+fn hover_on_a_bare_use_of_a_scene_typed_binding() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    let md = hover_md(&client, 10, &uri, at_name("\th.hp", "h"));
+    assert!(
+        md.contains("Health"),
+        "expected the attached script's class on the base, got {md:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The hop works for a LOCAL declared from a `get_node("…")` call, on the declaration name itself.
+#[test]
+fn hover_on_a_local_declared_from_a_get_node_call() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    let md = hover_md(
+        &client,
+        10,
+        &uri,
+        at_name("var l = get_node(\"Sprite\")", "l"),
+    );
+    assert!(
+        md.contains("Sprite2D"),
+        "the local's declaration must carry the call's scene type, got {md:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// typeDefinition on the binding jumps to the scene type's declaration — the Sprite2D stub for
+/// `sp` — instead of bare `Node`'s.
+#[test]
+fn type_definition_on_a_scene_typed_binding_reaches_the_scene_class() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    let raw = type_def_raw(&client, 10, &uri, at("@onready var sp := $Sprite", "sp"));
+    assert!(!raw.is_null(), "expected a typeDefinition for `sp`");
+    let loc: GotoDefinitionResponse = serde_json::from_value(raw).expect("response deserializes");
+    let GotoDefinitionResponse::Scalar(loc) = loc else {
+        panic!("expected a single location");
+    };
+    assert!(
+        loc.uri.as_str().ends_with("Sprite2D.gd"),
+        "expected the Sprite2D stub, got {}",
+        loc.uri.as_str()
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// typeDefinition through the scripted-node binding reaches the attached script's file.
+#[test]
+fn type_definition_on_a_scripted_binding_reaches_the_script() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    let raw = type_def_raw(&client, 10, &uri, at_name("@onready var h := $Health", "h"));
+    let text = raw.to_string();
+    assert!(
+        text.contains("health.gd"),
+        "expected a jump into health.gd, got: {text}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// The two refusals: an explicitly annotated declaration keeps the author's type (no scene
+/// rescue), and a binding in a scene-less script stays bare `Node` (no false positive).
+#[test]
+fn an_annotated_or_sceneless_binding_stays_on_the_analyzer() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let (client, server_thread) = boot(&p, &uri, MAIN_GD);
+
+    // `var typed: Node2D = $Sprite` — the annotation outranks the scene, so the hover must not
+    // name the node's Sprite2D.
+    let md = hover_md(
+        &client,
+        10,
+        &uri,
+        at("var typed: Node2D = $Sprite", "typed"),
+    );
+    assert!(
+        !md.contains("Sprite2D"),
+        "an annotated binding must not pick up the scene type, got {md:?}"
+    );
+
+    shutdown(&client, server_thread);
+
+    // Scene-less script: the hop has no scene to ask, so the answer stays the analyzer's Node.
+    let src = "extends Node2D\n\n@onready var sp := $Sprite\nfunc g():\n\tsp.flip_h\n";
+    p.write("orphan4.gd", src);
+    let uri2 = file_uri(&p.root.join("orphan4.gd"));
+    let (client2, server_thread2) = boot(&p, &uri2, src);
+    let md = hover_md(&client2, 10, &uri2, Position::new(2, 13));
+    assert!(
+        !md.contains("Sprite2D"),
+        "a scene-less binding must stay bare, got {md:?}"
+    );
+
+    shutdown(&client2, server_thread2);
+}
