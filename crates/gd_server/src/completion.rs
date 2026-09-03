@@ -112,7 +112,7 @@ pub fn completion(state: &mut ServerState, params: CompletionParams) -> Completi
     let mapper = PositionMapper::new(&doc.rope, state.encoding);
     let byte = mapper.position_to_byte(tdp.position);
 
-    let ctx = classify(&parsed.tree, &tokens, byte);
+    let ctx = classify(&parsed.tree, &tokens, &parsed.comments, byte);
     // The single-line replace range = the typed-prefix span (empty ⇒ a zero-width range at the
     // cursor, so the client inserts without deleting). Override stubs are the one exception: accepting
     // a full signature over an existing `func name():` skeleton must consume that stale same-line
