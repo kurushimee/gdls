@@ -383,6 +383,15 @@ impl Workspace {
     /// warm-load re-parses those files from disk rather than trusting a buffer-only interface.
     /// See [`Self::save_cache`] for the rationale.
     pub fn save_cache_excluding_open(&self, open_paths: &FxHashSet<Utf8PathBuf>) {
+        if !open_paths.is_empty() {
+            // Say why up front: the next warm start will report these files as re-parsed
+            // (their stat entries are absent), which otherwise reads as cache churn (#611).
+            log::info!(
+                "cache: excluding {} open buffer(s) from the persisted stat table; \
+                 they will be re-parsed on the next warm start",
+                open_paths.len()
+            );
+        }
         let root = &self.project.root;
         let key = build_cache_key(&self.native, root, self.dialect);
         // Exclude files currently open in an editor buffer: their stat_table entry still reflects
@@ -1913,7 +1922,7 @@ fn warm_index_from_cache(
         }
         log::info!(
             "warm_index: stat-diff complete: {} unchanged, {} reparsed, {} added, {} removed, \
-             {} skipped (unreadable)",
+             {} skipped (unreadable); {} asset(s) stat-diffed (path-index only, never parsed)",
             walked_paths
                 .len()
                 .saturating_sub(reparsed + added + skipped_unreadable),
@@ -1921,6 +1930,7 @@ fn warm_index_from_cache(
             added,
             removed_paths.len(),
             skipped_unreadable,
+            walked_asset_paths.len(),
         );
     } else {
         log::info!(
