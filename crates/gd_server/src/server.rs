@@ -774,6 +774,20 @@ pub fn run() -> Result<()> {
     run_with_recorder(BenchRecorder::from_env())
 }
 
+/// Stack for the stdio session thread. The event loop parses and analyzes every open buffer
+/// synchronously on its calling thread, and the recursive descent over deeply nested
+/// expressions is proportional to nesting depth (#610): a 1000-level array literal
+/// overflows the OS default main-thread stack (1 MiB on Windows, 8 MiB on most Linux) and
+/// aborts the process — clients lose the whole session, not just one request. A dedicated
+/// thread with a generous reserve turns that abort into headroom; the reserve is virtual
+/// address space, committed page-by-page, so the RAM cost is only what the recursion
+/// actually touches. Worst measured frame cost is ~1.3 KiB per nesting level (array
+/// literals; chain frames measured cheaper), so 256 MiB absorbs ≥190k levels at the worst
+/// shape — past every probe in the verification matrix (50k-level arrays, 200k-term binary
+/// chains, 100k-link member chains) and two orders of magnitude past the deepest real file
+/// seen (1000 levels, #610).
+const SESSION_STACK_SIZE: usize = 256 * 1024 * 1024;
+
 /// `run` with an explicitly-injected [`BenchRecorder`]. The plain [`run`] wrapper sources the
 /// recorder from `$GDLS_BENCH_RECORD_TO`; the `bench --record` CLI subcommand calls this
 /// directly so it doesn't have to mutate the global environment.
@@ -781,7 +795,19 @@ pub fn run_with_recorder(recorder: Option<BenchRecorder>) -> Result<()> {
     crate::logging::init();
     log::info!("gdls {} starting on stdio", env!("CARGO_PKG_VERSION"));
     let (connection, io_threads) = Connection::stdio();
-    let end = serve_inner(connection, recorder, WatcherSource::Real)?;
+    // Run the session off the main thread so deep client files can't overflow the OS-default
+    // main-thread stack (#610). The in-memory `serve`/`serve_with_*` entry points used by the
+    // integration tests are intentionally NOT wrapped: their inputs are controlled, and the
+    // test harness already gives each test its own thread.
+    let session = std::thread::Builder::new()
+        .name("gdls-session".into())
+        .stack_size(SESSION_STACK_SIZE)
+        .spawn(move || serve_inner(connection, recorder, WatcherSource::Real))
+        .expect("invariant: no session without this thread — spawn failure means OS resource exhaustion");
+    let end = match session.join() {
+        Ok(result) => result?,
+        Err(panic) => std::panic::resume_unwind(panic),
+    };
     io_threads.join()?;
     log::info!("gdls stopped");
     // LSP 3.17 §exit: `exit` without a prior `shutdown` is an error the client can detect only
