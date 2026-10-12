@@ -135,12 +135,12 @@ impl MemoryBudget {
                 }
                 Ok(None) => {
                     // File is missing, or present with no `[memory]` caps at all — the documented
-                    // WP-H1 fallback. One warn so a fresh-clone operator sees the ladder is using
-                    // the safety defaults; do not pollute every session under a workspace that
-                    // never bothered to ship a budget (the ladder still works either way). A
-                    // *partial* `[memory]` section is a typo, not this case — it returns `Err` and
-                    // lands in the louder arm below.
-                    tracing::warn!(
+                    // WP-H1 fallback, and the normal case: the probe is relative to the server's
+                    // cwd, which an editor sets to the game project, never the gdls checkout. So
+                    // `debug`, not `warn`; the `memory_budget_resolved` line still names the
+                    // source. A *partial* `[memory]` section is a typo, not this case — it returns
+                    // `Err` and lands in the louder arm below.
+                    tracing::debug!(
                         name = "memory_budget_default",
                         bench_path = %path,
                         soft_cap_mb = soft,

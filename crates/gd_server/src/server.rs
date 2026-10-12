@@ -1339,8 +1339,8 @@ fn serve_inner(
             recv(ticker) -> _ => {
                 // M5 WP-O2: periodic RSS sample. One syscall every 3 s; on Windows this is a
                 // process query that costs sub-millisecond, and on Linux it's a `/proc/self/statm`
-                // read. The sampler updates `peak_bytes` in place and emits a `tracing::info!`
-                // event tagged `phase="tick"` so the structured trace carries the whole pressure
+                // read. The sampler updates `peak_bytes` in place and emits a `debug` event tagged
+                // `phase="tick"` so a trace captured with `rss=debug` carries the whole pressure
                 // curve, not just the four explicit lifecycle samples.
                 state.rss.sample_now("tick");
                 // M5 WP-H1: classify the current peak against the resolved budget and react on
@@ -1993,6 +1993,15 @@ fn apply_reaction_batch(
         republish_all_open_buffers(state);
         // M10 (#72): project/native surface changed → re-request semantic tokens for visible docs.
         send_semantic_tokens_refresh(state);
+    } else if native_changed && root_dump_is_outranked(state, root) {
+        // Godot's dump always lands in the project root before `try_adopt_dump` moves it into
+        // `.gdls/`, so every auto-dump fires this event for a file that is already gone. Neither
+        // that echo nor a user's own root file can change the live DB while a pinned path or a
+        // managed dump outranks it in the resolution ladder.
+        log::debug!(
+            "watcher: project-root extension_api.json changed, but a pinned extensionApiPath or \
+             the managed .gdls dump outranks it; nothing to reload"
+        );
     } else if native_changed {
         log::info!(
             "watcher: extension_api.json changed; reloading native DB (coalesced for the batch)"
@@ -2017,6 +2026,14 @@ fn apply_reaction_batch(
     // switch can balloon the parse + analysis caches in one go; this catches that burst without
     // waiting for the 3-second ticker.
     state.rss.sample_now("post_watcher");
+}
+
+/// Whether a change to `<root>/extension_api.json` cannot affect the native DB: a pinned
+/// `extensionApiPath` replaces the whole ladder, and a managed `.gdls` dump is tried before the
+/// root file (`api_dump::resolve_native_db`).
+fn root_dump_is_outranked(state: &ServerState, root: &Utf8Path) -> bool {
+    state.options.extension_api_path.is_some()
+        || crate::api_dump::dump_path(root).as_std_path().exists()
 }
 
 /// M7 (#60): translate client-delivered `FileEvent`s into [`Reaction`]s (same classification
@@ -4374,6 +4391,65 @@ mod tests {
         let shared = SessionShared::default();
         let unregistered = finish_request(&shared, ok(11));
         assert!(unregistered.error.is_none());
+    }
+
+    /// The auto-dump's own sequence: Godot writes `<root>/extension_api.json`, `try_adopt_dump`
+    /// moves it into `.gdls/`, and the dump arm adopts it. The watcher event for the moved-away
+    /// root file must not reload on its own; the adoption is what loads the new dump.
+    #[test]
+    fn root_dump_echo_is_skipped_while_the_managed_dump_outranks_it() {
+        const API: &str = r#"{
+            "header": {"version_major": 4, "version_minor": 7, "version_patch": 2,
+                       "version_full_name": "Fake Godot v4.7.2.test"},
+            "classes": [{"name": "Object"}, {"name": "Node", "inherits": "Object"}]
+        }"#;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(dir.path().join("project.godot"), "config_version=5\n").unwrap();
+        let (mut state, _rx) = state_on(&root);
+        let before = state.workspace.analysis_generation();
+
+        let managed = crate::api_dump::dump_path(&root);
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, API).unwrap();
+        assert!(root_dump_is_outranked(&state, &root));
+
+        let open = FxHashSet::default();
+        apply_reaction_batch(&mut state, vec![Reaction::ExtensionApiJson], &root, &open);
+        assert_eq!(
+            state.workspace.analysis_generation(),
+            before,
+            "the root-file echo reloaded the native DB"
+        );
+        assert!(
+            state.workspace.reload_native(&state.options),
+            "the adoption step must still load the managed dump"
+        );
+    }
+
+    /// With no managed dump and nothing pinned, the project-root file is the live source, so a
+    /// change to it still reloads.
+    #[test]
+    fn root_dump_change_reloads_when_nothing_outranks_it() {
+        const API: &str = r#"{
+            "header": {"version_major": 4, "version_minor": 7, "version_patch": 2,
+                       "version_full_name": "Fake Godot v4.7.2.test"},
+            "classes": [{"name": "Object"}, {"name": "Node", "inherits": "Object"}]
+        }"#;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(dir.path().join("project.godot"), "config_version=5\n").unwrap();
+        let (mut state, _rx) = state_on(&root);
+        let before = state.workspace.analysis_generation();
+
+        std::fs::write(root.join("extension_api.json"), API).unwrap();
+        assert!(!root_dump_is_outranked(&state, &root));
+        let open = FxHashSet::default();
+        apply_reaction_batch(&mut state, vec![Reaction::ExtensionApiJson], &root, &open);
+        assert!(
+            state.workspace.analysis_generation() > before,
+            "a new project-root dump must replace the embedded surface"
+        );
     }
 
     /// WP-H1 Soft action: when the ladder transitions to Soft, `evict_half` runs on the

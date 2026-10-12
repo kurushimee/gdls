@@ -2,7 +2,7 @@
   "name": "gdls",
   "displayName": "gdls: GDScript Language Server",
   "description": "Fast, type-aware GDScript diagnostics and navigation for Godot 4.6 and 4.7, with no Godot editor running.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "publisher": "kurushimee",
   "license": "MIT",
   "icon": "icon.png",
