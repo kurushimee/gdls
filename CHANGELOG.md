@@ -4,6 +4,11 @@ All notable changes to `gdls` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **The Godot binary env var is now `GODOT`**, replacing `GDLS_GODOT` for discovery and `GDLS_GODOT_BINARY` for the differential test. `GODOT=off` or an empty value still turns off the auto-dump.
+
 ## [3.0.0] - 2026-08-29
 
 Godot 4.7 support. One binary now serves both 4.6 and 4.7, and each project is read as the release it targets, so upgrading gdls does not change what a 4.6 project sees.

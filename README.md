@@ -51,9 +51,9 @@ For any other client, the core registration is five lines:
 }
 ```
 
-Native types need no setup. gdls finds your Godot binary (`godotBinaryPath` option, then the `GDLS_GODOT` env var, then `godot4`/`godot` on `PATH`), runs `--dump-extension-api-with-docs` with project context so the project's GDExtension classes are captured, and keeps the result under `.gdls/`, regenerating only when the binary or the project's `.gdextension` set changes. The dump runs in the background, so it never delays a request; the session re-checks open files as soon as it lands. If no binary is discoverable, a bundled stock class surface for your project's own Godot release keeps builtins like `Node` and `Timer` resolving, and gdls will not invent "unknown type" errors for classes only your engine build knows about.
+Native types need no setup. gdls finds your Godot binary (`godotBinaryPath` option, then the `GODOT` env var, then `godot4`/`godot` on `PATH`), runs `--dump-extension-api-with-docs` with project context so the project's GDExtension classes are captured, and keeps the result under `.gdls/`, regenerating only when the binary or the project's `.gdextension` set changes. The dump runs in the background, so it never delays a request; the session re-checks open files as soon as it lands. If no binary is discoverable, a bundled stock class surface for your project's own Godot release keeps builtins like `Node` and `Timer` resolving, and gdls will not invent "unknown type" errors for classes only your engine build knows about.
 
-To pin a hand-made dump instead, set `initializationOptions.extensionApiPath`. To stop gdls from ever spawning Godot, set `autoDumpExtensionApi: false` (or `GDLS_GODOT=off`) and dump manually from inside the project directory:
+To pin a hand-made dump instead, set `initializationOptions.extensionApiPath`. To stop gdls from ever spawning Godot, set `autoDumpExtensionApi: false` (or `GODOT=off`) and dump manually from inside the project directory:
 
 ```sh
 godot --dump-extension-api-with-docs

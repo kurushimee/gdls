@@ -26,7 +26,7 @@ Adding support for a newer release therefore *demotes* the current full tree to 
 
 For fidelity against real code, including project-specific native classes, the godot binary runs over a sample corpus of an actual project to produce its diagnostics, and gdls diffs against them. This catches divergences the upstream corpus cannot, especially around Godot's native API and a project's own typing patterns. It runs offline, never at runtime.
 
-It lives in `crates/gd_analyze/tests/differential.rs` and is env-gated: when neither `GDLS_GODOT_BINARY` nor `GDLS_SAMPLE_CORPUS` is set, it logs "skipped" to stderr and returns success. There is no Godot build in CI, so this is a local pass, run before a release and recorded in the header comment of `crates/gd_analyze/tests/conformance/analyze_fidelity_floor.txt` as `# Differential oracle: <PASS|FAIL> against <corpus>, godot binary <path/sha>, at <date> on commit <sha>.`
+It lives in `crates/gd_analyze/tests/differential.rs` and is env-gated: when neither `GODOT` nor `GDLS_SAMPLE_CORPUS` is set, it logs "skipped" to stderr and returns success. There is no Godot build in CI, so this is a local pass, run before a release and recorded in the header comment of `crates/gd_analyze/tests/conformance/analyze_fidelity_floor.txt` as `# Differential oracle: <PASS|FAIL> against <corpus>, godot binary <path/sha>, at <date> on commit <sha>.`
 
 `GDLS_DIFFERENTIAL_THRESHOLD` (default `0.75`) sets the matched-over-eligible floor when the test does run.
 
