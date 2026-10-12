@@ -16,7 +16,7 @@
 //! cargo test -p gd_analyze --test differential -- --ignored --nocapture
 //! ```
 //!
-//! **Discovery**: `$GDLS_GODOT_BINARY` (absolute path) wins if set; otherwise `which::which("godot")`
+//! **Discovery**: `$GODOT` (absolute path) wins if set; otherwise `which::which("godot")`
 //! is probed. If neither resolves, the test prints a `differential: godot not on PATH; skipping`
 //! line on stderr and returns `Ok(())` — a no-op on machines without the binary.
 //!
@@ -76,17 +76,17 @@ fn native_db() -> &'static NativeDb {
     })
 }
 
-/// Resolve the godot binary location: `$GDLS_GODOT_BINARY` wins absolute-path-style; otherwise
+/// Resolve the godot binary location: `$GODOT` wins absolute-path-style; otherwise
 /// `which::which("godot")` walks `PATH`. Returns `None` if neither produces a callable binary,
 /// at which point the test no-ops with a skip message.
 fn resolve_godot_binary() -> Option<PathBuf> {
-    if let Some(env) = std::env::var_os("GDLS_GODOT_BINARY") {
+    if let Some(env) = std::env::var_os("GODOT") {
         let candidate = PathBuf::from(env);
         if candidate.is_file() {
             return Some(candidate);
         }
         eprintln!(
-            "differential: GDLS_GODOT_BINARY={} is set but does not point at a file; falling back \
+            "differential: GODOT={} is set but does not point at a file; falling back \
              to PATH lookup",
             candidate.display()
         );
@@ -296,7 +296,7 @@ fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
 fn godot_differential_meets_jaccard_floor() {
     let Some(godot) = resolve_godot_binary() else {
         eprintln!(
-            "differential: godot not on PATH; skipping (set $GDLS_GODOT_BINARY=<abs path> to point \
+            "differential: godot not on PATH; skipping (set $GODOT=<abs path> to point \
              at a specific build, or install the godot binary on PATH)"
         );
         return;

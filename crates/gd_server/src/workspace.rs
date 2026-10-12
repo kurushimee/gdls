@@ -2273,7 +2273,7 @@ fn reconcile_release(
                  from that dump, so code that is fine would be reported as errors. The built-in \
                  stock {dialect} surface is being used instead, which means classes from your own \
                  Godot build are not available. Re-dump with a {dialect} binary (set \
-                 `godotBinaryPath`, or the GDLS_GODOT environment variable), or fix \
+                 `godotBinaryPath`, or the GODOT environment variable), or fix \
                  `application/config/features` in project.godot."
             ))
         }
@@ -2288,7 +2288,7 @@ fn reconcile_release(
                 "the extension_api.json gdls found is for Godot {dump_release} but this project \
                  declares Godot {dialect}. gdls will not report unknown identifiers or members \
                  against it, since every API added since {dump_release} is missing from it. \
-                 Re-dump with a {dialect} binary (set `godotBinaryPath`, or the GDLS_GODOT \
+                 Re-dump with a {dialect} binary (set `godotBinaryPath`, or the GODOT \
                  environment variable), or fix `application/config/features` in project.godot."
             ))
         }

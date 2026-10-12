@@ -149,7 +149,7 @@ pub(crate) fn resolve_native_db(
             log::warn!(
                 "native API: no project-derived source (no extensionApiPath, no cached dump, \
                  auto-dump {}); using the embedded stock {} surface — project-specific native \
-                 classes degrade to dynamic. Set godotBinaryPath or GDLS_GODOT for an exact dump.",
+                 classes degrade to dynamic. Set godotBinaryPath or GODOT for an exact dump.",
                 if options.auto_dump_extension_api {
                     "found no source"
                 } else {
@@ -164,7 +164,7 @@ pub(crate) fn resolve_native_db(
     // (5) Nothing — dynamic.
     log::warn!(
         "native API unavailable (no extensionApiPath, no cached dump, auto-dump {}, embedded \
-         fallback {}); native types degrade to dynamic — set godotBinaryPath or GDLS_GODOT",
+         fallback {}); native types degrade to dynamic — set godotBinaryPath or GODOT",
         if options.auto_dump_extension_api {
             "found no source"
         } else {
@@ -222,7 +222,7 @@ pub(crate) fn spawn_background_dump(
     }
     let Some(binary) = discover_binary(options) else {
         log::warn!(
-            "native API: no Godot binary found (godotBinaryPath unset, GDLS_GODOT unset, \
+            "native API: no Godot binary found (godotBinaryPath unset, GODOT unset, \
              no godot4/godot on PATH); cannot auto-dump"
         );
         return None;
@@ -318,13 +318,13 @@ pub(crate) fn embedded_stock_db(dialect: Dialect) -> Option<NativeDb> {
     }
 }
 
-/// Discovery order: explicit `godotBinaryPath` → `GDLS_GODOT` env (empty or `off` hard-disables)
+/// Discovery order: explicit `godotBinaryPath` → `GODOT` env (empty or `off` hard-disables)
 /// → `godot4` → `godot` on PATH (`which` handles Windows PATHEXT). The pure core is split out
 /// for tests.
 fn discover_binary(options: &InitializationOptions) -> Option<Utf8PathBuf> {
     discover_binary_with(
         options.godot_binary_path.as_deref(),
-        std::env::var("GDLS_GODOT").ok().as_deref(),
+        std::env::var("GODOT").ok().as_deref(),
         |name| which::which(name).ok(),
     )
 }

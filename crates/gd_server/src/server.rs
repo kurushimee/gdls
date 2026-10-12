@@ -1084,7 +1084,7 @@ fn serve_inner(
                  found. Engine classes and their documentation are available, but classes from \
                  your own Godot build or from GDExtensions are not, so gdls will not report \
                  unknown identifiers or members anywhere in your code. To use your engine's \
-                 real API, set `godotBinaryPath` (or the GDLS_GODOT environment variable), or \
+                 real API, set `godotBinaryPath` (or the GODOT environment variable), or \
                  point `extensionApiPath` at an extension_api.json."
             ),
         );
