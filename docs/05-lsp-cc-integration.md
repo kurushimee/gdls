@@ -6,7 +6,7 @@ gdls speaks LSP 3.17 over stdio. Every capability below is advertised only when 
 
 **Lifecycle and sync.** `initialize`, `initialized`, `shutdown`, `exit`, `serverInfo`. Incremental `textDocumentSync` (`didOpen`, `didChange`, `didSave`, `didClose`). `positionEncoding` negotiated across UTF-8, UTF-16, and UTF-32. `$/cancelRequest` with true preemption: a cancelled request returns `RequestCancelled`, and one made stale by an edit returns `ContentModified`. `workDoneProgress` on the cold index, warm start, reconcile, and re-index, plus client tokens on `references` and `workspace/symbol`.
 
-**Diagnostics.** Push `textDocument/publishDiagnostics` and pull `textDocument/diagnostic`, computing the same items either way. `workspace/diagnostic` is deliberately absent (`04-diagnostics-strict-mode.md` §2).
+**Diagnostics.** Push `textDocument/publishDiagnostics` or pull `textDocument/diagnostic`, one channel per client: pull for a client with `textDocument.diagnostic` plus `workspace.diagnostics.refreshSupport`, push for every other (`04-diagnostics-strict-mode.md` §2). The items are the same either way. `workspace/diagnostic` is deliberately absent (`04-diagnostics-strict-mode.md` §2).
 
 **Configuration and files.** `workspace/didChangeConfiguration` plus `workspace/configuration` for runtime re-config. `workspace/didChangeWatchedFiles`, dynamically registered when the client offers it, merged with the native watcher and de-duplicated by content fingerprint. `workspace/willRenameFiles` plus the `did*` notifications.
 

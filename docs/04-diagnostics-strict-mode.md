@@ -14,7 +14,7 @@ The Godot editor's LSP tries to diagnose almost the whole project at once. gdls 
 
 **Dependents.** When file X changes and a dependent Y could now have new errors, gdls does not eagerly re-publish Y. The global index is already updated by the watcher, so the next time Y is opened, edited, or queried, Y is analyzed fresh against the new state and its diagnostics are correct then. Signal stays focused on the file in hand, and stale results are never served.
 
-**Triggers for (re)publishing a document's diagnostics:** `didOpen`, `didChange` (debounced), and `didSave`. A client that prefers pull can ask via `textDocument/diagnostic` instead; the computation is the same and the items are byte-identical.
+**Triggers for (re)publishing a document's diagnostics:** `didOpen`, `didChange` (debounced), and `didSave`. Each client gets diagnostics on one channel only, because a client fed by both keeps two collections and shows every item twice. A client that advertises `textDocument.diagnostic` and `workspace.diagnostics.refreshSupport` is offered `diagnosticProvider` and receives no `publishDiagnostics`; it pulls through `textDocument/diagnostic`, and `workspace/diagnostic/refresh` takes the place of each cross-file republish. Every other client gets push alone and no `diagnosticProvider`. Pull needs refresh support because without it a pulled report for a file other than the one being edited could never learn that a dependency changed. The computation is the same either way, and a pull request is still answered for a push client.
 
 Project-wide pull (`workspace/diagnostic`) is deliberately not offered, because it contradicts the per-file principle. Clients fall back to per-file pull or push cleanly.
 

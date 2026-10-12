@@ -16,6 +16,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **The periodic memory samples log at `debug`.** The 3-second ticker and the sample after each watcher batch no longer write an `info` line for the whole session. The lifecycle samples stay at `info`, and `rss=debug` brings back the full pressure curve.
 - **The Godot binary env var is now `GODOT`**, replacing `GDLS_GODOT` for discovery and `GDLS_GODOT_BINARY` for the differential test. `GODOT=off` or an empty value still turns off the auto-dump.
 
+### Fixed
+- **Each diagnostic shows once.** gdls pushed every diagnostic and also offered pull, so VS Code, Cursor, Neovim, Zed, and Sublime kept both copies and showed each item twice. A client that can pull and be told to re-pull now gets pull alone, and every other client, Claude Code included, gets push alone.
+
 ## [3.0.0] - 2026-08-29
 
 Godot 4.7 support. One binary now serves both 4.6 and 4.7, and each project is read as the release it targets, so upgrading gdls does not change what a 4.6 project sees.

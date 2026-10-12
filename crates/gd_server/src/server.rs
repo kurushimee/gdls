@@ -165,6 +165,14 @@ pub(crate) struct ClientCaps {
     /// and the pull client re-requests on its own cadence — typically only for the document it is
     /// editing, which is exactly the staleness this closes for clients that DO advertise it.
     pub(crate) diagnostic_refresh_support: bool,
+    /// Diagnostics travel on ONE channel per client, never both: a client that receives a file's
+    /// diagnostics by push and by pull keeps them as two collections and shows every item twice
+    /// (VS Code renders both in one hover). Pull is chosen when the client advertises
+    /// `textDocument.diagnostic` AND [`Self::diagnostic_refresh_support`] — without refresh, a
+    /// cross-file change could never reach a pulled report for a file the user isn't editing,
+    /// which push handles by republishing every affected open buffer. When true, gdls advertises
+    /// `diagnosticProvider` and never sends `publishDiagnostics`; when false, the reverse.
+    pub(crate) pull_diagnostics: bool,
     /// The M11 (#79) workspace file-operation gates, captured under
     /// `workspace.fileOperations`. Grouped in a sub-struct like [`CodeActionCaps`] so the handler
     /// reads `state.caps.file_operations.<gate>` and the advertised capability mirrors them.
@@ -333,6 +341,24 @@ impl ClientCaps {
     /// 0.97 misspells — see there.
     fn negotiate(caps: &lsp_types::ClientCapabilities, raw: &serde_json::Value) -> Self {
         let td = caps.text_document.as_ref();
+        // #255/#277: `workspace.diagnostics.refreshSupport` — PLURAL, per LSP 3.17. lsp-types
+        // 0.97 names the field `workspace.diagnostic` (singular), which under its
+        // `rename_all = "camelCase"` deserializes the wrong wire key, so the typed path is
+        // blind to what VS Code, Neovim, Zed and Sublime actually send (all four of the
+        // captured client profiles use the plural). Read the spec key off the raw object and
+        // keep the typed field as a fallback for any client that follows lsp-types instead.
+        let diagnostic_refresh_support = raw
+            .get("workspace")
+            .and_then(|w| w.get("diagnostics"))
+            .and_then(|d| d.get("refreshSupport"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                caps.workspace
+                    .as_ref()
+                    .and_then(|w| w.diagnostic.as_ref())
+                    .and_then(|d| d.refresh_support)
+                    .unwrap_or(false)
+            });
         ClientCaps {
             hierarchical_document_symbols: td
                 .and_then(|t| t.document_symbol.as_ref())
@@ -404,24 +430,9 @@ impl ClientCaps {
                 .and_then(|w| w.workspace_edit.as_ref())
                 .and_then(|w| w.document_changes)
                 .unwrap_or(false),
-            // #255/#277: `workspace.diagnostics.refreshSupport` — PLURAL, per LSP 3.17. lsp-types
-            // 0.97 names the field `workspace.diagnostic` (singular), which under its
-            // `rename_all = "camelCase"` deserializes the wrong wire key, so the typed path is
-            // blind to what VS Code, Neovim, Zed and Sublime actually send (all four of the
-            // captured client profiles use the plural). Read the spec key off the raw object and
-            // keep the typed field as a fallback for any client that follows lsp-types instead.
-            diagnostic_refresh_support: raw
-                .get("workspace")
-                .and_then(|w| w.get("diagnostics"))
-                .and_then(|d| d.get("refreshSupport"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or_else(|| {
-                    caps.workspace
-                        .as_ref()
-                        .and_then(|w| w.diagnostic.as_ref())
-                        .and_then(|d| d.refresh_support)
-                        .unwrap_or(false)
-                }),
+            diagnostic_refresh_support,
+            pull_diagnostics: td.and_then(|t| t.diagnostic.as_ref()).is_some()
+                && diagnostic_refresh_support,
             semantic_tokens: SemanticTokensCaps::negotiate(caps),
             inlay_hint: InlayHintCaps::negotiate(caps),
             code_action: CodeActionCaps::negotiate(caps),
@@ -2745,14 +2756,16 @@ fn capabilities(
         // changes this file's report (the resultId's epoch component tracks it).
         // workspaceDiagnostics stays false permanently: project-wide pull conflicts with the
         // per-file-diagnostics principle (docs/00 §4; documented skip in docs/09 §5).
-        diagnostic_provider: Some(lsp_types::DiagnosticServerCapabilities::Options(
-            lsp_types::DiagnosticOptions {
+        // Advertised only to a pull client, which then gets no `publishDiagnostics` at all
+        // ([`ClientCaps::pull_diagnostics`]).
+        diagnostic_provider: caps.pull_diagnostics.then(|| {
+            lsp_types::DiagnosticServerCapabilities::Options(lsp_types::DiagnosticOptions {
                 identifier: Some("gdls".to_string()),
                 inter_file_dependencies: true,
                 workspace_diagnostics: false,
                 work_done_progress_options: Default::default(),
-            },
-        )),
+            })
+        }),
         // M10 (#75): codeAction. `resolve_provider: true` advertises `codeAction/resolve` — a client
         // with `codeAction.resolveSupport` receives the action sans `edit` and pulls the edit lazily.
         // `code_action_kinds` lists EXACTLY the kinds gdls offers (only `quickfix` this phase) so a
@@ -3507,6 +3520,11 @@ fn parse_params<P: serde::de::DeserializeOwned>(
 /// by a content fingerprint, so the same `didChange` doesn't pay the cost twice when
 /// `documentSymbol` and `publishDiagnostics` race on identical buffer text.
 fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) {
+    // A pull client reads diagnostics through `textDocument/diagnostic` and re-pulls on
+    // `workspace/diagnostic/refresh`; pushing too would show every item twice.
+    if state.caps.pull_diagnostics {
+        return;
+    }
     let params = PublishDiagnosticsParams {
         diagnostics: diagnostic_items(state, &uri),
         uri,
