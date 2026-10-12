@@ -11,7 +11,7 @@
 //!   - `workspaceSymbolProvider.resolveProvider == true` is advertised.
 //!   - Malformed / absent `data` resolves to the item unchanged (never panics).
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv_response, request, sample_project, shutdown, try_recv};
 use lsp_server::Connection;

@@ -3,7 +3,7 @@
 //! watcher dead (the Helix scenario — its only watch path), the duplicate-delivery dedupe gate,
 //! and the project-reload routing of non-`.gd` client events.
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 

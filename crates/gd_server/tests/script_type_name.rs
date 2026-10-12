@@ -6,7 +6,7 @@
 //! test asserts on a published diagnostic rather than on the helper, because the helper was already
 //! correct and it was one call site reaching past it.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};

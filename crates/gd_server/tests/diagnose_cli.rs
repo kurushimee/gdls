@@ -11,7 +11,7 @@
 //!   5. `--path-audit` runs `Index::verify()` and exits nonzero on any identity-invariant
 //!      violation; on a clean index it prints `path-audit: OK` and exits 0.
 
-mod common;
+use crate::common;
 
 use std::process::Command;
 

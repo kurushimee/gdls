@@ -18,7 +18,7 @@
 //!      (`1bad`, `has space`), a GDScript keyword (`func`, `if`), and a name colliding with an
 //!      existing member in scope.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 

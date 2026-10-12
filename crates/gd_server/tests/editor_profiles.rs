@@ -81,7 +81,7 @@
 //!
 //! Every milestone from M8 on extends this list with its own gated projections.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
@@ -154,9 +154,16 @@ fn flag(profile: &serde_json::Value, path: &[&str]) -> bool {
 
 #[test]
 fn every_vendored_profile_gets_its_exact_gated_projections() {
-    for (name, profile) in profiles() {
-        check_profile(&name, &profile);
-    }
+    // Each profile boots its own server and spends most of its walk waiting for the session to go
+    // quiet, so the walks run side by side. A thread named after its profile reports its own panic.
+    std::thread::scope(|s| {
+        for (name, profile) in profiles() {
+            std::thread::Builder::new()
+                .name(name.clone())
+                .spawn_scoped(s, move || check_profile(&name, &profile))
+                .expect("spawn profile walk");
+        }
+    });
 }
 
 /// Boot a fresh in-memory server with the given client `capabilities` JSON and extra

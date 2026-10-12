@@ -12,7 +12,7 @@
 //! whole compiles only where those hooks exist. CI runs `--all-targets` in debug, where it does.
 #![cfg(debug_assertions)]
 
-mod common;
+use crate::common;
 
 use std::num::NonZeroUsize;
 

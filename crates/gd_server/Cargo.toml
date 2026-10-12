@@ -5,10 +5,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+autotests = false
+
+[lib]
+# There are no doc examples to run, so `cargo test` skips the rustdoc pass.
+doctest = false
 
 [[bin]]
 name = "gdls"
 path = "src/main.rs"
+test = false
 
 # M11 (#80): a cross-platform STUB formatter for `tests/formatting.rs` — a stdin→stdout filter whose
 # behavior is selected by its first arg (squeeze/replace/fail/sleep/binary/…). The integration test
@@ -19,6 +25,7 @@ path = "src/main.rs"
 [[bin]]
 name = "gdls_format_stub"
 path = "src/bin/gdls_format_stub.rs"
+test = false
 
 [dependencies]
 gd_syntax.workspace = true
@@ -80,3 +87,8 @@ gd_analyze = { workspace = true, features = ["test-support"] }
 notify.workspace = true
 notify-debouncer-full.workspace = true
 crossbeam-channel = "0.5.15"
+
+# Every tests/*.rs file is a module of this one binary (see tests/main.rs), not a binary of its own.
+[[test]]
+name = "integration"
+path = "tests/main.rs"

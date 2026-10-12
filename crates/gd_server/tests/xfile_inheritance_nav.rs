@@ -7,7 +7,7 @@
 //!   - `textDocument/references` on the signal declaration includes the cross-file emit site,
 //!   - `textDocument/hover` renders `var`/`const` member declarations.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};

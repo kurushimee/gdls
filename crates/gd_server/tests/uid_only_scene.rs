@@ -5,7 +5,7 @@
 //! those at insert time off the project's uid map, and every event that can change that map — a
 //! sidecar appearing, changing, or being deleted — re-reads the scenes that depend on it.
 
-mod common;
+use crate::common;
 
 use gd_server::config::InitializationOptions;
 use gd_server::Workspace;

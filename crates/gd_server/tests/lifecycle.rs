@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use crate::common;
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
     ClientCapabilities, DidOpenTextDocumentParams, DocumentSymbolClientCapabilities,
@@ -47,12 +48,17 @@ fn notification(method: &str, params: serde_json::Value) -> Message {
 #[test]
 fn m0_lifecycle_diagnostics_and_symbols() {
     let (server, client) = Connection::memory();
-    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let (scratch, workspace_folders) = common::scratch_root();
+    let server_thread = std::thread::spawn(move || {
+        let _scratch = scratch;
+        gd_server::serve(server)
+    });
 
     // 1) initialize — offer UTF-16 + UTF-8 (the server should prefer UTF-8) and advertise
     //    hierarchical documentSymbol support so step 4 gets the nested shape (the flat
     //    downgrade for clients without the capability is covered in symbols_and_diagnostics.rs).
     let init = InitializeParams {
+        workspace_folders,
         capabilities: ClientCapabilities {
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(vec![

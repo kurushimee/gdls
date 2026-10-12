@@ -15,15 +15,16 @@ The toolchain is pinned by `rust-toolchain.toml` (`stable` plus `rustfmt` and `c
 ```bash
 cargo fmt --all --check          # format gate (CI fails on diff)
 cargo lint                       # alias: clippy --workspace --all-targets -- -D warnings
-cargo build --workspace --all-targets
 cargo test --workspace
 ```
 
 CI denies all warnings (`RUSTFLAGS: -D warnings`), so be clippy-clean on first write. Use `cargo lint`, the alias in `.cargo/config.toml`, not bare `cargo clippy`.
 
+Each crate builds its integration tests as one binary, `integration`, whose root `tests/main.rs` declares every `tests/*.rs` file as a module. A new test file needs its `mod` line there, or `crates/gd_syntax/tests/test_layout.rs` fails. Run one file's tests with `cargo test -p gd_server --test integration rename::`.
+
 To run it: `cargo run --bin gdls` (debug) or `target/release/gdls` (release). It speaks JSON-RPC over stdio, so a bare invocation just waits for an LSP client.
 
-**The local loop is the Linux half of the gate.** CI also runs the same four steps on `windows-latest`, which stayed red for twelve merges once (#279) because nothing in the merge loop surfaces it. After merging, check `gh run list --branch main --limit 5`. Anything under test that needs a file URI goes through `common::file_uri` (over `gd_server::uri::path_to_file_uri`), never a hand-built `format!("file://…")`, since a Windows temp root is a drive path and does not survive that.
+**The local loop is the Linux half of the gate.** CI also runs the tests on `windows-latest` (format, clippy, and a stable compile check of the `fuzz/` crate run on Linux only), and that leg stayed red for twelve merges once (#279) because nothing in the merge loop surfaces it. After merging, check `gh run list --branch main --limit 5`. Anything under test that needs a file URI goes through `common::file_uri` (over `gd_server::uri::path_to_file_uri`), never a hand-built `format!("file://…")`, since a Windows temp root is a drive path and does not survive that. A test session with no project of its own boots on `common::scratch_root()`: a server with no root falls back to the working directory, which under `cargo test` is the crate itself, so it would index and watch the fixtures and write a `.gdls/` cache into the tree.
 
 ## Rust workflow notes
 

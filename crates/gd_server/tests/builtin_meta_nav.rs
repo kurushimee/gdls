@@ -7,7 +7,7 @@
 //! `signatureHelp`, and `completion` all used to miss the static. The server reconstructs the meta
 //! type at the protocol boundary; nothing here reaches an `AnalysisResult`.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

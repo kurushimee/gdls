@@ -5,7 +5,7 @@
 //! the global env (`std::env::set_var` is unsafe under Rust 2024 thread-safety rules) and keeps
 //! the test independent of any sibling test in this binary that might be reading env vars.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
@@ -32,10 +32,14 @@ fn record_then_replay_round_trips() {
     // ----- record phase -----
     let recorder = BenchRecorder::new(DEFAULT_TRACE_CAPACITY, artifact_path.clone());
     let (server, client) = Connection::memory();
-    let server_thread =
-        std::thread::spawn(move || gd_server::serve_with_recorder(server, Some(recorder)));
+    let (scratch, workspace_folders) = common::scratch_root();
+    let server_thread = std::thread::spawn(move || {
+        let _scratch = scratch;
+        gd_server::serve_with_recorder(server, Some(recorder))
+    });
 
     let init = InitializeParams {
+        workspace_folders,
         capabilities: ClientCapabilities {
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(vec![PositionEncodingKind::UTF8]),
@@ -206,11 +210,19 @@ fn ring_buffer_evicts_oldest() {
 #[test]
 fn unrecorded_serve_is_identical_to_baseline() {
     let (server, client) = Connection::memory();
-    let server_thread = std::thread::spawn(move || gd_server::serve_with_recorder(server, None));
+    let (scratch, workspace_folders) = common::scratch_root();
+    let server_thread = std::thread::spawn(move || {
+        let _scratch = scratch;
+        gd_server::serve_with_recorder(server, None)
+    });
 
+    let init = InitializeParams {
+        workspace_folders,
+        ..Default::default()
+    };
     client
         .sender
-        .send(request(1, "initialize", InitializeParams::default()))
+        .send(request(1, "initialize", init))
         .expect("send initialize");
     let _ = recv(&client);
     client

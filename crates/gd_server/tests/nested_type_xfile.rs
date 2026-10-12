@@ -6,7 +6,7 @@
 //! `references` fanned out empty cross-file — which under `rename` silently rewrote the declaring
 //! file only and left every caller pointing at a name that no longer existed.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, TempProject};
 use lsp_server::Connection;

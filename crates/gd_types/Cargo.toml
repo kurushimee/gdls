@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+autotests = false
+
+[lib]
+# There are no doc examples to run, so `cargo test` skips the rustdoc pass.
+doctest = false
 
 [dependencies]
 roxmltree = "0.21.1"
@@ -12,3 +17,8 @@ rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "2.0.18"
+
+# Every tests/*.rs file is a module of this one binary (see tests/main.rs), not a binary of its own.
+[[test]]
+name = "integration"
+path = "tests/main.rs"

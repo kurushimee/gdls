@@ -2,7 +2,7 @@
 //! `resultId`/`unchanged` round-trip, cross-file (epoch) invalidation, and the advertised
 //! capability shape. `workspace/diagnostic` stays method-not-found by design (`docs/09 §5`).
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, sample_project, shutdown};
 use lsp_server::{Connection, Message, RequestId};

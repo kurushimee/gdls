@@ -5,7 +5,7 @@
 //! `WorkspaceXFileQuery` + `CanonicalKey`-keyed cache — the seam the integration suite previously
 //! only claimed to cover.
 
-mod common;
+use crate::common;
 
 use std::rc::Rc;
 

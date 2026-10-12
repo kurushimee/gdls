@@ -9,7 +9,7 @@
 //! deliberate silences (a `uid://`, a `user://`, an existing file with no loader, a directory) are
 //! where gdls under-reports on purpose — see `WorkspaceXFileQuery::preload_missing_path`.
 
-mod common;
+use crate::common;
 
 use common::TempProject;
 use gd_server::config::InitializationOptions;

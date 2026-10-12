@@ -2,7 +2,7 @@
 //! subclass files — direct and transitive — rather than just implementing classes (the previous
 //! class-level BFS).
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::Connection;

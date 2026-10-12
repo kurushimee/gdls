@@ -3,7 +3,7 @@
 //! and `hover` renders a signature for every one of them — including the engine-compiled
 //! GDScript-only family, which is in no dump and used to hover as its bare return type.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

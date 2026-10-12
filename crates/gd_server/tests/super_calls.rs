@@ -11,7 +11,7 @@
 //! The invariant these tests pin: a `super.X()` site is edited exactly when the declaration its
 //! call binding resolves to is edited, and never when some other declaration is.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, TempProject};
 use lsp_server::Connection;

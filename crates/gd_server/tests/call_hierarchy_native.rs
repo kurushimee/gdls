@@ -4,7 +4,7 @@
 //! rust-analyzer/gopls convention). Expanding a stub-anchored item answers with a clean empty
 //! list.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
