@@ -809,12 +809,14 @@ impl NativeDb {
     }
 
     /// Merge a class parsed from doc XML as a fallback tier. Returns `false` and changes nothing if a
-    /// class of that name already exists — the JSON dump always wins (`docs/03-indexing-freshness.md`
+    /// class or builtin of that name already exists — the JSON dump always wins (`docs/03-indexing-freshness.md`
     /// §2). The XML reader normalizes its type strings into the dump's encoding, so ingestion is
     /// shared with the JSON path.
     pub fn merge_doc_class(&mut self, class: api::ClassDef) -> bool {
         if let Some(sym) = self.interner.get(&class.name) {
-            if self.classes.contains_key(&sym) {
+            // A builtin's name is never a class in Godot's ClassDB. Merged as one, it would shadow
+            // the builtin for the analyzer, which checks native classes first.
+            if self.classes.contains_key(&sym) || self.builtins.contains_key(&sym) {
                 return false;
             }
         }

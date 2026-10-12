@@ -58,6 +58,11 @@ struct Fixture {
 }
 
 fn boot(client: &Connection, src: &str) -> Fixture {
+    boot_with(client, src, &[])
+}
+
+/// [`boot`] with `extra` `(file name, source)` scripts written beside `main.gd`.
+fn boot_with(client: &Connection, src: &str, extra: &[(&str, &str)]) -> Fixture {
     let dir = tempfile::tempdir().expect("create fixture dir");
     let root = dir.path();
     std::fs::write(root.join("project.godot"), "").unwrap();
@@ -66,6 +71,9 @@ fn boot(client: &Connection, src: &str) -> Fixture {
     let stub_cache = root.join("stub-cache");
     let main_path = root.join("main.gd");
     std::fs::write(&main_path, src).unwrap();
+    for (name, text) in extra {
+        std::fs::write(root.join(name), text).unwrap();
+    }
 
     let init = InitializeParams {
         initialization_options: Some(serde_json::json!({
@@ -338,6 +346,47 @@ fn the_instance_and_native_paths_are_untouched() {
     assert!(
         labels.iter().any(|l| l.starts_with("Node2D(")),
         "the native constructor still answers; got {labels:?}"
+    );
+
+    shutdown(&client, server_thread);
+}
+
+/// A project script declaring `class_name Vector2` registers the name, but every reference still
+/// binds the builtin (#622). The name and a constant read off it anchor on the builtin's page, and
+/// completion offers the builtin's members rather than the script's.
+#[test]
+fn a_class_name_hiding_a_builtin_does_not_capture_its_navigation() {
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let fixture = boot_with(
+        &client,
+        SRC,
+        &[("shadow.gd", "class_name Vector2\nextends Node\n")],
+    );
+
+    for (id, line, col, name) in [(10, 5, 12, "Vector2"), (11, 5, 20, "ONE")] {
+        let loc = definition(&client, id, at(&fixture, line, col))
+            .unwrap_or_else(|| panic!("{name} must resolve"));
+        let path = gd_server::uri::uri_to_path(&loc.uri).unwrap();
+        assert_eq!(
+            path.file_name(),
+            Some("Vector2.gd"),
+            "{name} stays on the builtin's page; got {path:?}"
+        );
+        assert!(
+            path.as_std_path().starts_with(&fixture.stub_cache),
+            "{name} anchors under the stub cache, not on the script; got {path:?}"
+        );
+    }
+
+    let labels = completion_labels(&client, 12, at(&fixture, 5, 18));
+    assert!(
+        labels.iter().any(|l| l == "ONE"),
+        "the builtin's constant is offered; got {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|l| l == "new"),
+        "a builtin offers no `new`; got {labels:?}"
     );
 
     shutdown(&client, server_thread);

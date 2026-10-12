@@ -2114,13 +2114,31 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         }
     }
 
-    // 4. Native class name → metatype (analyzer.cpp:4541-4545).
+    // 4. Builtin type name (`int`/`String`/`Vector2`/…), analyzer.cpp:4556-4564. Godot checks it
+    //    first among the globals, ahead of native and project classes, so a `class_name Vector3`
+    //    somewhere in the project never turns `Vector3.ZERO` into a script member lookup. Only a
+    //    subscript base may spell one (`int.MAX`, `Vector3.AXIS_X`); standing alone it is an error,
+    //    and Godot deliberately does NOT return after pushing it — the name carries on down the
+    //    chain and picks up `Identifier "int" not declared in the current scope.` from the tail as
+    //    well. Type annotations never reach here: they resolve through `resolver::resolve_datatype`.
+    if let Some(bt) = crate::resolver::builtin_type_from_name(&name) {
+        if can_be_builtin {
+            ctx.set_type(id, builtin_meta_type(bt));
+            return;
+        }
+        ctx.push_error(
+            "Builtin type cannot be used as a name on its own.".to_owned(),
+            id,
+        );
+    }
+
+    // 5. Native class name → metatype (analyzer.cpp:4566-4570).
     if ctx.native.class_named(&name).is_some() {
         ctx.set_type(id, native_meta_type(name.clone()));
         return;
     }
 
-    // 5. Project `class_name` → script metatype (analyzer.cpp:4547-4550).
+    // 6. Project `class_name` → script metatype (analyzer.cpp:4572-4575).
     if let Some(fid) = ctx.xfile.global_class_file(&name) {
         // Cross-file class reference: drives `textDocument/references` and
         // `textDocument/implementation` (the latter then filters by extends chain).
@@ -2144,22 +2162,6 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             ctx.set_type(id, script_meta_type(ctx, fid));
         }
         return;
-    }
-
-    // 6. Builtin type name (`int`/`String`/`Vector2`/…), analyzer.cpp:4555-4563. Only a subscript
-    //    base may spell one (`int.MAX`, `Vector3.AXIS_X`); standing alone it is an error, and
-    //    Godot deliberately does NOT return after pushing it — the name carries on down the chain
-    //    and picks up `Identifier "int" not declared in the current scope.` from the tail as well.
-    //    Type annotations never reach here: they resolve through `resolver::resolve_datatype`.
-    if let Some(bt) = crate::resolver::builtin_type_from_name(&name) {
-        if can_be_builtin {
-            ctx.set_type(id, builtin_meta_type(bt));
-            return;
-        }
-        ctx.push_error(
-            "Builtin type cannot be used as a name on its own.".to_owned(),
-            id,
-        );
     }
 
     // 7. Variant-as-name (analyzer.cpp:4667-4676) — "Allow `Variant` here since it might be used
