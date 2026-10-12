@@ -24,7 +24,7 @@ Each crate builds its integration tests as one binary, `integration`, whose root
 
 To run it: `cargo run --bin gdls` (debug) or `target/release/gdls` (release). It speaks JSON-RPC over stdio, so a bare invocation just waits for an LSP client.
 
-**The local loop is the Linux half of the gate.** CI also runs the tests on `windows-latest` (format, clippy, and a stable compile check of the `fuzz/` crate run on Linux only), and that leg stayed red for twelve merges once (#279) because nothing in the merge loop surfaces it. After merging, check `gh run list --branch main --limit 5`. Anything under test that needs a file URI goes through `common::file_uri` (over `gd_server::uri::path_to_file_uri`), never a hand-built `format!("file://…")`, since a Windows temp root is a drive path and does not survive that. A test session with no project of its own boots on `common::scratch_root()`: a server with no root falls back to the working directory, which under `cargo test` is the crate itself, so it would index and watch the fixtures and write a `.gdls/` cache into the tree.
+**The local loop is the Linux half of the gate.** CI also runs the tests on `windows-latest` (format, clippy, and a stable compile check of the `fuzz/` crate run on Linux only), and that leg stayed red for twelve merges once (#279) because nothing in the merge loop surfaces it. After merging, check `gh run list --branch main --limit 5`. The rules that keep `gd_server` tests passing on Windows and inside one shared test process are in `crates/gd_server/tests/CLAUDE.md`.
 
 ## Rust workflow notes
 
