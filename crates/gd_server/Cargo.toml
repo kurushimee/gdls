@@ -7,6 +7,12 @@ license.workspace = true
 rust-version.workspace = true
 autotests = false
 
+[features]
+# Test-only behavior for this crate's own integration tests, switched on by the self dev-dependency
+# below and never by a `gdls` build. It remembers the parsed embedded stock dump across the
+# many sessions one test process runs (`api_dump::embedded_stock_db`).
+test-support = []
+
 [lib]
 # There are no doc examples to run, so `cargo test` skips the rustdoc pass.
 doctest = false
@@ -76,6 +82,8 @@ unicode-ident.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Turns on `test-support` (above) whenever this crate's tests build.
+gd_server = { path = ".", features = ["test-support"] }
 # WP-RD1: `test-support` exposes `gd_analyze::AnalysisResult::new_for_test` so the integration
 # tests here (xfile, memory_pressure) can construct `AnalysisResult` literals now that its
 # `bindings` / `member_xrefs` fields are private. Dev-dep-only: the feature is never enabled in a
