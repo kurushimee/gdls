@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 - **Each diagnostic shows once.** gdls pushed every diagnostic and also offered pull, so VS Code, Cursor, Neovim, Zed, and Sublime kept both copies and showed each item twice. A client that can pull and be told to re-pull now gets pull alone, and every other client, Claude Code included, gets push alone.
 - **Go to definition on `obj.method()` lands on the receiver's type, not the calling class.** When the calling class had a method with the same name, a typed receiver whose method came from a native class (including a custom engine build's classes) or from a subclass jumped to the calling class's own method, often the very method making the call. A method declared by the receiver's native class now opens its API page. A method only subclasses declare lists those subclasses, the same as `implementation`. A method the receiver's type can't have finds nothing.
+- **A `class_name` that matches a builtin type no longer takes over that type.** While any script declared `class_name Vector3`, even for a moment while typing a longer name, every `Vector3.ZERO` in the project reported `Cannot find member "ZERO" in base "Vector3".` and an inference error, completion offered the script's members, and go to definition on a member found nothing. Godot checks builtin types before project classes, and gdls now does too. The script itself still reports `Class "Vector3" hides a built-in type.`
 
 ## [3.0.0] - 2026-08-29
 

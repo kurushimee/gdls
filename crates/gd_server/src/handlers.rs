@@ -4051,6 +4051,12 @@ fn global_class_file(state: &ServerState, name: &str) -> Option<gd_project::File
 }
 
 fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<Location> {
+    // A `class_name Vector3` registers, but every reference still binds the builtin, which Godot
+    // checks first among the globals (`gdscript_analyzer.cpp:4556`). Answering with the script
+    // here would send `Vector3` to it instead of the builtin's stub.
+    if gd_analyze::resolver::builtin_type_from_name(name).is_some() {
+        return None;
+    }
     let entry = state.workspace.index.registry().get(name)?;
     let path = entry.path.clone();
     let indexed_span = entry.name_span;
