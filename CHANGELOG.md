@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **A VS Code and Cursor extension** in `editors/vscode`. It starts `gdls` from `PATH` (or the `gdls.path` setting) for every `.gd` file in a Godot project, exposes every `initializationOptions` key as an editor setting that applies live or restarts the server as needed, and adds GDScript highlighting and editing rules. Releases are tagged `vscode-v<version>` and attach the `.vsix`.
 
 ### Changed
+- **The periodic memory samples log at `debug`.** The 3-second ticker and the sample after each watcher batch no longer write an `info` line for the whole session. The lifecycle samples stay at `info`, and `rss=debug` brings back the full pressure curve.
 - **The Godot binary env var is now `GODOT`**, replacing `GDLS_GODOT` for discovery and `GDLS_GODOT_BINARY` for the differential test. `GODOT=off` or an empty value still turns off the auto-dump.
 
 ## [3.0.0] - 2026-08-29

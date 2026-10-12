@@ -1,5 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as readline from "node:readline";
+import type { Readable } from "node:stream";
 import * as vscode from "vscode";
 import {
   DidChangeConfigurationNotification,
@@ -82,12 +84,18 @@ async function start(): Promise<void> {
   const serverOptions: ServerOptions = {
     command,
     transport: TransportKind.stdio,
-    options: projectRoot ? { cwd: projectRoot } : undefined,
+    options: { cwd: projectRoot, env: { ...process.env, GDLS_LOG: serverLogFilter() } },
   };
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "gdscript" }],
     initializationOptions: settings(),
     outputChannel: output,
+    // The client's default logs every stderr line as an error. gdls prints its own level on each
+    // line, so route by that instead.
+    stdioOptions: {
+      stdout: (input) => forEachLine(input, (line) => output.info(line)),
+      stderr: (input) => forEachLine(input, logServerLine),
+    },
     middleware: {
       workspace: {
         // gdls pulls its whole "gdls" section on every configuration change. Answer it from the
@@ -126,6 +134,59 @@ async function start(): Promise<void> {
       }
     });
     client = undefined;
+  }
+}
+
+function forEachLine(input: Readable, fn: (line: string) => void): void {
+  readline.createInterface({ input, crlfDelay: Infinity, terminal: false }).on("line", fn);
+}
+
+// A gdls stderr line looks like `   9.549566900s  INFO rss: rss sample phase="tick" …`.
+const SERVER_LINE = /^\s*\d+(?:\.\d+)?s\s+(TRACE|DEBUG|INFO|WARN|ERROR)\s+(.*)$/;
+// Lines without a level, such as a panic message or its backtrace, keep the last level seen.
+let lastServerLevel = "ERROR";
+
+function logServerLine(line: string): void {
+  const m = SERVER_LINE.exec(line);
+  if (m) {
+    lastServerLevel = m[1];
+  }
+  const text = m ? m[2] : line;
+  switch (lastServerLevel) {
+    case "TRACE":
+      return output.trace(text);
+    case "DEBUG":
+      return output.debug(text);
+    case "INFO":
+      return output.info(text);
+    case "WARN":
+      return output.warn(text);
+    default:
+      return output.error(text);
+  }
+}
+
+/**
+ * The `GDLS_LOG` filter for a new server: the user's own `GDLS_LOG` if set, else the output
+ * channel's log level, so gdls never formats lines the channel would hide anyway.
+ */
+function serverLogFilter(): string {
+  if (process.env.GDLS_LOG) {
+    return process.env.GDLS_LOG;
+  }
+  switch (output.logLevel) {
+    case vscode.LogLevel.Off:
+      return "off";
+    case vscode.LogLevel.Trace:
+      return "trace";
+    case vscode.LogLevel.Debug:
+      return "debug";
+    case vscode.LogLevel.Warning:
+      return "warn";
+    case vscode.LogLevel.Error:
+      return "error";
+    default:
+      return "info";
   }
 }
 

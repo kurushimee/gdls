@@ -1339,8 +1339,8 @@ fn serve_inner(
             recv(ticker) -> _ => {
                 // M5 WP-O2: periodic RSS sample. One syscall every 3 s; on Windows this is a
                 // process query that costs sub-millisecond, and on Linux it's a `/proc/self/statm`
-                // read. The sampler updates `peak_bytes` in place and emits a `tracing::info!`
-                // event tagged `phase="tick"` so the structured trace carries the whole pressure
+                // read. The sampler updates `peak_bytes` in place and emits a `debug` event tagged
+                // `phase="tick"` so a trace captured with `rss=debug` carries the whole pressure
                 // curve, not just the four explicit lifecycle samples.
                 state.rss.sample_now("tick");
                 // M5 WP-H1: classify the current peak against the resolved budget and react on

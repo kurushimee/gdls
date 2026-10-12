@@ -68,6 +68,10 @@ Path settings accept `${workspaceFolder}` and a leading `~`. In an untrusted wor
 - **gdls: Restart Server**
 - **gdls: Show Output**, which you can also open by clicking **gdls** in the status bar
 
+## Logs
+
+The **gdls** output channel shows the server's log at the level gdls gave each line. Pick **Set Log Level...** from the channel's menu to see more or less, then run **gdls: Restart Server**, since gdls takes its log filter from that level when it starts. A `GDLS_LOG` variable in the editor's environment overrides it.
+
 ## Using it next to godot-tools
 
 The godot-tools extension also handles `.gd` files and connects to the Godot editor's own language server. With both running, you will see duplicate hovers, completions, and diagnostics. Disable godot-tools for the workspace, or turn off its language server, when you use gdls.
