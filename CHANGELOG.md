@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 - **Each diagnostic shows once.** gdls pushed every diagnostic and also offered pull, so VS Code, Cursor, Neovim, Zed, and Sublime kept both copies and showed each item twice. A client that can pull and be told to re-pull now gets pull alone, and every other client, Claude Code included, gets push alone.
+- **Go to definition on `obj.method()` no longer lands on the calling class's own `method`.** If the receiver has a known type that lacks the method, which Godot reports as an error, it now finds nothing instead of jumping to a same-named method in the current file.
 
 ## [3.0.0] - 2026-08-29
 

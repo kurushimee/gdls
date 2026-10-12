@@ -643,6 +643,13 @@ pub fn definition(
     // in-file lookup (1), which would otherwise match a same-named ROOT member for an inner-class
     // instance (`var x := Inner.new(); x.collide` → the inner `collide`, not the root's). Only the
     // attribute-on-Script case is handled here; a non-attribute cursor or a Native base falls through.
+    //
+    // #619: an attribute whose base has a concrete type names a member OF THAT TYPE, so step (1)'s
+    // name-only scan of this file must not answer it. Without the flag, `b.do_thing()` on a
+    // `b: OtherBase` that lacks `do_thing` jumped to this class's own same-named method. `self.x`
+    // types as this file's `Script` and is answered above, before the flag can matter. `Enum`
+    // bases stay with steps (1)/(1.55), and a `Variant` base keeps the name-only fallback.
+    let mut attr_on_typed_base = false;
     {
         let attr_base = parsed.tree.iter_ids().find_map(|id| {
             if let NodeKind::Subscript(sub) = &parsed.tree.get(id).kind {
@@ -658,10 +665,15 @@ pub fn definition(
         });
         if let Some(base_id) = attr_base {
             let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
-            let sr = analyzed.as_deref().and_then(|a| {
-                let dt = projected_base_type(state, &uri, &parsed.tree, a, base_id);
+            let base_dt = analyzed
+                .as_deref()
+                .map(|a| projected_base_type(state, &uri, &parsed.tree, a, base_id));
+            attr_on_typed_base = base_dt.as_ref().is_some_and(|dt| {
+                matches!(dt.kind, DtKind::Script | DtKind::Native | DtKind::Builtin)
+            });
+            let sr = base_dt.and_then(|dt| {
                 (dt.kind == DtKind::Script)
-                    .then(|| dt.script_type.clone())
+                    .then_some(dt.script_type)
                     .flatten()
             });
             if let Some(sr) = sr {
@@ -864,8 +876,10 @@ pub fn definition(
     }
 
     // (1) In-file member.
-    if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-        return Some(GotoDefinitionResponse::Scalar(loc));
+    if !attr_on_typed_base {
+        if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
+            return Some(GotoDefinitionResponse::Scalar(loc));
+        }
     }
 
     // (1.5) Cross-file member access (#13): the analyzer records a `Binding::Use` at this exact

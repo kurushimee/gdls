@@ -670,3 +670,52 @@ fn a_bare_native_call_is_unchanged() {
     );
     shutdown(&client, handle);
 }
+
+// ===================================================================================================
+// #619 — a dotted call whose method name the calling class also declares.
+// ===================================================================================================
+
+const SHADOW_GD: &str = "\
+extends Node
+var nav: NavBase
+var node: Node2D
+func boost(amount: int) -> void:
+\tpass
+func missing() -> void:
+\tpass
+func _ready() -> void:
+\tnav.boost(1)
+\tnav.missing()
+\tnode.missing()
+\tself.missing()
+";
+
+/// `nav.boost(1)` names the receiver type's `boost`, never the calling class's own `boost`. When
+/// the receiver's type lacks the method, the answer is nothing rather than the calling class's
+/// same-named method. `self.missing()` still lands on the calling class.
+#[test]
+fn definition_on_dotted_call_ignores_a_same_named_own_method() {
+    let p = project();
+    p.write("shadow.gd", SHADOW_GD);
+    let (client, handle) = boot_with_api(&p);
+    let _ = did_open(&client, &p, "shadow.gd");
+    let uri = file_uri(&p.root.join("shadow.gd"));
+
+    let at = |id, line, character| {
+        definition_at(&client, &uri, id, line, character).map(|l| {
+            (
+                l.uri.as_str().rsplit('/').next().unwrap().to_owned(),
+                l.range.start.line,
+            )
+        })
+    };
+    assert_eq!(at(61, 8, 6), Some(("base.gd".to_owned(), 5)), "nav.boost");
+    assert_eq!(at(62, 9, 6), None, "nav.missing");
+    assert_eq!(at(63, 10, 7), None, "node.missing");
+    assert_eq!(
+        at(64, 11, 7),
+        Some(("shadow.gd".to_owned(), 5)),
+        "self.missing"
+    );
+    shutdown(&client, handle);
+}
