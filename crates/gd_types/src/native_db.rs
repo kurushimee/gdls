@@ -260,6 +260,9 @@ pub struct NativeDb {
     /// project) is engine-`Exact` yet extension-blind — so the analyzer's negative-claim
     /// gates must decline "does not exist" about these names.
     extension_declared_missing: FxHashSet<Sym>,
+    /// How many classes [`Self::merge_doc_class`] added. The content hash covers only the dump
+    /// text, so this is what tells two DBs with different doc-XML merges apart in a log.
+    doc_class_count: usize,
 }
 
 impl NativeDb {
@@ -278,6 +281,7 @@ impl NativeDb {
             content_hash: 0,
             provenance: ApiProvenance::Absent,
             extension_declared_missing: FxHashSet::default(),
+            doc_class_count: 0,
         }
     }
 
@@ -351,6 +355,7 @@ impl NativeDb {
             content_hash: 0,
             provenance: ApiProvenance::Exact,
             extension_declared_missing: FxHashSet::default(),
+            doc_class_count: 0,
         }
     }
 
@@ -398,6 +403,15 @@ impl NativeDb {
     /// instance `Generic` right after ingest.
     pub fn set_provenance(&mut self, provenance: ApiProvenance) {
         self.provenance = provenance;
+    }
+
+    /// How many classes came from doc XML rather than the dump (see the field).
+    pub fn doc_class_count(&self) -> usize {
+        self.doc_class_count
+    }
+
+    pub fn builtin_count(&self) -> usize {
+        self.builtins.len()
     }
 
     pub fn class_count(&self) -> usize {
@@ -822,6 +836,7 @@ impl NativeDb {
         }
         let nc = ingest_class(class, &mut self.interner);
         self.classes.insert(nc.name, nc);
+        self.doc_class_count += 1;
         true
     }
 }

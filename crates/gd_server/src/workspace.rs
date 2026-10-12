@@ -162,6 +162,8 @@ pub struct Workspace {
     /// (every file, no type filter). Paths only — never parsed; freshness rides the shared stat
     /// table like scenes.
     pub(crate) assets: AssetIndex,
+    /// Recent state changes, kept for the builtin-member audit (`crate::trail`).
+    pub(crate) trail: crate::trail::Trail,
 }
 
 impl Workspace {
@@ -287,7 +289,16 @@ impl Workspace {
         // default), so the "never zero" invariant `lru::LruCache::new` requires is enforced by the
         // type — no fallible unwrap at this call site.
         let cap = options.memory.cache_capacity();
+        let mut trail = crate::trail::Trail::default();
+        trail.state(format!(
+            "workspace loaded: Godot {dialect}, {file_count} script(s), {} class_name(s), {} \
+             GDExtension(s), native DB {}",
+            index.registry().len(),
+            project.gdextensions.len(),
+            crate::trail::describe_native(&native),
+        ));
         Workspace {
+            trail,
             native,
             project,
             dialect,
@@ -328,6 +339,37 @@ impl Workspace {
             .put(normalize_path_buf(path), fingerprint(text));
     }
 
+    /// Record a script's interface write in the trail, and its `class_name` change, if any: a
+    /// `class_name` entering or leaving the registry changes how every file resolves that name.
+    fn note_reindex(&mut self, path: &Utf8Path, new_class: Option<&str>, origin: &str) {
+        let old_class = self
+            .index
+            .interface_of(path)
+            .and_then(|i| i.class_name.clone());
+        self.trail.file(format!(
+            "{origin} reindex {path} (class_name {new_class:?})"
+        ));
+        if old_class.as_deref() != new_class {
+            self.trail.name(format!(
+                "class_name of {path}: {old_class:?} -> {new_class:?} ({origin})"
+            ));
+        }
+    }
+
+    /// Record a script leaving the index (see [`Self::note_reindex`]).
+    fn note_removal(&mut self, path: &Utf8Path, origin: &str) {
+        let old_class = self
+            .index
+            .interface_of(path)
+            .and_then(|i| i.class_name.clone());
+        self.trail.file(format!("{origin} removed {path}"));
+        if old_class.is_some() {
+            self.trail.name(format!(
+                "class_name of {path}: {old_class:?} -> None ({origin} removal)"
+            ));
+        }
+    }
+
     /// M7 (#61): the wholesale-invalidation counter component of the pull-diagnostics
     /// `resultId` — see the field doc.
     pub fn analysis_generation(&self) -> u64 {
@@ -346,6 +388,10 @@ impl Workspace {
         );
         self.analysis_cache.clear();
         self.analysis_generation += 1;
+        self.trail.state(format!(
+            "strict config changed; analysis cache cleared (generation {})",
+            self.analysis_generation
+        ));
     }
 
     /// M7 (#59): apply runtime analyzer knobs (iteration cap, checkpoint delay). Cached results
@@ -358,6 +404,10 @@ impl Workspace {
             .map(std::time::Duration::from_micros);
         self.analysis_cache.clear();
         self.analysis_generation += 1;
+        self.trail.state(format!(
+            "analyzer config changed; analysis cache cleared (generation {})",
+            self.analysis_generation
+        ));
     }
 
     /// M7 (#59): resize both LRU caches to a runtime `memory.cacheCapacity`. `lru::resize`
@@ -850,6 +900,9 @@ impl Workspace {
         for _ in 0..analysis_drop {
             self.analysis_cache.pop_lru();
         }
+        self.trail.state(format!(
+            "memory pressure: evicted {parse_drop} parse(s) and {analysis_drop} analysis(es)"
+        ));
         parse_drop + analysis_drop
     }
 
@@ -915,6 +968,7 @@ impl Workspace {
         // the new text right after (see `last_applied_disk`).
         self.last_applied_disk.pop(&normalize_path_buf(path));
         let iface = gd_project::extract_interface(tree);
+        self.note_reindex(path, iface.class_name.as_deref(), "live");
         self.index.txn(path, |idx| {
             idx.on_file_changed(path, iface);
         });
@@ -956,6 +1010,7 @@ impl Workspace {
         // M7 (#60): a deleted file's dedupe record must not suppress a future re-create with
         // identical content.
         self.last_applied_disk.pop(&normalize_path_buf(path));
+        self.note_removal(path, "live");
         self.index.txn(path, |idx| {
             idx.on_file_removed(path);
         });
@@ -1147,6 +1202,9 @@ impl Workspace {
         // once the file is readable/valid. A genuinely absent file is *not* a failure — it rebuilds
         // normally (the legitimate standalone-`.gd` case).
         if outcome.should_preserve_prior() {
+            self.trail.state(format!(
+                "project.godot reload {outcome:?}; previous project model kept"
+            ));
             log::warn!(
                 "project.godot reload {outcome:?}; keeping the previous project model, native DB, \
                  and warning policy rather than resetting to defaults"
@@ -1168,12 +1226,21 @@ impl Workspace {
                  rebuilt",
                 self.dialect,
             );
+            self.trail.state(format!(
+                "project.godot reload moved the dialect {} -> {dialect}",
+                self.dialect
+            ));
             self.dialect = dialect;
             self.dialect_origin = dialect_origin;
             self.project = project;
             return true;
         }
         self.dialect_origin = dialect_origin;
+        self.trail.state(format!(
+            "project.godot reloaded: {} GDExtension(s), {} autoload(s)",
+            project.gdextensions.len(),
+            project.autoloads.len(),
+        ));
         self.project = project;
         // A `project.godot` reload re-scans the `.uid` sidecars, so hand the fresh map over; every
         // file whose uid target moved is re-resolved and marked dirty by the swap.
@@ -1213,6 +1280,10 @@ impl Workspace {
         );
         self.analysis_cache.clear();
         self.analysis_generation += 1;
+        self.trail.state(format!(
+            "project reload cleared the analysis cache (generation {})",
+            self.analysis_generation
+        ));
         false
     }
 
@@ -1251,6 +1322,11 @@ impl Workspace {
             || (self.native.provenance() == ApiProvenance::Exact
                 && new.provenance() != ApiProvenance::Exact);
         if downgrade {
+            self.trail.state(format!(
+                "native DB reload refused as a downgrade: kept {}, rejected {}",
+                crate::trail::describe_native(&self.native),
+                crate::trail::describe_native(&new),
+            ));
             log::warn!(
                 "native API: reload resolved a strictly worse source ({} classes, {:?} \
                  provenance); keeping the live DB ({} classes, {:?})",
@@ -1266,11 +1342,27 @@ impl Workspace {
             && new.provenance() == self.native.provenance()
         {
             log::debug!("native API: reload resolved identical content; nothing to do");
+            self.trail
+                .state("native DB reload resolved identical content; kept".to_owned());
             return false;
         }
+        let (old_desc, new_desc) = (
+            crate::trail::describe_native(&self.native),
+            crate::trail::describe_native(&new),
+        );
+        let replaced = if old_desc == new_desc {
+            format!("reloaded unchanged: {new_desc}")
+        } else {
+            format!("replaced: {old_desc} -> {new_desc}")
+        };
+        log::info!("native API: live DB {replaced}");
         self.native = new;
         self.analysis_cache.clear();
         self.analysis_generation += 1;
+        self.trail.state(format!(
+            "native DB {replaced} (generation {})",
+            self.analysis_generation
+        ));
         true
     }
 
@@ -1505,6 +1597,7 @@ impl Workspace {
             let tree = parse_in_dialect(&text, self.dialect).tree;
             let new_iface = gd_project::extract_interface(&tree);
             let is_added = self.index.interface_of(&path).is_none();
+            self.note_reindex(&path, new_iface.class_name.as_deref(), "reconcile");
             self.index.txn(&path, |idx| {
                 idx.on_file_changed(&path, new_iface);
             });
@@ -1545,6 +1638,7 @@ impl Workspace {
                 .collect();
             let n = removed_paths.len();
             for path in &removed_paths {
+                self.note_removal(path, "reconcile");
                 self.index.txn(path, |idx| idx.on_file_removed(path));
                 self.last_applied_disk.pop(&normalize_path_buf(path));
                 self.stat_table.remove(path);
@@ -1612,6 +1706,10 @@ impl Workspace {
         _span.record("walked", walked as u64);
         _span.record("walk_errors", walk_errors as u64);
         _span.record("elapsed_us", _start.elapsed().as_micros() as u64);
+        self.trail.state(format!(
+            "reconcile ({mode_label}): added {added}, modified {modified}, removed {removed}, \
+             walk errors {walk_errors}"
+        ));
 
         ReconciliationReport {
             added,

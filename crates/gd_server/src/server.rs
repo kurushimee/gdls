@@ -1520,6 +1520,10 @@ pub(crate) fn react_to_memory_pressure(state: &mut ServerState) {
     }
     let prev_level = state.memory_pressure;
     state.memory_pressure = new_level;
+    state
+        .workspace
+        .trail
+        .state(format!("memory pressure {prev_level:?} -> {new_level:?}"));
     // `peak_mb` is the monotonic session high-water mark (context); `window_max_mb` is the rolling
     // value that actually drove this transition. Reporting both lets an operator see *why* the
     // ladder recovered even while the session peak is still high.
@@ -1976,7 +1980,30 @@ fn apply_reaction_batch(
     // Scan the batch into two booleans and do the (expensive) reload + republish at most once after.
     let mut project_changed = false;
     let mut native_changed = false;
+    // What set the reload off, named in its log line and the trail (#622).
+    let mut triggers: Vec<String> = Vec::new();
     for reaction in reactions {
+        let what = match &reaction {
+            Reaction::ProjectGodot => Some("project.godot".to_owned()),
+            Reaction::ExtensionApiJson => Some("extension_api.json".to_owned()),
+            Reaction::Gdextension { path, change } => Some(format!("{path} ({change:?})")),
+            Reaction::DocClassesXml { path } => Some(path.to_string()),
+            _ => None,
+        };
+        if let Some(what) = what {
+            state
+                .workspace
+                .trail
+                .state(format!("watcher: {} {what}", reaction_kind(&reaction)));
+            if triggers.len() < 8 && !triggers.contains(&what) {
+                triggers.push(what);
+            }
+        } else if let Reaction::Scene { path, change } = &reaction {
+            state
+                .workspace
+                .trail
+                .file(format!("watcher: scene {path} ({change:?})"));
+        }
         match reaction {
             // Coalesce the project/native-DB reactions into the post-batch reload below.
             Reaction::ProjectGodot
@@ -1994,8 +2021,9 @@ fn apply_reaction_batch(
     // `native_changed` (it reloads the native DB too), so the `else if` avoids a double reload.
     if project_changed {
         log::info!(
-            "watcher: project.godot / GDExtension surface changed; reloading project model + \
-             native DB (coalesced once for the batch)"
+            "watcher: project.godot / GDExtension surface changed ({}); reloading project model + \
+             native DB (coalesced once for the batch)",
+            triggers.join(", ")
         );
         let _progress = server_progress(state, "Reloading Godot API");
         if state.workspace.reload_project_and_native(&state.options) {
@@ -2577,7 +2605,12 @@ fn rebuild_workspace_for_dialect_change(state: &mut ServerState) {
     let dialect = state.workspace.dialect;
     log::info!("rebuilding the workspace under Godot {dialect} semantics");
     let mut sink = crate::progress::NoopSink;
+    let mut trail = std::mem::take(&mut state.workspace.trail);
     state.workspace = Workspace::load_with_progress(&root, &state.options, &mut sink);
+    // Keep the session's history; the fresh workspace's own load entry lands at the end.
+    let loaded = std::mem::take(&mut state.workspace.trail);
+    trail.append_from(loaded);
+    state.workspace.trail = trail;
     for uri in open_buffer_uris(state) {
         reindex_open_buffer(state, &uri);
     }
@@ -2910,7 +2943,7 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Option<Response> {
     // arrives after the mutation in wire order, runs against the new text.
     if let Some(interrupt) = lifecycle.interrupt() {
         let _ = state.shared.finish(&req_id);
-        tracing::info!(
+        tracing::debug!(
             target: "cancel",
             id = %req_id,
             method = %method,
@@ -3245,7 +3278,7 @@ fn finish_request(shared: &SessionShared, resp: Response) -> Response {
     let lifecycle = shared.finish(&resp.id);
     match lifecycle.as_deref().and_then(RequestLifecycle::interrupt) {
         Some(interrupt) => {
-            tracing::info!(target: "cancel", id = %resp.id, interrupt = ?interrupt, "request interrupted");
+            tracing::debug!(target: "cancel", id = %resp.id, interrupt = ?interrupt, "request interrupted");
             interrupt_response(interrupt, resp.id)
         }
         None => resp,
@@ -3567,6 +3600,15 @@ pub(crate) fn diagnostic_items(state: &mut ServerState, uri: &Uri) -> Vec<Diagno
                 // Only `.gd` files go through the analyzer — for any other open buffer the syntax
                 // diagnostics carry the publish on their own.
                 let analyzed = analyze_gd(state, uri, &parsed.tree, &text);
+                if let Some(result) = analyzed.as_deref() {
+                    crate::trail::audit_member_misses(
+                        &mut state.workspace,
+                        uri,
+                        &text,
+                        &parsed.tree,
+                        result,
+                    );
+                }
                 // Related-location memo BEFORE the doc borrow: every distinct cross-file target
                 // (a SHADOWED_VARIABLE_BASE_CLASS base script) is read once into a rope for the
                 // encoding-correct projection below. Bounded by the related entries one file's
