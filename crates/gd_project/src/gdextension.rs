@@ -120,7 +120,7 @@ mod tests {
         let root = Utf8Path::from_path(dir.path()).unwrap();
         for rel in [
             "doc_classes/A.xml",
-            "Doc_Classes/B.xml",
+            "sub/Doc_Classes/B.xml",
             "build/Vector3.xml",
             "doc_classes/nested/C.xml",
         ] {
@@ -139,6 +139,6 @@ mod tests {
             .map(|p| p.strip_prefix(root).unwrap().as_str().replace('\\', "/"))
             .collect();
         got.sort();
-        assert_eq!(got, ["Doc_Classes/B.xml", "doc_classes/A.xml"]);
+        assert_eq!(got, ["doc_classes/A.xml", "sub/Doc_Classes/B.xml"]);
     }
 }
