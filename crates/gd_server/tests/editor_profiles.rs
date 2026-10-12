@@ -317,8 +317,11 @@ fn did_create_delete_gated_independently() {
 }
 
 fn check_profile(name: &str, profile: &serde_json::Value) {
-    let capabilities: ClientCapabilities = serde_json::from_value(profile.clone())
+    let _: ClientCapabilities = serde_json::from_value(profile.clone())
         .unwrap_or_else(|e| panic!("{name}: profile must deserialize as ClientCapabilities: {e}"));
+    // Diagnostics ride ONE channel: pull when the client can both pull and be told to re-pull.
+    let expect_pull = profile["textDocument"].get("diagnostic").is_some()
+        && flag(profile, &["workspace", "diagnostics", "refreshSupport"]);
 
     let expect_progress = flag(profile, &["window", "workDoneProgress"]);
     let expect_registration = flag(
@@ -362,15 +365,17 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
     p.write("src/m10probe.gd", M10_PROBE_SRC);
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
-    let init = InitializeParams {
-        capabilities,
-        initialization_options: Some(serde_json::json!({
+    // The profile goes on the wire verbatim. A round-trip through the typed `ClientCapabilities`
+    // would drop keys lsp-types misnames — `workspace.diagnostics.refreshSupport` among them —
+    // and the server would see a different client than the real editor is.
+    let init = serde_json::json!({
+        "capabilities": profile,
+        "initializationOptions": {
             "projectRoot": p.root.as_str(),
             "autoDumpExtensionApi": false,
             "extensionApiPath": p.root.join("extension_api.json").as_str(),
-        })),
-        ..Default::default()
-    };
+        },
+    });
     client.sender.send(request(1, "initialize", init)).unwrap();
     // Capture the InitializeResult — the M11 (#79) `willRename` projection asserts the ADVERTISED
     // `workspace.fileOperations` block against what the profile offered, so the advertised
@@ -433,14 +438,42 @@ fn check_profile(name: &str, profile: &serde_json::Value) {
             },
         ))
         .unwrap();
-    let publish = loop {
-        if let Message::Notification(n) = recv(&client) {
-            if n.method == "textDocument/publishDiagnostics" {
-                break n.params;
+    assert_eq!(
+        init_result.capabilities.diagnostic_provider.is_some(),
+        expect_pull,
+        "{name}: diagnosticProvider iff the client pulls with refreshSupport"
+    );
+    let diagnostics = if expect_pull {
+        client
+            .sender
+            .send(request(
+                9,
+                "textDocument/diagnostic",
+                serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+            ))
+            .unwrap();
+        loop {
+            match recv(&client) {
+                Message::Notification(n) => assert_ne!(
+                    n.method, "textDocument/publishDiagnostics",
+                    "{name}: a pull client must not also receive pushes"
+                ),
+                Message::Response(r) if r.id == RequestId::from(9) => {
+                    break r.result.expect("pull report")["items"].clone();
+                }
+                _ => {}
+            }
+        }
+    } else {
+        loop {
+            if let Message::Notification(n) = recv(&client) {
+                if n.method == "textDocument/publishDiagnostics" {
+                    break n.params["diagnostics"].clone();
+                }
             }
         }
     };
-    let unused = publish["diagnostics"]
+    let unused = diagnostics
         .as_array()
         .unwrap()
         .iter()
@@ -764,6 +797,24 @@ fn check_m10_projection(
                 diagnostics = n.params["diagnostics"].clone();
             }
         }
+    }
+    // A pull client gets no push, so ask for the same report.
+    if profile["textDocument"].get("diagnostic").is_some()
+        && flag(profile, &["workspace", "diagnostics", "refreshSupport"])
+    {
+        assert!(
+            diagnostics.is_null(),
+            "{name}: a pull client must not also receive pushes"
+        );
+        client
+            .sender
+            .send(request(
+                70,
+                "textDocument/diagnostic",
+                serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+            ))
+            .unwrap();
+        diagnostics = response_result(name, client, 70)["items"].clone();
     }
 
     // ---- semanticTokens (#72): the legend ALLOW-FILTER. -----------------------------------------

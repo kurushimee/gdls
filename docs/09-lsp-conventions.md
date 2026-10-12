@@ -75,7 +75,7 @@ Every `textDocument/*`, `workspace/*`, and `window/*` feature of LSP 3.17, plus 
 |---|---|---|
 | didOpen/didChange/didClose/didSave (incremental) | served | |
 | publishDiagnostics (push) | served | Tags, `relatedInformation`, and `codeDescription` capability-gated |
-| Pull diagnostics: `textDocument/diagnostic` | served | The same per-file computation as push, with byte-identical items; unchanged via a `version:hash:epoch:generation` resultId |
+| Pull diagnostics: `textDocument/diagnostic` | served | The same per-file computation as push, with byte-identical items; unchanged via a `version:hash:epoch:generation` resultId. Advertised only to a client with `textDocument.diagnostic` plus `workspace.diagnostics.refreshSupport`, which then receives no push |
 | hover · definition · declaration · typeDefinition · references · implementation · documentHighlight · documentSymbol · workspace/symbol · workspaceSymbol/resolve · documentLink | served | |
 | callHierarchy (prepare, incoming, outgoing) · typeHierarchy (prepare, supertypes, subtypes) | served | The `class_name` registry plus extends graph *is* the type-hierarchy data |
 | completion plus completionItem/resolve · signatureHelp | served | §6.1, §6.2 |

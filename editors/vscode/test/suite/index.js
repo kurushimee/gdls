@@ -50,6 +50,14 @@ const checks = {
     assert.strictEqual(err.range.start.line, 5);
   },
 
+  async diagnosticsAreNotDuplicated() {
+    // A client fed by both push and pull keeps two collections and shows every item twice.
+    await new Promise((r) => setTimeout(r, 2000));
+    const diags = vscode.languages.getDiagnostics(uri("scripts/main.gd"));
+    const keys = diags.map((d) => `${d.range.start.line}:${d.range.start.character}:${d.message}`);
+    assert.deepStrictEqual(keys, [...new Set(keys)], `duplicate diagnostics: ${JSON.stringify(keys)}`);
+  },
+
   async hover() {
     const hovers = await waitFor("hover on speed", async () => {
       const h = await vscode.commands.executeCommand("vscode.executeHoverProvider", uri("scripts/player.gd"), new vscode.Position(4, 6));
