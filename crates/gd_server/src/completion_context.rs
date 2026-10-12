@@ -783,6 +783,21 @@ fn string_arg_content_before_cursor(tokens: &[Token], byte: usize) -> Option<&st
     tok.source.get(rel_start..rel_end)
 }
 
+/// True iff the cursor sits strictly inside a string-family literal token (`"…"`, `&"…"`, `^"…"`):
+/// after its first byte and before its last, so a caret just past the closing quote is outside.
+fn cursor_inside_string_literal(tokens: &[Token], byte: usize) -> bool {
+    use gd_syntax::token::Literal;
+    tokens.iter().any(|t| {
+        t.kind == TokenKind::Literal
+            && t.span.start < byte
+            && byte < t.span.end
+            && matches!(
+                t.literal,
+                Some(Literal::String(_) | Literal::StringName(_) | Literal::NodePath(_))
+            )
+    })
+}
+
 /// The in-string prefix span the edit replaces for a string-argument deferred context — chosen so
 /// accepting an item never doubles a prefix and never drops a required scheme. Returns a source-byte
 /// [`ByteSpan`]; `None` when the cursor is not strictly inside the string.
@@ -1391,6 +1406,13 @@ fn classify_call_or_identifier(
                     ) || callee_kind.is_identifier();
 
                     if is_callee && !is_func_params {
+                        // A caret strictly inside a string argument (`print("ab|")`, `f(&"|")`) is
+                        // not an expression position: Godot offers nothing there beyond a per-call
+                        // `get_argument_options` string list, which gdls does not build. The
+                        // path-taking callees were already claimed by `classify_deferred` (#620).
+                        if cursor_inside_string_literal(tokens, byte) {
+                            return CompletionContext::bare(CompletionKind::None);
+                        }
                         let arg_index = arg_index_after(tokens, open_idx, byte);
                         let (callee, callee_name) = recover_callee(tree, tokens, callee_idx);
                         return CompletionContext::new(
