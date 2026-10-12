@@ -436,13 +436,10 @@ fn reaction_for_path(path: &Utf8Path, change: FileChange, project_root: &Utf8Pat
             change,
         },
         Some("xml") => {
-            // Doc-classes XML lives under an addon's `doc_classes/` directory; we recognize that
-            // pattern (any XML whose parent component name is `doc_classes` lowercase).
-            if path
-                .parent()
-                .and_then(|p| p.file_name())
-                .is_some_and(|n| n.eq_ignore_ascii_case("doc_classes"))
-            {
+            // Doc-classes XML lives under an addon's `doc_classes/` directory. The native-DB merge
+            // reads exactly this set (`GdExtension::doc_xml_files`), so every file it merged
+            // reloads the DB again when it changes or goes away.
+            if gd_project::gdextension::is_doc_classes_xml(path) {
                 Reaction::DocClassesXml {
                     path: path.to_path_buf(),
                 }
