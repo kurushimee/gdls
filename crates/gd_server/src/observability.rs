@@ -356,13 +356,13 @@ where
         drop(exts);
         // Single clamped atomic decrement (mirrors the `fetch_add` in `on_new_span`). A plain
         // load-then-store pair would let two spans closing on different threads both read N and
-        // both store N-1, silently losing a decrement and skewing the indent; `fetch_update`
+        // both store N-1, silently losing a decrement and skewing the indent; `try_update`
         // retries on contention so the count stays exact. `saturating_sub` keeps it from wrapping
         // under an unusual close-before-open ordering. The closure never returns `None`, so the
         // `Result` is always `Ok` — discard it.
         let _ = self
             .depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
                 Some(d.saturating_sub(1))
             });
         if ms >= self.threshold_ms {
