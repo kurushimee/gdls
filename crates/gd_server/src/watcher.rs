@@ -272,7 +272,7 @@ impl FileWatcher {
 /// cache. notify 9 marks a watch as stopping before the close, which removes the race itself.
 impl Drop for FileWatcher {
     fn drop(&mut self) {
-        // Both fail only when notify's thread is already gone, and then there is nothing to wait for.
+        // Both fail only when notify's thread is already gone, which leaves nothing to wait for.
         let _ = self.debouncer.unwatch(self.root.as_std_path());
         let _ = self.debouncer.configure(notify::Config::default());
     }
@@ -835,23 +835,26 @@ mod tests {
         // How long the burst ACTUALLY took — the precondition for the coalescing assertion below.
         let burst_span = burst_start.elapsed();
 
-        // Drain debounced batches until the stream goes quiet (no batch for a full 300 ms after the
-        // burst settles). Count only the events the watcher actually ACTS on — `classify_event`'s
-        // `Reaction::GdSource` (the index-affecting Create/Modify events whose per-save reindex
-        // budget WP-T1 depends on coalescing). Counting *raw* events instead is what made this test
-        // CI-flaky: notify-debouncer-full coalesces the burst's Create/Modify events for one path
-        // into ~1, but it does NOT coalesce the `Access(Open/Close)` events each write also emits
-        // (one open + one close per write). Those Access events are dropped by the production
-        // classifier (`SkipReason::AccessOnly`) and are irrelevant to the reindex budget, yet on a
-        // loaded CI runner ~2 Access events × 12 writes pushed the raw count to 24 — past `WRITES` —
-        // and failed a perfectly-healthy debouncer. Classifying first measures the real contract.
-        // A batch can't arrive later than one quiet window after the last write, so a receive that
-        // waits longer than that and hears nothing means the stream has settled.
+        // Drain debounced batches until the stream goes quiet. Count only the events the watcher
+        // actually ACTS on — `classify_event`'s `Reaction::GdSource` (the index-affecting
+        // Create/Modify events whose per-save reindex budget WP-T1 depends on coalescing). Counting
+        // *raw* events instead is what made this test CI-flaky: notify-debouncer-full coalesces the
+        // burst's Create/Modify events for one path into ~1, but it does NOT coalesce the
+        // `Access(Open/Close)` events each write also emits (one open + one close per write). Those
+        // Access events are dropped by the production classifier (`SkipReason::AccessOnly`) and are
+        // irrelevant to the reindex budget, yet on a loaded CI runner ~2 Access events × 12 writes
+        // pushed the raw count to 24 — past `WRITES` — and failed a perfectly-healthy debouncer.
+        // Classifying first measures the real contract. A batch can't arrive later than one quiet
+        // window after the last write, so a receive that waits longer than that and hears nothing
+        // means the stream has settled. Once the hammered file's batch is in, only a short wait is
+        // needed: every write finished before this loop started, so a debouncer that failed to
+        // coalesce has already queued its extra batches.
         let settle = quiet + Duration::from_millis(500);
+        let mut wait = settle;
         let mut index_events_for_target = 0usize;
         let deadline = Instant::now() + settle * 4;
         while Instant::now() < deadline {
-            match watcher.events().recv_timeout(settle) {
+            match watcher.events().recv_timeout(wait) {
                 Ok(Ok(batch)) => {
                     for ev in &batch {
                         for reaction in classify_event(ev, &root) {
@@ -861,6 +864,9 @@ mod tests {
                                 }
                             }
                         }
+                    }
+                    if index_events_for_target > 0 {
+                        wait = Duration::from_millis(300);
                     }
                 }
                 Ok(Err(_errors)) => {}
