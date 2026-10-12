@@ -21,7 +21,7 @@ Audited in `modules/gdscript/language_server/` at `4.6.3-stable`. This is the ba
 | Capability | Godot's own LSP | gdls |
 |---|---|---|
 | `hover` | signature, doc, and a "Defined in" link, including member and method signatures (`text_document.cpp:347`, `godot_lsp.h:1284`) | full signatures for members, calls, and `preload`, plus doc prose |
-| `definition` | `Location` at the symbol; resolves `class_name` in expression position via `is_global_class` (`workspace.cpp:650`) | in-file members, cross-file classes, `class_name` in expression position, `preload`/`load` strings, autoloads, and native symbols — engine classes, Variant types, and global utilities alike — into materialized stubs |
+| `definition` | `Location` at the symbol; resolves `class_name` in expression position via `is_global_class` (`workspace.cpp:650`) | in-file members, cross-file classes, `class_name` in expression position, `preload`/`load` strings, autoloads, and native symbols — engine classes, Variant types, and global utilities alike — into materialized stubs. A call on a typed receiver (`obj.method()`) resolves on the receiver's type, or on the subclasses that declare the method when the type itself does not, and never on a same-named member of the calling class |
 | preload `res://` navigation | via `documentLink` on any file-resolving string literal (`extend_parser.cpp:186-215`), not `definition` | both: `documentLink` on `res://` literals, and `definition` inside the string |
 | autoload navigation | no dedicated handling | resolves the singleton name to its script |
 | `references` | project-wide textual name scan plus per-hit re-resolve (`workspace.cpp:472`) | index-backed and binding-correct, including cross-file member and signal call sites through typed vars |
