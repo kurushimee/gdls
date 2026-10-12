@@ -1436,6 +1436,11 @@ fn serve_inner(
     // Use save_cache_excluding_open so any unsaved buffer interfaces are NOT persisted as disk
     // truth: warm-load will re-parse those files from disk and recover the correct on-disk state
     // ("never lie" guarantee — Issue 1 never-lie fix).
+    //
+    // The watcher stops first. The save writes into the watched root, and stopping notify's
+    // Windows watcher while that change is still queued is the race `FileWatcher`'s `Drop`
+    // describes, so the root has to be quiet when it stops.
+    drop(watcher);
     let open_paths = open_buffer_paths(&state);
     state.workspace.save_cache_excluding_open(&open_paths);
 

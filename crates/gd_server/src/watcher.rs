@@ -138,7 +138,8 @@ pub enum FileChange {
 /// Owns the [`Debouncer`] handle (dropping it stops the internal thread) and the receive end of
 /// the debounced event stream.
 pub struct FileWatcher {
-    /// Kept alive: drop = thread stops. Field is unread by design — the channel is the API.
+    /// Kept alive for the session, since the channel is the API. Dropping it is not enough to
+    /// stop watching, though: see the `Drop` impl below.
     ///
     /// `NoCache`, NOT the debouncer's `RecommendedCache`: on every platform except Linux/Android
     /// the recommended cache is a `FileIdMap` whose `add_root` synchronously walks the ENTIRE
@@ -148,7 +149,7 @@ pub struct FileWatcher {
     /// to pair rename halves; gdls already handles unpaired `From`/`To` events (the
     /// vanished-path → remove / `To` → modified-reindex arms in `server.rs`), so the cache buys
     /// nothing we need.
-    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
+    debouncer: Debouncer<RecommendedWatcher, NoCache>,
     rx: Receiver<DebounceEventResult>,
     /// The path handed to [`notify`] at construction. Retained so the main loop can re-stat it on
     /// a periodic tick (see [`Self::root_exists`]): notify's Windows backend silently `unwatch`es
@@ -184,7 +185,7 @@ impl FileWatcher {
     pub fn with_quiet_time(root: &Utf8Path, quiet_time: Duration) -> anyhow::Result<Self> {
         let (tx, rx) = unbounded::<DebounceEventResult>();
         // The Sender is accepted directly when the `crossbeam-channel` feature is on; no
-        // adapter closure or bridge thread needed. `NoCache` — see the `_debouncer` field doc.
+        // adapter closure or bridge thread needed. `NoCache` — see the `debouncer` field doc.
         let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
             quiet_time,
             None,
@@ -197,7 +198,7 @@ impl FileWatcher {
             .watch(root.as_std_path(), RecursiveMode::Recursive)
             .with_context(|| format!("FileWatcher failed to watch {root} recursively"))?;
         Ok(FileWatcher {
-            _debouncer: debouncer,
+            debouncer,
             rx,
             root: root.to_path_buf(),
             // WP-RD11 (5): capture the root's file identity for the delete+recreate liveness check.
@@ -256,6 +257,24 @@ impl FileWatcher {
                 true
             }
         }
+    }
+}
+
+/// Stop watching before returning, instead of leaving it to notify's own `Drop`.
+///
+/// notify 8's `Drop` only queues a stop for its watcher thread. On Windows that thread then closes
+/// the directory handle, and if a change landed just before the close, its completion re-arms
+/// `ReadDirectoryChangesW` on the closed handle value. When another thread has opened a handle in
+/// the meantime and got the same value, the re-armed read blocks on that handle and both threads
+/// hang for good. Unwatching and then waiting on `configure`, which notify answers from the same
+/// thread in queue order, makes the close finish before this returns. The caller still has to drop
+/// the watcher while the root is quiet, which is why shutdown drops it before saving the index
+/// cache. notify 9 marks a watch as stopping before the close, which removes the race itself.
+impl Drop for FileWatcher {
+    fn drop(&mut self) {
+        // Both fail only when notify's thread is already gone, and then there is nothing to wait for.
+        let _ = self.debouncer.unwatch(self.root.as_std_path());
+        let _ = self.debouncer.configure(notify::Config::default());
     }
 }
 
