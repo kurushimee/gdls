@@ -20,6 +20,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  # No debug info in CI builds: about 20% off a rebuild, and a panic still reports its file and line.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   check:
@@ -48,13 +50,20 @@ jobs:
         run: cargo lint
       # The fuzz crate is its own workspace, so nothing above compiles it, and a signature change in
       # a library crate used to break it unseen until the fuzz job ran on main. A stable check
-      # catches that here; the nightly libFuzzer build only matters for actually fuzzing.
+      # catches that here; the nightly libFuzzer build only matters for actually fuzzing. It builds
+      # into the main target directory because that is the one the cache keeps.
       - name: Fuzz crate compiles
         if: runner.os == 'Linux'
-        run: cargo check --manifest-path fuzz/Cargo.toml --bins
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins --target-dir target
       # Includes the conformance ratchets and the Layer-1 panic-smoke test (always-on, stable).
       - name: Test
         run: cargo test --workspace
+        # The tests create and delete thousands of temporary projects. On Windows the default temp
+        # folder sits on the system drive, where that file churn costs noticeably more kernel time
+        # than on the runner's work drive.
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
 
   # Layer 2: coverage-guided libFuzzer. Nightly + Linux only (cargo-fuzz is unsupported on Windows).
   # Every push to main fuzzes each target for a minute, all five at once; the nightly schedule runs
