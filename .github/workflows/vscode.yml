@@ -65,7 +65,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#vscode-v}"
           mv gdls.vsix "gdls-$version.vsix"
-          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --title "VS Code extension $version" --notes "The gdls extension for VS Code and Cursor. It needs \`gdls\` on PATH; see editors/vscode/README.md."
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --latest=false --title "VS Code extension $version" --notes "The gdls extension for VS Code and Cursor. It needs \`gdls\` on PATH; see editors/vscode/README.md."
           gh release upload "$GITHUB_REF_NAME" "gdls-$version.vsix" --clobber
       - name: Publish to the Visual Studio Marketplace
         if: env.VSCE_PAT != ''
