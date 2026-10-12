@@ -133,8 +133,13 @@ pub struct Workspace {
     /// client's `didChangeWatchedFiles`. `Index::on_file_changed` unconditionally bumps the
     /// file's epoch (forcing re-analysis), so an identical-content reindex is NOT a free no-op;
     /// this gate is what makes the belt-and-suspenders delivery free. Content-addressed (not a
-    /// time window), so an A→B→A edit sequence applies all three. Bounded LRU; entries drop on
-    /// [`Self::remove`].
+    /// time window), so an A→B→A edit sequence applies all three. Bounded LRU.
+    ///
+    /// A record is only ever the fingerprint of the text the index's interface was extracted
+    /// from. Any other write to the index for that path clears it ([`Self::reindex`],
+    /// [`Self::remove`], and the reconcile walk, which records its own read instead). A stale
+    /// record turns the event for a finished write into a "duplicate" of content the index no
+    /// longer holds, and the wrong interface then sticks for the session (#623).
     last_applied_disk: LruCache<Utf8PathBuf, u64>,
     /// Per-file stat snapshot used for warm-start cache saves and stat-based reconcile. Keyed by
     /// normalized path (`gd_project::normalize_path`). Populated during warm-load (stat-diff walk)
@@ -906,6 +911,9 @@ impl Workspace {
     /// via `save_cache_excluding_open` so warm-load re-parses from disk rather than serving the
     /// never-persisted buffer interface as disk truth.
     pub fn reindex(&mut self, path: &Utf8Path, tree: &ParseTree) {
+        // The index stops reflecting the recorded disk text here; a disk-sourced caller records
+        // the new text right after (see `last_applied_disk`).
+        self.last_applied_disk.pop(&normalize_path_buf(path));
         let iface = gd_project::extract_interface(tree);
         self.index.txn(path, |idx| {
             idx.on_file_changed(path, iface);
@@ -1500,6 +1508,7 @@ impl Workspace {
             self.index.txn(&path, |idx| {
                 idx.on_file_changed(&path, new_iface);
             });
+            self.record_disk_apply(&path, &text);
             // Update stat table with the fresh stat (or remove entry if stat failed so next
             // reconcile retries).
             if let Some(s) = new_stat {
@@ -1537,6 +1546,7 @@ impl Workspace {
             let n = removed_paths.len();
             for path in &removed_paths {
                 self.index.txn(path, |idx| idx.on_file_removed(path));
+                self.last_applied_disk.pop(&normalize_path_buf(path));
                 self.stat_table.remove(path);
             }
             // M11 (#76): parallel scene removal pass — a `.tscn` in the index but absent from the

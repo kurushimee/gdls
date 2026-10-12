@@ -4627,4 +4627,92 @@ mod tests {
              drifted-in late.gd; the rescan branch must bypass (not depend on) per-event dispatch"
         );
     }
+
+    /// A per-file debounced event of `kind` on `path`, the shape the live watcher delivers.
+    fn file_event(kind: notify::EventKind, path: &Utf8Path) -> DebouncedEvent {
+        let event = notify::Event::new(kind).add_path(path.as_std_path().to_path_buf());
+        DebouncedEvent::new(event, Instant::now())
+    }
+
+    fn modified_event(path: &Utf8Path) -> DebouncedEvent {
+        use notify::event::{DataChange, ModifyKind};
+        file_event(
+            notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            path,
+        )
+    }
+
+    /// #623: a rescan that catches a file mid-write must not leave the duplicate-delivery gate
+    /// remembering the content from BEFORE the rescan. Otherwise the event for the finished write,
+    /// whose bytes match that stale record, is dropped as a duplicate, and the half-written
+    /// interface (here: no `extends`, so every child reads as `RefCounted`) sticks for the session.
+    #[test]
+    fn a_rescan_mid_write_does_not_swallow_the_finished_write() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+        let base = root.join("base.gd");
+        let good = "extends Node\nclass_name BaseThing\n";
+        std::fs::write(&base, good).unwrap();
+        let (mut state, _rx) = state_on(&root);
+
+        // A save that rewrites identical bytes is applied once and recorded.
+        handle_watcher(&mut state, vec![modified_event(&base)]);
+        // The overflow rescan reads the file while it is truncated.
+        std::fs::write(&base, "").unwrap();
+        handle_watcher(&mut state, vec![rescan_event()]);
+        assert!(
+            !state.workspace.index.registry().contains("BaseThing"),
+            "precondition: the rescan indexed the truncated file"
+        );
+        // The write finishes, and its event arrives.
+        std::fs::write(&base, good).unwrap();
+        handle_watcher(&mut state, vec![modified_event(&base)]);
+
+        let iface = state
+            .workspace
+            .index
+            .interface_of(&base)
+            .expect("base.gd stays indexed");
+        assert_eq!(
+            iface.extends,
+            gd_project::Extends::Names(vec!["Node".to_owned()]),
+            "the finished write must be re-applied, not deduped against the pre-rescan content"
+        );
+        assert!(state.workspace.index.registry().contains("BaseThing"));
+    }
+
+    /// #623, the removal half: a rescan that finds a file gone drops it from the index, so the
+    /// event for its re-creation with the same bytes must not be deduped away.
+    #[test]
+    fn a_rescan_removal_does_not_swallow_the_recreation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+        let base = root.join("base.gd");
+        let good = "extends Node\nclass_name BaseThing\n";
+        std::fs::write(&base, good).unwrap();
+        let (mut state, _rx) = state_on(&root);
+
+        handle_watcher(&mut state, vec![modified_event(&base)]);
+        std::fs::remove_file(&base).unwrap();
+        handle_watcher(&mut state, vec![rescan_event()]);
+        assert!(
+            state.workspace.index.interface_of(&base).is_none(),
+            "precondition: the rescan dropped the vanished file"
+        );
+        std::fs::write(&base, good).unwrap();
+        handle_watcher(
+            &mut state,
+            vec![file_event(
+                notify::EventKind::Create(notify::event::CreateKind::File),
+                &base,
+            )],
+        );
+
+        assert!(
+            state.workspace.index.registry().contains("BaseThing"),
+            "the re-created file must be re-indexed, not deduped against its pre-removal content"
+        );
+    }
 }
