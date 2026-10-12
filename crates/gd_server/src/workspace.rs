@@ -1746,6 +1746,7 @@ fn warm_index_from_cache(
     // reparsed nor added, so they must be excluded from the "unchanged" count below (otherwise a
     // locked/permission-denied file is mis-reported as unchanged).
     let mut skipped_unreadable = 0usize;
+    let mut assets_changed = 0usize;
 
     for entry_result in walker {
         let entry = match entry_result {
@@ -1788,6 +1789,7 @@ fn warm_index_from_cache(
                 (Some(old), Some(new)) => old.size != new.size || old.mtime_ns != new.mtime_ns,
             };
             if stat_changed {
+                assets_changed += 1;
                 if let Some(res) = gd_project::path_to_res(root, &path) {
                     assets.insert(res);
                 }
@@ -1911,16 +1913,22 @@ fn warm_index_from_cache(
                 stat_table.remove(&gd_project::normalize_path(&abs));
             }
         }
+        // Scripts and scenes are parsed; every other file is only indexed by path. Name both
+        // groups, so the totals add up to the cached-file count logged before the diff.
         log::info!(
-            "warm_index: stat-diff complete: {} unchanged, {} reparsed, {} added, {} removed, \
-             {} skipped (unreadable)",
+            "warm_index: stat-diff complete: scripts and scenes {} unchanged, {} reparsed, \
+             {} added, {} removed, {} skipped (unreadable); other files {} unchanged, \
+             {} changed, {} removed",
             walked_paths
                 .len()
                 .saturating_sub(reparsed + added + skipped_unreadable),
             reparsed,
             added,
-            removed_paths.len(),
+            removed_paths.len() + removed_scenes.len(),
             skipped_unreadable,
+            walked_asset_paths.len().saturating_sub(assets_changed),
+            assets_changed,
+            removed_assets.len(),
         );
     } else {
         log::info!(
