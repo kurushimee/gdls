@@ -52,6 +52,8 @@ Two principles span files:
 
 **Three coordinate spaces, never confused** (`crates/gd_server/src/position.rs`): internal byte offsets (`gd_syntax`), Godot's tab-expanded 1-based `(line, column)` (kept only for `.out` fidelity), and LSP `Position` (UTF-16 by default, UTF-8 or 32 if negotiated). Byte to LSP conversion happens only at the protocol boundary, via a `PositionMapper` built per request from the current rope.
 
+The VS Code and Cursor extension lives in `editors/vscode` (TypeScript, its own npm build and `vscode.yml` workflow). Its `gdls.*` settings mirror `crates/gd_server/src/config.rs`, so a new or renamed option there needs a matching setting there.
+
 `gd_server` is a library plus a thin `main.rs`, so the event loop can be driven over an in-memory `Connection` in tests (`crates/gd_server/tests/lifecycle.rs`). The lexer is pull-based and parser-driven (`crates/gd_syntax/src/lexer.rs`): newline and indent suppression inside `()[]{}` and lambdas is toggled by the parser, so it is not a standalone pre-pass.
 
 ## Conventions (these override normal instincts)

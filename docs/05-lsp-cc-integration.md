@@ -100,6 +100,7 @@ Malformed options fall back to documented defaults with a `window/showMessage(Wa
 ## 4. Deployment
 
 - Ship a single static `gdls` (Rust release build) and put it on `PATH`, or reference it from a plugin that makes sure it is installed.
+- The VS Code and Cursor extension in `editors/vscode` never bundles or downloads gdls. It runs `gdls.path`, else `gdls` on `PATH`, and builds `initializationOptions` and every `workspace/configuration` reply from its `gdls.*` settings, so both carry the same values. It finds `projectRoot` itself (the shallowest `project.godot` outside `addons/`), and it restarts the server when a session-structural setting changes instead of letting gdls keep the old value.
 - `extension_api.json` is auto-managed: gdls dumps it via the discovered Godot binary and regenerates on binary or `.gdextension` changes (`03-indexing-freshness.md` §1). Manual generation is only needed when `autoDumpExtensionApi` is disabled or no Godot binary is discoverable.
 - No other runtime files are required. The server is stateless across restarts apart from the `.gdls/` warm-start cache and managed dump.
 
