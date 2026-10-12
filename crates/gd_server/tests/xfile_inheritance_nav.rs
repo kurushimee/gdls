@@ -60,7 +60,9 @@ fn boot_with_api(p: &TempProject) -> (Connection, std::thread::JoinHandle<anyhow
             "projectRoot": p.root.as_str(),
             "autoDumpExtensionApi": false,
             "extensionApiPath": p.root.join("extension_api.json").as_str(),
-            "stubCacheDir": p.root.join("stub-cache").as_str(),
+            // Under `.gdls/`, which the watcher ignores, so a materialized page never indexes as a
+            // project script.
+            "stubCacheDir": p.root.join(".gdls").join("stub-cache").as_str(),
         })),
         capabilities: lsp_types::ClientCapabilities {
             general: Some(lsp_types::GeneralClientCapabilities {

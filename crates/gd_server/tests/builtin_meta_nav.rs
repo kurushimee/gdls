@@ -68,7 +68,8 @@ fn boot_with(client: &Connection, src: &str, extra: &[(&str, &str)]) -> Fixture 
     std::fs::write(root.join("project.godot"), "").unwrap();
     let api_path = root.join("extension_api.json");
     std::fs::write(&api_path, API).unwrap();
-    let stub_cache = root.join("stub-cache");
+    // Under `.gdls/`, which the watcher ignores, so a materialized page never indexes as a project script.
+    let stub_cache = root.join(".gdls").join("stub-cache");
     let main_path = root.join("main.gd");
     std::fs::write(&main_path, src).unwrap();
     for (name, text) in extra {
