@@ -60,6 +60,7 @@ fn boot_with_api(p: &TempProject) -> (Connection, std::thread::JoinHandle<anyhow
             "projectRoot": p.root.as_str(),
             "autoDumpExtensionApi": false,
             "extensionApiPath": p.root.join("extension_api.json").as_str(),
+            "stubCacheDir": p.root.join("stub-cache").as_str(),
         })),
         capabilities: lsp_types::ClientCapabilities {
             general: Some(lsp_types::GeneralClientCapabilities {
@@ -678,44 +679,109 @@ fn a_bare_native_call_is_unchanged() {
 const SHADOW_GD: &str = "\
 extends Node
 var nav: NavBase
-var node: Node2D
+var res: Resource
 func boost(amount: int) -> void:
-\tpass
+\tnav.boost(amount)
 func missing() -> void:
 \tpass
-func _ready() -> void:
-\tnav.boost(1)
+func add(value: int) -> void:
+\tres.add(value)
+func extra() -> void:
+\tnav.extra()
 \tnav.missing()
-\tnode.missing()
 \tself.missing()
+\tres.from_script()
 ";
 
-/// `nav.boost(1)` names the receiver type's `boost`, never the calling class's own `boost`. When
-/// the receiver's type lacks the method, the answer is nothing rather than the calling class's
-/// same-named method. `self.missing()` still lands on the calling class.
+/// Two subclasses of `NavBase` declare `extra`, which `NavBase` itself does not.
+const SUB_A_GD: &str = "class_name NavSubA\nextends NavBase\nfunc extra() -> void:\n\tpass\n";
+const SUB_B_GD: &str = "class_name NavSubB\nextends NavBase\nfunc extra() -> void:\n\tpass\n";
+
+/// A script two native levels below `Resource` (`PackedScene` extends it) declares `from_script`.
+const SUB_RES_GD: &str = "extends PackedScene\nfunc from_script() -> void:\n\tpass\n";
+
+/// A definition request at `(line, character)` as every `(file name, 0-based line)` it returns.
+fn definitions_at(
+    client: &Connection,
+    uri: &lsp_types::Uri,
+    id: i32,
+    line: u32,
+    character: u32,
+) -> Vec<(String, u32)> {
+    client
+        .sender
+        .send(request(
+            id,
+            "textDocument/definition",
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
+                    position: Position::new(line, character),
+                },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            },
+        ))
+        .unwrap();
+    let resp = recv_response(client);
+    let result: Option<GotoDefinitionResponse> =
+        serde_json::from_value(resp.result.unwrap_or(serde_json::Value::Null)).unwrap_or(None);
+    let locs = match result {
+        Some(GotoDefinitionResponse::Scalar(loc)) => vec![loc],
+        Some(GotoDefinitionResponse::Array(v)) => v,
+        _ => Vec::new(),
+    };
+    let mut out: Vec<(String, u32)> = locs
+        .into_iter()
+        .map(|l| {
+            let file = l.uri.as_str().rsplit('/').next().unwrap().to_owned();
+            (file, l.range.start.line)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// `nav.boost(amount)` inside this class's own `boost` names the receiver type's `boost`, never the
+/// method making the call. The same holds for a native receiver (`res.add` inside `add`). A method
+/// that only subclasses of the receiver's type declare (`nav.extra()`) answers with those
+/// subclasses, and so does a native receiver (`res.from_script()`). A method nothing in that tree
+/// declares answers with nothing, and `self.missing()` still lands on this class.
 #[test]
 fn definition_on_dotted_call_ignores_a_same_named_own_method() {
     let p = project();
     p.write("shadow.gd", SHADOW_GD);
+    p.write("sub_a.gd", SUB_A_GD);
+    p.write("sub_b.gd", SUB_B_GD);
+    p.write("sub_res.gd", SUB_RES_GD);
+    p.write(
+        "extension_api.json",
+        &common::MINI_API.replace(
+            r#"{"name": "Resource", "inherits": "Object"}"#,
+            r#"{"name": "Resource", "inherits": "Object", "methods": [{"name": "add",
+                "is_const": false, "is_vararg": false, "is_static": false, "is_virtual": false,
+                "hash": 1, "arguments": [{"name": "value", "type": "int"}]}]}"#,
+        ),
+    );
     let (client, handle) = boot_with_api(&p);
     let _ = did_open(&client, &p, "shadow.gd");
     let uri = file_uri(&p.root.join("shadow.gd"));
+    let at = |id, line, character| definitions_at(&client, &uri, id, line, character);
+    let one = |file: &str, line| vec![(file.to_owned(), line)];
 
-    let at = |id, line, character| {
-        definition_at(&client, &uri, id, line, character).map(|l| {
-            (
-                l.uri.as_str().rsplit('/').next().unwrap().to_owned(),
-                l.range.start.line,
-            )
-        })
-    };
-    assert_eq!(at(61, 8, 6), Some(("base.gd".to_owned(), 5)), "nav.boost");
-    assert_eq!(at(62, 9, 6), None, "nav.missing");
-    assert_eq!(at(63, 10, 7), None, "node.missing");
-    assert_eq!(
-        at(64, 11, 7),
-        Some(("shadow.gd".to_owned(), 5)),
-        "self.missing"
+    assert_eq!(at(61, 4, 6), one("base.gd", 5), "nav.boost");
+    let native = at(62, 8, 6);
+    assert!(
+        native.len() == 1 && native[0].0 == "Resource.gd",
+        "res.add must reach the native stub, got {native:?}"
     );
+    assert_eq!(
+        at(63, 10, 6),
+        vec![("sub_a.gd".to_owned(), 2), ("sub_b.gd".to_owned(), 2)],
+        "nav.extra"
+    );
+    assert_eq!(at(64, 11, 6), Vec::new(), "nav.missing");
+    assert_eq!(at(65, 12, 7), one("shadow.gd", 5), "self.missing");
+    assert_eq!(at(66, 13, 6), one("sub_res.gd", 1), "res.from_script");
     shutdown(&client, handle);
 }

@@ -645,11 +645,13 @@ pub fn definition(
     // attribute-on-Script case is handled here; a non-attribute cursor or a Native base falls through.
     //
     // #619: an attribute whose base has a concrete type names a member OF THAT TYPE, so step (1)'s
-    // name-only scan of this file must not answer it. Without the flag, `b.do_thing()` on a
-    // `b: OtherBase` that lacks `do_thing` jumped to this class's own same-named method. `self.x`
-    // types as this file's `Script` and is answered above, before the flag can matter. `Enum`
-    // bases stay with steps (1)/(1.55), and a `Variant` base keeps the name-only fallback.
+    // name-only scan of this file must not answer it. It used to: `sys.add(x)` on a
+    // `sys: SomeNative`, written inside this class's own `add`, jumped to that enclosing `add`
+    // rather than the native's. `self.x` types as this file's `Script` and is answered above,
+    // before the flag can matter. `Enum` bases stay with steps (1)/(1.55), and a `Variant` base
+    // keeps the name-only fallback.
     let mut attr_on_typed_base = false;
+    let mut duck_native_base: Option<String> = None;
     {
         let attr_base = parsed.tree.iter_ids().find_map(|id| {
             if let NodeKind::Subscript(sub) = &parsed.tree.get(id).kind {
@@ -671,6 +673,17 @@ pub fn definition(
             attr_on_typed_base = base_dt.as_ref().is_some_and(|dt| {
                 matches!(dt.kind, DtKind::Script | DtKind::Native | DtKind::Builtin)
             });
+            duck_native_base = base_dt
+                .as_ref()
+                .filter(|dt| dt.kind == DtKind::Native && !dt.native_type.is_empty())
+                .filter(|dt| {
+                    state
+                        .workspace
+                        .native
+                        .lookup_member(&dt.native_type, &name)
+                        .is_none()
+                })
+                .map(|dt| dt.native_type.clone());
             let sr = base_dt.and_then(|dt| {
                 (dt.kind == DtKind::Script)
                     .then_some(dt.script_type)
@@ -704,15 +717,33 @@ pub fn definition(
                     if let Some(loc) = member_decl_location(state, link.file, &link.inner, &name) {
                         return Some(GotoDefinitionResponse::Scalar(loc));
                     }
-                } else if let Some(owner) = script_base_native_owner(state, &sr, &name) {
-                    let stub_root = state.options.stub_cache_dir.clone();
-                    if let Some(loc) =
-                        native_member_stub_location(state, &owner, &name, stub_root.as_deref())
-                    {
-                        return Some(GotoDefinitionResponse::Scalar(loc));
+                } else {
+                    if let Some(owner) = script_base_native_owner(state, &sr, &name) {
+                        let stub_root = state.options.stub_cache_dir.clone();
+                        if let Some(loc) =
+                            native_member_stub_location(state, &owner, &name, stub_root.as_deref())
+                        {
+                            return Some(GotoDefinitionResponse::Scalar(loc));
+                        }
+                    }
+                    // #619: nothing up the chain declares it, so this is a duck-typed call that
+                    // Godot only warns about (UNSAFE_METHOD_ACCESS): the method lives on
+                    // subclasses of the receiver's type. Those declarations are the targets, the
+                    // same list `implementation` gives on the base method.
+                    let seed = TypeRef::Script(sr.file, sr.inner.clone());
+                    if let Some(resp) = subtype_method_response(state, &seed, &name) {
+                        return Some(resp);
                     }
                 }
             }
+        }
+    }
+
+    // (0.55) #619: the same duck-typed call on a NATIVE receiver whose class lacks the method
+    // (`var c: SomeNative; c.from_a_script()`): the script subclasses that declare it.
+    if let Some(base) = duck_native_base {
+        if let Some(resp) = subtype_method_response(state, &TypeRef::Native(base), &name) {
+            return Some(resp);
         }
     }
 
@@ -6950,8 +6981,54 @@ fn find_method_overrides(
     // unrelated class's subclasses.
     let seed = TypeRef::Script(current_fid, class_path);
 
+    Some(subtype_method_locations(state, &seed, fn_name, enc))
+}
+
+/// [`subtype_method_locations`] as a definition answer: a single target as a scalar, several as
+/// an array, none as `None` so the caller decides what an empty answer means.
+fn subtype_method_response(
+    state: &mut ServerState,
+    seed: &TypeRef,
+    fn_name: &str,
+) -> Option<GotoDefinitionResponse> {
+    let mut locs = subtype_method_locations(state, seed, fn_name, state.encoding);
+    match locs.len() {
+        0 => None,
+        1 => locs.pop().map(GotoDefinitionResponse::Scalar),
+        _ => Some(GotoDefinitionResponse::Array(locs)),
+    }
+}
+
+/// Every strict subtype of `seed` that declares a method named `fn_name`, as a `Location` at that
+/// declaration's identifier. A subtype that doesn't declare it is skipped, so only real
+/// declarations are reported.
+fn subtype_method_locations(
+    state: &mut ServerState,
+    seed: &TypeRef,
+    fn_name: &str,
+    enc: crate::position::PositionEncoding,
+) -> Vec<Location> {
     let edges = subclass_edges(&state.workspace.index, &state.workspace.native);
-    let subtypes = subtype_closure(&edges, &seed);
+    let subtypes = match seed {
+        // The graph links a native class only to the scripts that extend it directly, so a native
+        // seed starts from every native class at or below it that some script extends.
+        TypeRef::Native(base) => {
+            let native = &state.workspace.native;
+            let mut all: Vec<TypeRef> = Vec::new();
+            for key in edges.keys() {
+                if let TypeRef::Native(n) = key {
+                    if native.is_subclass_of_named(n, base) {
+                        all.extend(subtype_closure(&edges, key));
+                    }
+                }
+            }
+            let mut seen: FxHashSet<TypeRef> = FxHashSet::default();
+            all.retain(|t| seen.insert(t.clone()));
+            all.sort_by(type_ref_order);
+            all
+        }
+        TypeRef::Script(..) => subtype_closure(&edges, seed),
+    };
 
     // For each subtype that actually declares `fn_name`, emit a Location at its identifier.
     // A subtype that doesn't override it is skipped — method override search only reports
@@ -7016,7 +7093,7 @@ fn find_method_overrides(
         });
     }
 
-    Some(locations)
+    locations
 }
 
 /// `textDocument/implementation`: list the project classes that extend the class under the cursor
@@ -9837,13 +9914,19 @@ fn subtype_closure(edges: &FxHashMap<TypeRef, Vec<TypeRef>>, seed: &TypeRef) -> 
         }
         out.push(next);
     }
-    out.sort_by(|a, b| match (a, b) {
+    out.sort_by(type_ref_order);
+    out
+}
+
+/// A stable order for [`TypeRef`]s: project classes by file and inner-class path, then natives by
+/// name.
+fn type_ref_order(a: &TypeRef, b: &TypeRef) -> std::cmp::Ordering {
+    match (a, b) {
         (TypeRef::Script(fa, pa), TypeRef::Script(fb, pb)) => (fa.get(), pa).cmp(&(fb.get(), pb)),
         (TypeRef::Script(..), TypeRef::Native(_)) => std::cmp::Ordering::Less,
         (TypeRef::Native(_), TypeRef::Script(..)) => std::cmp::Ordering::Greater,
         (TypeRef::Native(a), TypeRef::Native(b)) => a.cmp(b),
-    });
-    out
+    }
 }
 
 fn for_each_class(index: &gd_project::Index, mut f: impl FnMut(gd_project::FileId, &[String])) {
