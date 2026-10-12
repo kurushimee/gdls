@@ -1,0 +1,10 @@
+**
+!dist/extension.js
+!syntaxes/**
+!language-configuration.json
+!icon.png
+!README.md
+!CHANGELOG.md
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!package.json

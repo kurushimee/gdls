@@ -40,6 +40,8 @@ Register the server with your LSP client. For Claude Code, install the plugin fr
 /plugin install gdls@gdls-plugin
 ```
 
+For VS Code or Cursor, install the gdls extension from [`editors/vscode`](editors/vscode). It runs the `gdls` on your `PATH` and turns every option below into an editor setting. Each `vscode-v*` release on [GitHub Releases](https://github.com/kurushimee/gdls/releases) carries the `.vsix`.
+
 For any other client, the core registration is five lines:
 
 ```json

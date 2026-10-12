@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **A VS Code and Cursor extension** in `editors/vscode`. It starts `gdls` from `PATH` (or the `gdls.path` setting) for every `.gd` file in a Godot project, exposes every `initializationOptions` key as an editor setting that applies live or restarts the server as needed, and adds GDScript highlighting and editing rules. Releases are tagged `vscode-v<version>` and attach the `.vsix`.
+
 ### Changed
 - **The Godot binary env var is now `GODOT`**, replacing `GDLS_GODOT` for discovery and `GDLS_GODOT_BINARY` for the differential test. `GODOT=off` or an empty value still turns off the auto-dump.
 
