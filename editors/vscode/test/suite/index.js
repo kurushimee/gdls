@@ -3,7 +3,11 @@ const assert = require("node:assert");
 const path = require("node:path");
 const vscode = require("vscode");
 
+const fs = require("node:fs");
+
 const workspace = process.env.GDLS_TEST_WORKSPACE;
+// runTest.js prints this file once VS Code exits.
+const say = (line) => fs.appendFileSync(process.env.GDLS_TEST_LOG, `${line}\n`);
 const uri = (rel) => vscode.Uri.file(path.join(workspace, rel));
 
 async function waitFor(what, fn, timeoutMs = 60000) {
@@ -147,13 +151,14 @@ const checks = {
 };
 
 exports.run = async function run() {
+  say(`suite started, gdls workspace ${workspace}`);
   const failures = [];
   for (const [name, check] of Object.entries(checks)) {
     try {
       await check();
-      console.log(`  ok   ${name}`);
+      say(`  ok   ${name}`);
     } catch (err) {
-      console.log(`  FAIL ${name}: ${err && err.message}`);
+      say(`  FAIL ${name}: ${err && err.stack}`);
       failures.push(name);
     }
   }
