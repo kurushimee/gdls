@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ## [Unreleased]
 
 ### Added
+- **A self-check for builtin types losing their members.** When a diagnostic says a builtin type lacks a member that the live native API, or the stock API for the project's release, actually has, gdls logs one warning at the default level. It shows how the analyzer typed the base, what the native API and the `class_name` registry hold for that name, and the session's most recent state changes (native API swaps, project reloads and what triggered them, cache invalidations, `class_name` changes, file reindexes). Native API swaps and the files that trigger a project reload are now named in the default log too.
 - **A VS Code and Cursor extension** in `editors/vscode`. It starts `gdls` from `PATH` (or the `gdls.path` setting) for every `.gd` file in a Godot project, exposes every `initializationOptions` key as an editor setting that applies live or restarts the server as needed, and adds GDScript highlighting and editing rules. Releases are tagged `vscode-v<version>` and attach the `.vsix`.
 
 ### Changed
@@ -14,6 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **The auto-dump no longer reloads the native DB twice.** Moving Godot's root output into `.gdls/` fired a watcher reload on top of the adoption's own. A root `extension_api.json` change is now skipped whenever a pinned path or the managed dump outranks it.
 - **The warm-start summary names what it counts.** It splits scripts and scenes from other files, so its totals match the cached-file count logged before it.
 - **The periodic memory samples log at `debug`.** The 3-second ticker and the sample after each watcher batch no longer write an `info` line for the whole session. The lifecycle samples stay at `info`, and `rss=debug` brings back the full pressure curve.
+- **Cancelled and content-modified requests log at `debug`.** A client cancels requests all the time while the user types, so these lines no longer fill the default log.
 - **The Godot binary env var is now `GODOT`**, replacing `GDLS_GODOT` for discovery and `GDLS_GODOT_BINARY` for the differential test. `GODOT=off` or an empty value still turns off the auto-dump.
 
 ### Fixed

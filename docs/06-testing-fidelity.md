@@ -98,6 +98,8 @@ The server is long-running, so it measures itself. All of it goes to stderr, nev
 
 The default filter is `info`, which is cheap in production. `GDLS_LOG` takes per-target directives (`GDLS_LOG=gd_server::api_dump=debug`). `GDLS_TRACE='*>50'` enables a hierarchical-profiler-style filter that logs spans taking more than 50 ms, modelled on rust-analyzer's `RA_PROFILE`. `GDLS_LOG_FORMAT=json` emits the structured JSONL that `scripts/summarize-spans.py` reads.
 
+The default level is kept to what an operator needs from a session they did not watch: startup, reloads and what triggered them, native DB swaps, and anomalies. Per-request and per-edit events, cancellations included, log at `debug`. One `warn` is a self-check rather than an event: `gd_server::trail` keeps an in-memory ring of recent state changes (native DB swaps, project reloads, watcher reactions, cache invalidations, `class_name` changes, script reindexes), and when a diagnostic reports a builtin type's member as missing while the live native DB or the stock surface for the release has it, gdls logs one `builtin member audit` warning with the analyzer's type for the base, what the DB and the class registry say about the name, and that ring.
+
 ### 7.2 Latency and the budget file
 
 The `handle_request` span emits `request_latency_us` at close. `bench/budget.toml` records observed p50 and p99 per method, measured against a large real-world project, plus cold index, reconcile, scene index, and peak RSS.
