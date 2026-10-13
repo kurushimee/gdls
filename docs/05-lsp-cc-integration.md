@@ -6,7 +6,7 @@ gdls speaks LSP 3.17 over stdio. Every capability below is advertised only when 
 
 **Lifecycle and sync.** `initialize`, `initialized`, `shutdown`, `exit`, `serverInfo`. Incremental `textDocumentSync` (`didOpen`, `didChange`, `didSave`, `didClose`). `positionEncoding` negotiated across UTF-8, UTF-16, and UTF-32. `$/cancelRequest` with true preemption: a cancelled request returns `RequestCancelled`, and one made stale by an edit returns `ContentModified`. `workDoneProgress` on the cold index, warm start, reconcile, and re-index, plus client tokens on `references` and `workspace/symbol`.
 
-**Diagnostics.** Push `textDocument/publishDiagnostics` and pull `textDocument/diagnostic`, computing the same items either way. `workspace/diagnostic` is deliberately absent (`04-diagnostics-strict-mode.md` §2).
+**Diagnostics.** Push `textDocument/publishDiagnostics` or pull `textDocument/diagnostic`, one channel per client: pull for a client with `textDocument.diagnostic` plus `workspace.diagnostics.refreshSupport`, push for every other (`04-diagnostics-strict-mode.md` §2). The items are the same either way. `workspace/diagnostic` is deliberately absent (`04-diagnostics-strict-mode.md` §2).
 
 **Configuration and files.** `workspace/didChangeConfiguration` plus `workspace/configuration` for runtime re-config. `workspace/didChangeWatchedFiles`, dynamically registered when the client offers it, merged with the native watcher and de-duplicated by content fingerprint. `workspace/willRenameFiles` plus the `did*` notifications.
 
@@ -81,7 +81,7 @@ Other Claude Code config fields that work here: `transport` (`"stdio"` is the de
 | `projectRoot` | string (path) | The `res://` root. Optional; falls back to the workspace folder, then the nearest `project.godot`. |
 | `dialect` | `"4.6"` \| `"4.7"` | Pin the Godot feature release whose frontend semantics apply, instead of reading it from `project.godot`'s `application/config/features`. Optional, and normally left unset — Godot writes that entry itself, so a real project always declares one. A version outside the supported range is ignored with a warning rather than failing `initialize`. |
 | `extensionApiPath` | string (path) | Pin a hand-made `extension_api.json`. Optional. When absent, the auto-dump resolution applies (`03-indexing-freshness.md` §1), and when no project-derived source resolves, the embedded stock fallback serves builtins. Pinning also skips the background auto-dump entirely, so the managed dump can never be served while a path is pinned. |
-| `godotBinaryPath` | string (path) | Godot 4.x executable for the auto-dump. Optional; discovery falls back to `GDLS_GODOT`, then `godot4`/`godot` on `PATH`. |
+| `godotBinaryPath` | string (path) | Godot 4.x executable for the auto-dump. Optional; discovery falls back to `GODOT`, then `godot4`/`godot` on `PATH`. |
 | `autoDumpExtensionApi` | bool | Allow gdls to spawn Godot to regenerate the managed dump under `.gdls/`. The dump runs on a background thread and is adopted mid-session (reload plus republish), so it never blocks a request. Default `true`; `false` forbids spawning entirely. |
 | `embeddedApiFallback` | bool | When every native-API source misses, fall back to a bundled stock class surface for the project's own release (one asset per supported release, picked by dialect) instead of an empty DB, so builtins always resolve on a fresh install. Under this fallback (`Generic` provenance) unknown-type and unknown-member negatives are suppressed: only a project-derived (`Exact`) dump may claim a name does not exist. Default `true`. See `02-frontend-port.md` §11b. |
 | `strict.profile` | `"godot"` \| `"strict"` \| `"off"` | Diagnostics profile (see `04-diagnostics-strict-mode.md`). Default `"godot"`. |
@@ -100,6 +100,7 @@ Malformed options fall back to documented defaults with a `window/showMessage(Wa
 ## 4. Deployment
 
 - Ship a single static `gdls` (Rust release build) and put it on `PATH`, or reference it from a plugin that makes sure it is installed.
+- The VS Code and Cursor extension in `editors/vscode` never bundles or downloads gdls. It runs `gdls.path`, else `gdls` on `PATH`, and builds `initializationOptions` and every `workspace/configuration` reply from its `gdls.*` settings, so both carry the same values. It finds `projectRoot` itself (the shallowest `project.godot` outside `addons/`), and it restarts the server when a session-structural setting changes instead of letting gdls keep the old value.
 - `extension_api.json` is auto-managed: gdls dumps it via the discovered Godot binary and regenerates on binary or `.gdextension` changes (`03-indexing-freshness.md` §1). Manual generation is only needed when `autoDumpExtensionApi` is disabled or no Godot binary is discoverable.
 - No other runtime files are required. The server is stateless across restarts apart from the `.gdls/` warm-start cache and managed dump.
 

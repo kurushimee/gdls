@@ -10,7 +10,7 @@
 //! - capability gating both ways (snippet on/off, documentationFormat, insertReplaceSupport off);
 //! - `CompletionItemKind` clamped to the client's `completionItemKind.valueSet`.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv_response, request, sample_project, TempProject};
 use lsp_server::{Connection, Message};

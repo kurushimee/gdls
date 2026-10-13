@@ -11,7 +11,7 @@
 //! Cross-crate by necessity: `gd_project` has no `tempfile` dev-dep, but `ProjectModel` is public
 //! and the `gd_server` test rig already provides a throwaway on-disk project.
 
-mod common;
+use crate::common;
 
 use common::{options_for, TempProject};
 use gd_project::{DialectOrigin, LoadOutcome, ProjectModel};

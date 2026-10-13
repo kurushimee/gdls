@@ -2,7 +2,7 @@
 //! declaration, cross-file member), BBCode → GFM conversion (never raw BBCode on the wire,
 //! anti-catalog W8), and the `hover.contentFormat` gate with its plaintext downgrade.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, sample_project};
 use lsp_server::{Connection, Message, RequestId};

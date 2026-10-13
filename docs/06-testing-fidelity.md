@@ -26,7 +26,7 @@ Adding support for a newer release therefore *demotes* the current full tree to 
 
 For fidelity against real code, including project-specific native classes, the godot binary runs over a sample corpus of an actual project to produce its diagnostics, and gdls diffs against them. This catches divergences the upstream corpus cannot, especially around Godot's native API and a project's own typing patterns. It runs offline, never at runtime.
 
-It lives in `crates/gd_analyze/tests/differential.rs` and is env-gated: when neither `GDLS_GODOT_BINARY` nor `GDLS_SAMPLE_CORPUS` is set, it logs "skipped" to stderr and returns success. There is no Godot build in CI, so this is a local pass, run before a release and recorded in the header comment of `crates/gd_analyze/tests/conformance/analyze_fidelity_floor.txt` as `# Differential oracle: <PASS|FAIL> against <corpus>, godot binary <path/sha>, at <date> on commit <sha>.`
+It lives in `crates/gd_analyze/tests/differential.rs` and is env-gated: when neither `GODOT` nor `GDLS_SAMPLE_CORPUS` is set, it logs "skipped" to stderr and returns success. There is no Godot build in CI, so this is a local pass, run before a release and recorded in the header comment of `crates/gd_analyze/tests/conformance/analyze_fidelity_floor.txt` as `# Differential oracle: <PASS|FAIL> against <corpus>, godot binary <path/sha>, at <date> on commit <sha>.`
 
 `GDLS_DIFFERENTIAL_THRESHOLD` (default `0.75`) sets the matched-over-eligible floor when the test does run.
 
@@ -70,7 +70,7 @@ The two oracles back each other up: trimmed-API conformance proves analyzer logi
 | `complete_context` | Completion-context classification at arbitrary cursor positions. |
 | `scene_parse` | The `.tscn` text parser. |
 
-The fuzz crate is deliberately outside the workspace: libFuzzer needs nightly and cargo-fuzz does not support Windows, so the stable `--workspace` CI on both matrix legs must never compile it. `crates/gd_syntax/tests/fuzz_crate_isolation.rs` guards that.
+The fuzz crate is deliberately outside the workspace: libFuzzer needs nightly and cargo-fuzz does not support Windows, so the stable `--workspace` build must never compile it. `crates/gd_syntax/tests/fuzz_crate_isolation.rs` guards that. The Linux CI leg type-checks it on stable instead (`cargo check --manifest-path fuzz/Cargo.toml`), which catches a library signature change that would break a target. Every push to `main` fuzzes all five targets at once for a minute each, and a nightly run gives each ten.
 
 **Graceful degradation.** A missing `extension_api.json` makes native types dynamic under the provenance rules (`02-frontend-port.md` §11b), with one notice. A missing `project.godot` means treating the root as `res://` with defaults applied. Unreadable files are skipped and logged to stderr at `warn` level, distinguishing `NotFound` (drop the file) from other I/O errors (keep the last-known interface).
 
@@ -97,6 +97,8 @@ The server is long-running, so it measures itself. All of it goes to stderr, nev
 `tracing` plus `tracing-subscriber`, with `tracing-log` bridging the rest of the workspace's `log::*` callsites so they keep their original target, file, and line. Spans include `analyze{file, version}`, `handle_request{method, id}`, `cold_index{root}`, and `watcher_event{path, kind}`. Each emits an event with elapsed micros on close.
 
 The default filter is `info`, which is cheap in production. `GDLS_LOG` takes per-target directives (`GDLS_LOG=gd_server::api_dump=debug`). `GDLS_TRACE='*>50'` enables a hierarchical-profiler-style filter that logs spans taking more than 50 ms, modelled on rust-analyzer's `RA_PROFILE`. `GDLS_LOG_FORMAT=json` emits the structured JSONL that `scripts/summarize-spans.py` reads.
+
+The default level is kept to what an operator needs from a session they did not watch: startup, reloads and what triggered them, native DB swaps, and anomalies. Per-request and per-edit events, cancellations included, log at `debug`. One `warn` is a self-check rather than an event: `gd_server::trail` keeps an in-memory ring of recent state changes (native DB swaps, project reloads, watcher reactions, cache invalidations, `class_name` changes, script reindexes), and when a diagnostic reports a builtin type's member as missing while the live native DB or the stock surface for the release has it, gdls logs one `builtin member audit` warning with the analyzer's type for the base, what the DB and the class registry say about the name, and that ring.
 
 ### 7.2 Latency and the budget file
 
@@ -127,12 +129,11 @@ Every mutation to `gd_project::Index` flows through `IndexMutation` (`03-indexin
 
 ## 8. The CI gate
 
-The local dev loop is the CI gate, and it runs on both `ubuntu-latest` and `windows-latest`:
+The local dev loop is the CI gate. The tests run on both `ubuntu-latest` and `windows-latest`; format and clippy read the same source on every OS, so they run on Linux only:
 
 ```bash
 cargo fmt --all --check
 cargo lint                       # clippy --workspace --all-targets -- -D warnings
-cargo build --workspace --all-targets
 cargo test --workspace
 ```
 

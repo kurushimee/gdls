@@ -8,7 +8,7 @@
 //! tests, and the spawn path itself is platform-uniform `std::process`.
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, TempProject};
 use lsp_server::{Connection, Message};

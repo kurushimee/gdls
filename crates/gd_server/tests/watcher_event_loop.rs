@@ -17,7 +17,7 @@
 //! fires), which is deterministic — unlike the real-FS timing the `watcher_and_nav.rs` suite
 //! tolerates.
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 

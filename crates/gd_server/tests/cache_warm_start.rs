@@ -13,7 +13,7 @@
 //! excluded from the timing measurements. The suite MUST NOT shrink the corpus below 3k — the
 //! design mandates this band. `success_criterion: timeout: 300s` covers the full scenario.
 
-mod common;
+use crate::common;
 
 use std::time::Instant;
 

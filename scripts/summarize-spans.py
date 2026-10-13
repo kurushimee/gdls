@@ -16,7 +16,7 @@ trivial.
 Capture a trace first with:
 
     export GDLS_LOG_FORMAT=json
-    export GDLS_LOG="info,handle_request=info,analyze=info,cold_index=info,reconcile=info,watcher_event=info,rss=info"
+    export GDLS_LOG="info,handle_request=info,analyze=info,cold_index=info,reconcile=info,watcher_event=info,rss=debug"
     gdls 2> target/m5-p1-calib-YYYY-MM-DD.jsonl
     # (LSP client driving on stdin / stdout.)
 

@@ -398,6 +398,17 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         });
     }
 
+    // #589: the cursor is on a plain identifier whose declaration was inferred from a `$`/`%`/
+    // `get_node("…")` access — the binding itself (`var h := $Hero`, bare uses of `h`). The #125
+    // arm above answers only for a cursor INSIDE the access; this carries the same scene-precise
+    // type one binding back, so hover stops contradicting what `h.combo` offers one character
+    // later. It replaces only the analyzer's inferred type: a member keeps its `var h: …` card and
+    // `##` doc, and a local keeps its bare type label. The one-hop read refuses annotated
+    // declarations (the author's annotation wins) and any identifier in a member-access slot
+    // (`a.h` is about `a`). Navigation-only, like the arm above — this never enters an
+    // `AnalysisResult`.
+    let scene_dt = crate::scene_nav::scene_identifier_type_at(state, &uri, &parsed.tree, byte);
+
     // #513: the cursor is on an annotation's own name (`@export_range`, `@onready`). Nothing below
     // answers that question, so it used to fall all the way through to the "what type is the
     // smallest node around here" arm and render the ENCLOSING CLASS — a card confidently naming the
@@ -415,9 +426,14 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     // v1.0.2 (issue #26): the cursor is on the NAME of a class-level declaration — render its
     // signature (the analyzer pins no type on the name identifier, so the typed-ancestor
     // fallback below would walk up to the class node and surface its `<Script #N>` meta).
-    if let Some(decl_md) =
-        hover_declaration_signature(state, &parsed.tree, node_id, &uri, analyzed.as_deref())
-    {
+    if let Some(decl_md) = hover_declaration_signature(
+        state,
+        &parsed.tree,
+        node_id,
+        &uri,
+        analyzed.as_deref(),
+        scene_dt.as_ref(),
+    ) {
         let leaf_node = parsed.tree.get(node_id);
         return Some(Hover {
             contents: hover_contents(state, decl_md),
@@ -468,9 +484,9 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         // #411: a member named bare in VALUE position (`speed`, `CAP`, `mode`). Runs last so every
         // call and attribute path above keeps shadowing it.
         .or_else(|| {
-            analyzed
-                .as_deref()
-                .and_then(|a| hover_bare_member_signature(state, &uri, &parsed.tree, byte, a))
+            analyzed.as_deref().and_then(|a| {
+                hover_bare_member_signature(state, &uri, &parsed.tree, byte, a, scene_dt.as_ref())
+            })
         });
 
     let markdown = if let Some(sig) = member_sig {
@@ -483,6 +499,14 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         // would point at before falling back.
         if !cursor_is_on_a_symbol(&text, byte) {
             return None;
+        }
+        // #589: a local bound from a node access, which no member card above claims.
+        if let Some(dt) = &scene_dt {
+            let label = human_type_label(state, &parsed.tree, dt);
+            return Some(Hover {
+                contents: hover_contents(state, format!("```gdscript\n{label}\n```")),
+                range: Some(mapper.span_to_range(leaf_node.span)),
+            });
         }
         let file = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
         render_hover(
@@ -643,6 +667,15 @@ pub fn definition(
     // in-file lookup (1), which would otherwise match a same-named ROOT member for an inner-class
     // instance (`var x := Inner.new(); x.collide` → the inner `collide`, not the root's). Only the
     // attribute-on-Script case is handled here; a non-attribute cursor or a Native base falls through.
+    //
+    // #619: an attribute whose base has a concrete type names a member OF THAT TYPE, so step (1)'s
+    // name-only scan of this file must not answer it. It used to: `sys.add(x)` on a
+    // `sys: SomeNative`, written inside this class's own `add`, jumped to that enclosing `add`
+    // rather than the native's. `self.x` types as this file's `Script` and is answered above,
+    // before the flag can matter. `Enum` bases stay with steps (1)/(1.55), and a `Variant` base
+    // keeps the name-only fallback.
+    let mut attr_on_typed_base = false;
+    let mut duck_native_base: Option<String> = None;
     {
         let attr_base = parsed.tree.iter_ids().find_map(|id| {
             if let NodeKind::Subscript(sub) = &parsed.tree.get(id).kind {
@@ -658,10 +691,26 @@ pub fn definition(
         });
         if let Some(base_id) = attr_base {
             let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
-            let sr = analyzed.as_deref().and_then(|a| {
-                let dt = projected_base_type(state, &uri, &parsed.tree, a, base_id);
+            let base_dt = analyzed
+                .as_deref()
+                .map(|a| projected_base_type(state, &uri, &parsed.tree, a, base_id));
+            attr_on_typed_base = base_dt.as_ref().is_some_and(|dt| {
+                matches!(dt.kind, DtKind::Script | DtKind::Native | DtKind::Builtin)
+            });
+            duck_native_base = base_dt
+                .as_ref()
+                .filter(|dt| dt.kind == DtKind::Native && !dt.native_type.is_empty())
+                .filter(|dt| {
+                    state
+                        .workspace
+                        .native
+                        .lookup_member(&dt.native_type, &name)
+                        .is_none()
+                })
+                .map(|dt| dt.native_type.clone());
+            let sr = base_dt.and_then(|dt| {
                 (dt.kind == DtKind::Script)
-                    .then(|| dt.script_type.clone())
+                    .then_some(dt.script_type)
                     .flatten()
             });
             if let Some(sr) = sr {
@@ -692,15 +741,33 @@ pub fn definition(
                     if let Some(loc) = member_decl_location(state, link.file, &link.inner, &name) {
                         return Some(GotoDefinitionResponse::Scalar(loc));
                     }
-                } else if let Some(owner) = script_base_native_owner(state, &sr, &name) {
-                    let stub_root = state.options.stub_cache_dir.clone();
-                    if let Some(loc) =
-                        native_member_stub_location(state, &owner, &name, stub_root.as_deref())
-                    {
-                        return Some(GotoDefinitionResponse::Scalar(loc));
+                } else {
+                    if let Some(owner) = script_base_native_owner(state, &sr, &name) {
+                        let stub_root = state.options.stub_cache_dir.clone();
+                        if let Some(loc) =
+                            native_member_stub_location(state, &owner, &name, stub_root.as_deref())
+                        {
+                            return Some(GotoDefinitionResponse::Scalar(loc));
+                        }
+                    }
+                    // #619: nothing up the chain declares it, so this is a duck-typed call that
+                    // Godot only warns about (UNSAFE_METHOD_ACCESS): the method lives on
+                    // subclasses of the receiver's type. Those declarations are the targets, the
+                    // same list `implementation` gives on the base method.
+                    let seed = TypeRef::Script(sr.file, sr.inner.clone());
+                    if let Some(resp) = subtype_method_response(state, &seed, &name) {
+                        return Some(resp);
                     }
                 }
             }
+        }
+    }
+
+    // (0.55) #619: the same duck-typed call on a NATIVE receiver whose class lacks the method
+    // (`var c: SomeNative; c.from_a_script()`): the script subclasses that declare it.
+    if let Some(base) = duck_native_base {
+        if let Some(resp) = subtype_method_response(state, &TypeRef::Native(base), &name) {
+            return Some(resp);
         }
     }
 
@@ -836,6 +903,13 @@ pub fn definition(
                 state.options.stub_cache_dir.as_deref(),
             )
             .map(GotoDefinitionResponse::Scalar),
+            Some(CalleeTarget::Builtin { class }) => builtin_member_stub_location(
+                state,
+                &class,
+                &name,
+                state.options.stub_cache_dir.as_deref(),
+            )
+            .map(GotoDefinitionResponse::Scalar),
             _ => None,
         };
     }
@@ -864,8 +938,10 @@ pub fn definition(
     }
 
     // (1) In-file member.
-    if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-        return Some(GotoDefinitionResponse::Scalar(loc));
+    if !attr_on_typed_base {
+        if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
+            return Some(GotoDefinitionResponse::Scalar(loc));
+        }
     }
 
     // (1.5) Cross-file member access (#13): the analyzer records a `Binding::Use` at this exact
@@ -1086,6 +1162,16 @@ pub fn type_definition(
     // whose declaration is a more useful jump than bare `Node`'s stub. Navigation-only — see
     // `crate::scene_nav`.
     if let Some((_, dt)) = crate::scene_nav::scene_node_type_at(state, &uri, &parsed.tree, byte) {
+        if let Some(loc) = type_decl_location(state, &dt) {
+            return Some(GotoTypeDefinitionResponse::Scalar(loc));
+        }
+    }
+
+    // #589: the same one-hop read for the binding itself — typeDefinition on `h` (from
+    // `var h := $Hero`) lands on the attached script exactly as it does on `$Hero`, instead of
+    // bare `Node`'s stub. Navigation-only; an annotated declaration (`lazy: Node`) is refused by
+    // the hop, so the author's own type keeps answering.
+    if let Some(dt) = crate::scene_nav::scene_identifier_type_at(state, &uri, &parsed.tree, byte) {
         if let Some(loc) = type_decl_location(state, &dt) {
             return Some(GotoTypeDefinitionResponse::Scalar(loc));
         }
@@ -2090,6 +2176,18 @@ fn hover_call_binding_signature(
                 &member,
             ))
         }
+        CalleeTarget::Builtin { class } => {
+            let (bt, member) = state
+                .workspace
+                .native
+                .lookup_builtin_member(&class, &name)?;
+            let declaring = state.workspace.native.name_of(bt.name).to_owned();
+            Some(native_member_hover_md(
+                &state.workspace.native,
+                &declaring,
+                &member,
+            ))
+        }
         _ => None,
     }
 }
@@ -2436,6 +2534,7 @@ fn hover_bare_member_signature(
     tree: &ParseTree,
     cursor_byte: usize,
     analyzed: &AnalysisResult,
+    scene_dt: Option<&gd_analyze::DataType>,
 ) -> Option<String> {
     let ident_id = bare_identifier_at(tree, cursor_byte)?;
     let span = tree.get(ident_id).span;
@@ -2456,6 +2555,12 @@ fn hover_bare_member_signature(
     });
     if let Some((file, class_path)) = target {
         if let Some(iface) = iface_at_inner(&state.workspace.index, file, &class_path) {
+            if let Some(md) = scene_dt.and_then(|dt| {
+                let decl = iface.members.iter().find(|m| m.name.as_str() == name)?;
+                scene_member_hover_md(state, tree, decl, dt)
+            }) {
+                return Some(md);
+            }
             // #526: the bare read's own type table entry, for a member the interface cannot type.
             let resolved = iface
                 .members
@@ -2816,6 +2921,7 @@ fn hover_declaration_signature(
     leaf_id: NodeId,
     uri: &Uri,
     analyzed: Option<&AnalysisResult>,
+    scene_dt: Option<&gd_analyze::DataType>,
 ) -> Option<String> {
     if !matches!(&tree.get(leaf_id).kind, NodeKind::Identifier(_)) {
         return None;
@@ -2936,6 +3042,9 @@ fn hover_declaration_signature(
             .find(|i| i.class_name.as_deref() == Some(class_name))?;
     }
     let member_decl = iface.members.iter().find(|m| m.name == name)?;
+    if let Some(md) = scene_dt.and_then(|dt| scene_member_hover_md(state, tree, member_decl, dt)) {
+        return Some(md);
+    }
     let member_doc = member_decl.doc.clone();
     let class_path: Vec<String> = chain.iter().rev().cloned().collect();
     let params = crate::signature_help::declaring_param_list(state, fid, &class_path, &name);
@@ -2972,6 +3081,35 @@ fn hover_declaration_signature(
     // M7 (#62): the member's own `##` doc prose, BBCode → GFM, plus the #258 banner.
     if let Some(doc) = member_doc {
         crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, &doc);
+    }
+    Some(md)
+}
+
+/// #589: the card for a member bound from a node access (`@onready var sp := $Sprite`), typed
+/// with the scene-precise type from `scene_nav` instead of the shallow interface's bare `Node`.
+/// Same signature shape and `##` doc as every other member card, so only the type differs. `None`
+/// for anything but a variable, the only member kind the one-hop read answers for.
+fn scene_member_hover_md(
+    state: &ServerState,
+    tree: &ParseTree,
+    decl: &gd_project::MemberDecl,
+    scene_dt: &gd_analyze::DataType,
+) -> Option<String> {
+    if !matches!(
+        decl.kind,
+        gd_project::MemberKind::Var | gd_project::MemberKind::Property
+    ) {
+        return None;
+    }
+    let untyped = gd_project::MemberDecl {
+        ty: gd_project::TypeExpr::None,
+        ..decl.clone()
+    };
+    let base = format_member_signature(&decl.name, &untyped, &state.workspace.native, None)?;
+    let label = human_type_label(state, tree, scene_dt);
+    let mut md = format!("```gdscript\n{base}: {label}\n```");
+    if let Some(doc) = &decl.doc {
+        crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
     }
     Some(md)
 }
@@ -4006,6 +4144,12 @@ fn global_class_file(state: &ServerState, name: &str) -> Option<gd_project::File
 }
 
 fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<Location> {
+    // A `class_name Vector3` registers, but every reference still binds the builtin, which Godot
+    // checks first among the globals (`gdscript_analyzer.cpp:4556`). Answering with the script
+    // here would send `Vector3` to it instead of the builtin's stub.
+    if gd_analyze::resolver::builtin_type_from_name(name).is_some() {
+        return None;
+    }
     let entry = state.workspace.index.registry().get(name)?;
     let path = entry.path.clone();
     let indexed_span = entry.name_span;
@@ -6936,8 +7080,54 @@ fn find_method_overrides(
     // unrelated class's subclasses.
     let seed = TypeRef::Script(current_fid, class_path);
 
+    Some(subtype_method_locations(state, &seed, fn_name, enc))
+}
+
+/// [`subtype_method_locations`] as a definition answer: a single target as a scalar, several as
+/// an array, none as `None` so the caller decides what an empty answer means.
+fn subtype_method_response(
+    state: &mut ServerState,
+    seed: &TypeRef,
+    fn_name: &str,
+) -> Option<GotoDefinitionResponse> {
+    let mut locs = subtype_method_locations(state, seed, fn_name, state.encoding);
+    match locs.len() {
+        0 => None,
+        1 => locs.pop().map(GotoDefinitionResponse::Scalar),
+        _ => Some(GotoDefinitionResponse::Array(locs)),
+    }
+}
+
+/// Every strict subtype of `seed` that declares a method named `fn_name`, as a `Location` at that
+/// declaration's identifier. A subtype that doesn't declare it is skipped, so only real
+/// declarations are reported.
+fn subtype_method_locations(
+    state: &mut ServerState,
+    seed: &TypeRef,
+    fn_name: &str,
+    enc: crate::position::PositionEncoding,
+) -> Vec<Location> {
     let edges = subclass_edges(&state.workspace.index, &state.workspace.native);
-    let subtypes = subtype_closure(&edges, &seed);
+    let subtypes = match seed {
+        // The graph links a native class only to the scripts that extend it directly, so a native
+        // seed starts from every native class at or below it that some script extends.
+        TypeRef::Native(base) => {
+            let native = &state.workspace.native;
+            let mut all: Vec<TypeRef> = Vec::new();
+            for key in edges.keys() {
+                if let TypeRef::Native(n) = key {
+                    if native.is_subclass_of_named(n, base) {
+                        all.extend(subtype_closure(&edges, key));
+                    }
+                }
+            }
+            let mut seen: FxHashSet<TypeRef> = FxHashSet::default();
+            all.retain(|t| seen.insert(t.clone()));
+            all.sort_by(type_ref_order);
+            all
+        }
+        TypeRef::Script(..) => subtype_closure(&edges, seed),
+    };
 
     // For each subtype that actually declares `fn_name`, emit a Location at its identifier.
     // A subtype that doesn't override it is skipped — method override search only reports
@@ -7002,7 +7192,7 @@ fn find_method_overrides(
         });
     }
 
-    Some(locations)
+    locations
 }
 
 /// `textDocument/implementation`: list the project classes that extend the class under the cursor
@@ -7949,6 +8139,28 @@ pub fn outgoing_calls(
                     None => {
                         log::debug!(
                             "outgoingCalls: omitting native callee {callee_name} — the {class} \
+                             stub could not be materialized"
+                        );
+                        continue;
+                    }
+                }
+            }
+            // Builtin callee (#583): the same anchoring as the Native arm, into the builtin's
+            // own rendered stub page (`String.gd`, `Vector2.gd`) — the same page `definition`
+            // jumps to for the identical caret. Builtins have no inheritance, so the detail is
+            // the builtin itself. Stub materialization failure omits the entry rather than
+            // fabricating a location, exactly like the Native arm.
+            CalleeTarget::Builtin { class } => {
+                match builtin_member_stub_location(
+                    state,
+                    &class,
+                    &callee_name,
+                    stub_root.as_deref(),
+                ) {
+                    Some(loc) => (loc.uri, loc.range, loc.range, Some(class)),
+                    None => {
+                        log::debug!(
+                            "outgoingCalls: omitting builtin callee {callee_name} — the {class} \
                              stub could not be materialized"
                         );
                         continue;
@@ -9823,13 +10035,19 @@ fn subtype_closure(edges: &FxHashMap<TypeRef, Vec<TypeRef>>, seed: &TypeRef) -> 
         }
         out.push(next);
     }
-    out.sort_by(|a, b| match (a, b) {
+    out.sort_by(type_ref_order);
+    out
+}
+
+/// A stable order for [`TypeRef`]s: project classes by file and inner-class path, then natives by
+/// name.
+fn type_ref_order(a: &TypeRef, b: &TypeRef) -> std::cmp::Ordering {
+    match (a, b) {
         (TypeRef::Script(fa, pa), TypeRef::Script(fb, pb)) => (fa.get(), pa).cmp(&(fb.get(), pb)),
         (TypeRef::Script(..), TypeRef::Native(_)) => std::cmp::Ordering::Less,
         (TypeRef::Native(_), TypeRef::Script(..)) => std::cmp::Ordering::Greater,
         (TypeRef::Native(a), TypeRef::Native(b)) => a.cmp(b),
-    });
-    out
+    }
 }
 
 fn for_each_class(index: &gd_project::Index, mut f: impl FnMut(gd_project::FileId, &[String])) {

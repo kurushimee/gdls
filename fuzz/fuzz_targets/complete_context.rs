@@ -31,20 +31,19 @@ mod common;
 fuzz_target!(|input: (u8, &str)| {
     let (tag, data) = input;
     let dialect = common::dialect_from(tag);
-    let tree = gd_syntax::parse_with_options(
+    let parsed = gd_syntax::parse_with_options(
         data,
         &ParseOptions {
             dialect,
             script_path: "",
         },
-    )
-    .tree;
+    );
     let (tokens, _errs) = gd_syntax::tokenize_with_dialect(data, dialect);
     // Inclusive of 0 and len, plus one past the end, plus a wildly-out-of-range offset — every
     // offset must clamp to a well-defined result rather than panic (half-open spans mean the AST
     // probe is `None` at end-of-input, so the boundary offsets are the interesting ones).
     for byte in 0..=data.len() + 1 {
-        let _ = classify(&tree, &tokens, byte);
+        let _ = classify(&parsed.tree, &tokens, &parsed.comments, byte);
     }
-    let _ = classify(&tree, &tokens, usize::MAX);
+    let _ = classify(&parsed.tree, &tokens, &parsed.comments, usize::MAX);
 });

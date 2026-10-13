@@ -2,7 +2,7 @@
 //! create → begin → report* → end pairing, the capability-ungated silence rule (no create,
 //! ever), and client-token progress on `references` (independent of the window capability).
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

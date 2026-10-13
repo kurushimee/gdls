@@ -1,0 +1,80 @@
+name: VS Code extension
+
+on:
+  push:
+    branches: [main]
+    tags: ["vscode-v*"]
+    paths: ["editors/vscode/**", ".github/workflows/vscode.yml"]
+  pull_request:
+    paths: ["editors/vscode/**", ".github/workflows/vscode.yml"]
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: editors/vscode
+
+jobs:
+  test:
+    name: typecheck · test · package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        working-directory: .
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The extension expects gdls on PATH, so the tests run against a build of this same commit.
+      - name: Build gdls
+        working-directory: .
+        run: |
+          cargo build --release --bin gdls
+          echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
+      - run: npm ci
+      - run: npm run typecheck
+      - name: Test in VS Code
+        run: xvfb-run -a npm test
+      - run: npx vsce package --out gdls.vsix
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gdls-vsix
+          path: editors/vscode/gdls.vsix
+
+  release:
+    name: release
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/vscode-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      OVSX_PAT: ${{ secrets.OVSX_PAT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: gdls-vsix
+          path: editors/vscode
+      - name: Check the tag matches package.json
+        run: test "vscode-v$(node -p 'require("./package.json").version')" = "$GITHUB_REF_NAME"
+      - name: Publish to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#vscode-v}"
+          mv gdls.vsix "gdls-$version.vsix"
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --latest=false --title "VS Code extension $version" --notes "The gdls extension for VS Code and Cursor. It needs \`gdls\` on PATH; see editors/vscode/README.md."
+          gh release upload "$GITHUB_REF_NAME" "gdls-$version.vsix" --clobber
+      - name: Publish to the Visual Studio Marketplace
+        if: env.VSCE_PAT != ''
+        run: npx --yes @vscode/vsce@4 publish --packagePath gdls-*.vsix
+      - name: Publish to Open VSX (Cursor)
+        if: env.OVSX_PAT != ''
+        run: npx --yes ovsx@1 publish gdls-*.vsix

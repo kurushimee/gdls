@@ -2114,13 +2114,31 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         }
     }
 
-    // 4. Native class name → metatype (analyzer.cpp:4541-4545).
+    // 4. Builtin type name (`int`/`String`/`Vector2`/…), analyzer.cpp:4556-4564. Godot checks it
+    //    first among the globals, ahead of native and project classes, so a `class_name Vector3`
+    //    somewhere in the project never turns `Vector3.ZERO` into a script member lookup. Only a
+    //    subscript base may spell one (`int.MAX`, `Vector3.AXIS_X`); standing alone it is an error,
+    //    and Godot deliberately does NOT return after pushing it — the name carries on down the
+    //    chain and picks up `Identifier "int" not declared in the current scope.` from the tail as
+    //    well. Type annotations never reach here: they resolve through `resolver::resolve_datatype`.
+    if let Some(bt) = crate::resolver::builtin_type_from_name(&name) {
+        if can_be_builtin {
+            ctx.set_type(id, builtin_meta_type(bt));
+            return;
+        }
+        ctx.push_error(
+            "Builtin type cannot be used as a name on its own.".to_owned(),
+            id,
+        );
+    }
+
+    // 5. Native class name → metatype (analyzer.cpp:4566-4570).
     if ctx.native.class_named(&name).is_some() {
         ctx.set_type(id, native_meta_type(name.clone()));
         return;
     }
 
-    // 5. Project `class_name` → script metatype (analyzer.cpp:4547-4550).
+    // 6. Project `class_name` → script metatype (analyzer.cpp:4572-4575).
     if let Some(fid) = ctx.xfile.global_class_file(&name) {
         // Cross-file class reference: drives `textDocument/references` and
         // `textDocument/implementation` (the latter then filters by extends chain).
@@ -2144,22 +2162,6 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             ctx.set_type(id, script_meta_type(ctx, fid));
         }
         return;
-    }
-
-    // 6. Builtin type name (`int`/`String`/`Vector2`/…), analyzer.cpp:4555-4563. Only a subscript
-    //    base may spell one (`int.MAX`, `Vector3.AXIS_X`); standing alone it is an error, and
-    //    Godot deliberately does NOT return after pushing it — the name carries on down the chain
-    //    and picks up `Identifier "int" not declared in the current scope.` from the tail as well.
-    //    Type annotations never reach here: they resolve through `resolver::resolve_datatype`.
-    if let Some(bt) = crate::resolver::builtin_type_from_name(&name) {
-        if can_be_builtin {
-            ctx.set_type(id, builtin_meta_type(bt));
-            return;
-        }
-        ctx.push_error(
-            "Builtin type cannot be used as a name on its own.".to_owned(),
-            id,
-        );
     }
 
     // 7. Variant-as-name (analyzer.cpp:4667-4676) — "Allow `Variant` here since it might be used
@@ -3229,27 +3231,36 @@ pub(crate) fn is_type_compatible(
     let mut src_chain_unknown = false;
     match source.kind {
         DtKind::Native => {
-            // analyzer.cpp:6221-6231 — a native source can only satisfy a Native target.
+            // analyzer.cpp:6221-6231 — a native source can only satisfy a Native target. A native
+            // class used as a value is a `GDScriptNativeClass` object, not an instance.
             if target.kind != DtKind::Native {
                 return false;
             }
-            src_native = Some(source.native_type.clone());
+            if source.is_meta_type {
+                src_native = Some(GDSCRIPT_NATIVE_CLASS.to_owned());
+            } else {
+                src_native = Some(source.native_type.clone());
+            }
         }
         DtKind::Script => {
             if source.is_meta_type {
-                // A script META is an engine `Script` object (analyzer.cpp:6233-6236). The
-                // trimmed DB may not carry the `Script` class, so stay permissive — the
-                // pre-decomposition code returned `true` for every Script operand.
-                return true;
+                // A script META is the script resource itself (analyzer.cpp:6440-6441), and every
+                // script a `ScriptRef` names is a `.gd` file, so its class is `GDScript`.
+                src_native = Some("GDScript".to_owned());
+            } else {
+                let Some(sr) = source.script_type.as_ref() else {
+                    return true; // degenerate Script type — permissive
+                };
+                src_script = Some(sr.clone());
+                match crate::script_chain::chain_native_root(ctx, sr) {
+                    Some(root) => src_native = Some(root),
+                    None => src_chain_unknown = true,
+                }
             }
-            let Some(sr) = source.script_type.as_ref() else {
-                return true; // degenerate Script type — permissive
-            };
-            src_script = Some(sr.clone());
-            match crate::script_chain::chain_native_root(ctx, sr) {
-                Some(root) => src_native = Some(root),
-                None => src_chain_unknown = true,
-            }
+        }
+        DtKind::Class if source.is_meta_type => {
+            // analyzer.cpp:6447-6448 — a class used as a value is its `GDScript` resource.
+            src_native = Some("GDScript".to_owned());
         }
         DtKind::Class => {
             // Walk the in-file base chain to the bottom (analyzer.cpp:6246-6258); a Script
@@ -3298,8 +3309,23 @@ pub(crate) fn is_type_compatible(
             if src_chain_unknown {
                 return true;
             }
+            let target_native = if target.is_meta_type {
+                GDSCRIPT_NATIVE_CLASS
+            } else {
+                target.native_type.as_str()
+            };
             src_native
-                .map(|n| ctx.native.is_subclass_of_named(&n, &target.native_type))
+                .map(|n| native_is_parent_class(ctx, &n, target_native))
+                .unwrap_or(false)
+        }
+        DtKind::Script | DtKind::Class if target.is_meta_type => {
+            // analyzer.cpp:6475-6477, 6486-6488 — a script or class META target takes the
+            // `GDScript` resource itself.
+            if src_chain_unknown {
+                return true;
+            }
+            src_native
+                .map(|n| native_is_parent_class(ctx, &n, "GDScript"))
                 .unwrap_or(false)
         }
         DtKind::Script => {
@@ -3348,6 +3374,19 @@ pub(crate) fn is_type_compatible(
         }
         _ => false,
     }
+}
+
+/// The class Godot gives a native class used as a value (`GDScriptNativeClass`).
+const GDSCRIPT_NATIVE_CLASS: &str = "GDScriptNativeClass";
+
+/// `ClassDB::is_parent_class` over the native DB. `GDScriptNativeClass` is a module class that
+/// `extension_api.json` never lists, so its `RefCounted` base is spelled out here
+/// (gdscript.h, `class GDScriptNativeClass : public RefCounted`).
+fn native_is_parent_class(ctx: &AnalysisContext, sub: &str, sup: &str) -> bool {
+    if sub == GDSCRIPT_NATIVE_CLASS {
+        return sup == GDSCRIPT_NATIVE_CLASS || ctx.native.is_subclass_of_named("RefCounted", sup);
+    }
+    ctx.native.is_subclass_of_named(sub, sup)
 }
 
 /// The this-file [`ScriptRef`] identity of an in-file class NODE — root has an empty inner
@@ -5023,6 +5062,11 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     // when neither project arm resolved. Only set on a Some lookup (degrade-don't-lie: a
     // silent-Variant miss records `Unresolved`, never a guessed class).
     let mut native_callee: Option<String> = None;
+    // #583: the builtin a successful `lookup_builtin_method` ran against —
+    // `CalleeTarget::Builtin` when neither project nor native arm resolved. Same
+    // degrade-don't-lie rule as `native_callee`: a miss records `Unresolved`, never a guessed
+    // builtin.
+    let mut builtin_callee: Option<String> = None;
 
     // #546: a BUILTIN base never takes the constructor arm. Godot's `get_function_signature` puts
     // its BUILTIN lookup (analyzer.cpp:5904-5937) ABOVE the `p_is_constructor` → `_init` rewrite
@@ -5386,6 +5430,10 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
 
     if !found && base_type.kind == DtKind::Builtin && base_type.builtin_type != VariantType::Nil {
         if let Some(s) = lookup_builtin_method(ctx, base_type.builtin_type, &function_name) {
+            // #583: a dispatched builtin method is a resolvable callee, not a miss — the
+            // binding block below records `CalleeTarget::Builtin` so navigation anchors into
+            // the builtin's stub page the way it does for native classes.
+            builtin_callee = Some(data_type::variant_type_name(base_type.builtin_type).to_owned());
             return_type = Some(s.return_dt.clone());
             sig = s;
             found = true;
@@ -6000,7 +6048,9 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     //      `Unresolved` rather than a placeholder id.
     //   3. `native_callee` — a `lookup_native_method` hit: the class the lookup ran against
     //      (consumers resolve the DECLARING class via `NativeDb::lookup_member`).
-    //   4. `Unresolved` — builtin-value/enum methods, value-callables, misses.
+    //   4. `builtin_callee` — a `lookup_builtin_method` hit: the builtin's dump name (consumers
+    //      anchor into the builtin's own stub page, #583).
+    //   5. `Unresolved` — value-callables, misses.
     // Recording is additive (WP-N1b): it sets no type and emits no diagnostic.
     if callee_kind || is_subscript_callee || call.is_super {
         let caller = caller_function_name(ctx);
@@ -6057,6 +6107,8 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
             }
         } else if let Some(class) = native_callee {
             CalleeTarget::Native { class }
+        } else if let Some(class) = builtin_callee {
+            CalleeTarget::Builtin { class }
         } else {
             CalleeTarget::Unresolved
         };

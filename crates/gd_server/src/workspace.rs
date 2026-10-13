@@ -133,8 +133,13 @@ pub struct Workspace {
     /// client's `didChangeWatchedFiles`. `Index::on_file_changed` unconditionally bumps the
     /// file's epoch (forcing re-analysis), so an identical-content reindex is NOT a free no-op;
     /// this gate is what makes the belt-and-suspenders delivery free. Content-addressed (not a
-    /// time window), so an A→B→A edit sequence applies all three. Bounded LRU; entries drop on
-    /// [`Self::remove`].
+    /// time window), so an A→B→A edit sequence applies all three. Bounded LRU.
+    ///
+    /// A record is only ever the fingerprint of the text the index's interface was extracted
+    /// from. Any other write to the index for that path clears it ([`Self::reindex`],
+    /// [`Self::remove`], and the reconcile walk, which records its own read instead). A stale
+    /// record turns the event for a finished write into a "duplicate" of content the index no
+    /// longer holds, and the wrong interface then sticks for the session (#623).
     last_applied_disk: LruCache<Utf8PathBuf, u64>,
     /// Per-file stat snapshot used for warm-start cache saves and stat-based reconcile. Keyed by
     /// normalized path (`gd_project::normalize_path`). Populated during warm-load (stat-diff walk)
@@ -157,6 +162,8 @@ pub struct Workspace {
     /// (every file, no type filter). Paths only — never parsed; freshness rides the shared stat
     /// table like scenes.
     pub(crate) assets: AssetIndex,
+    /// Recent state changes, kept for the builtin-member audit (`crate::trail`).
+    pub(crate) trail: crate::trail::Trail,
 }
 
 impl Workspace {
@@ -282,7 +289,16 @@ impl Workspace {
         // default), so the "never zero" invariant `lru::LruCache::new` requires is enforced by the
         // type — no fallible unwrap at this call site.
         let cap = options.memory.cache_capacity();
+        let mut trail = crate::trail::Trail::default();
+        trail.state(format!(
+            "workspace loaded: Godot {dialect}, {file_count} script(s), {} class_name(s), {} \
+             GDExtension(s), native DB {}",
+            index.registry().len(),
+            project.gdextensions.len(),
+            crate::trail::describe_native(&native),
+        ));
         Workspace {
+            trail,
             native,
             project,
             dialect,
@@ -323,6 +339,37 @@ impl Workspace {
             .put(normalize_path_buf(path), fingerprint(text));
     }
 
+    /// Record a script's interface write in the trail, and its `class_name` change, if any: a
+    /// `class_name` entering or leaving the registry changes how every file resolves that name.
+    fn note_reindex(&mut self, path: &Utf8Path, new_class: Option<&str>, origin: &str) {
+        let old_class = self
+            .index
+            .interface_of(path)
+            .and_then(|i| i.class_name.clone());
+        self.trail.file(format!(
+            "{origin} reindex {path} (class_name {new_class:?})"
+        ));
+        if old_class.as_deref() != new_class {
+            self.trail.name(format!(
+                "class_name of {path}: {old_class:?} -> {new_class:?} ({origin})"
+            ));
+        }
+    }
+
+    /// Record a script leaving the index (see [`Self::note_reindex`]).
+    fn note_removal(&mut self, path: &Utf8Path, origin: &str) {
+        let old_class = self
+            .index
+            .interface_of(path)
+            .and_then(|i| i.class_name.clone());
+        self.trail.file(format!("{origin} removed {path}"));
+        if old_class.is_some() {
+            self.trail.name(format!(
+                "class_name of {path}: {old_class:?} -> None ({origin} removal)"
+            ));
+        }
+    }
+
     /// M7 (#61): the wholesale-invalidation counter component of the pull-diagnostics
     /// `resultId` — see the field doc.
     pub fn analysis_generation(&self) -> u64 {
@@ -341,6 +388,10 @@ impl Workspace {
         );
         self.analysis_cache.clear();
         self.analysis_generation += 1;
+        self.trail.state(format!(
+            "strict config changed; analysis cache cleared (generation {})",
+            self.analysis_generation
+        ));
     }
 
     /// M7 (#59): apply runtime analyzer knobs (iteration cap, checkpoint delay). Cached results
@@ -353,6 +404,10 @@ impl Workspace {
             .map(std::time::Duration::from_micros);
         self.analysis_cache.clear();
         self.analysis_generation += 1;
+        self.trail.state(format!(
+            "analyzer config changed; analysis cache cleared (generation {})",
+            self.analysis_generation
+        ));
     }
 
     /// M7 (#59): resize both LRU caches to a runtime `memory.cacheCapacity`. `lru::resize`
@@ -845,6 +900,9 @@ impl Workspace {
         for _ in 0..analysis_drop {
             self.analysis_cache.pop_lru();
         }
+        self.trail.state(format!(
+            "memory pressure: evicted {parse_drop} parse(s) and {analysis_drop} analysis(es)"
+        ));
         parse_drop + analysis_drop
     }
 
@@ -906,7 +964,11 @@ impl Workspace {
     /// via `save_cache_excluding_open` so warm-load re-parses from disk rather than serving the
     /// never-persisted buffer interface as disk truth.
     pub fn reindex(&mut self, path: &Utf8Path, tree: &ParseTree) {
+        // The index stops reflecting the recorded disk text here; a disk-sourced caller records
+        // the new text right after (see `last_applied_disk`).
+        self.last_applied_disk.pop(&normalize_path_buf(path));
         let iface = gd_project::extract_interface(tree);
+        self.note_reindex(path, iface.class_name.as_deref(), "live");
         self.index.txn(path, |idx| {
             idx.on_file_changed(path, iface);
         });
@@ -948,6 +1010,7 @@ impl Workspace {
         // M7 (#60): a deleted file's dedupe record must not suppress a future re-create with
         // identical content.
         self.last_applied_disk.pop(&normalize_path_buf(path));
+        self.note_removal(path, "live");
         self.index.txn(path, |idx| {
             idx.on_file_removed(path);
         });
@@ -1139,6 +1202,9 @@ impl Workspace {
         // once the file is readable/valid. A genuinely absent file is *not* a failure — it rebuilds
         // normally (the legitimate standalone-`.gd` case).
         if outcome.should_preserve_prior() {
+            self.trail.state(format!(
+                "project.godot reload {outcome:?}; previous project model kept"
+            ));
             log::warn!(
                 "project.godot reload {outcome:?}; keeping the previous project model, native DB, \
                  and warning policy rather than resetting to defaults"
@@ -1160,12 +1226,21 @@ impl Workspace {
                  rebuilt",
                 self.dialect,
             );
+            self.trail.state(format!(
+                "project.godot reload moved the dialect {} -> {dialect}",
+                self.dialect
+            ));
             self.dialect = dialect;
             self.dialect_origin = dialect_origin;
             self.project = project;
             return true;
         }
         self.dialect_origin = dialect_origin;
+        self.trail.state(format!(
+            "project.godot reloaded: {} GDExtension(s), {} autoload(s)",
+            project.gdextensions.len(),
+            project.autoloads.len(),
+        ));
         self.project = project;
         // A `project.godot` reload re-scans the `.uid` sidecars, so hand the fresh map over; every
         // file whose uid target moved is re-resolved and marked dirty by the swap.
@@ -1205,6 +1280,10 @@ impl Workspace {
         );
         self.analysis_cache.clear();
         self.analysis_generation += 1;
+        self.trail.state(format!(
+            "project reload cleared the analysis cache (generation {})",
+            self.analysis_generation
+        ));
         false
     }
 
@@ -1243,6 +1322,11 @@ impl Workspace {
             || (self.native.provenance() == ApiProvenance::Exact
                 && new.provenance() != ApiProvenance::Exact);
         if downgrade {
+            self.trail.state(format!(
+                "native DB reload refused as a downgrade: kept {}, rejected {}",
+                crate::trail::describe_native(&self.native),
+                crate::trail::describe_native(&new),
+            ));
             log::warn!(
                 "native API: reload resolved a strictly worse source ({} classes, {:?} \
                  provenance); keeping the live DB ({} classes, {:?})",
@@ -1258,11 +1342,27 @@ impl Workspace {
             && new.provenance() == self.native.provenance()
         {
             log::debug!("native API: reload resolved identical content; nothing to do");
+            self.trail
+                .state("native DB reload resolved identical content; kept".to_owned());
             return false;
         }
+        let (old_desc, new_desc) = (
+            crate::trail::describe_native(&self.native),
+            crate::trail::describe_native(&new),
+        );
+        let replaced = if old_desc == new_desc {
+            format!("reloaded unchanged: {new_desc}")
+        } else {
+            format!("replaced: {old_desc} -> {new_desc}")
+        };
+        log::info!("native API: live DB {replaced}");
         self.native = new;
         self.analysis_cache.clear();
         self.analysis_generation += 1;
+        self.trail.state(format!(
+            "native DB {replaced} (generation {})",
+            self.analysis_generation
+        ));
         true
     }
 
@@ -1497,9 +1597,11 @@ impl Workspace {
             let tree = parse_in_dialect(&text, self.dialect).tree;
             let new_iface = gd_project::extract_interface(&tree);
             let is_added = self.index.interface_of(&path).is_none();
+            self.note_reindex(&path, new_iface.class_name.as_deref(), "reconcile");
             self.index.txn(&path, |idx| {
                 idx.on_file_changed(&path, new_iface);
             });
+            self.record_disk_apply(&path, &text);
             // Update stat table with the fresh stat (or remove entry if stat failed so next
             // reconcile retries).
             if let Some(s) = new_stat {
@@ -1536,7 +1638,9 @@ impl Workspace {
                 .collect();
             let n = removed_paths.len();
             for path in &removed_paths {
+                self.note_removal(path, "reconcile");
                 self.index.txn(path, |idx| idx.on_file_removed(path));
+                self.last_applied_disk.pop(&normalize_path_buf(path));
                 self.stat_table.remove(path);
             }
             // M11 (#76): parallel scene removal pass — a `.tscn` in the index but absent from the
@@ -1602,6 +1706,10 @@ impl Workspace {
         _span.record("walked", walked as u64);
         _span.record("walk_errors", walk_errors as u64);
         _span.record("elapsed_us", _start.elapsed().as_micros() as u64);
+        self.trail.state(format!(
+            "reconcile ({mode_label}): added {added}, modified {modified}, removed {removed}, \
+             walk errors {walk_errors}"
+        ));
 
         ReconciliationReport {
             added,
@@ -1746,6 +1854,7 @@ fn warm_index_from_cache(
     // reparsed nor added, so they must be excluded from the "unchanged" count below (otherwise a
     // locked/permission-denied file is mis-reported as unchanged).
     let mut skipped_unreadable = 0usize;
+    let mut assets_changed = 0usize;
 
     for entry_result in walker {
         let entry = match entry_result {
@@ -1788,6 +1897,7 @@ fn warm_index_from_cache(
                 (Some(old), Some(new)) => old.size != new.size || old.mtime_ns != new.mtime_ns,
             };
             if stat_changed {
+                assets_changed += 1;
                 if let Some(res) = gd_project::path_to_res(root, &path) {
                     assets.insert(res);
                 }
@@ -1911,16 +2021,22 @@ fn warm_index_from_cache(
                 stat_table.remove(&gd_project::normalize_path(&abs));
             }
         }
+        // Scripts and scenes are parsed; every other file is only indexed by path. Name both
+        // groups, so the totals add up to the cached-file count logged before the diff.
         log::info!(
-            "warm_index: stat-diff complete: {} unchanged, {} reparsed, {} added, {} removed, \
-             {} skipped (unreadable)",
+            "warm_index: stat-diff complete: scripts and scenes {} unchanged, {} reparsed, \
+             {} added, {} removed, {} skipped (unreadable); other files {} unchanged, \
+             {} changed, {} removed",
             walked_paths
                 .len()
                 .saturating_sub(reparsed + added + skipped_unreadable),
             reparsed,
             added,
-            removed_paths.len(),
+            removed_paths.len() + removed_scenes.len(),
             skipped_unreadable,
+            walked_asset_paths.len().saturating_sub(assets_changed),
+            assets_changed,
+            removed_assets.len(),
         );
     } else {
         log::info!(
@@ -2273,7 +2389,7 @@ fn reconcile_release(
                  from that dump, so code that is fine would be reported as errors. The built-in \
                  stock {dialect} surface is being used instead, which means classes from your own \
                  Godot build are not available. Re-dump with a {dialect} binary (set \
-                 `godotBinaryPath`, or the GDLS_GODOT environment variable), or fix \
+                 `godotBinaryPath`, or the GODOT environment variable), or fix \
                  `application/config/features` in project.godot."
             ))
         }
@@ -2288,7 +2404,7 @@ fn reconcile_release(
                 "the extension_api.json gdls found is for Godot {dump_release} but this project \
                  declares Godot {dialect}. gdls will not report unknown identifiers or members \
                  against it, since every API added since {dump_release} is missing from it. \
-                 Re-dump with a {dialect} binary (set `godotBinaryPath`, or the GDLS_GODOT \
+                 Re-dump with a {dialect} binary (set `godotBinaryPath`, or the GODOT \
                  environment variable), or fix `application/config/features` in project.godot."
             ))
         }

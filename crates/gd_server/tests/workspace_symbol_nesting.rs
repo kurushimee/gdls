@@ -6,7 +6,7 @@
 //! singleton whose script carries no `class_name` was missing for a different reason: it is a
 //! project-wide global that no `class_name` registry entry covers.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

@@ -11,7 +11,7 @@
 //!      `endCharacter`); full columned ranges otherwise.
 //!   4. A malformed/partial-AST file still folds what parsed and never panics.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, request, shutdown, TempProject};
 use lsp_server::Connection;

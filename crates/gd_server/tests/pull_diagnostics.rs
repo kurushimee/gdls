@@ -2,7 +2,7 @@
 //! `resultId`/`unchanged` round-trip, cross-file (epoch) invalidation, and the advertised
 //! capability shape. `workspace/diagnostic` stays method-not-found by design (`docs/09 §5`).
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, sample_project, shutdown};
 use lsp_server::{Connection, Message, RequestId};
@@ -234,9 +234,9 @@ fn dependency_interface_edit_invalidates_dependent_result_id() {
     shutdown(&client, server_thread);
 }
 
-/// The advertised provider shape, and the deliberate `workspace/diagnostic` skip.
+/// A client without pull support is not offered it: diagnostics reach it by push alone.
 #[test]
-fn advertises_diagnostic_provider_and_skips_workspace_diagnostic() {
+fn push_client_is_not_offered_a_diagnostic_provider() {
     let p = sample_project();
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
@@ -248,6 +248,40 @@ fn advertises_diagnostic_provider_and_skips_workspace_diagnostic() {
         })),
         ..Default::default()
     };
+    client.sender.send(request(1, "initialize", init)).unwrap();
+    let resp = recv_response(&client);
+    let caps = &resp.result.expect("initialize result")["capabilities"];
+    assert!(
+        caps.get("diagnosticProvider")
+            .is_none_or(serde_json::Value::is_null),
+        "a push client must not be offered pull: {caps}"
+    );
+    client
+        .sender
+        .send(notification("initialized", InitializedParams {}))
+        .unwrap();
+    shutdown(&client, server_thread);
+}
+
+/// A pull client (`textDocument.diagnostic` plus `workspace.diagnostics.refreshSupport`) gets the
+/// exact provider shape and NO `publishDiagnostics`: a client fed by both channels keeps two
+/// collections and shows every item twice. `workspace/diagnostic` stays a deliberate skip.
+#[test]
+fn pull_client_gets_the_provider_and_no_pushes() {
+    let p = sample_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let init = serde_json::json!({
+        "capabilities": {
+            "textDocument": { "diagnostic": { "dynamicRegistration": false } },
+            "workspace": { "diagnostics": { "refreshSupport": true } },
+        },
+        "initializationOptions": {
+            "projectRoot": p.root.as_str(),
+            "autoDumpExtensionApi": false,
+            "extensionApiPath": p.root.join("extension_api.json").as_str(),
+        },
+    });
     client.sender.send(request(1, "initialize", init)).unwrap();
     let resp = recv_response(&client);
     let caps = &resp.result.expect("initialize result")["capabilities"];
@@ -265,17 +299,58 @@ fn advertises_diagnostic_provider_and_skips_workspace_diagnostic() {
         .send(notification("initialized", InitializedParams {}))
         .unwrap();
 
+    let uri = file_uri(&p.root.join("unused.gd"));
+    client
+        .sender
+        .send(notification(
+            "textDocument/didOpen",
+            DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: uri.clone(),
+                    language_id: "gdscript".to_string(),
+                    version: 1,
+                    text: UNUSED_SRC.to_string(),
+                },
+            },
+        ))
+        .unwrap();
     client
         .sender
         .send(request(
             2,
+            "textDocument/diagnostic",
+            serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+        ))
+        .unwrap();
+    // The server handles messages in order, so a push for the open would arrive before the reply.
+    let report = loop {
+        match recv(&client) {
+            Message::Notification(note) => assert_ne!(
+                note.method, "textDocument/publishDiagnostics",
+                "a pull client must not also receive pushes"
+            ),
+            Message::Response(r) if r.id == RequestId::from(2) => {
+                break r.result.expect("pull returns a report")
+            }
+            _ => {}
+        }
+    };
+    assert!(
+        !report["items"].as_array().expect("full report").is_empty(),
+        "the pull must carry the diagnostics the push no longer sends"
+    );
+
+    client
+        .sender
+        .send(request(
+            3,
             "workspace/diagnostic",
             serde_json::json!({ "previousResultIds": [] }),
         ))
         .unwrap();
     let resp = loop {
         let r = recv_response(&client);
-        if r.id == RequestId::from(2) {
+        if r.id == RequestId::from(3) {
             break r;
         }
     };

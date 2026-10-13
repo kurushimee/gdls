@@ -15,7 +15,7 @@
 //! into `Invalid cast` / `Cannot assign` false positives). Keeping the real scene setup is what
 //! gives the guard teeth against re-introduction.
 
-mod common;
+use crate::common;
 
 use common::TempProject;
 use gd_server::config::InitializationOptions;

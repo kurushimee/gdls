@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use crate::common;
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
     ClientCapabilities, GeneralClientCapabilities, GotoDefinitionParams, GotoDefinitionResponse,
@@ -60,10 +61,13 @@ fn boot_with_options(
     init_options: Option<serde_json::Value>,
 ) -> (Connection, std::thread::JoinHandle<()>) {
     let (server, client) = Connection::memory();
+    let (scratch, workspace_folders) = common::scratch_root();
     let handle = std::thread::spawn(move || {
+        let _scratch = scratch;
         gd_server::serve(server).expect("serve() returned an error");
     });
     let init = InitializeParams {
+        workspace_folders,
         capabilities: ClientCapabilities {
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(vec![PositionEncodingKind::UTF8]),
@@ -1656,7 +1660,8 @@ fn definition_on_native_symbols_jumps_into_materialized_stubs() {
     let fixture = tempfile::tempdir().expect("create fixture dir");
     let fixture_dir = fixture.path().to_path_buf();
     std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
-    let stub_cache = fixture_dir.join("stub-cache");
+    // Under `.gdls/`, which the watcher ignores, so a materialized page never indexes as a project script.
+    let stub_cache = fixture_dir.join(".gdls").join("stub-cache");
     let api_path = fixture_dir.join("extension_api.json");
     std::fs::write(
         &api_path,
@@ -2048,7 +2053,8 @@ fn hover_and_definition_reach_a_scripts_inherited_members() {
     let script_path = fixture_dir.join("main.gd");
     std::fs::write(&script_path, src).expect("write main.gd");
 
-    let stub_dir = fixture_dir.join("stubs");
+    // Under `.gdls/`, which the watcher ignores, so a materialized page never indexes as a project script.
+    let stub_dir = fixture_dir.join(".gdls").join("stubs");
     let init_options = serde_json::json!({
         "projectRoot": fixture_dir.to_string_lossy().as_ref(),
         "extensionApiPath": api_path.to_string_lossy().as_ref(),
@@ -2134,7 +2140,8 @@ fn builtin_type_symbols_carry_docs_and_jump_into_a_stub() {
     let fixture = tempfile::tempdir().expect("create fixture dir");
     let fixture_dir = fixture.path().to_path_buf();
     std::fs::write(fixture_dir.join("project.godot"), "").expect("write project.godot");
-    let stub_cache = fixture_dir.join("stub-cache");
+    // Under `.gdls/`, which the watcher ignores, so a materialized page never indexes as a project script.
+    let stub_cache = fixture_dir.join(".gdls").join("stub-cache");
     let api_path = fixture_dir.join("extension_api.json");
     std::fs::write(
         &api_path,

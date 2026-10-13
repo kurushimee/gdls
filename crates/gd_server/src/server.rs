@@ -165,6 +165,14 @@ pub(crate) struct ClientCaps {
     /// and the pull client re-requests on its own cadence — typically only for the document it is
     /// editing, which is exactly the staleness this closes for clients that DO advertise it.
     pub(crate) diagnostic_refresh_support: bool,
+    /// Diagnostics travel on ONE channel per client, never both: a client that receives a file's
+    /// diagnostics by push and by pull keeps them as two collections and shows every item twice
+    /// (VS Code renders both in one hover). Pull is chosen when the client advertises
+    /// `textDocument.diagnostic` AND [`Self::diagnostic_refresh_support`] — without refresh, a
+    /// cross-file change could never reach a pulled report for a file the user isn't editing,
+    /// which push handles by republishing every affected open buffer. When true, gdls advertises
+    /// `diagnosticProvider` and never sends `publishDiagnostics`; when false, the reverse.
+    pub(crate) pull_diagnostics: bool,
     /// The M11 (#79) workspace file-operation gates, captured under
     /// `workspace.fileOperations`. Grouped in a sub-struct like [`CodeActionCaps`] so the handler
     /// reads `state.caps.file_operations.<gate>` and the advertised capability mirrors them.
@@ -333,6 +341,24 @@ impl ClientCaps {
     /// 0.97 misspells — see there.
     fn negotiate(caps: &lsp_types::ClientCapabilities, raw: &serde_json::Value) -> Self {
         let td = caps.text_document.as_ref();
+        // #255/#277: `workspace.diagnostics.refreshSupport` — PLURAL, per LSP 3.17. lsp-types
+        // 0.97 names the field `workspace.diagnostic` (singular), which under its
+        // `rename_all = "camelCase"` deserializes the wrong wire key, so the typed path is
+        // blind to what VS Code, Neovim, Zed and Sublime actually send (all four of the
+        // captured client profiles use the plural). Read the spec key off the raw object and
+        // keep the typed field as a fallback for any client that follows lsp-types instead.
+        let diagnostic_refresh_support = raw
+            .get("workspace")
+            .and_then(|w| w.get("diagnostics"))
+            .and_then(|d| d.get("refreshSupport"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                caps.workspace
+                    .as_ref()
+                    .and_then(|w| w.diagnostic.as_ref())
+                    .and_then(|d| d.refresh_support)
+                    .unwrap_or(false)
+            });
         ClientCaps {
             hierarchical_document_symbols: td
                 .and_then(|t| t.document_symbol.as_ref())
@@ -404,24 +430,9 @@ impl ClientCaps {
                 .and_then(|w| w.workspace_edit.as_ref())
                 .and_then(|w| w.document_changes)
                 .unwrap_or(false),
-            // #255/#277: `workspace.diagnostics.refreshSupport` — PLURAL, per LSP 3.17. lsp-types
-            // 0.97 names the field `workspace.diagnostic` (singular), which under its
-            // `rename_all = "camelCase"` deserializes the wrong wire key, so the typed path is
-            // blind to what VS Code, Neovim, Zed and Sublime actually send (all four of the
-            // captured client profiles use the plural). Read the spec key off the raw object and
-            // keep the typed field as a fallback for any client that follows lsp-types instead.
-            diagnostic_refresh_support: raw
-                .get("workspace")
-                .and_then(|w| w.get("diagnostics"))
-                .and_then(|d| d.get("refreshSupport"))
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or_else(|| {
-                    caps.workspace
-                        .as_ref()
-                        .and_then(|w| w.diagnostic.as_ref())
-                        .and_then(|d| d.refresh_support)
-                        .unwrap_or(false)
-                }),
+            diagnostic_refresh_support,
+            pull_diagnostics: td.and_then(|t| t.diagnostic.as_ref()).is_some()
+                && diagnostic_refresh_support,
             semantic_tokens: SemanticTokensCaps::negotiate(caps),
             inlay_hint: InlayHintCaps::negotiate(caps),
             code_action: CodeActionCaps::negotiate(caps),
@@ -1076,44 +1087,15 @@ fn serve_inner(
     // is simply absent —
     // which is why it carries `Generic` provenance and why the analyzer will not turn its misses
     // into errors. A stderr line is invisible to most clients; "never lie" covers a degraded
-    // surface the user cannot see. One notification per session, at startup, never repeated.
+    // surface the user cannot see. One notification per session: at startup, or when the background
+    // dump settles if one is running.
     notify_dialect(&state);
 
-    // #329: a dump that named a different Godot release than the project declared was rejected
-    // (or demoted) during load. That is a different story from "no dump was found", and the user
-    // has to hear the real one — the fix is on their side, in project.godot or in which binary
-    // dumped the API. Takes precedence over the generic-surface notice below, which would
-    // otherwise tell them nothing was found when something was.
-    if let Some(notice) = state.workspace.native_release_notice.clone() {
-        show_message(&state, lsp_types::MessageType::WARNING, &notice);
-    } else if state.workspace.native.provenance() == gd_types::ApiProvenance::Generic {
-        // #302: name the release actually ingested. Since v3.0.0 the stock asset is picked per
-        // project from `application/config/features`, so a hardcoded version told a 4.7 user the
-        // 4.6 surface was loaded while the log line right above said otherwise.
-        let h = state.workspace.native.header();
-        let served = format!(
-            "Godot {}.{}.{}",
-            h.version_major, h.version_minor, h.version_patch
-        );
-        // #503: WARNING, and the consequence spelled out. The stock surface carries `Generic`
-        // provenance, and `Generic` gates off EVERY negative diagnostic in the file, not just
-        // claims about engine classes — `Function "x()" not found in base self.` and misses on
-        // the user's OWN classes go with it. Saying only that custom classes are missing reads
-        // as "the surface is fine", so a user chasing vanished errors has nothing to connect
-        // this to. The release-mismatch notice one branch up already says it this way; the two
-        // states cost the same, so they announce the same.
-        show_message(
-            &state,
-            lsp_types::MessageType::WARNING,
-            &format!(
-                "gdls is using its built-in stock {served} API surface — no project dump was \
-                 found. Engine classes and their documentation are available, but classes from \
-                 your own Godot build or from GDExtensions are not, so gdls will not report \
-                 unknown identifiers or members anywhere in your code. To use your engine's \
-                 real API, set `godotBinaryPath` (or the GDLS_GODOT environment variable), or \
-                 point `extensionApiPath` at an extension_api.json."
-            ),
-        );
+    // A first session has no dump yet, so it boots on the stock surface while Godot dumps the real
+    // one in the background. Announcing the stock surface now would warn about a state that is
+    // about to go away, so the notice waits for the dump's outcome (the `recv(dump_arm)` arm).
+    if dump_rx.is_none() {
+        notify_native_surface(&state);
     }
 
     // At startup no buffers are open yet, so this set is empty; building it via the same helper the
@@ -1244,6 +1226,8 @@ fn serve_inner(
                         log::warn!("native API: background dump thread ended without reporting");
                     }
                 }
+                // The startup notice was held for this outcome; say what the session ended up with.
+                notify_native_surface(&state);
             },
             recv(forward_rx) -> msg => match msg {
                 Ok(Message::Request(req)) => {
@@ -1365,8 +1349,8 @@ fn serve_inner(
             recv(ticker) -> _ => {
                 // M5 WP-O2: periodic RSS sample. One syscall every 3 s; on Windows this is a
                 // process query that costs sub-millisecond, and on Linux it's a `/proc/self/statm`
-                // read. The sampler updates `peak_bytes` in place and emits a `tracing::info!`
-                // event tagged `phase="tick"` so the structured trace carries the whole pressure
+                // read. The sampler updates `peak_bytes` in place and emits a `debug` event tagged
+                // `phase="tick"` so a trace captured with `rss=debug` carries the whole pressure
                 // curve, not just the four explicit lifecycle samples.
                 state.rss.sample_now("tick");
                 // M5 WP-H1: classify the current peak against the resolved budget and react on
@@ -1451,6 +1435,11 @@ fn serve_inner(
     // Use save_cache_excluding_open so any unsaved buffer interfaces are NOT persisted as disk
     // truth: warm-load will re-parse those files from disk and recover the correct on-disk state
     // ("never lie" guarantee — Issue 1 never-lie fix).
+    //
+    // The watcher stops first. The save writes into the watched root, and stopping notify's
+    // Windows watcher while that change is still queued is the race `FileWatcher`'s `Drop`
+    // describes, so the root has to be quiet when it stops.
+    drop(watcher);
     let open_paths = open_buffer_paths(&state);
     state.workspace.save_cache_excluding_open(&open_paths);
 
@@ -1535,6 +1524,10 @@ pub(crate) fn react_to_memory_pressure(state: &mut ServerState) {
     }
     let prev_level = state.memory_pressure;
     state.memory_pressure = new_level;
+    state
+        .workspace
+        .trail
+        .state(format!("memory pressure {prev_level:?} -> {new_level:?}"));
     // `peak_mb` is the monotonic session high-water mark (context); `window_max_mb` is the rolling
     // value that actually drove this transition. Reporting both lets an operator see *why* the
     // ladder recovered even while the session peak is still high.
@@ -1991,7 +1984,30 @@ fn apply_reaction_batch(
     // Scan the batch into two booleans and do the (expensive) reload + republish at most once after.
     let mut project_changed = false;
     let mut native_changed = false;
+    // What set the reload off, named in its log line and the trail (#622).
+    let mut triggers: Vec<String> = Vec::new();
     for reaction in reactions {
+        let what = match &reaction {
+            Reaction::ProjectGodot => Some("project.godot".to_owned()),
+            Reaction::ExtensionApiJson => Some("extension_api.json".to_owned()),
+            Reaction::Gdextension { path, change } => Some(format!("{path} ({change:?})")),
+            Reaction::DocClassesXml { path } => Some(path.to_string()),
+            _ => None,
+        };
+        if let Some(what) = what {
+            state
+                .workspace
+                .trail
+                .state(format!("watcher: {} {what}", reaction_kind(&reaction)));
+            if triggers.len() < 8 && !triggers.contains(&what) {
+                triggers.push(what);
+            }
+        } else if let Reaction::Scene { path, change } = &reaction {
+            state
+                .workspace
+                .trail
+                .file(format!("watcher: scene {path} ({change:?})"));
+        }
         match reaction {
             // Coalesce the project/native-DB reactions into the post-batch reload below.
             Reaction::ProjectGodot
@@ -2009,8 +2025,9 @@ fn apply_reaction_batch(
     // `native_changed` (it reloads the native DB too), so the `else if` avoids a double reload.
     if project_changed {
         log::info!(
-            "watcher: project.godot / GDExtension surface changed; reloading project model + \
-             native DB (coalesced once for the batch)"
+            "watcher: project.godot / GDExtension surface changed ({}); reloading project model + \
+             native DB (coalesced once for the batch)",
+            triggers.join(", ")
         );
         let _progress = server_progress(state, "Reloading Godot API");
         if state.workspace.reload_project_and_native(&state.options) {
@@ -2019,6 +2036,15 @@ fn apply_reaction_batch(
         republish_all_open_buffers(state);
         // M10 (#72): project/native surface changed → re-request semantic tokens for visible docs.
         send_semantic_tokens_refresh(state);
+    } else if native_changed && root_dump_is_outranked(state, root) {
+        // Godot's dump always lands in the project root before `try_adopt_dump` moves it into
+        // `.gdls/`, so every auto-dump fires this event for a file that is already gone. Neither
+        // that echo nor a user's own root file can change the live DB while a pinned path or a
+        // managed dump outranks it in the resolution ladder.
+        log::debug!(
+            "watcher: project-root extension_api.json changed, but a pinned extensionApiPath or \
+             the managed .gdls dump outranks it; nothing to reload"
+        );
     } else if native_changed {
         log::info!(
             "watcher: extension_api.json changed; reloading native DB (coalesced for the batch)"
@@ -2043,6 +2069,14 @@ fn apply_reaction_batch(
     // switch can balloon the parse + analysis caches in one go; this catches that burst without
     // waiting for the 3-second ticker.
     state.rss.sample_now("post_watcher");
+}
+
+/// Whether a change to `<root>/extension_api.json` cannot affect the native DB: a pinned
+/// `extensionApiPath` replaces the whole ladder, and a managed `.gdls` dump is tried before the
+/// root file (`api_dump::resolve_native_db`).
+fn root_dump_is_outranked(state: &ServerState, root: &Utf8Path) -> bool {
+    state.options.extension_api_path.is_some()
+        || crate::api_dump::dump_path(root).as_std_path().exists()
 }
 
 /// M7 (#60): translate client-delivered `FileEvent`s into [`Reaction`]s (same classification
@@ -2542,6 +2576,48 @@ fn republish_dirty_open_buffers_except(state: &mut ServerState, skip: Option<&Ur
 /// (`project.godot`) or native DB reload (`extension_api.json` / gdextension surface) where the
 /// `Index.dirty` set won't capture the change (the change isn't interface-keyed; it affects every
 /// file's analysis).
+/// Warn the user when the session serves a degraded native surface: a dump rejected for naming the
+/// wrong Godot release, or the built-in stock surface. Silent when the session has the engine's
+/// own dump.
+fn notify_native_surface(state: &ServerState) {
+    // #329: a dump that named a different Godot release than the project declared was rejected
+    // (or demoted) during load. That is a different story from "no dump was found", and the user
+    // has to hear the real one — the fix is on their side, in project.godot or in which binary
+    // dumped the API. Takes precedence over the generic-surface notice below, which would
+    // otherwise tell them nothing was found when something was.
+    if let Some(notice) = state.workspace.native_release_notice.clone() {
+        show_message(state, lsp_types::MessageType::WARNING, &notice);
+    } else if state.workspace.native.provenance() == gd_types::ApiProvenance::Generic {
+        // #302: name the release actually ingested. Since v3.0.0 the stock asset is picked per
+        // project from `application/config/features`, so a hardcoded version told a 4.7 user the
+        // 4.6 surface was loaded while the log line right above said otherwise.
+        let h = state.workspace.native.header();
+        let served = format!(
+            "Godot {}.{}.{}",
+            h.version_major, h.version_minor, h.version_patch
+        );
+        // #503: WARNING, and the consequence spelled out. The stock surface carries `Generic`
+        // provenance, and `Generic` gates off EVERY negative diagnostic in the file, not just
+        // claims about engine classes — `Function "x()" not found in base self.` and misses on
+        // the user's OWN classes go with it. Saying only that custom classes are missing reads
+        // as "the surface is fine", so a user chasing vanished errors has nothing to connect
+        // this to. The release-mismatch notice one branch up already says it this way; the two
+        // states cost the same, so they announce the same.
+        show_message(
+            state,
+            lsp_types::MessageType::WARNING,
+            &format!(
+                "gdls is using its built-in stock {served} API surface — no project dump was \
+                 found. Engine classes and their documentation are available, but classes from \
+                 your own Godot build or from GDExtensions are not, so gdls will not report \
+                 unknown identifiers or members anywhere in your code. To use your engine's \
+                 real API, set `godotBinaryPath` (or the GODOT environment variable), or \
+                 point `extensionApiPath` at an extension_api.json."
+            ),
+        );
+    }
+}
+
 /// Tell the user which Godot version their scripts are being read as, but only when gdls had to
 /// guess or correct rather than read a declared one.
 ///
@@ -2575,7 +2651,12 @@ fn rebuild_workspace_for_dialect_change(state: &mut ServerState) {
     let dialect = state.workspace.dialect;
     log::info!("rebuilding the workspace under Godot {dialect} semantics");
     let mut sink = crate::progress::NoopSink;
+    let mut trail = std::mem::take(&mut state.workspace.trail);
     state.workspace = Workspace::load_with_progress(&root, &state.options, &mut sink);
+    // Keep the session's history; the fresh workspace's own load entry lands at the end.
+    let loaded = std::mem::take(&mut state.workspace.trail);
+    trail.append_from(loaded);
+    state.workspace.trail = trail;
     for uri in open_buffer_uris(state) {
         reindex_open_buffer(state, &uri);
     }
@@ -2754,14 +2835,16 @@ fn capabilities(
         // changes this file's report (the resultId's epoch component tracks it).
         // workspaceDiagnostics stays false permanently: project-wide pull conflicts with the
         // per-file-diagnostics principle (docs/00 §4; documented skip in docs/09 §5).
-        diagnostic_provider: Some(lsp_types::DiagnosticServerCapabilities::Options(
-            lsp_types::DiagnosticOptions {
+        // Advertised only to a pull client, which then gets no `publishDiagnostics` at all
+        // ([`ClientCaps::pull_diagnostics`]).
+        diagnostic_provider: caps.pull_diagnostics.then(|| {
+            lsp_types::DiagnosticServerCapabilities::Options(lsp_types::DiagnosticOptions {
                 identifier: Some("gdls".to_string()),
                 inter_file_dependencies: true,
                 workspace_diagnostics: false,
                 work_done_progress_options: Default::default(),
-            },
-        )),
+            })
+        }),
         // M10 (#75): codeAction. `resolve_provider: true` advertises `codeAction/resolve` — a client
         // with `codeAction.resolveSupport` receives the action sans `edit` and pulls the edit lazily.
         // `code_action_kinds` lists EXACTLY the kinds gdls offers (only `quickfix` this phase) so a
@@ -2906,7 +2989,7 @@ fn dispatch_request(state: &mut ServerState, req: Request) -> Option<Response> {
     // arrives after the mutation in wire order, runs against the new text.
     if let Some(interrupt) = lifecycle.interrupt() {
         let _ = state.shared.finish(&req_id);
-        tracing::info!(
+        tracing::debug!(
             target: "cancel",
             id = %req_id,
             method = %method,
@@ -3241,7 +3324,7 @@ fn finish_request(shared: &SessionShared, resp: Response) -> Response {
     let lifecycle = shared.finish(&resp.id);
     match lifecycle.as_deref().and_then(RequestLifecycle::interrupt) {
         Some(interrupt) => {
-            tracing::info!(target: "cancel", id = %resp.id, interrupt = ?interrupt, "request interrupted");
+            tracing::debug!(target: "cancel", id = %resp.id, interrupt = ?interrupt, "request interrupted");
             interrupt_response(interrupt, resp.id)
         }
         None => resp,
@@ -3516,6 +3599,11 @@ fn parse_params<P: serde::de::DeserializeOwned>(
 /// by a content fingerprint, so the same `didChange` doesn't pay the cost twice when
 /// `documentSymbol` and `publishDiagnostics` race on identical buffer text.
 fn publish_diagnostics(state: &mut ServerState, uri: Uri, version: Option<i32>) {
+    // A pull client reads diagnostics through `textDocument/diagnostic` and re-pulls on
+    // `workspace/diagnostic/refresh`; pushing too would show every item twice.
+    if state.caps.pull_diagnostics {
+        return;
+    }
     let params = PublishDiagnosticsParams {
         diagnostics: diagnostic_items(state, &uri),
         uri,
@@ -3558,6 +3646,15 @@ pub(crate) fn diagnostic_items(state: &mut ServerState, uri: &Uri) -> Vec<Diagno
                 // Only `.gd` files go through the analyzer — for any other open buffer the syntax
                 // diagnostics carry the publish on their own.
                 let analyzed = analyze_gd(state, uri, &parsed.tree, &text);
+                if let Some(result) = analyzed.as_deref() {
+                    crate::trail::audit_member_misses(
+                        &mut state.workspace,
+                        uri,
+                        &text,
+                        &parsed.tree,
+                        result,
+                    );
+                }
                 // Related-location memo BEFORE the doc borrow: every distinct cross-file target
                 // (a SHADOWED_VARIABLE_BASE_CLASS base script) is read once into a rope for the
                 // encoding-correct projection below. Bounded by the related entries one file's
@@ -4402,6 +4499,65 @@ mod tests {
         assert!(unregistered.error.is_none());
     }
 
+    /// The auto-dump's own sequence: Godot writes `<root>/extension_api.json`, `try_adopt_dump`
+    /// moves it into `.gdls/`, and the dump arm adopts it. The watcher event for the moved-away
+    /// root file must not reload on its own; the adoption is what loads the new dump.
+    #[test]
+    fn root_dump_echo_is_skipped_while_the_managed_dump_outranks_it() {
+        const API: &str = r#"{
+            "header": {"version_major": 4, "version_minor": 7, "version_patch": 2,
+                       "version_full_name": "Fake Godot v4.7.2.test"},
+            "classes": [{"name": "Object"}, {"name": "Node", "inherits": "Object"}]
+        }"#;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(dir.path().join("project.godot"), "config_version=5\n").unwrap();
+        let (mut state, _rx) = state_on(&root);
+        let before = state.workspace.analysis_generation();
+
+        let managed = crate::api_dump::dump_path(&root);
+        std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+        std::fs::write(&managed, API).unwrap();
+        assert!(root_dump_is_outranked(&state, &root));
+
+        let open = FxHashSet::default();
+        apply_reaction_batch(&mut state, vec![Reaction::ExtensionApiJson], &root, &open);
+        assert_eq!(
+            state.workspace.analysis_generation(),
+            before,
+            "the root-file echo reloaded the native DB"
+        );
+        assert!(
+            state.workspace.reload_native(&state.options),
+            "the adoption step must still load the managed dump"
+        );
+    }
+
+    /// With no managed dump and nothing pinned, the project-root file is the live source, so a
+    /// change to it still reloads.
+    #[test]
+    fn root_dump_change_reloads_when_nothing_outranks_it() {
+        const API: &str = r#"{
+            "header": {"version_major": 4, "version_minor": 7, "version_patch": 2,
+                       "version_full_name": "Fake Godot v4.7.2.test"},
+            "classes": [{"name": "Object"}, {"name": "Node", "inherits": "Object"}]
+        }"#;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(dir.path().join("project.godot"), "config_version=5\n").unwrap();
+        let (mut state, _rx) = state_on(&root);
+        let before = state.workspace.analysis_generation();
+
+        std::fs::write(root.join("extension_api.json"), API).unwrap();
+        assert!(!root_dump_is_outranked(&state, &root));
+        let open = FxHashSet::default();
+        apply_reaction_batch(&mut state, vec![Reaction::ExtensionApiJson], &root, &open);
+        assert!(
+            state.workspace.analysis_generation() > before,
+            "a new project-root dump must replace the embedded surface"
+        );
+    }
+
     /// WP-H1 Soft action: when the ladder transitions to Soft, `evict_half` runs on the
     /// workspace's caches. Build a state with a budget that puts the running process between
     /// soft and hard (peak > soft, peak ≤ hard), stuff the cache, fire react, then assert the
@@ -4557,6 +4713,94 @@ mod tests {
             state.workspace.index.registry().contains("Latecomer"),
             "need_rescan must trigger a full reconcile that re-walks the tree and indexes the \
              drifted-in late.gd; the rescan branch must bypass (not depend on) per-event dispatch"
+        );
+    }
+
+    /// A per-file debounced event of `kind` on `path`, the shape the live watcher delivers.
+    fn file_event(kind: notify::EventKind, path: &Utf8Path) -> DebouncedEvent {
+        let event = notify::Event::new(kind).add_path(path.as_std_path().to_path_buf());
+        DebouncedEvent::new(event, Instant::now())
+    }
+
+    fn modified_event(path: &Utf8Path) -> DebouncedEvent {
+        use notify::event::{DataChange, ModifyKind};
+        file_event(
+            notify::EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            path,
+        )
+    }
+
+    /// #623: a rescan that catches a file mid-write must not leave the duplicate-delivery gate
+    /// remembering the content from BEFORE the rescan. Otherwise the event for the finished write,
+    /// whose bytes match that stale record, is dropped as a duplicate, and the half-written
+    /// interface (here: no `extends`, so every child reads as `RefCounted`) sticks for the session.
+    #[test]
+    fn a_rescan_mid_write_does_not_swallow_the_finished_write() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+        let base = root.join("base.gd");
+        let good = "extends Node\nclass_name BaseThing\n";
+        std::fs::write(&base, good).unwrap();
+        let (mut state, _rx) = state_on(&root);
+
+        // A save that rewrites identical bytes is applied once and recorded.
+        handle_watcher(&mut state, vec![modified_event(&base)]);
+        // The overflow rescan reads the file while it is truncated.
+        std::fs::write(&base, "").unwrap();
+        handle_watcher(&mut state, vec![rescan_event()]);
+        assert!(
+            !state.workspace.index.registry().contains("BaseThing"),
+            "precondition: the rescan indexed the truncated file"
+        );
+        // The write finishes, and its event arrives.
+        std::fs::write(&base, good).unwrap();
+        handle_watcher(&mut state, vec![modified_event(&base)]);
+
+        let iface = state
+            .workspace
+            .index
+            .interface_of(&base)
+            .expect("base.gd stays indexed");
+        assert_eq!(
+            iface.extends,
+            gd_project::Extends::Names(vec!["Node".to_owned()]),
+            "the finished write must be re-applied, not deduped against the pre-rescan content"
+        );
+        assert!(state.workspace.index.registry().contains("BaseThing"));
+    }
+
+    /// #623, the removal half: a rescan that finds a file gone drops it from the index, so the
+    /// event for its re-creation with the same bytes must not be deduped away.
+    #[test]
+    fn a_rescan_removal_does_not_swallow_the_recreation() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).expect("utf-8 temp dir");
+        std::fs::write(root.join("project.godot"), "config_version=5\n").unwrap();
+        let base = root.join("base.gd");
+        let good = "extends Node\nclass_name BaseThing\n";
+        std::fs::write(&base, good).unwrap();
+        let (mut state, _rx) = state_on(&root);
+
+        handle_watcher(&mut state, vec![modified_event(&base)]);
+        std::fs::remove_file(&base).unwrap();
+        handle_watcher(&mut state, vec![rescan_event()]);
+        assert!(
+            state.workspace.index.interface_of(&base).is_none(),
+            "precondition: the rescan dropped the vanished file"
+        );
+        std::fs::write(&base, good).unwrap();
+        handle_watcher(
+            &mut state,
+            vec![file_event(
+                notify::EventKind::Create(notify::event::CreateKind::File),
+                &base,
+            )],
+        );
+
+        assert!(
+            state.workspace.index.registry().contains("BaseThing"),
+            "the re-created file must be re-indexed, not deduped against its pre-removal content"
         );
     }
 }
