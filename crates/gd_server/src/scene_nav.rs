@@ -209,6 +209,27 @@ pub(crate) fn scene_type_of_base(
     scene_type_ending_at(state, uri, tree, tree.get(base_id).span.end)
 }
 
+/// [`scene_type_ending_at`] for the plain identifier under the cursor — the #589 seam for hover
+/// and typeDefinition on a BINDING whose type was inferred from a `$`/`%`/`get_node("…")` access
+/// (`var h := $Hero`, hover on the declaration name or on a bare use of `h`). The cursor node must
+/// BE an identifier: a bare name, never a member-access slot (`a.h` is a member of `a` — the hop
+/// refuses those again on its side; the gate here keeps a `$`-free cursor from even trying). The
+/// hop's own conservatism carries over unchanged: one hop, off the declaration's own initializer,
+/// an explicit annotation outranks the scene, and an unresolvable shape yields `None`.
+/// NAVIGATION ONLY, exactly like every other seam in this module.
+pub(crate) fn scene_identifier_type_at(
+    state: &ServerState,
+    uri: &Uri,
+    tree: &ParseTree,
+    byte: usize,
+) -> Option<DataType> {
+    let node_id = tree.innermost_node_at(byte)?;
+    if !matches!(tree.get(node_id).kind, NodeKind::Identifier(_)) {
+        return None;
+    }
+    scene_type_ending_at(state, uri, tree, tree.get(node_id).span.end)
+}
+
 /// The innermost `$`/`%` access (a `GetNode` node) or `get_node("literal")` call containing `byte`,
 /// with the scene query it maps to. Both spell the same access — Godot's parser desugars `$X` into
 /// `get_node("X")` — so both resolve through the same query.

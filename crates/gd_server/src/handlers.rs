@@ -398,6 +398,17 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         });
     }
 
+    // #589: the cursor is on a plain identifier whose declaration was inferred from a `$`/`%`/
+    // `get_node("…")` access — the binding itself (`var h := $Hero`, bare uses of `h`). The #125
+    // arm above answers only for a cursor INSIDE the access; this carries the same scene-precise
+    // type one binding back, so hover stops contradicting what `h.combo` offers one character
+    // later. It replaces only the analyzer's inferred type: a member keeps its `var h: …` card and
+    // `##` doc, and a local keeps its bare type label. The one-hop read refuses annotated
+    // declarations (the author's annotation wins) and any identifier in a member-access slot
+    // (`a.h` is about `a`). Navigation-only, like the arm above — this never enters an
+    // `AnalysisResult`.
+    let scene_dt = crate::scene_nav::scene_identifier_type_at(state, &uri, &parsed.tree, byte);
+
     // #513: the cursor is on an annotation's own name (`@export_range`, `@onready`). Nothing below
     // answers that question, so it used to fall all the way through to the "what type is the
     // smallest node around here" arm and render the ENCLOSING CLASS — a card confidently naming the
@@ -415,9 +426,14 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
     // v1.0.2 (issue #26): the cursor is on the NAME of a class-level declaration — render its
     // signature (the analyzer pins no type on the name identifier, so the typed-ancestor
     // fallback below would walk up to the class node and surface its `<Script #N>` meta).
-    if let Some(decl_md) =
-        hover_declaration_signature(state, &parsed.tree, node_id, &uri, analyzed.as_deref())
-    {
+    if let Some(decl_md) = hover_declaration_signature(
+        state,
+        &parsed.tree,
+        node_id,
+        &uri,
+        analyzed.as_deref(),
+        scene_dt.as_ref(),
+    ) {
         let leaf_node = parsed.tree.get(node_id);
         return Some(Hover {
             contents: hover_contents(state, decl_md),
@@ -468,9 +484,9 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         // #411: a member named bare in VALUE position (`speed`, `CAP`, `mode`). Runs last so every
         // call and attribute path above keeps shadowing it.
         .or_else(|| {
-            analyzed
-                .as_deref()
-                .and_then(|a| hover_bare_member_signature(state, &uri, &parsed.tree, byte, a))
+            analyzed.as_deref().and_then(|a| {
+                hover_bare_member_signature(state, &uri, &parsed.tree, byte, a, scene_dt.as_ref())
+            })
         });
 
     let markdown = if let Some(sig) = member_sig {
@@ -483,6 +499,14 @@ pub fn hover(state: &mut ServerState, params: HoverParams) -> Option<Hover> {
         // would point at before falling back.
         if !cursor_is_on_a_symbol(&text, byte) {
             return None;
+        }
+        // #589: a local bound from a node access, which no member card above claims.
+        if let Some(dt) = &scene_dt {
+            let label = human_type_label(state, &parsed.tree, dt);
+            return Some(Hover {
+                contents: hover_contents(state, format!("```gdscript\n{label}\n```")),
+                range: Some(mapper.span_to_range(leaf_node.span)),
+            });
         }
         let file = uri_to_path(&uri).and_then(|p| state.workspace.index.file_id(&p));
         render_hover(
@@ -1131,6 +1155,16 @@ pub fn type_definition(
     // whose declaration is a more useful jump than bare `Node`'s stub. Navigation-only — see
     // `crate::scene_nav`.
     if let Some((_, dt)) = crate::scene_nav::scene_node_type_at(state, &uri, &parsed.tree, byte) {
+        if let Some(loc) = type_decl_location(state, &dt) {
+            return Some(GotoTypeDefinitionResponse::Scalar(loc));
+        }
+    }
+
+    // #589: the same one-hop read for the binding itself — typeDefinition on `h` (from
+    // `var h := $Hero`) lands on the attached script exactly as it does on `$Hero`, instead of
+    // bare `Node`'s stub. Navigation-only; an annotated declaration (`lazy: Node`) is refused by
+    // the hop, so the author's own type keeps answering.
+    if let Some(dt) = crate::scene_nav::scene_identifier_type_at(state, &uri, &parsed.tree, byte) {
         if let Some(loc) = type_decl_location(state, &dt) {
             return Some(GotoTypeDefinitionResponse::Scalar(loc));
         }
@@ -2481,6 +2515,7 @@ fn hover_bare_member_signature(
     tree: &ParseTree,
     cursor_byte: usize,
     analyzed: &AnalysisResult,
+    scene_dt: Option<&gd_analyze::DataType>,
 ) -> Option<String> {
     let ident_id = bare_identifier_at(tree, cursor_byte)?;
     let span = tree.get(ident_id).span;
@@ -2501,6 +2536,12 @@ fn hover_bare_member_signature(
     });
     if let Some((file, class_path)) = target {
         if let Some(iface) = iface_at_inner(&state.workspace.index, file, &class_path) {
+            if let Some(md) = scene_dt.and_then(|dt| {
+                let decl = iface.members.iter().find(|m| m.name.as_str() == name)?;
+                scene_member_hover_md(state, tree, decl, dt)
+            }) {
+                return Some(md);
+            }
             // #526: the bare read's own type table entry, for a member the interface cannot type.
             let resolved = iface
                 .members
@@ -2861,6 +2902,7 @@ fn hover_declaration_signature(
     leaf_id: NodeId,
     uri: &Uri,
     analyzed: Option<&AnalysisResult>,
+    scene_dt: Option<&gd_analyze::DataType>,
 ) -> Option<String> {
     if !matches!(&tree.get(leaf_id).kind, NodeKind::Identifier(_)) {
         return None;
@@ -2981,6 +3023,9 @@ fn hover_declaration_signature(
             .find(|i| i.class_name.as_deref() == Some(class_name))?;
     }
     let member_decl = iface.members.iter().find(|m| m.name == name)?;
+    if let Some(md) = scene_dt.and_then(|dt| scene_member_hover_md(state, tree, member_decl, dt)) {
+        return Some(md);
+    }
     let member_doc = member_decl.doc.clone();
     let class_path: Vec<String> = chain.iter().rev().cloned().collect();
     let params = crate::signature_help::declaring_param_list(state, fid, &class_path, &name);
@@ -3017,6 +3062,35 @@ fn hover_declaration_signature(
     // M7 (#62): the member's own `##` doc prose, BBCode → GFM, plus the #258 banner.
     if let Some(doc) = member_doc {
         crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, &doc);
+    }
+    Some(md)
+}
+
+/// #589: the card for a member bound from a node access (`@onready var sp := $Sprite`), typed
+/// with the scene-precise type from `scene_nav` instead of the shallow interface's bare `Node`.
+/// Same signature shape and `##` doc as every other member card, so only the type differs. `None`
+/// for anything but a variable, the only member kind the one-hop read answers for.
+fn scene_member_hover_md(
+    state: &ServerState,
+    tree: &ParseTree,
+    decl: &gd_project::MemberDecl,
+    scene_dt: &gd_analyze::DataType,
+) -> Option<String> {
+    if !matches!(
+        decl.kind,
+        gd_project::MemberKind::Var | gd_project::MemberKind::Property
+    ) {
+        return None;
+    }
+    let untyped = gd_project::MemberDecl {
+        ty: gd_project::TypeExpr::None,
+        ..decl.clone()
+    };
+    let base = format_member_signature(&decl.name, &untyped, &state.workspace.native, None)?;
+    let label = human_type_label(state, tree, scene_dt);
+    let mut md = format!("```gdscript\n{base}: {label}\n```");
+    if let Some(doc) = &decl.doc {
+        crate::docs::append_member_doc(&mut md, crate::docs::ProseFormat::Markdown, doc);
     }
     Some(md)
 }
