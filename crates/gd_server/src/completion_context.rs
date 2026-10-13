@@ -32,6 +32,8 @@
 //!
 //! 1. **Deferred** (`$`/`%`/`get_node` node paths, `load`/`preload` file paths) — M11; checked first
 //!    so they are never misread as a member/identifier.
+//!    Then the **prose guard**: a caret inside any other string literal (closed or not) or inside a
+//!    comment yields [`CompletionKind::None`], as Godot offers nothing there (#599, #620).
 //! 2. **Member access** — anchor is `.` (or an identifier immediately preceded by `.`). Wins even
 //!    inside a call: `print(foo.` is `Attribute`, not a call argument. `super.` ⇒ `SuperMethod`.
 //! 3. **Punctuation-anchored** — `[` (subscript), `=`/`+=`/… (assign), `@…` (annotation), an
@@ -312,19 +314,30 @@ fn word_containing(tokens: &[Token], byte: usize) -> Option<ByteSpan> {
 ///
 /// Strings are single `Literal` tokens whose span covers both quotes, so "inside" is the strict
 /// span test: a cursor at the closing quote or past it is OUT of the string, which is how the
-/// `"abc".` member list keeps working. Comments are not tokens; the lexer records one
+/// `"abc".` member list keeps working. Only the string family counts, so a caret mid-number
+/// (`f(12|3)`) keeps its context. Comments are not tokens; the lexer records one
 /// [`CommentData`] per line whose span runs from the `#` to (exclusive) the newline, so a cursor
 /// anywhere from just past the `#` through the line's end byte counts — including the line-end
 /// position where comment typing actually stops. The deferred pass has already run by the time
 /// this is consulted, so `preload`/`load`/`get_node`/quoted-`$` shapes are never suppressed.
 fn in_prose(tokens: &[Token], comments: &HashMap<u32, CommentData>, byte: usize) -> bool {
-    let in_string = tokens
-        .iter()
-        .any(|t| t.kind == TokenKind::Literal && t.span.start < byte && byte < t.span.end);
-    in_string
+    cursor_inside_string_literal(tokens, byte)
+        || cursor_inside_unterminated_string(tokens, byte)
         || comments
             .values()
             .any(|c| c.span.start < byte && byte <= c.span.end)
+}
+
+/// Whether the cursor sits in a string whose closing quote is not typed yet. The lexer turns such a
+/// string into one `Error` token running from its opening quote (or `&`/`^`/`r` prefix) to where the
+/// scan stopped, so a caret at that token's end — the end of the source — is still inside it.
+fn cursor_inside_unterminated_string(tokens: &[Token], byte: usize) -> bool {
+    tokens.iter().any(|t| {
+        t.kind == TokenKind::Error
+            && &*t.source == "Unterminated string."
+            && t.span.start < byte
+            && byte <= t.span.end
+    })
 }
 
 /// Whether a token kind is a "word" the user could be mid-typing as an identifier/keyword. Used to
@@ -1447,13 +1460,6 @@ fn classify_call_or_identifier(
                     ) || callee_kind.is_identifier();
 
                     if is_callee && !is_func_params {
-                        // A caret strictly inside a string argument (`print("ab|")`, `f(&"|")`) is
-                        // not an expression position: Godot offers nothing there beyond a per-call
-                        // `get_argument_options` string list, which gdls does not build. The
-                        // path-taking callees were already claimed by `classify_deferred` (#620).
-                        if cursor_inside_string_literal(tokens, byte) {
-                            return CompletionContext::bare(CompletionKind::None);
-                        }
                         let arg_index = arg_index_after(tokens, open_idx, byte);
                         let (callee, callee_name) = recover_callee(tree, tokens, callee_idx);
                         return CompletionContext::new(

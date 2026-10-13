@@ -1589,3 +1589,34 @@ fn member_access_after_a_string_still_classifies() {
     let m = "func f():\n\tvar n := \"abc\".|\n";
     assert!(matches!(at(m).kind, CompletionKind::Attribute { .. }));
 }
+
+#[test]
+fn no_completion_inside_an_unterminated_string() {
+    // Typing before the closing quote exists: the lexer makes the rest of the source one `Error`
+    // token, and Godot still offers nothing — in an assignment, a call argument, or at EOF.
+    for m in [
+        "func f():\n\tvar s := \"hello wo|\n\tpass\n",
+        "func f():\n\tvar s := &\"na|",
+        "func f():\n\tprint(\"ab|\n",
+    ] {
+        assert_eq!(at(m).kind, CompletionKind::None, "{m:?}");
+    }
+}
+
+#[test]
+fn the_prose_guard_keeps_its_neighbors() {
+    // A `#` inside a string is not a comment, a caret just before a trailing `#` is outside it, and
+    // a caret mid-number is not in a string.
+    assert_eq!(
+        at("func f():\n\tvar s = \"# no\"\n\tpri|\n").kind,
+        CompletionKind::Identifier
+    );
+    assert_eq!(
+        at("func f():\n\tvar x = 1 # trailing co|\n").kind,
+        CompletionKind::None
+    );
+    assert!(matches!(
+        at("func f():\n\tf(12|3)\n").kind,
+        CompletionKind::CallArguments { .. }
+    ));
+}
