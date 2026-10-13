@@ -10,7 +10,7 @@
 //! `_make_arguments_hint` builds (gdscript_editor.cpp:750-795). Godot's editor language server
 //! answers `null` to `textDocument/signatureHelp`, so the hint popup is the only oracle for it.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

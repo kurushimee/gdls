@@ -21,7 +21,7 @@
 //!      literal.
 //!   6. A user variable/type named `Color` (non-constructor) → NO swatch.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, request, shutdown, TempProject};
 use lsp_server::Connection;

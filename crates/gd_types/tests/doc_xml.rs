@@ -102,3 +102,18 @@ fn json_dump_wins_over_doc_xml() {
     assert!(db.is_subclass_of_named("Node", "Object"));
     assert!(!db.is_subclass_of_named("Node", "Bogus"));
 }
+
+/// A doc page for a builtin (`Vector3.xml` from the engine's `doc/classes`, or anything else
+/// spelling a builtin's name) is not a class. Merged as one, it shadowed the builtin for the
+/// analyzer, which checks native classes first, and `Vector3.ZERO` stopped resolving (#622).
+#[test]
+fn doc_xml_never_turns_a_builtin_into_a_class() {
+    let mut db = NativeDb::from_json(TRIMMED).expect("trimmed parses");
+    let fake = parse_doc_class(
+        r#"<?xml version="1.0"?><class name="Vector3"><methods><method name="length"><return type="float"/></method></methods></class>"#,
+    )
+    .expect("parses");
+    assert!(!db.merge_doc_class(fake), "Vector3 is a builtin");
+    assert!(db.class_named("Vector3").is_none());
+    assert!(db.builtin_named("Vector3").is_some());
+}

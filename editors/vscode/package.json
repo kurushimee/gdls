@@ -1,0 +1,467 @@
+{
+  "name": "gdls",
+  "displayName": "gdls: GDScript Language Server",
+  "description": "Fast, type-aware GDScript diagnostics and navigation for Godot 4.6 and 4.7, with no Godot editor running.",
+  "version": "1.0.1",
+  "publisher": "kurushimee",
+  "license": "MIT",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kurushimee/gdls",
+    "directory": "editors/vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/kurushimee/gdls/issues"
+  },
+  "homepage": "https://github.com/kurushimee/gdls/tree/main/editors/vscode#readme",
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "keywords": [
+    "godot",
+    "gdscript",
+    "lsp",
+    "language server",
+    "gamedev"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/project.godot"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "gdls only starts in a trusted workspace, since it can run the Godot binary and a formatter configured by the workspace.",
+      "restrictedConfigurations": [
+        "gdls.path",
+        "gdls.godotBinaryPath",
+        "gdls.formatter.command",
+        "gdls.formatter.args"
+      ]
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "languages": [
+      {
+        "id": "gdscript",
+        "aliases": [
+          "GDScript",
+          "gdscript"
+        ],
+        "extensions": [
+          ".gd"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "gdscript",
+        "scopeName": "source.gdscript",
+        "path": "./syntaxes/GDScript.tmLanguage.json"
+      }
+    ],
+    "configurationDefaults": {
+      "[gdscript]": {
+        "editor.insertSpaces": false,
+        "editor.detectIndentation": true,
+        "editor.tabSize": 4
+      }
+    },
+    "commands": [
+      {
+        "command": "gdls.restart",
+        "title": "Restart Server",
+        "category": "gdls"
+      },
+      {
+        "command": "gdls.showOutput",
+        "title": "Show Output",
+        "category": "gdls"
+      }
+    ],
+    "configuration": {
+      "title": "gdls",
+      "properties": {
+        "gdls.path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "machine-overridable",
+          "markdownDescription": "Path to the `gdls` executable. Leave empty to find `gdls` on `PATH`."
+        },
+        "gdls.projectRoot": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "resource",
+          "markdownDescription": "The Godot project folder (the one holding `project.godot`). Leave empty to use the first `project.godot` found in the workspace."
+        },
+        "gdls.dialect": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            null,
+            "4.6",
+            "4.7"
+          ],
+          "enumDescriptions": [
+            "Read the release from project.godot",
+            "Godot 4.6",
+            "Godot 4.7"
+          ],
+          "default": null,
+          "markdownDescription": "Pin the Godot release whose GDScript rules apply. Leave unset to read it from `project.godot`, which Godot always writes."
+        },
+        "gdls.godotBinaryPath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "machine-overridable",
+          "markdownDescription": "Godot 4.x executable used to dump `extension_api.json`. Leave empty to try `GODOT`, then `godot4` and `godot` on `PATH`."
+        },
+        "gdls.extensionApiPath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "window",
+          "markdownDescription": "Use this hand-made `extension_api.json` instead of the managed dump. Setting it also turns off the automatic dump."
+        },
+        "gdls.autoDumpExtensionApi": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Let gdls run Godot in the background to dump the project's native API into `.gdls/`, so GDExtension classes resolve."
+        },
+        "gdls.embeddedApiFallback": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "When no project dump is available, fall back to the stock class list for the project's Godot release, so built-in types like `Node` still resolve."
+        },
+        "gdls.strict.profile": {
+          "type": "string",
+          "enum": [
+            "godot",
+            "strict",
+            "off"
+          ],
+          "enumDescriptions": [
+            "Godot's own default warning levels and project settings",
+            "Godot's levels plus every typing warning, promoted to an error",
+            "Errors only, no warnings"
+          ],
+          "default": "godot",
+          "markdownDescription": "Diagnostics profile."
+        },
+        "gdls.strict.enableWarnings": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "UNASSIGNED_VARIABLE",
+              "UNASSIGNED_VARIABLE_OP_ASSIGN",
+              "UNUSED_VARIABLE",
+              "UNUSED_LOCAL_CONSTANT",
+              "UNUSED_PRIVATE_CLASS_VARIABLE",
+              "UNUSED_PARAMETER",
+              "UNUSED_SIGNAL",
+              "SHADOWED_VARIABLE",
+              "SHADOWED_VARIABLE_BASE_CLASS",
+              "SHADOWED_GLOBAL_IDENTIFIER",
+              "UNREACHABLE_CODE",
+              "UNREACHABLE_PATTERN",
+              "STANDALONE_EXPRESSION",
+              "STANDALONE_TERNARY",
+              "INCOMPATIBLE_TERNARY",
+              "UNTYPED_DECLARATION",
+              "INFERRED_DECLARATION",
+              "UNSAFE_PROPERTY_ACCESS",
+              "UNSAFE_METHOD_ACCESS",
+              "UNSAFE_CAST",
+              "UNSAFE_CALL_ARGUMENT",
+              "UNSAFE_VOID_RETURN",
+              "RETURN_VALUE_DISCARDED",
+              "STATIC_CALLED_ON_INSTANCE",
+              "MISSING_TOOL",
+              "REDUNDANT_STATIC_UNLOAD",
+              "REDUNDANT_AWAIT",
+              "MISSING_AWAIT",
+              "ASSERT_ALWAYS_TRUE",
+              "ASSERT_ALWAYS_FALSE",
+              "INTEGER_DIVISION",
+              "NARROWING_CONVERSION",
+              "INT_AS_ENUM_WITHOUT_CAST",
+              "INT_AS_ENUM_WITHOUT_MATCH",
+              "ENUM_VARIABLE_WITHOUT_DEFAULT",
+              "EMPTY_FILE",
+              "DEPRECATED_KEYWORD",
+              "CONFUSABLE_IDENTIFIER",
+              "CONFUSABLE_LOCAL_DECLARATION",
+              "CONFUSABLE_LOCAL_USAGE",
+              "CONFUSABLE_CAPTURE_REASSIGNMENT",
+              "CONFUSABLE_TEMPORARY_MODIFICATION",
+              "INFERENCE_ON_VARIANT",
+              "NATIVE_METHOD_OVERRIDE",
+              "GET_NODE_DEFAULT_WITHOUT_ONREADY",
+              "ONREADY_WITH_EXPORT"
+            ]
+          },
+          "uniqueItems": true,
+          "default": [],
+          "markdownDescription": "Warnings to turn on, on top of the profile."
+        },
+        "gdls.strict.disableWarnings": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "UNASSIGNED_VARIABLE",
+              "UNASSIGNED_VARIABLE_OP_ASSIGN",
+              "UNUSED_VARIABLE",
+              "UNUSED_LOCAL_CONSTANT",
+              "UNUSED_PRIVATE_CLASS_VARIABLE",
+              "UNUSED_PARAMETER",
+              "UNUSED_SIGNAL",
+              "SHADOWED_VARIABLE",
+              "SHADOWED_VARIABLE_BASE_CLASS",
+              "SHADOWED_GLOBAL_IDENTIFIER",
+              "UNREACHABLE_CODE",
+              "UNREACHABLE_PATTERN",
+              "STANDALONE_EXPRESSION",
+              "STANDALONE_TERNARY",
+              "INCOMPATIBLE_TERNARY",
+              "UNTYPED_DECLARATION",
+              "INFERRED_DECLARATION",
+              "UNSAFE_PROPERTY_ACCESS",
+              "UNSAFE_METHOD_ACCESS",
+              "UNSAFE_CAST",
+              "UNSAFE_CALL_ARGUMENT",
+              "UNSAFE_VOID_RETURN",
+              "RETURN_VALUE_DISCARDED",
+              "STATIC_CALLED_ON_INSTANCE",
+              "MISSING_TOOL",
+              "REDUNDANT_STATIC_UNLOAD",
+              "REDUNDANT_AWAIT",
+              "MISSING_AWAIT",
+              "ASSERT_ALWAYS_TRUE",
+              "ASSERT_ALWAYS_FALSE",
+              "INTEGER_DIVISION",
+              "NARROWING_CONVERSION",
+              "INT_AS_ENUM_WITHOUT_CAST",
+              "INT_AS_ENUM_WITHOUT_MATCH",
+              "ENUM_VARIABLE_WITHOUT_DEFAULT",
+              "EMPTY_FILE",
+              "DEPRECATED_KEYWORD",
+              "CONFUSABLE_IDENTIFIER",
+              "CONFUSABLE_LOCAL_DECLARATION",
+              "CONFUSABLE_LOCAL_USAGE",
+              "CONFUSABLE_CAPTURE_REASSIGNMENT",
+              "CONFUSABLE_TEMPORARY_MODIFICATION",
+              "INFERENCE_ON_VARIANT",
+              "NATIVE_METHOD_OVERRIDE",
+              "GET_NODE_DEFAULT_WITHOUT_ONREADY",
+              "ONREADY_WITH_EXPORT"
+            ]
+          },
+          "uniqueItems": true,
+          "default": [],
+          "markdownDescription": "Warnings to turn off."
+        },
+        "gdls.strict.errorWarnings": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "UNASSIGNED_VARIABLE",
+              "UNASSIGNED_VARIABLE_OP_ASSIGN",
+              "UNUSED_VARIABLE",
+              "UNUSED_LOCAL_CONSTANT",
+              "UNUSED_PRIVATE_CLASS_VARIABLE",
+              "UNUSED_PARAMETER",
+              "UNUSED_SIGNAL",
+              "SHADOWED_VARIABLE",
+              "SHADOWED_VARIABLE_BASE_CLASS",
+              "SHADOWED_GLOBAL_IDENTIFIER",
+              "UNREACHABLE_CODE",
+              "UNREACHABLE_PATTERN",
+              "STANDALONE_EXPRESSION",
+              "STANDALONE_TERNARY",
+              "INCOMPATIBLE_TERNARY",
+              "UNTYPED_DECLARATION",
+              "INFERRED_DECLARATION",
+              "UNSAFE_PROPERTY_ACCESS",
+              "UNSAFE_METHOD_ACCESS",
+              "UNSAFE_CAST",
+              "UNSAFE_CALL_ARGUMENT",
+              "UNSAFE_VOID_RETURN",
+              "RETURN_VALUE_DISCARDED",
+              "STATIC_CALLED_ON_INSTANCE",
+              "MISSING_TOOL",
+              "REDUNDANT_STATIC_UNLOAD",
+              "REDUNDANT_AWAIT",
+              "MISSING_AWAIT",
+              "ASSERT_ALWAYS_TRUE",
+              "ASSERT_ALWAYS_FALSE",
+              "INTEGER_DIVISION",
+              "NARROWING_CONVERSION",
+              "INT_AS_ENUM_WITHOUT_CAST",
+              "INT_AS_ENUM_WITHOUT_MATCH",
+              "ENUM_VARIABLE_WITHOUT_DEFAULT",
+              "EMPTY_FILE",
+              "DEPRECATED_KEYWORD",
+              "CONFUSABLE_IDENTIFIER",
+              "CONFUSABLE_LOCAL_DECLARATION",
+              "CONFUSABLE_LOCAL_USAGE",
+              "CONFUSABLE_CAPTURE_REASSIGNMENT",
+              "CONFUSABLE_TEMPORARY_MODIFICATION",
+              "INFERENCE_ON_VARIANT",
+              "NATIVE_METHOD_OVERRIDE",
+              "GET_NODE_DEFAULT_WITHOUT_ONREADY",
+              "ONREADY_WITH_EXPORT"
+            ]
+          },
+          "uniqueItems": true,
+          "default": [],
+          "markdownDescription": "Warnings to report as errors."
+        },
+        "gdls.completion.snippets": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Insert call parentheses and placeholders when accepting a function completion."
+        },
+        "gdls.completion.callArgumentStyle": {
+          "type": "string",
+          "enum": [
+            "parensWithCursor",
+            "parens",
+            "nameOnly"
+          ],
+          "enumDescriptions": [
+            "foo() with the cursor between the parentheses",
+            "foo() with the cursor after them",
+            "foo with no parentheses"
+          ],
+          "default": "parensWithCursor",
+          "markdownDescription": "How an accepted function completion is inserted, when snippets are on."
+        },
+        "gdls.inlayHint.typeHints": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show the inferred type after `var x :=` and on inferred `for` variables."
+        },
+        "gdls.inlayHint.parameterHints": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show parameter names at call sites with more than one argument."
+        },
+        "gdls.formatter.command": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "machine-overridable",
+          "markdownDescription": "External formatter to run for **Format Document**, such as `gdformat`. It reads the file on stdin and writes the result to stdout. Formatting is off while this is empty."
+        },
+        "gdls.formatter.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "scope": "machine-overridable",
+          "markdownDescription": "Arguments passed to the formatter command. No shell is involved."
+        },
+        "gdls.memory.cacheCapacity": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "markdownDescription": "How many files' parse and analysis results to keep cached. Leave empty for the default."
+        },
+        "gdls.memory.softCapMb": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "markdownDescription": "Memory use, in MB, at which gdls starts trimming its caches. Set it together with the hard cap."
+        },
+        "gdls.memory.hardCapMb": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "markdownDescription": "Memory use, in MB, at which gdls drops its caches. Set it together with the soft cap."
+        },
+        "gdls.analyzer.iterLimit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "default": null,
+          "minimum": 1,
+          "markdownDescription": "Upper bound on analyzer steps per file before it gives up on that file. Leave empty for the default."
+        },
+        "gdls.stubCacheDir": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "scope": "machine-overridable",
+          "markdownDescription": "Folder for the generated engine API pages that go-to-definition opens for built-in classes. Leave empty for the user cache folder."
+        },
+        "gdls.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "markdownDescription": "Log the LSP traffic between the editor and gdls to the **gdls** output channel."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --minify",
+    "watch": "npm run build -- --sourcemap --watch",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package",
+    "test": "npm run build && node test/runTest.js"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "~1.91.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.6.0"
+  }
+}

@@ -276,7 +276,7 @@ fn parse_phase_fidelity() {
     assert!(
         problems.is_empty(),
         "{summary}\n\n{}\n\nTo re-baseline: \
-         GDLS_BLESS_CONFORMANCE=1 cargo test -p gd_syntax --test conformance -- --nocapture\n\n\
+         GDLS_BLESS_CONFORMANCE=1 cargo test -p gd_syntax --test integration conformance:: -- --nocapture\n\n\
          sample mismatches:\n{}",
         problems.join("\n\n"),
         samples.join("\n"),

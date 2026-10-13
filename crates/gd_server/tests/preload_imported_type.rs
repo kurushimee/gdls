@@ -14,7 +14,7 @@
 //! `uid://…` on save, so the tests below pin that the uid form reaches exactly the same answers,
 //! and that a uid nothing declares — or one two resources claim — degrades to Variant in silence.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};

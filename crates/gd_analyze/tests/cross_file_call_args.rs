@@ -317,3 +317,82 @@ fn correctly_typed_calls_stay_silent() {
         assert_eq!(errors(&p, &use_body(body)), Vec::<String>::new(), "{body}");
     }
 }
+
+/// A class name used as a value is its `GDScript` resource, and a native class name is a
+/// `GDScriptNativeClass` object (#621). Before, an in-file class name was checked as an instance
+/// of itself, so passing it to a `Script` parameter was a false error, while a native class name
+/// was checked as an instance and so passed a parameter of its own type. The expected list is
+/// exactly what `godot --check-only` prints for this file at 4.7.2.
+#[test]
+fn a_class_name_used_as_a_value_is_its_script_resource() {
+    let ent = "class_name CharacterEntity\nextends Node\n";
+    let menu = "\
+class_name Menu
+extends Node
+
+func register_method(script: Script, label: StringName) -> void:
+\tprint(script, label)
+
+func take_res(r: Resource) -> void:
+\tprint(r)
+
+func take_gd(g: GDScript) -> void:
+\tprint(g)
+
+func take_node(n: Node) -> void:
+\tprint(n)
+
+func take_obj(o: Object) -> void:
+\tprint(o)
+
+func take_rc(o: RefCounted) -> void:
+\tprint(o)
+";
+    let p = Project::new(&[
+        ("res://ent.gd", ent),
+        ("res://menu.gd", menu),
+        ("res://use.gd", ""),
+    ]);
+    let src = "\
+class_name User
+extends Node
+
+class Inner:
+\tpass
+
+func s(script: Script) -> void:
+\tprint(script)
+
+func f() -> void:
+\tvar m := Menu.new()
+\tm.register_method(CharacterEntity, &\"Kill\")
+\tm.take_res(CharacterEntity)
+\tm.take_gd(CharacterEntity)
+\ts(User)
+\ts(Inner)
+\ts(CharacterEntity)
+\tm.take_node(CharacterEntity)
+\tm.take_node(User)
+\ts(Node)
+\tm.take_node(Node)
+\tm.take_obj(Node)
+\tm.take_rc(Node)
+\tvar sc: Script = CharacterEntity
+\tvar sc2: Script = Inner
+\tprint(sc, sc2)
+";
+    let invalid = |func: &str, to: &str, from: &str| {
+        format!(
+            r#"Invalid argument for "{func}()" function: argument 1 should be "{to}" but is "{from}"."#
+        )
+    };
+    assert_eq!(
+        errors(&p, src),
+        vec![
+            invalid("take_node", "Node", "CharacterEntity"),
+            invalid("take_node", "Node", "User"),
+            invalid("s", "Script", "GDScriptNativeClass"),
+            invalid("take_node", "Node", "GDScriptNativeClass"),
+        ],
+    );
+}

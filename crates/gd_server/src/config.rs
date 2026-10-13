@@ -27,7 +27,7 @@ pub struct InitializationOptions {
     /// source misses.
     pub extension_api_path: Option<String>,
     /// Path to a Godot 4.x executable for the `extension_api.json` auto-dump. Optional; when
-    /// absent, discovery falls back to the `GDLS_GODOT` env var, then `godot4`/`godot` on PATH.
+    /// absent, discovery falls back to the `GODOT` env var, then `godot4`/`godot` on PATH.
     pub godot_binary_path: Option<String>,
     /// v1.0.1: automatically dump `extension_api.json` (with project context, so GDExtension
     /// classes are captured) into `.gdls/` when no explicit `extensionApiPath` is set and the

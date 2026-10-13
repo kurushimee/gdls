@@ -11,7 +11,7 @@
 //!   5. `--path-audit` runs `Index::verify()` and exits nonzero on any identity-invariant
 //!      violation; on a clean index it prints `path-audit: OK` and exits 0.
 
-mod common;
+use crate::common;
 
 use std::process::Command;
 
@@ -100,7 +100,7 @@ fn diagnose_indexes_extension_api() {
 fn diagnose_notes_stock_native_surface_without_dump() {
     // Diagnose never runs the background dump (that is the session's job, issue #25), so a
     // run that fell back to the embedded stock surface must say so — otherwise the resolve
-    // ladder's "set godotBinaryPath or GDLS_GODOT for an exact dump" advice implies this CLI
+    // ladder's "set godotBinaryPath or GODOT for an exact dump" advice implies this CLI
     // will act on it. It won't; only a session dumps.
     let project = sample_project();
     // sample_project ships a project-root extension_api.json (Exact surface); remove it so

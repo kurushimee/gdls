@@ -1,6 +1,14 @@
 # Workspace-local cargo configuration.
-# Build profiles live in the root Cargo.toml ([profile.*]); this file holds command aliases only.
+# Build profiles live in the root Cargo.toml ([profile.*]); this file holds command aliases and the
+# test environment.
 
 [alias]
 # `cargo lint` — the CI lint gate, runnable locally.
 lint = "clippy --workspace --all-targets -- -D warnings"
+
+[env]
+# Most gd_server tests spend their time waiting for a session to go quiet, not computing, so the test
+# pool runs far more threads than cores to overlap those waits (on a 4-core runner the suite took
+# 58 s at the default 4 threads and 13-16 s at 32). An explicit RUST_TEST_THREADS or --test-threads
+# still wins.
+RUST_TEST_THREADS = "32"

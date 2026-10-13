@@ -3,7 +3,7 @@
 //! walk must publish nothing. The whole point of the issue is that these two used to be
 //! indistinguishable, and both came out silent.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};

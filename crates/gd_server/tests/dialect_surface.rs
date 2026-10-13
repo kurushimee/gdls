@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+use crate::common;
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
     ClientCapabilities, GeneralClientCapabilities, Hover, HoverContents, HoverParams,
@@ -68,10 +69,13 @@ fn boot(tag: &str) -> (Connection, std::thread::JoinHandle<()>) {
 /// with the empty one.
 fn boot_with_api(tag: &str, api_path: Option<&str>) -> (Connection, std::thread::JoinHandle<()>) {
     let (server, client) = Connection::memory();
+    let (scratch, workspace_folders) = common::scratch_root();
     let handle = std::thread::spawn(move || {
+        let _scratch = scratch;
         gd_server::serve(server).expect("serve() returned an error");
     });
     let init = InitializeParams {
+        workspace_folders,
         capabilities: ClientCapabilities {
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(vec![PositionEncodingKind::UTF8]),

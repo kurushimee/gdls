@@ -21,7 +21,7 @@
 //!   * minimal-diff: a one-line reformat yields a TextEdit touching only that region, not the whole
 //!     doc.
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 

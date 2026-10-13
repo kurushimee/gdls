@@ -197,6 +197,7 @@ dependencies = [
  "flate2",
  "gd_analyze",
  "gd_project",
+ "gd_server",
  "gd_syntax",
  "gd_types",
  "log",

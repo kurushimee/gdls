@@ -36,7 +36,7 @@ Before tagging a release, run the diagnostics sweep on both acceptance projects,
 
 The five-target fuzz gate (`parse`, `analyze`, `index_invariants`, `complete_context`, `scene_parse`) runs before a release too. Any panic blocks it.
 
-CI runs the same four steps on `ubuntu-latest` and `windows-latest`. The local loop only covers the Linux half, and the Windows leg has stayed red across a dozen merges before because nothing in the merge loop surfaces it. Check `gh run list --branch main` after merging.
+CI runs the tests on `ubuntu-latest` and `windows-latest`, and format and clippy on Linux. The local loop only covers the Linux half, and the Windows leg has stayed red across a dozen merges before because nothing in the merge loop surfaces it. Check `gh run list --branch main` after merging.
 
 ## 5. Known risks
 

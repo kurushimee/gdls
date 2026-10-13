@@ -6,7 +6,7 @@
 //! made the answer depend on which end of the chain the cursor landed on: two disjoint halves,
 //! each presented as the complete answer. These pin the union, and pin what must NOT join it.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, TempProject};
 use lsp_server::Connection;

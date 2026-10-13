@@ -11,7 +11,7 @@
 //! A transport close (stdin EOF with no `exit` at all) stays 0: the client is gone, which is not
 //! a protocol violation.
 
-mod common;
+use crate::common;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};

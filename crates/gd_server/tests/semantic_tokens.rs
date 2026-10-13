@@ -14,7 +14,7 @@
 //!      true vs false produces identical output (gdls emits no base-grammar tokens, so there is
 //!      nothing to suppress — the correct generic-LSP-first behavior).
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, request, shutdown, TempProject};
 use lsp_server::Connection;

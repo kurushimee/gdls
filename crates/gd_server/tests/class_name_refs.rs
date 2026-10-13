@@ -17,7 +17,7 @@
 //! The edit-count assertions are not the point; a corruption bug is only fixed when the rewritten
 //! file is clean, so the tests below apply the edits and re-analyze.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
