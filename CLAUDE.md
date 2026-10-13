@@ -15,15 +15,16 @@ The toolchain is pinned by `rust-toolchain.toml` (`stable` plus `rustfmt` and `c
 ```bash
 cargo fmt --all --check          # format gate (CI fails on diff)
 cargo lint                       # alias: clippy --workspace --all-targets -- -D warnings
-cargo build --workspace --all-targets
 cargo test --workspace
 ```
 
 CI denies all warnings (`RUSTFLAGS: -D warnings`), so be clippy-clean on first write. Use `cargo lint`, the alias in `.cargo/config.toml`, not bare `cargo clippy`.
 
+Each crate builds its integration tests as one binary, `integration`, whose root `tests/main.rs` declares every `tests/*.rs` file as a module. A new test file needs its `mod` line there, or `crates/gd_syntax/tests/test_layout.rs` fails. Run one file's tests with `cargo test -p gd_server --test integration rename::`.
+
 To run it: `cargo run --bin gdls` (debug) or `target/release/gdls` (release). It speaks JSON-RPC over stdio, so a bare invocation just waits for an LSP client.
 
-**The local loop is the Linux half of the gate.** CI also runs the same four steps on `windows-latest`, which stayed red for twelve merges once (#279) because nothing in the merge loop surfaces it. After merging, check `gh run list --branch main --limit 5`. Anything under test that needs a file URI goes through `common::file_uri` (over `gd_server::uri::path_to_file_uri`), never a hand-built `format!("file://…")`, since a Windows temp root is a drive path and does not survive that.
+**`scripts/gate.sh` is the whole CI gate on this machine**, the Windows tests and the VS Code extension included, so a PR merges on its `GATE-COMPLETE ok` without waiting for CI. CI is checked once, on `main` after the merge (`gh run list --branch main --limit 5`). Setup and the disposable Windows mirror are in `scripts/CLAUDE.md`. The rules that keep `gd_server` tests passing on Windows and inside one shared test process are in `crates/gd_server/tests/CLAUDE.md`.
 
 ## Rust workflow notes
 
@@ -51,6 +52,8 @@ Two principles span files:
 **Eager interfaces, lazy bodies** (`docs/01` §4). Every `.gd` is shallow-parsed at startup for what it *exposes* (`extends`, `class_name`, signatures), and full type analysis runs lazily per file on demand, cached and invalidated on change. This mirrors Godot's shallow-versus-full `GDScriptCache`, and it is what makes 10k files tractable. Diagnostics are per file on open and edit, never whole-project.
 
 **Three coordinate spaces, never confused** (`crates/gd_server/src/position.rs`): internal byte offsets (`gd_syntax`), Godot's tab-expanded 1-based `(line, column)` (kept only for `.out` fidelity), and LSP `Position` (UTF-16 by default, UTF-8 or 32 if negotiated). Byte to LSP conversion happens only at the protocol boundary, via a `PositionMapper` built per request from the current rope.
+
+The VS Code and Cursor extension lives in `editors/vscode` (TypeScript, its own npm build and `vscode.yml` workflow). Its `gdls.*` settings mirror `crates/gd_server/src/config.rs`, so a new or renamed option there needs a matching setting there.
 
 `gd_server` is a library plus a thin `main.rs`, so the event loop can be driven over an in-memory `Connection` in tests (`crates/gd_server/tests/lifecycle.rs`). The lexer is pull-based and parser-driven (`crates/gd_syntax/src/lexer.rs`): newline and indent suppression inside `()[]{}` and lambdas is toggled by the parser, so it is not a standalone pre-pass.
 

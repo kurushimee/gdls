@@ -4,7 +4,7 @@
 //! accepts `uid://` too — the const's type, the dependency edge that re-analyzes a consumer, and
 //! the sidecar going stale mid-session.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};

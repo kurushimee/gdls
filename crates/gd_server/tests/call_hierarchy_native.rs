@@ -4,7 +4,7 @@
 //! rust-analyzer/gopls convention). Expanding a stub-anchored item answers with a clean empty
 //! list.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
@@ -41,7 +41,8 @@ fn boot_native(client: &Connection) -> NativeFixture {
     std::fs::write(root.join("project.godot"), "").unwrap();
     let api_path = root.join("extension_api.json");
     std::fs::write(&api_path, NODE_API).unwrap();
-    let stub_cache = root.join("stub-cache");
+    // Under `.gdls/`, which the watcher ignores, so a materialized page never indexes as a project script.
+    let stub_cache = root.join(".gdls").join("stub-cache");
     let src = "extends Node\nfunc go() -> void:\n\tqueue_free()\n\tmystery()\n";
     let main_path = root.join("main.gd");
     std::fs::write(&main_path, src).unwrap();

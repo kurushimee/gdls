@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use crate::common;
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
     ClientCapabilities, DiagnosticTag, DocumentSymbol, DocumentSymbolClientCapabilities,
@@ -49,11 +50,14 @@ fn boot_with_capabilities(
     capabilities: ClientCapabilities,
 ) -> (Connection, std::thread::JoinHandle<()>) {
     let (server, client) = Connection::memory();
+    let (scratch, workspace_folders) = common::scratch_root();
     let handle = std::thread::spawn(move || {
+        let _scratch = scratch;
         gd_server::serve(server).expect("serve() returned an error");
     });
 
     let init = InitializeParams {
+        workspace_folders,
         capabilities,
         ..Default::default()
     };
@@ -1033,10 +1037,13 @@ fn boot_with_options(
     init_options: Option<serde_json::Value>,
 ) -> (Connection, std::thread::JoinHandle<()>) {
     let (server, client) = Connection::memory();
+    let (scratch, workspace_folders) = common::scratch_root();
     let handle = std::thread::spawn(move || {
+        let _scratch = scratch;
         gd_server::serve(server).expect("serve() returned an error");
     });
     let init = InitializeParams {
+        workspace_folders,
         capabilities: ClientCapabilities {
             general: Some(GeneralClientCapabilities {
                 position_encodings: Some(vec![PositionEncodingKind::UTF8]),

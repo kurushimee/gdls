@@ -2,7 +2,7 @@
 //! notification-payload path (sectioned and bare), the malformed-keeps-previous contract, and
 //! the session-structural field guard.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

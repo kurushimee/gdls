@@ -4,7 +4,7 @@
 //! byte-identical: the structured location rides alongside in a field Godot never serializes,
 //! so the conformance ratchets are untouched.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

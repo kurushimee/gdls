@@ -10,7 +10,7 @@
 //! `workspace::version_mismatch_tests` pins the decision itself. This pins what a user sees:
 //! diagnostics on the wire, and the message that explains them.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

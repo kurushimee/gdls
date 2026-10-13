@@ -236,7 +236,7 @@ pub enum ApiProvenance {
 }
 
 /// The native-class database.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct NativeDb {
     interner: Interner,
     classes: FxHashMap<Sym, NativeClass>,
@@ -260,6 +260,9 @@ pub struct NativeDb {
     /// project) is engine-`Exact` yet extension-blind — so the analyzer's negative-claim
     /// gates must decline "does not exist" about these names.
     extension_declared_missing: FxHashSet<Sym>,
+    /// How many classes [`Self::merge_doc_class`] added. The content hash covers only the dump
+    /// text, so this is what tells two DBs with different doc-XML merges apart in a log.
+    doc_class_count: usize,
 }
 
 impl NativeDb {
@@ -278,6 +281,7 @@ impl NativeDb {
             content_hash: 0,
             provenance: ApiProvenance::Absent,
             extension_declared_missing: FxHashSet::default(),
+            doc_class_count: 0,
         }
     }
 
@@ -351,6 +355,7 @@ impl NativeDb {
             content_hash: 0,
             provenance: ApiProvenance::Exact,
             extension_declared_missing: FxHashSet::default(),
+            doc_class_count: 0,
         }
     }
 
@@ -398,6 +403,15 @@ impl NativeDb {
     /// instance `Generic` right after ingest.
     pub fn set_provenance(&mut self, provenance: ApiProvenance) {
         self.provenance = provenance;
+    }
+
+    /// How many classes came from doc XML rather than the dump (see the field).
+    pub fn doc_class_count(&self) -> usize {
+        self.doc_class_count
+    }
+
+    pub fn builtin_count(&self) -> usize {
+        self.builtins.len()
     }
 
     pub fn class_count(&self) -> usize {
@@ -809,17 +823,20 @@ impl NativeDb {
     }
 
     /// Merge a class parsed from doc XML as a fallback tier. Returns `false` and changes nothing if a
-    /// class of that name already exists — the JSON dump always wins (`docs/03-indexing-freshness.md`
+    /// class or builtin of that name already exists — the JSON dump always wins (`docs/03-indexing-freshness.md`
     /// §2). The XML reader normalizes its type strings into the dump's encoding, so ingestion is
     /// shared with the JSON path.
     pub fn merge_doc_class(&mut self, class: api::ClassDef) -> bool {
         if let Some(sym) = self.interner.get(&class.name) {
-            if self.classes.contains_key(&sym) {
+            // A builtin's name is never a class in Godot's ClassDB. Merged as one, it would shadow
+            // the builtin for the analyzer, which checks native classes first.
+            if self.classes.contains_key(&sym) || self.builtins.contains_key(&sym) {
                 return false;
             }
         }
         let nc = ingest_class(class, &mut self.interner);
         self.classes.insert(nc.name, nc);
+        self.doc_class_count += 1;
         true
     }
 }

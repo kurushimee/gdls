@@ -2,7 +2,7 @@
 //! the file (inside preload/load calls). Non-res paths (`user://`, plain strings) produce no
 //! link. The capability flag must also be advertised in `initialize`.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};

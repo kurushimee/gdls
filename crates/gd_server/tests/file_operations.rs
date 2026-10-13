@@ -26,7 +26,7 @@
 //!      `obj.load(…)` method arg is NOT; and the same literal text as a preload arg vs a const in
 //!      one file rewrites ONLY the preload arg (position, not string, is the gate).
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

@@ -6,7 +6,7 @@
 # Differential oracle: PASS against a large real-world GDScript project (manual run), godot
 #   binary on PATH, date 2026-05-27.
 # Re-run on each milestone close via:
-#   GDLS_GODOT_BINARY=<path> GDLS_SAMPLE_CORPUS=<dir> cargo test -p gd_analyze --test differential
+#   GODOT=<path> GDLS_SAMPLE_CORPUS=<dir> cargo test -p gd_analyze --test differential
 # Update this header in the same PR that closes the milestone. Until the CI job described in
 # docs/06 §2 lands (planned with M5 hardening), this header is the M3 exit-criterion witness
 # for "differential oracle agrees on a project sample" (docs/07 row M3).

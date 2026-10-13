@@ -8,7 +8,7 @@
 //!   - `textDocument/definition` on `Global` in `caller.gd` jumps to `global.gd`.
 //!   - Shadowing: a local `var Global = 1` prevents the autoload from being typed.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};

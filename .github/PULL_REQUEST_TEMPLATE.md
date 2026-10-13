@@ -16,7 +16,6 @@ gdls mirrors Godot 4.6.3-stable's GDScript frontend function for function and ma
 
 - [ ] `cargo fmt --all --check`
 - [ ] `cargo lint` (clippy, `-D warnings`)
-- [ ] `cargo build --workspace --all-targets`
 - [ ] `cargo test --workspace`
 
 ## Fidelity ratchets

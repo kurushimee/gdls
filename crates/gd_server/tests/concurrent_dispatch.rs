@@ -11,7 +11,7 @@
 //! one gate; the uncancelled run pays every gate — that gap is what the preemption assertions
 //! measure.
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 

@@ -13,6 +13,7 @@
 
 use std::time::Duration;
 
+use crate::common;
 use lsp_server::{Connection, Message, Notification, Request, RequestId};
 use lsp_types::{
     CancelParams, ClientCapabilities, DidOpenTextDocumentParams, DocumentSymbolParams,
@@ -63,9 +64,14 @@ fn notification(method: &str, params: serde_json::Value) -> Message {
 /// scenario it wants.
 fn init_session() -> (Connection, std::thread::JoinHandle<anyhow::Result<()>>, Uri) {
     let (server, client) = Connection::memory();
-    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let (scratch, workspace_folders) = common::scratch_root();
+    let server_thread = std::thread::spawn(move || {
+        let _scratch = scratch;
+        gd_server::serve(server)
+    });
 
     let init = InitializeParams {
+        workspace_folders,
         capabilities: ClientCapabilities::default(),
         ..Default::default()
     };

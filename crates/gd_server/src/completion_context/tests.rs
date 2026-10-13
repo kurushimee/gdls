@@ -193,6 +193,55 @@ fn call_arguments_not_confused_by_string_paren() {
 }
 
 #[test]
+fn string_call_argument_offers_nothing() {
+    // #620: a caret inside a String/StringName argument of any non-path callee is no completion
+    // context — native, script, and global callees alike, in any slot, StringName or String.
+    for m in [
+        "func g():\n\tprint(\"ab|\")",
+        "func g():\n\temit_signal(\"|\")",
+        "func g():\n\thas_method(\"|\")",
+        "func g():\n\tset_meta(&\"|\", 1)",
+        "func g():\n\tf(&\"|\")",
+        "func g():\n\tf(1, \"x|y\")",
+        "func g():\n\tInput.is_action_pressed(\"|\")",
+    ] {
+        let ctx = at(m);
+        assert_eq!(ctx.kind, CompletionKind::None, "{m:?}");
+    }
+}
+
+#[test]
+fn string_call_argument_guard_keeps_neighbors() {
+    // Outside the quotes the slot is still a call argument; path callees stay deferred.
+    for m in [
+        "func g():\n\tf(|)",
+        "func g():\n\tf(\"a\", |)",
+        "func g():\n\tf(\"a\"|)",
+        "func g():\n\tf(12|3)",
+    ] {
+        let ctx = at(m);
+        assert!(
+            matches!(ctx.kind, CompletionKind::CallArguments { .. }),
+            "{m:?} → {:?}",
+            ctx.kind
+        );
+    }
+    for m in [
+        "func g():\n\tpreload(\"res://|\")",
+        "func g():\n\tload(\"res://|\")",
+        "func g():\n\tget_node(\"|\")",
+        "func g():\n\tNodePath(\"|\")",
+    ] {
+        let ctx = at(m);
+        assert!(
+            matches!(ctx.kind, CompletionKind::Deferred(_)),
+            "{m:?} → {:?}",
+            ctx.kind
+        );
+    }
+}
+
+#[test]
 fn call_arguments_multiline() {
     // A call split across lines: standalone tokenization emits Newline/Indent inside the parens, and
     // the comma counting must skip them. Cursor on the third line is arg index 1.

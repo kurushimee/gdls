@@ -92,3 +92,18 @@ same-file = "1.0.6"
 lto = true
 # `panic` is intentionally left at the default `unwind` (not `abort`): the server must degrade a
 # stray panic to a logged error rather than dying mid-session, and cargo-fuzz relies on unwinding.
+
+[profile.dev]
+# Line tables keep file:line in panics and backtraces at a fraction of the link time and disk of full
+# debug info. Nothing here drives a debugger.
+debug = "line-tables-only"
+
+# Dependencies and gd_types compile optimized even in dev builds. A test session that boots the
+# server ingests the embedded stock extension_api.json, and that serde_json parse is instantiated in
+# gd_types: unoptimized it took about 0.25 s of CPU per boot, roughly half of what the whole gd_server
+# suite spent. Neither changes often, so the extra compile time is paid once and then cached.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.gd_types]
+opt-level = 2

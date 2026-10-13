@@ -12,7 +12,7 @@
 //!   per-signature `activeParameter` only appears behind `activeParameterSupport`;
 //! - `null` when the cursor is in no call; a retrigger keeps `activeSignature` stable.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv_response, request, TempProject};
 use lsp_server::Connection;
