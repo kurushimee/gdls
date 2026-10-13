@@ -32,11 +32,11 @@ Raising a floor is deliberate: update the floor file and say so in the commit me
 
 ## 4. The release gate
 
-Before tagging a release, run the diagnostics sweep on both acceptance projects, comparatively against the previous release binary (`06-testing-fidelity.md` §6). `--strict` plus the warning histogram, error baselines holding, and the private project swept on Windows with the Windows binary. A navigation walk is not a diagnostics gate.
+Before tagging a release, run the diagnostics sweep on both acceptance projects, comparatively against the previous release binary (`06-testing-fidelity.md` §6). `--strict` plus the warning histogram, error baselines holding, and the private project swept on Windows with the Windows binary. A navigation walk is not a diagnostics gate. Every error family that appears or disappears is settled against the project's own engine with `godot --check-only`, and on the OSS project a full diff against the Godot editor's language server, ranges included, should read zero differences.
 
 The five-target fuzz gate (`parse`, `analyze`, `index_invariants`, `complete_context`, `scene_parse`) runs before a release too. Any panic blocks it.
 
-CI runs the tests on `ubuntu-latest` and `windows-latest`, and format and clippy on Linux. The local loop only covers the Linux half, and the Windows leg has stayed red across a dozen merges before because nothing in the merge loop surfaces it. Check `gh run list --branch main` after merging.
+CI runs the tests on `ubuntu-latest` and `windows-latest`, and format and clippy on Linux. `scripts/gate.sh` runs every one of those legs on one machine, Windows and the VS Code extension included (`scripts/CLAUDE.md`), so a pull request merges on the local gate. The libFuzzer job still runs only on `main`, so check `gh run list --branch main` after merging: the Windows leg once stayed red across a dozen merges because nothing in the merge loop surfaced it.
 
 ## 5. Known risks
 
