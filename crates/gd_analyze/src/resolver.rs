@@ -2080,7 +2080,11 @@ fn resolve_class_member(
                 // / const / enum / signal does. Without this, `enum { V }` in a subclass whose
                 // base also defines `V` (as enum value, var, const, etc.) misses the
                 // `The member "X" already exists in parent class …` template.
-                check_class_member_name_conflict(ctx, class_id, &name, false, iid);
+                // analyzer.cpp:1216 / :1232 — the conflict is anchored on the custom value
+                // when the entry has one and on the whole enum otherwise, never on the value's
+                // own identifier.
+                let conflict_anchor = ev.custom_value.or(ev.parent_enum).unwrap_or(iid);
+                check_class_member_name_conflict(ctx, class_id, &name, false, conflict_anchor);
                 // Set RESOLVING so a cyclic custom-value reference re-entering this member
                 // triggers the cyclic_ref check at the top of `resolve_class_member`.
                 ctx.set_type(iid, resolving());
@@ -2325,11 +2329,13 @@ pub(crate) fn resolve_function_signature(ctx: &mut AnalysisContext, func_id: Nod
         // an untyped rest parameter is an *inferred* `Array` plus an UNTYPED_DECLARATION
         // warning, never an error (validating the unspecified shape false-positived
         // `func f(...args):` with `…but "Variant" is specified` through v1.0.2).
-        let has_specifier = matches!(
-            &ctx.node(rp).kind,
-            NodeKind::Parameter(p) if p.datatype_specifier.is_some()
-        );
-        if has_specifier {
+        // analyzer.cpp:1808 / :1810 — both templates anchor on
+        // `p_function->rest_parameter->datatype_specifier`, not on the parameter.
+        let specifier = match &ctx.node(rp).kind {
+            NodeKind::Parameter(p) => p.datatype_specifier,
+            _ => None,
+        };
+        if let Some(spec) = specifier {
             let rt = ctx.get_type(rp).clone();
             if rt.is_set() {
                 let is_array = rt.kind == DtKind::Builtin && rt.builtin_type == VariantType::Array;
@@ -2338,12 +2344,12 @@ pub(crate) fn resolve_function_signature(ctx: &mut AnalysisContext, func_id: Nod
                         format!(
                             r#"The rest parameter type must be "Array", but "{rt}" is specified."#
                         ),
-                        rp,
+                        spec,
                     );
                 } else if !rt.container_element_types.is_empty() {
                     ctx.push_error(
                         "Typed arrays are currently not supported for the rest parameter.",
-                        rp,
+                        spec,
                     );
                 }
             }
