@@ -57,6 +57,8 @@ Configuration can change mid-session through `workspace/didChangeConfiguration`,
 
 Diagnostics carry Godot's warning and error identifiers in the LSP `Diagnostic.code` field, so they are greppable and stable across versions. Where the client advertises support, they also carry `tags`, `relatedInformation`, and a `codeDescription.href` pointing at the ProjectSettings anchor for that warning code (the three deprecated codes point at the overview page instead).
 
+Ranges are byte spans converted at the protocol boundary, with one rewrite: a range that ends on a line break is reported on the line that break closes, at the column one past its last character, which is where Godot's tokenizer puts a NEWLINE token. Without it a missing return or an unimplemented abstract method would highlight the whole next line's indentation as well, since the byte after a `\n` already belongs to the following line.
+
 `Diagnostic.data` pairs each diagnostic with its quickfixes, so `codeAction` can offer them without re-analyzing: a `_` prefix for the `UNUSED_*` family, an `@onready` insertion for `GET_NODE_DEFAULT_WITHOUT_ONREADY`, and a clearly-labeled mechanical `@warning_ignore` insertion. `source.fixAll` aggregates the safe ones.
 
 ## 6. Sources

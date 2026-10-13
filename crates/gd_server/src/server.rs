@@ -3810,7 +3810,7 @@ fn collect_diagnostics(
     let mut out = Vec::with_capacity(syntax.len() + analyzed.map_or(0, |a| a.diagnostics.len()));
     for d in syntax {
         out.push(Diagnostic {
-            range: mapper.span_to_range(d.span),
+            range: mapper.diagnostic_span_to_range(d.span),
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("gdls".to_string()),
             message: d.message.clone(),
@@ -3823,7 +3823,7 @@ fn collect_diagnostics(
             // render against ranges, and the span carries the byte range a Godot-faithful renderer
             // wants. The override only matters for `.out`-style line-number diffing (conformance).
             out.push(Diagnostic {
-                range: mapper.span_to_range(d.span()),
+                range: mapper.diagnostic_span_to_range(d.span()),
                 severity: Some(analyzer_severity(d.severity())),
                 code: Some(NumberOrString::String(d.code().to_owned())),
                 source: Some("gdls".to_string()),
