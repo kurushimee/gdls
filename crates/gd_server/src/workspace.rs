@@ -451,6 +451,14 @@ impl Workspace {
             .filter(|(path, _)| !open_paths.contains(*path))
             .map(|(_, stat)| stat.clone())
             .collect();
+        // The next warm start re-parses these, which otherwise reads as cache churn (#611).
+        let excluded = self.stat_table.len() - files.len();
+        if excluded > 0 {
+            log::info!(
+                "cache: excluding {excluded} open buffer(s) from the persisted stat table; \
+                 they will be re-parsed on the next warm start"
+            );
+        }
         cache::save(root, &self.index, &self.scenes, &self.assets, &files, key);
     }
 
