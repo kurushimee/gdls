@@ -1,6 +1,6 @@
 # Contributing to gdls
 
-`gdls` is a standalone GDScript language server built as a faithful Rust port of the GDScript frontend (tokenizer, parser, analyzer) from Godot 4.6.3-stable.
+`gdls` is a standalone GDScript language server built as a faithful Rust port of the GDScript frontend (tokenizer, parser, analyzer) from Godot. One binary serves every supported Godot release, choosing one per project from `project.godot`. The [README](README.md) lists which releases are supported.
 
 Please read this guide before opening a pull request. The faithful-port rule below is what makes gdls match Godot's diagnostics exactly, and it changes how contributions get reviewed compared to a normal greenfield Rust project.
 
@@ -13,7 +13,9 @@ The port crates (`gd_syntax`, `gd_types`, `gd_analyze`, `gd_project`) mirror God
 - Keep enums dense and in Godot's declaration order. Several of them (`TokenKind`, for one) are `#[repr(u8)]` indices into parallel tables, guarded by `const _: () = assert!(...)` checks.
 - Rename a symbol only when a Rust keyword collides (`SELF` → `SelfKw`, `TK_CONST` → `Const`), and say why in a comment.
 
-The source of truth is the Godot source, not the design docs. Port against a local checkout of official Godot (`godotengine/godot`) at tag `4.6.3-stable`. Derive every enum, count, and message template mechanically from that source. Never hard-code one from memory or from the docs. Where a doc cites a concrete number it may have drifted, and the source wins. Grep to confirm at port time.
+The source of truth is the Godot source, not the design docs. Port against a local checkout of official Godot (`godotengine/godot`) that carries every supported release tag, with HEAD at the newest. Derive every enum, count, and message template mechanically from that source. Never hard-code one from memory or from the docs. Where a doc cites a concrete number it may have drifted, and the source wins. Grep to confirm at port time.
+
+Where the supported releases differ, the ported code follows the newest one, and the older behavior is wrapped in a dialect guard. The guard rules are in [`crates/gd_syntax/src/dialect.rs`](crates/gd_syntax/src/dialect.rs), and `grep -rn "DIALECT("` lists every guard.
 
 The looser Rust conventions further down apply mainly to the `gd_server` LSP glue and to tests.
 
@@ -21,7 +23,7 @@ The looser Rust conventions further down apply mainly to the `gd_server` LSP glu
 
 You need a Rust toolchain. It is pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (`stable` plus `rustfmt` and `clippy`) and `rustup` installs it on first build.
 
-For fidelity work and the local differential-oracle tooling, a local Godot 4.6.3-stable checkout and the `godot` binary are handy (to regenerate `extension_api.json` and to diff against the engine's own output). Neither is required to build or test gdls.
+For fidelity work and the local differential-oracle tooling, a local Godot checkout with the supported release tags and the matching `godot` binaries are handy (to regenerate `extension_api.json` and to diff against the engine's own output). Neither is required to build or test gdls.
 
 ## The dev loop is the CI gate
 
@@ -43,9 +45,7 @@ To run the binary: `cargo run --bin gdls` (debug) or `target/release/gdls`. It s
 
 ## Fidelity and the conformance corpus
 
-"Match Godot exactly" is measured against Godot's own golden corpus (`.gd` input plus `.out` expected output), vendored under `crates/*/tests/conformance/`. Two ratchets are enforced in CI and currently hold at 1.0000: parser 186/186 and analyzer 300/300.
-
-A change that lowers a ratchet fails CI. If you are deliberately adding corpus cases, raise the ratchet to match.
+"Match Godot exactly" is measured against Godot's own golden corpus (`.gd` input plus `.out` expected output), vendored under `crates/*/tests/conformance/`. CI enforces two conformance ratchets, one for the parser and one for the analyzer, and a change that lowers either of them fails CI. If you are deliberately adding corpus cases, raise the ratchet to match.
 
 Five `cargo-fuzz` targets (`parse`, `analyze`, `index_invariants`, `complete_context`, `scene_parse`) run on nightly Linux. Any panic blocks a release: the parser must always return a partial AST, and position conversions must clamp rather than panic.
 
