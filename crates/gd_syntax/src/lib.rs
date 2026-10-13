@@ -14,6 +14,7 @@ pub mod doc_comments;
 pub mod lexer;
 pub mod parser;
 pub mod span;
+pub mod stack;
 pub mod token;
 pub mod warning_names;
 
@@ -179,17 +180,22 @@ mod tests {
         assert!(broken.tree.had_parse_errors);
     }
 
-    /// Deeply nested input must hit the recursion-depth guard and return (with errors), never
-    /// overflow the native stack — that would be an uncatchable abort, a fuzz release-blocker.
+    /// Input nested past the depth limit must come back with errors, never overflow the native
+    /// stack — that would be an uncatchable abort, a fuzz release-blocker. Test threads have small
+    /// stacks, so this also covers `stack::ensure` at every recursion site.
     #[test]
     fn pathological_nesting_does_not_overflow() {
-        let n = 50_000;
+        let n = parser::MAX_PARSE_DEPTH as usize + 10;
         for src in [
-            format!("var x = {}", "(".repeat(n)), // expression nesting
-            format!("var x = {}", "[".repeat(n)), // array nesting
+            format!("var x = {}", "(".repeat(n)),      // expression nesting
+            format!("var x = {}", "[".repeat(n)),      // array nesting
+            format!("var x = {}", "-".repeat(n)),      // unary nesting
+            format!("var x = 1{}", " + 1".repeat(n)),  // binary chain (left spine)
+            format!("var x = self{}", ".a".repeat(n)), // member chain (left spine)
+            format!("var x = {}1", "func(): return ".repeat(n)), // lambda nesting
             format!("var x: {}int", "Array[".repeat(n)), // type nesting
             format!("match 0:\n\t{}0", "[".repeat(n)), // pattern nesting
-            "\tif 0:\n".repeat(n),                // block / indentation nesting
+            "\tif 0:\n".repeat(n),                     // block / indentation nesting
         ] {
             let r = parse(&src);
             assert!(!r.diagnostics.is_empty(), "expected errors, got none");

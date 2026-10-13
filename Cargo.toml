@@ -72,6 +72,9 @@ lru = "0.18.0"
 # confusable-character tables at compile time and zero runtime allocation beyond the skeleton
 # string itself (cached keyword skeleton-set is built once via `OnceLock`).
 unicode-security = "0.1.2"
+# `stacker`: grows the stack on demand where recursion depth follows the source's nesting
+# (`gd_syntax::stack`), so a deep file cannot overflow a thread however small its stack is.
+stacker = "0.1.25"
 # `unicode-ident` — the identifier-character predicate (`is_xid_start`/`is_xid_continue`, faithful to
 # Godot's `xid_start`/`xid_continue` tables in `gdscript_tokenizer.cpp`). Hoisted here so the
 # `gd_syntax` lexer and the `gd_server` inlayHint type-annotation validator share ONE version of the

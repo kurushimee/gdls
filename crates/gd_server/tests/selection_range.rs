@@ -345,3 +345,44 @@ fn out_of_range_and_malformed_never_panic() {
 
     shutdown(&client, server_thread);
 }
+
+/// A pathologically nested line would give one link per enclosing node, and every link nests the
+/// JSON response two levels deeper than JSON readers allow. The chain keeps its innermost and
+/// outermost links within a fixed cap, still strictly increasing.
+#[test]
+fn a_deeply_nested_cursor_gets_a_capped_chain() {
+    let p = base_project();
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let depth = 300;
+    let line = format!("\tvar x = {}{}", "[".repeat(depth), "]".repeat(depth));
+    let src = format!("extends Node\n\nfunc run() -> void:\n{line}\n");
+    init_and_open(&p, &client, &[("deep.gd", &src)]);
+    let uri = file_uri(&p.root.join("deep.gd"));
+
+    let pos = Position {
+        line: 3,
+        character: (9 + depth - 1) as u32,
+    };
+    let result = request_selection(&client, 10, &uri, vec![pos]);
+    let ranges = chain(&result[0]);
+    assert!(
+        (16..=48).contains(&ranges.len()),
+        "chain length {}",
+        ranges.len()
+    );
+    for w in ranges.windows(2) {
+        assert!(strictly_contains(&w[1], &w[0]), "{:?} ⊄ {:?}", w[0], w[1]);
+    }
+    // The outermost link still spans the whole script.
+    let outer = ranges.last().unwrap();
+    assert_eq!(
+        outer.start,
+        Position {
+            line: 0,
+            character: 0
+        }
+    );
+
+    shutdown(&client, server_thread);
+}

@@ -3023,7 +3023,9 @@ fn warn_confusable_local_declaration(ctx: &mut AnalysisContext, node_id: NodeId)
     if name.is_empty() || ctx.suite_stack.len() < 2 {
         return;
     }
-    let parent_suite_id = ctx.suite_stack[ctx.suite_stack.len() - 2];
+    let Some(parent_suite_id) = ctx.suite_stack.iter().nth(1) else {
+        return;
+    };
     let has_in_parent = match &ctx.node(parent_suite_id).kind {
         NodeKind::Suite(s) => s.locals_indices.contains_key(&name),
         _ => false,
@@ -4043,6 +4045,12 @@ fn resolve_class_body(ctx: &mut AnalysisContext, class_id: NodeId) {
 /// gdls's port stays diagnostics-only and skips the capture-rewrite — captures still resolve
 /// against the lambda's enclosing scope via the existing `lookup_local` walk over `suite_stack`.
 fn drain_pending_lambda_bodies(ctx: &mut AnalysisContext) {
+    // A lambda body's suites drain the lambdas nested in it, so this recursion follows the source's
+    // lambda nesting; see `gd_syntax::stack`.
+    gd_syntax::stack::ensure(|| drain_pending_lambda_bodies_body(ctx))
+}
+
+fn drain_pending_lambda_bodies_body(ctx: &mut AnalysisContext) {
     use gd_syntax::ast::NodeKind;
 
     // analyzer.cpp:6536-6537: copy the queue and clear it, then iterate the copy in
@@ -4050,66 +4058,71 @@ fn drain_pending_lambda_bodies(ctx: &mut AnalysisContext) {
     // Any lambdas queued *while* we're draining (nested lambdas, or follow-up lambdas
     // queued from a default-arg reduction triggered during a lambda body) remain in
     // `ctx.pending_lambda_bodies` for the next drain call.
-    let lambdas = std::mem::take(&mut ctx.pending_lambda_bodies);
-    for pending in lambdas {
-        let func_id = match &ctx.node(pending.lambda_id).kind {
-            NodeKind::Lambda(l) => l.function,
-            _ => continue,
-        };
-        let Some(func_id) = func_id else { continue };
+    loop {
+        let lambdas = std::mem::take(&mut ctx.pending_lambda_bodies);
+        for pending in lambdas {
+            let func_id = match &ctx.node(pending.lambda_id).kind {
+                NodeKind::Lambda(l) => l.function,
+                _ => continue,
+            };
+            let Some(func_id) = func_id else { continue };
 
-        // Drain runs with `current_function` / `concrete_function` already restored from the
-        // outer class-body pass (both `None` at this point). Prime `concrete_function` to the
-        // captured outer so `resolve_function_body`'s lambda branch leaves it untouched —
-        // that's what makes static-context errors emitted inside the lambda body resolve the
-        // outer concrete's name (e.g. `static_func()`), or pick the "from a static variable
-        // initializer." template when captured_concrete is `None` (the lambda was queued from
-        // a `static var` initializer at class level, no enclosing concrete function). Also
-        // restore `static_context` to the value captured at queue time — see the matching note
-        // on `reduce_lambda`.
+            // Drain runs with `current_function` / `concrete_function` already restored from the
+            // outer class-body pass (both `None` at this point). Prime `concrete_function` to the
+            // captured outer so `resolve_function_body`'s lambda branch leaves it untouched —
+            // that's what makes static-context errors emitted inside the lambda body resolve the
+            // outer concrete's name (e.g. `static_func()`), or pick the "from a static variable
+            // initializer." template when captured_concrete is `None` (the lambda was queued from
+            // a `static var` initializer at class level, no enclosing concrete function). Also
+            // restore `static_context` to the value captured at queue time — see the matching note
+            // on `reduce_lambda`.
+            //
+            // Also restore the outer `suite_stack` so the lambda body's `lookup_local` resolves
+            // captures from the enclosing function's locals (Godot's capture mechanism). Without
+            // this, identifier references like `outer_var` inside the lambda's body fall through to
+            // `Identifier "X" not declared in the current scope.`. Godot resolves lambdas in the
+            // outer function's environment via per-statement reduce; gdls queues them, so we
+            // snapshot+restore the stack to preserve the same effective scope.
+            let pre_concrete = ctx.concrete_function;
+            let pre_static = ctx.static_context;
+            let pre_suite_stack = std::mem::take(&mut ctx.suite_stack);
+            let pre_lambda_stack = std::mem::take(&mut ctx.current_lambda_stack);
+            ctx.concrete_function = pending.captured_concrete;
+            ctx.static_context = pending.captured_static;
+            ctx.suite_stack = pending.captured_suite_stack;
+            ctx.current_lambda_stack = pending.captured_lambda_stack;
+            ctx.push_current_lambda(pending.lambda_id);
+            resolve_function_body(ctx, func_id, true);
+            ctx.pop_current_lambda();
+            ctx.concrete_function = pre_concrete;
+            ctx.static_context = pre_static;
+            ctx.suite_stack = pre_suite_stack;
+            ctx.current_lambda_stack = pre_lambda_stack;
+        }
+        // If new lambdas were queued during this drain pass (e.g. a lambda body that itself
+        // declared another lambda whose body was queued mid-resolution), keep draining. Godot's
+        // `resolve_pending_lambda_bodies` doesn't loop, but the outer per-statement and class-body
+        // drains call it again afterwards; collapsing those callsites here keeps the queue empty
+        // on return without changing observable ordering. Each pass reaches one level deeper into
+        // nested lambdas, so this is a loop rather than a self-call that would grow the stack with
+        // the source's nesting.
         //
-        // Also restore the outer `suite_stack` so the lambda body's `lookup_local` resolves
-        // captures from the enclosing function's locals (Godot's capture mechanism). Without
-        // this, identifier references like `outer_var` inside the lambda's body fall through to
-        // `Identifier "X" not declared in the current scope.`. Godot resolves lambdas in the
-        // outer function's environment via per-statement reduce; gdls queues them, so we
-        // snapshot+restore the stack to preserve the same effective scope.
-        let pre_concrete = ctx.concrete_function;
-        let pre_static = ctx.static_context;
-        let pre_suite_stack = std::mem::take(&mut ctx.suite_stack);
-        let pre_lambda_stack = std::mem::take(&mut ctx.current_lambda_stack);
-        ctx.concrete_function = pending.captured_concrete;
-        ctx.static_context = pending.captured_static;
-        ctx.suite_stack = pending.captured_suite_stack;
-        ctx.current_lambda_stack = pending.captured_lambda_stack;
-        ctx.push_current_lambda(pending.lambda_id);
-        resolve_function_body(ctx, func_id, true);
-        ctx.pop_current_lambda();
-        ctx.concrete_function = pre_concrete;
-        ctx.static_context = pre_static;
-        ctx.suite_stack = pre_suite_stack;
-        ctx.current_lambda_stack = pre_lambda_stack;
-    }
-    // If new lambdas were queued during this drain pass (e.g. a lambda body that itself
-    // declared another lambda whose body was queued mid-resolution), keep draining. The
-    // Godot's `resolve_pending_lambda_bodies` doesn't loop, but the outer per-statement
-    // and class-body drains call it again afterwards; collapsing those callsites here
-    // keeps the queue empty on return without changing observable ordering.
-    //
-    // M5 WP-O3 / WP-O4 governor + cancellation checkpoint at the re-entrant self-call. A
-    // pathological grammar that perpetually queues new lambdas during drain would otherwise
-    // loop here indefinitely; this checkpoint guarantees the recursion bails by the iter_limit.
-    // The synthetic error anchors at the root class node (or `ByteSpan::default()` if the tree
-    // had no root — degenerate parse), as a "the analyzer gave up draining lambdas in this file"
-    // marker. No single per-lambda span fits; the recursion isn't tied to any one AST node.
-    if !ctx.pending_lambda_bodies.is_empty() {
+        // M5 WP-O3 / WP-O4 governor + cancellation checkpoint before each further pass. A
+        // pathological grammar that perpetually queues new lambdas during drain would otherwise
+        // loop here indefinitely; this checkpoint guarantees the loop bails by the iter_limit.
+        // The synthetic error anchors at the root class node (or `ByteSpan::default()` if the tree
+        // had no root — degenerate parse), as a "the analyzer gave up draining lambdas in this file"
+        // marker. No single per-lambda span fits; the loop isn't tied to any one AST node.
+        if ctx.pending_lambda_bodies.is_empty() {
+            break;
+        }
         let span = ctx
             .tree
             .root_id()
             .map(|root| ctx.tree.get(root).span)
             .unwrap_or_default();
-        if !ctx.checkpoint(span) {
-            drain_pending_lambda_bodies(ctx);
+        if ctx.checkpoint(span) {
+            break;
         }
     }
 }
@@ -6001,6 +6014,11 @@ fn decide_suite_type(ctx: &mut AnalysisContext, suite_id: NodeId, stmt_id: NodeI
 /// expression kind goes through `reduce_expression`; the statement kinds go through their
 /// dedicated `resolve_*` (porting analyzer.cpp:1589-1670).
 fn resolve_node(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
+    // Recursion here follows the source's block nesting; see `gd_syntax::stack`.
+    gd_syntax::stack::ensure(|| resolve_node_body(ctx, id, is_root))
+}
+
+fn resolve_node_body(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     // M5 WP-O3 / WP-O4 governor + cancellation checkpoint at the dispatcher head — covers every
     // statement kind that goes through here, not just the expression kinds that flow into
     // reduce_expression. Bail leaves whichever per-kind resolver was about to run unexecuted; the
@@ -6104,7 +6122,7 @@ fn warn_unused_local(
     if name.is_empty() || name.starts_with('_') {
         return;
     }
-    let Some(&suite_id) = ctx.suite_stack.last() else {
+    let Some(suite_id) = ctx.suite_stack.last() else {
         return;
     };
     let suite_end = ctx.node(suite_id).span.end;

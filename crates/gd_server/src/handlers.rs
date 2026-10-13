@@ -6271,31 +6271,33 @@ pub fn selection_range(
     Some(out)
 }
 
-/// Build the `parent`-linked [`lsp_types::SelectionRange`] ancestor chain for `byte`: start at the
-/// innermost node, walk up via [`crate::completion_context::smallest_node_strictly_containing`]
-/// (the same nearest-strictly-enclosing-ancestor step completion uses) until nothing larger
-/// contains it, then thread the spans into a child→parent linked list. `None` when no node covers
-/// `byte`. A loop guard (bounded by the node count) makes a malformed tree's span relationships
-/// unable to spin.
+/// Most links a selection chain carries. Every link nests the response's JSON two levels deeper,
+/// and JSON readers cap nesting (`serde_json`, which Rust-based clients use, stops at 128), so a
+/// longer chain keeps its innermost links, where expanding a selection starts, and its outermost
+/// ones (statement, function, class), and drops the middle. Real code stays well under the cap;
+/// only a pathologically nested line reaches it.
+const MAX_SELECTION_CHAIN: usize = 48;
+const MAX_SELECTION_CHAIN_OUTER: usize = 16;
+
+/// Build the `parent`-linked [`lsp_types::SelectionRange`] ancestor chain for `byte`: the innermost
+/// node, then its [`crate::completion_context::enclosing_nodes`], threaded into a child→parent
+/// linked list. `None` when no node covers `byte`.
 fn selection_chain_at(
     tree: &ParseTree,
     byte: usize,
     mapper: &PositionMapper,
 ) -> Option<lsp_types::SelectionRange> {
     let innermost = tree.innermost_node_at(byte)?;
-    // Collect node ids innermost → outermost.
-    let mut chain: Vec<NodeId> = vec![innermost];
-    let mut cur = innermost;
-    let mut guard = tree.len();
-    while let Some(parent) = crate::completion_context::smallest_node_strictly_containing(tree, cur)
-    {
-        chain.push(parent);
-        cur = parent;
-        guard = guard.saturating_sub(1);
-        if guard == 0 {
-            break;
-        }
+    // Innermost → outermost.
+    let mut chain = vec![innermost];
+    chain.extend(crate::completion_context::enclosing_nodes(tree, innermost));
+    if chain.len() > MAX_SELECTION_CHAIN {
+        chain.drain(
+            MAX_SELECTION_CHAIN - MAX_SELECTION_CHAIN_OUTER
+                ..chain.len() - MAX_SELECTION_CHAIN_OUTER,
+        );
     }
+
     // Thread from outermost back to innermost so each link points at its parent.
     let mut node: Option<Box<lsp_types::SelectionRange>> = None;
     for &id in chain.iter().rev() {

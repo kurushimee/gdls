@@ -4,6 +4,7 @@
 
 mod annotation_arguments;
 mod conformance;
+mod depth_limit;
 mod dialect_delta;
 mod fuzz_crate_isolation;
 mod fuzz_smoke;

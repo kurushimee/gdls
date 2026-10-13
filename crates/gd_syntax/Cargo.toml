@@ -15,6 +15,7 @@ doctest = false
 unicode-ident.workspace = true
 unicode-security.workspace = true
 serde.workspace = true
+stacker.workspace = true
 
 # Every tests/*.rs file is a module of this one binary (see tests/main.rs), not a binary of its own.
 [[test]]

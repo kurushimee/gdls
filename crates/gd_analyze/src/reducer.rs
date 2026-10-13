@@ -106,6 +106,11 @@ pub(crate) fn class_inner_path(ctx: &AnalysisContext, class_id: NodeId) -> Vec<S
 /// a recursive cycle stops, on exit guarantee the node has a determined type (Godot's tail-guard
 /// at analyzer.cpp:2686). `is_root` is propagated to the call/ternary reducers in E2.
 pub(crate) fn reduce_expression(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
+    // Recursion here follows the source's nesting; see `gd_syntax::stack`.
+    gd_syntax::stack::ensure(|| reduce_expression_body(ctx, id, is_root))
+}
+
+fn reduce_expression_body(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
     if !ctx.reduced.insert(id) {
         // Already reduced this node — don't do this more than once (analyzer.cpp:2600).
         return;
@@ -1886,7 +1891,7 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
     // before the declaration) and `var a = a + 1` (the identifier is inside the same
     // variable's initializer — Godot's parser hasn't added the local yet when parsing
     // the initializer, so it's also UNDEFINED_SOURCE).
-    let forward_local = ctx.suite_stack.last().copied().and_then(|sid| {
+    let forward_local = ctx.suite_stack.last().and_then(|sid| {
         if let NodeKind::Suite(s) = &ctx.node(sid).kind {
             if let Some(&idx) = s.locals_indices.get(&name) {
                 if let Some(local) = s.locals.get(idx) {
@@ -2601,7 +2606,7 @@ fn enclosing_concrete_function_name(ctx: &AnalysisContext) -> Option<String> {
 /// Walk [`AnalysisContext::suite_stack`] innermost-first for a local named `name` (the analog of
 /// Godot's `SuiteNode::has_local` chain reached via `IdentifierNode::suite`).
 pub(crate) fn lookup_local(ctx: &AnalysisContext, name: &str) -> Option<gd_syntax::ast::Local> {
-    for &suite_id in ctx.suite_stack.iter().rev() {
+    for suite_id in ctx.suite_stack.iter() {
         if let NodeKind::Suite(s) = &ctx.node(suite_id).kind {
             if let Some(&idx) = s.locals_indices.get(name) {
                 if let Some(local) = s.locals.get(idx) {
@@ -3602,7 +3607,8 @@ fn reduce_assignment(ctx: &mut AnalysisContext, id: NodeId) {
                     _ => None,
                 })
                 .map(|b| ctx.node(b).span);
-            for &suite_id in ctx.suite_stack.clone().iter().rev() {
+            let suite_stack = ctx.suite_stack.clone();
+            for suite_id in suite_stack.iter() {
                 if let NodeKind::Suite(s) = &ctx.node(suite_id).kind {
                     if let Some(&idx) = s.locals_indices.get(&name) {
                         if let Some(local) = s.locals.get(idx) {
@@ -7117,6 +7123,11 @@ fn const_index(base: &FoldedValue, index: &FoldedValue) -> ConstIndex {
 }
 
 fn reduce_subscript(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: bool) {
+    // A subscript chain recurses into its base directly, not through `reduce_expression`.
+    gd_syntax::stack::ensure(|| reduce_subscript_body(ctx, id, can_be_pseudo_type))
+}
+
+fn reduce_subscript_body(ctx: &mut AnalysisContext, id: NodeId, can_be_pseudo_type: bool) {
     let sub = match ctx.node(id).kind.clone() {
         NodeKind::Subscript(s) => s,
         _ => return,
@@ -10304,50 +10315,113 @@ pub(crate) fn warn_confusable_temporary_modification(ctx: &mut AnalysisContext, 
     if ctx.dialect < Dialect::Godot4_7 {
         return;
     }
-    let is_assignment = matches!(ctx.node(expr_id).kind, NodeKind::Assignment(_));
-    let mut current = match &ctx.node(expr_id).kind {
-        NodeKind::Assignment(a) => a.assignee,
-        NodeKind::Subscript(_) => Some(expr_id),
-        _ => return,
-    };
-
-    while let Some(cur) = current {
-        let NodeKind::Subscript(sub) = ctx.node(cur).kind.clone() else {
-            break;
-        };
-        let Some(base) = sub.base else {
-            break;
-        };
-        let base_dt = ctx.get_type(base).clone();
-        if base_dt.is_typed_container_type() && !base_dt.is_meta_type {
-            if let Some((base_id, scope_native)) = confusable_base_identifier(ctx, base) {
-                let name = subscript_identifier_name(ctx, base_id);
-                if !name.is_empty()
-                    && ctx.native_property_scope.get(&base_id) == Some(&scope_native)
-                    && lookup_native_property(ctx, &scope_native, &name).is_some()
-                {
-                    if is_assignment {
-                        ctx.push_warning(
-                            WarningCode::ConfusableTemporaryModification,
-                            &[scope_native.clone(), name.clone()],
-                            expr_id,
-                        );
-                    } else if let Some(member) = subscript_attribute_name(ctx, cur) {
-                        // Only a *mutating* builtin method loses the write; `points.size()` is
-                        // `const` and reads the copy harmlessly.
-                        if builtin_method_is_mutating(ctx, base_dt.builtin_type, &member) {
-                            ctx.push_warning(
-                                WarningCode::ConfusableTemporaryModification,
-                                &[scope_native.clone(), name.clone(), member],
-                                cur,
-                            );
-                        }
-                    }
+    match ctx.node(expr_id).kind {
+        NodeKind::Assignment(ref a) => {
+            let mut current = a.assignee;
+            while let Some(cur) = current {
+                let Some(base) = subscript_base(ctx, cur) else {
+                    break;
+                };
+                if let Some((scope_native, name)) = confusable_native_property(ctx, base) {
+                    ctx.push_warning(
+                        WarningCode::ConfusableTemporaryModification,
+                        &[scope_native, name],
+                        expr_id,
+                    );
                 }
+                current = Some(base);
             }
         }
-        current = Some(base);
+        NodeKind::Subscript(_) => {
+            // Godot walks every link below `expr_id` here. Only the links that warn matter, and
+            // what makes a link warn is fixed once it is reduced, so the climb jumps between them.
+            let mut current = confusable_next_link(ctx, expr_id);
+            while let Some(cur) = current {
+                if let Some((scope_native, name, member)) = confusable_mutating_call(ctx, cur) {
+                    ctx.push_warning(
+                        WarningCode::ConfusableTemporaryModification,
+                        &[scope_native, name, member],
+                        cur,
+                    );
+                }
+                current = subscript_base(ctx, cur).and_then(|b| confusable_next_link(ctx, b));
+            }
+        }
+        _ => {}
     }
+}
+
+/// The base of a subscript node, or `None` when `id` is not a subscript or has no base.
+fn subscript_base(ctx: &AnalysisContext, id: NodeId) -> Option<NodeId> {
+    match &ctx.node(id).kind {
+        NodeKind::Subscript(sub) => sub.base,
+        _ => None,
+    }
+}
+
+/// The nearest link at or below `start` in a subscript chain that warns as a mutating call through
+/// a native packed-array property. Memoized in [`AnalysisContext::confusable_next_link`], so a
+/// chain is walked once however many of its links start a climb.
+fn confusable_next_link(ctx: &mut AnalysisContext, start: NodeId) -> Option<NodeId> {
+    let mut pending = Vec::new();
+    let mut cur = Some(start);
+    let mut found = None;
+    while let Some(link) = cur {
+        if let Some(&memo) = ctx.confusable_next_link.get(&link) {
+            found = memo;
+            break;
+        }
+        let Some(base) = subscript_base(ctx, link) else {
+            break;
+        };
+        pending.push(link);
+        if confusable_mutating_call(ctx, link).is_some() {
+            found = Some(link);
+            break;
+        }
+        cur = Some(base);
+    }
+    // Every link passed on the way down shares the answer, except that a warning link is its own.
+    for link in pending.into_iter().rev() {
+        if confusable_mutating_call(ctx, link).is_some() {
+            found = Some(link);
+        }
+        ctx.confusable_next_link.insert(link, found);
+    }
+    found
+}
+
+/// When `base` is a packed array read straight out of a native property, the native class the
+/// property was found on and the property's name.
+fn confusable_native_property(ctx: &AnalysisContext, base: NodeId) -> Option<(String, String)> {
+    let base_dt = ctx.get_type(base);
+    if !base_dt.is_typed_container_type() || base_dt.is_meta_type {
+        return None;
+    }
+    let (base_id, scope_native) = confusable_base_identifier(ctx, base)?;
+    let name = subscript_identifier_name(ctx, base_id);
+    (!name.is_empty()
+        && ctx.native_property_scope.get(&base_id) == Some(&scope_native)
+        && lookup_native_property(ctx, &scope_native, &name).is_some())
+    .then_some((scope_native, name))
+}
+
+/// When the subscript `link` calls a mutating builtin method on a packed array read out of a native
+/// property, the warning's three arguments: native class, property, and method.
+fn confusable_mutating_call(
+    ctx: &AnalysisContext,
+    link: NodeId,
+) -> Option<(String, String, String)> {
+    let base = subscript_base(ctx, link)?;
+    let (scope_native, name) = confusable_native_property(ctx, base)?;
+    let member = subscript_attribute_name(ctx, link)?;
+    // Only a *mutating* builtin method loses the write; `points.size()` is `const` and reads the
+    // copy harmlessly.
+    builtin_method_is_mutating(ctx, ctx.get_type(base).builtin_type, &member).then_some((
+        scope_native,
+        name,
+        member,
+    ))
 }
 
 /// The identifier a subscript chain's base names, plus the native class its lookup was scoped to.
