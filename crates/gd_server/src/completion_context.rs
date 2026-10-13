@@ -469,10 +469,8 @@ pub(crate) fn arg_index_after(tokens: &[Token], open_idx: usize, byte: usize) ->
 /// `innermost_node_at`'s convention (a child is pushed after its parent, so this picks the closest
 /// ancestor). `None` when nothing strictly contains it.
 ///
-/// M9 (#70): `pub(crate)` so `handlers::selection_range` reuses this exact "nearest strictly-
-/// enclosing ancestor" step to build its `SelectionRange` ancestor chain (repeated calls walk
-/// innermost → root). Because it excludes equal-span nodes, the chain is strictly increasing — no
-/// duplicate or looping range.
+/// One step scans the whole tree, so a walk up to some ancestor goes through [`enclosing_nodes`],
+/// which yields the same chain in one pass.
 pub(crate) fn smallest_node_strictly_containing(tree: &ParseTree, inner: NodeId) -> Option<NodeId> {
     let target = tree.get(inner).span;
     let mut best: Option<(NodeId, usize)> = None;
@@ -494,6 +492,40 @@ pub(crate) fn smallest_node_strictly_containing(tree: &ParseTree, inner: NodeId)
         }
     }
     best.map(|(id, _)| id)
+}
+
+/// Every node repeated [`smallest_node_strictly_containing`] steps reach from `inner`, innermost
+/// first, ties broken the same way. Because it excludes equal-span nodes, the chain is strictly
+/// increasing — no duplicate or looping range.
+///
+/// Every node on the chain contains `inner`'s span, so one scan collects the candidates and one
+/// sort by width orders them. A node no wider than the current link cannot strictly contain it, so
+/// each step only ever looks further along the sorted list, and the chain costs one pass however
+/// deep the cursor sits (the per-step scan is quadratic on a deeply nested line).
+pub(crate) fn enclosing_nodes(tree: &ParseTree, inner: NodeId) -> Vec<NodeId> {
+    let target = tree.get(inner).span;
+    let mut candidates: Vec<NodeId> = tree
+        .iter_ids()
+        .filter(|&id| {
+            let s = tree.get(id).span;
+            id != inner && s.start <= target.start && target.end <= s.end
+        })
+        .collect();
+    // Smallest first; among equal widths the latest node first, the one the per-step scan keeps.
+    candidates.sort_by_key(|&id| {
+        let s = tree.get(id).span;
+        (s.end - s.start, std::cmp::Reverse(id.index()))
+    });
+    let mut chain = Vec::new();
+    let mut cur = target;
+    for id in candidates {
+        let s = tree.get(id).span;
+        if s.start <= cur.start && cur.end <= s.end && (s.start, s.end) != (cur.start, cur.end) {
+            chain.push(id);
+            cur = s;
+        }
+    }
+    chain
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -1584,10 +1616,29 @@ fn token_is_property_accessor_position(tokens: &[Token], byte: usize) -> bool {
     let mut indent_depth: i32 = 0;
     let mut property_depth: Option<i32> = None;
     let mut line_has_meaningful = false;
+    // What `is_property_block_colon` would learn by rescanning the line from its start, kept as the
+    // loop goes so a line full of colons (a nested dictionary) stays linear.
+    let mut line_depth: i32 = 0;
+    let mut line_saw_var = false;
+    let mut line_saw_value_or_type = false;
 
-    for (i, t) in tokens.iter().enumerate() {
+    for t in tokens {
         if t.span.end > byte {
             break;
+        }
+        let block_colon =
+            t.kind == Colon && line_depth == 0 && line_saw_var && line_saw_value_or_type;
+        match t.kind {
+            Newline | Indent | Dedent => {
+                line_depth = 0;
+                line_saw_var = false;
+                line_saw_value_or_type = false;
+            }
+            ParenthesisOpen | BracketOpen | BraceOpen => line_depth += 1,
+            ParenthesisClose | BracketClose | BraceClose => line_depth -= 1,
+            Var if line_depth == 0 => line_saw_var = true,
+            Colon | Equal if line_depth == 0 => line_saw_value_or_type = true,
+            _ => {}
         }
         match t.kind {
             Newline => line_has_meaningful = false,
@@ -1609,7 +1660,7 @@ fn token_is_property_accessor_position(tokens: &[Token], byte: usize) -> bool {
                 line_has_meaningful = false;
             }
             Eof | Error => {}
-            Colon if is_property_block_colon(tokens, i) => {
+            Colon if block_colon => {
                 property_depth = Some(indent_depth);
                 line_has_meaningful = true;
             }
@@ -1677,8 +1728,7 @@ fn ast_is_property_accessor_position(tree: &ParseTree, byte: usize) -> bool {
             // (chain `Identifier → Suite → Function → Variable`) — so a `Function`/`Suite` between
             // the cursor and the property `Variable` means we are in an accessor body, NOT at the
             // keyword position. Reject the moment one is seen.
-            let mut cur = Some(id);
-            while let Some(n) = cur {
+            for n in std::iter::once(id).chain(enclosing_nodes(tree, id)) {
                 match &tree.get(n).kind {
                     NodeKind::Function(_) | NodeKind::Suite(_) => break,
                     NodeKind::Variable(v) if v.property != gd_syntax::ast::PropertyStyle::None => {
@@ -1686,7 +1736,6 @@ fn ast_is_property_accessor_position(tree: &ParseTree, byte: usize) -> bool {
                     }
                     _ => {}
                 }
-                cur = smallest_node_strictly_containing(tree, n);
             }
         }
     }

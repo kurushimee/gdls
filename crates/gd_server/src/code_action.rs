@@ -597,24 +597,21 @@ fn enclosing_statement_line(state: &mut ServerState, uri: &Uri, diag: &Diagnosti
     // annotation would land on the signature (whose ignore-span doesn't cover the body line — valid
     // GDScript but the warning wouldn't be suppressed). Godot's `_ => {}` arm covers such a target
     // through its own `loc.end.line`, so the expression line is suppressed.
-    let mut cur = tree.innermost_node_at(byte)?;
-    let mut guard = tree.len();
-    loop {
+    let innermost = tree.innermost_node_at(byte)?;
+    let mut chain = vec![innermost];
+    chain.extend(crate::completion_context::enclosing_nodes(tree, innermost));
+    for (i, &cur) in chain.iter().enumerate() {
         if is_ignore_target(&tree.get(cur).kind) {
             // The node's byte-span start → 0-based line (clamp-don't-lie via the mapper).
             return Some(mapper.byte_to_position(tree.get(cur).span.start).line);
         }
-        let parent = crate::completion_context::smallest_node_strictly_containing(tree, cur)?;
+        let parent = *chain.get(i + 1)?;
         if matches!(tree.get(parent).kind, gd_syntax::ast::NodeKind::Suite(_)) {
             // `cur` is a direct block statement — a safe, span-covering insertion point.
             return Some(mapper.byte_to_position(tree.get(cur).span.start).line);
         }
-        cur = parent;
-        guard = guard.saturating_sub(1);
-        if guard == 0 {
-            return None; // Malformed-tree span cycle guard — refuse rather than spin.
-        }
     }
+    None
 }
 
 /// Whether a node kind is an `@warning_ignore` *target* — a statement or declaration the parser
@@ -754,9 +751,8 @@ fn underscore_decl_anchor(
         return Some(mapper.byte_to_position(tree.get(node_id).span.start));
     }
     // Walk up to the enclosing Variable/Parameter and read its identifier child.
-    let mut cur = node_id;
-    let mut guard = tree.len();
-    loop {
+    let enclosing = crate::completion_context::enclosing_nodes(tree, node_id);
+    for cur in std::iter::once(node_id).chain(enclosing) {
         let ident = match &tree.get(cur).kind {
             NodeKind::Variable(v) => v.identifier,
             NodeKind::Parameter(p) => p.identifier,
@@ -765,12 +761,8 @@ fn underscore_decl_anchor(
         if let Some(iid) = ident {
             return Some(mapper.byte_to_position(tree.get(iid).span.start));
         }
-        cur = crate::completion_context::smallest_node_strictly_containing(tree, cur)?;
-        guard = guard.saturating_sub(1);
-        if guard == 0 {
-            return None; // Malformed-tree cycle guard.
-        }
     }
+    None
 }
 
 /// Build the `_`-prefix rename edit by calling [`crate::handlers::rename`] against the CURRENT buffer
@@ -1931,18 +1923,10 @@ fn enclosing_variable(
     tree: &gd_syntax::ast::ParseTree,
     byte: usize,
 ) -> Option<gd_syntax::ast::NodeId> {
-    let mut cur = tree.innermost_node_at(byte)?;
-    let mut guard = tree.len();
-    loop {
-        if matches!(tree.get(cur).kind, NodeKind::Variable(_)) {
-            return Some(cur);
-        }
-        cur = crate::completion_context::smallest_node_strictly_containing(tree, cur)?;
-        guard = guard.saturating_sub(1);
-        if guard == 0 {
-            return None;
-        }
-    }
+    let innermost = tree.innermost_node_at(byte)?;
+    std::iter::once(innermost)
+        .chain(crate::completion_context::enclosing_nodes(tree, innermost))
+        .find(|&cur| matches!(tree.get(cur).kind, NodeKind::Variable(_)))
 }
 
 /// The warning `PNAME` carried on `diag`'s `code` (a string code), or `None`. Unlike

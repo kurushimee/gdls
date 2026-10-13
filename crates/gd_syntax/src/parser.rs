@@ -11,9 +11,9 @@
 //! Faithful-port notes: prefix and infix share one `fn`-pointer type ([`ParseFn`]) exactly as Godot's
 //! `ParseFunction` does (prefix is called with `previous_operand = None`). The lexer is pull-based and
 //! parser-driven, so multiline mode is toggled here on `()`/`[]`/`{}` and popped by each function that
-//! consumes the matching close token. The one deliberate deviation from Godot is a recursion-depth
-//! guard ([`MAX_PARSE_DEPTH`]): Godot relies on the native stack, but an overflow there is an
-//! uncatchable abort, which would be a fuzz release-blocker — so we bail with an error instead.
+//! consumes the matching close token. The one deliberate deviation from Godot is a nesting-depth
+//! guard ([`MAX_PARSE_DEPTH`]): Godot relies on the native stack and crashes on a deep enough file,
+//! while gdls reports one error and keeps going.
 //!
 //! Completion contexts, documentation-comment parsing, and annotation *application* (`@export` type
 //! resolution, `@tool`/`@icon` effects) are analyzer/Phase-2 concerns and are intentionally omitted:
@@ -30,9 +30,19 @@ use crate::token::{Literal, Token, TokenKind};
 use crate::warning_names::warning_name_is_valid;
 use crate::{Diagnostic, DocumentSymbol, ParseOptions, SymbolKind};
 
-/// Maximum expression/statement nesting before the parser bails with an error instead of risking a
-/// native stack overflow (an uncatchable abort). Deliberate deviation from Godot for fuzz safety.
-const MAX_PARSE_DEPTH: u32 = 256;
+/// Nesting depth at which the parser reports the source as too deeply nested and stops descending.
+///
+/// Godot has no such limit and recurses on the native stack until it overflows, so the limit has to
+/// sit above every depth Godot can load, or gdls would reject a file that works. Measured against
+/// the official 4.7.2 Linux build (8 MiB main stack, the size Godot links with on every platform),
+/// Godot crashes loading binary chains from about 3,500 terms, arrays and dictionaries under
+/// 10,000 levels, member chains under 8,000 links, `not` chains under 20,000, and parentheses, the
+/// cheapest shape, under 30,000. Twice the worst of those leaves margin for compilers that build
+/// smaller frames. Depth counts each nested expression, statement, type, or pattern, and each link
+/// a postfix or binary operator adds to the left of a chain, since those nest the tree as deeply
+/// as brackets do. Every level runs through [`crate::stack::ensure`], so reaching the limit is
+/// safe on any thread.
+pub const MAX_PARSE_DEPTH: u32 = 65_536;
 
 /// A prefix or infix parse function. Mirrors Godot's single `ParseFunction` pointer type: the
 /// `previous_operand` is `None` for a prefix call and `Some(operand)` for an infix call.
@@ -607,7 +617,20 @@ pub struct Parser {
     annotation_stack: Vec<NodeId>,
     multiline_stack: Vec<bool>,
     nodes_in_progress: Vec<NodeId>,
+    /// Godot's `advance` stretches every node in progress to the token just consumed, which costs
+    /// one write per open node per token and turns deep nesting quadratic. gdls counts those
+    /// stretches instead ([`Parser::stretch_seq`], ending at [`Parser::stretch_end`]) and applies
+    /// the latest to a node only when the node completes or its span is read. This holds, per node
+    /// index, the count at which the node's end was last written, or `None` once it is no longer
+    /// in progress.
+    stretched_at: Vec<Option<u64>>,
+    stretch_seq: u64,
+    stretch_end: (usize, crate::span::LineCol),
     depth: u32,
+    /// Set once nesting reaches [`MAX_PARSE_DEPTH`]. Until the enclosing statement or class member
+    /// recovers (see [`Parser::synchronize`]), every level that is still open unwinds without
+    /// reporting anything, so the file gets one error rather than one per open level.
+    depth_exceeded: bool,
 }
 
 /// The default-constructed `Token` the parser's `previous` starts as.
@@ -665,7 +688,11 @@ impl Parser {
             annotation_stack: Vec::new(),
             multiline_stack: Vec::new(),
             nodes_in_progress: Vec::new(),
+            stretched_at: Vec::new(),
+            stretch_seq: 0,
+            stretch_end: (0, crate::span::LineCol::default()),
             depth: 0,
+            depth_exceeded: false,
         };
         parser.prime_first_token();
         parser
@@ -714,7 +741,40 @@ impl Parser {
         n.span = span;
         n.loc = loc;
         self.nodes_in_progress.push(id);
+        if self.stretched_at.len() <= id.index() {
+            self.stretched_at.resize(id.index() + 1, None);
+        }
+        self.stretched_at[id.index()] = Some(self.stretch_seq);
         id
+    }
+
+    /// Give `id` the end Godot's eager `advance` would have stretched it to by now.
+    fn apply_stretch(&mut self, id: NodeId) {
+        let Some(Some(seq)) = self.stretched_at.get(id.index()).copied() else {
+            return;
+        };
+        if seq < self.stretch_seq {
+            let (span_end, loc_end) = self.stretch_end;
+            let n = self.tree.get_mut(id);
+            n.span.end = span_end;
+            n.loc.end = loc_end;
+            self.stretched_at[id.index()] = Some(self.stretch_seq);
+        }
+    }
+
+    /// Record that `id`'s extents were just written, so no earlier stretch applies to it.
+    fn mark_written(&mut self, id: NodeId) {
+        if let Some(slot @ Some(_)) = self.stretched_at.get_mut(id.index()) {
+            *slot = Some(self.stretch_seq);
+        }
+    }
+
+    /// Take `id` off the in-progress stack, settling its end first.
+    fn pop_in_progress(&mut self) {
+        if let Some(id) = self.nodes_in_progress.pop() {
+            self.apply_stretch(id);
+            self.stretched_at[id.index()] = None;
+        }
     }
 
     /// A recovery node: not extent-tracked and not on the in-progress stack (Godot's
@@ -729,6 +789,8 @@ impl Parser {
 
     fn reset_extents_from_node(&mut self, id: NodeId, from: Option<NodeId>) {
         if let Some(from) = from {
+            self.apply_stretch(from);
+            self.mark_written(id);
             let (span, loc) = {
                 let f = self.tree.get(from);
                 (f.span, f.loc)
@@ -742,6 +804,7 @@ impl Parser {
     /// Reset a node's extents to span a single token (Godot's `reset_extents(node, token)`), used to
     /// re-anchor a node's start at a keyword the caller already looked past.
     fn reset_extents_from_current(&mut self, id: NodeId) {
+        self.mark_written(id);
         let (span, loc) = (self.current.span, self.current.loc);
         let n = self.tree.get_mut(id);
         n.span = span;
@@ -749,6 +812,7 @@ impl Parser {
     }
 
     fn reset_extents_from_previous(&mut self, id: NodeId) {
+        self.mark_written(id);
         let (span, loc) = (self.previous.span, self.previous.loc);
         let n = self.tree.get_mut(id);
         n.span = span;
@@ -756,6 +820,7 @@ impl Parser {
     }
 
     fn update_extents(&mut self, id: NodeId) {
+        self.mark_written(id);
         let (span_end, loc_end) = (self.previous.span.end, self.previous.loc.end);
         let n = self.tree.get_mut(id);
         n.span.end = span_end;
@@ -765,9 +830,9 @@ impl Parser {
     fn complete_extents(&mut self, id: NodeId) {
         while self.nodes_in_progress.last().is_some_and(|&n| n != id) {
             // Parser bug: mismatch in the extents stack. Recover by popping.
-            self.nodes_in_progress.pop();
+            self.pop_in_progress();
         }
-        self.nodes_in_progress.pop();
+        self.pop_in_progress();
     }
 
     // ----- token driving (gdscript_parser.cpp:570) -----
@@ -794,13 +859,8 @@ impl Parser {
         self.drain_current_errors();
         if self.previous.kind != TokenKind::Dedent {
             // `DEDENT` belongs to the next non-empty line, so don't stretch nodes over it.
-            let (span_end, loc_end) = (self.previous.span.end, self.previous.loc.end);
-            for i in 0..self.nodes_in_progress.len() {
-                let id = self.nodes_in_progress[i];
-                let n = self.tree.get_mut(id);
-                n.span.end = span_end;
-                n.loc.end = loc_end;
-            }
+            self.stretch_seq += 1;
+            self.stretch_end = (self.previous.span.end, self.previous.loc.end);
         }
     }
 
@@ -833,13 +893,41 @@ impl Parser {
 
     fn push_error(&mut self, message: impl Into<String>) {
         self.panic_mode = true;
+        if self.depth_exceeded {
+            return;
+        }
         self.errors.push(Diagnostic {
             span: self.previous.span,
             message: message.into(),
         });
     }
 
+    /// Finish unwinding from [`MAX_PARSE_DEPTH`] once back at a statement or class member outside
+    /// any lambda (a lambda's statements sit inside the expression that is still unwinding). The
+    /// rest of the line is the too-deep material, so this skips all of it rather than stopping at
+    /// a keyword inside it and parsing on from there. Returns whether it did anything.
+    fn recover_from_depth_limit(&mut self) -> bool {
+        if !self.depth_exceeded || self.in_lambda {
+            return false;
+        }
+        self.depth_exceeded = false;
+        self.panic_mode = false;
+        while !self.is_at_end()
+            && !matches!(
+                self.previous.kind,
+                TokenKind::Newline | TokenKind::Semicolon
+            )
+        {
+            self.tree.recovery_lost_source = true;
+            self.advance();
+        }
+        true
+    }
+
     fn synchronize(&mut self) {
+        if self.recover_from_depth_limit() {
+            return;
+        }
         self.panic_mode = false;
         while !self.is_at_end() {
             if matches!(
@@ -901,6 +989,31 @@ impl Parser {
         self.lambda_ended || self.in_lambda || self.is_statement_end_token()
     }
 
+    /// Enter one nesting level. At [`MAX_PARSE_DEPTH`] this reports `what` as too deeply nested,
+    /// once, and returns `false`; so does every call while the parse is still unwinding from it.
+    fn enter_nesting(&mut self, what: &str) -> bool {
+        if self.depth_exceeded {
+            return false;
+        }
+        if self.depth >= MAX_PARSE_DEPTH {
+            self.push_error(format!("{what} is too deeply nested."));
+            self.depth_exceeded = true;
+            return false;
+        }
+        self.depth += 1;
+        true
+    }
+
+    /// Run `f` one nesting level deeper, or return `None` when [`Parser::enter_nesting`] refuses.
+    fn nested<T>(&mut self, what: &str, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if !self.enter_nesting(what) {
+            return None;
+        }
+        let result = crate::stack::ensure(|| f(self));
+        self.depth -= 1;
+        result
+    }
+
     // ----- Pratt expression engine (gdscript_parser.cpp:2734) -----
 
     fn parse_expression(&mut self, can_assign: bool, stop_on_assign: bool) -> Option<NodeId> {
@@ -913,14 +1026,9 @@ impl Parser {
         can_assign: bool,
         stop_on_assign: bool,
     ) -> Option<NodeId> {
-        if self.depth >= MAX_PARSE_DEPTH {
-            self.push_error("Expression is too deeply nested.");
-            return None;
-        }
-        self.depth += 1;
-        let result = self.parse_precedence_impl(precedence, can_assign, stop_on_assign);
-        self.depth -= 1;
-        result
+        self.nested("Expression", |p| {
+            p.parse_precedence_impl(precedence, can_assign, stop_on_assign)
+        })
     }
 
     fn parse_precedence_impl(
@@ -949,23 +1057,29 @@ impl Parser {
         self.advance(); // Only consume the token if there's a valid rule.
         let mut previous_operand = prefix_rule(self, None, can_assign);
 
+        // Each infix rule wraps the operand so far one level deeper, without recursing, so the
+        // loop counts those levels toward the depth limit itself.
+        let mut spine = 0;
         while precedence <= get_rule(self.current.kind).prec {
             if previous_operand.is_none()
                 || (stop_on_assign && self.current.kind == TokenKind::Equal)
                 || self.lambda_ended
+                || !self.enter_nesting("Expression")
             {
-                return previous_operand;
+                break;
             }
+            spine += 1;
             match self.current.kind {
                 TokenKind::ParenthesisOpen | TokenKind::BracketOpen => self.push_multiline(true),
                 _ => {}
             }
             self.advance();
             let Some(infix_rule) = get_rule(self.previous.kind).infix else {
-                return previous_operand;
+                break;
             };
             previous_operand = infix_rule(self, previous_operand, can_assign);
         }
+        self.depth -= spine;
 
         previous_operand
     }
@@ -1912,14 +2026,7 @@ impl Parser {
 
     fn parse_type(&mut self, allow_void: bool) -> Option<NodeId> {
         // Depth-guard nested container types (`Array[Array[Array[…]]]`). See [`MAX_PARSE_DEPTH`].
-        if self.depth >= MAX_PARSE_DEPTH {
-            self.push_error("Type is too deeply nested.");
-            return None;
-        }
-        self.depth += 1;
-        let result = self.parse_type_inner(allow_void);
-        self.depth -= 1;
-        result
+        self.nested("Type", |p| p.parse_type_inner(allow_void))
     }
 
     fn parse_type_inner(&mut self, allow_void: bool) -> Option<NodeId> {
@@ -2392,6 +2499,8 @@ impl Parser {
             if token != TokenKind::Static {
                 next_is_static = false;
             }
+            // See the same call in `parse_statement`.
+            self.recover_from_depth_limit();
             if self.panic_mode {
                 self.synchronize();
             }
@@ -3533,6 +3642,9 @@ impl Parser {
                     self.register_suite_local(suite, statement);
                 }
             }
+            if self.depth_exceeded {
+                break;
+            }
 
             let continue_loop = (multiline || self.previous.kind == TokenKind::Semicolon)
                 && !self.check(TokenKind::Dedent)
@@ -3571,13 +3683,10 @@ impl Parser {
     fn parse_statement(&mut self) -> Option<NodeId> {
         // Depth-guard the statement/block recursion cycle (parse_statement → if/for/while/match →
         // parse_suite → parse_statement). See [`MAX_PARSE_DEPTH`].
-        if self.depth >= MAX_PARSE_DEPTH {
-            self.push_error("Statement is too deeply nested.");
-            return None;
-        }
-        self.depth += 1;
-        let result = self.parse_statement_inner();
-        self.depth -= 1;
+        let result = self.nested("Statement", Self::parse_statement_inner);
+        // A statement whose expression ends in a lambda can end without an error even though the
+        // limit fired inside that lambda, so recovery cannot wait for `synchronize`.
+        self.recover_from_depth_limit();
         result
     }
 
@@ -3924,7 +4033,8 @@ impl Parser {
             let previous_suite = self.current_suite;
             self.current_suite = Some(else_block);
 
-            let elif = self.parse_if("elif");
+            // Each `elif` nests inside the previous branch's else-block. See [`MAX_PARSE_DEPTH`].
+            let elif = self.nested("Statement", |p| p.parse_if("elif"));
             if let (NodeKind::Suite(s), Some(elif)) =
                 (&mut self.tree.get_mut(else_block).kind, elif)
             {
@@ -4215,14 +4325,7 @@ impl Parser {
 
     fn parse_match_pattern(&mut self, p_root_pattern: Option<NodeId>) -> Option<NodeId> {
         // Depth-guard nested array/dictionary patterns (`[[[…]]]`). See [`MAX_PARSE_DEPTH`].
-        if self.depth >= MAX_PARSE_DEPTH {
-            self.push_error("Pattern is too deeply nested.");
-            return None;
-        }
-        self.depth += 1;
-        let result = self.parse_match_pattern_inner(p_root_pattern);
-        self.depth -= 1;
-        result
+        self.nested("Pattern", |p| p.parse_match_pattern_inner(p_root_pattern))
     }
 
     fn parse_match_pattern_inner(&mut self, p_root_pattern: Option<NodeId>) -> Option<NodeId> {
@@ -4451,6 +4554,10 @@ impl Parser {
     /// Like [`Parser::push_error`] but anchored at a node's extents (Godot's `push_error(msg, node)`).
     fn push_error_at(&mut self, node: NodeId, message: impl Into<String>) {
         self.panic_mode = true;
+        if self.depth_exceeded {
+            return;
+        }
+        self.apply_stretch(node);
         let span = self.tree.get(node).span;
         self.errors.push(Diagnostic {
             span,
@@ -4920,6 +5027,10 @@ impl Parser {
         // parses, fall back to `previous.loc.end.line` (also the lexer's view of "end").
         let eof_line = self.current.loc.end.line.max(self.previous.loc.end.line);
         self.tree.eof_line = eof_line;
+        // Whatever is still in progress has to carry the end Godot would have stretched it to.
+        while !self.nodes_in_progress.is_empty() {
+            self.pop_in_progress();
+        }
         (self.tree, self.errors)
     }
 }

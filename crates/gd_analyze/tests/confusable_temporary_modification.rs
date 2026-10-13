@@ -103,3 +103,22 @@ fn an_explicit_base_warns_the_same_as_the_implicit_one() {
     assert_eq!(count(src, Dialect::Godot4_7), 2);
     assert_eq!(count(src, Dialect::Godot4_6), 0);
 }
+
+#[test]
+fn a_warning_link_under_other_links_warns_once_per_climb_that_reaches_it() {
+    // Godot climbs the whole chain from every subscript and from every call's callee, so a warning
+    // link with more chain above it is reported by each climb that passes it. The climb is
+    // memoized, and these counts pin that it still reaches the same links the same number of times.
+    for (body, expected) in [
+        ("\tpoints.clear()", 1),
+        ("\tpoints.append.bind(Vector2.ONE)", 2),
+        (
+            "\tvar _c := points.append.bind(Vector2.ONE).get_method()",
+            2,
+        ),
+        ("\tvar _m = points.clear.get_method().length()", 2),
+    ] {
+        let src = format!("extends Line2D\n\nfunc _ready() -> void:\n{body}\n");
+        assert_eq!(count(&src, Dialect::Godot4_7), expected, "{body}");
+    }
+}

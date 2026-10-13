@@ -181,8 +181,78 @@ pub(crate) struct PendingLambdaBody {
     pub lambda_id: NodeId,
     pub captured_concrete: Option<NodeId>,
     pub captured_static: bool,
-    pub captured_suite_stack: Vec<NodeId>,
-    pub captured_lambda_stack: Vec<NodeId>,
+    pub captured_suite_stack: ScopeStack,
+    pub captured_lambda_stack: ScopeStack,
+}
+
+/// A stack of node ids whose copies share everything below the top, so a copy costs O(1). Each
+/// queued lambda snapshots the scope chains it was reduced in, and a nested lambda's body is
+/// resolved while the enclosing one's chains are saved aside; with plain vectors those copies made
+/// both time and memory quadratic in the lambda nesting depth.
+#[derive(Clone, Default)]
+pub struct ScopeStack {
+    top: Option<std::rc::Rc<ScopeLink>>,
+    len: usize,
+}
+
+struct ScopeLink {
+    id: NodeId,
+    below: Option<std::rc::Rc<ScopeLink>>,
+}
+
+impl ScopeStack {
+    pub fn push(&mut self, id: NodeId) {
+        let below = self.top.take();
+        self.top = Some(std::rc::Rc::new(ScopeLink { id, below }));
+        self.len += 1;
+    }
+
+    pub fn pop(&mut self) -> Option<NodeId> {
+        let top = self.top.take()?;
+        self.top = top.below.clone();
+        self.len -= 1;
+        Some(top.id)
+    }
+
+    /// The innermost entry.
+    #[must_use]
+    pub fn last(&self) -> Option<NodeId> {
+        self.top.as_ref().map(|link| link.id)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Innermost first.
+    pub fn iter(&self) -> impl Iterator<Item = NodeId> + '_ {
+        std::iter::successors(self.top.as_deref(), |link| link.below.as_deref()).map(|link| link.id)
+    }
+}
+
+impl Drop for ScopeStack {
+    /// Unlink iteratively: the default drop of a long chain recurses once per entry.
+    fn drop(&mut self) {
+        let mut cur = self.top.take();
+        while let Some(link) = cur {
+            match std::rc::Rc::try_unwrap(link) {
+                Ok(mut link) => cur = link.below.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for ScopeStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
 }
 
 /// The mutable analysis state for one file. Borrows the inputs (tree, native DB, cross-file query,
@@ -286,6 +356,11 @@ pub struct AnalysisContext<'a> {
     /// Recorded at the single choke point (`try_native_member`'s property arm) rather than
     /// re-derived, since re-running identifier resolution would re-emit its diagnostics.
     pub native_property_scope: FxHashMap<NodeId, String>,
+    /// For each subscript a `warn_confusable_temporary_modification` climb has passed, the nearest
+    /// link at or below it that warns on a mutating method call (`None` when none does). Godot
+    /// climbs the whole chain from every subscript, which is quadratic in the chain's length; the
+    /// memo lets a climb jump from one warning link to the next and still emit the same warnings.
+    pub confusable_next_link: FxHashMap<NodeId, Option<NodeId>>,
     /// Godot's `current_enum` (analyzer.cpp:4392-4412): the [`NodeKind::Enum`] whose values are
     /// being resolved right now, so an entry may refer to its siblings. `None` outside one.
     pub current_enum: Option<NodeId>,
@@ -316,7 +391,7 @@ pub struct AnalysisContext<'a> {
     /// Lambda cursor stack, outermost-to-innermost. Godot carries `current_lambda` plus
     /// `LambdaNode::parent_lambda`; gdls derives the same chain by pushing around lambda
     /// signature/body reduction.
-    pub current_lambda_stack: Vec<NodeId>,
+    pub current_lambda_stack: ScopeStack,
     /// Whether the current `reduce_call` is being called as the target of an enclosing `await`.
     /// Mirrors Godot's `p_is_await` parameter (analyzer.cpp:3231 / 3751-3758): when true, a
     /// coroutine call result does NOT fire MISSING_AWAIT; when false at statement root it fires
@@ -355,7 +430,7 @@ pub struct AnalysisContext<'a> {
     /// Godot's `IdentifierNode::suite` back-pointer (gdscript_parser.cpp:3097) gives the parser
     /// scope-tracked lookups; gdls's AST keeps `SuiteNode::locals` but not the back-pointer, so
     /// we walk this stack inside `reduce_identifier` instead.
-    pub suite_stack: Vec<NodeId>,
+    pub suite_stack: ScopeStack,
     /// Godot's per-variable `assignments` counter, keyed by the declaring node. Upstream keeps
     /// it on `VariableNode` (debug-only): the declaration initializer contributes one
     /// (gdscript_parser.cpp:1261 — folded in lazily by `crate::reducer::assignment_count`) and
@@ -484,11 +559,12 @@ impl<'a> AnalysisContext<'a> {
             reducing_callee_node: None,
             identifier_can_be_builtin: false,
             native_property_scope: FxHashMap::default(),
+            confusable_next_link: FxHashMap::default(),
             current_enum: None,
             enum_element_values: FxHashMap::default(),
             concrete_function: None,
             pending_lambda_bodies: Vec::new(),
-            current_lambda_stack: Vec::new(),
+            current_lambda_stack: ScopeStack::default(),
             awaiting_call: false,
             resolved_interfaces: FxHashSet::default(),
             reduced: FxHashSet::default(),
@@ -497,7 +573,7 @@ impl<'a> AnalysisContext<'a> {
             abstract_nodes: FxHashSet::default(),
             resolved_annotations: FxHashSet::default(),
             annotation_resolved_args: FxHashMap::default(),
-            suite_stack: Vec::new(),
+            suite_stack: ScopeStack::default(),
             assignments: FxHashMap::default(),
             warning_ignore_regions,
             warning_ignored_lines,
@@ -526,7 +602,7 @@ impl<'a> AnalysisContext<'a> {
     /// `GDScriptAnalyzer::mark_lambda_use_self()` (analyzer.cpp:6364): mark the current lambda
     /// and all parent lambdas as using `self`.
     pub(crate) fn mark_lambda_use_self(&mut self) {
-        for &lambda in &self.current_lambda_stack {
+        for lambda in self.current_lambda_stack.iter() {
             self.lambda_uses_self.insert(lambda);
         }
     }

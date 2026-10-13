@@ -30,6 +30,7 @@ mod cross_file_inferred_member;
 mod cross_file_inheritance;
 mod cross_file_property_miss;
 mod datatype_render_name;
+mod deep_nesting;
 mod differential;
 mod enum_call_surface;
 mod enum_super_pattern_errors;

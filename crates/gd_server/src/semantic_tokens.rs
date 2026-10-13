@@ -234,6 +234,8 @@ pub(crate) fn classify_document(
     // is excluded (its callee dispatches to the parent). `X.new()` is included (a `method` use). (#176)
     let mut dotted_callee_spans: FxHashSet<(usize, usize)> = FxHashSet::default();
 
+    let scopes = ScopeIndex::build(tree);
+
     // First pass: declarations (structural — always emitted) + collect decl/type/attribute span sets.
     for id in tree.iter_ids() {
         let node = tree.get(id);
@@ -286,7 +288,7 @@ pub(crate) fn classify_document(
                     // the DECLARATION agree with the cross-file USE (a resolved method use →
                     // `method`, see `use_token`) and with the M8 completion convention (script
                     // methods → METHOD, native free functions → FUNCTION).
-                    let ty = if is_class_member_func(tree, id) {
+                    let ty = if scopes.member_funcs.contains(&id) {
                         TokType::Method
                     } else {
                         TokType::Function
@@ -318,7 +320,7 @@ pub(crate) fn classify_document(
                     // A class-level var is a `property`; a function-local var is a `variable`. The
                     // enclosing-suite test below (locals) handles locals; here, decide by whether the
                     // var node is a direct class member.
-                    let ty = if is_class_member_var(tree, id) {
+                    let ty = if scopes.member_vars.contains(&id) {
                         TokType::Property
                     } else {
                         TokType::Variable
@@ -534,7 +536,7 @@ pub(crate) fn classify_document(
                 if matches!(
                     target_kind,
                     BindingTargetKind::Function | BindingTargetKind::Member
-                ) && !callee_is_in_file_callable_property(tree, span.start, &ident.name)
+                ) && !callee_is_in_file_callable_property(&scopes, span.start, &ident.name)
                 {
                     push_span(&mut out, span, TokType::Method, use_deprecated(index, b));
                     continue;
@@ -615,7 +617,7 @@ pub(crate) fn classify_document(
         // pressure). Skip idents that aren't a local reference at all (attribute positions `obj.x`,
         // Lua-style dict keys `{ x = v }`) — see `not_a_local_use` (the over-capture lesson).
         if !not_a_local_use.contains(&key) {
-            if let Some(ty) = local_use_kind(tree, span.start, &ident.name) {
+            if let Some(ty) = local_use_kind(&scopes, span.start, &ident.name) {
                 push_span(&mut out, span, ty, 0);
             }
         }
@@ -631,29 +633,22 @@ pub(crate) fn classify_document(
 /// Purely structural (no analyzer): finds the innermost enclosing `Function` span containing `byte`,
 /// then the nearest enclosing `Suite` whose `locals` declares `name`. Mirrors the per-suite `locals`
 /// scoping that `ParseTree::resolve_local_binding_at` uses for references' local classification.
-fn local_use_kind(tree: &ParseTree, byte: usize, name: &str) -> Option<TokType> {
+fn local_use_kind(scopes: &ScopeIndex<'_>, byte: usize, name: &str) -> Option<TokType> {
     // Innermost enclosing function (smallest span containing the byte).
     let mut fn_span: Option<ByteSpan> = None;
-    for id in tree.iter_ids() {
-        if let NodeKind::Function(_) = &tree.get(id).kind {
-            let s = tree.get(id).span;
-            if s.start <= byte
-                && byte < s.end
-                && fn_span.is_none_or(|b| s.end - s.start < b.end - b.start)
-            {
-                fn_span = Some(s);
-            }
+    for &s in &scopes.functions {
+        if s.start <= byte
+            && byte < s.end
+            && fn_span.is_none_or(|b| s.end - s.start < b.end - b.start)
+        {
+            fn_span = Some(s);
         }
     }
     let fn_span = fn_span?;
     // The nearest enclosing Suite (within the function) whose locals declare `name`. A Suite's span
     // contains the use; among those, prefer the innermost (smallest) — GDScript blocks shadow.
     let mut best: Option<(ByteSpan, LocalKind)> = None;
-    for id in tree.iter_ids() {
-        let NodeKind::Suite(suite) = &tree.get(id).kind else {
-            continue;
-        };
-        let s = tree.get(id).span;
+    for &(s, suite) in &scopes.suites {
         if s.start < fn_span.start || s.end > fn_span.end {
             continue; // not inside this function
         }
@@ -694,18 +689,15 @@ fn local_use_kind(tree: &ParseTree, byte: usize, name: &str) -> Option<TokType> 
 /// no chain walk: a `var cb` inherited from an in-file base is NOT in this class's own members, so the
 /// default (`method`) applies — and Godot resolves an inherited Callable property's bare call the same
 /// way an inherited method does, so `method` there is the consistent (non-regressing) choice.
-fn callee_is_in_file_callable_property(tree: &ParseTree, byte: usize, name: &str) -> bool {
+fn callee_is_in_file_callable_property(scopes: &ScopeIndex<'_>, byte: usize, name: &str) -> bool {
     // The innermost enclosing class (smallest class span containing the callee byte).
     let mut best: Option<(ByteSpan, &gd_syntax::ast::ClassNode)> = None;
-    for id in tree.iter_ids() {
-        if let NodeKind::Class(c) = &tree.get(id).kind {
-            let s = tree.get(id).span;
-            if s.start <= byte
-                && byte < s.end
-                && best.is_none_or(|(b, _)| s.end - s.start < b.end - b.start)
-            {
-                best = Some((s, c));
-            }
+    for &(s, c) in &scopes.classes {
+        if s.start <= byte
+            && byte < s.end
+            && best.is_none_or(|(b, _)| s.end - s.start < b.end - b.start)
+        {
+            best = Some((s, c));
         }
     }
     let Some((_, class)) = best else {
@@ -997,35 +989,58 @@ fn mark_type_chain(tree: &ParseTree, id: NodeId, type_spans: &mut FxHashMap<(usi
     }
 }
 
-/// Whether a `Variable` node `var_id` is a direct member of a class (→ `property`) rather than a
-/// function-local (→ `variable`). A class member appears in some `ClassNode.members` as
-/// `Member::Variable(var_id)`.
-fn is_class_member_var(tree: &ParseTree, var_id: NodeId) -> bool {
-    tree.iter_ids().any(|cid| {
-        if let NodeKind::Class(c) = &tree.get(cid).kind {
-            c.members
-                .iter()
-                .any(|m| matches!(m, Member::Variable(v) if *v == var_id))
-        } else {
-            false
-        }
-    })
+/// The scope nodes the per-identifier lookups consult, gathered in one pass over the tree. Each
+/// lookup used to rescan the whole tree, which made a document's tokens quadratic in its size.
+struct ScopeIndex<'t> {
+    /// Every `Function` span, in node order.
+    functions: Vec<ByteSpan>,
+    /// Every `Suite`, in node order.
+    suites: Vec<(ByteSpan, &'t gd_syntax::ast::SuiteNode)>,
+    /// Every `Class`, in node order.
+    classes: Vec<(ByteSpan, &'t gd_syntax::ast::ClassNode)>,
+    /// `Variable` nodes that are a direct member of a class (→ `property`) rather than a
+    /// function-local (→ `variable`): they appear in some `ClassNode.members` as
+    /// `Member::Variable`.
+    member_vars: FxHashSet<NodeId>,
+    /// `Function` nodes that are a direct member of a class (→ `method`) rather than a lambda body
+    /// (→ `function`). A named-lambda body is reached only via `LambdaNode.function`, so it is
+    /// absent from every class's member list.
+    member_funcs: FxHashSet<NodeId>,
 }
 
-/// Whether a `Function` node `fn_id` is a direct member of a class (→ `method`) rather than a
-/// lambda body (→ `function`). A class method appears in some `ClassNode.members` as
-/// `Member::Function(fn_id)`; a named-lambda body is reached only via `LambdaNode.function`, so it
-/// is absent from every class's member list.
-fn is_class_member_func(tree: &ParseTree, fn_id: NodeId) -> bool {
-    tree.iter_ids().any(|cid| {
-        if let NodeKind::Class(c) = &tree.get(cid).kind {
-            c.members
-                .iter()
-                .any(|m| matches!(m, Member::Function(f) if *f == fn_id))
-        } else {
-            false
+impl<'t> ScopeIndex<'t> {
+    fn build(tree: &'t ParseTree) -> Self {
+        let mut scopes = ScopeIndex {
+            functions: Vec::new(),
+            suites: Vec::new(),
+            classes: Vec::new(),
+            member_vars: FxHashSet::default(),
+            member_funcs: FxHashSet::default(),
+        };
+        for id in tree.iter_ids() {
+            let span = tree.get(id).span;
+            match &tree.get(id).kind {
+                NodeKind::Function(_) => scopes.functions.push(span),
+                NodeKind::Suite(suite) => scopes.suites.push((span, suite)),
+                NodeKind::Class(class) => {
+                    scopes.classes.push((span, class));
+                    for member in &class.members {
+                        match member {
+                            Member::Variable(v) => {
+                                scopes.member_vars.insert(*v);
+                            }
+                            Member::Function(f) => {
+                                scopes.member_funcs.insert(*f);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
-    })
+        scopes
+    }
 }
 
 /// Push a [`RawToken`] for `span` (skips an empty span — a zero-width identifier from a recovery
