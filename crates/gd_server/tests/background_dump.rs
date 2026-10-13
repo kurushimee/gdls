@@ -35,10 +35,28 @@ fn diagnostics_for(msg: &Message, uri_str: &str) -> Option<Vec<String>> {
     Some(params.diagnostics.into_iter().map(|d| d.message).collect())
 }
 
+/// Whether `msg` is the warning that the session serves the built-in stock surface.
+fn is_stock_notice(msg: &Message) -> bool {
+    let Message::Notification(n) = msg else {
+        return false;
+    };
+    n.method == "window/showMessage"
+        && n.params["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("built-in stock"))
+}
+
+/// A fake Godot binary at `<root>/fake-godot.sh` whose behavior is the given shell script body.
+fn fake_binary(project: &TempProject, script_body: &str) -> camino::Utf8PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = project.root.join("fake-godot.sh");
+    std::fs::write(bin.as_std_path(), format!("#!/bin/sh\n{script_body}\n")).unwrap();
+    std::fs::set_permissions(bin.as_std_path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
 #[test]
 fn background_dump_adoption_republishes_open_buffers() {
-    use std::os::unix::fs::PermissionsExt;
-
     let project = TempProject::new();
     project.write(
         "project.godot",
@@ -52,16 +70,13 @@ fn background_dump_adoption_republishes_open_buffers() {
     // the initial publish reflects the embedded fallback on any scheduler — a sync point, not a
     // timed sleep. The poll cap (~30 s) keeps an orphaned fake from outliving the test; the dump
     // thread's own deadline kill covers it regardless.
-    let bin = project.root.join("fake-godot.sh");
-    std::fs::write(
-        bin.as_std_path(),
-        format!(
-            "#!/bin/sh\ni=0\nwhile [ ! -f go.flag ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done\n\
-             cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 0\n"
+    let bin = fake_binary(
+        &project,
+        &format!(
+            "i=0\nwhile [ ! -f go.flag ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done\n\
+             cat > extension_api.json <<'EOF'\n{MINI_DUMP}\nEOF\nexit 0"
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(bin.as_std_path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let (server, client) = Connection::memory();
     let server_thread = std::thread::spawn(move || gd_server::serve(server));
@@ -98,8 +113,12 @@ fn background_dump_adoption_republishes_open_buffers() {
 
     // Publish #1 — embedded stock fallback (Generic): Timer resolves, FakeCustomClass degrades
     // silently. ZERO diagnostics; the v1.0.1 behavior was an error on every native name.
+    // The stock surface is only the stand-in while the dump runs, so its warning must never show:
+    // not at startup, and not once the real dump has been adopted.
+    let mut stock_notice = false;
     let first = loop {
         let msg = recv(&client);
+        stock_notice |= is_stock_notice(&msg);
         if let Some(diags) = diagnostics_for(&msg, uri.as_str()) {
             break diags;
         }
@@ -124,6 +143,7 @@ fn background_dump_adoption_republishes_open_buffers() {
         let Some(msg) = common::try_recv(&client, Duration::from_secs(5)) else {
             continue;
         };
+        stock_notice |= is_stock_notice(&msg);
         if let Some(diags) = diagnostics_for(&msg, uri.as_str()) {
             if diags.iter().any(|m| m.contains(r#"type "Timer""#)) {
                 break diags;
@@ -153,5 +173,64 @@ fn background_dump_adoption_republishes_open_buffers() {
         .as_std_path()
         .exists());
 
+    // The server handles messages in order, so anything the adoption sent after its republish
+    // arrives before the shutdown response.
+    client
+        .sender
+        .send(request(99, "shutdown", serde_json::Value::Null))
+        .unwrap();
+    loop {
+        let msg = recv(&client);
+        stock_notice |= is_stock_notice(&msg);
+        if matches!(msg, Message::Response(_)) {
+            break;
+        }
+    }
+    client
+        .sender
+        .send(notification("exit", serde_json::Value::Null))
+        .unwrap();
+    server_thread.join().expect("server panicked").ok();
+    assert!(
+        !stock_notice,
+        "the stock-surface warning must not show while a dump is running or after it lands"
+    );
+}
+
+#[test]
+fn failed_background_dump_still_warns_about_the_stock_surface() {
+    let project = TempProject::new();
+    project.write(
+        "project.godot",
+        "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
+    );
+    let bin = fake_binary(&project, "exit 1");
+
+    let (server, client) = Connection::memory();
+    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let init = InitializeParams {
+        initialization_options: Some(serde_json::json!({
+            "projectRoot": project.root.as_str(),
+            "godotBinaryPath": bin.as_str(),
+        })),
+        ..Default::default()
+    };
+    client.sender.send(request(1, "initialize", init)).unwrap();
+    let _init_resp = recv(&client);
+    client
+        .sender
+        .send(notification("initialized", InitializedParams {}))
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "a failed dump must leave the session warning about the stock surface"
+        );
+        if common::try_recv(&client, Duration::from_secs(5)).is_some_and(|m| is_stock_notice(&m)) {
+            break;
+        }
+    }
     shutdown(&client, server_thread);
 }
