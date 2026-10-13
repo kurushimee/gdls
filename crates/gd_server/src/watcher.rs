@@ -138,7 +138,8 @@ pub enum FileChange {
 /// Owns the [`Debouncer`] handle (dropping it stops the internal thread) and the receive end of
 /// the debounced event stream.
 pub struct FileWatcher {
-    /// Kept alive: drop = thread stops. Field is unread by design — the channel is the API.
+    /// Kept alive for the session, since the channel is the API. Dropping it is not enough to
+    /// stop watching, though: see the `Drop` impl below.
     ///
     /// `NoCache`, NOT the debouncer's `RecommendedCache`: on every platform except Linux/Android
     /// the recommended cache is a `FileIdMap` whose `add_root` synchronously walks the ENTIRE
@@ -148,7 +149,7 @@ pub struct FileWatcher {
     /// to pair rename halves; gdls already handles unpaired `From`/`To` events (the
     /// vanished-path → remove / `To` → modified-reindex arms in `server.rs`), so the cache buys
     /// nothing we need.
-    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
+    debouncer: Debouncer<RecommendedWatcher, NoCache>,
     rx: Receiver<DebounceEventResult>,
     /// The path handed to [`notify`] at construction. Retained so the main loop can re-stat it on
     /// a periodic tick (see [`Self::root_exists`]): notify's Windows backend silently `unwatch`es
@@ -184,7 +185,7 @@ impl FileWatcher {
     pub fn with_quiet_time(root: &Utf8Path, quiet_time: Duration) -> anyhow::Result<Self> {
         let (tx, rx) = unbounded::<DebounceEventResult>();
         // The Sender is accepted directly when the `crossbeam-channel` feature is on; no
-        // adapter closure or bridge thread needed. `NoCache` — see the `_debouncer` field doc.
+        // adapter closure or bridge thread needed. `NoCache` — see the `debouncer` field doc.
         let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
             quiet_time,
             None,
@@ -197,7 +198,7 @@ impl FileWatcher {
             .watch(root.as_std_path(), RecursiveMode::Recursive)
             .with_context(|| format!("FileWatcher failed to watch {root} recursively"))?;
         Ok(FileWatcher {
-            _debouncer: debouncer,
+            debouncer,
             rx,
             root: root.to_path_buf(),
             // WP-RD11 (5): capture the root's file identity for the delete+recreate liveness check.
@@ -256,6 +257,24 @@ impl FileWatcher {
                 true
             }
         }
+    }
+}
+
+/// Stop watching before returning, instead of leaving it to notify's own `Drop`.
+///
+/// notify 8's `Drop` only queues a stop for its watcher thread. On Windows that thread then closes
+/// the directory handle, and if a change landed just before the close, its completion re-arms
+/// `ReadDirectoryChangesW` on the closed handle value. When another thread has opened a handle in
+/// the meantime and got the same value, the re-armed read blocks on that handle and both threads
+/// hang for good. Unwatching and then waiting on `configure`, which notify answers from the same
+/// thread in queue order, makes the close finish before this returns. The caller still has to drop
+/// the watcher while the root is quiet, which is why shutdown drops it before saving the index
+/// cache. notify 9 marks a watch as stopping before the close, which removes the race itself.
+impl Drop for FileWatcher {
+    fn drop(&mut self) {
+        // Both fail only when notify's thread is already gone, which leaves nothing to wait for.
+        let _ = self.debouncer.unwatch(self.root.as_std_path());
+        let _ = self.debouncer.configure(notify::Config::default());
     }
 }
 
@@ -816,23 +835,26 @@ mod tests {
         // How long the burst ACTUALLY took — the precondition for the coalescing assertion below.
         let burst_span = burst_start.elapsed();
 
-        // Drain debounced batches until the stream goes quiet (no batch for a full 300 ms after the
-        // burst settles). Count only the events the watcher actually ACTS on — `classify_event`'s
-        // `Reaction::GdSource` (the index-affecting Create/Modify events whose per-save reindex
-        // budget WP-T1 depends on coalescing). Counting *raw* events instead is what made this test
-        // CI-flaky: notify-debouncer-full coalesces the burst's Create/Modify events for one path
-        // into ~1, but it does NOT coalesce the `Access(Open/Close)` events each write also emits
-        // (one open + one close per write). Those Access events are dropped by the production
-        // classifier (`SkipReason::AccessOnly`) and are irrelevant to the reindex budget, yet on a
-        // loaded CI runner ~2 Access events × 12 writes pushed the raw count to 24 — past `WRITES` —
-        // and failed a perfectly-healthy debouncer. Classifying first measures the real contract.
-        // A batch can't arrive later than one quiet window after the last write, so a receive that
-        // waits longer than that and hears nothing means the stream has settled.
+        // Drain debounced batches until the stream goes quiet. Count only the events the watcher
+        // actually ACTS on — `classify_event`'s `Reaction::GdSource` (the index-affecting
+        // Create/Modify events whose per-save reindex budget WP-T1 depends on coalescing). Counting
+        // *raw* events instead is what made this test CI-flaky: notify-debouncer-full coalesces the
+        // burst's Create/Modify events for one path into ~1, but it does NOT coalesce the
+        // `Access(Open/Close)` events each write also emits (one open + one close per write). Those
+        // Access events are dropped by the production classifier (`SkipReason::AccessOnly`) and are
+        // irrelevant to the reindex budget, yet on a loaded CI runner ~2 Access events × 12 writes
+        // pushed the raw count to 24 — past `WRITES` — and failed a perfectly-healthy debouncer.
+        // Classifying first measures the real contract. A batch can't arrive later than one quiet
+        // window after the last write, so a receive that waits longer than that and hears nothing
+        // means the stream has settled. Once the hammered file's batch is in, only a short wait is
+        // needed: every write finished before this loop started, so a debouncer that failed to
+        // coalesce has already queued its extra batches.
         let settle = quiet + Duration::from_millis(500);
+        let mut wait = settle;
         let mut index_events_for_target = 0usize;
         let deadline = Instant::now() + settle * 4;
         while Instant::now() < deadline {
-            match watcher.events().recv_timeout(settle) {
+            match watcher.events().recv_timeout(wait) {
                 Ok(Ok(batch)) => {
                     for ev in &batch {
                         for reaction in classify_event(ev, &root) {
@@ -842,6 +864,9 @@ mod tests {
                                 }
                             }
                         }
+                    }
+                    if index_events_for_target > 0 {
+                        wait = Duration::from_millis(300);
                     }
                 }
                 Ok(Err(_errors)) => {}

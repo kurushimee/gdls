@@ -9,7 +9,7 @@
 //! is why it was never wrong here. These pin that `references` now does too, and pin what must NOT
 //! start rerouting — a bare native or utility call keeps its raw-identifier answer.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, TempProject};
 use lsp_server::Connection;

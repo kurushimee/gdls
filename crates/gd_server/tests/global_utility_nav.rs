@@ -3,7 +3,7 @@
 //! and `hover` renders a signature for every one of them — including the engine-compiled
 //! GDScript-only family, which is in no dump and used to hover as its bare return type.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 
@@ -54,7 +54,8 @@ fn boot(client: &Connection, api: &str, src: &str) -> Fixture {
     std::fs::write(root.join("project.godot"), "").unwrap();
     let api_path = root.join("extension_api.json");
     std::fs::write(&api_path, api).unwrap();
-    let stub_cache = root.join("stub-cache");
+    // Under `.gdls/`, which the watcher ignores, so a materialized page never indexes as a project script.
+    let stub_cache = root.join(".gdls").join("stub-cache");
     let main_path = root.join("main.gd");
     std::fs::write(&main_path, src).unwrap();
 

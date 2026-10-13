@@ -4,7 +4,7 @@
 //! (`var l: Lib = Lib.new(); l.helper()`), find-references on `helper`'s declaration must
 //! include all cross-file call sites — even files whose interface does not mention `Lib`.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, TempProject};
 use lsp_server::Connection;

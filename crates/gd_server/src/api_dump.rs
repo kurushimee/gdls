@@ -292,6 +292,28 @@ fn embedded_stock_bytes(dialect: Dialect) -> &'static [u8] {
 /// `None` only if the embedded bytes fail to decompress/parse — corrupt vendored asset, caught
 /// by `embedded_stock_db_loads` in CI — so callers degrade rather than unwrap.
 pub(crate) fn embedded_stock_db(dialect: Dialect) -> Option<NativeDb> {
+    // A test process runs hundreds of sessions, and each would otherwise parse the same embedded
+    // dump again, which was a large share of the integration suite's CPU. A production process runs
+    // one session, where keeping a second copy around would only cost memory, so only test builds
+    // remember the result.
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        static MEMO: std::sync::Mutex<Vec<(Dialect, NativeDb)>> = std::sync::Mutex::new(Vec::new());
+        let mut memo = MEMO
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, db)) = memo.iter().find(|(d, _)| *d == dialect) {
+            return Some(db.clone());
+        }
+        let db = ingest_embedded_stock_db(dialect)?;
+        memo.push((dialect, db.clone()));
+        Some(db)
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    ingest_embedded_stock_db(dialect)
+}
+
+fn ingest_embedded_stock_db(dialect: Dialect) -> Option<NativeDb> {
     use std::io::Read;
 
     let embedded_gz: &[u8] = embedded_stock_bytes(dialect);

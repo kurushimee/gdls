@@ -24,11 +24,16 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        working-directory: .
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The extension expects gdls on PATH, so the tests run against a build of this same commit.
       - name: Build gdls
         working-directory: .
         run: |
-          rustup show
           cargo build --release --bin gdls
           echo "$GITHUB_WORKSPACE/target/release" >> "$GITHUB_PATH"
       - run: npm ci

@@ -70,7 +70,7 @@ The two oracles back each other up: trimmed-API conformance proves analyzer logi
 | `complete_context` | Completion-context classification at arbitrary cursor positions. |
 | `scene_parse` | The `.tscn` text parser. |
 
-The fuzz crate is deliberately outside the workspace: libFuzzer needs nightly and cargo-fuzz does not support Windows, so the stable `--workspace` CI on both matrix legs must never compile it. `crates/gd_syntax/tests/fuzz_crate_isolation.rs` guards that.
+The fuzz crate is deliberately outside the workspace: libFuzzer needs nightly and cargo-fuzz does not support Windows, so the stable `--workspace` build must never compile it. `crates/gd_syntax/tests/fuzz_crate_isolation.rs` guards that. The Linux CI leg type-checks it on stable instead (`cargo check --manifest-path fuzz/Cargo.toml`), which catches a library signature change that would break a target. Every push to `main` fuzzes all five targets at once for a minute each, and a nightly run gives each ten.
 
 **Graceful degradation.** A missing `extension_api.json` makes native types dynamic under the provenance rules (`02-frontend-port.md` §11b), with one notice. A missing `project.godot` means treating the root as `res://` with defaults applied. Unreadable files are skipped and logged to stderr at `warn` level, distinguishing `NotFound` (drop the file) from other I/O errors (keep the last-known interface).
 
@@ -129,12 +129,11 @@ Every mutation to `gd_project::Index` flows through `IndexMutation` (`03-indexin
 
 ## 8. The CI gate
 
-The local dev loop is the CI gate, and it runs on both `ubuntu-latest` and `windows-latest`:
+The local dev loop is the CI gate. The tests run on both `ubuntu-latest` and `windows-latest`; format and clippy read the same source on every OS, so they run on Linux only:
 
 ```bash
 cargo fmt --all --check
 cargo lint                       # clippy --workspace --all-targets -- -D warnings
-cargo build --workspace --all-targets
 cargo test --workspace
 ```
 

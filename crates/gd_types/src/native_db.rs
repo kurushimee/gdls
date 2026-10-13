@@ -236,7 +236,7 @@ pub enum ApiProvenance {
 }
 
 /// The native-class database.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct NativeDb {
     interner: Interner,
     classes: FxHashMap<Sym, NativeClass>,

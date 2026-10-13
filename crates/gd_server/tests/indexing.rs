@@ -3,7 +3,7 @@
 //! full LSP loop against that project to confirm startup indexing + the shared parse cache keep
 //! `documentSymbol` / `publishDiagnostics` working.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, options_for, recv, recv_response, sample_project};
 use gd_project::Resolution;

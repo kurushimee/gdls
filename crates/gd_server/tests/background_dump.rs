@@ -7,7 +7,7 @@
 //! `api_dump::tests::fake_binary`; Windows CI exercises the embedded/discovery layers).
 #![cfg(unix)]
 
-mod common;
+use crate::common;
 
 use std::time::{Duration, Instant};
 

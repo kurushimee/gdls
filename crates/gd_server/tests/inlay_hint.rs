@@ -11,7 +11,7 @@
 //!   6. A TYPE hint's `textEdit`, applied, re-analyzes with ZERO new diagnostics.
 //!   7. Hints respect the requested range.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, try_recv, TempProject};
 use lsp_server::{Connection, Message, Response};

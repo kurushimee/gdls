@@ -13,7 +13,7 @@
 //!
 //! **Invocation**:
 //! ```text
-//! cargo test -p gd_analyze --test differential -- --ignored --nocapture
+//! cargo test -p gd_analyze --test integration differential:: -- --ignored --nocapture
 //! ```
 //!
 //! **Discovery**: `$GODOT` (absolute path) wins if set; otherwise `which::which("godot")`
@@ -292,7 +292,7 @@ fn jaccard(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
 }
 
 #[test]
-#[ignore = "local-only differential; run with `cargo test -p gd_analyze --test differential -- --ignored --nocapture`"]
+#[ignore = "local-only differential; run with `cargo test -p gd_analyze --test integration differential:: -- --ignored --nocapture`"]
 fn godot_differential_meets_jaccard_floor() {
     let Some(godot) = resolve_godot_binary() else {
         eprintln!(

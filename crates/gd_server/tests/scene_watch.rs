@@ -3,7 +3,7 @@
 //! path calls), and warm-start cache round-trip. Proves the `**/*.tscn` watcher glob's events are
 //! actually consumed (not delivered-then-ignored) and that the scene index survives a warm restart.
 
-mod common;
+use crate::common;
 
 use gd_server::config::InitializationOptions;
 use gd_server::Workspace;

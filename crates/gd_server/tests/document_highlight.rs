@@ -9,7 +9,7 @@
 //!      (which `references` WOULD return) yields no out-of-file highlight.
 //!   4. Ranges are the identifier token, not the whole line.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, request, shutdown, TempProject};
 use lsp_server::Connection;

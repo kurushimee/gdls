@@ -8,7 +8,7 @@
 //! compiles that script fine). An unknown name the project does NOT declare still errors,
 //! exactly as before.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};
