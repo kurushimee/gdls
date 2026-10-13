@@ -847,9 +847,9 @@ fn hover_on_a_binding_declared_from_an_access_shows_the_scene_type() {
     let (client, server_thread) = boot(&p, &uri, MAIN_GD);
 
     let md = hover_md(&client, 10, &uri, at("@onready var sp := $Sprite", "sp"));
-    assert!(
-        md.contains("Sprite2D"),
-        "the binding must carry the access's scene type, got {md:?}"
+    assert_eq!(
+        md, "var sp: Sprite2D",
+        "the binding must carry the access's scene type"
     );
 
     shutdown(&client, server_thread);
@@ -864,9 +864,9 @@ fn hover_on_a_bare_use_of_a_scene_typed_binding() {
     let (client, server_thread) = boot(&p, &uri, MAIN_GD);
 
     let md = hover_md(&client, 10, &uri, at_name("\th.hp", "h"));
-    assert!(
-        md.contains("Health"),
-        "expected the attached script's class on the base, got {md:?}"
+    assert_eq!(
+        md, "var h: Health",
+        "expected the attached script's class on the base"
     );
 
     shutdown(&client, server_thread);
@@ -968,4 +968,36 @@ fn an_annotated_or_sceneless_binding_stays_on_the_analyzer() {
     );
 
     shutdown(&client2, server_thread2);
+}
+
+/// The scene type replaces only the type in a member's card: the `##` doc stays, on the
+/// declaration and on a bare use alike.
+#[test]
+fn a_scene_typed_member_card_keeps_its_doc() {
+    let p = scene_project();
+    let uri = file_uri(&p.root.join("main.gd"));
+    let src = MAIN_GD.replace(
+        "@onready var sp := $Sprite",
+        "## The hero's sprite.\n@onready var sp := $Sprite",
+    );
+    let (client, server_thread) = boot(&p, &uri, &src);
+
+    for (id, pos) in [
+        (10, at("@onready var sp := $Sprite", "sp")),
+        (11, at_name("\tsp.flip_h", "sp")),
+    ] {
+        // One line down: the doc line sits above the declaration `at` reads off `MAIN_GD`.
+        let md = hover_md(
+            &client,
+            id,
+            &uri,
+            Position::new(pos.line + 1, pos.character),
+        );
+        assert!(
+            md.starts_with("var sp: Sprite2D") && md.contains("The hero's sprite."),
+            "expected the scene-typed card with its doc, got {md:?}"
+        );
+    }
+
+    shutdown(&client, server_thread);
 }
