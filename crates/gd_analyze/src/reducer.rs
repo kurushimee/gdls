@@ -7492,6 +7492,10 @@ fn reduce_subscript_attribute(
                     // reached as `Outer.Inner`, a cross-file constant. Godot's copy at :4861 moves the
                     // bit either way, and it is the bit the companion diagnostics gate on (#364).
                     ctx.folds.mark_constant(sub_id);
+                } else if is_constant_builtin_member_read(ctx, base_id, &base_type, attr_id) {
+                    // Opaque rather than a bare constant bit, so an operator over it folds too.
+                    ctx.folds
+                        .set(sub_id, FoldedValue::Opaque(result_type.builtin_type, None));
                 }
                 // #256: a SCRIPT base never reaches the `else` arm below — its member miss reduces to
                 // a permissive Variant (an interface gap must never become `Cannot find member`), so
@@ -7635,6 +7639,33 @@ fn reduce_subscript_attribute(
     }
 
     ctx.set_type(sub_id, result_type);
+}
+
+/// analyzer.cpp:4840-4848 — a constant base that is not a meta type answers the attribute through
+/// `reduced_value.get_named`, and a hit makes the subscript constant. gdls holds no value for most
+/// builtin constants (`const A := Vector3i(1, 2, 3)` folds opaque), so only the read whose hit is
+/// certain is ported: a member the dump lists on the base's builtin type, such as `A.x`.
+fn is_constant_builtin_member_read(
+    ctx: &AnalysisContext,
+    base_id: NodeId,
+    base_type: &DataType,
+    attr_id: NodeId,
+) -> bool {
+    if !ctx.folds.is_constant(base_id)
+        || base_type.is_meta_type
+        || base_type.kind != DtKind::Builtin
+    {
+        return false;
+    }
+    let NodeKind::Identifier(attr) = &ctx.node(attr_id).kind else {
+        return false;
+    };
+    let builtin = data_type::variant_type_name(base_type.builtin_type);
+    ctx.get_type(attr_id).kind == DtKind::Builtin
+        && matches!(
+            ctx.native.lookup_builtin_member(builtin, &attr.name),
+            Some((_, gd_types::NativeMember::Property(_)))
+        )
 }
 
 /// Outcome of a cross-file call-signature walk over a script chain.
