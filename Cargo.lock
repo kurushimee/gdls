@@ -191,6 +191,7 @@ dependencies = [
  "gd_syntax",
  "gd_types",
  "rustc-hash",
+ "serde_json",
  "unicode-security",
  "which",
 ]

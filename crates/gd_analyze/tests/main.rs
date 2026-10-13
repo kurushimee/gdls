@@ -71,6 +71,7 @@ mod string_like_folds;
 mod subscript_errors;
 mod subscript_result_type;
 mod type_annotation_chain;
+mod unmodelled_builtin_type;
 mod utility_call_args;
 mod utility_callable;
 mod variable_annotation_apply;

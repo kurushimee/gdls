@@ -2393,7 +2393,8 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             // `game="*res://ghost.tscn"` whose scene is missing. Without it, `game.foo()` would
             // false-positive here. Corpus-safe: `is_autoload` is `false` for every corpus query.
             let is_autoload = ctx.xfile.is_autoload(&name);
-            if !is_native_member && !is_autoload {
+            let is_unmodelled_builtin = crate::resolver::is_unmodelled_builtin(ctx, &name);
+            if !is_native_member && !is_autoload && !is_unmodelled_builtin {
                 ctx.push_absence_error(
                     format!(r#"Identifier "{name}" not declared in the current scope."#),
                     id,
@@ -4630,6 +4631,11 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
         // analyzer.cpp:3258 — builtin constructor.
         if let Some(bt) = crate::resolver::builtin_type_from_name(&function_name) {
             reduce_builtin_constructor(ctx, id, &call, bt, &function_name);
+            return;
+        }
+        // The same dispatch for a builtin type gdls cannot model: a construction it cannot check.
+        if crate::resolver::is_unmodelled_builtin(ctx, &function_name) {
+            ctx.set_type(id, DataType::variant());
             return;
         }
 
