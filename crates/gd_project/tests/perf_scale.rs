@@ -150,7 +150,7 @@ fn malformed_file_does_not_break_the_index() {
 
 /// Local calibration run (not in the CI default set): prints the 10k cold-index time.
 #[test]
-#[ignore = "perf calibration — run explicitly: cargo test -p gd_project --test perf_scale -- --ignored --nocapture"]
+#[ignore = "perf calibration — run explicitly: cargo test -p gd_project --test integration perf_scale:: -- --ignored --nocapture"]
 fn cold_index_perf_10k() {
     let n = 10_000;
     let elapsed = index_and_check(n);

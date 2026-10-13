@@ -9,7 +9,7 @@
 //! Enum rendering strips the path back down through the `String::get_file()` mirror in
 //! `Display for DataType`, so the full path costs it nothing — the rows below pin both halves.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

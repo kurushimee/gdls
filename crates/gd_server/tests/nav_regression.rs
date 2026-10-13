@@ -23,7 +23,7 @@
 //!     module-level comment block below). Adding a regression test would require refactoring
 //!     `gd_server::serve` to accept an injectable watcher receiver; that refactor is M5 scope.
 
-mod common;
+use crate::common;
 
 use common::{notification, recv, request, shutdown, MINI_API};
 use gd_syntax::Dialect;

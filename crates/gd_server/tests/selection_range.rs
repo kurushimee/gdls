@@ -9,7 +9,7 @@
 //!   3. Multiple positions are answered index-aligned (one chain per requested position).
 //!   4. A position over no node / malformed input still returns a (degenerate) range, never panics.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, request, shutdown, TempProject};
 use lsp_server::Connection;

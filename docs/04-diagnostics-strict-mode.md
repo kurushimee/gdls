@@ -14,7 +14,7 @@ The Godot editor's LSP tries to diagnose almost the whole project at once. gdls 
 
 **Dependents.** When file X changes and a dependent Y could now have new errors, gdls does not eagerly re-publish Y. The global index is already updated by the watcher, so the next time Y is opened, edited, or queried, Y is analyzed fresh against the new state and its diagnostics are correct then. Signal stays focused on the file in hand, and stale results are never served.
 
-**Triggers for (re)publishing a document's diagnostics:** `didOpen`, `didChange` (debounced), and `didSave`. A client that prefers pull can ask via `textDocument/diagnostic` instead; the computation is the same and the items are byte-identical.
+**Triggers for (re)publishing a document's diagnostics:** `didOpen`, `didChange` (debounced), and `didSave`. Each client gets diagnostics on one channel only, because a client fed by both keeps two collections and shows every item twice. A client that advertises `textDocument.diagnostic` and `workspace.diagnostics.refreshSupport` is offered `diagnosticProvider` and receives no `publishDiagnostics`; it pulls through `textDocument/diagnostic`, and `workspace/diagnostic/refresh` takes the place of each cross-file republish. Every other client gets push alone and no `diagnosticProvider`. Pull needs refresh support because without it a pulled report for a file other than the one being edited could never learn that a dependency changed. The computation is the same either way, and a pull request is still answered for a push client.
 
 Project-wide pull (`workspace/diagnostic`) is deliberately not offered, because it contradicts the per-file principle. Clients fall back to per-file pull or push cleanly.
 
@@ -42,6 +42,10 @@ Strict mode is a post-analysis policy layer, not new analysis machinery. Godot a
 ```
 
 **Precedence:** built-in defaults, then `project.godot` config, then the profile, then fine-grained overrides, then inline `@warning_ignore(code)`, which always wins for its scope.
+
+**Which directories report warnings at all** is decided before any of that. `debug/gdscript/warnings/directory_rules` maps a `res://` directory to `Exclude` or `Include`, and Godot registers a default of `{"res://addons": Exclude}` — third-party code is not the user's to fix, so none of its warnings are reported. The rules are matched deepest-first, so a nested `Include` carves an exception out of a broader `Exclude`, and the deprecated boolean `debug/gdscript/warnings/exclude_addons` still migrates into the `res://addons` entry and overrides whatever the rule list said about it. An excluded script emits no warning at all, not even one the project promoted to an error, because upstream tests the flag above the level lookup. Errors proper are untouched. The mechanism is byte-identical at both supported releases, so it takes no dialect guard.
+
+The `strict` profile is the one place gdls departs: it already overrides a project-wide `warnings/enable = false`, and it overrides the directory exclusions the same way, so a deliberate audit sweep still sees inside `res://addons/`. The `godot` profile — the default, and what a user gets — honours them exactly.
 
 Configuration can change mid-session through `workspace/didChangeConfiguration`, which rebuilds the policy and drops the analysis cache so later publishes run under the new settings.
 

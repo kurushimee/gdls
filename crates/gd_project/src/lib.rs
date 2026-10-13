@@ -40,8 +40,9 @@ pub use interface::{
 pub use model::{AutoloadTyping, LoadOutcome, ProjectModel};
 pub use paths::{join_lexical, path_to_res, res_to_path};
 pub use project_godot::{
-    autoload_key_span, classify, parse as parse_project_godot, Autoload, ProjectGodot, ResTarget,
-    WarnLevel, WarningConfig,
+    autoload_key_span, classify, default_warning_directory_rules, parse as parse_project_godot,
+    Autoload, ProjectGodot, ResTarget, WarnDirectoryDecision, WarnDirectoryRule, WarnLevel,
+    WarningConfig,
 };
 pub use registry::{BaseRef, ClassEntry, ClassNameRegistry};
 pub use scene::{

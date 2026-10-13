@@ -206,6 +206,10 @@ pub struct AnalysisContext<'a> {
     /// for isolated unit-test analysis — the head's fqcn then falls back to empty exactly as the
     /// pre-WP-J behaviour, preserving every existing test's diagnostic strings.
     pub script_path: String,
+    /// Godot's `is_script_ignoring_warnings`: this file lives under a directory the project's
+    /// `debug/gdscript/warnings/directory_rules` excludes, so it reports no warnings at all.
+    /// Third-party code under `res://addons/` is the default case.
+    script_ignores_warnings: bool,
     pub policy: &'a WarnPolicy,
 
     /// Resolved type per node (Godot's `Node::datatype`); for a class node, its **meta** type.
@@ -457,7 +461,11 @@ impl<'a> AnalysisContext<'a> {
         let warning_ignore_regions = build_warning_ignore_regions(tree);
         let warning_ignored_lines = build_warning_ignored_lines(tree);
         let script_path = script_path.into();
+        // Resolved once per file, exactly as `evaluate_warning_directory_rules_for_script_path`
+        // is called once per parse (`gdscript_parser.cpp:481`).
+        let script_ignores_warnings = policy.ignores_script(&script_path);
         AnalysisContext {
+            script_ignores_warnings,
             tree,
             native,
             xfile,
@@ -752,6 +760,12 @@ impl<'a> AnalysisContext<'a> {
         at_node: gd_syntax::ast::NodeId,
         related: Vec<crate::diagnostic::RelatedInfo>,
     ) {
+        // Godot's `push_warning` bails on `is_script_ignoring_warnings` above the level lookup
+        // (`gdscript_parser.cpp`), so an excluded script emits nothing — not even a warning the
+        // project promoted to an error. Errors proper are unaffected.
+        if self.script_ignores_warnings {
+            return;
+        }
         // #575: a parse that lost or invented source is not judged on style. Recovery skips
         // tokens and synthesizes placeholders — a dropped initializer, a swallowed `is` operand —
         // and a warning about one of those describes gdls's recovery rather than the user's code.

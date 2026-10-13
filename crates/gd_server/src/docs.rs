@@ -447,6 +447,17 @@ enum Tag<'a> {
     Unknown,
 }
 
+/// The documented classes whose names Godot writes in lowercase, so the shape test below cannot
+/// find them. Upstream does not use a shape test at all — `_add_text` asks `doc->class_list.has`
+/// (`editor/doc/editor_help.cpp:730`), and the class list carries `int`, `float`, and `bool` beside
+/// `Node2D` and `Variant`. Without these, `[int]` and `[float]` reach hover as literal brackets in
+/// the middle of a sentence whose other type references render as code spans (#585).
+///
+/// The set is `doc/classes/*.xml` filtered to a lowercase initial, and is identical at both
+/// supported tags, so no dialect guard is owed. `@GlobalScope` and `@GDScript` already pass on the
+/// `@` arm.
+const LOWERCASE_CLASSES: &[&str] = &["bool", "float", "int"];
+
 fn classify(tag: &str) -> Tag<'_> {
     match tag {
         "b" | "/b" => Tag::Bold,
@@ -504,7 +515,10 @@ fn classify(tag: &str) -> Tag<'_> {
                 return Tag::StripKeepContent;
             }
             // Bare class reference: identifier-shaped, starting uppercase or `@` (`[Node2D]`,
-            // `[@GlobalScope]`).
+            // `[@GlobalScope]`), plus the three Godot spells in lowercase.
+            if LOWERCASE_CLASSES.contains(&tag) {
+                return Tag::SymbolRef(tag);
+            }
             let mut chars = tag.chars();
             if let Some(first) = chars.next() {
                 if (first.is_ascii_uppercase() || first == '@')
@@ -629,6 +643,35 @@ mod tests {
     fn unknown_tags_pass_through_in_markdown() {
         assert_eq!(md("a [weird-tag] b"), "a [weird-tag] b");
         assert_eq!(plain("a [weird-tag] b"), "a  b");
+    }
+
+    /// The three documented classes Godot names in lowercase. They sit in prose beside class
+    /// references that already render, so a shape test alone splits one sentence two ways.
+    #[test]
+    fn lowercase_class_names_render_like_every_other_class_reference() {
+        assert_eq!(
+            md("Supported types: [int], [float], [Vector2], [bool]."),
+            "Supported types: `int`, `float`, `Vector2`, `bool`."
+        );
+        assert_eq!(
+            plain("Supported types: [int], [float], [Vector2], [bool]."),
+            "Supported types: int, float, Vector2, bool."
+        );
+        for name in LOWERCASE_CLASSES {
+            assert!(
+                matches!(classify(name), Tag::SymbolRef(_)),
+                "[{name}] is a documented class and must render as a code span"
+            );
+        }
+        // Still lowercase, still not a class — the table is a closed set, not a rule loosening.
+        // (An UPPERCASE name like `Int` stays a symbol ref on the pre-existing shape arm, which
+        // is deliberately permissive: an unknown class reference is a code span, not a defect.)
+        for name in ["integer", "floats", "boolean", "void", "variant"] {
+            assert!(
+                !matches!(classify(name), Tag::SymbolRef(_)),
+                "[{name}] is not a documented class"
+            );
+        }
     }
 
     #[test]

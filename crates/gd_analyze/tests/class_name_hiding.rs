@@ -190,3 +190,20 @@ fn an_unshadowed_class_name_is_silent() {
     let errs = errors_in(&[("res://main.gd", src)], &["SettingsGlobal"], 0);
     assert!(!errs.iter().any(|e| e.contains("hides")), "got {errs:?}");
 }
+
+/// A `class_name` that hides a builtin still registers, but every other file keeps reading the
+/// name as the builtin: Godot checks builtin types first among the globals
+/// (`gdscript_analyzer.cpp:4556`). Before that order was ported, `Vector3.ZERO` became a member
+/// lookup on the script and reported `Cannot find member "ZERO" in base "Vector3".` plus an
+/// inference failure on the declaration (#622).
+#[test]
+fn a_class_name_hiding_a_builtin_does_not_capture_the_builtin_elsewhere() {
+    let shadow = "class_name Vector3\nextends Node\n";
+    let src = "extends Node\n\nfunc f():\n\tvar n := Vector3.ZERO\n\tprint(n)\n";
+    let errs = errors_in(
+        &[("res://shadow.gd", shadow), ("res://main.gd", src)],
+        &[],
+        1,
+    );
+    assert!(errs.is_empty(), "got {errs:?}");
+}

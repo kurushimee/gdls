@@ -21,7 +21,7 @@ Audited in `modules/gdscript/language_server/` at `4.6.3-stable`. This is the ba
 | Capability | Godot's own LSP | gdls |
 |---|---|---|
 | `hover` | signature, doc, and a "Defined in" link, including member and method signatures (`text_document.cpp:347`, `godot_lsp.h:1284`) | full signatures for members, calls, and `preload`, plus doc prose |
-| `definition` | `Location` at the symbol; resolves `class_name` in expression position via `is_global_class` (`workspace.cpp:650`) | in-file members, cross-file classes, `class_name` in expression position, `preload`/`load` strings, autoloads, and native symbols — engine classes, Variant types, and global utilities alike — into materialized stubs |
+| `definition` | `Location` at the symbol; resolves `class_name` in expression position via `is_global_class` (`workspace.cpp:650`) | in-file members, cross-file classes, `class_name` in expression position, `preload`/`load` strings, autoloads, and native symbols — engine classes, Variant types, and global utilities alike — into materialized stubs. A call on a typed receiver (`obj.method()`) resolves on the receiver's type, or on the subclasses that declare the method when the type itself does not, and never on a same-named member of the calling class |
 | preload `res://` navigation | via `documentLink` on any file-resolving string literal (`extend_parser.cpp:186-215`), not `definition` | both: `documentLink` on `res://` literals, and `definition` inside the string |
 | autoload navigation | no dedicated handling | resolves the singleton name to its script |
 | `references` | project-wide textual name scan plus per-hit re-resolve (`workspace.cpp:472`) | index-backed and binding-correct, including cross-file member and signal call sites through typed vars |
@@ -75,7 +75,7 @@ Every `textDocument/*`, `workspace/*`, and `window/*` feature of LSP 3.17, plus 
 |---|---|---|
 | didOpen/didChange/didClose/didSave (incremental) | served | |
 | publishDiagnostics (push) | served | Tags, `relatedInformation`, and `codeDescription` capability-gated |
-| Pull diagnostics: `textDocument/diagnostic` | served | The same per-file computation as push, with byte-identical items; unchanged via a `version:hash:epoch:generation` resultId |
+| Pull diagnostics: `textDocument/diagnostic` | served | The same per-file computation as push, with byte-identical items; unchanged via a `version:hash:epoch:generation` resultId. Advertised only to a client with `textDocument.diagnostic` plus `workspace.diagnostics.refreshSupport`, which then receives no push |
 | hover · definition · declaration · typeDefinition · references · implementation · documentHighlight · documentSymbol · workspace/symbol · workspaceSymbol/resolve · documentLink | served | |
 | callHierarchy (prepare, incoming, outgoing) · typeHierarchy (prepare, supertypes, subtypes) | served | The `class_name` registry plus extends graph *is* the type-hierarchy data |
 | completion plus completionItem/resolve · signatureHelp | served | §6.1, §6.2 |
@@ -197,6 +197,8 @@ A native symbol's `definition` is a real `Location` in a real file, because LSP 
 Every symbol Godot documents has a page to land on, which means one per engine class, one per Variant type, and two more for the things that belong to no class: `@GlobalScope.gd` for the Variant utilities the dump carries, and `@GDScript.gd` for the ones the language compiles in. The split mirrors Godot's own documentation. The second page is the reason `len` and `range` resolve in a project whose dump is stale, trimmed, or missing entirely — those functions live in the engine binary, not in `extension_api.json`, so their declarations are transcribed from the `REGISTER_FUNC` table rather than read from data.
 
 A declaration line on a page is produced by the same builder as the hover for the same symbol, so the two can never drift apart.
+
+Reaching a page sometimes needs a type the analyzer never assigned. `reduce_call` recognizes a builtin type name in a callee's base and synthesizes the meta type inline, without ever reducing that base node (`gdscript_analyzer.cpp:3597-3603`), so `Vector2` in `Vector2.from_angle(a)` carries no type in the result while the same name in `Vector2.ONE` does. The navigation surfaces rebuild it at the protocol boundary: `handlers::builtin_meta_base_type` answers a constant meta `DataType` for a bare identifier that names a builtin, and only when the analyzer left that node unresolved, so an already-typed base always wins. Like the scene-derived node types it sits beside, the reconstruction is a display and jump vehicle that never enters an `AnalysisResult` (`docs/02` §11).
 
 ### 7.4 Performance and scale
 

@@ -1048,9 +1048,14 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         {
             return bad_type;
         }
+        // Anchored on the whole `TypeNode`, which is what upstream passes (`p_type`,
+        // analyzer.cpp:904) and which starts at the token that introduces the type — the `:` of
+        // `var n: NoSuchType`, the `is`, the `as`, the `->` — because `alloc_node` resets a new
+        // node's extents to `previous`. The per-segment errors below anchor on their own chain
+        // entry instead, matching `p_type->type_chain[1]` / `[2]`.
         ctx.push_absence_error(
             format!(r#"Could not find type "{first}" in the current scope."#),
-            first_id,
+            type_id,
         );
         return bad_type;
     }

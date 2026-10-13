@@ -4,7 +4,7 @@
 //! the arbitrary project resources Godot's `_get_directory_contents` lists for `load`/`preload`
 //! completion are indexed, kept live, and survive a warm restart — the same discipline scenes get.
 
-mod common;
+use crate::common;
 
 use gd_server::config::InitializationOptions;
 use gd_server::Workspace;

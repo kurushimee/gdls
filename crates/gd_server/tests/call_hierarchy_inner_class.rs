@@ -10,7 +10,7 @@
 //! The analyzer already recorded the callee's owning class (`CalleeTarget::Script::class_path`);
 //! this pins that the caller side records it too and that both legs key on it.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

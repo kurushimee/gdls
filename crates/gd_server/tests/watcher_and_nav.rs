@@ -17,7 +17,7 @@
 //! member-initializer cycles (WP-R2/WP-X2) and the `project.godot`-reload effect are pinned with
 //! hard assertions, since those don't depend on real-FS event timing.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

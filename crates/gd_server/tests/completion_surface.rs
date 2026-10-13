@@ -13,7 +13,7 @@
 //! - …and none of Godot's fourteen keyword constants, so `PI`, `self`, and `return` never did
 //!   either (#318).
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv_response, request, TempProject};
 use lsp_server::Connection;

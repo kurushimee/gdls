@@ -643,6 +643,15 @@ pub fn definition(
     // in-file lookup (1), which would otherwise match a same-named ROOT member for an inner-class
     // instance (`var x := Inner.new(); x.collide` → the inner `collide`, not the root's). Only the
     // attribute-on-Script case is handled here; a non-attribute cursor or a Native base falls through.
+    //
+    // #619: an attribute whose base has a concrete type names a member OF THAT TYPE, so step (1)'s
+    // name-only scan of this file must not answer it. It used to: `sys.add(x)` on a
+    // `sys: SomeNative`, written inside this class's own `add`, jumped to that enclosing `add`
+    // rather than the native's. `self.x` types as this file's `Script` and is answered above,
+    // before the flag can matter. `Enum` bases stay with steps (1)/(1.55), and a `Variant` base
+    // keeps the name-only fallback.
+    let mut attr_on_typed_base = false;
+    let mut duck_native_base: Option<String> = None;
     {
         let attr_base = parsed.tree.iter_ids().find_map(|id| {
             if let NodeKind::Subscript(sub) = &parsed.tree.get(id).kind {
@@ -658,10 +667,26 @@ pub fn definition(
         });
         if let Some(base_id) = attr_base {
             let analyzed = analyze_if_gd(state, &uri, &parsed.tree, &text);
-            let sr = analyzed.as_deref().and_then(|a| {
-                let dt = projected_base_type(state, &uri, &parsed.tree, a, base_id);
+            let base_dt = analyzed
+                .as_deref()
+                .map(|a| projected_base_type(state, &uri, &parsed.tree, a, base_id));
+            attr_on_typed_base = base_dt.as_ref().is_some_and(|dt| {
+                matches!(dt.kind, DtKind::Script | DtKind::Native | DtKind::Builtin)
+            });
+            duck_native_base = base_dt
+                .as_ref()
+                .filter(|dt| dt.kind == DtKind::Native && !dt.native_type.is_empty())
+                .filter(|dt| {
+                    state
+                        .workspace
+                        .native
+                        .lookup_member(&dt.native_type, &name)
+                        .is_none()
+                })
+                .map(|dt| dt.native_type.clone());
+            let sr = base_dt.and_then(|dt| {
                 (dt.kind == DtKind::Script)
-                    .then(|| dt.script_type.clone())
+                    .then_some(dt.script_type)
                     .flatten()
             });
             if let Some(sr) = sr {
@@ -692,15 +717,33 @@ pub fn definition(
                     if let Some(loc) = member_decl_location(state, link.file, &link.inner, &name) {
                         return Some(GotoDefinitionResponse::Scalar(loc));
                     }
-                } else if let Some(owner) = script_base_native_owner(state, &sr, &name) {
-                    let stub_root = state.options.stub_cache_dir.clone();
-                    if let Some(loc) =
-                        native_member_stub_location(state, &owner, &name, stub_root.as_deref())
-                    {
-                        return Some(GotoDefinitionResponse::Scalar(loc));
+                } else {
+                    if let Some(owner) = script_base_native_owner(state, &sr, &name) {
+                        let stub_root = state.options.stub_cache_dir.clone();
+                        if let Some(loc) =
+                            native_member_stub_location(state, &owner, &name, stub_root.as_deref())
+                        {
+                            return Some(GotoDefinitionResponse::Scalar(loc));
+                        }
+                    }
+                    // #619: nothing up the chain declares it, so this is a duck-typed call that
+                    // Godot only warns about (UNSAFE_METHOD_ACCESS): the method lives on
+                    // subclasses of the receiver's type. Those declarations are the targets, the
+                    // same list `implementation` gives on the base method.
+                    let seed = TypeRef::Script(sr.file, sr.inner.clone());
+                    if let Some(resp) = subtype_method_response(state, &seed, &name) {
+                        return Some(resp);
                     }
                 }
             }
+        }
+    }
+
+    // (0.55) #619: the same duck-typed call on a NATIVE receiver whose class lacks the method
+    // (`var c: SomeNative; c.from_a_script()`): the script subclasses that declare it.
+    if let Some(base) = duck_native_base {
+        if let Some(resp) = subtype_method_response(state, &TypeRef::Native(base), &name) {
+            return Some(resp);
         }
     }
 
@@ -864,8 +907,10 @@ pub fn definition(
     }
 
     // (1) In-file member.
-    if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
-        return Some(GotoDefinitionResponse::Scalar(loc));
+    if !attr_on_typed_base {
+        if let Some(loc) = find_in_file_definition(&parsed.tree, &name, &uri, &mapper) {
+            return Some(GotoDefinitionResponse::Scalar(loc));
+        }
     }
 
     // (1.5) Cross-file member access (#13): the analyzer records a `Binding::Use` at this exact
@@ -1782,8 +1827,55 @@ fn projected_base_type(
     analyzed: &AnalysisResult,
     base_id: NodeId,
 ) -> DataType {
-    crate::scene_nav::scene_type_of_base(state, uri, tree, base_id)
-        .unwrap_or_else(|| analyzed.types.get(base_id).clone())
+    if let Some(dt) = crate::scene_nav::scene_type_of_base(state, uri, tree, base_id) {
+        return dt;
+    }
+    let dt = analyzed.types.get(base_id).clone();
+    if dt.kind == DtKind::Unresolved {
+        if let Some(meta) = builtin_meta_base_type(tree, base_id) {
+            return meta;
+        }
+    }
+    dt
+}
+
+/// The `Vector2` in `Vector2.from_angle(1.0)` — a builtin type name as a CALL callee's base.
+///
+/// The analyzer leaves that node untyped, and it is right to: `reduce_call`'s subscript-callee arm
+/// short-circuits a builtin type name into a synthesized meta type and never reduces the base
+/// (`gdscript_analyzer.cpp:3597-3603`, where only the `else` branch calls `reduce_expression`). The
+/// type it builds is a local, consumed by the dispatch and discarded, so nothing writes it back —
+/// in Godot's own AST either.
+///
+/// Navigation reads the type table, so without this the base looks `Unresolved` and every surface
+/// gives up on a call the analyzer resolved perfectly well: `definition` and `signatureHelp` answer
+/// null, hover falls back to the expression's type label. Rebuilt HERE rather than stamped in the
+/// analyzer, so faithfulness is untouched and nothing enters an `AnalysisResult` (#591).
+///
+/// Only a bare identifier qualifies. `Vector2.ONE.normalized()` types its base through
+/// `reduce_subscript` like any other expression and never reaches this.
+pub(crate) fn builtin_meta_base_type(tree: &ParseTree, base_id: NodeId) -> Option<DataType> {
+    let NodeKind::Identifier(ident) = &tree.get(base_id).kind else {
+        return None;
+    };
+    let builtin_type = gd_analyze::resolver::builtin_type_from_name(&ident.name)?;
+    Some(DataType {
+        type_source: gd_analyze::TypeSource::AnnotatedExplicit,
+        kind: DtKind::Builtin,
+        builtin_type,
+        is_meta_type: true,
+        is_constant: true,
+        ..Default::default()
+    })
+}
+
+/// [`builtin_meta_base_type`] for a surface that knows the base only by where it ENDS — the byte
+/// before the dot. `signature_help` walks tokens rather than the base node, so it locates the base
+/// that way; the reconstruction itself is the same one.
+pub(crate) fn builtin_meta_type_ending_at(tree: &ParseTree, end: usize) -> Option<DataType> {
+    tree.iter_ids()
+        .find(|&id| tree.get(id).span.end == end && builtin_meta_base_type(tree, id).is_some())
+        .and_then(|id| builtin_meta_base_type(tree, id))
 }
 
 /// M6-F: when the cursor lands on a Call or Subscript node, resolve the callee's `MemberDecl`
@@ -3959,6 +4051,12 @@ fn global_class_file(state: &ServerState, name: &str) -> Option<gd_project::File
 }
 
 fn find_global_class_definition(state: &mut ServerState, name: &str) -> Option<Location> {
+    // A `class_name Vector3` registers, but every reference still binds the builtin, which Godot
+    // checks first among the globals (`gdscript_analyzer.cpp:4556`). Answering with the script
+    // here would send `Vector3` to it instead of the builtin's stub.
+    if gd_analyze::resolver::builtin_type_from_name(name).is_some() {
+        return None;
+    }
     let entry = state.workspace.index.registry().get(name)?;
     let path = entry.path.clone();
     let indexed_span = entry.name_span;
@@ -6889,8 +6987,54 @@ fn find_method_overrides(
     // unrelated class's subclasses.
     let seed = TypeRef::Script(current_fid, class_path);
 
+    Some(subtype_method_locations(state, &seed, fn_name, enc))
+}
+
+/// [`subtype_method_locations`] as a definition answer: a single target as a scalar, several as
+/// an array, none as `None` so the caller decides what an empty answer means.
+fn subtype_method_response(
+    state: &mut ServerState,
+    seed: &TypeRef,
+    fn_name: &str,
+) -> Option<GotoDefinitionResponse> {
+    let mut locs = subtype_method_locations(state, seed, fn_name, state.encoding);
+    match locs.len() {
+        0 => None,
+        1 => locs.pop().map(GotoDefinitionResponse::Scalar),
+        _ => Some(GotoDefinitionResponse::Array(locs)),
+    }
+}
+
+/// Every strict subtype of `seed` that declares a method named `fn_name`, as a `Location` at that
+/// declaration's identifier. A subtype that doesn't declare it is skipped, so only real
+/// declarations are reported.
+fn subtype_method_locations(
+    state: &mut ServerState,
+    seed: &TypeRef,
+    fn_name: &str,
+    enc: crate::position::PositionEncoding,
+) -> Vec<Location> {
     let edges = subclass_edges(&state.workspace.index, &state.workspace.native);
-    let subtypes = subtype_closure(&edges, &seed);
+    let subtypes = match seed {
+        // The graph links a native class only to the scripts that extend it directly, so a native
+        // seed starts from every native class at or below it that some script extends.
+        TypeRef::Native(base) => {
+            let native = &state.workspace.native;
+            let mut all: Vec<TypeRef> = Vec::new();
+            for key in edges.keys() {
+                if let TypeRef::Native(n) = key {
+                    if native.is_subclass_of_named(n, base) {
+                        all.extend(subtype_closure(&edges, key));
+                    }
+                }
+            }
+            let mut seen: FxHashSet<TypeRef> = FxHashSet::default();
+            all.retain(|t| seen.insert(t.clone()));
+            all.sort_by(type_ref_order);
+            all
+        }
+        TypeRef::Script(..) => subtype_closure(&edges, seed),
+    };
 
     // For each subtype that actually declares `fn_name`, emit a Location at its identifier.
     // A subtype that doesn't override it is skipped — method override search only reports
@@ -6955,7 +7099,7 @@ fn find_method_overrides(
         });
     }
 
-    Some(locations)
+    locations
 }
 
 /// `textDocument/implementation`: list the project classes that extend the class under the cursor
@@ -9776,13 +9920,19 @@ fn subtype_closure(edges: &FxHashMap<TypeRef, Vec<TypeRef>>, seed: &TypeRef) -> 
         }
         out.push(next);
     }
-    out.sort_by(|a, b| match (a, b) {
+    out.sort_by(type_ref_order);
+    out
+}
+
+/// A stable order for [`TypeRef`]s: project classes by file and inner-class path, then natives by
+/// name.
+fn type_ref_order(a: &TypeRef, b: &TypeRef) -> std::cmp::Ordering {
+    match (a, b) {
         (TypeRef::Script(fa, pa), TypeRef::Script(fb, pb)) => (fa.get(), pa).cmp(&(fb.get(), pb)),
         (TypeRef::Script(..), TypeRef::Native(_)) => std::cmp::Ordering::Less,
         (TypeRef::Native(_), TypeRef::Script(..)) => std::cmp::Ordering::Greater,
         (TypeRef::Native(a), TypeRef::Native(b)) => a.cmp(b),
-    });
-    out
+    }
 }
 
 fn for_each_class(index: &gd_project::Index, mut f: impl FnMut(gd_project::FileId, &[String])) {
@@ -10512,6 +10662,48 @@ mod tests {
 
     fn uri(s: &str) -> Uri {
         s.parse().expect("test uri")
+    }
+
+    /// #591: only a bare builtin type name qualifies for the reconstructed meta type. Anything
+    /// else in callee-base position — a local, a native class, a subscript, a call — is either
+    /// already typed by the analyzer or genuinely not a builtin, and must be left alone, or the
+    /// reconstruction would shadow a real type with a wrong one.
+    #[test]
+    fn only_a_bare_builtin_type_name_reconstructs_a_meta_type() {
+        let src = "func go():\n\tvar v := Vector2.ZERO\n\tprint(Vector2, v, Node2D, Color)\n";
+        let parsed = gd_syntax::parse(src);
+        let tree = &parsed.tree;
+
+        let named = |name: &str| -> Vec<Option<DataType>> {
+            tree.iter_ids()
+                .filter(
+                    |&id| matches!(&tree.get(id).kind, NodeKind::Identifier(i) if i.name == name),
+                )
+                .map(|id| builtin_meta_base_type(tree, id))
+                .collect()
+        };
+
+        for name in ["Vector2", "Color"] {
+            let hits = named(name);
+            assert!(!hits.is_empty(), "{name} appears in the fixture");
+            for dt in &hits {
+                let dt = dt.as_ref().unwrap_or_else(|| panic!("{name} is a builtin"));
+                assert!(dt.is_meta_type, "{name} reconstructs as a meta type");
+                assert_eq!(dt.kind, DtKind::Builtin);
+            }
+        }
+
+        for name in ["v", "Node2D", "go", "print"] {
+            for dt in named(name) {
+                assert!(dt.is_none(), "{name} is not a builtin type name");
+            }
+        }
+
+        // A non-identifier node never qualifies, whatever it evaluates to.
+        assert!(tree
+            .iter_ids()
+            .filter(|&id| !matches!(&tree.get(id).kind, NodeKind::Identifier(_)))
+            .all(|id| builtin_meta_base_type(tree, id).is_none()));
     }
 
     fn loc(u: &str, line: u32, character: u32) -> Location {

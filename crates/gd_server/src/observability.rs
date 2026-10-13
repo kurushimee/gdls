@@ -35,6 +35,10 @@ use crate::memory::{Bytes, MemoryBudget};
 /// samples) a 4-deep window clears a one-off spike within ~12 s of the working set returning.
 const PRESSURE_WINDOW_SAMPLES: usize = 4;
 
+/// Sample phases that repeat for the whole session: the 3-second ticker and the sample after every
+/// watcher batch. They log at `debug` so an idle server's default log stays quiet.
+const PERIODIC_PHASES: [&str; 2] = ["tick", "post_watcher"];
+
 /// Resident-set-size sampler. Cross-platform via `sysinfo`: Windows reads `WorkingSetSize`,
 /// Linux `/proc/self/statm`, macOS the Mach task_info VM API. One `sysinfo::System` instance per
 /// sampler, refreshed in-place on each [`Self::sample_now`] (no per-call allocation).
@@ -50,9 +54,10 @@ const PRESSURE_WINDOW_SAMPLES: usize = 4;
 ///   recovers once a spike ages out of the window.
 ///
 /// Each `sample_now` returns the *current* reading, updates `peak` if exceeded, and pushes onto
-/// the rolling window. The WP-O1 tracing pipeline fans out the readings as
-/// `tracing::info!(target = "rss", phase, bytes)` events; consumers grep that target in the JSONL
-/// trace.
+/// the rolling window. The WP-O1 tracing pipeline fans out the readings as `target = "rss"`
+/// events; consumers grep that target in the JSONL trace. The once-per-session phases log at
+/// `info`, while the repeating ones in [`PERIODIC_PHASES`] log at `debug`, so the 3-second ticker
+/// stays out of a default `info` log. Capturing the whole pressure curve takes `rss=debug`.
 pub struct RssSampler {
     sys: sysinfo::System,
     pid: sysinfo::Pid,
@@ -94,8 +99,9 @@ impl RssSampler {
     }
 
     /// Re-refresh this process and return the current RSS in bytes. Updates [`Self::peak`] in
-    /// place. Emits a structured `tracing::info!` event on each call so the JSONL trace carries
-    /// the full pressure curve (consumed by the WP-P1 summary script + Phase-H walk).
+    /// place. Emits a structured event on each call so the JSONL trace carries the full pressure
+    /// curve (consumed by the WP-P1 summary script + Phase-H walk): `info` for a lifecycle phase,
+    /// `debug` for one of the [`PERIODIC_PHASES`].
     pub fn sample_now(&mut self, phase: &'static str) -> Bytes {
         Self::refresh_self(&mut self.sys, self.pid);
         let current = match self.sys.process(self.pid).map(|p| p.memory()) {
@@ -117,14 +123,25 @@ impl RssSampler {
                 self.peak_bytes
             }
         };
-        tracing::info!(
-            target: "rss",
-            phase,
-            bytes = current,
-            peak_bytes = self.peak_bytes,
-            baseline_bytes = self.baseline_bytes,
-            "rss sample"
-        );
+        if PERIODIC_PHASES.contains(&phase) {
+            tracing::debug!(
+                target: "rss",
+                phase,
+                bytes = current,
+                peak_bytes = self.peak_bytes,
+                baseline_bytes = self.baseline_bytes,
+                "rss sample"
+            );
+        } else {
+            tracing::info!(
+                target: "rss",
+                phase,
+                bytes = current,
+                peak_bytes = self.peak_bytes,
+                baseline_bytes = self.baseline_bytes,
+                "rss sample"
+            );
+        }
         Bytes::new(current)
     }
 
@@ -356,13 +373,13 @@ where
         drop(exts);
         // Single clamped atomic decrement (mirrors the `fetch_add` in `on_new_span`). A plain
         // load-then-store pair would let two spans closing on different threads both read N and
-        // both store N-1, silently losing a decrement and skewing the indent; `fetch_update`
+        // both store N-1, silently losing a decrement and skewing the indent; `try_update`
         // retries on contention so the count stays exact. `saturating_sub` keeps it from wrapping
         // under an unusual close-before-open ordering. The closure never returns `None`, so the
         // `Result` is always `Ok` — discard it.
         let _ = self
             .depth
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
                 Some(d.saturating_sub(1))
             });
         if ms >= self.threshold_ms {
@@ -378,6 +395,49 @@ mod tests {
     use super::*;
     use tracing::info_span;
     use tracing_subscriber::layer::SubscriberExt;
+
+    /// The repeating samples stay out of a default `info` log, since the 3-second ticker would
+    /// otherwise write a line every 3 s for the whole session; the lifecycle samples stay visible.
+    #[test]
+    fn periodic_rss_samples_log_below_info() {
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = buf.clone();
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_writer(move || Capture(sink.clone()))
+            .with_ansi(false);
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new("info"))
+            .with(fmt_layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let mut rss = RssSampler::new();
+            rss.sample_now("tick");
+            rss.sample_now("post_watcher");
+            rss.sample_now("post_cold_index");
+        });
+        let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("phase=\"post_cold_index\""),
+            "lifecycle sample missing: {out}"
+        );
+        assert!(
+            !out.contains("phase=\"tick\""),
+            "tick sample logged at info: {out}"
+        );
+        assert!(
+            !out.contains("phase=\"post_watcher\""),
+            "post_watcher sample logged at info: {out}"
+        );
+    }
 
     #[test]
     fn parse_gdls_trace_accepts_wildcard_threshold() {

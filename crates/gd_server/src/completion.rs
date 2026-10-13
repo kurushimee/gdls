@@ -512,7 +512,14 @@ fn resolve_base_type(
     {
         return Some(dt);
     }
-    analyzed_base_type(tree, analyzed, base, tokens, byte).cloned()
+    if let Some(dt) = analyzed_base_type(tree, analyzed, base, tokens, byte) {
+        return Some(dt.clone());
+    }
+    // #591: `Vector2.from_angle(` — a builtin type name in a callee's base position carries no
+    // type, faithfully (see `handlers::builtin_meta_base_type`), so the two scans above find
+    // nothing and the list came back empty. `Vector2.` alone offers 11 items because that parses
+    // as a plain subscript, which the analyzer does type.
+    end.and_then(|e| crate::handlers::builtin_meta_type_ending_at(tree, e))
 }
 
 /// The analyzer's own type for a `<base>.<cursor>` base expression, or `None` when it has none.

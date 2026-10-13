@@ -60,7 +60,7 @@ git -C "$GODOT" rev-parse HEAD
 git -C "$GODOT" rev-parse "HEAD:modules/gdscript/tests/scripts/analyzer"
 ```
 
-Then re-bless the ratchet with `GDLS_BLESS_CONFORMANCE=1 cargo test -p gd_analyze --test conformance -- --nocapture` and review the diff to `analyze_known_failures.txt` and `analyze_fidelity_floor.txt`.
+Then re-bless the ratchet with `GDLS_BLESS_CONFORMANCE=1 cargo test -p gd_analyze --test integration conformance:: -- --nocapture` and review the diff to `analyze_known_failures.txt` and `analyze_fidelity_floor.txt`.
 
 ## Adding support for a newer release
 

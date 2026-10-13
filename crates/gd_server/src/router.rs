@@ -259,10 +259,13 @@ pub(crate) fn spawn_router(
                             match serde_json::from_value::<CancelParams>(note.params.clone()) {
                                 Ok(p) => {
                                     let id = request_id_from_number_or_string(p.id);
+                                    // Both arms are routine — editors cancel hovers and completions
+                                    // constantly, often after the reply already went out — so
+                                    // neither belongs in a default `info` log.
                                     if shared.cancel(&id) {
-                                        tracing::info!(target: "cancel", id = %id, "cancel_requested");
+                                        tracing::debug!(target: "cancel", id = %id, "cancel_requested");
                                     } else {
-                                        log::warn!(
+                                        log::debug!(
                                             "$/cancelRequest for {id:?}: no in-flight request \
                                              with that id; ignoring (LSP 3.17 §$/cancelRequest: \
                                              unknown ids are allowed)"

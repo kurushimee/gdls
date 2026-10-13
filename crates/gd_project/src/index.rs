@@ -239,7 +239,7 @@ impl Index {
         // `finish_cold_index`); release logs + quarantines the named files the same way
         // `Index::txn` does for runtime mutations, then keeps serving (never crash).
         if let Err(violations) = idx.verify() {
-            if cfg!(debug_assertions) {
+            if panics_on_violation() {
                 panic!(
                     "cold_index post-state violated Index invariants: {violations:?}\n\
                      A violation here is a bug in `set_interface_from_tree` / `finish_cold_index` \
@@ -1531,13 +1531,13 @@ impl IndexMut<'_> {
     /// path the index never interned), which `verify` flags and `txn` then quarantines, then
     /// re-verifies clean.
     ///
-    /// This path is **release-only and not fuzzable**. `txn` answers any post-state violation with
-    /// its debug-only `panic!` ("a mutator desynced the index"), so the quarantine branch runs only
-    /// when debug-assertions are OFF — i.e. `cargo test -p gd_project --release`, where the sibling
-    /// test [`Index::txn`]'s caller skips itself under `cfg!(debug_assertions)`. cargo-fuzz keeps
-    /// debug-assertions ON, so an injected violation there would hit the debug-`panic!` and
-    /// libfuzzer's hook would abort before quarantine ran — which is why the index-invariant fuzz
-    /// target drives only the change/remove mutators and leaves recovery to these release tests.
+    /// This path is **not fuzzable**. `txn` answers any post-state violation with its debug-only
+    /// `panic!` ("a mutator desynced the index"), so the quarantine branch runs only where
+    /// [`panics_on_violation`] is false: a release build, or a unit test inside `as_release`.
+    /// cargo-fuzz keeps debug-assertions ON, so an injected violation there would hit the
+    /// debug-`panic!` and libfuzzer's hook would abort before quarantine ran — which is why the
+    /// index-invariant fuzz target drives only the change/remove mutators and leaves recovery to
+    /// these unit tests.
     ///
     /// Gated on `cfg(test)`, so it never exists in a production `gdls` binary (nor in the fuzz
     /// build, which no longer references it).
@@ -1551,6 +1551,25 @@ impl IndexMut<'_> {
             None,
         );
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by the unit tests' `as_release` so a debug-profile test can drive the release recovery
+    /// path. See [`panics_on_violation`].
+    static RELEASE_RECOVERY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether an invariant violation panics instead of being quarantined. Debug builds panic so a
+/// mutator bug fails loudly, and release builds quarantine the named files and keep serving. A unit
+/// test can switch its own thread to the release answer, so the quarantine path runs under the
+/// normal debug `cargo test` instead of needing a separate `--release` build.
+fn panics_on_violation() -> bool {
+    #[cfg(test)]
+    if RELEASE_RECOVERY.with(std::cell::Cell::get) {
+        return false;
+    }
+    cfg!(debug_assertions)
 }
 
 impl Index {
@@ -1612,7 +1631,7 @@ impl Index {
             Err(v) => v,
         };
 
-        if cfg!(debug_assertions) && !mutation_panicked {
+        if panics_on_violation() && !mutation_panicked {
             panic!(
                 "index_invariant_violated file={file} invariants={violations:?}\n\
                  This is a bug — verify() caught an inconsistency that on_file_* mutators \
@@ -1793,6 +1812,14 @@ mod tests {
     // Forward-slash absolute path, matching the `Index`'s normalized keys (see `normalize`).
     fn abs(rel: &str) -> Utf8PathBuf {
         Utf8PathBuf::from(format!("/proj/{rel}"))
+    }
+
+    /// Run `f` with this thread's invariant violations quarantined the way a release build does.
+    fn as_release<R>(f: impl FnOnce() -> R) -> R {
+        RELEASE_RECOVERY.with(|r| r.set(true));
+        let out = f();
+        RELEASE_RECOVERY.with(|r| r.set(false));
+        out
     }
 
     /// Build a cold index from `(res-relative-path, source)` pairs.
@@ -2487,17 +2514,14 @@ mod tests {
 
     #[test]
     fn index_mutation_release_handles_mutation_panic() {
-        // Skip in debug builds — debug-only verify-violation panics interact with
-        // catch_unwind in ways the test doesn't need to assert. Release behavior is the
-        // recoverable session-survival path we care about.
-        if cfg!(debug_assertions) {
-            return;
-        }
+        // Release behavior is the recoverable session-survival path we care about.
         let mut idx = cold_index(&[("a.gd", "extends Node\n")]);
         // A mutation that panics partway: verify still runs (catch_unwind), the index
         // stays consistent because no mutator was called, and the session keeps going.
-        idx.txn(&abs("a.gd"), |_i| {
-            panic!("simulated panic inside mutation closure");
+        as_release(|| {
+            idx.txn(&abs("a.gd"), |_i| {
+                panic!("simulated panic inside mutation closure");
+            });
         });
         assert!(
             idx.verify().is_ok(),
@@ -2514,9 +2538,6 @@ mod tests {
         // call (taking the index from one consistent state to another) and THEN panics.
         // The recovery should still leave the index in a verifiable state — possibly with
         // some files quarantined — and the LSP session must stay alive.
-        if cfg!(debug_assertions) {
-            return;
-        }
         let mut idx = cold_index(&[
             ("a.gd", "class_name A\nextends Node\n"),
             ("b.gd", "class_name B\nextends A\n"),
@@ -2524,13 +2545,15 @@ mod tests {
 
         let new_a_iface =
             interface::extract(&gd_syntax::parse("class_name A2\nextends Node\n").tree);
-        idx.txn(&abs("a.gd"), |i| {
-            // First: a real consistent mutation that succeeds. After this call the index is
-            // still verifiable on its own.
-            i.on_file_changed(&abs("a.gd"), new_a_iface);
-            // Then: a panic mid-closure, simulating a buggy reducer that aborts after some
-            // table writes already landed. The catch_unwind boundary captures this.
-            panic!("simulated mid-closure panic after a successful on_file_changed");
+        as_release(|| {
+            idx.txn(&abs("a.gd"), |i| {
+                // First: a real consistent mutation that succeeds. After this call the index is
+                // still verifiable on its own.
+                i.on_file_changed(&abs("a.gd"), new_a_iface);
+                // Then: a panic mid-closure, simulating a buggy reducer that aborts after some
+                // table writes already landed. The catch_unwind boundary captures this.
+                panic!("simulated mid-closure panic after a successful on_file_changed");
+            });
         });
 
         // The session must still be alive (we returned from `apply` instead of unwinding
@@ -2552,9 +2575,7 @@ mod tests {
         // e.g. a reducer that wrote the registry then aborted before interning the file). Because
         // the closure panicked, `apply` skips its debug-only invariant panic
         // (`cfg!(debug_assertions) && !mutation_panicked` is false) and runs the quarantine path in
-        // BOTH debug and release — so this exercises remediation under the normal `cargo test`
-        // profile, which `index_mutation_release_handles_mutation_panic` cannot (it early-returns
-        // in debug).
+        // BOTH debug and release, with no `as_release` needed.
         let mut idx = cold_index(&[("a.gd", "extends Node\n")]);
 
         idx.txn(&abs("a.gd"), |i| {
@@ -2593,15 +2614,12 @@ mod tests {
         // → quarantines the offending entry → re-verifies clean. Because the closure didn't panic,
         // `txn`'s debug-only invariant panic is bypassed only by the quarantine path here too: a
         // `DanglingClassName` is a real violation, and in debug `txn` would panic on it UNLESS the
-        // mutation panicked. So the remediation path only runs in RELEASE (debug `txn` panics on a
-        // non-panic violation by design) — which is also exactly why the index-invariant fuzz target
-        // (cargo-fuzz keeps debug-assertions ON) cannot exercise recovery and leaves it to this
-        // release test. Mirror `index_mutation_release_handles_mutation_panic`'s guard.
-        if cfg!(debug_assertions) {
-            return;
-        }
+        // mutation panicked. So the remediation path only runs with the release answer (debug `txn`
+        // panics on a non-panic violation by design) — which is also exactly why the
+        // index-invariant fuzz target (cargo-fuzz keeps debug-assertions ON) cannot exercise
+        // recovery and leaves it to this test.
         let mut idx = cold_index(&[("a.gd", "extends Node\n")]);
-        idx.txn(&abs("a.gd"), |i| i.inject_verify_violation());
+        as_release(|| idx.txn(&abs("a.gd"), |i| i.inject_verify_violation()));
         assert!(
             idx.verify().is_ok(),
             "txn must quarantine the injected violation and leave a verifiable index (no panic path)"

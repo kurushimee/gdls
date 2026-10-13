@@ -9,7 +9,7 @@
 //! analyzer stays free of the server crate; `gd_server` maps its parsed `initializationOptions` onto
 //! these at the call site (WP-G).
 
-use gd_project::{WarnLevel as ProjLevel, WarningConfig};
+use gd_project::{WarnDirectoryRule, WarnLevel as ProjLevel, WarningConfig};
 use gd_syntax::Dialect;
 
 use crate::warnings::{
@@ -53,6 +53,9 @@ const STRICT_PROMOTED: [WarningCode; 6] = [
 #[derive(Clone, Debug)]
 pub struct WarnPolicy {
     levels: [WarnLevel; WARNING_MAX],
+    /// The project's `directory_rules`, deepest first — or empty when the strict profile has
+    /// deliberately taken them out of play. See [`WarnPolicy::ignores_script`].
+    directory_rules: Vec<WarnDirectoryRule>,
 }
 
 impl WarnPolicy {
@@ -116,7 +119,32 @@ impl WarnPolicy {
             }
         }
 
-        WarnPolicy { levels }
+        // (5) which directories report warnings at all. `StrictProfile::Strict` is gdls's own
+        // "show me everything" mode and already overrides a project-wide `enable = false` at step
+        // (1), so it overrides the directory exclusions the same way; `Godot` — what a user gets
+        // by default — honours them exactly as the engine does. `Off` reports nothing regardless.
+        let directory_rules = match strict.profile {
+            StrictProfile::Strict => Vec::new(),
+            StrictProfile::Godot | StrictProfile::Off => project.directory_rules.clone(),
+        };
+
+        WarnPolicy {
+            levels,
+            directory_rules,
+        }
+    }
+
+    /// Whether the script at `res_path` reports warnings at all — Godot's
+    /// `is_script_ignoring_warnings`, set by `evaluate_warning_directory_rules_for_script_path`
+    /// (`gdscript_parser.cpp:328`) and checked at the very top of `push_warning`, above the level
+    /// lookup. So an excluded script emits nothing, not even a warning the project promoted to an
+    /// error. Errors proper are untouched.
+    #[must_use]
+    pub fn ignores_script(&self, res_path: &str) -> bool {
+        self.directory_rules
+            .iter()
+            .find(|rule| res_path.starts_with(&rule.directory))
+            .is_some_and(|rule| rule.decision == gd_project::WarnDirectoryDecision::Exclude)
     }
 
     /// The effective level of a warning, before any `@warning_ignore` suppression.

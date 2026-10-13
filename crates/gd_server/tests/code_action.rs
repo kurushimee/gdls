@@ -15,7 +15,7 @@
 //!   6. Generic-client degraded path: no `resolveSupport` → the edit is computed EAGERLY in the
 //!      `codeAction` response (no resolve round-trip needed).
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, request, shutdown, try_recv, TempProject};
 use lsp_server::{Connection, Message, RequestId, Response};

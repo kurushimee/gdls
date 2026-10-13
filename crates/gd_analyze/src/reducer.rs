@@ -2114,13 +2114,31 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         }
     }
 
-    // 4. Native class name → metatype (analyzer.cpp:4541-4545).
+    // 4. Builtin type name (`int`/`String`/`Vector2`/…), analyzer.cpp:4556-4564. Godot checks it
+    //    first among the globals, ahead of native and project classes, so a `class_name Vector3`
+    //    somewhere in the project never turns `Vector3.ZERO` into a script member lookup. Only a
+    //    subscript base may spell one (`int.MAX`, `Vector3.AXIS_X`); standing alone it is an error,
+    //    and Godot deliberately does NOT return after pushing it — the name carries on down the
+    //    chain and picks up `Identifier "int" not declared in the current scope.` from the tail as
+    //    well. Type annotations never reach here: they resolve through `resolver::resolve_datatype`.
+    if let Some(bt) = crate::resolver::builtin_type_from_name(&name) {
+        if can_be_builtin {
+            ctx.set_type(id, builtin_meta_type(bt));
+            return;
+        }
+        ctx.push_error(
+            "Builtin type cannot be used as a name on its own.".to_owned(),
+            id,
+        );
+    }
+
+    // 5. Native class name → metatype (analyzer.cpp:4566-4570).
     if ctx.native.class_named(&name).is_some() {
         ctx.set_type(id, native_meta_type(name.clone()));
         return;
     }
 
-    // 5. Project `class_name` → script metatype (analyzer.cpp:4547-4550).
+    // 6. Project `class_name` → script metatype (analyzer.cpp:4572-4575).
     if let Some(fid) = ctx.xfile.global_class_file(&name) {
         // Cross-file class reference: drives `textDocument/references` and
         // `textDocument/implementation` (the latter then filters by extends chain).
@@ -2144,22 +2162,6 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
             ctx.set_type(id, script_meta_type(ctx, fid));
         }
         return;
-    }
-
-    // 6. Builtin type name (`int`/`String`/`Vector2`/…), analyzer.cpp:4555-4563. Only a subscript
-    //    base may spell one (`int.MAX`, `Vector3.AXIS_X`); standing alone it is an error, and
-    //    Godot deliberately does NOT return after pushing it — the name carries on down the chain
-    //    and picks up `Identifier "int" not declared in the current scope.` from the tail as well.
-    //    Type annotations never reach here: they resolve through `resolver::resolve_datatype`.
-    if let Some(bt) = crate::resolver::builtin_type_from_name(&name) {
-        if can_be_builtin {
-            ctx.set_type(id, builtin_meta_type(bt));
-            return;
-        }
-        ctx.push_error(
-            "Builtin type cannot be used as a name on its own.".to_owned(),
-            id,
-        );
     }
 
     // 7. Variant-as-name (analyzer.cpp:4667-4676) — "Allow `Variant` here since it might be used
@@ -3229,27 +3231,36 @@ pub(crate) fn is_type_compatible(
     let mut src_chain_unknown = false;
     match source.kind {
         DtKind::Native => {
-            // analyzer.cpp:6221-6231 — a native source can only satisfy a Native target.
+            // analyzer.cpp:6221-6231 — a native source can only satisfy a Native target. A native
+            // class used as a value is a `GDScriptNativeClass` object, not an instance.
             if target.kind != DtKind::Native {
                 return false;
             }
-            src_native = Some(source.native_type.clone());
+            if source.is_meta_type {
+                src_native = Some(GDSCRIPT_NATIVE_CLASS.to_owned());
+            } else {
+                src_native = Some(source.native_type.clone());
+            }
         }
         DtKind::Script => {
             if source.is_meta_type {
-                // A script META is an engine `Script` object (analyzer.cpp:6233-6236). The
-                // trimmed DB may not carry the `Script` class, so stay permissive — the
-                // pre-decomposition code returned `true` for every Script operand.
-                return true;
+                // A script META is the script resource itself (analyzer.cpp:6440-6441), and every
+                // script a `ScriptRef` names is a `.gd` file, so its class is `GDScript`.
+                src_native = Some("GDScript".to_owned());
+            } else {
+                let Some(sr) = source.script_type.as_ref() else {
+                    return true; // degenerate Script type — permissive
+                };
+                src_script = Some(sr.clone());
+                match crate::script_chain::chain_native_root(ctx, sr) {
+                    Some(root) => src_native = Some(root),
+                    None => src_chain_unknown = true,
+                }
             }
-            let Some(sr) = source.script_type.as_ref() else {
-                return true; // degenerate Script type — permissive
-            };
-            src_script = Some(sr.clone());
-            match crate::script_chain::chain_native_root(ctx, sr) {
-                Some(root) => src_native = Some(root),
-                None => src_chain_unknown = true,
-            }
+        }
+        DtKind::Class if source.is_meta_type => {
+            // analyzer.cpp:6447-6448 — a class used as a value is its `GDScript` resource.
+            src_native = Some("GDScript".to_owned());
         }
         DtKind::Class => {
             // Walk the in-file base chain to the bottom (analyzer.cpp:6246-6258); a Script
@@ -3298,8 +3309,23 @@ pub(crate) fn is_type_compatible(
             if src_chain_unknown {
                 return true;
             }
+            let target_native = if target.is_meta_type {
+                GDSCRIPT_NATIVE_CLASS
+            } else {
+                target.native_type.as_str()
+            };
             src_native
-                .map(|n| ctx.native.is_subclass_of_named(&n, &target.native_type))
+                .map(|n| native_is_parent_class(ctx, &n, target_native))
+                .unwrap_or(false)
+        }
+        DtKind::Script | DtKind::Class if target.is_meta_type => {
+            // analyzer.cpp:6475-6477, 6486-6488 — a script or class META target takes the
+            // `GDScript` resource itself.
+            if src_chain_unknown {
+                return true;
+            }
+            src_native
+                .map(|n| native_is_parent_class(ctx, &n, "GDScript"))
                 .unwrap_or(false)
         }
         DtKind::Script => {
@@ -3348,6 +3374,19 @@ pub(crate) fn is_type_compatible(
         }
         _ => false,
     }
+}
+
+/// The class Godot gives a native class used as a value (`GDScriptNativeClass`).
+const GDSCRIPT_NATIVE_CLASS: &str = "GDScriptNativeClass";
+
+/// `ClassDB::is_parent_class` over the native DB. `GDScriptNativeClass` is a module class that
+/// `extension_api.json` never lists, so its `RefCounted` base is spelled out here
+/// (gdscript.h, `class GDScriptNativeClass : public RefCounted`).
+fn native_is_parent_class(ctx: &AnalysisContext, sub: &str, sup: &str) -> bool {
+    if sub == GDSCRIPT_NATIVE_CLASS {
+        return sup == GDSCRIPT_NATIVE_CLASS || ctx.native.is_subclass_of_named("RefCounted", sup);
+    }
+    ctx.native.is_subclass_of_named(sub, sup)
 }
 
 /// The this-file [`ScriptRef`] identity of an in-file class NODE — root has an empty inner
@@ -4459,6 +4498,11 @@ fn constant_arg_value_type(ctx: &AnalysisContext, arg: NodeId) -> Option<Variant
 /// `validate_call_arg`'s first arm stays quiet for (analyzer.cpp:6097). The soft
 /// `DataType::variant()` would draw `requires the subtype "Variant"` on every `Array.append`,
 /// `Object.set`, and `Dictionary.has` in a project (#449).
+///
+/// Since #587 a declared `Variant` already comes back hard, so this hardens only what is left:
+/// the shapes [`type_from_type_ref`] degrades to Variant because it cannot model them — a name
+/// a trimmed dump does not carry, a pointer. Godot never sees those, and a parameter is the one
+/// place where treating an unmodelled type as "accepts anything" is the safe direction.
 fn dump_param_type(ctx: &AnalysisContext, p: &gd_types::Param) -> DataType {
     let mut t = type_from_type_ref(ctx, &p.ty);
     if t.kind == DtKind::Variant {
@@ -5694,19 +5738,23 @@ fn reduce_call(ctx: &mut AnalysisContext, id: NodeId, is_root: bool) {
                 let cdt = ctx.get_type(callee).clone();
                 if cdt.is_set() && !cdt.is_variant() {
                     name_is_value = true;
+                    // Upstream resolves through `callee_id` but reports on `p_call->callee`
+                    // (analyzer.cpp:3745/3747), so `Vector2.ZERO()` underlines the whole
+                    // `Vector2.ZERO`, not just the attribute the resolution walked to.
+                    let anchor = call.callee.unwrap_or(callee);
                     if cdt.kind == DtKind::Builtin && cdt.builtin_type == VariantType::Callable {
                         ctx.push_error(
                             format!(
                                 r#"Name "{function_name}" is a Callable. You can call it with "{function_name}.call()" instead."#
                             ),
-                            callee,
+                            anchor,
                         );
                     } else {
                         ctx.push_error(
                             format!(
                                 r#"Name "{function_name}" called as a function but is a "{cdt}"."#
                             ),
-                            callee,
+                            anchor,
                         );
                     }
                 }
@@ -6648,7 +6696,15 @@ pub(crate) fn gd_utility_return_type(name: &str) -> Option<DataType> {
         ..Default::default()
     };
     Some(match name {
-        "convert" => DataType::variant(),
+        // `RETVAR` is `PropertyInfo(Variant::NIL, .., PROPERTY_USAGE_NIL_IS_VARIANT)`
+        // (gdscript_utility_functions.cpp:560), which `type_from_property` reads back as a HARD
+        // Variant like every other declared type — so `var x := convert(1, TYPE_INT)` draws
+        // `INFERENCE_ON_VARIANT` (#587).
+        "convert" => DataType {
+            type_source: TypeSource::AnnotatedExplicit,
+            kind: DtKind::Variant,
+            ..Default::default()
+        },
         "type_exists" => builtin(VariantType::Bool),
         "char" | "_char" => builtin(VariantType::String),
         "ord" => builtin(VariantType::Int),
@@ -9562,6 +9618,10 @@ fn lookup_native_constant(
 /// CLASS_IS_ENUM / CLASS_IS_BITFIELD arms (analyzer.cpp:5744-5759); typed collections stay
 /// soft Variant (the typed-collection slice is deferred work — hardening them here would
 /// activate container-element checks this port hasn't validated against the corpus).
+///
+/// Everything the dump does declare is HARD, matching `type_from_property`'s unconditional
+/// `type_source = ANNOTATED_EXPLICIT`. The one exception is a type gdls cannot model at all,
+/// where a soft Variant is the honest answer.
 fn type_from_type_ref(ctx: &AnalysisContext, ty: &gd_types::TypeRef) -> DataType {
     use gd_types::TypeRef;
     match ty {
@@ -9657,7 +9717,20 @@ fn type_from_type_ref(ctx: &AnalysisContext, ty: &gd_types::TypeRef) -> DataType
                 vec![type_from_type_ref(ctx, key), type_from_type_ref(ctx, value)];
             t
         }
-        TypeRef::Variant | TypeRef::Pointer(_) => DataType::variant(),
+        // analyzer.cpp:5841-5848 (`type_from_property`): every type read off the engine's
+        // reflection is `ANNOTATED_EXPLICIT`, Variant included — the dump SAYS the return is
+        // Variant, which is a declared fact, not an inference. A soft one here silently
+        // disabled `INFERENCE_ON_VARIANT` for `var x := abs(-1)` and every other
+        // Variant-returning native member (#587).
+        TypeRef::Variant => DataType {
+            type_source: TypeSource::AnnotatedExplicit,
+            kind: DtKind::Variant,
+            ..Default::default()
+        },
+        // A pointer has no `DataType` to map to — upstream never sees one, since these appear
+        // only on GDExtension-facing entries the analyzer does not reach. Stays a SOFT Variant:
+        // it is gdls admitting it cannot model the type, not the dump declaring one.
+        TypeRef::Pointer(_) => DataType::variant(),
     }
 }
 

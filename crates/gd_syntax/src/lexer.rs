@@ -405,6 +405,39 @@ impl Lexer {
         self.error_stack.push(token);
     }
 
+    /// The byte offset of the first character on the current line — what Godot means by
+    /// `error.start_column = 1` once it is expressed as a byte span.
+    fn line_start_byte(&self) -> usize {
+        let mut i = self.pos.min(self.chars.len());
+        while i > 0 && self.chars[i - 1] != '\n' {
+            i -= 1;
+        }
+        self.byte_at(i)
+    }
+
+    /// An indentation error, with the position rewrite Godot applies to all three of them
+    /// (`gdscript_tokenizer.cpp` `_check_indent`: `error.start_line = line; error.start_column = 1`).
+    /// [`Self::make_error`] hands back the in-progress token's extents, and at this point those
+    /// still mark the last token of the line *above*, so the error would otherwise be reported a
+    /// line early. `end_past_indent` is the extra `error.end_column = column + 1` the unindent
+    /// error takes on top, which puts its end one column past the indentation just measured.
+    fn push_indent_error(&mut self, message: impl Into<String>, end_past_indent: bool) {
+        let mut token = self.make_error(message);
+        token.span.start = self.line_start_byte();
+        token.loc.start = LineCol::new(self.line, 1);
+        if end_past_indent {
+            token.span.end = self.byte_at((self.pos + 1).min(self.chars.len()));
+            token.loc.end = LineCol::new(self.line, self.column.saturating_add(1));
+        }
+        // `make_error` recorded the pre-rewrite extents for the standalone lexer tests; keep that
+        // copy in step with the token the parser will actually report.
+        if let Some(last) = self.errors.last_mut() {
+            last.span = token.span;
+            last.loc = token.loc;
+        }
+        self.error_stack.push(token);
+    }
+
     fn has_error(&self) -> bool {
         !self.error_stack.is_empty()
     }
@@ -1018,7 +1051,7 @@ impl Lexer {
             }
 
             if mixed && !self.line_continuation && !self.multiline_mode {
-                self.push_error("Mixed use of tabs and spaces for indentation.");
+                self.push_indent_error("Mixed use of tabs and spaces for indentation.", false);
             }
 
             if self.line_continuation || self.multiline_mode {
@@ -1034,7 +1067,7 @@ impl Lexer {
                     Self::indent_char_name(current_indent_char),
                     Self::indent_char_name(self.indent_char)
                 );
-                self.push_error(msg);
+                self.push_indent_error(msg, false);
             }
 
             // Apply the indentation change.
@@ -1063,7 +1096,10 @@ impl Lexer {
                     None => indent_count != 0,
                 };
                 if mismatched {
-                    self.push_error("Unindent doesn't match the previous indentation level.");
+                    self.push_indent_error(
+                        "Unindent doesn't match the previous indentation level.",
+                        true,
+                    );
                     // Lenient: keep this level on the stack and continue.
                     self.indent_stack.push(indent_count);
                 }
@@ -1606,6 +1642,77 @@ mod tests {
                 .any(|e| e.message == "Mixed use of tabs and spaces for indentation."),
             "expected mixed tabs/spaces error, got {errs:?}"
         );
+    }
+
+    /// #593: all three indentation errors belong to the line that is mis-indented. Godot rewrites
+    /// their position after building the token (`_check_indent`), because `make_error` would
+    /// otherwise place them on the last token of the line above.
+    #[test]
+    fn an_indentation_error_lands_on_the_offending_line() {
+        // Line 3 opens with one space where the file has been indenting with tabs.
+        let src = "func f():\n\tvar a := 1\n var b := 2\n";
+        let (_toks, errs) = lex(src);
+        let placed: Vec<_> = errs
+            .iter()
+            .map(|e| {
+                (
+                    e.loc.start.line,
+                    e.loc.start.column,
+                    e.loc.end.column,
+                    e.span.start,
+                    e.span.end,
+                    e.message.as_str(),
+                )
+            })
+            .collect();
+        let line_3_start = src.find(" var b").expect("fixture line 3");
+
+        assert!(
+            placed.contains(&(
+                3,
+                1,
+                2,
+                line_3_start,
+                line_3_start + 1,
+                "Used space character for indentation instead of tab as used before in the file.",
+            )),
+            "{placed:?}"
+        );
+        // The unindent error takes one extra column upstream (`error.end_column = column + 1`).
+        assert!(
+            placed.contains(&(
+                3,
+                1,
+                3,
+                line_3_start,
+                line_3_start + 2,
+                "Unindent doesn't match the previous indentation level.",
+            )),
+            "{placed:?}"
+        );
+    }
+
+    /// The mixed-indentation error takes the same rewrite, and a tab-first file reports the
+    /// mirror-image message — both on the line that mixes them, not the line before.
+    #[test]
+    fn mixed_indentation_lands_on_the_offending_line() {
+        let src = "func f():\n\tif x:\n\t\tvar a := 1\n \tprint(a)\n";
+        let (_toks, errs) = lex(src);
+        let line_4_start = src.find(" \tprint").expect("fixture line 4");
+        for message in [
+            "Mixed use of tabs and spaces for indentation.",
+            "Used space character for indentation instead of tab as used before in the file.",
+        ] {
+            let e = errs
+                .iter()
+                .find(|e| e.message == message)
+                .unwrap_or_else(|| panic!("{message} not raised; got {errs:?}"));
+            assert_eq!(
+                (e.loc.start.line, e.loc.start.column, e.span.start),
+                (4, 1, line_4_start),
+                "{message}"
+            );
+        }
     }
 
     #[test]

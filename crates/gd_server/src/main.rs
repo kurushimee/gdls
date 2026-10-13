@@ -100,7 +100,7 @@ fn diagnose(args: &[String]) -> Result<()> {
     let mut workspace = Workspace::load(&root, &options);
     eprintln!("loaded {} script(s)", workspace.index.file_count());
     // Both non-exact rungs of the resolve ladder end their warning with "set godotBinaryPath or
-    // GDLS_GODOT for an exact dump" (api_dump.rs), which reads as advice this CLI will act on
+    // GODOT for an exact dump" (api_dump.rs), which reads as advice this CLI will act on
     // next run. It won't: diagnose never dumps, because the background dump is the LSP session's
     // job (api_dump::spawn_background_dump, started by serve_inner only — issue #25). Say so, so
     // an operator doesn't set the variable, re-run diagnose, and get the same surface with no
@@ -112,7 +112,7 @@ fn diagnose(args: &[String]) -> Result<()> {
             "note: this run's native API surface is not project-derived, and diagnose never \
              generates the dump — that is the LSP session's background job. Open the project in \
              an LSP session once to produce an exact dump; if the Godot binary is not on PATH as \
-             `godot4` or `godot`, point GDLS_GODOT at it (or set godotBinaryPath in the client's \
+             `godot4` or `godot`, point GODOT at it (or set godotBinaryPath in the client's \
              initializationOptions) so that session can find it."
         );
     }

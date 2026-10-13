@@ -210,6 +210,20 @@ pub fn poll_until<T>(
     }
 }
 
+/// An empty project root for a session that has no project of its own, plus the `workspaceFolders`
+/// value that points the server at it. With no root the server falls back to the process working
+/// directory, which under `cargo test` is the crate itself, so the session would index and watch
+/// the test fixtures and write a `.gdls/` cache into the source tree. Move the [`TempProject`] into
+/// the server thread so the directory lives exactly as long as the session.
+pub fn scratch_root() -> (TempProject, Option<Vec<lsp_types::WorkspaceFolder>>) {
+    let project = TempProject::new();
+    let folders = vec![lsp_types::WorkspaceFolder {
+        uri: file_uri(&project.root),
+        name: "scratch".to_string(),
+    }];
+    (project, Some(folders))
+}
+
 /// Build a `file://` URI the server's `uri_to_path` round-trips. Handles Windows drive paths and
 /// percent-encodes reserved chars (spaces, `#`, etc.) so test projects with spaces in their
 /// path are exercisable — mirrors the production [`gd_server::uri::path_to_file_uri`] helper.

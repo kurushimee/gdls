@@ -18,7 +18,7 @@
 //!      (`1bad`, `has space`), a GDScript keyword (`func`, `if`), and a name colliding with an
 //!      existing member in scope.
 
-mod common;
+use crate::common;
 
 use std::collections::HashMap;
 
@@ -1004,7 +1004,8 @@ fn boot_native_member_with_api(
     );
     project.write("extension_api.json", api);
     project.write("main.gd", src);
-    let stub_cache = project.root.join("stub-cache");
+    // Under `.gdls/`, which the watcher ignores, so a materialized page never indexes as a project script.
+    let stub_cache = project.root.join(".gdls").join("stub-cache");
 
     let (server, client) = Connection::memory();
     let handle = std::thread::spawn(move || gd_server::serve(server));
@@ -1226,7 +1227,8 @@ fn rename_class_to_existing_project_class_refused() {
         "class_name Hero\nextends Node\n\nfunc attack() -> void:\n\tpass\n",
     );
     project.write("villain.gd", "class_name Villain\nextends Node\n");
-    let stub_cache = project.root.join("stub-cache");
+    // Under `.gdls/`, which the watcher ignores, so a materialized page never indexes as a project script.
+    let stub_cache = project.root.join(".gdls").join("stub-cache");
 
     let (server, client) = Connection::memory();
     let handle = std::thread::spawn(move || gd_server::serve(server));

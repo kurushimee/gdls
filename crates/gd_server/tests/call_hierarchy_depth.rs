@@ -4,7 +4,7 @@
 //! `{uri, name}` data blob prepare/incoming items carry — and items whose data a client
 //! stripped must re-resolve from `uri` + `selectionRange` instead of dead-ending.
 
-mod common;
+use crate::common;
 
 use std::time::Duration;
 

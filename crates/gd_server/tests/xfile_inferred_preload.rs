@@ -3,7 +3,7 @@
 //! the reader as `Variant`, so hover said nothing and a strict session reported an unsafe access on
 //! a member whose type was perfectly knowable.
 
-mod common;
+use crate::common;
 
 use common::{file_uri, notification, recv, recv_response, request, shutdown, TempProject};
 use lsp_server::{Connection, Message};

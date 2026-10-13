@@ -5,10 +5,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+autotests = false
+
+[features]
+# Test-only behavior for this crate's own integration tests, switched on by the self dev-dependency
+# below and never by a `gdls` build. It remembers the parsed embedded stock dump across the
+# many sessions one test process runs (`api_dump::embedded_stock_db`).
+test-support = []
+
+[lib]
+# There are no doc examples to run, so `cargo test` skips the rustdoc pass.
+doctest = false
 
 [[bin]]
 name = "gdls"
 path = "src/main.rs"
+test = false
 
 # M11 (#80): a cross-platform STUB formatter for `tests/formatting.rs` — a stdin→stdout filter whose
 # behavior is selected by its first arg (squeeze/replace/fail/sleep/binary/…). The integration test
@@ -19,6 +31,7 @@ path = "src/main.rs"
 [[bin]]
 name = "gdls_format_stub"
 path = "src/bin/gdls_format_stub.rs"
+test = false
 
 [dependencies]
 gd_syntax.workspace = true
@@ -69,6 +82,8 @@ unicode-ident.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Turns on `test-support` (above) whenever this crate's tests build.
+gd_server = { path = ".", features = ["test-support"] }
 # WP-RD1: `test-support` exposes `gd_analyze::AnalysisResult::new_for_test` so the integration
 # tests here (xfile, memory_pressure) can construct `AnalysisResult` literals now that its
 # `bindings` / `member_xrefs` fields are private. Dev-dep-only: the feature is never enabled in a
@@ -80,3 +95,8 @@ gd_analyze = { workspace = true, features = ["test-support"] }
 notify.workspace = true
 notify-debouncer-full.workspace = true
 crossbeam-channel = "0.5.15"
+
+# Every tests/*.rs file is a module of this one binary (see tests/main.rs), not a binary of its own.
+[[test]]
+name = "integration"
+path = "tests/main.rs"
