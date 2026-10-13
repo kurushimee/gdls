@@ -74,6 +74,12 @@ Two findings were worth more than the delta itself. Vendoring the 4.7.2 corpus b
 
 The default for a project that declares no version is the **newest** port, which is why this is a major release: an existing undeclared project can see different diagnostics after the upgrade. Godot writes that entry itself, so a real project always has one.
 
+## Measuring against the engine itself (v3.1.0)
+
+After 3.0.0 the ratchets read 1.0000 on both corpora, and the corpora had stopped finding bugs: they pin what Godot reports on Godot's own tests, so a diagnostic gdls misses on real code, or invents there, is invisible to them. The work moved to two comparisons against the engine on a real project. The first set every warning to error level, ran `godot --check-only` over each Pixelorama script, and diffed the resulting `(file, line, message)` triples against gdls's. About 11,600 rows agreed, and the 1,700 that did not were a precise bug list. The second drove the Godot editor's own language server over the same scripts and compared every published diagnostic, first by line and then by full range, which is what surfaced the anchor and line-break extent bugs. By the release, that diff read zero differences on all 249 scripts.
+
+Most of the roughly 140 fixes came out of those two lists, and from the tracker filling and emptying again as each fix exposed the next layer. The release gate then found two more on the private project that no OSS code exercises: a member of a constant builtin that Godot folds and gdls did not (#638), and a builtin Variant type added by that project's engine fork (#639). Both were fixed before the tag.
+
 ## Three lessons that still apply
 
 **Mutating consumers need their own firewall.** `references` and `definition` are read-tuned, so their inaccuracies become silent source corruption under `rename` (which took six adversarial review rounds), `codeAction` edits, `willRenameFiles`, and the autoload rename. The pattern that works: a fail-closed positive-project-resolution gate, binding-correct collection (never name-only), and refusing outright rather than half-applying. Widening a candidate set is safe; widening what is collected inside one is not.
