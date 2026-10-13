@@ -29,7 +29,7 @@ const NODE_API: &str = r#"{
         {"name": "String",
          "methods": [{"name": "to_upper", "is_const": true, "is_static": false,
                       "is_vararg": false, "is_virtual": false, "hash": 2, "arguments": [],
-                      "return_value": {"type": "String"}}]}
+                      "return_type": "String"}]}
     ]
 }"#;
 
@@ -229,7 +229,7 @@ fn outgoing_calls_anchor_builtin_callees_in_stubs() {
         .lines()
         .nth(tu.to.selection_range.start.line as usize)
         .expect("selectionRange line within the stub");
-    assert_eq!(line, "func to_upper() -> void");
+    assert_eq!(line, "func to_upper() -> String");
     assert!(
         tu.to.detail.as_deref() == Some("String"),
         "the detail names the builtin; got {:?}",
