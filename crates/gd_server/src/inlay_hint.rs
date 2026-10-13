@@ -570,6 +570,9 @@ fn callee_parameter_names(
             script_parameter_names(state, *file, class_path, method, text)
         }
         CalleeTarget::Native { class } => native_parameter_names(state, class, method),
+        // #583: a builtin callee anchors navigation into its stub page, but parameter-name
+        // hints stay native/project-only for now — no fabricated names either way.
+        CalleeTarget::Builtin { .. } => None,
         CalleeTarget::Unresolved => None,
     }
 }
