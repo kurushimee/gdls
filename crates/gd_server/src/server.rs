@@ -1061,44 +1061,15 @@ fn serve_inner(
     // is simply absent —
     // which is why it carries `Generic` provenance and why the analyzer will not turn its misses
     // into errors. A stderr line is invisible to most clients; "never lie" covers a degraded
-    // surface the user cannot see. One notification per session, at startup, never repeated.
+    // surface the user cannot see. One notification per session: at startup, or when the background
+    // dump settles if one is running.
     notify_dialect(&state);
 
-    // #329: a dump that named a different Godot release than the project declared was rejected
-    // (or demoted) during load. That is a different story from "no dump was found", and the user
-    // has to hear the real one — the fix is on their side, in project.godot or in which binary
-    // dumped the API. Takes precedence over the generic-surface notice below, which would
-    // otherwise tell them nothing was found when something was.
-    if let Some(notice) = state.workspace.native_release_notice.clone() {
-        show_message(&state, lsp_types::MessageType::WARNING, &notice);
-    } else if state.workspace.native.provenance() == gd_types::ApiProvenance::Generic {
-        // #302: name the release actually ingested. Since v3.0.0 the stock asset is picked per
-        // project from `application/config/features`, so a hardcoded version told a 4.7 user the
-        // 4.6 surface was loaded while the log line right above said otherwise.
-        let h = state.workspace.native.header();
-        let served = format!(
-            "Godot {}.{}.{}",
-            h.version_major, h.version_minor, h.version_patch
-        );
-        // #503: WARNING, and the consequence spelled out. The stock surface carries `Generic`
-        // provenance, and `Generic` gates off EVERY negative diagnostic in the file, not just
-        // claims about engine classes — `Function "x()" not found in base self.` and misses on
-        // the user's OWN classes go with it. Saying only that custom classes are missing reads
-        // as "the surface is fine", so a user chasing vanished errors has nothing to connect
-        // this to. The release-mismatch notice one branch up already says it this way; the two
-        // states cost the same, so they announce the same.
-        show_message(
-            &state,
-            lsp_types::MessageType::WARNING,
-            &format!(
-                "gdls is using its built-in stock {served} API surface — no project dump was \
-                 found. Engine classes and their documentation are available, but classes from \
-                 your own Godot build or from GDExtensions are not, so gdls will not report \
-                 unknown identifiers or members anywhere in your code. To use your engine's \
-                 real API, set `godotBinaryPath` (or the GODOT environment variable), or \
-                 point `extensionApiPath` at an extension_api.json."
-            ),
-        );
+    // A first session has no dump yet, so it boots on the stock surface while Godot dumps the real
+    // one in the background. Announcing the stock surface now would warn about a state that is
+    // about to go away, so the notice waits for the dump's outcome (the `recv(dump_arm)` arm).
+    if dump_rx.is_none() {
+        notify_native_surface(&state);
     }
 
     // At startup no buffers are open yet, so this set is empty; building it via the same helper the
@@ -1229,6 +1200,8 @@ fn serve_inner(
                         log::warn!("native API: background dump thread ended without reporting");
                     }
                 }
+                // The startup notice was held for this outcome; say what the session ended up with.
+                notify_native_surface(&state);
             },
             recv(forward_rx) -> msg => match msg {
                 Ok(Message::Request(req)) => {
@@ -2577,6 +2550,48 @@ fn republish_dirty_open_buffers_except(state: &mut ServerState, skip: Option<&Ur
 /// (`project.godot`) or native DB reload (`extension_api.json` / gdextension surface) where the
 /// `Index.dirty` set won't capture the change (the change isn't interface-keyed; it affects every
 /// file's analysis).
+/// Warn the user when the session serves a degraded native surface: a dump rejected for naming the
+/// wrong Godot release, or the built-in stock surface. Silent when the session has the engine's
+/// own dump.
+fn notify_native_surface(state: &ServerState) {
+    // #329: a dump that named a different Godot release than the project declared was rejected
+    // (or demoted) during load. That is a different story from "no dump was found", and the user
+    // has to hear the real one — the fix is on their side, in project.godot or in which binary
+    // dumped the API. Takes precedence over the generic-surface notice below, which would
+    // otherwise tell them nothing was found when something was.
+    if let Some(notice) = state.workspace.native_release_notice.clone() {
+        show_message(state, lsp_types::MessageType::WARNING, &notice);
+    } else if state.workspace.native.provenance() == gd_types::ApiProvenance::Generic {
+        // #302: name the release actually ingested. Since v3.0.0 the stock asset is picked per
+        // project from `application/config/features`, so a hardcoded version told a 4.7 user the
+        // 4.6 surface was loaded while the log line right above said otherwise.
+        let h = state.workspace.native.header();
+        let served = format!(
+            "Godot {}.{}.{}",
+            h.version_major, h.version_minor, h.version_patch
+        );
+        // #503: WARNING, and the consequence spelled out. The stock surface carries `Generic`
+        // provenance, and `Generic` gates off EVERY negative diagnostic in the file, not just
+        // claims about engine classes — `Function "x()" not found in base self.` and misses on
+        // the user's OWN classes go with it. Saying only that custom classes are missing reads
+        // as "the surface is fine", so a user chasing vanished errors has nothing to connect
+        // this to. The release-mismatch notice one branch up already says it this way; the two
+        // states cost the same, so they announce the same.
+        show_message(
+            state,
+            lsp_types::MessageType::WARNING,
+            &format!(
+                "gdls is using its built-in stock {served} API surface — no project dump was \
+                 found. Engine classes and their documentation are available, but classes from \
+                 your own Godot build or from GDExtensions are not, so gdls will not report \
+                 unknown identifiers or members anywhere in your code. To use your engine's \
+                 real API, set `godotBinaryPath` (or the GODOT environment variable), or \
+                 point `extensionApiPath` at an extension_api.json."
+            ),
+        );
+    }
+}
+
 /// Tell the user which Godot version their scripts are being read as, but only when gdls had to
 /// guess or correct rather than read a declared one.
 ///
