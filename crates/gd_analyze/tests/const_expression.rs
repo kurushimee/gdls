@@ -400,6 +400,35 @@ fn a_shared_type_constructor_never_folds() {
     }
 }
 
+/// A member read off a constant builtin value folds (`gdscript_analyzer.cpp:4840-4848`), so it can
+/// feed a constructor or an operator inside another constant. A method call on it and a member of
+/// a variable still cannot.
+#[test]
+fn a_member_of_a_constant_builtin_is_a_constant_expression() {
+    let consts = "const V := Vector2(1, 2)\nconst W := Vector2i(160, 96)\nvar v := Vector2(1, 2)\n";
+    let errors_for = |init: &str| errors(&format!("{PREAMBLE}{consts}const X = {init}\n"));
+
+    for init in [
+        "Vector2i(W.x, W.y)",
+        "Vector2i(W.x * 8, W.y * 8)",
+        "Vector2(V.x, 1)",
+    ] {
+        let errs = errors_for(init);
+        assert!(errs.is_empty(), "`const X = {init}`: got {errs:?}");
+    }
+    for init in ["Vector2(v.x, 1)", "Vector2(V.length(), 1)"] {
+        let errs = errors_for(init);
+        assert!(
+            errs.iter().any(|e| e == MSG),
+            "`const X = {init}`: got {errs:?}"
+        );
+    }
+    assert_eq!(
+        errors_for(r#"V.x + "s""#),
+        ["Invalid operands to operator +, float and String."]
+    );
+}
+
 /// The shadowing guard: a base class's constant named like a native class must resolve as that
 /// constant, not fall through to the native-class arm. Without the base-chain step this row is the
 /// false positive the whole design is built to avoid.
