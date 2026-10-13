@@ -18,9 +18,9 @@ fn at(marked: &str) -> CompletionContext {
         "fixture must have exactly one `|`"
     );
     let src = marked.replacen('|', "", 1);
-    let tree = gd_syntax::parse(&src).tree;
+    let parsed = gd_syntax::parse(&src);
     let (tokens, _errs) = tokenize(&src);
-    classify(&tree, &tokens, byte)
+    classify(&parsed.tree, &tokens, &parsed.comments, byte)
 }
 
 /// The text the prefix span points at, for asserting the typed prefix.
@@ -593,13 +593,13 @@ fn attribute_base_node_is_the_base_expression() {
     // The recovered base node id must be the `local` identifier node (an Identifier whose text is
     // "local"), proving base extraction, not just "some node".
     let src = "func f():\n\tvar local = 1\n\tlocal.";
-    let tree = gd_syntax::parse(src).tree;
+    let parsed = gd_syntax::parse(src);
     let (tokens, _e) = tokenize(src);
-    let ctx = classify(&tree, &tokens, src.len());
+    let ctx = classify(&parsed.tree, &tokens, &parsed.comments, src.len());
     let CompletionKind::Attribute { base: Some(base) } = ctx.kind else {
         panic!("expected Attribute with a base, got {:?}", ctx.kind);
     };
-    match &tree.get(base).kind {
+    match &parsed.tree.get(base).kind {
         NodeKind::Identifier(id) => assert_eq!(id.name, "local"),
         other => panic!("base should be the `local` Identifier, got {other:?}"),
     }
@@ -610,9 +610,9 @@ fn call_arguments_callee_node_recovered_when_ast_survives() {
     // `max(1, , 2)` keeps a Call node, so the callee node id is recoverable (an Identifier "max").
     let src = "func f():\n\tmax(1, , 2)";
     let cursor = src.find(", , ").unwrap() + 2; // empty middle slot
-    let tree = gd_syntax::parse(src).tree;
+    let parsed = gd_syntax::parse(src);
     let (tokens, _e) = tokenize(src);
-    let ctx = classify(&tree, &tokens, cursor);
+    let ctx = classify(&parsed.tree, &tokens, &parsed.comments, cursor);
     let CompletionKind::CallArguments {
         callee,
         callee_name,
@@ -623,7 +623,7 @@ fn call_arguments_callee_node_recovered_when_ast_survives() {
     };
     assert_eq!(callee_name.as_deref(), Some("max"));
     let callee = callee.expect("max( keeps a Call node, callee id should be recovered");
-    match &tree.get(callee).kind {
+    match &parsed.tree.get(callee).kind {
         NodeKind::Identifier(id) => assert_eq!(id.name, "max"),
         other => panic!("callee should be the `max` Identifier, got {other:?}"),
     }
@@ -1004,14 +1004,14 @@ const FIXTURES: &[&str] = &[
 #[test]
 fn classify_never_panics_at_every_offset_of_every_fixture() {
     for src in FIXTURES {
-        let tree = gd_syntax::parse(src).tree;
+        let parsed = gd_syntax::parse(src);
         let (tokens, _errs) = tokenize(src);
         // Inclusive of 0 and len, plus one past, plus a wildly-out-of-range offset — all must clamp
         // to a well-defined result rather than panic.
         for byte in 0..=src.len() + 1 {
-            let _ = classify(&tree, &tokens, byte);
+            let _ = classify(&parsed.tree, &tokens, &parsed.comments, byte);
         }
-        let _ = classify(&tree, &tokens, usize::MAX);
+        let _ = classify(&parsed.tree, &tokens, &parsed.comments, usize::MAX);
     }
 }
 
@@ -1044,12 +1044,12 @@ fn classify_never_panics_on_existing_fuzz_corpus() {
             let Ok(src) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let tree = gd_syntax::parse(&src).tree;
+            let parsed = gd_syntax::parse(&src);
             let (tokens, _errs) = tokenize(&src);
             // Step a few bytes at a time to keep this fast over the whole corpus.
             let mut byte = 0;
             while byte <= src.len() {
-                let _ = classify(&tree, &tokens, byte);
+                let _ = classify(&parsed.tree, &tokens, &parsed.comments, byte);
                 byte += 1;
             }
             checked += 1;
@@ -1489,4 +1489,134 @@ fn the_type_positions_that_already_worked_are_unchanged() {
         at("func f():\n\tvar y: Array[|] = []").kind,
         CompletionKind::TypeName
     );
+}
+
+// ===================================================================================================
+// The prose guard (#599) — Godot offers nothing inside a string literal or a comment. The shapes
+// that genuinely want completion inside a string are claimed by the deferred pass before the
+// guard, and everything that already worked keeps working.
+// ===================================================================================================
+
+#[test]
+fn no_completion_inside_a_string_literal() {
+    // Mid-typing a message string: the whole identifier list used to pop here.
+    assert_eq!(
+        at("func f():\n\tvar s := \"hello wo|\"\n").kind,
+        CompletionKind::None
+    );
+}
+
+#[test]
+fn no_completion_inside_an_empty_string() {
+    // `"` is an advertised trigger character, so this fires the moment a string opens.
+    assert_eq!(
+        at("func f():\n\tvar s := \"|\"\n").kind,
+        CompletionKind::None
+    );
+}
+
+#[test]
+fn no_completion_inside_a_line_comment() {
+    assert_eq!(
+        at("func f():\n\t# a comment her|e\n\tpass\n").kind,
+        CompletionKind::None
+    );
+}
+
+#[test]
+fn no_completion_inside_a_doc_comment() {
+    assert_eq!(
+        at("## doc comment her|e\nfunc f():\n\tpass\n").kind,
+        CompletionKind::None
+    );
+}
+
+#[test]
+fn no_completion_at_the_end_of_a_comment_line() {
+    // The common typing position: the caret sits after the last comment character, at the
+    // comment span's exclusive end.
+    assert_eq!(
+        at("func f():\n\t# a comment here|\n\tpass\n").kind,
+        CompletionKind::None
+    );
+}
+
+#[test]
+fn no_completion_inside_stringname_and_nodepath_literals() {
+    // `&"…"` and `^"…"` are Literal tokens too — plain prose, not deferred paths.
+    assert_eq!(
+        at("func f():\n\tvar a := &\"na|\"\n").kind,
+        CompletionKind::None
+    );
+    assert_eq!(
+        at("func f():\n\tvar b := ^\"pa|\"\n").kind,
+        CompletionKind::None
+    );
+}
+
+#[test]
+fn no_completion_inside_a_dict_key_string() {
+    assert_eq!(
+        at("func f():\n\tvar d := {\"ke|\": 1}\n").kind,
+        CompletionKind::None
+    );
+}
+
+#[test]
+fn deferred_shapes_still_classify_inside_strings() {
+    // Resource paths and node paths are claimed by the deferred pass BEFORE the guard.
+    assert_eq!(
+        at("func f():\n\tpreload(\"res://src/|\")").kind,
+        CompletionKind::Deferred(DeferredReason::ResourcePath)
+    );
+    assert_eq!(
+        at("func f():\n\tload(\"res://|\")").kind,
+        CompletionKind::Deferred(DeferredReason::ResourcePath)
+    );
+    assert_eq!(
+        at("func f():\n\tget_node(\"Sp|\")").kind,
+        CompletionKind::Deferred(DeferredReason::NodePath)
+    );
+    assert_eq!(
+        at("func f():\n\t$\"He|\"").kind,
+        CompletionKind::Deferred(DeferredReason::NodePath)
+    );
+}
+
+#[test]
+fn member_access_after_a_string_still_classifies() {
+    // `"abc".` — the cursor is past the literal, never strictly inside it.
+    let m = "func f():\n\tvar n := \"abc\".|\n";
+    assert!(matches!(at(m).kind, CompletionKind::Attribute { .. }));
+}
+
+#[test]
+fn no_completion_inside_an_unterminated_string() {
+    // Typing before the closing quote exists: the lexer makes the rest of the source one `Error`
+    // token, and Godot still offers nothing — in an assignment, a call argument, or at EOF.
+    for m in [
+        "func f():\n\tvar s := \"hello wo|\n\tpass\n",
+        "func f():\n\tvar s := &\"na|",
+        "func f():\n\tprint(\"ab|\n",
+    ] {
+        assert_eq!(at(m).kind, CompletionKind::None, "{m:?}");
+    }
+}
+
+#[test]
+fn the_prose_guard_keeps_its_neighbors() {
+    // A `#` inside a string is not a comment, a caret just before a trailing `#` is outside it, and
+    // a caret mid-number is not in a string.
+    assert_eq!(
+        at("func f():\n\tvar s = \"# no\"\n\tpri|\n").kind,
+        CompletionKind::Identifier
+    );
+    assert_eq!(
+        at("func f():\n\tvar x = 1 # trailing co|\n").kind,
+        CompletionKind::None
+    );
+    assert!(matches!(
+        at("func f():\n\tf(12|3)\n").kind,
+        CompletionKind::CallArguments { .. }
+    ));
 }

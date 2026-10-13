@@ -32,6 +32,8 @@
 //!
 //! 1. **Deferred** (`$`/`%`/`get_node` node paths, `load`/`preload` file paths) — M11; checked first
 //!    so they are never misread as a member/identifier.
+//!    Then the **prose guard**: a caret inside any other string literal (closed or not) or inside a
+//!    comment yields [`CompletionKind::None`], as Godot offers nothing there (#599, #620).
 //! 2. **Member access** — anchor is `.` (or an identifier immediately preceded by `.`). Wins even
 //!    inside a call: `print(foo.` is `Attribute`, not a call argument. `super.` ⇒ `SuperMethod`.
 //! 3. **Punctuation-anchored** — `[` (subscript), `=`/`+=`/… (assign), `@…` (annotation), an
@@ -43,7 +45,10 @@
 //!    `CallArguments` (arg index = depth-0 commas from the `(` to the cursor); else a bare/partial
 //!    identifier ⇒ `Identifier`, or `None`.
 
+use std::collections::HashMap;
+
 use gd_syntax::ast::{NodeId, NodeKind, ParseTree, SubscriptAccess};
+use gd_syntax::lexer::CommentData;
 use gd_syntax::token::{Token, TokenKind};
 use gd_syntax::ByteSpan;
 
@@ -187,11 +192,18 @@ impl CompletionContext {
 }
 
 /// Classify the completion context at byte offset `byte`. Pure and panic-free for any
-/// `(tree, tokens, byte)` — out-of-range offsets and partial/mid-edit token streams all resolve to
-/// a well-defined variant (worst case [`CompletionKind::None`]). `tokens` must be the standalone
-/// [`gd_syntax::tokenize`] output for the same source the tree was parsed from.
+/// `(tree, tokens, comments, byte)` — out-of-range offsets and partial/mid-edit token streams all
+/// resolve to a well-defined variant (worst case [`CompletionKind::None`]). `tokens` must be the
+/// standalone [`gd_syntax::tokenize`] output for the same source the tree was parsed from, and
+/// `comments` the lexer's recorded comment map for that source
+/// ([`gd_syntax::ParseResult::comments`]).
 #[must_use]
-pub fn classify(tree: &ParseTree, tokens: &[Token], byte: usize) -> CompletionContext {
+pub fn classify(
+    tree: &ParseTree,
+    tokens: &[Token],
+    comments: &HashMap<u32, CommentData>,
+    byte: usize,
+) -> CompletionContext {
     // The token index of the anchor = the last token that ends at or before the cursor. Whitespace
     // is not a token, so for `speed = <space>` the anchor is `=`, regardless of trailing spaces.
     let anchor = anchor_index(tokens, byte);
@@ -199,6 +211,17 @@ pub fn classify(tree: &ParseTree, tokens: &[Token], byte: usize) -> CompletionCo
     // (1) Deferred contexts first — never let a `$`/`%`/path read as a member/identifier.
     if let Some(ctx) = classify_deferred(tokens, anchor, byte) {
         return ctx;
+    }
+
+    // (1.5) Prose guard (#599) — Godot offers nothing inside a string literal or a comment. The
+    // deferred pass above already claimed the shapes that genuinely want completion inside a
+    // string (`preload`/`load` resource paths, `$"…"`/`%"…"` and `get_node("…")` node paths), so
+    // whatever string position remains is prose: a message string, a dict key, a StringName, a
+    // NodePath value. Without this guard the token-anchored classifier takes the literal as its
+    // anchor and the bare-identifier fallthrough pops the whole identifier list. Comments are not
+    // tokens at all, so they are checked against the lexer's recorded spans instead.
+    if in_prose(tokens, comments, byte) {
+        return CompletionContext::bare(CompletionKind::None);
     }
 
     // (2) Member access — `.`-anchored. Wins over an enclosing call (`print(foo.` is Attribute).
@@ -284,6 +307,37 @@ fn word_containing(tokens: &[Token], byte: usize) -> Option<ByteSpan> {
         .iter()
         .find(|t| is_word_token(t.kind) && t.span.start < byte && byte < t.span.end)
         .map(|t| t.span)
+}
+
+/// Whether the cursor sits in prose — strictly inside a string-literal token or inside a recorded
+/// comment span — where Godot offers no completion (#599).
+///
+/// Strings are single `Literal` tokens whose span covers both quotes, so "inside" is the strict
+/// span test: a cursor at the closing quote or past it is OUT of the string, which is how the
+/// `"abc".` member list keeps working. Only the string family counts, so a caret mid-number
+/// (`f(12|3)`) keeps its context. Comments are not tokens; the lexer records one
+/// [`CommentData`] per line whose span runs from the `#` to (exclusive) the newline, so a cursor
+/// anywhere from just past the `#` through the line's end byte counts — including the line-end
+/// position where comment typing actually stops. The deferred pass has already run by the time
+/// this is consulted, so `preload`/`load`/`get_node`/quoted-`$` shapes are never suppressed.
+fn in_prose(tokens: &[Token], comments: &HashMap<u32, CommentData>, byte: usize) -> bool {
+    cursor_inside_string_literal(tokens, byte)
+        || cursor_inside_unterminated_string(tokens, byte)
+        || comments
+            .values()
+            .any(|c| c.span.start < byte && byte <= c.span.end)
+}
+
+/// Whether the cursor sits in a string whose closing quote is not typed yet. The lexer turns such a
+/// string into one `Error` token running from its opening quote (or `&`/`^`/`r` prefix) to where the
+/// scan stopped, so a caret at that token's end — the end of the source — is still inside it.
+fn cursor_inside_unterminated_string(tokens: &[Token], byte: usize) -> bool {
+    tokens.iter().any(|t| {
+        t.kind == TokenKind::Error
+            && &*t.source == "Unterminated string."
+            && t.span.start < byte
+            && byte <= t.span.end
+    })
 }
 
 /// Whether a token kind is a "word" the user could be mid-typing as an identifier/keyword. Used to
@@ -1406,13 +1460,6 @@ fn classify_call_or_identifier(
                     ) || callee_kind.is_identifier();
 
                     if is_callee && !is_func_params {
-                        // A caret strictly inside a string argument (`print("ab|")`, `f(&"|")`) is
-                        // not an expression position: Godot offers nothing there beyond a per-call
-                        // `get_argument_options` string list, which gdls does not build. The
-                        // path-taking callees were already claimed by `classify_deferred` (#620).
-                        if cursor_inside_string_literal(tokens, byte) {
-                            return CompletionContext::bare(CompletionKind::None);
-                        }
                         let arg_index = arg_index_after(tokens, open_idx, byte);
                         let (callee, callee_name) = recover_callee(tree, tokens, callee_idx);
                         return CompletionContext::new(
