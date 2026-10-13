@@ -23,6 +23,7 @@ mod completion_surface;
 mod concurrent_dispatch;
 mod diag_related;
 mod diagnose_cli;
+mod diagnostic_ranges;
 mod dialect_surface;
 mod doc_pipeline;
 mod document_color;

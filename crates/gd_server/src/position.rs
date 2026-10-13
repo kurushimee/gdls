@@ -116,6 +116,44 @@ impl<'a> PositionMapper<'a> {
             end: self.byte_to_position(span.end),
         }
     }
+
+    /// Byte span → LSP `Range` for a **diagnostic**, where a range ending on a line break stays on
+    /// the line that break closes.
+    ///
+    /// Godot's tokenizer gives a NEWLINE token the columns `column - 1 .. column` *after* `column`
+    /// has moved past the `\n` (`gdscript_tokenizer.cpp`'s `newline`), so a diagnostic that ends
+    /// on one ends at the character just past the line's last one — one column beyond the text,
+    /// which every client clamps back to the line end. gdls carries the same token as the byte
+    /// span `[offset_of_newline, offset_of_newline + 1)`, and that end byte is the *first byte of
+    /// the next line*, so the plain conversion reports `(line + 1, 0)` and the editor highlights a
+    /// whole extra line of leading whitespace. Only a token that spans the break can land there,
+    /// so the rewrite touches nothing else.
+    pub fn diagnostic_span_to_range(&self, span: ByteSpan) -> Range {
+        Range {
+            start: self.byte_to_position(span.start),
+            end: self.diagnostic_end_position(span),
+        }
+    }
+
+    fn diagnostic_end_position(&self, span: ByteSpan) -> Position {
+        let end = span.end;
+        if end <= span.start || end > self.rope.len_bytes() || self.rope.byte(end - 1) != b'\n' {
+            return self.byte_to_position(end);
+        }
+        let line = self.rope.byte_to_line(end - 1);
+        let line_slice = self.rope.line(line);
+        // The line slice carries its own terminator, so its length in client units is already the
+        // "one past the last character" column Godot reports.
+        let character = match self.enc {
+            PositionEncoding::Utf8 => line_slice.len_bytes(),
+            PositionEncoding::Utf16 => line_slice.len_utf16_cu(),
+            PositionEncoding::Utf32 => line_slice.len_chars(),
+        };
+        Position {
+            line: line as u32,
+            character: character as u32,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +175,87 @@ mod tests {
                 "round-trip failed at char {char_idx} (byte {byte}) in {enc:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_diagnostic_ending_on_a_newline_stays_on_that_line() {
+        // #595. `\tpass\n` is 5 characters; Godot reports the end one past them, at 6.
+        let text = "func f() -> int:\n\tpass\nfunc g():\n\tpass\n";
+        let rope = Rope::from_str(text);
+        let mapper = PositionMapper::new(&rope, PositionEncoding::Utf16);
+        let end_of_body = text.find("func g").expect("fixture has a second function");
+        let span = ByteSpan::new(0, end_of_body);
+        assert_eq!(
+            mapper.span_to_range(span).end,
+            Position {
+                line: 2,
+                character: 0
+            }
+        );
+        assert_eq!(
+            mapper.diagnostic_span_to_range(span).end,
+            Position {
+                line: 1,
+                character: 6
+            }
+        );
+    }
+
+    #[test]
+    fn the_newline_rule_counts_in_the_client_encoding() {
+        let text = "var s := \"café 🎮\"\nvar t := 1\n";
+        let rope = Rope::from_str(text);
+        let end = text.find("var t").expect("fixture has a second line");
+        let span = ByteSpan::new(0, end);
+        let ends = |enc| {
+            PositionMapper::new(&rope, enc)
+                .diagnostic_span_to_range(span)
+                .end
+        };
+        // 17 characters on line 0, so 18 in UTF-32 and 19 in UTF-16 (the emoji is a surrogate
+        // pair), each counting the line break as the one past the last character.
+        assert_eq!(ends(PositionEncoding::Utf32).character, 18);
+        assert_eq!(ends(PositionEncoding::Utf16).character, 19);
+        assert_eq!(ends(PositionEncoding::Utf8).character, 22);
+        assert!(ends(PositionEncoding::Utf16).line == 0);
+    }
+
+    #[test]
+    fn a_body_ending_on_the_last_newline_of_the_file_stays_on_its_line() {
+        let text = "extends Node\nfunc f() -> int:\n\tpass\n";
+        let rope = Rope::from_str(text);
+        let mapper = PositionMapper::new(&rope, PositionEncoding::Utf16);
+        let span = ByteSpan::new(
+            text.find("func").expect("fixture has a function"),
+            text.len(),
+        );
+        assert_eq!(
+            mapper.diagnostic_span_to_range(span).end,
+            Position {
+                line: 2,
+                character: 6
+            }
+        );
+    }
+
+    #[test]
+    fn an_ordinary_diagnostic_range_is_untouched() {
+        let text = "func f() -> int:
+	pass
+";
+        let rope = Rope::from_str(text);
+        let mapper = PositionMapper::new(&rope, PositionEncoding::Utf16);
+        let span = ByteSpan::new(5, 6);
+        assert_eq!(
+            mapper.diagnostic_span_to_range(span),
+            mapper.span_to_range(span)
+        );
+        // An empty span sitting at a line start belongs to that line, not the one before it.
+        let at_line_start = ByteSpan::new(17, 17);
+        assert_eq!(
+            mapper.diagnostic_span_to_range(at_line_start),
+            mapper.span_to_range(at_line_start)
+        );
     }
 
     #[test]
