@@ -24,7 +24,7 @@ Each crate builds its integration tests as one binary, `integration`, whose root
 
 To run it: `cargo run --bin gdls` (debug) or `target/release/gdls` (release). It speaks JSON-RPC over stdio, so a bare invocation just waits for an LSP client.
 
-**The local loop is the Linux half of the gate.** CI also runs the tests on `windows-latest` (format, clippy, and a stable compile check of the `fuzz/` crate run on Linux only), and that leg stayed red for twelve merges once (#279) because nothing in the merge loop surfaces it. After merging, check `gh run list --branch main --limit 5`. The rules that keep `gd_server` tests passing on Windows and inside one shared test process are in `crates/gd_server/tests/CLAUDE.md`.
+**`scripts/gate.sh` is the whole CI gate on this machine**, the Windows tests and the VS Code extension included, so a PR merges on its `GATE-COMPLETE ok` without waiting for CI. CI is checked once, on `main` after the merge (`gh run list --branch main --limit 5`). Setup and the disposable Windows mirror are in `scripts/CLAUDE.md`. The rules that keep `gd_server` tests passing on Windows and inside one shared test process are in `crates/gd_server/tests/CLAUDE.md`.
 
 ## Rust workflow notes
 

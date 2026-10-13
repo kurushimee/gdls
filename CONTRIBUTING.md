@@ -33,6 +33,8 @@ cargo lint                                        # alias for: clippy --workspac
 cargo test --workspace
 ```
 
+On WSL, `scripts/gate.sh` runs every CI job in one go, including the tests on Windows and the VS Code extension's tests; `scripts/CLAUDE.md` covers its setup.
+
 CI denies all warnings (`RUSTFLAGS: -D warnings`), so be clippy-clean on the first write. Use the `cargo lint` alias (defined in [`.cargo/config.toml`](.cargo/config.toml)), not bare `cargo clippy`.
 
 To run a single test: `cargo test -p gd_syntax simple_var_declaration` (name substring), or a whole integration file: `cargo test -p gd_server --test integration lifecycle::`. Each crate's `tests/*.rs` files are modules of one `integration` binary rooted at `tests/main.rs`, so a new file needs a `mod` line there. Add `-- --nocapture` for output.
