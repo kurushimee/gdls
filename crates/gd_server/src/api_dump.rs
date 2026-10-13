@@ -11,8 +11,9 @@
 //! - Godot may abort/core-dump on exit AFTER writing a complete dump (observed on 4.6.3 with
 //!   `--path`). The exit status is logged but never trusted over the artifact: if the dump file
 //!   appears and parses, it is used.
-//! - A never-imported project (no `.godot/extension_list.cfg`) may dump without GDExtension
-//!   classes; a heuristic post-check logs the remediation.
+//! - A never-imported project (no `.godot/extension_list.cfg`), or one whose Windows loader
+//!   copies a running editor holds, dumps without GDExtension classes. The ladder retries in a
+//!   staged shadow under `.gdls/` (see [`run_dump_ladder`]) and logs what is still missing.
 //!
 //! Hard rules: stdout is the LSP wire, so the child's stdio is null/piped — never inherited; and
 //! every failure degrades to the next resolution step with one log line — the server always
@@ -643,6 +644,8 @@ fn mirror_addon_dir(
     for entry in walkdir::WalkDir::new(real_dir.as_std_path())
         .follow_links(false)
         .into_iter()
+        // A vendored clone's `.git/` directory is VCS metadata as a whole, not just its name.
+        .filter_entry(|e| !(e.file_type().is_dir() && e.file_name() == ".git"))
         .filter_map(Result::ok)
     {
         if !entry.file_type().is_file() {
@@ -690,7 +693,11 @@ fn is_dynamic_library(name: &str) -> bool {
 /// locked and the result captures every declared extension. Rung 2: the staged shadow dump,
 /// taken whenever the direct path was (or would be) partial. Rung 3: fall back to whatever the
 /// direct run produced anyway — a stock-surface dump with precise per-extension notices still
-/// beats no dump, and the stale meta makes the next start retry the ladder.
+/// beats no dump. Its meta is fresh, so it stays until the user deletes it (the notice says so).
+///
+/// Every adoption overwrites `.gdls/extension_api.json`, and the event loop reloads from that
+/// file, so a partial direct dump is set aside before the shadow runs and put back unless the
+/// shadow strictly beats it. What is on disk is always the dump the outcome reports.
 fn run_dump_ladder(binary: &Utf8Path, root: &Utf8Path, project: &ProjectModel) -> DumpOutcome {
     let locked = locked_extension_copies(root, &project.gdextensions);
     if !locked.is_empty() {
@@ -708,15 +715,24 @@ fn run_dump_ladder(binary: &Utf8Path, root: &Utf8Path, project: &ProjectModel) -
     let adopt = |produced: &Utf8Path, locked: &[Utf8PathBuf]| {
         try_adopt_dump(produced, root, project, binary, locked)
     };
+    let managed = dump_path(root);
+    let set_aside = direct_dump_set_aside(root);
 
     // Rung 1 — direct.
-    let mut best: Option<NativeDb> = None;
+    let mut best: Option<(NativeDb, usize)> = None;
     if run_dump(binary, root).is_ok() {
         if let Ok(db) = adopt(&root.join("extension_api.json"), &locked) {
-            if failing_extensions(&db, &project.gdextensions).is_empty() {
+            let missing = failing_extensions(&db, &project.gdextensions).len();
+            if missing == 0 {
                 return adopted_outcome(&db);
             }
-            best = Some(db); // partial — keep it as the fallback while trying the shadow
+            // Partial: set it aside as the fallback while trying the shadow. If it can't be
+            // moved, a shadow adoption would overwrite it unrecoverably, so keep it as is.
+            if let Err(e) = std::fs::rename(managed.as_std_path(), set_aside.as_std_path()) {
+                log::warn!("native API: setting the partial direct dump aside failed: {e}");
+                return adopted_outcome(&db);
+            }
+            best = Some((db, missing));
         }
     }
 
@@ -745,10 +761,14 @@ fn run_dump_ladder(binary: &Utf8Path, root: &Utf8Path, project: &ProjectModel) -
                 let _ = std::fs::remove_dir_all(shadow.as_std_path());
                 match shadow_adopt {
                     Ok(db) => {
-                        if failing_extensions(&db, &project.gdextensions).is_empty() {
-                            return adopted_outcome(&db);
+                        let missing = failing_extensions(&db, &project.gdextensions).len();
+                        if best.as_ref().is_none_or(|(_, direct)| missing < *direct) {
+                            let _ = std::fs::remove_file(set_aside.as_std_path());
+                            if missing == 0 {
+                                return adopted_outcome(&db);
+                            }
+                            best = Some((db, missing));
                         }
-                        best = best.or(Some(db));
                     }
                     Err(()) => {
                         log::warn!("native API: shadow dump not adoptable (quarantined)")
@@ -759,11 +779,24 @@ fn run_dump_ladder(binary: &Utf8Path, root: &Utf8Path, project: &ProjectModel) -
         }
     }
 
-    // Rung 3 — the best dump we have, partial or not (notices name the gaps).
-    if let Some(db) = best {
+    // Rung 3 — the best dump we have, partial or not (notices name the gaps). A set-aside file
+    // that still exists is the direct dump `best` holds: put it back over whatever the shadow
+    // left (a worse dump, or nothing after a quarantine).
+    if set_aside.as_std_path().exists() {
+        if let Err(e) = std::fs::rename(set_aside.as_std_path(), managed.as_std_path()) {
+            log::warn!("native API: restoring the partial direct dump failed: {e}");
+            return DumpOutcome::Failed(format!("restoring the direct dump failed: {e}"));
+        }
+    }
+    if let Some((db, _)) = best {
         return adopted_outcome(&db);
     }
     DumpOutcome::Failed("no adoptable dump (direct and shadow both failed)".to_owned())
+}
+
+/// Where a partial direct dump waits while the shadow dump runs.
+fn direct_dump_set_aside(root: &Utf8Path) -> Utf8PathBuf {
+    root.join(".gdls").join("extension_api.direct.json")
 }
 
 fn adopted_outcome(db: &NativeDb) -> DumpOutcome {
@@ -1293,6 +1326,8 @@ mod tests {
         .expect("rf litter");
         std::fs::write(root.join("addons/foo/.gitignore").as_std_path(), b"*\n")
             .expect(".gitignore");
+        std::fs::create_dir_all(root.join("addons/foo/.git").as_std_path()).expect(".git");
+        std::fs::write(root.join("addons/foo/.git/HEAD").as_std_path(), b"ref\n").expect("HEAD");
         std::fs::create_dir_all(root.join("addons/bar/win64").as_std_path()).expect("bar/win64");
         std::fs::write(
             root.join("addons/bar/bar.gdextension").as_std_path(),
@@ -1315,7 +1350,6 @@ mod tests {
         assert_eq!(locked, vec![root.join("addons/foo/bin/~lib.dll")]);
     }
 
-    /// The shadow mirrors every addon dir (hardlink or copy — indistinguishable to a reader),
     /// The shadow mirrors every hint-bearing addon dir (hardlink or copy — indistinguishable to
     /// a reader), carries the real features line verbatim, generates the extension list from the
     /// hints, and never stages loader copies or VCS metadata.
@@ -1360,13 +1394,6 @@ mod tests {
             "staged content parity (hardlink or copy)"
         );
         assert!(
-            shadow
-                .join("addons/foo/bin/~lib.dll")
-                .as_std_path()
-                .exists(),
-            "a fresh loader-copy twin must be pre-created for every mirrored library"
-        );
-        assert!(
             !shadow
                 .join("addons/foo/bin/~lib.dll~RF1.TMP")
                 .as_std_path()
@@ -1376,6 +1403,10 @@ mod tests {
         assert!(
             !shadow.join("addons/foo/.gitignore").as_std_path().exists(),
             "VCS metadata must never be staged"
+        );
+        assert!(
+            !shadow.join("addons/foo/.git").as_std_path().exists(),
+            "a vendored clone's .git directory must never be staged"
         );
     }
 
@@ -1548,6 +1579,78 @@ mod tests {
         fn no_artifact_is_err() {
             let (_dir, root, bin) = fixture("exit 1");
             assert!(run_dump_with_timeout(&bin, &root, Duration::from_secs(10)).is_err());
+        }
+
+        /// The ladder against a fake godot that dumps `direct` at the project root and `shadow`
+        /// inside the staged shadow. Returns the outcome and the class count of what ended up
+        /// on disk, which must always be the dump the outcome reports.
+        fn run_ladder(direct: &str, shadow: &str) -> (DumpOutcome, Option<usize>) {
+            use std::os::unix::fs::PermissionsExt;
+            let (dir, root) = ext_fixture();
+            let bin = root.join("fake-godot.sh");
+            std::fs::write(
+                bin.as_std_path(),
+                format!(
+                    "#!/bin/sh\ncase \"$PWD\" in\n*dump_shadow) cat > extension_api.json <<'EOF'\n{shadow}\nEOF\n;;\n*) cat > extension_api.json <<'EOF'\n{direct}\nEOF\n;;\nesac\n"
+                ),
+            )
+            .expect("fake binary");
+            std::fs::set_permissions(bin.as_std_path(), std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            let project = ProjectModel::load(&root);
+            let outcome = run_dump_ladder(&bin, &root, &project);
+            let on_disk = NativeDb::load(dump_path(&root).as_str())
+                .ok()
+                .map(|db| db.class_count());
+            assert!(
+                !direct_dump_set_aside(&root).as_std_path().exists(),
+                "the set-aside direct dump never outlives the ladder"
+            );
+            assert!(
+                !shadow_root(&root).as_std_path().exists(),
+                "the shadow is removed either way"
+            );
+            drop(dir);
+            (outcome, on_disk)
+        }
+
+        const WITH_FOO_AND_BAR: &str = r#"{"header":{"version_major":4,"version_minor":6,"version_patch":3,"version_full_name":"Godot Engine v4.6.3.fake"},"classes":[{"name":"Object"},{"name":"Foo","inherits":"Object"},{"name":"Bar","inherits":"Object"}]}"#;
+        const WITH_FOO: &str = r#"{"header":{"version_major":4,"version_minor":6,"version_patch":3,"version_full_name":"Godot Engine v4.6.3.fake"},"classes":[{"name":"Object"},{"name":"Node","inherits":"Object"},{"name":"Foo","inherits":"Object"}]}"#;
+
+        /// A partial direct dump and a shadow that captures every hinted extension: the shadow
+        /// wins, on disk as in the outcome.
+        #[test]
+        fn ladder_adopts_a_complete_shadow_over_a_partial_direct_dump() {
+            let (outcome, on_disk) = run_ladder(MINI_DUMP, WITH_FOO_AND_BAR);
+            assert!(
+                matches!(outcome, DumpOutcome::Adopted { classes: 3, .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(on_disk, Some(3));
+        }
+
+        /// An unparseable shadow artifact is quarantined, which must not take the partial
+        /// direct dump down with it: the direct dump is what the outcome reports, so it is
+        /// what the event loop must find on disk.
+        #[test]
+        fn ladder_restores_the_direct_dump_when_the_shadow_is_unparseable() {
+            let (outcome, on_disk) = run_ladder(WITH_FOO, "not json");
+            assert!(
+                matches!(outcome, DumpOutcome::Adopted { classes: 3, .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(on_disk, Some(3));
+        }
+
+        /// A shadow no better than the direct dump never replaces it on disk.
+        #[test]
+        fn ladder_keeps_the_direct_dump_when_the_shadow_is_no_better() {
+            let (outcome, on_disk) = run_ladder(WITH_FOO, MINI_DUMP);
+            assert!(
+                matches!(outcome, DumpOutcome::Adopted { classes: 3, .. }),
+                "{outcome:?}"
+            );
+            assert_eq!(on_disk, Some(3));
         }
 
         /// End-to-end: spawn_background_dump decision + thread + adoption. The fake binary

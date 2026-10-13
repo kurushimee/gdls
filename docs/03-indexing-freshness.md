@@ -26,7 +26,10 @@ Operational facts the implementation is built around, verified on 4.6.3:
 
 - The dump lands in the project root regardless of the child's cwd. So a pre-existing user `<root>/extension_api.json` suppresses the dump entirely (never clobber it), and the fresh output is moved into `.gdls/extension_api.json`.
 - Godot may abort on exit *after* writing a complete dump, so the artifact decides, never the exit status.
-- A never-imported project (no `.godot/extension_list.cfg`) loads no GDExtensions, so its dump misses their classes. gdls detects the symptom (declared extensions, none of their class hints resolving) and logs the remediation: open the project in the editor once.
+- A never-imported project (no `.godot/extension_list.cfg`) loads no GDExtensions, so its dump misses their classes.
+- On Windows, Godot loads each GDExtension library from a `~`-prefixed copy beside it. The copy's name is fixed, so while an editor has the project open, a second Godot process can't make its own copy, skips that extension, and dumps without its classes.
+
+Both gaps are handled by a staged retry. When the direct dump is missing every class hint of some extension, gdls builds a shadow project in `.gdls/dump_shadow`: a minimal `project.godot` with the real `config/features` line, a generated `extension_list.cfg` naming only the extensions that have class hints, and hardlinked mirrors of their addon folders. Each mirrored library gets its own fresh `~` copy, so the shadow never touches the editor's. gdls dumps there and adopts the result if it misses fewer extensions than the direct dump, then removes the shadow. Whatever is adopted, gdls logs each extension still missing and the likely cause (locked by an open editor, or never imported).
 
 The resolution ladder when no explicit path is set: fresh `.gdls` dump, then auto-dump, then stale `.gdls` dump, then unmanaged `<root>/extension_api.json`, then the embedded stock surface, then empty and dynamic. Spawning happens only at session startup, only for real projects (`project.godot` present), with the child's stdout and stderr piped (stdout is the LSP wire) and a 5 minute kill-timeout. The dump runs on a background thread and is adopted mid-session, so the budget is deliberately generous, and a deadline-killed dump that already wrote its artifact is still adopted.
 
