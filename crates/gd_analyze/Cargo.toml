@@ -34,6 +34,7 @@ unicode-security.workspace = true
 # (`tests/differential.rs`). Pinned in the workspace `[dependencies]` table per the workspace
 # policy in the root `Cargo.toml` (one version per shared external dep, lives in exactly one place).
 which.workspace = true
+serde_json.workspace = true
 
 # Every tests/*.rs file is a module of this one binary (see tests/main.rs), not a binary of its own.
 [[test]]

@@ -1045,6 +1045,7 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
         // find type" is exactly as unsound as the provenance cases above — degrade silently.
         if ctx.native.provenance() != gd_types::ApiProvenance::Exact
             || ctx.native.is_extension_declared_missing(&first)
+            || is_unmodelled_builtin(ctx, &first)
         {
             return bad_type;
         }
@@ -1291,6 +1292,13 @@ pub(crate) fn resolve_datatype(ctx: &mut AnalysisContext, opt: Option<NodeId>) -
 // ===================================================================================================
 // Builtin-type name table — GDScriptParser::get_builtin_type (gdscript_parser.cpp:55)
 // ===================================================================================================
+
+/// A builtin type the dump declares that [`builtin_type_from_name`] has no `VariantType` for: one
+/// a custom engine build registered. Godot reads builtin names from `Variant::get_type_name`, so
+/// that engine knows the name as a type and a constructor, and gdls must not call it undeclared.
+pub(crate) fn is_unmodelled_builtin(ctx: &AnalysisContext, name: &str) -> bool {
+    builtin_type_from_name(name).is_none() && ctx.native.builtin_named(name).is_some()
+}
 
 /// `GDScriptParser::get_builtin_type(name)` (gdscript_parser.cpp:55): every `Variant::Type` name
 /// *except* `Nil` and `Object` (those are not GDScript builtin type annotations — `Object` is a native
