@@ -1440,7 +1440,7 @@ fn serve_inner(
     // on a debug-artifact-write error would mask the real reason it stopped).
     if let Some(rec) = state.recorder.take() {
         let buffers = bench::snapshot_buffers(&state.vfs);
-        if let Err(e) = rec.flush(buffers) {
+        if let Err(e) = rec.flush(buffers, state.workspace.project.root.as_str()) {
             log::warn!("bench recorder flush failed: {e}");
         }
     }

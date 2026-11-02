@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   - Typing a new `class_name` that passed through an existing one (`CharacterEntity` on the way to `CharacterEntityAI`) took the name over, then dropped it for good, so every use read `Could not find type`. The real owner now keeps it, and a change of owner re-analyzes everything that depends on it.
   - When an API dump landed mid-session, the warm cache stored unsaved buffer contents as disk truth, so a half-typed `extends` could survive restarts. Open buffers are now left out of that save.
   - The cache format moved to v21, so caches holding a wrong owner are rebuilt on first start.
+- **`PI`, `TAU`, `INF`, and `NAN` count as constants inside a constructor.** `const A := Vector3(PI / 2.0, 0.0, 0.0)` and the like drew `isn't a constant expression`, also when nested in another constructor or a dictionary. Godot accepts them, and so does gdls now (#644).
 
 ### Changed
 - **`target/` and `node_modules/` are indexed.** Godot scans them, so a `class_name` declared there is real to Godot and now to gdls.

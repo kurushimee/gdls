@@ -2225,18 +2225,15 @@ fn reduce_identifier(ctx: &mut AnalysisContext, id: NodeId) {
         return;
     }
 
-    // 8. Global constants (PI, TAU, INF, NAN) — see [`is_global_float_constant`].
-    if is_global_float_constant(&name) {
-        ctx.set_type(
-            id,
-            DataType {
-                type_source: TypeSource::AnnotatedExplicit,
-                kind: DtKind::Builtin,
-                builtin_type: VariantType::Float,
-                is_constant: true,
-                ..Default::default()
-            },
-        );
+    // 8. Global constants (PI, TAU, INF, NAN) — see [`global_float_constant`]. The parser turns
+    //    their tokens into plain identifiers (`parse_precedence` treats `CONST_PI` as one), so they
+    //    reach Godot's `has_any_global_constant` arm (analyzer.cpp:4634-4643), which sets
+    //    `reduced_value` as well as the type. Without the fold, `Vector3(PI, 0, 0)` could not fold
+    //    and a `const` built from it read as non-constant (#644).
+    if let Some(value) = global_float_constant(&name) {
+        let folded = FoldedValue::Float(value);
+        ctx.set_type(id, type_from_variant(&folded));
+        ctx.folds.set(id, folded);
         return;
     }
 
@@ -8196,7 +8193,7 @@ fn resolve_value_head(
     if ctx.native.global_constant(name).is_some() {
         return ShapeAnswer::Type(Box::new(hard_builtin(VariantType::Int)));
     }
-    if is_global_float_constant(name) {
+    if global_float_constant(name).is_some() {
         return ShapeAnswer::Type(Box::new(hard_builtin(VariantType::Float)));
     }
     if let Some(fid) = ctx.xfile.autoload_file(name) {
@@ -8205,12 +8202,19 @@ fn resolve_value_head(
     ShapeAnswer::Unknown
 }
 
-/// The four `@GlobalScope` float constants. Godot exposes them through
-/// `GDScriptLanguage::get_global_map()`, and the dump does not carry them — its `global_constants`
-/// array holds only the integer limits — so the set is listed here rather than read. Shared by the
-/// in-file `reduce_identifier` and the cross-file [`resolve_value_head`] so the two cannot drift.
-fn is_global_float_constant(name: &str) -> bool {
-    matches!(name, "PI" | "TAU" | "INF" | "NAN")
+/// The value of one of the four `@GlobalScope` float constants, `None` for any other name. Godot
+/// registers them in `GDScriptLanguage::init` (gdscript.cpp:2154-2157), and the dump does not carry
+/// them — its `global_constants` array holds only the integer limits — so the set is listed here
+/// rather than read. Shared by the in-file `reduce_identifier` and the cross-file
+/// [`resolve_value_head`] so the two cannot drift.
+fn global_float_constant(name: &str) -> Option<f64> {
+    match name {
+        "PI" => Some(std::f64::consts::PI),
+        "TAU" => Some(std::f64::consts::TAU),
+        "INF" => Some(f64::INFINITY),
+        "NAN" => Some(f64::NAN),
+        _ => None,
+    }
 }
 
 /// One segment read off an already-resolved type.
