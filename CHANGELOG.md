@@ -4,7 +4,9 @@ All notable changes to `gdls` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [3.1.1] - 2026-11-02
+
+A patch release on the same two Godot releases as 3.1.0. It fixes false type errors that came from the `class_name` index pointing a name at the wrong file, and constant expressions that use `PI`, `TAU`, `INF`, or `NAN`. The warm-start cache format moved to v21, so the first start after the upgrade is a cold one.
 
 ### Fixed
 - **A `class_name` always resolves to the file Godot gives it.** False errors such as `argument 1 should be "Node3D" but is "CharacterEntity".` came from the index pointing a class name at the wrong file, or at none:
