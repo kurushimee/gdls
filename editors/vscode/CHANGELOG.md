@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.2
+
+- Updated build and test dependencies. No change in behavior. Released alongside gdls 3.1.1.
+
 ## 1.0.1
 
 - Server log lines show at the level gdls gave them, not all as errors.
