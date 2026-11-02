@@ -4,6 +4,19 @@ All notable changes to `gdls` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **A `class_name` always resolves to the file Godot gives it.** False errors such as `argument 1 should be "Node3D" but is "CharacterEntity".` came from the index pointing a class name at the wrong file, or at none:
+  - A script in a folder Godot never scans (a `.gdignore`'d folder, a nested project, any dot-named folder) could take over a name. The index now skips exactly what Godot's scan skips. A file opened from such a folder still gets navigation, but never owns a name a project file declares.
+  - With two scanned files declaring one name, whichever was indexed last owned it. The owner is now the file Godot registers last, whatever the edit order.
+  - Typing a new `class_name` that passed through an existing one (`CharacterEntity` on the way to `CharacterEntityAI`) took the name over, then dropped it for good, so every use read `Could not find type`. The real owner now keeps it, and a change of owner re-analyzes everything that depends on it.
+  - When an API dump landed mid-session, the warm cache stored unsaved buffer contents as disk truth, so a half-typed `extends` could survive restarts. Open buffers are now left out of that save.
+  - The cache format moved to v21, so caches holding a wrong owner are rebuilt on first start.
+
+### Changed
+- **`target/` and `node_modules/` are indexed.** Godot scans them, so a `class_name` declared there is real to Godot and now to gdls.
+
 ## [3.1.0] - 2026-10-13
 
 A fidelity and navigation release on the same two Godot releases as 3.0.0. About 140 fixes close the distance to what Godot itself reports and answers: errors and warnings the analyzer missed, false positives it invented, and navigation that stopped at a file boundary. On Pixelorama, every diagnostic now matches the Godot 4.7.2 editor's own language server in message, severity, and range, across all 249 scripts. It also ships a VS Code and Cursor extension.

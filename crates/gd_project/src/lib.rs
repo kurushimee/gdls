@@ -20,6 +20,7 @@ pub mod model;
 pub mod paths;
 pub mod project_godot;
 pub mod registry;
+pub mod scan_order;
 pub mod scene;
 pub mod scene_index;
 
@@ -30,7 +31,9 @@ pub use cache::{
 };
 pub use depgraph::{DepGraph, FileId};
 pub use dialect_resolve::{dialect_notice, resolve_dialect, DialectOrigin};
-pub use exclude::{is_excluded, ProjectRoot, EXCLUDED_COMPONENTS};
+pub use exclude::{
+    is_excluded, is_scan_boundary_marker, is_skipped_dir, keep_walk_entry, ProjectRoot, ScanFilter,
+};
 pub use gdextension::GdExtension;
 pub use index::{normalize as normalize_path, Index, IndexInvariant, IndexMut, Resolution};
 pub use interface::{

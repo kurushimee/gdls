@@ -9,12 +9,15 @@
 //! (Godot's separate `INHERITANCE_SOLVED` pass) keeps the registry free of stale cross-tier handles
 //! after an M4 DB reload.
 
+use std::cmp::Ordering;
+
 use camino::{Utf8Path, Utf8PathBuf};
 use gd_syntax::ByteSpan;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::interface::Extends;
+use crate::interface::{Extends, Interface};
+use crate::scan_order::godot_scan_order;
 
 /// A class's immediate base, captured syntactically (resolved on demand by the [`crate::index::Index`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,39 +55,75 @@ pub struct ClassEntry {
     /// re-parsing the declaring file. Zero-width when unknown; consumers must bounds-check
     /// against the current file text (the indexed span can lag an unsaved edit).
     pub name_span: ByteSpan,
+    /// Godot's scan never reaches this file. See [`crate::interface::Interface::outside_godot_scan`].
+    #[serde(default)]
+    pub outside_godot_scan: bool,
+}
+
+impl ClassEntry {
+    /// The registration of `iface`'s top-level `class_name`, declared by the file at `path`.
+    #[must_use]
+    pub fn declared_by(path: &Utf8Path, iface: &Interface) -> Self {
+        let (line, name_span) = iface.class_name_loc.unwrap_or((1, ByteSpan::default()));
+        ClassEntry {
+            path: path.to_path_buf(),
+            base: BaseRef::from_extends(&iface.extends),
+            is_abstract: iface.is_abstract,
+            line,
+            name_span,
+            outside_godot_scan: iface.outside_godot_scan,
+        }
+    }
 }
 
 /// `class_name` → [`ClassEntry`]. Only top-level `class_name` declarations are global (inner classes
 /// are reachable only as `Outer.Inner`, never registered here), matching Godot.
 ///
-/// A `path → name` reverse map (`by_path`) makes [`Self::remove_by_path`] O(1): a file declares at
-/// most one global `class_name`, so reconciling a file's registration on every (re)index never scans
-/// the whole table — without it, the cold index is O(N²).
+/// Every file declaring a name is kept, not just one. The winner is the declarer Godot's editor
+/// registers last ([`godot_scan_order`]), preferring any file Godot's scan reaches over one it
+/// never sees, so it depends only on which files declare the name, never
+/// on the order they were indexed or edited in. Removing the winner promotes the next declarer
+/// instead of dropping the name: a scratch copy, or a new file passing through an existing name
+/// while its `class_name` is typed, can never hide or take over the real class for good.
 ///
-/// Serialization stores only `by_name` (the source of truth); `by_path` is rebuilt on load.
+/// A `path → name` reverse map (`by_path`) keeps [`Self::remove_by_path`] cheap: a file declares at
+/// most one global `class_name`, so reconciling a file's registration never scans the whole table.
+///
+/// Serialization stores every declarer; `by_path` is rebuilt on load.
 #[derive(Clone, Debug, Default)]
 pub struct ClassNameRegistry {
-    by_name: FxHashMap<String, ClassEntry>,
+    /// Every declarer of a name, sorted by [`godot_scan_order`]. The last one wins. Never empty.
+    by_name: FxHashMap<String, Vec<ClassEntry>>,
     by_path: FxHashMap<Utf8PathBuf, String>,
 }
 
 impl Serialize for ClassNameRegistry {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Serialize only the forward map (`by_name`). `by_path` is rebuilt on load.
         self.by_name.serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for ClassNameRegistry {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let by_name = FxHashMap::<String, ClassEntry>::deserialize(deserializer)?;
-        // Rebuild the reverse map from the forward data.
-        let mut by_path = FxHashMap::default();
-        for (name, entry) in &by_name {
-            by_path.insert(entry.path.clone(), name.clone());
+        let stored = FxHashMap::<String, Vec<ClassEntry>>::deserialize(deserializer)?;
+        // Re-insert rather than trust the stored order, so a cache can never carry a winner the
+        // current ordering rule would not pick.
+        let mut registry = ClassNameRegistry::new();
+        for (name, declarers) in stored {
+            for entry in declarers {
+                registry.insert_entry(name.clone(), entry);
+            }
         }
-        Ok(ClassNameRegistry { by_name, by_path })
+        Ok(registry)
     }
+}
+
+/// The order declarers of one name compete in; the greatest owns it. A file Godot's scan reaches
+/// always beats one it doesn't, then Godot's own registration order decides.
+fn ownership_order(a: &ClassEntry, b: &ClassEntry) -> Ordering {
+    b.outside_godot_scan
+        .cmp(&a.outside_godot_scan)
+        .then_with(|| godot_scan_order(&a.path, &b.path))
 }
 
 impl ClassNameRegistry {
@@ -92,11 +131,13 @@ impl ClassNameRegistry {
         Self::default()
     }
 
-    /// Register `name`'s declaration, derived from a file's interface base. If `path` previously
-    /// declared a *different* name, that stale entry is dropped first. A duplicate `class_name` across
-    /// two files is last-writer-wins (a project error the analyzer reports in M3; the registry does
-    /// not arbitrate). `name_loc` is the `class_name` identifier's (1-based line, byte span) from
-    /// the interface; `None` (defensive — a named class always has an identifier) anchors at line 1.
+    /// Register `path`'s declaration of `name`, derived from the file's interface base. A name the
+    /// file declared before is retired first. `name_loc` is the `class_name` identifier's (1-based
+    /// line, byte span); `None` (defensive — a named class always has an identifier) anchors at
+    /// line 1.
+    ///
+    /// Returns every name whose winning file changed, so the caller can re-link what refers to it.
+    #[must_use]
     pub fn insert(
         &mut self,
         name: String,
@@ -104,14 +145,7 @@ impl ClassNameRegistry {
         extends: &Extends,
         is_abstract: bool,
         name_loc: Option<(u32, ByteSpan)>,
-    ) {
-        // If this path already declared a different name, retire it (guarding a name now owned by a
-        // different path).
-        if let Some(prev) = self.by_path.get(path).cloned() {
-            if prev != name && self.by_name.get(&prev).is_some_and(|e| e.path == path) {
-                self.by_name.remove(&prev);
-            }
-        }
+    ) -> Vec<String> {
         let (line, name_span) = name_loc.unwrap_or((1, ByteSpan::default()));
         let entry = ClassEntry {
             path: path.to_path_buf(),
@@ -119,40 +153,92 @@ impl ClassNameRegistry {
             is_abstract,
             line,
             name_span,
+            outside_godot_scan: false,
         };
-        self.by_path.insert(entry.path.clone(), name.clone());
-        self.by_name.insert(name, entry);
+        self.insert_declaration(name, entry)
     }
 
+    /// [`Self::insert`] for a fully built entry, keyed by `entry.path`.
+    #[must_use]
+    pub fn insert_declaration(&mut self, name: String, entry: ClassEntry) -> Vec<String> {
+        let path = entry.path.clone();
+        let path = path.as_path();
+        let mut affected: Vec<String> = self.by_path.get(path).cloned().into_iter().collect();
+        if !affected.contains(&name) {
+            affected.push(name.clone());
+        }
+        let winners_before: Vec<Option<Utf8PathBuf>> =
+            affected.iter().map(|n| self.winner_path(n)).collect();
+
+        let _ = self.remove_by_path(path);
+        self.insert_entry(name, entry);
+
+        affected
+            .into_iter()
+            .zip(winners_before)
+            .filter(|(n, before)| self.winner_path(n) != *before)
+            .map(|(n, _)| n)
+            .collect()
+    }
+
+    fn winner_path(&self, name: &str) -> Option<Utf8PathBuf> {
+        self.get(name).map(|e| e.path.clone())
+    }
+
+    /// Add one declarer at its scan-order position.
+    fn insert_entry(&mut self, name: String, entry: ClassEntry) {
+        self.by_path.insert(entry.path.clone(), name.clone());
+        let declarers = self.by_name.entry(name).or_default();
+        let at = declarers.partition_point(|d| ownership_order(d, &entry) == Ordering::Less);
+        declarers.insert(at, entry);
+    }
+
+    /// The file that owns `name`: of all its declarers, the one Godot registers last.
     pub fn get(&self, name: &str) -> Option<&ClassEntry> {
-        self.by_name.get(name)
+        self.by_name.get(name).and_then(|d| d.last())
     }
 
     pub fn contains(&self, name: &str) -> bool {
         self.by_name.contains_key(name)
     }
 
-    pub fn remove(&mut self, name: &str) -> Option<ClassEntry> {
-        let entry = self.by_name.remove(name)?;
-        // Keep `by_path` consistent only if it still points at this name.
-        if self.by_path.get(&entry.path).is_some_and(|n| n == name) {
-            self.by_path.remove(&entry.path);
-        }
-        Some(entry)
-    }
-
-    /// Drop the `class_name` declared by `path` (a file lost its `class_name`, or was deleted), in
-    /// O(1). Returns the removed name(s) so the caller can re-link anything that referenced them.
+    /// Drop the `class_name` declared by `path` (a file lost its `class_name`, or was deleted).
+    /// When `path` was the winner, the next declarer takes over.
+    ///
+    /// Returns the name if its winning file changed, so the caller can re-link its referencers.
+    #[must_use]
     pub fn remove_by_path(&mut self, path: &Utf8Path) -> Vec<String> {
         let Some(name) = self.by_path.remove(path) else {
             return Vec::new();
         };
-        // Only retire the `by_name` entry if it still belongs to this path (a duplicate name may have
-        // been re-pointed at another file).
-        if self.by_name.get(&name).is_some_and(|e| e.path == path) {
+        let Some(declarers) = self.by_name.get_mut(&name) else {
+            return Vec::new();
+        };
+        let Some(at) = declarers.iter().position(|d| d.path == path) else {
+            return Vec::new();
+        };
+        let was_winner = at + 1 == declarers.len();
+        declarers.remove(at);
+        if declarers.is_empty() {
             self.by_name.remove(&name);
         }
-        vec![name]
+        if was_winner {
+            vec![name]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Every file declaring `name`, winner last.
+    pub fn declarers(&self, name: &str) -> &[ClassEntry] {
+        self.by_name.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every `(name, declarer)` pair, losers included.
+    pub fn all_declarations(&self) -> impl Iterator<Item = (&str, &ClassEntry)> {
+        self.by_name
+            .iter()
+            .flat_map(|(name, declarers)| declarers.iter().map(move |d| (name.as_str(), d)))
     }
 
     pub fn len(&self) -> usize {
@@ -167,12 +253,12 @@ impl ClassNameRegistry {
         self.by_name.keys().map(String::as_str)
     }
 
-    /// Iterate every `(name, &ClassEntry)` pair. Used by M4's `implementation` handler (linear walk
+    /// Iterate every `(name, winner)` pair. Used by M4's `implementation` handler (linear walk
     /// looking for subclasses of a given class) and `workspace/symbol` (class-prefix ranking).
     pub fn entries(&self) -> impl Iterator<Item = (&str, &ClassEntry)> {
         self.by_name
             .iter()
-            .map(|(name, entry)| (name.as_str(), entry))
+            .filter_map(|(name, declarers)| declarers.last().map(|winner| (name.as_str(), winner)))
     }
 }
 
@@ -187,7 +273,7 @@ mod tests {
     #[test]
     fn insert_and_get() {
         let mut r = ClassNameRegistry::new();
-        r.insert(
+        let _ = r.insert(
             "Hero".into(),
             &p("/proj/hero.gd"),
             &Extends::Names(vec!["Node2D".into()]),
@@ -204,8 +290,8 @@ mod tests {
     #[test]
     fn base_ref_from_each_extends_shape() {
         let mut r = ClassNameRegistry::new();
-        r.insert("A".into(), &p("/a.gd"), &Extends::None, false, None);
-        r.insert(
+        let _ = r.insert("A".into(), &p("/a.gd"), &Extends::None, false, None);
+        let _ = r.insert(
             "B".into(),
             &p("/b.gd"),
             &Extends::Path {
@@ -215,7 +301,7 @@ mod tests {
             false,
             None,
         );
-        r.insert(
+        let _ = r.insert(
             "C".into(),
             &p("/c.gd"),
             &Extends::Names(vec!["Outer".into(), "Inner".into()]),
@@ -234,7 +320,7 @@ mod tests {
     #[test]
     fn insert_stores_name_loc_with_defensive_default() {
         let mut r = ClassNameRegistry::new();
-        r.insert(
+        let _ = r.insert(
             "Hero".into(),
             &p("/proj/hero.gd"),
             &Extends::None,
@@ -245,7 +331,7 @@ mod tests {
         assert_eq!(e.line, 3);
         assert_eq!(e.name_span, ByteSpan::new(27, 31));
         // No location recorded → the defensive line-1 anchor, zero-width span.
-        r.insert(
+        let _ = r.insert(
             "Bare".into(),
             &p("/proj/bare.gd"),
             &Extends::None,
@@ -260,7 +346,7 @@ mod tests {
     #[test]
     fn remove_by_path_returns_names() {
         let mut r = ClassNameRegistry::new();
-        r.insert(
+        let _ = r.insert(
             "Hero".into(),
             &p("/proj/hero.gd"),
             &Extends::None,
@@ -277,8 +363,8 @@ mod tests {
         // A file renaming its class_name (insert without a preceding remove) must not leave the old
         // name registered.
         let mut r = ClassNameRegistry::new();
-        r.insert("Old".into(), &p("/a.gd"), &Extends::None, false, None);
-        r.insert("New".into(), &p("/a.gd"), &Extends::None, false, None);
+        let _ = r.insert("Old".into(), &p("/a.gd"), &Extends::None, false, None);
+        let _ = r.insert("New".into(), &p("/a.gd"), &Extends::None, false, None);
         assert!(r.get("Old").is_none());
         assert!(r.get("New").is_some());
         assert_eq!(r.len(), 1);
@@ -288,14 +374,14 @@ mod tests {
     #[test]
     fn entries_returns_every_registered_name_with_entry() {
         let mut r = ClassNameRegistry::new();
-        r.insert(
+        let _ = r.insert(
             "Hero".into(),
             &p("/a.gd"),
             &Extends::Names(vec!["Node2D".into()]),
             false,
             None,
         );
-        r.insert("Enemy".into(), &p("/b.gd"), &Extends::None, true, None);
+        let _ = r.insert("Enemy".into(), &p("/b.gd"), &Extends::None, true, None);
         let mut entries: Vec<(&str, &Utf8PathBuf, bool)> = r
             .entries()
             .map(|(n, e)| (n, &e.path, e.is_abstract))
@@ -308,19 +394,94 @@ mod tests {
         assert!(!entries[1].2);
     }
 
+    fn declare(r: &mut ClassNameRegistry, name: &str, path: &str) -> Vec<String> {
+        r.insert(name.into(), &p(path), &Extends::None, false, None)
+    }
+
     #[test]
-    fn duplicate_name_across_paths_is_last_writer_wins() {
-        // Two files declaring the same class_name: the last wins; removing the *loser*'s path leaves
-        // the winner registered.
+    fn duplicate_winner_follows_godot_scan_order_not_insert_order() {
+        // Godot registers subdirectory files before a directory's own files, and the last one
+        // registered wins, so the top-level file owns the name whichever was indexed first.
+        for order in [
+            ["/p/a/copy.gd", "/p/real.gd"],
+            ["/p/real.gd", "/p/a/copy.gd"],
+        ] {
+            let mut r = ClassNameRegistry::new();
+            for path in order {
+                let _ = declare(&mut r, "Dup", path);
+            }
+            assert_eq!(r.get("Dup").unwrap().path, p("/p/real.gd"));
+            assert_eq!(r.declarers("Dup").len(), 2);
+            assert_eq!(r.len(), 1);
+        }
+    }
+
+    #[test]
+    fn removing_the_winner_promotes_the_next_declarer() {
         let mut r = ClassNameRegistry::new();
-        r.insert("Dup".into(), &p("/first.gd"), &Extends::None, false, None);
-        r.insert("Dup".into(), &p("/second.gd"), &Extends::None, false, None);
-        assert_eq!(r.get("Dup").unwrap().path, p("/second.gd"));
-        // Removing the first file reports the name (so referencers relink) but keeps the winner.
-        assert_eq!(r.remove_by_path(&p("/first.gd")), vec!["Dup".to_string()]);
-        assert_eq!(r.get("Dup").unwrap().path, p("/second.gd"));
-        // Removing the winner clears it.
-        assert_eq!(r.remove_by_path(&p("/second.gd")), vec!["Dup".to_string()]);
+        let _ = declare(&mut r, "Dup", "/p/a/copy.gd");
+        let _ = declare(&mut r, "Dup", "/p/real.gd");
+        // Removing a loser changes no winner.
+        assert!(r.remove_by_path(&p("/p/a/copy.gd")).is_empty());
+        assert_eq!(r.get("Dup").unwrap().path, p("/p/real.gd"));
+
+        let _ = declare(&mut r, "Dup", "/p/a/copy.gd");
+        assert_eq!(r.remove_by_path(&p("/p/real.gd")), vec!["Dup".to_string()]);
+        assert_eq!(r.get("Dup").unwrap().path, p("/p/a/copy.gd"));
+        assert_eq!(
+            r.remove_by_path(&p("/p/a/copy.gd")),
+            vec!["Dup".to_string()]
+        );
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn typing_through_an_existing_name_leaves_its_owner_registered() {
+        // A new file whose `class_name` is typed one keystroke at a time passes through an existing
+        // name. The real owner must keep the name once the typing moves past it.
+        let mut r = ClassNameRegistry::new();
+        let _ = declare(&mut r, "CharacterEntity", "/p/src/character.gd");
+        for typed in ["CharacterEnt", "CharacterEntity", "CharacterEntityA"] {
+            let _ = declare(&mut r, typed, "/p/src/zz_new.gd");
+        }
+        assert_eq!(
+            r.get("CharacterEntity").unwrap().path,
+            p("/p/src/character.gd")
+        );
+        assert_eq!(
+            r.get("CharacterEntityA").unwrap().path,
+            p("/p/src/zz_new.gd")
+        );
+        assert!(r.get("CharacterEnt").is_none());
+    }
+
+    #[test]
+    fn insert_reports_only_names_whose_winner_changed() {
+        let mut r = ClassNameRegistry::new();
+        assert_eq!(declare(&mut r, "A", "/p/a.gd"), vec!["A".to_string()]);
+        // Re-declaring the same name from the same file changes no winner.
+        assert!(declare(&mut r, "A", "/p/a.gd").is_empty());
+        // A losing duplicate changes no winner.
+        assert!(declare(&mut r, "A", "/p/sub/a.gd").is_empty());
+        // Renaming the winner hands `A` to the other declarer and creates `B`.
+        let mut changed = declare(&mut r, "B", "/p/a.gd");
+        changed.sort();
+        assert_eq!(changed, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(r.get("A").unwrap().path, p("/p/sub/a.gd"));
+    }
+
+    #[test]
+    fn serde_round_trip_keeps_every_declarer() {
+        let mut r = ClassNameRegistry::new();
+        let _ = declare(&mut r, "Dup", "/p/real.gd");
+        let _ = declare(&mut r, "Dup", "/p/a/copy.gd");
+        let json = serde_json::to_string(&r).unwrap();
+        let mut back: ClassNameRegistry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.get("Dup").unwrap().path, p("/p/real.gd"));
+        assert_eq!(
+            back.remove_by_path(&p("/p/real.gd")),
+            vec!["Dup".to_string()]
+        );
+        assert_eq!(back.get("Dup").unwrap().path, p("/p/a/copy.gd"));
     }
 }

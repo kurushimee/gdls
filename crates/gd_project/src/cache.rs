@@ -18,7 +18,7 @@
 //! racing use last-writer-wins: each renames its own complete temp over the target. A reader only
 //! ever opens a complete old or complete new file.
 //!
-//! **`.gdls` exclusion:** `exclude.rs` already lists `.gdls` in `EXCLUDED_COMPONENTS`, so the cold
+//! **`.gdls` exclusion:** `exclude.rs` skips every dot-named directory, as Godot does, so the cold
 //! indexer and watcher never try to parse `index.<fmtver>.json` as a GDScript source.
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -136,7 +136,11 @@ use crate::scene_index::{SceneIndex, SceneIndexCache};
 /// file appearing at or vanishing from a preloaded path re-links the consumers waiting on it. A v19
 /// cache decodes into the old single-valued shape and would rebuild the inverse with the preload
 /// paths missing, leaving those consumers permanently un-relinked. v19 files are ignored and rebuilt.
-pub const CACHE_FORMAT_VERSION: u32 = 20;
+/// v21: the `class_name` registry keeps every declarer of a name and picks the winner by Godot's
+/// scan order. A v20 cache stored one last-writer-wins entry per name, which could name a scratch
+/// copy as the owner, or have lost the name entirely after a new file passed through it while its
+/// `class_name` was typed. v20 files are ignored and rebuilt.
+pub const CACHE_FORMAT_VERSION: u32 = 21;
 
 /// The cache file's basename within `<root>/.gdls/`. The `.json` extension is honest: the payload
 /// is `serde_json`-encoded (see `save`/`load`), so a developer inspecting `.gdls/` or a backup tool
