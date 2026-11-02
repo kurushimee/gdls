@@ -330,6 +330,12 @@ pub struct Interface {
     /// `"The base class script has the @tool annotation, but this script does not have it."`).
     pub is_tool: bool,
     pub icon_path: Option<String>,
+    /// The file sits where Godot's editor scan never reaches it (outside the project root, or in a
+    /// dot-named, hidden, `.gdignore`'d or nested-project directory), so Godot never registers its
+    /// `class_name`. Set by whoever indexes the file, not by extraction. Such a declaration owns its
+    /// name only while no scanned file declares it too.
+    #[serde(default)]
+    pub outside_godot_scan: bool,
     pub members: Vec<MemberDecl>,
     /// M7 (#62): the class's `##` doc comment (brief/description/tutorials). Excluded from
     /// [`Self::signature_hash`] — see [`MemberDecl::doc`].
@@ -601,6 +607,8 @@ fn extract_class(
         is_abstract: has_annotation(tree, annotations, |n| n == "@abstract"),
         is_tool: has_annotation(tree, annotations, |n| n == "@tool"),
         icon_path: class.icon_path.clone(),
+        // Where the file sits is the indexer's knowledge, not the parse tree's.
+        outside_godot_scan: false,
         members,
         doc: tree.docs.class_docs.get(&class_id).cloned().map(Box::new),
         inner,

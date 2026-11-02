@@ -1208,7 +1208,7 @@ fn serve_inner(
                             send_semantic_tokens_refresh(&mut state);
                             // The warm-start cache key includes the native DB; re-save so the
                             // NEXT session warm-loads instead of cold-indexing on key mismatch.
-                            state.workspace.save_cache();
+                            save_cache_mid_session(&state);
                         }
                     }
                     Ok(crate::api_dump::DumpOutcome::Failed(e)) => {
@@ -1929,34 +1929,42 @@ fn handle_watcher(state: &mut ServerState, events: Vec<DebouncedEvent>) {
     let open_paths = open_buffer_paths(state);
     if events.iter().any(|e| e.need_rescan()) {
         log::info!("watcher: need_rescan set; running reconciliation");
-        let mut progress = server_progress(state, "Reconciling project");
-        let report = state.workspace.reconcile_with_progress(
-            crate::workspace::ReconcileMode::FullStat,
-            &open_paths,
-            &mut progress,
-        );
-        // M5 WP-O1 — preserved verbatim marker (operators & log-greppers depend on this exact
-        // label). Migrated to tracing::info! so the watcher-overflow path lights up the same
-        // way the cold-start path does in any structured trace consumer.
-        tracing::info!(
-            "watcher_reconciled added={} modified={} removed={} walked={}",
-            report.added,
-            report.modified,
-            report.removed,
-            report.walked
-        );
-        republish_dirty_open_buffers(state);
+        reconcile_from_watcher(state, &open_paths);
         return;
     }
 
     // Clone the project root ONCE per batch — classification and application both need it by
     // reference; cloning per reaction would scale linearly with the (typically large) batch.
     let root = state.workspace.project.root.clone();
+    let mut filter = gd_project::ScanFilter::new(&root);
     let reactions: Vec<Reaction> = events
         .iter()
-        .flat_map(|ev| watcher::classify_event(ev, &root))
+        .flat_map(|ev| watcher::classify_event_with(ev, &mut filter))
         .collect();
     apply_reaction_batch(state, reactions, &root, &open_paths);
+}
+
+/// Re-walk the whole project and bring the index in line with disk, then republish what moved.
+/// The recovery path when per-event updates can't be trusted to be complete: a watcher overflow,
+/// or a scan boundary that moved a whole subtree in or out of the project.
+fn reconcile_from_watcher(state: &mut ServerState, open_paths: &FxHashSet<Utf8PathBuf>) {
+    let mut progress = server_progress(state, "Reconciling project");
+    let report = state.workspace.reconcile_with_progress(
+        crate::workspace::ReconcileMode::FullStat,
+        open_paths,
+        &mut progress,
+    );
+    // M5 WP-O1 — preserved verbatim marker (operators & log-greppers depend on this exact
+    // label). Migrated to tracing::info! so the watcher-overflow path lights up the same
+    // way the cold-start path does in any structured trace consumer.
+    tracing::info!(
+        "watcher_reconciled added={} modified={} removed={} walked={}",
+        report.added,
+        report.modified,
+        report.removed,
+        report.walked
+    );
+    republish_dirty_open_buffers(state);
 }
 
 /// Apply one classified batch of [`Reaction`]s — the shared applier behind the native watcher
@@ -1976,6 +1984,7 @@ fn apply_reaction_batch(
     // Scan the batch into two booleans and do the (expensive) reload + republish at most once after.
     let mut project_changed = false;
     let mut native_changed = false;
+    let mut scan_boundary_moved = false;
     // What set the reload off, named in its log line and the trail (#622).
     let mut triggers: Vec<String> = Vec::new();
     for reaction in reactions {
@@ -1984,6 +1993,7 @@ fn apply_reaction_batch(
             Reaction::ExtensionApiJson => Some("extension_api.json".to_owned()),
             Reaction::Gdextension { path, change } => Some(format!("{path} ({change:?})")),
             Reaction::DocClassesXml { path } => Some(path.to_string()),
+            Reaction::ScanBoundary { path } => Some(path.to_string()),
             _ => None,
         };
         if let Some(what) = what {
@@ -2006,6 +2016,7 @@ fn apply_reaction_batch(
             | Reaction::Gdextension { .. }
             | Reaction::DocClassesXml { .. } => project_changed = true,
             Reaction::ExtensionApiJson => native_changed = true,
+            Reaction::ScanBoundary { .. } => scan_boundary_moved = true,
             // GdSource (per-file index mutation) and Other (dropped) both flow through
             // `apply_reaction` so each still opens a `watcher_event` span — the WP-RD7
             // `SkipReason` on an `Other` surfaces in the trace there.
@@ -2013,6 +2024,13 @@ fn apply_reaction_batch(
         }
     }
     republish_dirty_open_buffers(state);
+    if scan_boundary_moved {
+        log::info!(
+            "watcher: a .gdignore or nested project.godot changed ({}); re-walking the project",
+            triggers.join(", ")
+        );
+        reconcile_from_watcher(state, open_paths);
+    }
     // The coalesced project/native reload (WP-RD11 (3)). `project_changed` subsumes
     // `native_changed` (it reloads the native DB too), so the `else if` avoids a double reload.
     if project_changed {
@@ -2054,13 +2072,21 @@ fn apply_reaction_batch(
             // The warm-start cache key includes the native DB — re-save so the next session
             // warm-loads against the new key. (The background-dump completion arm does the
             // same; whichever path adopts first wins, the other dedupes by content hash.)
-            state.workspace.save_cache();
+            save_cache_mid_session(state);
         }
     }
     // M5 WP-O2: post-watcher-batch sample. A mass reindex driven by a `git checkout` or branch
     // switch can balloon the parse + analysis caches in one go; this catches that burst without
     // waiting for the 3-second ticker.
     state.rss.sample_now("post_watcher");
+}
+
+/// Persist the warm-start cache while editor buffers may be open. Their interfaces come from
+/// unsaved text, so their disk stats are left out and the next session re-parses them from disk;
+/// otherwise a half-typed `extends` or `class_name` would be served as disk truth across restarts.
+fn save_cache_mid_session(state: &ServerState) {
+    let open_paths = open_buffer_paths(state);
+    state.workspace.save_cache_excluding_open(&open_paths);
 }
 
 /// Whether a change to `<root>/extension_api.json` cannot affect the native DB: a pinned
@@ -2155,6 +2181,8 @@ fn register_watched_files(state: &mut ServerState, native_watcher_armed: bool) {
         watcher("**/*.gdextension"),
         watcher("**/extension_api.json"),
         watcher("**/doc_classes/*.xml"),
+        // A `.gdignore` moves a scan boundary: a whole subtree joins or leaves the project.
+        watcher("**/.gdignore"),
     ]
     .into_iter()
     .chain(asset_catch_all)
@@ -2226,6 +2254,7 @@ fn reaction_kind(reaction: &Reaction) -> &'static str {
         Reaction::DocClassesXml { .. } => "doc_classes_xml",
         Reaction::Scene { .. } => "scene",
         Reaction::Asset { .. } => "asset",
+        Reaction::ScanBoundary { .. } => "scan_boundary",
     }
 }
 

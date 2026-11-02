@@ -57,8 +57,8 @@ impl SceneIndex {
     }
 
     /// Cold-build the scene index by scanning every `.tscn` under `root` from disk, sharing
-    /// the script index's exclusion set ([`crate::exclude::is_excluded`] — `.godot/`, `.import/`,
-    /// `.git/`, `target/`, `node_modules/`, `.gdls/`, editor temp suffixes) so the two indexes agree
+    /// the script index's exclusion set ([`crate::exclude::keep_walk_entry`] — whatever Godot's own scan
+    /// skips) so the two indexes agree
     /// on what enters them. A file that can't be read or isn't under `root` is skipped (degrade,
     /// never fail), and walk/UTF-8 errors are logged at `warn` — matching `gd_files`' discipline.
     /// Scenes are keyed by their `res://` path.
@@ -67,9 +67,10 @@ impl SceneIndex {
         let mut idx = SceneIndex::new();
         // Before the first `reindex`, so every scene canonicalizes against a populated map.
         idx.set_uid_map(uids);
-        for entry_result in WalkDir::new(root).into_iter().filter_entry(|e| {
-            Utf8Path::from_path(e.path()).is_none_or(|p| !crate::exclude::is_excluded(p, root))
-        }) {
+        for entry_result in WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|e| crate::exclude::keep_walk_entry(e, root))
+        {
             let entry = match entry_result {
                 Ok(e) => e,
                 Err(e) => {

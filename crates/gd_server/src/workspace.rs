@@ -22,7 +22,7 @@ use walkdir::WalkDir;
 
 use crate::uri::CanonicalKey;
 use crate::xfile::{AutoloadEnv, WorkspaceXFileQuery};
-use gd_project::is_excluded;
+use gd_project::keep_walk_entry;
 
 use crate::config::{InitializationOptions, StrictConfig, StrictProfile as ServerStrictProfile};
 
@@ -975,11 +975,22 @@ impl Workspace {
         // The index stops reflecting the recorded disk text here; a disk-sourced caller records
         // the new text right after (see `last_applied_disk`).
         self.last_applied_disk.pop(&normalize_path_buf(path));
-        let iface = gd_project::extract_interface(tree);
+        let mut iface = gd_project::extract_interface(tree);
+        // Godot never registers a `class_name` from a script its scan doesn't reach, so an open
+        // scratch copy must never take over the real class.
+        iface.outside_godot_scan = !self.godot_scans(path);
         self.note_reindex(path, iface.class_name.as_deref(), "live");
         self.index.txn(path, |idx| {
             idx.on_file_changed(path, iface);
         });
+    }
+
+    /// Whether Godot's editor scan reaches `path`: it is under the project root and not in a
+    /// dot-named, hidden, `.gdignore`'d or nested-project directory.
+    fn godot_scans(&self, path: &Utf8Path) -> bool {
+        let root = normalize_path_buf(&self.project.root);
+        let path = normalize_path_buf(path);
+        path.starts_with(&root) && !gd_project::ScanFilter::new(&root).is_ignored(&path)
     }
 
     /// Refresh `stat_table` for `path` from its current on-disk metadata. Call this after a
@@ -1460,16 +1471,10 @@ impl Workspace {
         // asset keys aren't `FileId`s (like `walked_scene_paths`).
         let mut walked_asset_paths: FxHashSet<Utf8PathBuf> = FxHashSet::default();
 
+        // Skip what Godot's scan skips *before* descending — saves walking .godot/, etc.
         let walker = WalkDir::new(root.as_std_path())
             .into_iter()
-            .filter_entry(|e| {
-                // Skip excluded directories *before* descending — saves walking .godot/, etc.
-                if let Some(p) = camino::Utf8Path::from_path(e.path()) {
-                    !is_excluded(p, &root)
-                } else {
-                    true
-                }
-            });
+            .filter_entry(|e| keep_walk_entry(e, &root));
 
         // Inspect each WalkDir result explicitly — `.filter_map(Result::ok)` would silently
         // drop permission-denied / I/O / symlink-loop errors, and the downstream "removed"
@@ -1841,13 +1846,7 @@ fn warm_index_from_cache(
     // Walk current disk state — same walker reconcile uses.
     let walker = WalkDir::new(root.as_std_path())
         .into_iter()
-        .filter_entry(|e| {
-            if let Some(p) = camino::Utf8Path::from_path(e.path()) {
-                !is_excluded(p, root)
-            } else {
-                true
-            }
-        });
+        .filter_entry(|e| keep_walk_entry(e, root));
 
     let mut walk_errors = 0usize;
     let mut skipped_non_utf8 = 0usize;

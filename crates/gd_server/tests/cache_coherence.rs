@@ -313,33 +313,43 @@ fn dep_epoch_propagates_through_three_deep_extends_chain() {
     );
 }
 
-/// The cold index must skip the shared exclusion set, not just `.godot/`. Before
-/// the fix, `gd_files` filtered only `.godot/`, so a `.gd` under `target/` / `.git/` /
-/// `node_modules/` was indexed at startup and could register a `class_name` that shadows a real
-/// project class. `Workspace::load` → `Index::build` → `gd_files` → `gd_project::is_excluded`.
+/// The cold index skips exactly what Godot's editor scan skips: dot-named directories, a
+/// `.gdignore`'d directory, and a nested project. A script there can't own a `class_name` in Godot,
+/// so indexing it let a scratch copy take over the real class. Godot does scan `target/` and
+/// `node_modules/`, so gdls does too.
+/// `Workspace::load` → `Index::build` → `gd_files` → `gd_project::keep_walk_entry`.
 #[test]
-fn cold_index_skips_excluded_directories() {
+fn cold_index_skips_what_godot_skips() {
     let p = TempProject::new();
     p.write(
         "project.godot",
         "config_version=5\n\n[application]\nconfig/features=PackedStringArray(\"4.6\")\n",
     );
     p.write("src/real.gd", "class_name Real\nextends Node\n");
-    p.write("target/copy.gd", "class_name Copied\nextends Node\n");
+    p.write("target/build.gd", "class_name Built\nextends Node\n");
     p.write(".git/hook.gd", "class_name Ghost\nextends Node\n");
-    p.write("node_modules/dep/x.gd", "class_name Dep\nextends Node\n");
+    p.write("outputs/.gdignore", "");
+    p.write("outputs/copy.gd", "class_name Real\nextends RefCounted\n");
+    p.write("demo/project.godot", "config_version=5\n");
+    p.write("demo/x.gd", "class_name Nested\nextends Node\n");
 
     let ws = Workspace::load(&p.root, &options(&p));
-    assert!(
-        ws.index.file_id(&p.root.join("src/real.gd")).is_some(),
-        "a normal src/ .gd must be cold-indexed"
-    );
-    for excluded in ["target/copy.gd", ".git/hook.gd", "node_modules/dep/x.gd"] {
+    for scanned in ["src/real.gd", "target/build.gd"] {
         assert!(
-            ws.index.file_id(&p.root.join(excluded)).is_none(),
-            "{excluded} is under an excluded directory and must NOT be cold-indexed"
+            ws.index.file_id(&p.root.join(scanned)).is_some(),
+            "Godot scans {scanned}, so it must be cold-indexed"
         );
     }
+    for skipped in [".git/hook.gd", "outputs/copy.gd", "demo/x.gd"] {
+        assert!(
+            ws.index.file_id(&p.root.join(skipped)).is_none(),
+            "Godot never scans {skipped}, so it must NOT be cold-indexed"
+        );
+    }
+    assert_eq!(
+        ws.index.registry().get("Real").unwrap().path,
+        gd_project::normalize_path(&p.root.join("src/real.gd"))
+    );
 }
 
 /// WP-RD9 (Windows residual): a file reached through an NTFS **junction** must resolve to the same

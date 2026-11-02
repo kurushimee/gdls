@@ -15,6 +15,7 @@ mod call_hierarchy_depth;
 mod call_hierarchy_inner_class;
 mod call_hierarchy_native;
 mod cancellation;
+mod class_name_ownership;
 mod class_name_refs;
 mod code_action;
 mod common;

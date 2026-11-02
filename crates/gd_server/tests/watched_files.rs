@@ -193,6 +193,7 @@ fn registration_sent_iff_dynamic_registration_offered() {
             "**/*.gdextension",
             "**/extension_api.json",
             "**/doc_classes/*.xml",
+            "**/.gdignore",
             "**/*",
         ]
     );
@@ -251,6 +252,7 @@ fn register_watched_files_omits_the_catch_all_when_the_native_watcher_is_armed()
             "**/*.gdextension",
             "**/extension_api.json",
             "**/doc_classes/*.xml",
+            "**/.gdignore",
         ],
         "a session with its own watcher must not ask the client to watch the whole workspace"
     );

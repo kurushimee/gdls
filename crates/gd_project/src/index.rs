@@ -24,7 +24,7 @@ use walkdir::WalkDir;
 
 use crate::depgraph::{DepGraph, FileId};
 use crate::interface::{self, Extends, Interface, TypeExpr};
-use crate::registry::ClassNameRegistry;
+use crate::registry::{ClassEntry, ClassNameRegistry};
 
 /// What a name resolves to. `Unknown` is a first-class answer (degrade to dynamic, never a false
 /// "unknown class" error — `docs/00`).
@@ -129,21 +129,25 @@ impl Index {
     /// the cold index and as the core of [`Self::on_file_changed`]. Does **not** (re)compute edges —
     /// the cold index defers that to [`Self::finish_cold_index`] so forward references resolve.
     pub fn set_interface(&mut self, path: &Utf8Path, iface: Interface) -> FileId {
+        self.set_interface_tracked(path, iface).0
+    }
+
+    /// [`Self::set_interface`], also returning every `class_name` whose winning file changed.
+    fn set_interface_tracked(
+        &mut self,
+        path: &Utf8Path,
+        iface: Interface,
+    ) -> (FileId, Vec<String>) {
         let key = normalize(path);
         let fid = self.intern(&key);
-        // Drop any class_name this file used to declare, then register its current one.
-        self.registry.remove_by_path(&key);
-        if let Some(name) = &iface.class_name {
-            self.registry.insert(
-                name.clone(),
-                &key,
-                &iface.extends,
-                iface.is_abstract,
-                iface.class_name_loc,
-            );
-        }
+        let changed_names = match &iface.class_name {
+            Some(name) => self
+                .registry
+                .insert_declaration(name.clone(), ClassEntry::declared_by(&key, &iface)),
+            None => self.registry.remove_by_path(&key),
+        };
         self.interfaces.insert(fid, iface);
-        fid
+        (fid, changed_names)
     }
 
     /// Extract a parsed tree's interface and record it. Convenience over [`Self::set_interface`].
@@ -269,12 +273,11 @@ impl Index {
         let fid = self.intern(&key);
         let old = self.interfaces.get(&fid);
         let old_hash = old.map(|i| i.signature_hash());
-        let old_class_name = old.and_then(|i| i.class_name.clone());
         let was_live = old.is_some(); // did this path already hold a live interface?
         let new_hash = iface.signature_hash();
-        let new_class_name = iface.class_name.clone();
 
-        self.set_interface(&key, iface); // (1) re-extract; registry updated now
+        // (1) re-extract; registry updated now
+        let (_, changed_names) = self.set_interface_tracked(&key, iface);
         self.recompute_edges(fid);
         self.mark_dirty(fid); // (2) the file itself always re-analyzes (dirty + epoch bump)
 
@@ -283,12 +286,11 @@ impl Index {
             self.invalidate_all(self.deps.reverse_closure(fid));
         } // body-only ⇒ nothing else (docs/03 §5)
 
-        if old_class_name != new_class_name {
-            // (4) a global name appeared/disappeared/renamed ⇒ re-link & invalidate its referencers,
-            //     including files that had no edge to it yet.
-            for name in old_class_name.into_iter().chain(new_class_name) {
-                self.relink_referencers(&name);
-            }
+        // (4) a global name now resolves to a different file (it appeared, disappeared, or moved
+        //     between duplicate declarers) ⇒ re-link & invalidate its referencers, including files
+        //     that had no edge to it yet.
+        for name in changed_names {
+            self.relink_referencers(&name);
         }
 
         if !was_live {
@@ -326,7 +328,7 @@ impl Index {
         // that entry in place, so quarantine could never remediate a `DanglingClassName` violation —
         // it re-fired on every post-quarantine `verify`. `remove_by_path` is a no-op when the file
         // declared no `class_name`.
-        let removed_names = self.registry.remove_by_path(&key);
+        let changed_names = self.registry.remove_by_path(&key);
         if let Some(fid) = self.ids.get(&key).copied() {
             // Capture dependents before tearing edges down.
             self.invalidate_all(self.deps.reverse_closure(fid));
@@ -337,7 +339,7 @@ impl Index {
             self.set_uid_refs(fid, FxHashSet::default()); // and its uid references
             self.dirty.remove(&fid);
         }
-        for name in removed_names {
+        for name in changed_names {
             self.relink_referencers(&name);
         }
         // No path-referencer relink here (cf. `on_file_changed` branch 5): a removed file's
@@ -680,8 +682,8 @@ impl Index {
             }
         }
 
-        // Invariant 2: every registered class_name's path is a known FileId.
-        for (name, entry) in self.registry.entries() {
+        // Invariant 2: every declarer of a registered class_name is a known FileId.
+        for (name, entry) in self.registry.all_declarations() {
             if self.file_id(&entry.path).is_none() {
                 violations.push(IndexInvariant::DanglingClassName {
                     name: name.to_string(),
@@ -1094,8 +1096,22 @@ impl Index {
                 .ok()
                 .map(|_| *fid)
         }));
+        // Every declarer re-analyzes too: the one that lost the name now hides a global class,
+        // and the one that gained it no longer does.
+        let declarers: Vec<FileId> = self
+            .registry
+            .declarers(name)
+            .iter()
+            .filter_map(|d| self.ids.get(&d.path).copied())
+            .collect();
         for fid in referencers {
             self.recompute_edges(fid);
+            self.mark_dirty(fid);
+            // A referencer that now resolves the name differently may expose a different interface
+            // to its own dependents, so they re-analyze as well.
+            self.invalidate_all(self.deps.reverse_closure(fid));
+        }
+        for fid in declarers {
             self.mark_dirty(fid);
         }
     }
@@ -1388,12 +1404,12 @@ impl Index {
                 return false;
             }
         }
-        // Registry forward data must match. Use the public `entries()` API.
+        // Registry forward data must match, losing duplicate declarers included.
         if self.registry.len() != other.registry.len() {
             return false;
         }
-        for (name, entry) in self.registry.entries() {
-            if other.registry.get(name) != Some(entry) {
+        for name in self.registry.names() {
+            if other.registry.declarers(name) != self.registry.declarers(name) {
                 return false;
             }
         }
@@ -1543,7 +1559,7 @@ impl IndexMut<'_> {
     /// build, which no longer references it).
     #[cfg(test)]
     pub fn inject_verify_violation(&mut self) {
-        self.inner.registry.insert(
+        let _ = self.inner.registry.insert(
             "FuzzGhost".to_string(),
             &normalize(Utf8Path::new("/fuzz/ghost_never_interned.gd")),
             &Extends::None,
@@ -1738,11 +1754,10 @@ struct GdFilesScan {
     skipped_non_utf8: usize,
 }
 
-/// Every `.gd` file under `root`, skipping the shared exclusion set ([`crate::exclude::is_excluded`]
-/// — `.godot/`, `.import/`, `.git/`, `target/`, `node_modules/`, editor temp suffixes), so the cold
-/// index, `Workspace::reconcile`, and the watcher agree on what enters the index. Before this was
-/// shared, cold index skipped only `.godot/` and over-included `.gd` under `target/` etc., letting a
-/// vendored/build-copy script shadow a real project class. Walk errors (permission, vanished
+/// Every `.gd` file under `root` that Godot's own scan reaches ([`crate::exclude::keep_walk_entry`]),
+/// so the cold index, `Workspace::reconcile`, and the watcher agree on what enters the index. A
+/// script Godot never scans (a `.gdignore`'d scratch copy, a nested project) would otherwise let
+/// a `class_name` it declares take over or hide the real project class. Walk errors (permission, vanished
 /// mid-walk, symlink loops) and non-UTF-8 paths are counted + logged at `warn` so a startup glitch
 /// on a single subdir doesn't silently halve the project — the prior `.flatten()` swallowed every
 /// `Err` and re-introduced the exact bug `reconcile` was rewritten to avoid.
@@ -1750,12 +1765,12 @@ fn gd_files(root: &Utf8Path) -> GdFilesScan {
     let mut files = Vec::new();
     let mut walk_errors = 0usize;
     let mut skipped_non_utf8 = 0usize;
-    for entry_result in WalkDir::new(root).into_iter().filter_entry(|e| {
-        // Skip excluded directories *before* descending. Non-UTF-8 entries can't be classified
-        // here; keep them so the loop below counts them as `skipped_non_utf8` rather than
-        // silently dropping them at the filter.
-        camino::Utf8Path::from_path(e.path()).is_none_or(|p| !crate::exclude::is_excluded(p, root))
-    }) {
+    // Skip excluded directories *before* descending. Non-UTF-8 entries are kept so the loop below
+    // counts them as `skipped_non_utf8` rather than silently dropping them at the filter.
+    for entry_result in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| crate::exclude::keep_walk_entry(e, root))
+    {
         let entry = match entry_result {
             Ok(e) => e,
             Err(e) => {
@@ -2463,7 +2478,8 @@ mod tests {
         // (white-box) and assert removal clears it.
         let mut idx = Index::new(Utf8PathBuf::from("/proj"));
         let ghost = normalize(&abs("ghost.gd"));
-        idx.registry
+        let _ = idx
+            .registry
             .insert("Ghost".to_string(), &ghost, &Extends::None, false, None);
 
         match idx.verify() {
@@ -2581,7 +2597,7 @@ mod tests {
         idx.txn(&abs("a.gd"), |i| {
             // `i` is the sealed IndexMut; reach the raw registry table through its (in-crate)
             // private `inner` field to force a DanglingClassName the safe mutators never would.
-            i.inner.registry.insert(
+            let _ = i.inner.registry.insert(
                 "Ghost".to_string(),
                 &normalize(&abs("ghost.gd")),
                 &Extends::None,

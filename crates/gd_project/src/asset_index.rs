@@ -44,17 +44,18 @@ impl AssetIndex {
     /// Cold-build the asset index by scanning every file under `root` from disk that is NOT a `.gd`
     /// script (covered by [`Index`](crate::index::Index)) and NOT a `.tscn` scene (covered by
     /// [`SceneIndex`](crate::scene_index::SceneIndex)), sharing the script index's exclusion set
-    /// ([`crate::exclude::is_excluded`] — `.godot/`, `.import/`, `.git/`, `target/`, `node_modules/`,
-    /// `.gdls/`, editor temp suffixes) so all three indexes agree on what enters them. A file that
+    /// ([`crate::exclude::keep_walk_entry`] — whatever Godot's own scan skips) so all three indexes
+    /// agree on what enters them. A file that
     /// can't be keyed to a `res://` path or isn't under `root` is skipped (degrade, never fail), and
     /// walk/UTF-8 errors are logged at `warn` — matching [`SceneIndex::build`](crate::scene_index::SceneIndex::build).
     /// Assets are keyed by their `res://` path.
     #[must_use]
     pub fn build(root: &Utf8Path) -> Self {
         let mut idx = AssetIndex::new();
-        for entry_result in WalkDir::new(root).into_iter().filter_entry(|e| {
-            Utf8Path::from_path(e.path()).is_none_or(|p| !crate::exclude::is_excluded(p, root))
-        }) {
+        for entry_result in WalkDir::new(root)
+            .into_iter()
+            .filter_entry(|e| crate::exclude::keep_walk_entry(e, root))
+        {
             let entry = match entry_result {
                 Ok(e) => e,
                 Err(e) => {

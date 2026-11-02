@@ -82,6 +82,9 @@ pub enum Reaction {
         path: Utf8PathBuf,
         change: FileChange,
     },
+    /// A `.gdignore`, or a `project.godot` below the root, appeared or vanished, so a whole subtree
+    /// joined or left Godot's scan. Only a full re-walk can tell which files moved in or out.
+    ScanBoundary { path: Utf8PathBuf },
     /// Anything else — dropped without action. WP-RD7 split the former catch-all `Other` to carry a
     /// [`SkipReason`] so a structured trace can tell a `.tmp`-file skip from a non-UTF-8-path drop
     /// (the `reaction` span discriminant in `server::reaction_kind` reads it) without the handler
@@ -96,7 +99,8 @@ pub enum Reaction {
 pub enum SkipReason {
     /// The event carried no usable (UTF-8) path.
     NoPath,
-    /// The path is under an excluded directory (`.godot/`, `target/`, `.git/`, …).
+    /// Godot's scan never reaches the path (a dot-named or hidden entry, a `.gdignore`'d
+    /// directory, a nested project).
     Excluded,
     /// A read-only `Access` event — never index-affecting.
     AccessOnly,
@@ -282,11 +286,12 @@ impl Drop for FileWatcher {
 // Path classification + exclusion filter (WP-W2).
 // ---------------------------------------------------------------------------
 
-// The exclusion predicate now lives in `gd_project` so the cold index, `Workspace::reconcile`,
-// and this watcher share one definition (they used to diverge — the cold index skipped only
-// `.godot/`). Re-exported here so `watcher::is_excluded` keeps resolving for in-tree callers and
-// the classifier below. Its tests moved with it (`gd_project::exclude`).
+// The exclusion rules live in `gd_project` so the cold index, `Workspace::reconcile`, and this
+// watcher share one definition. `is_excluded` (name rules only) is re-exported for in-tree
+// callers; the classifier below uses the full [`ScanFilter`], which also honors `.gdignore`,
+// nested projects and hidden entries. Their tests live with them (`gd_project::exclude`).
 pub use gd_project::is_excluded;
+use gd_project::{is_scan_boundary_marker, ScanFilter};
 
 /// Classify a single debounced event into a [`Reaction`]. Multiple paths in one event (the
 /// rename case) are collapsed into a single [`Reaction::GdSource`] with [`FileChange::Renamed`]
@@ -298,7 +303,14 @@ pub use gd_project::is_excluded;
 /// directories (e.g. inside an addon's vendored copy) is not surfaced as
 /// [`Reaction::ExtensionApiJson`] — only the project root's dump counts.
 pub fn classify_event(event: &DebouncedEvent, project_root: &Utf8Path) -> Vec<Reaction> {
+    classify_event_with(event, &mut ScanFilter::new(project_root))
+}
+
+/// [`classify_event`] sharing one [`ScanFilter`] across a batch, so a burst of thousands of
+/// events checks each directory for `.gdignore` / `project.godot` once.
+pub fn classify_event_with(event: &DebouncedEvent, filter: &mut ScanFilter) -> Vec<Reaction> {
     use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+    let project_root = filter.root();
     use notify::EventKind;
 
     // Convert `std::path::PathBuf` → `Utf8PathBuf` losing non-UTF-8 paths (drop them).
@@ -334,9 +346,15 @@ pub fn classify_event(event: &DebouncedEvent, project_root: &Utf8Path) -> Vec<Re
     // Rename with both ends → one merged reaction (the debouncer normalizes Modify(Name(Both))).
     if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = event.kind {
         if let [from, to] = paths.as_slice() {
+            if let Some(boundary) = [from, to]
+                .into_iter()
+                .find_map(|p| scan_boundary_reaction(p, filter))
+            {
+                return vec![boundary];
+            }
             // If either side is excluded, demote to a one-sided event.
-            let from_excl = is_excluded(from, project_root);
-            let to_excl = is_excluded(to, project_root);
+            let from_excl = filter.is_ignored(from);
+            let to_excl = filter.is_ignored(to);
             return match (from_excl, to_excl) {
                 (true, true) => vec![Reaction::Other(SkipReason::Excluded)],
                 (false, true) => vec![reaction_for_path(from, FileChange::Deleted, project_root)],
@@ -373,9 +391,26 @@ pub fn classify_event(event: &DebouncedEvent, project_root: &Utf8Path) -> Vec<Re
 
     paths
         .iter()
-        .filter(|p| !is_excluded(p, project_root))
-        .map(|p| reaction_for_path(p, change.clone(), project_root))
+        .filter_map(|p| {
+            if let Some(boundary) = scan_boundary_reaction(p, filter) {
+                return Some(boundary);
+            }
+            (!filter.is_ignored(p)).then(|| reaction_for_path(p, change.clone(), project_root))
+        })
         .collect()
+}
+
+/// [`Reaction::ScanBoundary`] when `path` is a `.gdignore` or nested `project.godot` in a
+/// directory Godot's scan reaches. (The marker's own directory is skipped *because* of the marker,
+/// so only the directory's own name and ancestors are judged.)
+fn scan_boundary_reaction(path: &Utf8Path, filter: &mut ScanFilter) -> Option<Reaction> {
+    if !is_scan_boundary_marker(path, filter.root()) {
+        return None;
+    }
+    let dir = path.parent()?;
+    (!filter.is_ignored(dir)).then(|| Reaction::ScanBoundary {
+        path: path.to_path_buf(),
+    })
 }
 
 /// Construct a `Reaction::GdSource` for a both-ends rename. The documented `path == change.to`
@@ -425,7 +460,11 @@ pub fn classify_client_event(
     change: FileChange,
     project_root: &Utf8Path,
 ) -> Reaction {
-    if is_excluded(path, project_root) {
+    let mut filter = ScanFilter::new(project_root);
+    if let Some(boundary) = scan_boundary_reaction(path, &mut filter) {
+        return boundary;
+    }
+    if filter.is_ignored(path) {
         return Reaction::Other(SkipReason::Excluded);
     }
     reaction_for_path(path, change, project_root)
@@ -562,6 +601,25 @@ mod tests {
         assert!(
             matches!(r, Reaction::Asset { .. }),
             "a binary .scn is an asset, got {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_gdignore_or_nested_project_moves_a_scan_boundary() {
+        // Either file joins or removes a whole subtree, which only a re-walk can follow.
+        let root = p("/proj");
+        for marker in ["/proj/outputs/.gdignore", "/proj/demo/project.godot"] {
+            let r = classify_client_event(&p(marker), FileChange::Created, &root);
+            assert!(
+                matches!(r, Reaction::ScanBoundary { .. }),
+                "{marker}: got {r:?}"
+            );
+        }
+        // Inside a dot-named directory Godot never scans, it moves nothing.
+        let r = classify_client_event(&p("/proj/.git/x/.gdignore"), FileChange::Created, &root);
+        assert!(
+            matches!(r, Reaction::Other(SkipReason::Excluded)),
+            "got {r:?}"
         );
     }
 
