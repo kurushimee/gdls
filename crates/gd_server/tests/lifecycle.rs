@@ -235,11 +235,20 @@ fn m0_lifecycle_diagnostics_and_symbols() {
 /// field in an unmodelled shape used to abort the session before the server could answer: no
 /// result, no error, just a closed pipe. Here `rootUri` is a raw Windows drive path — exactly what
 /// broke #279 — and `clientInfo` is the wrong JSON type. The server must still reply, still
-/// advertise its capabilities, and still shut down cleanly, falling back to the cwd for its root.
+/// advertise its capabilities, and still shut down cleanly.
+///
+/// `initializationOptions` survives the recovery, so its `projectRoot` points the session at a
+/// scratch root. Without it the unusable `rootUri` would leave the server on its cwd fallback,
+/// which under `cargo test` is this crate (#642).
 #[test]
 fn a_malformed_initialize_param_still_completes_the_handshake() {
     let (server, client) = Connection::memory();
-    let server_thread = std::thread::spawn(move || gd_server::serve(server));
+    let (scratch, _) = common::scratch_root();
+    let project_root = scratch.root.to_string();
+    let server_thread = std::thread::spawn(move || {
+        let _scratch = scratch;
+        gd_server::serve(server)
+    });
 
     client
         .sender
@@ -250,6 +259,7 @@ fn a_malformed_initialize_param_still_completes_the_handshake() {
                 "processId": 1,
                 "rootUri": "file://C:\\Windows\\Temp\\proj",
                 "clientInfo": "definitely-not-an-object",
+                "initializationOptions": { "projectRoot": project_root },
                 "capabilities": {
                     "general": { "positionEncodings": ["utf-8"] }
                 }

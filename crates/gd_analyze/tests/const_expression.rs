@@ -304,6 +304,31 @@ fn a_folded_builtin_constructor_is_a_constant_expression() {
     assert_silent("Vector2(1, 2) + Vector2(3, 4)");
 }
 
+/// #644: `PI`, `TAU`, `INF`, and `NAN` fold to their values, as Godot's `has_any_global_constant`
+/// arm has them, so a builtin constructor over one of them folds too — directly, under an operator,
+/// nested in another constructor, or inside a dictionary. Every row is the issue's own, accepted by
+/// `Godot_v4.7.2-stable --headless --check-only`.
+#[test]
+fn a_constructor_over_a_global_float_constant_is_a_constant_expression() {
+    assert_silent("Basis(Vector3.RIGHT, -PI / 2)");
+    assert_silent("Transform3D(Basis(Vector3.RIGHT, PI / 2.0 - 0.2), Vector3(0.0, 0.0, -0.42))");
+    assert_silent("Vector3(PI / 2.0, 0.0, 0.0)");
+    assert_silent("{\"k\": Vector3(PI / 2.0, 0.0, 0.0)}");
+    assert_silent("Vector3(PI, 0.0, 0.0)");
+    assert_silent("Vector3(TAU, 0.0, 0.0)");
+    assert_silent("Vector2(INF, 0.0)");
+    assert_silent("Vector2(-INF, NAN)");
+    assert!(!local_const("Vector3(PI, 0.0, 0.0)")
+        .iter()
+        .any(|e| e == MSG));
+}
+
+/// The #644 control: the fold does not reach a non-constant argument beside the constant.
+#[test]
+fn a_constructor_over_a_global_float_constant_and_a_variable_is_reported() {
+    assert_reported("Vector3(PI, member_var, 0.0)");
+}
+
 /// A preload folds, and so does a preload nested in a literal.
 #[test]
 fn a_preload_is_a_constant_expression() {

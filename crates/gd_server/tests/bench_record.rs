@@ -32,11 +32,10 @@ fn record_then_replay_round_trips() {
     // ----- record phase -----
     let recorder = BenchRecorder::new(DEFAULT_TRACE_CAPACITY, artifact_path.clone());
     let (server, client) = Connection::memory();
+    // The scratch root outlives the recorded session: the replay below serves it again (#642).
     let (scratch, workspace_folders) = common::scratch_root();
-    let server_thread = std::thread::spawn(move || {
-        let _scratch = scratch;
-        gd_server::serve_with_recorder(server, Some(recorder))
-    });
+    let server_thread =
+        std::thread::spawn(move || gd_server::serve_with_recorder(server, Some(recorder)));
 
     let init = InitializeParams {
         workspace_folders,
@@ -127,6 +126,12 @@ fn record_then_replay_round_trips() {
         artifact.captured_at_unix_secs > 0,
         "captured_at_unix_secs unset"
     );
+    // `Path` equality, so a Windows root compares equal whichever separator each side spells.
+    assert_eq!(
+        artifact.project_root.as_deref().map(std::path::Path::new),
+        Some(scratch.root.as_std_path()),
+        "the artifact must record the root the session served, so a replay serves it too"
+    );
 
     // didOpen + documentSymbol + shutdown should all be in the ring. (initialize + initialized fire
     // BEFORE the recorder field is checked in the dispatch loop, but they pass through it too —
@@ -189,7 +194,7 @@ fn ring_buffer_evicts_oldest() {
         params: serde_json::Value::Null,
     });
     assert_eq!(rec.len(), 2);
-    rec.flush(Vec::new()).expect("flush");
+    rec.flush(Vec::new(), "/unused").expect("flush");
 
     let raw = std::fs::read_to_string(tmpdir.path().join("trace.json")).expect("read trace.json");
     let artifact: BenchArtifact = serde_json::from_str(&raw).expect("parse");

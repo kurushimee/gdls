@@ -111,6 +111,11 @@ pub struct BenchArtifact {
     pub env: BenchEnv,
     pub open_buffers: Vec<BufferSnapshot>,
     pub trace: Vec<TraceEntry>,
+    /// The project root the recorded session served. [`replay`] hands it back as `projectRoot`,
+    /// so a replay indexes the project it captured rather than its own working directory. `None`
+    /// only in an artifact written before the field existed (#642).
+    #[serde(default)]
+    pub project_root: Option<String>,
 }
 
 /// Ring buffer of recent JSON-RPC entries; owned by the live `ServerState` and emitted to disk on
@@ -200,9 +205,10 @@ impl BenchRecorder {
         self.trace.is_empty()
     }
 
-    /// Write the artifact to [`Self::dump_path`]. Consumes `self` because the recorder isn't
-    /// useful after flush — re-construct if more recording is needed.
-    pub fn flush(self, open_buffers: Vec<BufferSnapshot>) -> Result<()> {
+    /// Write the artifact to [`Self::dump_path`], recording `project_root` as the session's root.
+    /// Consumes `self` because the recorder isn't useful after flush — re-construct if more
+    /// recording is needed.
+    pub fn flush(self, open_buffers: Vec<BufferSnapshot>, project_root: &str) -> Result<()> {
         let artifact = BenchArtifact {
             version: ARTIFACT_VERSION,
             captured_at_unix_secs: SystemTime::now()
@@ -212,6 +218,7 @@ impl BenchRecorder {
             env: BenchEnv::capture(),
             open_buffers,
             trace: self.trace.into_iter().collect(),
+            project_root: Some(project_root.to_owned()),
         };
         let json =
             serde_json::to_string_pretty(&artifact).context("serialize bench artifact to JSON")?;
@@ -225,6 +232,15 @@ impl BenchRecorder {
         fs::write(&self.dump_path, json)
             .with_context(|| format!("write bench artifact to {}", self.dump_path.display()))?;
         Ok(())
+    }
+}
+
+/// The `initialize` params a replay sends: defaults, plus the recorded root as `projectRoot`. An
+/// artifact without a root leaves the server to its usual fallback, the working directory.
+fn replay_initialize_params(project_root: Option<&str>) -> lsp_types::InitializeParams {
+    lsp_types::InitializeParams {
+        initialization_options: project_root.map(|root| serde_json::json!({ "projectRoot": root })),
+        ..Default::default()
     }
 }
 
@@ -303,14 +319,17 @@ pub fn replay(artifact_path: &Path) -> Result<Vec<ReplayMetric>> {
     let server_thread = std::thread::spawn(move || crate::serve(server_conn));
 
     // Handshake: send a minimal `initialize` so the server reaches the dispatch loop. Replay never
-    // pretends to be a real client — capabilities are defaults; root URI is empty.
+    // pretends to be a real client — capabilities are defaults — but it does serve the recorded
+    // project root, so it indexes the project the session captured (#642).
     let init_id = 1_i32;
     client_conn
         .sender
         .send(Message::Request(Request {
             id: RequestId::from(init_id),
             method: "initialize".to_string(),
-            params: serde_json::to_value(lsp_types::InitializeParams::default())?,
+            params: serde_json::to_value(replay_initialize_params(
+                artifact.project_root.as_deref(),
+            ))?,
         }))
         .context("replay: send initialize")?;
     // Drain until the matching response (no spurious requests in the lifecycle handshake, but
@@ -464,5 +483,40 @@ fn drain_until_response(
                 anyhow::bail!("server disconnected while waiting for response id={expected_id}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #642: a replay serves the recorded root, so it never indexes its own working directory.
+    #[test]
+    fn a_replay_serves_the_recorded_root() {
+        let params = replay_initialize_params(Some("/projects/game"));
+        assert_eq!(
+            params.initialization_options,
+            Some(serde_json::json!({ "projectRoot": "/projects/game" }))
+        );
+    }
+
+    /// An artifact from before the root was recorded still replays, on the server's own fallback.
+    #[test]
+    fn a_replay_without_a_recorded_root_sends_no_options() {
+        assert_eq!(replay_initialize_params(None).initialization_options, None);
+    }
+
+    /// The root field is additive: an older artifact without it still parses.
+    #[test]
+    fn an_artifact_without_a_root_still_parses() {
+        let raw = serde_json::json!({
+            "version": ARTIFACT_VERSION,
+            "captured_at_unix_secs": 1,
+            "env": BenchEnv::capture(),
+            "open_buffers": [],
+            "trace": [],
+        });
+        let artifact: BenchArtifact = serde_json::from_value(raw).expect("parse");
+        assert_eq!(artifact.project_root, None);
     }
 }
